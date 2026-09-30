@@ -52,4 +52,12 @@ install: build
 uninstall:
 	rm -f $(PREFIX)/bin/lightcode
 
-.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall
+generate-protocol:
+	go tool oapi-codegen --config protocol/oapi-codegen.yaml -o protocol/protocol.gen.go protocol/openapi.yaml
+	cd frontend && npm run generate-protocol
+
+check-protocol: generate-protocol
+	sh scripts/check-protocol-generated.sh
+	cd frontend && npm run typecheck:protocol
+
+.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall generate-protocol check-protocol

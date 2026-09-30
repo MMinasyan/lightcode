@@ -1,0 +1,2528 @@
+# Lightcode Runtime protocol — the single source of truth for HTTP paths,
+# request/response DTOs, closed enums, error payloads, and SSE event frames.
+# Wire version "1" is the protocol identity, independent of the binary
+# release version. This file is hand-maintained; the Go and TypeScript
+# artifacts under protocol/ and frontend/src/generated/protocol/ are
+# generated from it and are never hand-edited.
+openapi: "3.0.3"
+info:
+  title: lightcode-protocol
+  version: "1"
+servers:
+  - url: "http://127.0.0.1"
+# Every path requires the bearer credential; it is declared once here and
+# enforced by the Runtime when the server lands.
+security:
+  - BearerAuth: []
+paths:
+  /v1/health:
+    get:
+      operationId: GetHealth
+      responses:
+        "200":
+          description: Authenticated, versioned readiness of the live Runtime owner.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/events:
+    get:
+      operationId: GetEvents
+      responses:
+        "200":
+          description: >
+            One multiplexed authenticated SSE stream over all scopes. Frames
+            use "event: notification" with one "data:" line carrying the JSON
+            Event; keepalives are SSE comments.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/Event"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions:
+    get:
+      operationId: ListSessions
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceQuery"
+        - $ref: "#/components/parameters/LifecycleQuery"
+      responses:
+        "200":
+          description: Projected Session headers, one revisioned row per Session.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: CreateSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: The created Session header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}:
+    get:
+      operationId: GetSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: The projected Session header without history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: DeleteSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "204":
+          description: The archived Session was deleted.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/archive:
+    post:
+      operationId: ArchiveSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: The archived Session header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/reopen:
+    post:
+      operationId: ReopenSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: The reopened Session header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/submit:
+    post:
+      operationId: SubmitSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "200":
+          description: The submission disposition and Operation when admitted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResult"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/compact:
+    post:
+      operationId: CompactSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompactRequest"
+      responses:
+        "200":
+          description: The admitted compaction Operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/interrupt:
+    post:
+      operationId: InterruptSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "204":
+          description: The interrupt control was issued; it does not wait for the terminal commit.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/stop:
+    post:
+      operationId: StopSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "204":
+          description: The stop control completed its background convergence wait.
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/fork:
+    post:
+      operationId: ForkSession
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkRequest"
+      responses:
+        "200":
+          description: The forked Session and its admitted Operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkResult"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/agent-type:
+    put:
+      operationId: SetSessionAgentType
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetSessionAgentTypeRequest"
+      responses:
+        "200":
+          description: The Session header; only subsequent admissions use the new Agent type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/hydration:
+    get:
+      operationId: GetSessionHydration
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: One coherent Session projection captured at one revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Hydration"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/history:
+    get:
+      operationId: GetSessionHistory
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One anchored page of conversation items in ascending display order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryPage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/pending:
+    get:
+      operationId: GetSessionPending
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Both process-local pending queues from the Session snapshot producer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingSnapshot"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/usage:
+    get:
+      operationId: GetSessionUsage
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: The canonical usage totals and the display context estimate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageSnapshot"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/code-snapshots:
+    get:
+      operationId: GetSessionCodeSnapshots
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "200":
+          description: Per-Operation code snapshot groups, ascending by admitted entry.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CodeSnapshotGroup"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/revert-code:
+    post:
+      operationId: RevertSessionCode
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevertCodeRequest"
+      responses:
+        "200":
+          description: The completed restore result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeRevertResult"
+        default:
+          description: >
+            A traversal I/O failure after earlier groups changed returns the
+            same result DTO with accumulated restored/skipped members and the
+            error member; every other failure, including a pre-traversal
+            storage failure, returns the schema error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeRevertError"
+  /v1/workspaces:
+    get:
+      operationId: ListWorkspaces
+      responses:
+        "200":
+          description: Distinct normalized Workspace roots derived from validated Sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workspace"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/workspaces/files/read:
+    post:
+      operationId: ReadWorkspaceFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadFileRequest"
+      responses:
+        "200":
+          description: The bounded file view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadFileResult"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/retained-code-snapshots:
+    get:
+      operationId: GetRetainedCodeSnapshots
+      parameters:
+        - name: workspace
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{8}$"
+      responses:
+        "200":
+          description: The legacy per-turn snapshot groups of one pre-cutover Session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetainedTurns"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/retained-code-snapshots/revert:
+    post:
+      operationId: RevertRetainedCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetainedRevertRequest"
+      responses:
+        "200":
+          description: The completed legacy restore result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeRevertResult"
+        default:
+          description: >
+            A traversal I/O failure after earlier turns changed returns the
+            same result DTO with accumulated restored/skipped members and the
+            error member; every other failure, including a pre-traversal
+            storage failure, returns the schema error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeRevertError"
+  /v1/configuration:
+    get:
+      operationId: GetConfiguration
+      responses:
+        "200":
+          description: The revisioned configuration view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigurationView"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/configuration/reload:
+    post:
+      operationId: ReloadConfiguration
+      responses:
+        "200":
+          description: A publication, not an edit — no result member.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevisionResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/configuration/settings:
+    put:
+      operationId: UpdateConfigurationSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSettingsRequest"
+      responses:
+        "200":
+          description: The published settings under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/agent-types/model:
+    put:
+      operationId: SetAgentTypeModel
+      parameters:
+        - name: agent_type
+          in: query
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAgentTypeModelRequest"
+      responses:
+        "200":
+          description: The updated Agent roster entry under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/models:
+    get:
+      operationId: ListModels
+      parameters:
+        - name: all
+          in: query
+          required: true
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: >
+            The full or visible flat model list, preserving the retained
+            connected-only and hidden rules.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers:
+    get:
+      operationId: ListProviders
+      responses:
+        "200":
+          description: Every provider view, listed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderList"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: CreateProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProviderRequest"
+      responses:
+        "200":
+          description: The added provider view; a generated key name is its generated_key_env.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/detail:
+    get:
+      operationId: GetProviderDetail
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: One full provider view with its owning configuration revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderDetail"
+        default:
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: UpdateProviderDetail
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProviderDetailRequest"
+      responses:
+        "200":
+          description: The edited provider view under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderMutation"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: DeleteProviderDetail
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: >
+            The removal published one next generation; the removed subject
+            leaves an explicit null result under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/discover:
+    post:
+      operationId: DiscoverProviderCandidates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiscoveryRequest"
+      responses:
+        "200":
+          description: Discovered model candidates, persisted nowhere.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DiscoveredModelCandidate"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/connect:
+    post:
+      operationId: ConnectProvider
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectRequest"
+      responses:
+        "200":
+          description: The connected provider's projected status under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/disconnect:
+    post:
+      operationId: DisconnectProvider
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: The disconnected provider's projected status under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/models:
+    get:
+      operationId: ListProviderModels
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: The listed provider's model views.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderModelList"
+        default:
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: UpdateProviderModel
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+        - $ref: "#/components/parameters/ModelIDQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProviderModelRequest"
+      responses:
+        "200":
+          description: The edited model view under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelMutation"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: DeleteProviderModel
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+        - $ref: "#/components/parameters/ModelIDQuery"
+      responses:
+        "200":
+          description: >
+            The deletion published one next generation; the removed subject
+            leaves an explicit null result under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/models/discover:
+    post:
+      operationId: DiscoverProviderModelCandidates
+      parameters:
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: >
+            Discovered model candidates excluding already-included usable
+            models, persisted nowhere.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DiscoveredModelCandidate"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/fields/{field}:
+    delete:
+      operationId: ResetProviderField
+      parameters:
+        - name: field
+          in: path
+          required: true
+          schema:
+            type: string
+            x-enum-varnames:
+              - Name
+              - BaseUrl
+              - EnvironmentVariable
+              - Headers
+              - Options
+              - SystemRole
+              - UsageInStream
+              - MaxTokensField
+              - ExtraBody
+              - Discovery
+              - ProtocolMetadata
+            enum:
+              - name
+              - base_url
+              - api_key_env
+              - headers
+              - options
+              - system_role
+              - usage_in_stream
+              - max_tokens_field
+              - extra_body
+              - discovery
+              - protocol_metadata
+        - $ref: "#/components/parameters/ProviderIDQuery"
+      responses:
+        "200":
+          description: The provider view after the reset, under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/providers/models/fields/{field}:
+    delete:
+      operationId: ResetProviderModelField
+      parameters:
+        - name: field
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - name
+              - context_window
+              - max_output_tokens
+              - input_modalities
+              - system_role
+              - usage_in_stream
+              - extra_body
+              - cost
+              - protocol_metadata
+        - $ref: "#/components/parameters/ProviderIDQuery"
+        - $ref: "#/components/parameters/ModelIDQuery"
+      responses:
+        "200":
+          description: The model view after the reset, under the mutation envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/warnings:
+    get:
+      operationId: GetWarnings
+      responses:
+        "200":
+          description: Every warning group in producer order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarningsSnapshot"
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        The Runtime owner's random 32-byte credential encoded as 64 lowercase
+        hex, sent as "Authorization: Bearer <credential>" on every path.
+  parameters:
+    SessionID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{32}$"
+    WorkspaceQuery:
+      name: workspace
+      in: query
+      required: true
+      schema:
+        type: string
+    LifecycleQuery:
+      name: lifecycle
+      in: query
+      required: true
+      schema:
+        $ref: "#/components/schemas/SessionLifecycle"
+    ProviderIDQuery:
+      name: provider_id
+      in: query
+      required: true
+      schema:
+        type: string
+    ModelIDQuery:
+      name: model_id
+      in: query
+      required: true
+      schema:
+        type: string
+  responses:
+    Error:
+      description: One schema-defined typed error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid
+            - unauthorized
+            - not_found
+            - conflict
+            - corrupt
+            - closed
+            - configuration
+            - storage
+            - internal
+        message:
+          type: string
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+    SessionLifecycle:
+      type: string
+      enum:
+        - open
+        - archived
+    InputOrigin:
+      type: string
+      enum:
+        - user
+        - runtime
+        - plugin
+    ToolCallStatus:
+      type: string
+      enum:
+        - success
+        - error
+        - denied
+        - interrupted
+    SystemRole:
+      type: string
+      enum:
+        - system
+        - user
+        - developer
+    ModelSource:
+      type: string
+      enum:
+        - bundled
+        - discovered
+        - user
+    InputModality:
+      type: string
+      enum:
+        - text
+        - image
+        - audio
+        - document
+    ModelRef:
+      type: string
+      description: >
+        A full model identity spelled as the "provider/model" string, split at
+        the first slash; provider identifiers never contain a slash, so a
+        slash-containing model suffix stays unambiguous.
+    SessionRevision:
+      type: object
+      additionalProperties: false
+      required:
+        - instance_id
+        - durable_revision
+        - local_revision
+      properties:
+        instance_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        durable_revision:
+          type: string
+        local_revision:
+          type: string
+    ConfigurationRevision:
+      type: object
+      additionalProperties: false
+      required:
+        - instance_id
+        - generation
+      properties:
+        instance_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        generation:
+          type: string
+    WarningsRevision:
+      type: object
+      additionalProperties: false
+      required:
+        - instance_id
+        - revision
+      properties:
+        instance_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        revision:
+          type: string
+    Health:
+      type: object
+      additionalProperties: false
+      required:
+        - instance_id
+        - protocol_version
+      properties:
+        instance_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        protocol_version:
+          type: string
+          enum:
+            - "1"
+    Scope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum:
+            - runtime
+            - workspace
+            - session
+            - operation
+            - agent
+            - job
+        workspace:
+          type: string
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+        job_id:
+          type: string
+    ContentPart:
+      oneOf:
+        - $ref: "#/components/schemas/TextPart"
+        - $ref: "#/components/schemas/ImageURLPart"
+        - $ref: "#/components/schemas/OpaquePart"
+      discriminator:
+        propertyName: kind
+        mapping:
+          text: "#/components/schemas/TextPart"
+          image_url: "#/components/schemas/ImageURLPart"
+          opaque: "#/components/schemas/OpaquePart"
+    TextPart:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - text
+      properties:
+        kind:
+          type: string
+          enum:
+            - text
+        text:
+          type: string
+        extra:
+          type: object
+    ImageURLPart:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - url
+      properties:
+        kind:
+          type: string
+          enum:
+            - image_url
+        url:
+          type: string
+        extra:
+          type: object
+    OpaquePart:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - opaque_wire_type
+      properties:
+        kind:
+          type: string
+          enum:
+            - opaque
+        opaque_wire_type:
+          type: string
+        extra:
+          type: object
+    UsageCount:
+      type: object
+      additionalProperties: false
+      required:
+        - input_tokens
+        - cached_input_tokens
+        - output_tokens
+      properties:
+        input_tokens:
+          type: string
+        cached_input_tokens:
+          type: string
+        output_tokens:
+          type: string
+    ModelUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+        - usage
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+        usage:
+          $ref: "#/components/schemas/UsageCount"
+    UsageTotals:
+      type: object
+      additionalProperties: false
+      required:
+        - by_model
+      properties:
+        by_model:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelUsage"
+    UsageContext:
+      type: object
+      additionalProperties: false
+      required:
+        - used_tokens
+        - context_window
+      properties:
+        used_tokens:
+          type: string
+        context_window:
+          type: integer
+          minimum: 0
+    UsageProjection:
+      type: object
+      additionalProperties: false
+      required:
+        - totals
+        - context
+      properties:
+        totals:
+          $ref: "#/components/schemas/UsageTotals"
+        context:
+          $ref: "#/components/schemas/UsageContext"
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - session_id
+        - workspace
+        - lifecycle
+        - agent_type
+        - created_at
+        - last_activity
+        - session_revision
+      properties:
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        workspace:
+          type: string
+        parent_session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        source_session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        lifecycle:
+          $ref: "#/components/schemas/SessionLifecycle"
+        agent_type:
+          type: string
+        current_operation_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_activity:
+          type: string
+          format: date-time
+        archived_at:
+          type: string
+          format: date-time
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+    CreateSessionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - workspace
+        - agent_type
+      properties:
+        workspace:
+          type: string
+        agent_type:
+          type: string
+    Operation:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - request_kind
+        - status
+        - admitted_at
+        - agent_type
+        - model
+        - usage
+      properties:
+        operation_id:
+          type: string
+        request_kind:
+          type: string
+          enum:
+            - message
+            - compact
+        status:
+          type: string
+          enum:
+            - running
+            - success
+            - failure
+            - interruption
+        admitted_at:
+          type: string
+          format: date-time
+        settled_at:
+          type: string
+          format: date-time
+        agent_type:
+          type: string
+        model:
+          $ref: "#/components/schemas/ModelRef"
+        detail:
+          type: string
+        usage:
+          $ref: "#/components/schemas/UsageTotals"
+    PendingInput:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - origin
+        - content
+      properties:
+        operation_id:
+          type: string
+        origin:
+          $ref: "#/components/schemas/InputOrigin"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+    PendingQueues:
+      type: object
+      additionalProperties: false
+      required:
+        - steering
+        - queued
+      properties:
+        steering:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingInput"
+        queued:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingInput"
+    PendingSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - session_revision
+        - pending
+      properties:
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+        pending:
+          $ref: "#/components/schemas/PendingQueues"
+    BackgroundMember:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - id
+      properties:
+        kind:
+          type: string
+          enum:
+            - child
+            - job
+        id:
+          type: string
+    ToolCallView:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - arguments
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: string
+        normalized_arguments:
+          type: object
+        status:
+          $ref: "#/components/schemas/ToolCallStatus"
+        content:
+          type: string
+        metadata:
+          type: object
+        extra:
+          type: object
+    InputItem:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - kind
+        - committed_at
+        - origin
+        - content
+      properties:
+        item_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - input
+        committed_at:
+          type: string
+          format: date-time
+        operation_id:
+          type: string
+        origin:
+          $ref: "#/components/schemas/InputOrigin"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+    AssistantItem:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - kind
+        - committed_at
+        - status
+        - source
+        - content
+        - tool_calls
+      properties:
+        item_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - assistant
+        committed_at:
+          type: string
+          format: date-time
+        operation_id:
+          type: string
+        status:
+          type: string
+          enum:
+            - completed
+            - errored
+            - interrupted
+        source:
+          $ref: "#/components/schemas/ModelRef"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+        refusal:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCallView"
+        extra:
+          type: object
+    SignalItem:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - kind
+        - committed_at
+        - subtype
+        - content
+      properties:
+        item_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - signal
+        committed_at:
+          type: string
+          format: date-time
+        operation_id:
+          type: string
+        subtype:
+          type: string
+          enum:
+            - interruption
+            - model_failure_continuation
+            - background_completion
+        content:
+          type: string
+        related_member:
+          $ref: "#/components/schemas/BackgroundMember"
+    CompactionItem:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - kind
+        - committed_at
+        - summary
+        - model
+      properties:
+        item_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - compaction
+        committed_at:
+          type: string
+          format: date-time
+        operation_id:
+          type: string
+        summary:
+          type: string
+        model:
+          $ref: "#/components/schemas/ModelRef"
+    OperationEndItem:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - kind
+        - committed_at
+        - status
+        - detail
+      properties:
+        item_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - operation_end
+        committed_at:
+          type: string
+          format: date-time
+        operation_id:
+          type: string
+        status:
+          type: string
+          enum:
+            - success
+            - failure
+            - interruption
+        detail:
+          type: string
+    ConversationItem:
+      oneOf:
+        - $ref: "#/components/schemas/InputItem"
+        - $ref: "#/components/schemas/AssistantItem"
+        - $ref: "#/components/schemas/SignalItem"
+        - $ref: "#/components/schemas/CompactionItem"
+        - $ref: "#/components/schemas/OperationEndItem"
+      discriminator:
+        propertyName: kind
+        mapping:
+          input: "#/components/schemas/InputItem"
+          assistant: "#/components/schemas/AssistantItem"
+          signal: "#/components/schemas/SignalItem"
+          compaction: "#/components/schemas/CompactionItem"
+          operation_end: "#/components/schemas/OperationEndItem"
+    ConversationPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConversationItem"
+        older_cursor:
+          type: string
+    HistoryPage:
+      type: object
+      additionalProperties: false
+      required:
+        - session_revision
+        - items
+      properties:
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConversationItem"
+        older_cursor:
+          type: string
+    UsageSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - session_revision
+        - configuration_revision
+        - usage
+      properties:
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        usage:
+          $ref: "#/components/schemas/UsageProjection"
+    Warning:
+      type: object
+      additionalProperties: false
+      required:
+        - source
+        - kind
+        - message
+      properties:
+        source:
+          type: string
+          enum:
+            - setup
+            - prompt
+            - catalog
+            - agents
+            - lsp
+            - protocol
+        kind:
+          type: string
+        message:
+          type: string
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+    WarningsSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - warnings_revision
+        - warnings
+      properties:
+        warnings_revision:
+          $ref: "#/components/schemas/WarningsRevision"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Warning"
+    Hydration:
+      type: object
+      additionalProperties: false
+      required:
+        - session
+        - session_revision
+        - configuration_revision
+        - warnings_revision
+        - operations
+        - pending
+        - conversation
+        - usage
+        - warnings
+        - background
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        warnings_revision:
+          $ref: "#/components/schemas/WarningsRevision"
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+        active_operation:
+          $ref: "#/components/schemas/Operation"
+        pending:
+          $ref: "#/components/schemas/PendingQueues"
+        conversation:
+          $ref: "#/components/schemas/ConversationPage"
+        usage:
+          $ref: "#/components/schemas/UsageProjection"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Warning"
+        background:
+          type: array
+          items:
+            $ref: "#/components/schemas/BackgroundMember"
+    SubmitRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - mode
+        - content
+      properties:
+        operation_id:
+          type: string
+        mode:
+          type: string
+          enum:
+            - regular
+            - queued
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+    SubmitResult:
+      type: object
+      additionalProperties: false
+      required:
+        - disposition
+      properties:
+        disposition:
+          type: string
+          enum:
+            - admitted
+            - steering
+            - queued
+            - existing
+        operation:
+          $ref: "#/components/schemas/Operation"
+    CompactRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+      properties:
+        operation_id:
+          type: string
+    ForkRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - boundary_item_id
+        - operation_id
+        - content
+      properties:
+        boundary_item_id:
+          type: string
+        operation_id:
+          type: string
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+    ForkResult:
+      type: object
+      additionalProperties: false
+      required:
+        - session
+        - operation
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        operation:
+          $ref: "#/components/schemas/Operation"
+    SetSessionAgentTypeRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - agent_type
+      properties:
+        agent_type:
+          type: string
+    RevertCodeRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - boundary_operation_id
+      properties:
+        boundary_operation_id:
+          type: string
+    Workspace:
+      type: object
+      additionalProperties: false
+      required:
+        - root
+        - display_name
+      properties:
+        root:
+          type: string
+        display_name:
+          type: string
+    ReadFileRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - workspace
+        - path
+      properties:
+        workspace:
+          type: string
+        path:
+          type: string
+    ReadFileResult:
+      type: object
+      additionalProperties: false
+      required:
+        - content
+        - canonical_path
+        - truncated
+      properties:
+        content:
+          type: string
+        canonical_path:
+          type: string
+        truncated:
+          type: boolean
+    SnapshotFile:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+        - existed
+      properties:
+        path:
+          type: string
+        existed:
+          type: boolean
+    CodeSnapshotGroup:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - group_item_id
+        - files
+      properties:
+        operation_id:
+          type: string
+        group_item_id:
+          type: string
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnapshotFile"
+    SkippedFile:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+        - reason
+      properties:
+        path:
+          type: string
+        reason:
+          type: string
+    CodeRevertResult:
+      type: object
+      additionalProperties: false
+      required:
+        - restored
+        - skipped
+      properties:
+        restored:
+          type: array
+          items:
+            type: string
+        skipped:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkippedFile"
+        error:
+          $ref: "#/components/schemas/Error"
+    CodeRevertError:
+      oneOf:
+        - $ref: "#/components/schemas/CodeRevertResult"
+        - $ref: "#/components/schemas/Error"
+    RetainedTurn:
+      type: object
+      additionalProperties: false
+      required:
+        - turn
+        - files
+      properties:
+        turn:
+          type: integer
+          minimum: 1
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnapshotFile"
+    RetainedTurns:
+      type: object
+      additionalProperties: false
+      required:
+        - turns
+      properties:
+        turns:
+          type: array
+          items:
+            $ref: "#/components/schemas/RetainedTurn"
+    RetainedRevertRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - workspace
+        - session_id
+        - after_turn
+      properties:
+        workspace:
+          type: string
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{8}$"
+        after_turn:
+          type: integer
+    SessionsSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - auto_archive
+        - archive_after_days
+        - delete_after_archive_days
+      properties:
+        auto_archive:
+          type: boolean
+        archive_after_days:
+          type: integer
+        delete_after_archive_days:
+          type: integer
+    ToolsSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - max_output_bytes
+        - read_max_lines
+        - read_line_max_chars
+        - command_timeout
+      properties:
+        max_output_bytes:
+          type: integer
+        read_max_lines:
+          type: integer
+        read_line_max_chars:
+          type: integer
+        command_timeout:
+          type: integer
+    JobsSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - max_background_processes
+        - max_output_bytes
+        - read_line_max_chars
+      properties:
+        max_background_processes:
+          type: integer
+        max_output_bytes:
+          type: integer
+        read_line_max_chars:
+          type: integer
+    TasksSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - max_concurrent
+        - max_output_bytes
+      properties:
+        max_concurrent:
+          type: integer
+        max_output_bytes:
+          type: integer
+    PluginsSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        tools:
+          $ref: "#/components/schemas/ToolsSettings"
+        jobs:
+          $ref: "#/components/schemas/JobsSettings"
+        tasks:
+          $ref: "#/components/schemas/TasksSettings"
+    Settings:
+      type: object
+      additionalProperties: false
+      required:
+        - sessions
+        - plugins
+      properties:
+        sessions:
+          $ref: "#/components/schemas/SessionsSettings"
+        plugins:
+          $ref: "#/components/schemas/PluginsSettings"
+    Agent:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - description
+        - subagent
+        - model
+        - readonly
+        - write_dir
+        - tools
+        - capabilities
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        subagent:
+          type: boolean
+        model:
+          $ref: "#/components/schemas/ModelRef"
+        readonly:
+          type: boolean
+        write_dir:
+          type: string
+        tools:
+          type: array
+          items:
+            type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+    ConfigurationView:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - settings
+        - agents
+        - providers
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        settings:
+          $ref: "#/components/schemas/Settings"
+        agents:
+          type: array
+          items:
+            $ref: "#/components/schemas/Agent"
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Provider"
+    RevisionResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+    DeletionMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - result
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        result:
+          type: object
+          nullable: true
+          enum:
+            - null
+          description: >
+            The removed subject leaves no post-state view; deletion is the
+            one mutation whose result is an explicit null.
+    UpdateSettingsRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - settings
+      properties:
+        settings:
+          $ref: "#/components/schemas/Settings"
+    SettingsMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - result
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        result:
+          $ref: "#/components/schemas/Settings"
+    SetAgentTypeModelRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+    AgentMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - result
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        result:
+          $ref: "#/components/schemas/Agent"
+    Cost:
+      type: object
+      additionalProperties: false
+      properties:
+        input:
+          type: number
+          format: double
+        output:
+          type: number
+          format: double
+        cache_read:
+          type: number
+          format: double
+        cache_write:
+          type: number
+          format: double
+    ProtocolMetadata:
+      type: object
+      additionalProperties: false
+      properties:
+        family:
+          type: string
+        must_preserve:
+          type: array
+          items:
+            type: string
+        drop:
+          type: array
+          items:
+            type: string
+    ProviderEdit:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        base_url:
+          type: string
+        api_key_env:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        options:
+          type: object
+        system_role:
+          $ref: "#/components/schemas/SystemRole"
+        usage_in_stream:
+          type: boolean
+        max_tokens_field:
+          type: string
+        extra_body:
+          type: object
+        discovery:
+          type: boolean
+        protocol_metadata:
+          $ref: "#/components/schemas/ProtocolMetadata"
+        hidden:
+          type: boolean
+    ModelEdit:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        context_window:
+          type: integer
+        max_output_tokens:
+          type: integer
+        input_modalities:
+          type: array
+          items:
+            $ref: "#/components/schemas/InputModality"
+        system_role:
+          $ref: "#/components/schemas/SystemRole"
+        usage_in_stream:
+          type: boolean
+        extra_body:
+          type: object
+        cost:
+          $ref: "#/components/schemas/Cost"
+        protocol_metadata:
+          $ref: "#/components/schemas/ProtocolMetadata"
+        hidden:
+          type: boolean
+    ModelView:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - context_window
+        - max_output_tokens
+        - input_modalities
+        - system_role
+        - usage_in_stream
+        - hidden
+        - source
+        - incomplete
+        - provider_hidden
+        - usable
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        context_window:
+          type: integer
+        max_output_tokens:
+          type: integer
+        input_modalities:
+          type: array
+          items:
+            $ref: "#/components/schemas/InputModality"
+        system_role:
+          $ref: "#/components/schemas/SystemRole"
+        usage_in_stream:
+          type: boolean
+        extra_body:
+          type: object
+        cost:
+          $ref: "#/components/schemas/Cost"
+        protocol_metadata:
+          $ref: "#/components/schemas/ProtocolMetadata"
+        hidden:
+          type: boolean
+        source:
+          $ref: "#/components/schemas/ModelSource"
+        incomplete:
+          type: boolean
+        provider_hidden:
+          type: boolean
+        usable:
+          type: boolean
+    Provider:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - builtin
+        - connected
+        - key_source
+        - base_url
+        - api_key_env
+        - headers
+        - user_headers
+        - system_role
+        - usage_in_stream
+        - max_tokens_field
+        - discovery
+        - hidden
+        - connectable
+        - disconnectable
+        - removable
+        - models
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        builtin:
+          type: boolean
+        connected:
+          type: boolean
+        key_source:
+          type: string
+          enum:
+            - none
+            - keyless
+            - managed
+            - external
+        base_url:
+          type: string
+        api_key_env:
+          type: string
+        generated_key_env:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        user_headers:
+          type: object
+          additionalProperties:
+            type: string
+        options:
+          type: object
+        system_role:
+          $ref: "#/components/schemas/SystemRole"
+        usage_in_stream:
+          type: boolean
+        max_tokens_field:
+          type: string
+        extra_body:
+          type: object
+        discovery:
+          type: boolean
+        protocol_metadata:
+          $ref: "#/components/schemas/ProtocolMetadata"
+        hidden:
+          type: boolean
+        connectable:
+          type: boolean
+        disconnectable:
+          type: boolean
+        removable:
+          type: boolean
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelView"
+    ProviderList:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - providers
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Provider"
+    ProviderDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - provider
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        provider:
+          $ref: "#/components/schemas/Provider"
+    CreateProviderRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - provider
+        - models
+      properties:
+        id:
+          type: string
+        provider:
+          $ref: "#/components/schemas/ProviderEdit"
+        models:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ModelEdit"
+        api_key:
+          type: string
+    UpdateProviderDetailRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/ProviderEdit"
+    ProviderMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - result
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        result:
+          $ref: "#/components/schemas/Provider"
+    ConnectRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        api_key:
+          type: string
+    DiscoveryRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - base_url
+        - api_key_env
+      properties:
+        base_url:
+          type: string
+        api_key_env:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+    DiscoveredModelCandidate:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - context_window
+        - max_output_tokens
+        - usable
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        context_window:
+          type: integer
+        max_output_tokens:
+          type: integer
+        cost:
+          $ref: "#/components/schemas/Cost"
+        usable:
+          type: boolean
+    UpdateProviderModelRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelEdit"
+    ModelMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - result
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        result:
+          $ref: "#/components/schemas/ModelView"
+    ModelListEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - ref
+        - provider
+        - provider_name
+        - model
+        - display_name
+        - context_window
+        - max_output_tokens
+        - hidden
+        - provider_hidden
+        - incomplete
+        - source
+      properties:
+        ref:
+          $ref: "#/components/schemas/ModelRef"
+        provider:
+          type: string
+        provider_name:
+          type: string
+        model:
+          type: string
+        display_name:
+          type: string
+        context_window:
+          type: integer
+        max_output_tokens:
+          type: integer
+        cost:
+          $ref: "#/components/schemas/Cost"
+        hidden:
+          type: boolean
+        provider_hidden:
+          type: boolean
+        incomplete:
+          type: boolean
+        source:
+          $ref: "#/components/schemas/ModelSource"
+    ModelList:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - models
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelListEntry"
+    ProviderModelList:
+      type: object
+      additionalProperties: false
+      required:
+        - configuration_revision
+        - models
+      properties:
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelView"
+    ConfigurationChangedEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - configuration_revision
+      properties:
+        kind:
+          type: string
+          enum:
+            - configuration_changed
+        scope:
+          $ref: "#/components/schemas/Scope"
+        configuration_revision:
+          $ref: "#/components/schemas/ConfigurationRevision"
+    ScopeEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+      properties:
+        kind:
+          type: string
+          enum:
+            - scope_opened
+            - scope_closed
+        scope:
+          $ref: "#/components/schemas/Scope"
+    SessionChangedEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - session_revision
+      properties:
+        kind:
+          type: string
+          enum:
+            - session_changed
+        scope:
+          $ref: "#/components/schemas/Scope"
+        session_revision:
+          $ref: "#/components/schemas/SessionRevision"
+    WarningChangedEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - warnings_revision
+      properties:
+        kind:
+          type: string
+          enum:
+            - warning_changed
+        scope:
+          $ref: "#/components/schemas/Scope"
+        warnings_revision:
+          $ref: "#/components/schemas/WarningsRevision"
+    TextDeltaEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - position
+        - content
+      properties:
+        kind:
+          type: string
+          enum:
+            - text_delta
+        scope:
+          $ref: "#/components/schemas/Scope"
+        position:
+          type: integer
+          minimum: 0
+        content:
+          type: string
+          minLength: 1
+    ToolStartedEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - call_id
+        - ordinal
+        - name
+      properties:
+        kind:
+          type: string
+          enum:
+            - tool_started
+        scope:
+          $ref: "#/components/schemas/Scope"
+        call_id:
+          type: string
+        ordinal:
+          type: integer
+          minimum: 0
+        name:
+          type: string
+    ToolFinishedEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - call_id
+        - status
+      properties:
+        kind:
+          type: string
+          enum:
+            - tool_finished
+        scope:
+          $ref: "#/components/schemas/Scope"
+        call_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/ToolCallStatus"
+    Event:
+      oneOf:
+        - $ref: "#/components/schemas/ConfigurationChangedEvent"
+        - $ref: "#/components/schemas/ScopeEvent"
+        - $ref: "#/components/schemas/SessionChangedEvent"
+        - $ref: "#/components/schemas/WarningChangedEvent"
+        - $ref: "#/components/schemas/TextDeltaEvent"
+        - $ref: "#/components/schemas/ToolStartedEvent"
+        - $ref: "#/components/schemas/ToolFinishedEvent"
+      discriminator:
+        propertyName: kind
+        mapping:
+          configuration_changed: "#/components/schemas/ConfigurationChangedEvent"
+          scope_opened: "#/components/schemas/ScopeEvent"
+          scope_closed: "#/components/schemas/ScopeEvent"
+          session_changed: "#/components/schemas/SessionChangedEvent"
+          warning_changed: "#/components/schemas/WarningChangedEvent"
+          text_delta: "#/components/schemas/TextDeltaEvent"
+          tool_started: "#/components/schemas/ToolStartedEvent"
+          tool_finished: "#/components/schemas/ToolFinishedEvent"
