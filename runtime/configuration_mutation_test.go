@@ -441,9 +441,9 @@ func TestConfigurationMutateNoEditReturnsCurrentGeneration(t *testing.T) {
 		t.Fatalf("read owning file: %v", err)
 	}
 
-	noEdit := func(map[string]json.RawMessage, map[string]json.RawMessage) (editedFile, bool, error) {
+	noEdit := configurationEdit{apply: func(rawRoots) (editedFile, bool, error) {
 		return editMainConfig, false, nil
-	}
+	}}
 	candidate, err := svc.mutate(context.Background(), noEdit)
 	if err != nil {
 		t.Fatalf("no-edit mutate: %v", err)

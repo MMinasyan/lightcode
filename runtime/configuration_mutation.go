@@ -27,12 +27,26 @@ const (
 	editAgentsFile
 )
 
-// configurationEdit mutates the owned decoded root maps of the latest raw
-// input files in place and reports the owning file it edited and whether the
-// edit changed anything. changed=false is exclusively an explicit
-// no-user-override reset that found nothing to edit; a successful edit is
-// always changed=true, identical bytes included.
-type configurationEdit func(configRoot, agentsRoot map[string]json.RawMessage) (editedFile, bool, error)
+// rawRoots carries the owned decoded root maps of the latest raw input
+// files one edit applies to.
+type rawRoots struct {
+	config map[string]json.RawMessage
+	agents map[string]json.RawMessage
+}
+
+// configurationEdit is one narrow mutation of the owned decoded root maps of
+// the latest raw user layer. apply mutates the roots in place and reports the
+// owning file it edited and whether the edit changed anything; changed=false
+// is exclusively an explicit no-user-override reset that found nothing to
+// edit, and a successful edit is always changed=true, identical bytes
+// included. check is the optional pure edited-subject check over the built
+// candidate — it runs after the one build and before the write, so a touched
+// subject the catalog validation dropped is refused without a write, and no
+// fallible projection ever runs after the commit.
+type configurationEdit struct {
+	apply func(rawRoots) (editedFile, bool, error)
+	check func(*configuration) error
+}
 
 // mutate applies one edit to the latest raw user layer and publishes the
 // complete validated candidate through the shared construction and
@@ -42,12 +56,13 @@ type configurationEdit func(configRoot, agentsRoot map[string]json.RawMessage) (
 // stale published snapshot — and decoded as root objects whose raw members
 // keep their exact bytes; a missing file contributes its skeleton bytes in
 // memory and is created by no read. The edit's owning file — and only that
-// file — is atomically rewritten mode 0600 after the candidate validates and
-// the final caller-first cancellation check passes. A no-edit result returns
-// the current publication without consuming a generation; a failed candidate
-// or a cancellation before the write leaves the file and publication
-// unchanged; after the write starts, no further cancellation check, rebuild,
-// or fallible stage runs before the ready snapshot, its one event, and the
+// file — is atomically rewritten mode 0600 after the candidate validates,
+// the edit's candidate check passes, and the final caller-first cancellation
+// check passes. A no-edit result returns the current publication without
+// consuming a generation; a failed candidate, a failed check, or a
+// cancellation before the write leaves the file and publication unchanged;
+// after the write starts, no further cancellation check, rebuild, or
+// fallible stage runs before the ready snapshot, its one event, and the
 // mutex release — an admitted call completes publication despite caller
 // disconnect or owner shutdown.
 func (s *configurationService) mutate(ctx context.Context, edit configurationEdit) (*configuration, error) {
@@ -81,7 +96,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return nil, configurationFailure(err)
 	}
-	owning, changed, err := edit(configRoot, agentsRoot)
+	owning, changed, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot})
 	if err != nil {
 		s.buildMu.Unlock()
 		return nil, err
@@ -121,6 +136,16 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return nil, err
 	}
+	// The edit's pure edited-subject check runs once over the built
+	// candidate, before the write: a touched subject the shared catalog
+	// validation dropped refuses the edit here, with the file and the
+	// publication untouched. Nothing fallible runs after the write.
+	if edit.check != nil {
+		if err := edit.check(candidate); err != nil {
+			s.buildMu.Unlock()
+			return nil, configurationFailure(err)
+		}
+	}
 	// The final caller-first cancellation check, immediately before the
 	// atomic write of the owning file. After the write starts nothing
 	// fallible precedes the ready publication.
@@ -143,7 +168,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 // from the new complete plugins document. Never merged per field. Every
 // other top-level root member is unowned and kept untouched.
 func editSettings(settings protocol.Settings) configurationEdit {
-	return func(configRoot, _ map[string]json.RawMessage) (editedFile, bool, error) {
+	return configurationEdit{apply: func(roots rawRoots) (editedFile, bool, error) {
 		sessions, err := json.Marshal(settings.Sessions)
 		if err != nil {
 			return 0, false, err
@@ -152,10 +177,10 @@ func editSettings(settings protocol.Settings) configurationEdit {
 		if err != nil {
 			return 0, false, err
 		}
-		configRoot["sessions"] = sessions
-		configRoot["plugins"] = plugins
+		roots.config["sessions"] = sessions
+		roots.config["plugins"] = plugins
 		return editMainConfig, true, nil
-	}
+	}}
 }
 
 // editAgentModel copies the retained owning model-field mutation onto the
@@ -170,7 +195,8 @@ func editSettings(settings protocol.Settings) configurationEdit {
 // definition is created; builtins that need no explicit user entry stay
 // addressable.
 func (s *configurationService) editAgentModel(agentType, ref string) configurationEdit {
-	return func(_, agentsRoot map[string]json.RawMessage) (editedFile, bool, error) {
+	return configurationEdit{apply: func(roots rawRoots) (editedFile, bool, error) {
+		agentsRoot := roots.agents
 		if ref != "" {
 			if _, err := model.Parse(ref); err != nil {
 				return 0, false, fmt.Errorf("model ref %q: %v: %w", ref, err, harness.ErrInvalid)
@@ -206,7 +232,7 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 			return 0, false, err
 		}
 		return editAgentsFile, true, nil
-	}
+	}}
 }
 
 // readCapturedBytes reads one input file's latest bytes without side

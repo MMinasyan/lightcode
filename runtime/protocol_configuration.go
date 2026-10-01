@@ -213,6 +213,162 @@ func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef str
 	return mutation, nil
 }
 
+// The provider/model metadata mutations: every operator is one admitted call
+// through the one configuration mutation path, projects its result from the
+// returned candidate only — never a second current() load — and has no
+// fallible step after the publication. Visibility edits ride the patches'
+// Hidden pointers; there is no second setter family and no secret parameter.
+
+// addProvider creates one custom provider with its models through the one
+// mutation path: a new trimmed nonempty no-slash ID, a required base URL,
+// normalized unique model IDs, and at least one usable model. The candidate
+// check proves the created subject survived the shared catalog validation
+// before the owning write.
+func (r *Runtime) addProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit) (protocol.ProviderMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models))
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	// The edit's candidate check already proved the created provider is a
+	// member of this candidate's catalog.
+	prov := candidate.catalog.Providers[strings.TrimSpace(providerID)]
+	return protocol.ProviderMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                projectProvider(candidate, r.managedEnv, prov),
+	}, nil
+}
+
+// updateProvider patches one known provider's writable members through the
+// same mutation path: builtin locks, the connected-provider api_key_env
+// prohibition and the wholesale headers rule are the edit's own prewrite
+// checks, and the result projects the returned candidate's effective view.
+func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit) (protocol.ProviderMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editProviderUpdate(providerID, patch))
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	// The edit's candidate check already proved the patched provider is a
+	// member of this candidate's catalog.
+	prov := candidate.catalog.Providers[providerID]
+	return protocol.ProviderMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                projectProvider(candidate, r.managedEnv, prov),
+	}, nil
+}
+
+// deleteProvider removes one custom provider's owning user definition. The
+// mutation's result is the generated deletion envelope: no post-state view,
+// an explicit null result.
+func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protocol.DeletionMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.DeletionMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editProviderDelete(providerID))
+	if err != nil {
+		return protocol.DeletionMutation{}, err
+	}
+	return protocol.DeletionMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                nil,
+	}, nil
+}
+
+// resetProviderField removes exactly one provider user-layer override — or
+// no-ops on an absent override, returning the unchanged projection and the
+// current revision with no file write, generation, or event.
+func (r *Runtime) resetProviderField(ctx context.Context, providerID string, field protocol.ResetProviderFieldParamsField) (protocol.ProviderMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editProviderFieldReset(providerID, field))
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	// The edit's candidate check already proved the reset provider is a
+	// member of this candidate's catalog.
+	prov := candidate.catalog.Providers[providerID]
+	return protocol.ProviderMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                projectProvider(candidate, r.managedEnv, prov),
+	}, nil
+}
+
+// saveModel upserts one model's user-layer fields under a known provider —
+// the same PUT as the retained SaveModel, so a missing model creates a user
+// model — through the same mutation path.
+func (r *Runtime) saveModel(ctx context.Context, providerID, modelID string, patch protocol.ModelEdit) (protocol.ModelMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.ModelMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editModelSave(providerID, modelID, patch))
+	if err != nil {
+		return protocol.ModelMutation{}, err
+	}
+	// The edit's candidate check already proved the saved model is a member
+	// of this candidate's catalog.
+	prov := candidate.catalog.Providers[providerID]
+	return protocol.ModelMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                projectModelView(prov, prov.Models[modelID]),
+	}, nil
+}
+
+// deleteModel removes one user model's owning definition; the result is the
+// generated deletion envelope with its explicit null.
+func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (protocol.DeletionMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.DeletionMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editModelDelete(providerID, modelID))
+	if err != nil {
+		return protocol.DeletionMutation{}, err
+	}
+	return protocol.DeletionMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                nil,
+	}, nil
+}
+
+// resetModelField removes exactly one model user-layer override — or no-ops
+// on an absent override, returning the unchanged projection and the current
+// revision with no file write, generation, or event.
+func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID string, field protocol.ResetProviderModelFieldParamsField) (protocol.ModelMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.ModelMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editModelFieldReset(providerID, modelID, field))
+	if err != nil {
+		return protocol.ModelMutation{}, err
+	}
+	// The edit's candidate check already proved the reset model is a member
+	// of this candidate's catalog.
+	prov := candidate.catalog.Providers[providerID]
+	return protocol.ModelMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                projectModelView(prov, prov.Models[modelID]),
+	}, nil
+}
+
 // capturedProvider resolves one provider ID against the captured catalog:
 // an empty identity wraps the shared invalid sentinel and an unknown valid
 // one returns the catalog's typed unknown-provider error.
@@ -302,13 +458,7 @@ func (c *configuration) userHeaders(providerID string, builtin bool) map[string]
 		}
 	}
 	if builtin {
-		for bundledName := range catalog.BundledProviderHeaders(providerID) {
-			for existing := range headers {
-				if strings.EqualFold(existing, bundledName) {
-					delete(headers, existing)
-				}
-			}
-		}
+		headers = stripBundledHeaderKeys(headers, providerID)
 	}
 	return stripCredentialHeaders(headers)
 }
@@ -495,8 +645,7 @@ func jsonMapPointer(in map[string]any) *map[string]any {
 func stripCredentialHeaders(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for name, value := range headers {
-		trimmed := strings.TrimSpace(name)
-		if strings.EqualFold(trimmed, "Authorization") || strings.EqualFold(trimmed, "Proxy-Authorization") {
+		if credentialHeaderName(name) {
 			continue
 		}
 		out[name] = value

@@ -62,6 +62,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		// (absent) prior group under the admitted Session identity.
 		submitThroughRuntime(t, r, sessionID, "op-1", "please write")
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
+		awaitSessionNotBusy(t, r, sessionID)
 		first, err := r.getWarnings(ctx)
 		if err != nil {
 			t.Fatalf("getWarnings: %v", err)
@@ -137,6 +138,21 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 			t.Fatalf("warnings changed on failed preparations:\n%v\n%v", warningBodies(before.Warnings), warningBodies(after.Warnings))
 		}
 	})
+}
+
+// awaitSessionNotBusy waits until the Session's actual execution state — the
+// current operation, the run slot, the reservation — is clear. Terminal
+// settlement is durably visible before the run retires, so the next admission
+// needs the settled fact, not just the settled operation record.
+func awaitSessionNotBusy(t *testing.T, r *Runtime, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for snapshotThroughRuntime(t, r, sessionID).ExecutionBusy {
+		if time.Now().After(deadline) {
+			t.Fatalf("session %q never left its busy state", sessionID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // submitExpectFailure submits one regular message expecting the admission to
