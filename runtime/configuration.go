@@ -17,15 +17,17 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // configuration is the immutable snapshot of one effective input set: the
-// assembled catalog with its build warnings, the complete resolved agent
-// definitions (retaining their private fields) with the definition warnings,
-// the session policy, the per-plugin configuration values, and the captured
-// global and Workspace permission inputs. Input documents and unconsumed
-// sections are discarded once the snapshot is built; later consumers add
-// their own fields when they land.
+// assembled catalog with its build warnings and each model's source label,
+// the complete resolved agent definitions (retaining their private fields)
+// with the definition warnings, the session policy, the per-plugin
+// configuration values with their effective projected settings, the owned
+// decoded provider user layer this same build consumed, and the captured
+// global and Workspace permission inputs. Input documents are discarded once
+// the snapshot is built; later consumers add their own fields when they land.
 type configuration struct {
 	generation           uint64
 	catalog              *catalog.Catalog
@@ -34,6 +36,8 @@ type configuration struct {
 	agentWarnings        []agents.Warning
 	sessions             config.SessionConfig
 	plugins              map[string]json.RawMessage
+	settings             protocol.Settings
+	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
 }
@@ -99,9 +103,53 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 		agentWarnings:        definitions.Warnings(),
 		sessions:             sessions,
 		plugins:              doc.Plugins,
+		settings:             projectSettings(sessions, doc.Plugins),
+		userProviders:        doc.Providers,
 		permissions:          doc.Permissions,
 		workspacePermissions: workspacePermissions,
 	}, nil
+}
+
+// settingsDecoderDefaults mirror the concrete plugins' own decoders: missing
+// or null members keep these values, unknown members are ignored. The
+// projection is presentation only — the publication's validation ran the
+// plugins' real validators, and this file imports no concrete plugin.
+var (
+	toolsSettingsDefaults = protocol.ToolsSettings{MaxOutputBytes: 15360, ReadMaxLines: 500, ReadLineMaxChars: 5000, CommandTimeout: 120}
+	jobsSettingsDefaults  = protocol.JobsSettings{MaxBackgroundProcesses: 10, MaxOutputBytes: 15360, ReadLineMaxChars: 5000}
+	tasksSettingsDefaults = protocol.TasksSettings{MaxConcurrent: 4, MaxOutputBytes: 15360}
+)
+
+// projectSettings projects the effective settings view beside the raw
+// sections: the parsed session policy plus each present plugin section's
+// complete effective fields — the exact existing decoder defaults with the
+// captured supplied values. Absent optional sections stay omitted. This is
+// the named product view, not execution authority.
+func projectSettings(sessions config.SessionConfig, plugins map[string]json.RawMessage) protocol.Settings {
+	out := protocol.Settings{
+		Sessions: protocol.SessionsSettings{
+			AutoArchive:            sessions.AutoArchive,
+			ArchiveAfterDays:       sessions.ArchiveAfterDays,
+			DeleteAfterArchiveDays: sessions.DeleteAfterArchiveDays,
+		},
+		Plugins: protocol.PluginsSettings{},
+	}
+	if raw, ok := plugins["tools"]; ok {
+		settings := toolsSettingsDefaults
+		_ = json.Unmarshal(raw, &settings) // publication already validated this section
+		out.Plugins.Tools = &settings
+	}
+	if raw, ok := plugins["jobs"]; ok {
+		settings := jobsSettingsDefaults
+		_ = json.Unmarshal(raw, &settings)
+		out.Plugins.Jobs = &settings
+	}
+	if raw, ok := plugins["tasks"]; ok {
+		settings := tasksSettingsDefaults
+		_ = json.Unmarshal(raw, &settings)
+		out.Plugins.Tasks = &settings
+	}
+	return out
 }
 
 // permissionPolicy resolves this revision's automatic policy for one

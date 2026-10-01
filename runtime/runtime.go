@@ -73,6 +73,8 @@ type Runtime struct {
 	cancelWork   context.CancelFunc
 	config       *configurationService
 	obs          *observation
+	warnings     *warningStore
+	managedEnv   *config.ManagedEnv
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
@@ -161,7 +163,11 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 
 	obs := newObservation()
+	// The warning store initializes before any plugin scope opens: scopes
+	// and preparations report into it from the moment they exist.
+	warnings := newWarningStore()
 	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath, obs)
+	configService.attachWarnings(warnings)
 	if _, err := configService.publish(work); err != nil {
 		// Initial publication supplies the owned context as both caller and
 		// owner, so its caller-first checkpoints report a canceled
@@ -201,7 +207,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, warnings, options.prepare).bind(),
 	})
 	if err != nil {
 		return unwind(err)
@@ -217,6 +223,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		cancelWork:   cancelWork,
 		config:       configService,
 		obs:          obs,
+		warnings:     warnings,
+		managedEnv:   managedEnv,
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
@@ -436,6 +444,10 @@ func (r *Runtime) beginShutdown() {
 		r.mu.Lock()
 		r.closed = true
 		r.mu.Unlock()
+		// The warning store's admission closes with the Runtime: later
+		// reports are ignored presentation. Short in-memory coordination
+		// only — no network or plugin work runs here.
+		r.warnings.close()
 		r.cancelWork()
 		go func() {
 			r.shutdownErr = r.joinShutdown()

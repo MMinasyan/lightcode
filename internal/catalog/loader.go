@@ -259,7 +259,7 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 	if !ok {
 		return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: "providers must be an object"}}
 	}
-	return cloneJSONValue(providers).(map[string]any), nil
+	return CloneJSONValue(providers).(map[string]any), nil
 }
 func writeEmptyCatalogConfig(configPath string) error {
 	if _, err := atomicfs.CreateExclusive(configPath, []byte(catalogEmptyConfigTemplate), 0o600); err != nil {

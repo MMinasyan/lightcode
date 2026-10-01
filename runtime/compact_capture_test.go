@@ -67,7 +67,7 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (*configuration, *pre
 	if _, err := svc.publish(context.Background()); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	return svc.current(), newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil)
+	return svc.current(), newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil)
 }
 
 func compactToolsPlugin() Plugin {

@@ -67,6 +67,11 @@ type configurationService struct {
 	owner context.Context
 	obs   *observation
 
+	// warnings is the Runtime-owned presentation store every successful
+	// publication's global setup/catalog/agents refresh reports into; nil
+	// (isolated service tests) drops only that passive presentation.
+	warnings *warningStore
+
 	buildMu   sync.Mutex
 	published atomic.Pointer[configuration]
 }
@@ -106,6 +111,14 @@ func (s *configurationService) current() *configuration {
 	return s.published.Load()
 }
 
+// attachWarnings wires the Runtime-owned warning store. Every successful
+// publication refreshes the global setup/catalog/agents groups from its
+// published candidate at this shared publication path; a failed or canceled
+// build refreshes nothing.
+func (s *configurationService) attachWarnings(warnings *warningStore) {
+	s.warnings = warnings
+}
+
 // publish runs one serialized initial-load or reload build and publishes the
 // complete candidate with its next generation as a single atomic Store,
 // carrying the configuration event in the same observation section as that
@@ -140,6 +153,15 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
 		return nil, err
+	}
+	// The global warning groups follow the published candidate: refreshed
+	// under the build mutex so a later publication can never interleave an
+	// earlier candidate's refresh, and reached only after the final
+	// cancellation checkpoint, from which no failure returns.
+	if s.warnings != nil {
+		s.warnings.setGlobal("setup", setupWarnings(candidate))
+		s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings))
+		s.warnings.setGlobal("agents", agentWarnings(candidate.agentWarnings))
 	}
 	s.obs.publish(func() {
 		s.published.Store(candidate)

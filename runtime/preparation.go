@@ -13,7 +13,9 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // debugWireEnv is the retained wire-debug opt-in: when set to "1", raw
@@ -42,6 +44,54 @@ type selection struct {
 	agent      harness.AgentType
 	bindings   Bindings
 	invocation Invocation
+
+	// warnings is the per-preparation private presentation collector: the
+	// concrete preparation assigns the assembled prompt warnings into it and
+	// the binder publishes them under the admitted Session identity only
+	// after every preparation step succeeded. It is never the Invocation or
+	// the durable capture.
+	warnings *preparationWarnings
+}
+
+// preparationWarnings collects one preparation's presentation values.
+type preparationWarnings struct {
+	store     *warningStore
+	sessionID string
+	prompt    []prompt.Warning
+}
+
+// publish replaces the owning Session's prompt group with the collected
+// values; a nil store drops the presentation.
+func (w *preparationWarnings) publish() {
+	w.store.setSessionPrompt(w.sessionID, promptWarnings(w.sessionID, w.prompt))
+}
+
+// promptWarnings maps the assembled prompt diagnostics onto the store's
+// typed session group.
+func promptWarnings(sessionID string, warnings []prompt.Warning) []protocol.Warning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]protocol.Warning, 0, len(warnings))
+	for _, warning := range warnings {
+		id := sessionID
+		out = append(out, protocol.Warning{Source: "prompt", Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+	}
+	return out
+}
+
+// protocolWarnings maps one transport attempt's returned diagnostics onto the
+// store's typed session group.
+func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []protocol.Warning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]protocol.Warning, 0, len(warnings))
+	for _, warning := range warnings {
+		id := sessionID
+		out = append(out, protocol.Warning{Source: "protocol", Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+	}
+	return out
 }
 
 // PreparationHook is one pure preparation capability: it may replace the
@@ -89,15 +139,17 @@ type preparation struct {
 	workspaces  *workspaceScopes
 	home        string
 	background  BackgroundServices
+	warnings    *warningStore
 	prepare     prepare
 }
 
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
 // once-resolved home, the background services bridge armed after harness.New
-// returns, and the controlled preparation function; nil selects the concrete
-// production preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, prepare prepare) *preparation {
+// returns, the Runtime-owned warning store (nil in isolated preparation
+// tests, dropping only passive presentation), and the controlled preparation
+// function; nil selects the concrete production preparation.
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, warnings *warningStore, prepare prepare) *preparation {
 	return &preparation{
 		config:      config,
 		composition: c,
@@ -105,6 +157,7 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 		workspaces:  workspaces,
 		home:        home,
 		background:  background,
+		warnings:    warnings,
 		prepare:     prepare,
 	}
 }
@@ -144,6 +197,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		input := sel
 		input.agent.Tools = slices.Clone(agent.Tools)
 		input.agent.Capabilities = slices.Clone(agent.Capabilities)
+		// The per-preparation collector is allocated owned: only a successful
+		// preparation — validation, hooks and cancellation checks all passed —
+		// publishes its values under the admitted Session identity.
+		input.warnings = &preparationWarnings{store: p.warnings, sessionID: req.Session.Identity.SessionID}
 		prepare := p.prepare
 		if prepare == nil {
 			prepare = p.concretePrepare
@@ -162,6 +219,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
+		input.warnings.publish()
 		return harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
@@ -393,6 +451,12 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
+	// The assembled prompt's diagnostics are this preparation's presentation
+	// contribution, collected privately and published by the binder only
+	// after every preparation step succeeded.
+	if sel.warnings != nil {
+		sel.warnings.prompt = result.Warnings
+	}
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
@@ -586,11 +650,16 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 		}
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, _, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				stream, warnings, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				// The attempt's diagnostics are recorded under the admitted
+				// Session identity even when the physical request failed after
+				// encoding succeeded — a diagnostic is presentation only.
+				p.warnings.appendProtocol(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, _, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				stream, warnings, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				p.warnings.appendProtocol(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			// A nil Retry selects the standard classifier.

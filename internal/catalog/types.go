@@ -76,6 +76,10 @@ type Model struct {
 	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
 	Cost             *Cost             `json:"cost,omitempty"`
 	ProtocolMetadata *ProtocolMetadata `json:"protocol_metadata,omitempty"`
+
+	// Source is the model's provenance label stamped by Build (user, bundled
+	// or discovered); never serialized with the catalog itself.
+	Source string `json:"-"`
 }
 
 // Provider is a resolved provider entry in the effective catalog.

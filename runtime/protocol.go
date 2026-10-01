@@ -717,11 +717,11 @@ func sessionContextWindow(snap harness.SessionSnapshot, captured *configuration)
 // projectHydration assembles the complete Session-owned hydration body from
 // one owned snapshot and one captured configuration: the newest conversation
 // page, one Session header, the sorted Operation headers with the active
-// pointer into them, both pending FIFOs, background membership, and the
-// usage projection — all under that snapshot's revision. The warning list
-// and its revision are completed in a later step; the list stays present
-// and empty and no warning revision is invented.
-func projectHydration(snap harness.SessionSnapshot, captured *configuration) (protocol.Hydration, error) {
+// pointer into them, both pending FIFOs, background membership, the usage
+// projection, and the warning presentation — every global group plus this
+// Session's own prompt and protocol warnings, under the independently
+// captured warning revision.
+func projectHydration(snap harness.SessionSnapshot, captured *configuration, warnings []protocol.Warning, warningsRevision uint64) (protocol.Hydration, error) {
 	page, err := projectHistoryPage(snap, nil)
 	if err != nil {
 		return protocol.Hydration{}, err
@@ -753,7 +753,8 @@ func projectHydration(snap harness.SessionSnapshot, captured *configuration) (pr
 		Conversation:          protocol.ConversationPage{Items: page.Items, OlderCursor: page.OlderCursor},
 		Usage:                 projectSessionUsage(snap, captured),
 		Background:            background,
-		Warnings:              []protocol.Warning{},
+		Warnings:              warnings, // the shared read producer returns owned non-nil slices
+		WarningsRevision:      protocol.WarningsRevision{Revision: formatWarningRevision(warningsRevision)},
 		ConfigurationRevision: configurationRevision(captured),
 	}, nil
 }
@@ -815,13 +816,15 @@ func (r *Runtime) getUsage(ctx context.Context, sessionID string) (protocol.Usag
 
 // buildHydration is the private Session-owned hydration builder: one Harness
 // snapshot and one captured configuration assemble every body member under
-// that snapshot revision. It becomes the exported hydration method only
-// when its warning field is completed.
+// that snapshot revision, and one captured warning snapshot supplies the
+// warning presentation with its independently revisioned clock — the warning
+// capture happens exactly once per read and is not another Session read.
 func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protocol.Hydration, error) {
 	var hydration protocol.Hydration
 	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, captured *configuration) error {
+		warningsRevision, warnings := r.warnings.hydrate(sessionID)
 		var err error
-		hydration, err = projectHydration(snap, captured)
+		hydration, err = projectHydration(snap, captured, warnings, warningsRevision)
 		return err
 	}); err != nil {
 		return protocol.Hydration{}, err
