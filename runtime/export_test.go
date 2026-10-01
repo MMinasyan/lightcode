@@ -6,6 +6,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // OpenForTest is the test-build composition bridge used by the external
@@ -76,4 +77,30 @@ func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) 
 // It is absent from production builds.
 func DescribeToolForTest(spec CapabilitySpec, inv Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
 	return spec.describe(inv, constraints, identity)
+}
+
+// GetConfigurationForTest bridges the private configuration read for the
+// external composition tests. It is absent from production builds.
+func GetConfigurationForTest(r *Runtime) (protocol.ConfigurationView, error) {
+	return r.getConfiguration(context.Background())
+}
+
+// GetWarningsForTest bridges the unfiltered warning read for the external
+// composition tests. It is absent from production builds.
+func GetWarningsForTest(r *Runtime) (protocol.WarningsSnapshot, error) {
+	return r.getWarnings(context.Background())
+}
+
+// UpdateSettingsForTest bridges the private settings mutation — the
+// whole-shape configuration writer — for the external composition tests that
+// compose the real plugin validators. It is absent from production builds.
+func UpdateSettingsForTest(r *Runtime, settings protocol.Settings) (protocol.SettingsMutation, error) {
+	return r.updateSettings(context.Background(), settings)
+}
+
+// SetAgentTypeModelForTest bridges the private Agent-model mutation for the
+// external composition tests that compose the real agent roster. It is
+// absent from production builds.
+func SetAgentTypeModelForTest(r *Runtime, agentType, modelRef string) (protocol.AgentMutation, error) {
+	return r.setAgentTypeModel(context.Background(), agentType, modelRef)
 }

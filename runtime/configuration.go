@@ -166,15 +166,22 @@ func (c *configuration) permissionPolicy(workspace string) harness.PermissionPol
 	return harness.ResolvePermissionPolicy(c.permissions, workspaceRaw)
 }
 
-// agentTypes projects the snapshot's resolved definitions onto the Harness:
-// public model identity, owned slices, the permission capability constraints
-// with WriteDir trimmed once (preserving the legacy whitespace-as-unset
-// behavior: no environment expansion, no new path syntax), the subagent
-// eligibility and roster description, and the complete roster with no
-// internal package type reaching the view.
+// agentTypes projects the snapshot's resolved definitions onto the Harness
+// view.
 func (c *configuration) agentTypes() []harness.AgentType {
-	out := make([]harness.AgentType, 0, len(c.definitions))
-	for _, def := range c.definitions {
+	return projectAgentTypes(c.definitions)
+}
+
+// projectAgentTypes projects resolved definitions onto the Harness view: the
+// shared producer admission and the Agent-model edit's known-type check both
+// resolve through — public model identity, owned slices, the permission
+// capability constraints with WriteDir trimmed once (preserving the legacy
+// whitespace-as-unset behavior: no environment expansion, no new path
+// syntax), the subagent eligibility and roster description, and the complete
+// roster with no internal package type reaching the view.
+func projectAgentTypes(defs []agents.Resolved) []harness.AgentType {
+	out := make([]harness.AgentType, 0, len(defs))
+	for _, def := range defs {
 		at := harness.AgentType{
 			Name:         def.Name,
 			SystemPrompt: def.SystemPrompt,

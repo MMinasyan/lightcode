@@ -158,6 +158,61 @@ func (r *Runtime) getWarnings(ctx context.Context) (protocol.WarningsSnapshot, e
 	}, nil
 }
 
+// updateSettings replaces the complete settings shape through the one
+// configuration mutation path: the whole sessions and whole plugins members
+// are written as the generated target shape — an omitted optional plugin
+// section removing any newer one — and a successful edit atomically rewrites
+// the owning main configuration and publishes the next generation, identical
+// bytes included. Unowned top-level root members are untouched. The result
+// projects the returned candidate, never a second current() load that could
+// see a later writer.
+func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings) (protocol.SettingsMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.SettingsMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, editSettings(settings))
+	if err != nil {
+		return protocol.SettingsMutation{}, err
+	}
+	return protocol.SettingsMutation{
+		ConfigurationRevision: configurationRevision(candidate),
+		Result:                ownSettings(candidate.settings),
+	}, nil
+}
+
+// setAgentTypeModel edits one known Agent type's user model override through
+// the same mutation path: a nonempty ref replaces it, an empty string clears
+// it. Every successful request — set, clear, absent override, identical
+// bytes — writes the owning agents file and publishes the next generation;
+// the no-override exception belongs to the retained public field reset
+// operator, which this client is not. An unknown or dropped type fails
+// invalid and writes nothing; the result projects from the returned
+// candidate.
+func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef string) (protocol.AgentMutation, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.AgentMutation{}, err
+	}
+	defer release()
+	candidate, err := r.config.mutate(ctx, r.config.editAgentModel(agentType, modelRef))
+	if err != nil {
+		return protocol.AgentMutation{}, err
+	}
+	mutation := protocol.AgentMutation{ConfigurationRevision: configurationRevision(candidate)}
+	for _, agent := range projectAgents(candidate) {
+		if agent.Name == agentType {
+			mutation.Result = agent
+			break
+		}
+	}
+	// The edit's known-type check already guarantees the requested type is a
+	// member of the returned candidate's roster, so Result is always set on
+	// every supported request.
+	return mutation, nil
+}
+
 // capturedProvider resolves one provider ID against the captured catalog:
 // an empty identity wraps the shared invalid sentinel and an unknown valid
 // one returns the catalog's typed unknown-provider error.

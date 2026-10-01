@@ -134,13 +134,10 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 		s.buildMu.Unlock()
 		return nil, err
 	}
-	generation := uint64(1)
-	if snapshot := s.published.Load(); snapshot != nil {
-		generation = snapshot.generation + 1
-		if generation == 0 {
-			s.buildMu.Unlock()
-			return nil, fmt.Errorf("configuration publication generation exhausted: %w", ErrConfiguration)
-		}
+	generation, err := s.nextGeneration()
+	if err != nil {
+		s.buildMu.Unlock()
+		return nil, err
 	}
 	candidate, err := s.build(ctx, generation)
 	if err != nil {
@@ -154,10 +151,32 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 		s.buildMu.Unlock()
 		return nil, err
 	}
-	// The global warning groups follow the published candidate: refreshed
-	// under the build mutex so a later publication can never interleave an
-	// earlier candidate's refresh, and reached only after the final
-	// cancellation checkpoint, from which no failure returns.
+	s.commit(candidate)
+	return candidate, nil
+}
+
+// nextGeneration reserves the next publication generation; the caller holds
+// the build mutex. Initial publication uses generation 1 and only a success
+// increments it.
+func (s *configurationService) nextGeneration() (uint64, error) {
+	generation := uint64(1)
+	if snapshot := s.published.Load(); snapshot != nil {
+		generation = snapshot.generation + 1
+		if generation == 0 {
+			return 0, fmt.Errorf("configuration publication generation exhausted: %w", ErrConfiguration)
+		}
+	}
+	return generation, nil
+}
+
+// commit publishes the validated candidate as the ready snapshot with its
+// one event; the caller holds the build mutex. The global warning groups
+// follow the published candidate: refreshed under the build mutex so a later
+// publication can never interleave an earlier candidate's refresh, and
+// reached only after the caller's final cancellation checkpoint, from which
+// no failure returns. The build mutex releases inside the commit, before the
+// enqueue.
+func (s *configurationService) commit(candidate *configuration) {
 	if s.warnings != nil {
 		s.warnings.setGlobal("setup", setupWarnings(candidate))
 		s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings))
@@ -167,7 +186,6 @@ func (s *configurationService) publish(ctx context.Context) (*configuration, err
 		s.published.Store(candidate)
 		s.buildMu.Unlock()
 	}, Event{Kind: EventConfiguration, ConfigurationRevision: strconv.FormatUint(candidate.generation, 10)})
-	return candidate, nil
 }
 
 // canceled applies the caller-first cancellation rule: a done caller context
@@ -184,14 +202,8 @@ func (s *configurationService) canceled(ctx context.Context) error {
 }
 
 // build reads and interprets exactly one input set: the main and agents bytes
-// are captured once (preserving the first-run skeletons), the captured
-// providers layer is delegated to Loader.LoadCaptured so provider assembly
-// and every cost protection use that one read, sessions and agent definitions
-// are parsed against the ordinary visible export IDs and the compiled tool
-// universe, the Workspace permission inventory is enumerated once into the
-// candidate, and the plugin section is validated against the owned
-// declarations. Nothing is published until the complete candidate survives
-// all of it.
+// are captured once (preserving the first-run skeletons), then the shared
+// candidate construction consumes those captured bytes.
 func (s *configurationService) build(ctx context.Context, generation uint64) (*configuration, error) {
 	configData, err := captureConfiguredFile(s.configPath, mainConfigSkeleton)
 	if err != nil {
@@ -201,6 +213,19 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 	if err != nil {
 		return nil, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
 	}
+	return s.buildCaptured(ctx, generation, configData, agentsData)
+}
+
+// buildCaptured is the one candidate construction every publisher — Reload's
+// capture and a mutation's edited bytes — runs: the captured documents are
+// decoded once, the captured providers layer is delegated to
+// Loader.LoadCaptured so provider assembly and every cost protection use
+// that one read, sessions and agent definitions are parsed against the
+// ordinary visible export IDs and the compiled tool universe, the Workspace
+// permission inventory is enumerated once into the candidate, and the plugin
+// section is validated against the owned declarations. Nothing is returned
+// until the complete candidate survives all of it.
+func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData, agentsData []byte) (*configuration, error) {
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
 		return nil, configurationFailure(err)
