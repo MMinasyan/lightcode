@@ -68,25 +68,19 @@ export type ContentPart = ({
 export type TextPart = {
     kind: 'text';
     text: string;
-    extra?: {
-        [key: string]: unknown;
-    };
+    extra?: JsonObject;
 };
 
 export type ImageUrlPart = {
     kind: 'image_url';
     url: string;
-    extra?: {
-        [key: string]: unknown;
-    };
+    extra?: JsonObject;
 };
 
 export type OpaquePart = {
     kind: 'opaque';
     opaque_wire_type: string;
-    extra?: {
-        [key: string]: unknown;
-    };
+    extra?: JsonObject;
 };
 
 export type UsageCount = {
@@ -166,21 +160,27 @@ export type BackgroundMember = {
     id: string;
 };
 
+/**
+ * Optional bounded tool-owned metadata: one complete non-null JSON value of any kind whose semantics belong to the producing tool and whose durable size the owning Session bounds. Carried verbatim for client display; the top-level null literal is not a value.
+ */
+export type ToolMetadata = unknown;
+
+/**
+ * One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+ */
+export type JsonObject = {
+    [key: string]: unknown;
+};
+
 export type ToolCallView = {
     id: string;
     name: string;
     arguments: string;
-    normalized_arguments?: {
-        [key: string]: unknown;
-    };
+    normalized_arguments?: JsonObject;
     status?: ToolCallStatus;
     content?: string;
-    metadata?: {
-        [key: string]: unknown;
-    };
-    extra?: {
-        [key: string]: unknown;
-    };
+    metadata?: ToolMetadata;
+    extra?: JsonObject;
 };
 
 export type InputItem = {
@@ -202,9 +202,7 @@ export type AssistantItem = {
     content: Array<ContentPart>;
     refusal?: string;
     tool_calls: Array<ToolCallView>;
-    extra?: {
-        [key: string]: unknown;
-    };
+    extra?: JsonObject;
 };
 
 export type SignalItem = {

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -733,15 +734,18 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 }
 
 // assertExactJSONKeys marshals v and checks its flattened object key set
-// against the expected members, then returns the marshaled body.
+// against the expected members, then returns the marshaled body. Decoding
+// keeps exact numbers, so opaque values like 1e1000 survive the inspection.
 func assertExactJSONKeys(t *testing.T, v any, want []string) string {
 	t.Helper()
 	data, err := json.Marshal(v)
 	if err != nil {
 		t.Fatalf("marshal %T: %v", v, err)
 	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	var top map[string]any
-	if err := json.Unmarshal(data, &top); err != nil {
+	if err := decoder.Decode(&top); err != nil {
 		t.Fatalf("unmarshal %T: %v", v, err)
 	}
 	var got []string

@@ -1015,7 +1015,7 @@ components:
         text:
           type: string
         extra:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
     ImageURLPart:
       type: object
       additionalProperties: false
@@ -1030,7 +1030,7 @@ components:
         url:
           type: string
         extra:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
     OpaquePart:
       type: object
       additionalProperties: false
@@ -1045,7 +1045,7 @@ components:
         opaque_wire_type:
           type: string
         extra:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
     UsageCount:
       type: object
       additionalProperties: false
@@ -1251,6 +1251,20 @@ components:
             - job
         id:
           type: string
+    ToolMetadata:
+      description: >-
+        Optional bounded tool-owned metadata: one complete non-null JSON
+        value of any kind whose semantics belong to the producing tool and
+        whose durable size the owning Session bounds. Carried verbatim for
+        client display; the top-level null literal is not a value.
+      x-go-type: json.RawMessage
+    JSONObject:
+      type: object
+      description: >-
+        One validated JSON object of arbitrary members, carried with its raw
+        values intact: no member's JSON kind is constrained.
+      additionalProperties: true
+      x-go-type: map[string]json.RawMessage
     ToolCallView:
       type: object
       additionalProperties: false
@@ -1266,15 +1280,15 @@ components:
         arguments:
           type: string
         normalized_arguments:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
         status:
           $ref: "#/components/schemas/ToolCallStatus"
         content:
           type: string
         metadata:
-          type: object
+          $ref: "#/components/schemas/ToolMetadata"
         extra:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
     InputItem:
       type: object
       additionalProperties: false
@@ -1344,7 +1358,7 @@ components:
           items:
             $ref: "#/components/schemas/ToolCallView"
         extra:
-          type: object
+          $ref: "#/components/schemas/JSONObject"
     SignalItem:
       type: object
       additionalProperties: false

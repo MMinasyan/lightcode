@@ -3,9 +3,12 @@ package protocol_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
 
@@ -46,24 +49,29 @@ func componentSchema(t *testing.T, name string) *openapi3.Schema {
 
 func acceptJSON(t *testing.T, s *openapi3.Schema, value string) {
 	t.Helper()
-	var decoded any
-	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
-		t.Fatalf("decoding test value: %v", err)
-	}
-	if err := s.VisitJSON(decoded); err != nil {
+	if err := s.VisitJSON(decodeSchemaJSON(t, value)); err != nil {
 		t.Fatalf("schema rejected valid value %s: %v", value, err)
 	}
 }
 
 func rejectJSON(t *testing.T, s *openapi3.Schema, value string) {
 	t.Helper()
-	var decoded any
-	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
-		t.Fatalf("decoding test value: %v", err)
-	}
-	if err := s.VisitJSON(decoded); err == nil {
+	if err := s.VisitJSON(decodeSchemaJSON(t, value)); err == nil {
 		t.Fatalf("schema accepted invalid value %s", value)
 	}
+}
+
+// decodeSchemaJSON decodes one test value with exact numbers preserved, so
+// extreme exponents (1e1000) reach the validator without a float64 overflow.
+func decodeSchemaJSON(t *testing.T, value string) any {
+	t.Helper()
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("decoding test value: %v", err)
+	}
+	return decoded
 }
 
 const (
@@ -331,5 +339,141 @@ func TestGeneratedSystemRoleSharedAcrossEditsAndViews(t *testing.T) {
 		modelView.SystemRole != protocol.SystemRoleDeveloper ||
 		provider.SystemRole != protocol.SystemRoleDeveloper {
 		t.Fatal("generated SystemRole is not shared across provider/model edits and views")
+	}
+}
+
+// TestToolMetadataAcceptsEveryNonNullJSONValue pins the tool-owned metadata
+// contract: one bounded non-null JSON value of any kind — no type constraint.
+// The top-level null literal is not a value and stays rejected.
+func TestToolMetadataAcceptsEveryNonNullJSONValue(t *testing.T) {
+	s := componentSchema(t, "ToolMetadata")
+	acceptJSON(t, s, `{"n": 9007199254740993}`)
+	acceptJSON(t, s, `[1, "two", false]`)
+	acceptJSON(t, s, `"line count"`)
+	acceptJSON(t, s, `true`)
+	acceptJSON(t, s, `0`)
+	acceptJSON(t, s, `{"rows": [null, {"depth": 1e1000}]}`)
+	acceptJSON(t, s, `1e1000`)
+	rejectJSON(t, s, `null`)
+}
+
+// TestConversationRawObjectFieldsShareOneComponent keeps the conversation
+// extra/normalized-argument fields on the one shared raw-valued object
+// component and the tool metadata on its own component — and nothing else in
+// the schema on either.
+func TestConversationRawObjectFieldsShareOneComponent(t *testing.T) {
+	doc := schema(t)
+	var refs []string
+	for name, schemaRef := range doc.Components.Schemas {
+		for field, prop := range schemaRef.Value.Properties {
+			switch prop.Ref {
+			case "#/components/schemas/JSONObject":
+				refs = append(refs, name+"."+field+"=JSONObject")
+			case "#/components/schemas/ToolMetadata":
+				refs = append(refs, name+"."+field+"=ToolMetadata")
+			}
+		}
+	}
+	sort.Strings(refs)
+	want := []string{
+		"AssistantItem.extra=JSONObject",
+		"ImageURLPart.extra=JSONObject",
+		"OpaquePart.extra=JSONObject",
+		"TextPart.extra=JSONObject",
+		"ToolCallView.extra=JSONObject",
+		"ToolCallView.metadata=ToolMetadata",
+		"ToolCallView.normalized_arguments=JSONObject",
+	}
+	if !reflect.DeepEqual(refs, want) {
+		t.Fatalf("shared raw-object component references = %v, want exactly %v", refs, want)
+	}
+}
+
+// TestGeneratedToolMetadataRoundTripsRawValues proves the generated
+// tool-metadata and normalized-argument members keep every JSON value
+// byte-exact across a decode and re-encode: large integers and extreme
+// exponents never pass through a float64, and every non-null kind is
+// accepted. The probe decodes through the generated type and re-inspects the
+// re-encoded bytes through raw members, so the check exercises exactly the
+// generated contract's value fidelity.
+func TestGeneratedToolMetadataRoundTripsRawValues(t *testing.T) {
+	const wire = `{"id":"call-1","name":"read","arguments":"e30=","metadata":{"n":9007199254740993,"big":1e1000,"list":[null,false,0],"text":"x"}}`
+	var view protocol.ToolCallView
+	if err := json.Unmarshal([]byte(wire), &view); err != nil {
+		t.Fatalf("decoding generated ToolCallView: %v", err)
+	}
+	data, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshaling generated ToolCallView: %v", err)
+	}
+	for _, want := range []string{"9007199254740993", "1e1000", `[null,false,0]`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("re-encoded ToolCallView JSON = %s, want %q preserved", data, want)
+		}
+	}
+
+	// The same fidelity for the raw-valued normalized-argument object.
+	const normalized = `{"id":"call-2","name":"grep","arguments":"e30=","normalized_arguments":{"n":9007199254740993,"big":1e1000}}`
+	var normalizedView protocol.ToolCallView
+	if err := json.Unmarshal([]byte(normalized), &normalizedView); err != nil {
+		t.Fatalf("decoding generated normalized arguments: %v", err)
+	}
+	reEncoded, err := json.Marshal(normalizedView)
+	if err != nil {
+		t.Fatalf("marshaling generated normalized arguments: %v", err)
+	}
+	for _, want := range []string{"9007199254740993", "1e1000"} {
+		if !strings.Contains(string(reEncoded), want) {
+			t.Fatalf("re-encoded normalized arguments = %s, want %q preserved", reEncoded, want)
+		}
+	}
+}
+
+// TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors proves the
+// generated raw-valued object keeps opaque numbers exact through the
+// union constructors a producer uses and the As accessors a consumer uses.
+func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.T) {
+	normalized := protocol.JSONObject{"n": json.RawMessage(`9007199254740993`), "big": json.RawMessage(`1e1000`)}
+	metadata := protocol.ToolMetadata(json.RawMessage(`{"n":9007199254740993,"big":1e1000}`))
+	item := protocol.AssistantItem{
+		ItemId:      "assistant-1",
+		CommittedAt: time.Time{}.UTC(),
+		Status:      protocol.AssistantItemStatusCompleted,
+		Source:      "prov/m",
+		Content:     []protocol.ContentPart{},
+		ToolCalls: []protocol.ToolCallView{{
+			Id:                  "call-1",
+			Name:                "read",
+			Arguments:           "{}",
+			NormalizedArguments: &normalized,
+			Status:              &[]protocol.ToolCallStatus{protocol.ToolCallStatusSuccess}[0],
+			Content:             &[]string{""}[0],
+			Metadata:            &metadata,
+		}},
+	}
+	var wire protocol.ConversationItem
+	if err := wire.FromAssistantItem(item); err != nil {
+		t.Fatalf("FromAssistantItem: %v", err)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshaling generated ConversationItem: %v", err)
+	}
+	for _, want := range []string{"9007199254740993", "1e1000"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("wire JSON = %s, want %q preserved", data, want)
+		}
+	}
+	decoded, err := wire.AsAssistantItem()
+	if err != nil {
+		t.Fatalf("AsAssistantItem: %v", err)
+	}
+	if decoded.ToolCalls[0].NormalizedArguments == nil || string((*decoded.ToolCalls[0].NormalizedArguments)["n"]) != `9007199254740993` {
+		t.Fatalf("decoded normalized arguments = %v, want the raw number preserved", decoded.ToolCalls[0].NormalizedArguments)
+	}
+	// A raw-valued object re-encodes canonically (sorted members) while every
+	// value stays byte-exact: the two opaque numbers survive untouched.
+	if decoded.ToolCalls[0].Metadata == nil || string(*decoded.ToolCalls[0].Metadata) != `{"big":1e1000,"n":9007199254740993}` {
+		t.Fatalf("decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
 	}
 }

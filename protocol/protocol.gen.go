@@ -786,13 +786,15 @@ type AgentMutation struct {
 
 // AssistantItem defines model for AssistantItem.
 type AssistantItem struct {
-	CommittedAt time.Time               `json:"committed_at"`
-	Content     []ContentPart           `json:"content"`
-	Extra       *map[string]interface{} `json:"extra,omitempty"`
-	ItemId      string                  `json:"item_id"`
-	Kind        AssistantItemKind       `json:"kind"`
-	OperationId *string                 `json:"operation_id,omitempty"`
-	Refusal     *string                 `json:"refusal,omitempty"`
+	CommittedAt time.Time     `json:"committed_at"`
+	Content     []ContentPart `json:"content"`
+
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra       *JSONObject       `json:"extra,omitempty"`
+	ItemId      string            `json:"item_id"`
+	Kind        AssistantItemKind `json:"kind"`
+	OperationId *string           `json:"operation_id,omitempty"`
+	Refusal     *string           `json:"refusal,omitempty"`
 
 	// Source A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
 	Source    ModelRef            `json:"source"`
@@ -1007,9 +1009,10 @@ type Hydration struct {
 
 // ImageURLPart defines model for ImageURLPart.
 type ImageURLPart struct {
-	Extra *map[string]interface{} `json:"extra,omitempty"`
-	Kind  ImageURLPartKind        `json:"kind"`
-	Url   string                  `json:"url"`
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra *JSONObject      `json:"extra,omitempty"`
+	Kind  ImageURLPartKind `json:"kind"`
+	Url   string           `json:"url"`
 }
 
 // ImageURLPartKind defines model for ImageURLPart.Kind.
@@ -1033,6 +1036,9 @@ type InputModality string
 
 // InputOrigin defines model for InputOrigin.
 type InputOrigin string
+
+// JSONObject One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+type JSONObject = map[string]json.RawMessage
 
 // JobsSettings defines model for JobsSettings.
 type JobsSettings struct {
@@ -1119,9 +1125,10 @@ type ModelView struct {
 
 // OpaquePart defines model for OpaquePart.
 type OpaquePart struct {
-	Extra          *map[string]interface{} `json:"extra,omitempty"`
-	Kind           OpaquePartKind          `json:"kind"`
-	OpaqueWireType string                  `json:"opaque_wire_type"`
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra          *JSONObject    `json:"extra,omitempty"`
+	Kind           OpaquePartKind `json:"kind"`
+	OpaqueWireType string         `json:"opaque_wire_type"`
 }
 
 // OpaquePartKind defines model for OpaquePart.Kind.
@@ -1463,9 +1470,10 @@ type TextDeltaEventKind string
 
 // TextPart defines model for TextPart.
 type TextPart struct {
-	Extra *map[string]interface{} `json:"extra,omitempty"`
-	Kind  TextPartKind            `json:"kind"`
-	Text  string                  `json:"text"`
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra *JSONObject  `json:"extra,omitempty"`
+	Kind  TextPartKind `json:"kind"`
+	Text  string       `json:"text"`
 }
 
 // TextPartKind defines model for TextPart.Kind.
@@ -1476,14 +1484,20 @@ type ToolCallStatus string
 
 // ToolCallView defines model for ToolCallView.
 type ToolCallView struct {
-	Arguments           string                  `json:"arguments"`
-	Content             *string                 `json:"content,omitempty"`
-	Extra               *map[string]interface{} `json:"extra,omitempty"`
-	Id                  string                  `json:"id"`
-	Metadata            *map[string]interface{} `json:"metadata,omitempty"`
-	Name                string                  `json:"name"`
-	NormalizedArguments *map[string]interface{} `json:"normalized_arguments,omitempty"`
-	Status              *ToolCallStatus         `json:"status,omitempty"`
+	Arguments string  `json:"arguments"`
+	Content   *string `json:"content,omitempty"`
+
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra *JSONObject `json:"extra,omitempty"`
+	Id    string      `json:"id"`
+
+	// Metadata Optional bounded tool-owned metadata: one complete non-null JSON value of any kind whose semantics belong to the producing tool and whose durable size the owning Session bounds. Carried verbatim for client display; the top-level null literal is not a value.
+	Metadata *ToolMetadata `json:"metadata,omitempty"`
+	Name     string        `json:"name"`
+
+	// NormalizedArguments One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	NormalizedArguments *JSONObject     `json:"normalized_arguments,omitempty"`
+	Status              *ToolCallStatus `json:"status,omitempty"`
 }
 
 // ToolFinishedEvent defines model for ToolFinishedEvent.
@@ -1496,6 +1510,9 @@ type ToolFinishedEvent struct {
 
 // ToolFinishedEventKind defines model for ToolFinishedEvent.Kind.
 type ToolFinishedEventKind string
+
+// ToolMetadata Optional bounded tool-owned metadata: one complete non-null JSON value of any kind whose semantics belong to the producing tool and whose durable size the owning Session bounds. Carried verbatim for client display; the top-level null literal is not a value.
+type ToolMetadata = json.RawMessage
 
 // ToolStartedEvent defines model for ToolStartedEvent.
 type ToolStartedEvent struct {
