@@ -19,6 +19,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/pkoukk/tiktoken-go"
 )
 
@@ -880,9 +881,11 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 				return compactSummaryTurn("summary one", model.Usage{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), nil
 			})
 
-			// No passive event may fire across the compaction: the protocol
-			// and client surface are untouched by compaction.
-			sub, err := f.r.Subscribe(16)
+			// The subscription observes the real committed truth across the
+			// compaction: the fixed configuration and scope events plus the
+			// passive facts of the actual operations, with no synthetic
+			// admission.
+			sub, err := f.r.Subscribe(256)
 			if err != nil {
 				t.Fatalf("Subscribe: %v", err)
 			}
@@ -1025,21 +1028,62 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 			}
 			assertCompactShapes(t, compactShapesOf(sent.at(1).Messages), want)
 
-			// The subscription saw only the fixed configuration and scope
-			// event kinds across the compaction: no new protocol or client
-			// surface fired.
+			// Every invalidation names the real Session at session
+			// granularity and every delta the real running Operation: no
+			// event names a Session or Operation outside the committed
+			// admissions — compaction invents no synthetic admission.
+			seenSessionInvalidations := 0
+			seenDeltas := 0
+			var drained []Event
 			for {
 				select {
-				case event := <-sub.Events():
-					switch event.Kind {
-					case EventConfiguration, EventScopeOpened, EventScopeClosed:
-					default:
-						t.Fatalf("observation fired kind %q during compaction, want only the fixed configuration and scope set", event.Kind)
+				case event, ok := <-sub.Events():
+					if !ok {
+						t.Fatal("the subscription closed early, want it open through the drain")
 					}
+					drained = append(drained, event)
 					continue
 				default:
 				}
 				break
+			}
+			for _, event := range drained {
+				switch eventKind(t, event) {
+				case "configuration_changed", "scope_opened", "scope_closed":
+				case "session_changed":
+					body, err := event.AsSessionChangedEvent()
+					if err != nil {
+						t.Fatalf("session event body: %v", err)
+					}
+					if body.Scope.SessionId == nil || *body.Scope.SessionId != s {
+						t.Fatalf("compaction invalidation for session %v, want the real session", body.Scope.SessionId)
+					}
+					if body.Scope.Kind != protocol.ScopeKindSession {
+						t.Fatalf("compaction invalidation scope kind = %q, want the session granularity", body.Scope.Kind)
+					}
+					seenSessionInvalidations++
+				case "text_delta":
+					body, err := event.AsTextDeltaEvent()
+					if err != nil {
+						t.Fatalf("delta event body: %v", err)
+					}
+					if body.Scope.SessionId == nil || *body.Scope.SessionId != s ||
+						body.Scope.OperationId == nil || (*body.Scope.OperationId != "op-2" && *body.Scope.OperationId != "op-3") {
+						t.Fatalf("compaction delta scope = %+v, want a real admitted operation", body.Scope)
+					}
+					if body.Content == "" {
+						t.Fatal("compaction delta carries empty content")
+					}
+					seenDeltas++
+				default:
+					t.Fatalf("observation fired kind %q during compaction, outside the closed event set", eventKind(t, event))
+				}
+			}
+			if seenSessionInvalidations == 0 {
+				t.Fatal("the compaction committed no session invalidation, want the real committed hints")
+			}
+			if seenDeltas == 0 {
+				t.Fatal("the compaction model stream produced no text delta, want the real progress truth")
 			}
 
 			if err := f.r.Close(ctx); err != nil {
@@ -2905,10 +2949,6 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 		"ErrConfiguration":        true,
 		"ErrOwned":                true,
 		"Event":                   true,
-		"EventConfiguration":      true,
-		"EventKind":               true,
-		"EventScopeClosed":        true,
-		"EventScopeOpened":        true,
 		"Instance":                true,
 		"Invocation":              true,
 		"ModelAdaptation":         true,

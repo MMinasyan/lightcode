@@ -85,8 +85,8 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	if got := compactComposed(t, root.Plugins.Tools); !strings.Contains(got, `"max_output_bytes":4096`) {
 		t.Fatalf("plugins.tools member = %s, want the written section", got)
 	}
-	if event, ok := nextComposedEvent(t, sub); !ok || event.Kind != runtime.EventConfiguration || event.ConfigurationRevision != "2" {
-		t.Fatalf("event = %+v (ok=%v), want the generation 2 configuration event", event, ok)
+	if event, ok := nextComposedEvent(t, sub); !ok || composedEventKind(t, event) != "configuration_changed" || composedEventGeneration(t, event) != "2" {
+		t.Fatalf("event = %s (ok=%v), want the generation 2 configuration event", composedEventJSON(event), ok)
 	}
 
 	// The rejected write: the real tools validator refuses a zero

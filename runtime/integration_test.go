@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // Assembled-phase integration: one live scenario runs the concrete production
@@ -430,10 +431,11 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if !ok {
 				t.Fatal("the healthy subscription closed before op-b1's Operation-close publication")
 			}
-			observed = append(observed, event)
-			if event.Kind == EventScopeClosed && event.Scope.Kind == ScopeOperation && event.Scope.Workspace == wsB {
+			if body, closed := scopeClosedEvent(t, event); closed && body.Scope.Kind == protocol.ScopeKindOperation && deref(body.Scope.Workspace) == wsB {
+				recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 				break
 			}
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 		}
 
 		// Blocked Operation on A: the production model request parks at the
@@ -444,12 +446,17 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		if got := ws.constructed(); !slices.Equal(got, []string{wsB, wsA}) {
 			t.Fatalf("Workspace scope constructions = %v, want one per distinct key in first-use order", got)
 		}
-		// The saturated subscriber filled on the first publication and is
-		// removed at the second (the /wsa scope open), while the healthy one
-		// continues.
+		// The saturated subscriber filled on the first publication — a
+		// passive fact now precedes every scope opening — and is removed at
+		// the second, while the healthy one continues.
 		first, ok := nextEvent(t, sat)
-		if !ok || first.Kind != EventScopeOpened || first.Scope.Kind != ScopeWorkspace || first.Scope.Workspace != wsB {
-			t.Fatalf("saturated subscriber first event = %+v (ok=%v), want the /wsb workspace open", first, ok)
+		if !ok {
+			t.Fatal("saturated subscriber closed before its first buffered event")
+		}
+		switch eventKind(t, first) {
+		case "configuration_changed", "scope_opened", "scope_closed", "session_changed", "text_delta", "tool_started", "tool_finished", "warning_changed":
+		default:
+			t.Fatalf("saturated subscriber first event = %s, outside the closed event set", eventJSON(t, first))
 		}
 		if _, ok := nextEvent(t, sat); ok {
 			t.Fatal("saturated subscriber still open at the second publication, want it removed and closed")
@@ -508,10 +515,10 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if !ok {
 				t.Fatal("the healthy subscription closed before the queued delivery settled")
 			}
-			observed = append(observed, event)
-			if event.Kind == EventScopeClosed && event.Scope.Kind == ScopeOperation && event.Scope.Workspace == wsA {
+			if body, closed := scopeClosedEvent(t, event); closed && body.Scope.Kind == protocol.ScopeKindOperation && deref(body.Scope.Workspace) == wsA {
 				closedOps++
 			}
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 		}
 
 		// Shutdown joins the parked execution: the third admission's model
@@ -563,36 +570,37 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// order — scope identities exact, payloads stripped — ending with the
 		// sorted Workspace closures and the Runtime. The prefix consumed up to
 		// op-a2's Operation-close publication precedes the remaining drain.
-		scopeEvent := func(kind EventKind, scopeKind ScopeKind, workspace string) Event {
-			return Event{Kind: kind, Scope: ScopeInfo{Kind: scopeKind, Workspace: workspace}}
+		committedScope := func(kind protocol.ScopeEventKind, scopeKind ScopeKind, workspace, sessionID, operationID string) Event {
+			return scopeEvent(kind, ScopeInfo{Kind: scopeKind, Workspace: workspace, SessionID: sessionID, OperationID: operationID})
 		}
+		sessionBID, sessionAID := sessionB.Identity.SessionID, sessionA.Identity.SessionID
 		want := []Event{
-			scopeEvent(EventScopeOpened, ScopeWorkspace, wsB),
-			scopeEvent(EventScopeOpened, ScopeOperation, wsB),
-			scopeEvent(EventScopeOpened, ScopeAgent, wsB),
-			scopeEvent(EventScopeClosed, ScopeAgent, wsB),
-			scopeEvent(EventScopeClosed, ScopeOperation, wsB),
-			scopeEvent(EventScopeOpened, ScopeWorkspace, wsA),
-			scopeEvent(EventScopeOpened, ScopeOperation, wsA),
-			scopeEvent(EventScopeOpened, ScopeAgent, wsA),
-			{Kind: EventConfiguration, ConfigurationRevision: "2"},
-			scopeEvent(EventScopeClosed, ScopeAgent, wsA),
-			scopeEvent(EventScopeClosed, ScopeOperation, wsA),
-			scopeEvent(EventScopeOpened, ScopeOperation, wsA),
-			scopeEvent(EventScopeOpened, ScopeAgent, wsA),
-			scopeEvent(EventScopeClosed, ScopeAgent, wsA),
-			scopeEvent(EventScopeClosed, ScopeOperation, wsA),
-			scopeEvent(EventScopeOpened, ScopeOperation, wsA),
-			scopeEvent(EventScopeOpened, ScopeAgent, wsA),
-			scopeEvent(EventScopeClosed, ScopeAgent, wsA),
-			scopeEvent(EventScopeClosed, ScopeOperation, wsA),
-			scopeEvent(EventScopeClosed, ScopeWorkspace, wsA),
-			scopeEvent(EventScopeClosed, ScopeWorkspace, wsB),
-			scopeEvent(EventScopeClosed, ScopeRuntime, ""),
+			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsB, "", ""),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsB, sessionBID, "op-b1"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsB, sessionBID, "op-b1"),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsB, sessionBID, "op-b1"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsB, sessionBID, "op-b1"),
+			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a1"),
+			configurationChangedEvent(2),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a2"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a2"),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a2"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a2"),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a3"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a3"),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a3"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a3"),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsB, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeRuntime, "", "", ""),
 		}
-		got := append(observed, drainClosed(t, healthy)...)
+		got := append(observed, committedTail(t, healthy, sessionAID, sessionBID)...)
 		if !slices.EqualFunc(got, want, equalEvent) {
-			t.Fatalf("healthy subscriber events = %+v, want the complete committed sequence %+v", got, want)
+			t.Fatalf("healthy subscriber committed events = %s, want the complete committed sequence %s", eventsJSON(t, got), eventsJSON(t, want))
 		}
 
 		// Restart repair on the same store: recovery settles the abandoned
@@ -617,4 +625,99 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 	})
+}
+
+// recordCommittedEvent appends one scope or configuration event to the
+// committed-order oracle; every passive fact and warning event is accounted
+// separately — its scope must name one of the real Sessions, never a foreign
+// identity.
+func recordCommittedEvent(t *testing.T, observed *[]Event, event Event, sessionIDs ...string) {
+	t.Helper()
+	switch eventKind(t, event) {
+	case "configuration_changed", "scope_opened", "scope_closed":
+		*observed = append(*observed, event)
+	case "warning_changed":
+		// The warning events the reloads' own commits and the real sessions'
+		// prompt preparations require are accounted here on their
+		// independent revision clock, never dropped silently: a global event
+		// carries the runtime scope, a session event the real Session's
+		// scope.
+		body, err := event.AsWarningChangedEvent()
+		if err != nil {
+			t.Fatalf("warning event body: %v", err)
+		}
+		if body.Scope.Kind == protocol.ScopeKindRuntime {
+			// the global reload groups
+		} else if body.Scope.Kind == protocol.ScopeKindSession && scopeNamesRealSession(t, body.Scope, sessionIDs...) {
+			// the session's own prompt group
+		} else {
+			t.Fatalf("warning event scope = %+v, want the runtime scope or a real session", body.Scope)
+		}
+		if _, err := strconv.ParseUint(body.WarningsRevision.Revision, 10, 64); err != nil {
+			t.Fatalf("warning event revision %q is not a decimal integer", body.WarningsRevision.Revision)
+		}
+	case "session_changed":
+		body, err := event.AsSessionChangedEvent()
+		if err != nil {
+			t.Fatalf("session event body: %v", err)
+		}
+		if !scopeNamesRealSession(t, body.Scope, sessionIDs...) {
+			t.Fatalf("passive invalidation for %v, want a real session", body.Scope.SessionId)
+		}
+	case "text_delta", "tool_started", "tool_finished":
+		scope := progressEventScope(t, event)
+		if !scopeNamesRealSession(t, scope, sessionIDs...) {
+			t.Fatalf("passive progress for %v, want a real session", scope.SessionId)
+		}
+	default:
+		t.Fatalf("unexpected event kind %q", eventKind(t, event))
+	}
+}
+
+// scopeClosedEvent decodes one scope event, reporting whether it is a
+// closure.
+func scopeClosedEvent(t *testing.T, event Event) (protocol.ScopeEvent, bool) {
+	t.Helper()
+	if eventKind(t, event) != "scope_closed" {
+		return protocol.ScopeEvent{}, false
+	}
+	body, err := event.AsScopeEvent()
+	if err != nil {
+		t.Fatalf("scope event body: %v", err)
+	}
+	return body, true
+}
+
+// committedTail drains the remaining closed subscription, keeping the
+// committed order exact while accounting the passive facts of the real
+// Sessions — a foreign identity fatals inside the recorder.
+func committedTail(t *testing.T, sub *Subscription, sessionIDs ...string) []Event {
+	t.Helper()
+	var out []Event
+	for _, event := range drainClosed(t, sub) {
+		recordCommittedEvent(t, &out, event, sessionIDs...)
+	}
+	return out
+}
+
+// scopeNamesRealSession reports whether one event scope names one of the
+// given real Sessions.
+func scopeNamesRealSession(t *testing.T, scope protocol.Scope, sessionIDs ...string) bool {
+	t.Helper()
+	if scope.SessionId == nil {
+		return false
+	}
+	for _, sessionID := range sessionIDs {
+		if *scope.SessionId == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

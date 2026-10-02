@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -182,22 +181,32 @@ func (s *configurationService) nextGeneration() (uint64, error) {
 }
 
 // commit publishes the validated candidate as the ready snapshot with its
-// one event; the caller holds the build mutex. The global warning groups
-// follow the published candidate: refreshed under the build mutex so a later
-// publication can never interleave an earlier candidate's refresh, and
-// reached only after the caller's final cancellation checkpoint, from which
-// no failure returns. The build mutex releases inside the commit, before the
-// enqueue.
+// events; the caller holds the build mutex. The global warning groups follow
+// the published candidate: refreshed through the store's non-reentrant cores
+// inside the one observation section, so a later publication can never
+// interleave an earlier candidate's refresh and no nested publication exists,
+// and reached only after the caller's final cancellation checkpoint, from
+// which no failure returns. The section stores the candidate, releases the
+// build mutex, and enqueues the configuration event plus one final
+// runtime-scoped warning event exactly when any group changed — each changed
+// group keeps its own revision increment.
 func (s *configurationService) commit(candidate *configuration) {
-	if s.warnings != nil {
-		s.warnings.setGlobal("setup", setupWarnings(candidate))
-		s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings))
-		s.warnings.setGlobal("agents", agentWarnings(candidate.agentWarnings))
-	}
-	s.obs.publish(func() {
+	s.obs.publish(func() []Event {
+		warningChanged := false
+		if s.warnings != nil {
+			warningChanged = s.warnings.setGlobal("setup", setupWarnings(candidate)) || warningChanged
+			warningChanged = s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings)) || warningChanged
+			warningChanged = s.warnings.setGlobal("agents", agentWarnings(candidate.agentWarnings)) || warningChanged
+		}
+		revision := s.warnings.storeRevision()
 		s.published.Store(candidate)
 		s.buildMu.Unlock()
-	}, Event{Kind: EventConfiguration, ConfigurationRevision: strconv.FormatUint(candidate.generation, 10)})
+		events := []Event{configurationChangedEvent(candidate.generation)}
+		if warningChanged {
+			events = append(events, warningChangedEvent(runtimeEventScope(), revision))
+		}
+		return events
+	})
 }
 
 // canceled applies the caller-first cancellation rule: a done caller context

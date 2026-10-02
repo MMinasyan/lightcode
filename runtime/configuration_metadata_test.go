@@ -147,11 +147,11 @@ func metadataBaseline(t *testing.T, svc *configurationService, configPath string
 
 // drainMutationEvent consumes exactly the one event a successful edit
 // publishes, so a later refusal's silence assertion observes a quiet stream.
+// The one global warning event a warning-changing edit additionally requires
+// is tolerated only by callers that drain it explicitly.
 func drainMutationEvent(t *testing.T, sub *Subscription, generation string) {
 	t.Helper()
-	if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != generation {
-		t.Fatalf("edit event = %+v (ok=%v), want the generation %s configuration event", event, ok, generation)
-	}
+	nextConfigurationEvent(t, sub, generation)
 }
 
 // bigLexeme decodes one raw JSON member's exact number lexeme.
@@ -245,10 +245,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	if entry == nil || entry.Source != catalog.SourceUser || entry.Name != "a/b" {
 		t.Fatalf("slash model = %+v, want a user-sourced entry named by its ID", entry)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != "2" {
-		t.Fatalf("create event = %+v (ok=%v), want exactly the generation 2 configuration event", event, ok)
-	}
-	assertNoEvent(t, sub)
+	drainMutationEventWithWarning(t, sub, "2", svc.warnings)
 
 	// The raw file: the written members, an untouched unowned member, the
 	// untouched sibling's exact numeric lexeme, and no secret value anywhere.
@@ -722,7 +719,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 		protocol.ProviderEdit{BaseUrl: &[]string{"https://keyless.test/v1"}[0]}, valid, nil)); err != nil {
 		t.Fatalf("create keyless: %v", err)
 	}
-	drainMutationEvent(t, sub, "2")
+	drainMutationEventWithWarning(t, sub, "2", svc.warnings)
 	candidate, err := svc.mutate(context.Background(), svc.editProviderDelete("keyless"))
 	if err != nil || candidate.generation != 3 {
 		t.Fatalf("keyless delete = (%v, generation %d), want a publication at 3", err, candidate.generation)
@@ -730,9 +727,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	if candidate.catalog.Providers["keyless"] != nil {
 		t.Fatal("the deleted provider stayed in the candidate catalog")
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "3" {
-		t.Fatalf("delete event = %+v (ok=%v), want generation 3", event, ok)
-	}
+	drainMutationEventWithWarning(t, sub, "3", svc.warnings)
 
 	// The connected env-keyed custom is refused (unique at this layer: no
 	// direct Runtime row drives a connected env-keyed deletion).
@@ -776,7 +771,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 		protocol.ProviderEdit{BaseUrl: &[]string{"https://temp.test/v1"}[0]}, valid, nil)); err != nil {
 		t.Fatalf("create temp: %v", err)
 	}
-	drainMutationEvent(t, sub, "5")
+	drainMutationEventWithWarning(t, sub, "5", svc.warnings)
 	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
 	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
@@ -1074,7 +1069,7 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "bare", protocol.ModelEdit{})); err != nil {
 		t.Fatalf("empty patch upsert: %v", err)
 	}
-	drainMutationEvent(t, sub, "6")
+	drainMutationEventWithWarning(t, sub, "6", svc.warnings)
 
 	// An explicit zero context_window is a real value (the typed target and
 	// the catalog admit 0/incomplete models; there is no positivity rule):
@@ -1083,7 +1078,7 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{ContextWindow: &zero})); err != nil {
 		t.Fatalf("explicit zero window patch: %v", err)
 	}
-	drainMutationEvent(t, sub, "7")
+	drainMutationEventWithWarning(t, sub, "7", svc.warnings)
 	zeroEntry := svc.current().catalog.Providers["prov"].Models["m"]
 	if zeroEntry == nil || zeroEntry.ContextWindow != 0 {
 		t.Fatalf("model after explicit zero window = %+v, want the written 0 window retained as incomplete", zeroEntry)
@@ -1380,7 +1375,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 		if mutation.Result.Id != "newp" || mutation.Result.Builtin || len(mutation.Result.Models) != 1 || mutation.Result.Models[0].Source != protocol.ModelSource("user") {
 			t.Fatalf("created result = %+v, want the newp provider view with its user model", mutation.Result)
 		}
-		drainMutationEvent(t, sub, "2")
+		drainMutationEventWithWarning(t, sub, "2", r.warnings)
 
 		// The patch: the result projects the returned candidate.
 		name := "Patched"
@@ -1388,7 +1383,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "3" || mutation.Result.Name != "Patched" {
 			t.Fatalf("updateProvider = (%v, %+v), want the patched view at generation 3", err, mutation)
 		}
-		drainMutationEvent(t, sub, "3")
+		drainMutationEventWithWarning(t, sub, "3", r.warnings)
 
 		// The reset: the previous effective name is restored.
 		mutation, err = r.resetProviderField(ctx, "prov", protocol.ResetProviderFieldParamsFieldName)

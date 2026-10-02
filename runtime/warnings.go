@@ -51,58 +51,79 @@ func (s *warningStore) close() {
 }
 
 // setGroup replaces one group, deduplicating identical (kind,message) pairs
-// in producer order. An unchanged replacement advances nothing; a changed
-// one replaces or deletes the group and advances the revision — a successful
-// preparation with no warnings clears its Session's prior group.
-func (s *warningStore) setGroup(group warningGroup, warnings []protocol.Warning) {
+// in producer order. It is the non-reentrant mutation core: an unchanged
+// replacement advances nothing; a changed one replaces or deletes the group
+// and advances the revision — a successful preparation with no warnings
+// clears its Session's prior group. Publication (the warning_changed hint)
+// is composed by the caller inside its observation section; this core never
+// publishes.
+func (s *warningStore) setGroup(group warningGroup, warnings []protocol.Warning) bool {
 	if s == nil {
-		return
+		return false
 	}
 	deduped := dedupeWarnings(warnings)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return
+		return false
 	}
 	if existing, ok := s.groups[group]; ok && equalWarnings(existing, deduped) {
-		return
+		return false
 	}
 	if len(deduped) == 0 {
 		if _, ok := s.groups[group]; !ok {
-			return // clearing an absent group changed nothing
+			return false // clearing an absent group changed nothing
 		}
 		delete(s.groups, group)
 	} else {
 		s.groups[group] = deduped
 	}
 	s.revision++
+	return true
 }
 
 // setGlobal replaces one global group from a successful configuration
 // publication.
-func (s *warningStore) setGlobal(source protocol.WarningSource, warnings []protocol.Warning) {
-	s.setGroup(warningGroup{source: source}, warnings)
+func (s *warningStore) setGlobal(source protocol.WarningSource, warnings []protocol.Warning) bool {
+	return s.setGroup(warningGroup{source: source}, warnings)
 }
 
 // setSessionPrompt replaces one Session's prompt group from a successful
 // preparation.
-func (s *warningStore) setSessionPrompt(sessionID string, warnings []protocol.Warning) {
-	s.setGroup(warningGroup{source: "prompt", sessionID: sessionID}, warnings)
+func (s *warningStore) setSessionPrompt(sessionID string, warnings []protocol.Warning) bool {
+	return s.setGroup(warningGroup{source: "prompt", sessionID: sessionID}, warnings)
 }
 
 // appendProtocol adds one execution's protocol diagnostics to the owning
 // Session's protocol group, deduplicating identical (kind,message) pairs
 // while preserving producer order. Encoding succeeded whenever diagnostics
-// are present, including a physical transport failure after encoding.
-func (s *warningStore) appendProtocol(sessionID string, warnings []protocol.Warning) {
+// are present, including a physical transport failure after encoding. The
+// core never publishes.
+func (s *warningStore) appendProtocol(sessionID string, warnings []protocol.Warning) bool {
 	if s == nil || len(warnings) == 0 {
-		return
+		return false
 	}
-	group := warningGroup{source: "protocol", sessionID: sessionID}
+	return s.appendGroup(warningGroup{source: "protocol", sessionID: sessionID}, warnings)
+}
+
+// addLSP appends one Runtime-scoped plugin report to the Runtime-global LSP
+// group — the retained append shape, never a replacement — deduplicating
+// identical (kind,message) pairs in producer order. Reports after closure are
+// ignored; the core never publishes.
+func (s *warningStore) addLSP(kind, message string) bool {
+	if s == nil {
+		return false
+	}
+	return s.appendGroup(warningGroup{source: "lsp"}, []protocol.Warning{{Source: "lsp", Kind: kind, Message: message}})
+}
+
+// appendGroup is the shared append core: producer order with (kind,message)
+// dedupe, change-gated on real growth.
+func (s *warningStore) appendGroup(group warningGroup, warnings []protocol.Warning) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return
+		return false
 	}
 	merged := append([]protocol.Warning(nil), s.groups[group]...)
 	changed := false
@@ -114,10 +135,23 @@ func (s *warningStore) appendProtocol(sessionID string, warnings []protocol.Warn
 		changed = true
 	}
 	if !changed {
-		return
+		return false
 	}
 	s.groups[group] = merged
 	s.revision++
+	return true
+}
+
+// storeRevision reads the current revision under the store mutex; every
+// production mutation happens inside an observation section, so the value is
+// stable within one.
+func (s *warningStore) storeRevision() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revision
 }
 
 // snapshot is the complete unfiltered read.

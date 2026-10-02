@@ -70,27 +70,55 @@ func (h *Harness) emitFact(fact HarnessFact) {
 	h.deps.Observe(fact)
 }
 
-// currentRevision samples one coordinator's current revision pair after the
-// producer released its state lock. The coordinator mutex carries the pair and
-// the deletion flag, and the registry mutex taken inside that hold (the
-// permitted c.mu→h.mu order) carries the corruption marker, whose writers may
-// not hold the coordinator mutex; a deleted or corrupt coordinator therefore
-// suppresses a delayed stale hint. No snapshot or history copy is built to
-// read the pair.
-func (h *Harness) currentRevision(c *coordinator) (string, SessionRevision, bool) {
+// readObservation samples one coordinator's current identity and revision
+// pair under the coordinator mutex, reading the corruption marker through
+// the registry mutex taken inside that hold (the permitted c.mu→h.mu order),
+// whose writers may not hold the coordinator mutex. A deleted or corrupt
+// coordinator reports false. No snapshot or history copy is built to read
+// the pair; the identity is copied by value from the cached graph.
+func (h *Harness) readObservation(c *coordinator) (SessionIdentity, SessionRevision, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.gone {
-		return "", SessionRevision{}, false
+		return SessionIdentity{}, SessionRevision{}, false
 	}
-	sessionID := c.graph.Session.Identity.SessionID
+	identity := c.graph.Session.Identity
 	h.mu.Lock()
 	corrupt := c.corru
 	h.mu.Unlock()
 	if corrupt != nil {
+		return SessionIdentity{}, SessionRevision{}, false
+	}
+	return identity, SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev}, true
+}
+
+// currentRevision samples one coordinator's current revision pair after the
+// producer released its state lock, delegating to the shared cached sample.
+// A deleted or corrupt coordinator suppresses a delayed stale hint. No
+// snapshot or history copy is built to read the pair.
+func (h *Harness) currentRevision(c *coordinator) (string, SessionRevision, bool) {
+	identity, revision, ok := h.readObservation(c)
+	if !ok {
 		return "", SessionRevision{}, false
 	}
-	return sessionID, SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev}, true
+	return identity.SessionID, revision, true
+}
+
+// ReadObservation reads one Session's current identity and revision pair
+// from the cached coordinator only: the registry is consulted under the
+// registry mutex and released, and the sample then follows the same
+// coordinator validity rule as the passive facts. A cache miss, a deleted, or
+// a corrupt Session reports false; no materialization, storage read, or
+// registry growth happens. It is the passive publishers' cached identity
+// read, never an authoritative snapshot.
+func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRevision, bool) {
+	h.mu.Lock()
+	c := h.sessions[sessionID]
+	h.mu.Unlock()
+	if c == nil {
+		return SessionIdentity{}, SessionRevision{}, false
+	}
+	return h.readObservation(c)
 }
 
 // observeInvalidation emits one Session-scoped invalidation with the current

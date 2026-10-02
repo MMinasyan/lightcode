@@ -1410,3 +1410,94 @@ func TestObserveRestartNoReplay(t *testing.T) {
 		t.Fatalf("the new owner's first publication emitted %+v", got)
 	}
 }
+
+// observationCountingStorage fails every read and counts every access: the
+// cached-only observation read must perform no storage work at all.
+type observationCountingStorage struct {
+	Storage
+	calls int
+}
+
+func (s *observationCountingStorage) ReadEntries(ctx context.Context, sessionID string, after int64) ([]Entry, error) {
+	s.calls++
+	return s.Storage.ReadEntries(ctx, sessionID, after)
+}
+
+func (s *observationCountingStorage) ReadRegister(ctx context.Context, key RegisterKey) (Register, error) {
+	s.calls++
+	return s.Storage.ReadRegister(ctx, key)
+}
+
+func (s *observationCountingStorage) ReadRegisters(ctx context.Context, sessionID string) ([]Register, error) {
+	s.calls++
+	return s.Storage.ReadRegisters(ctx, sessionID)
+}
+
+// TestReadObservation pins the cached-only observation read: a warm valid
+// coordinator returns the identity (with its Workspace) and the current pair;
+// a cache miss, a deleted, and a corrupt Session report false without any
+// storage access; a cold Session is never materialized by the read.
+func TestReadObservation(t *testing.T) {
+	t.Run("valid warm coordinator", func(t *testing.T) {
+		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
+		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+			t.Fatalf("ReadSession: %v", err)
+		}
+		identity, revision, ok := h.ReadObservation(testSessionID)
+		if !ok {
+			t.Fatal("ReadObservation on a warm coordinator reported unavailable")
+		}
+		if identity.SessionID != testSessionID {
+			t.Fatalf("identity session = %q, want %q", identity.SessionID, testSessionID)
+		}
+		if identity.Workspace == "" {
+			t.Fatal("identity carries no workspace")
+		}
+		if want := snapshotPair(t, h, testSessionID); revision != want {
+			t.Fatalf("pair = %+v, want the current pair %+v", revision, want)
+		}
+	})
+
+	t.Run("cache miss performs no storage work", func(t *testing.T) {
+		store := &observationCountingStorage{Storage: freshSessionStore(t)}
+		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
+		if _, _, ok := h.ReadObservation(testSessionID); ok {
+			t.Fatal("ReadObservation on a never-materialized Session reported available")
+		}
+		if store.calls != 0 {
+			t.Fatalf("storage calls on a cache miss = %d, want zero", store.calls)
+		}
+		// The read left the registry cold: a repeat miss performs no work and
+		// the Session stays unmaterialized.
+		if _, _, ok := h.ReadObservation(testSessionID); ok {
+			t.Fatal("repeat ReadObservation materialized the Session")
+		}
+		if store.calls != 0 {
+			t.Fatalf("storage calls after repeat = %d, want zero", store.calls)
+		}
+	})
+
+	t.Run("deleted", func(t *testing.T) {
+		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
+		if _, err := h.ArchiveSession(context.Background(), testSessionID); err != nil {
+			t.Fatalf("ArchiveSession: %v", err)
+		}
+		if err := h.DeleteSession(context.Background(), testSessionID); err != nil {
+			t.Fatalf("DeleteSession: %v", err)
+		}
+		if _, _, ok := h.ReadObservation(testSessionID); ok {
+			t.Fatal("ReadObservation after deletion reported available")
+		}
+	})
+
+	t.Run("corrupt", func(t *testing.T) {
+		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
+		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+			t.Fatalf("ReadSession: %v", err)
+		}
+		h.markCorrupt(testSessionID, corruptSession(testSessionID, "injected corruption"))
+		if _, _, ok := h.ReadObservation(testSessionID); ok {
+			t.Fatal("ReadObservation on a corrupt Session reported available")
+		}
+	})
+}

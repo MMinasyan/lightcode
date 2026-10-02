@@ -57,10 +57,50 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 			t.Fatalf("createSession: %v", err)
 		}
 		sessionID := session.Identity.SessionID
+		promptSub, err := r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(promptSub.Close)
 
 		// Successful preparation: the assembled prompt warning replaces the
-		// (absent) prior group under the admitted Session identity.
+		// (absent) prior group under the admitted Session identity and its
+		// warning_changed hint names the Session scope — the Workspace from
+		// the cached identity read — with the advanced revision.
 		submitThroughRuntime(t, r, sessionID, "op-1", "please write")
+		var promptHint *protocol.WarningChangedEvent
+		progressBeforeHint := false
+		for promptHint == nil {
+			event, ok := nextEvent(t, promptSub)
+			if !ok {
+				t.Fatal("the prompt subscription closed before the preparation's warning hint")
+			}
+			switch eventKind(t, event) {
+			case "text_delta", "tool_started", "tool_finished":
+				// The preparation's publication precedes every effect of the
+				// admitted Operation: a warning hint that only arrives after
+				// the Operation's progress is not the preparation's hint.
+				progressBeforeHint = true
+				continue
+			case "warning_changed":
+				body, err := event.AsWarningChangedEvent()
+				if err != nil {
+					t.Fatalf("warning event body: %v", err)
+				}
+				if body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
+					promptHint = &body
+				}
+			}
+		}
+		if progressBeforeHint {
+			t.Fatal("the Session's first warning hint arrived after the Operation's progress, want the preparation's own publication")
+		}
+		if promptHint.Scope.Workspace == nil || *promptHint.Scope.Workspace != e.workspace("prompt-ws") {
+			t.Fatalf("prompt warning hint scope = %+v, want the cached workspace identity", promptHint.Scope)
+		}
+		if revision, err := warnRevision(promptHint.WarningsRevision.Revision); err != nil || revision == 0 {
+			t.Fatalf("prompt warning hint revision = %q, want an advanced counter", promptHint.WarningsRevision.Revision)
+		}
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitSessionNotBusy(t, r, sessionID)
 		first, err := r.getWarnings(ctx)
@@ -136,6 +176,31 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		}
 		if !slices.Equal(warningBodies(before.Warnings), warningBodies(after.Warnings)) {
 			t.Fatalf("warnings changed on failed preparations:\n%v\n%v", warningBodies(before.Warnings), warningBodies(after.Warnings))
+		}
+		// No warning hint fired for the failed preparation or hook: the
+		// passive stream stays silent for both new Sessions. The earlier
+		// successful preparations' own hints may still be queued, so only
+		// the original Session's hints are tolerated.
+		for {
+			select {
+			case event, ok := <-promptSub.Events():
+				if !ok {
+					t.Fatal("the prompt subscription closed around the failed preparations")
+				}
+				if eventKind(t, event) != "warning_changed" {
+					continue
+				}
+				body, err := event.AsWarningChangedEvent()
+				if err != nil {
+					t.Fatalf("warning event body: %v", err)
+				}
+				if body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
+					continue
+				}
+				t.Fatalf("a failed preparation published a warning hint: %+v", body)
+			default:
+			}
+			break
 		}
 	})
 }
@@ -347,11 +412,38 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 			t.Fatalf("createSession: %v", err)
 		}
 		sessionID := session.Identity.SessionID
+		protocolSub, err := r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(protocolSub.Close)
 
 		// Turn 1: the tool call turn succeeds; the follow-up re-encodes the
 		// replay-kept assistant-with-tool-calls message and the missing
-		// must-preserve field fires once per attempt.
+		// must-preserve field fires once per attempt. The diagnostic's
+		// warning_changed hint is Session-scoped and the settlement stays
+		// the Operation's own success.
 		submitThroughRuntime(t, r, sessionID, "op-1", "please write")
+		var protocolHint *protocol.WarningChangedEvent
+		for protocolHint == nil {
+			event, ok := nextEvent(t, protocolSub)
+			if !ok {
+				t.Fatal("the protocol subscription closed before the diagnostic hint")
+			}
+			if eventKind(t, event) != "warning_changed" {
+				continue
+			}
+			body, err := event.AsWarningChangedEvent()
+			if err != nil {
+				t.Fatalf("warning event body: %v", err)
+			}
+			if body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
+				protocolHint = &body
+			}
+		}
+		if protocolHint.Scope.Workspace == nil || *protocolHint.Scope.Workspace != e.workspace("protocol-ws") {
+			t.Fatalf("protocol diagnostic hint scope = %+v, want the cached workspace identity", protocolHint.Scope)
+		}
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		first, err := r.getWarnings(ctx)
 		if err != nil {
@@ -466,7 +558,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			t.Fatalf("publish: %v", err)
 		}
 		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, warnings, nil, nil)
+		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, newObservationAdapter(obs, warnings), nil, nil)
 
 		prepared, err := p.bind()(context.Background(), compactPrepRequest())
 		if err != nil {

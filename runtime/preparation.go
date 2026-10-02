@@ -55,15 +55,19 @@ type selection struct {
 
 // preparationWarnings collects one preparation's presentation values.
 type preparationWarnings struct {
-	store     *warningStore
+	publisher *observationAdapter
 	sessionID string
 	prompt    []prompt.Warning
 }
 
 // publish replaces the owning Session's prompt group with the collected
-// values; a nil store drops the presentation.
+// values through the passive publication adapter; a nil adapter drops the
+// presentation.
 func (w *preparationWarnings) publish() {
-	w.store.setSessionPrompt(w.sessionID, promptWarnings(w.sessionID, w.prompt))
+	if w == nil {
+		return
+	}
+	w.publisher.publishPrompt(w.sessionID, promptWarnings(w.sessionID, w.prompt))
 }
 
 // promptWarnings maps the assembled prompt diagnostics onto the store's
@@ -139,7 +143,7 @@ type preparation struct {
 	workspaces  *workspaceScopes
 	home        string
 	background  BackgroundServices
-	warnings    *warningStore
+	passive     *observationAdapter
 	prepare     prepare
 
 	// subprocessEnv is the Runtime's live managed-environment producer,
@@ -153,12 +157,12 @@ type preparation struct {
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
 // once-resolved home, the background services bridge armed after harness.New
-// returns, the Runtime-owned warning store (nil in isolated preparation
-// tests, dropping only passive presentation), the Runtime's live
+// returns, the Runtime's passive publication adapter (nil in isolated
+// preparation tests, dropping only passive presentation), the Runtime's live
 // managed-environment producer (nil without a retained manager), and the
 // controlled preparation function; nil selects the concrete production
 // preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, warnings *warningStore, subprocessEnv func() []string, prepare prepare) *preparation {
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, subprocessEnv func() []string, prepare prepare) *preparation {
 	return &preparation{
 		config:        config,
 		composition:   c,
@@ -166,7 +170,7 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 		workspaces:    workspaces,
 		home:          home,
 		background:    background,
-		warnings:      warnings,
+		passive:       passive,
 		subprocessEnv: subprocessEnv,
 		prepare:       prepare,
 	}
@@ -210,7 +214,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		// The per-preparation collector is allocated owned: only a successful
 		// preparation — validation, hooks and cancellation checks all passed —
 		// publishes its values under the admitted Session identity.
-		input.warnings = &preparationWarnings{store: p.warnings, sessionID: req.Session.Identity.SessionID}
+		input.warnings = &preparationWarnings{publisher: p.passive, sessionID: req.Session.Identity.SessionID}
 		prepare := p.prepare
 		if prepare == nil {
 			prepare = p.concretePrepare
@@ -665,12 +669,12 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 				// The attempt's diagnostics are recorded under the admitted
 				// Session identity even when the physical request failed after
 				// encoding succeeded — a diagnostic is presentation only.
-				p.warnings.appendProtocol(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
+				p.passive.appendProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
 				stream, warnings, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
-				p.warnings.appendProtocol(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
+				p.passive.appendProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			// A nil Retry selects the standard classifier.

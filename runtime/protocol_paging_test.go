@@ -1276,6 +1276,10 @@ func TestHydrationAndPageReturnedValueOwnership(t *testing.T) {
 		session := projectionSession(t, r, "/tmp/paging-owned", "solo").Identity.SessionID
 		submitConvergedThroughRuntime(t, r, session, "op-1", "work", harness.OperationSuccess)
 		e.prep.awaitCleanups(1)
+		// The run slot retires after the terminal is durably visible, and its
+		// retirement is a coordinator-local publication: the immutable
+		// baseline must be taken only after the busy state has cleared.
+		awaitSessionNotBusy(t, r, session)
 
 		page, err := r.getHistory(context.Background(), session, nil)
 		if err != nil {

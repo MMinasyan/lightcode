@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // Error identities reported by typed composition and scope lifetime.
@@ -56,13 +57,23 @@ func (k ScopeKind) rank() int {
 // same normalized owner root in every ScopeInfo. Workspace scopes carry only
 // lexical Workspace identity, never Session or Operation attribution; the
 // Runtime scope carries no narrower attribution at all; short scopes carry
-// the complete Workspace/Session/Operation identity.
+// the complete Workspace/Session/Operation identity. ReportWarning is the
+// Runtime's passive warning-report callback: only the Runtime scope carries
+// it, a plugin that needs it captures it at Open, and it grants no authority
+// — reports are presentation only and are ignored after the warning store's
+// closure.
 type ScopeInfo struct {
 	Kind        ScopeKind
 	DataDir     string
 	Workspace   string
 	SessionID   string
 	OperationID string
+
+	// ReportWarning reports one typed warning from a Runtime-scoped plugin
+	// into the Runtime-owned warning store. It is the retained manager
+	// callback's exact shape and performs no I/O or work under plugin state
+	// locks.
+	ReportWarning func(kind, message string)
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is
@@ -498,7 +509,10 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 	if sc.obs != nil && info.Kind != ScopeWorkspace {
 		// Construction completion is this scope's publication; a Workspace
 		// scope publishes later, at the registry commit in build.
-		sc.obs.publish(commit, scopeEvent(EventScopeOpened, info))
+		sc.obs.publish(func() []Event {
+			commit()
+			return []Event{scopeEvent(protocol.ScopeOpened, info)}
+		})
 	} else {
 		commit()
 	}
@@ -662,7 +676,10 @@ func (s *scope) close() error {
 		s.mu.Unlock()
 	}
 	if s.obs != nil {
-		s.obs.publish(commit, scopeEvent(EventScopeClosed, s.info))
+		s.obs.publish(func() []Event {
+			commit()
+			return []Event{scopeEvent(protocol.ScopeClosed, s.info)}
+		})
 	} else {
 		commit()
 	}
@@ -779,7 +796,7 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 		close(attempt.done)
 		return
 	}
-	w.obs.publish(func() {
+	w.obs.publish(func() []Event {
 		sc.obs = w.obs
 		w.mu.Lock()
 		delete(w.attempts, key)
@@ -787,7 +804,8 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 		w.mu.Unlock()
 		attempt.sc, attempt.err = sc, nil
 		close(attempt.done)
-	}, scopeEvent(EventScopeOpened, info))
+		return []Event{scopeEvent(protocol.ScopeOpened, info)}
+	})
 }
 
 // shutdown is called once by the Runtime owner. It closes registry admission,

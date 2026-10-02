@@ -363,8 +363,8 @@ func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.
 		if err != nil {
 			t.Fatalf("initial publish: %v", err)
 		}
-		if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != "1" {
-			t.Fatalf("initial publication event = %+v (ok=%v), want the generation 1 configuration event", event, ok)
+		if event, ok := nextEvent(t, sub); !ok || eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != "1" {
+			t.Fatalf("initial publication event = %s (ok=%v), want the generation 1 configuration event", eventJSON(t, event), ok)
 		}
 		if _, err := svc.publish(context.Background()); !errors.Is(err, ErrConfiguration) || !errors.Is(err, errValidator) {
 			t.Fatalf("reload = %v, want a rejection preserving the validator source error", err)

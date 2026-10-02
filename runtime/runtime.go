@@ -162,9 +162,12 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 
 	obs := newObservation()
-	// The warning store initializes before any plugin scope opens: scopes
-	// and preparations report into it from the moment they exist.
+	// The warning store and the passive publication adapter initialize
+	// before any plugin scope opens: the Runtime scope's identity carries
+	// the adapter's LSP closure, and scopes and preparations report into the
+	// store from the moment they exist.
 	warnings := newWarningStore()
+	adapter := newObservationAdapter(obs, warnings)
 	loader := catalog.NewLoader(home, nil)
 	configService := newConfigurationService(work, c, loader, configPath, obs)
 	configService.attachWarnings(warnings)
@@ -178,7 +181,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ReportWarning: adapter.reportLSP}, nil)
 	if err != nil {
 		return unlock(err)
 	}
@@ -215,15 +218,17 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, warnings, subprocessEnv, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, subprocessEnv, options.prepare).bind(),
+		Observe: adapter.observe,
 	})
 	if err != nil {
 		return unwind(err)
 	}
 	// Armed before publication: harness.New performed no I/O and the first
 	// Prepare requires the admission gate, so no caller can observe the
-	// unarmed bridge.
+	// unarmed bridge or the adapter's unbound Harness.
 	background.h = h
+	adapter.h = h
 
 	r := &Runtime{
 		lock:         lock,

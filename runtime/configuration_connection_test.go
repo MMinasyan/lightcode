@@ -211,18 +211,29 @@ func assertNoConnectionPublication(t *testing.T, r *Runtime, sub *Subscription, 
 	assertConnectionEnvSilent(t, r)
 }
 
-// drainConnectionEvent consumes exactly the one configuration event a single
-// completed connection operator publishes and then pins the stream silent.
-// Batched writers keep draining with drainMutationEvent before one final
-// silence assertion.
-func drainConnectionEvent(t *testing.T, sub *Subscription, generation string) Event {
+// drainConnectionEvent consumes exactly the events a single completed
+// connection operator publishes: the one configuration event, plus the one
+// global warning event a warning-changing publication additionally requires —
+// tolerated only when it is exactly the store's current revision, the one
+// the change advanced — and then pins the stream silent. Batched writers
+// keep draining with drainMutationEvent before one final silence assertion.
+func drainConnectionEvent(t *testing.T, store *warningStore, sub *Subscription, generation string) Event {
 	t.Helper()
 	event, ok := nextEvent(t, sub)
-	if !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != generation {
-		t.Fatalf("connection event = %+v (ok=%v), want the generation %s configuration event", event, ok, generation)
+	if !ok || eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != generation {
+		t.Fatalf("connection event = %s (ok=%v), want the generation %s configuration event", eventJSON(t, event), ok, generation)
 	}
-	assertNoEvent(t, sub)
+	drainOptionalWarningEvent(t, store, sub)
 	return event
+}
+
+// drainOptionalWarningEvent consumes the optional global warning event of
+// one warning-changing publication — its revision a real store value — and
+// then pins the stream silent.
+func drainOptionalWarningEvent(t *testing.T, store *warningStore, sub *Subscription) {
+	t.Helper()
+	consumeOptionalWarningEvent(t, sub, store)
+	assertNoEvent(t, sub)
 }
 
 // assertDiscoveryCacheLacks proves one fetched payload never reached the
@@ -267,7 +278,7 @@ func TestConnectProviderDiscoveryBackedManagedKey(t *testing.T) {
 		if len(mutation.Result.Models) == 0 || !mutation.Result.Models[0].Usable {
 			t.Fatalf("connected provider models = %+v, want the fetched usable model", mutation.Result.Models)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 
 		// The existing provider's connection owns no file: the configured
 		// main and agents bytes are untouched while the generation advanced.
@@ -351,12 +362,12 @@ func TestConnectProviderRepeatStillPublishes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read config: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		second, err := r.connectProvider(ctx, "usablep", nil)
 		if err != nil || second.ConfigurationRevision.Generation != "3" {
 			t.Fatalf("repeat connect = (%v, %q), want generation 3", err, second.ConfigurationRevision.Generation)
 		}
-		drainConnectionEvent(t, sub, "3")
+		drainConnectionEvent(t, r.warnings, sub, "3")
 		after, err := os.ReadFile(r.config.configPath)
 		if err != nil || string(after) != string(before) {
 			t.Fatalf("repeat connect changed the owning config (%v)", err)
@@ -432,7 +443,7 @@ func TestConnectProviderUsableSkipsFetch(t *testing.T) {
 			mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
 			t.Fatalf("usable connect = (%q, %+v), want generation 2 and a managed connected provider", mutation.ConfigurationRevision.Generation, mutation.Result)
 		}
-		event := drainConnectionEvent(t, sub, "2")
+		event := drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_USABLE_KEY") != connectionKey || !r.managedEnv.IsManaged("CONNECTION_USABLE_KEY") {
 			t.Fatalf("supplied key state = (%q, %v), want it TrySet through the manager", os.Getenv("CONNECTION_USABLE_KEY"), r.managedEnv.IsManaged("CONNECTION_USABLE_KEY"))
 		}
@@ -539,7 +550,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 		if _, err := r.Reload(ctx); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		fetches := server.requests()
 
 		key := connectionKey
@@ -556,7 +567,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 		if len(headers) != 2 || headers["authorization"] != "Bearer configured-lower" || headers["AUTHORIZATION"] != "Bearer configured-upper" {
 			t.Fatalf("captured transport headers = %v, want the raw spellings intact", headers)
 		}
-		drainConnectionEvent(t, sub, "3")
+		drainConnectionEvent(t, r.warnings, sub, "3")
 	})
 }
 
@@ -589,7 +600,7 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 		if _, err := r.Reload(ctx); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		fetches := server.requests()
@@ -814,7 +825,7 @@ func TestConnectProviderRaceRemovedRefusesBeforeWrites(t *testing.T) {
 		if _, err := f.r.deleteProvider(ctx, "discp"); err != nil {
 			t.Fatalf("deleteProvider during the parked fetch: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, f.r.warnings, sub, "2")
 		f.captureBaseline(t)
 		f.proceed()
 		f.join()
@@ -844,7 +855,7 @@ func TestConnectProviderRaceTransportChangedRefuses(t *testing.T) {
 		if _, err := f.r.updateProvider(ctx, "discp", protocol.ProviderEdit{BaseUrl: &moved}); err != nil {
 			t.Fatalf("updateProvider during the parked fetch: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, f.r.warnings, sub, "2")
 		f.captureBaseline(t)
 		f.proceed()
 		f.join()
@@ -923,11 +934,17 @@ func TestConnectProviderRaceConcurrentModelsSkipsCacheWrite(t *testing.T) {
 		}
 		proceed()
 		<-done
-		drainMutationEvent(t, sub, "2") // the concurrent writer's publication
+		// The batched pair: each publication's warning event is required only
+		// when its own refresh changed the store — the concurrent writer's
+		// and the connect's groups interleave — so each is consumed optionally
+		// and the sequence ends with one silence check.
+		nextConfigurationEvent(t, sub, "2")
+		consumeOptionalWarningEvent(t, sub, r.warnings)
 		if result.err != nil || result.mutation.ConfigurationRevision.Generation != "3" {
 			t.Fatalf("raced connect = (%v, %+v), want success at generation 3", result.err, result.mutation)
 		}
-		drainMutationEvent(t, sub, "3")
+		nextConfigurationEvent(t, sub, "3")
+		consumeOptionalWarningEvent(t, sub, r.warnings)
 		assertNoEvent(t, sub)
 		after, err := os.ReadFile(r.config.configPath)
 		if err != nil || string(after) == string(before) {
@@ -1082,7 +1099,7 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 		if _, err := r.Reload(ctx); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
@@ -1187,7 +1204,7 @@ func TestConnectProviderPublicationSurvivesLateCancellation(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatalf("connect after late cancellation = %v, want the ready publication", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_DISC_KEY") != connectionKey || !r.managedEnv.IsManaged("CONNECTION_DISC_KEY") {
 			t.Fatalf("late-canceled connect key state = (%q, %v)", os.Getenv("CONNECTION_DISC_KEY"), r.managedEnv.IsManaged("CONNECTION_DISC_KEY"))
 		}
@@ -1276,7 +1293,7 @@ func TestDisconnectProviderUnusableRemovesManagedKey(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("unusable disconnect = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_DISC_KEY") != "" || r.managedEnv.IsManaged("CONNECTION_DISC_KEY") {
 			t.Fatal("the managed key survived the unusable provider's disconnect")
 		}
@@ -1310,7 +1327,7 @@ func TestDisconnectProviderManagedKey(t *testing.T) {
 		if mutation.Result.Connected || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceNone) {
 			t.Fatalf("disconnected provider view = %+v, want the disconnected status", mutation.Result)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_USABLE_KEY") != "" || r.managedEnv.IsManaged("CONNECTION_USABLE_KEY") {
 			t.Fatal("the managed key survived the disconnect")
 		}
@@ -1379,7 +1396,7 @@ func TestDisconnectProviderAbsentUnmanagedSucceeds(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("absent-key disconnect = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		after, err := os.ReadFile(r.config.configPath)
 		if err != nil || string(after) != string(before) {
 			t.Fatalf("absent-key disconnect changed the owning config (%v)", err)
@@ -1405,14 +1422,14 @@ func TestDisconnectProviderRepeatStillPublishes(t *testing.T) {
 		if _, err := r.disconnectProvider(ctx, "usablep"); err != nil {
 			t.Fatalf("first disconnect: %v", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		// The second disconnect takes the absent-unmanaged path and STILL
 		// publishes the ready next generation.
 		second, err := r.disconnectProvider(ctx, "usablep")
 		if err != nil || second.ConfigurationRevision.Generation != "3" {
 			t.Fatalf("repeat disconnect = (%v, %+v), want generation 3", err, second)
 		}
-		drainConnectionEvent(t, sub, "3")
+		drainConnectionEvent(t, r.warnings, sub, "3")
 	})
 }
 
@@ -1450,7 +1467,7 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("latest-raw disconnect = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.BaseUrl != moved || mutation.Result.ApiKeyEnv != "CONNECTION_USABLE_KEY" || mutation.Result.Connected {
 			t.Fatalf("disconnect result = %+v, want the latest raw transport and the disconnected status", mutation.Result)
 		}
@@ -1499,7 +1516,7 @@ func TestDisconnectProviderLatestRawEnvRebindKeepsExternalSibling(t *testing.T) 
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("rebound disconnect = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.ApiKeyEnv != "CONNECTION_REBOUND_KEY" || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceExternal) || !mutation.Result.Connected {
 			t.Fatalf("rebound disconnect result = %+v, want the latest external binding", mutation.Result)
 		}
@@ -1587,7 +1604,7 @@ func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("addProvider = (%v, %+v), want generation 2", err, mutation)
 		}
-		event := drainConnectionEvent(t, sub, "2")
+		event := drainConnectionEvent(t, r.warnings, sub, "2")
 
 		// The generated name went to the raw layer, the exact (untrimmed)
 		// value only to the managed env.
@@ -1643,7 +1660,7 @@ func TestCreateProviderExplicitEmptyEnvKeyless(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("addProvider = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceKeyless) {
 			t.Fatalf("created provider key source = %q, want keyless", mutation.Result.KeySource)
 		}
@@ -1683,7 +1700,7 @@ func TestCreateProviderShellKeyNoPersist(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("addProvider = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceExternal) {
 			t.Fatalf("created provider key source = %q, want external", mutation.Result.KeySource)
 		}
@@ -1724,7 +1741,7 @@ func TestCreateProviderManagedOrphanKeyUpdatedBySuppliedValue(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("managed-orphan create = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_ORPHAN_KEY") != key || !r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY") {
 			t.Fatalf("managed orphan state = (%q, %v), want the supplied replacement", os.Getenv("CONNECTION_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY"))
 		}
@@ -1770,7 +1787,7 @@ func TestCreateProviderManagedEmptyKeyFilledBySuppliedValue(t *testing.T) {
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key); err != nil {
 			t.Fatalf("managed-empty create = %v, want the supplied value to fill the managed name", err)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY") != key || !r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY") {
 			t.Fatalf("managed-empty state = (%q, %v), want the supplied value", os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY"))
 		}
@@ -1808,7 +1825,7 @@ func TestCreateProviderManagedNameWithoutSuppliedKeyUsesExisting(t *testing.T) {
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("managed-existing create = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
 			t.Fatalf("created provider key source = %q, want managed", mutation.Result.KeySource)
 		}
@@ -1849,7 +1866,7 @@ func TestCreateProviderGeneratedNameCollisionUpdatesManagedOrphan(t *testing.T) 
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("generated-collision create = (%v, %+v), want generation 2", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if mutation.Result.ApiKeyEnv != "LIGHTCODE_NEWP_API_KEY" || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
 			t.Fatalf("generated collision result = %+v, want the generated managed name", mutation.Result)
 		}
@@ -1889,7 +1906,7 @@ func TestCreateProviderExternalSiblingWinsOverSuppliedReplacement(t *testing.T) 
 		if err != nil || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceExternal) {
 			t.Fatalf("external-sibling create = (%v, %+v), want the external source", err, mutation)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		if os.Getenv("CONNECTION_EXTERNAL_SIBLING_KEY") != "shell-exported-value" || r.managedEnv.IsManaged("CONNECTION_EXTERNAL_SIBLING_KEY") {
 			t.Fatalf("external sibling state = (%q, %v), want it untouched and unmanaged", os.Getenv("CONNECTION_EXTERNAL_SIBLING_KEY"), r.managedEnv.IsManaged("CONNECTION_EXTERNAL_SIBLING_KEY"))
 		}
@@ -2516,7 +2533,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceKeyless) || !mutation.Result.Connected {
 			t.Fatalf("keyless provider view = %+v, want connected keyless", mutation.Result)
 		}
-		drainConnectionEvent(t, sub, "2")
+		drainConnectionEvent(t, r.warnings, sub, "2")
 		after, err := os.ReadFile(r.config.configPath)
 		if err != nil || string(after) != string(before) {
 			t.Fatalf("keyless connect changed the owning config (%v)", err)
@@ -2532,7 +2549,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 		if _, err := r.Reload(ctx); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
-		drainConnectionEvent(t, sub, "3")
+		drainConnectionEvent(t, r.warnings, sub, "3")
 		dotsBefore, _, _ := runtimeMutationBaseline(t, r)
 		reserveEnvKey(t, "CONNECTION_DOTS_KEY")
 		t.Setenv("CONNECTION_DOTS_KEY", "dots-key-value")
@@ -2543,7 +2560,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 		if dotsMutation.ConfigurationRevision.Generation != "4" {
 			t.Fatalf("dotdot connect generation = %q, want 4", dotsMutation.ConfigurationRevision.Generation)
 		}
-		drainConnectionEvent(t, sub, "4")
+		drainConnectionEvent(t, r.warnings, sub, "4")
 		dotsAfter, err := os.ReadFile(r.config.configPath)
 		if err != nil || string(dotsAfter) != string(dotsBefore) {
 			t.Fatalf("dotdot connect changed the owning config (%v)", err)

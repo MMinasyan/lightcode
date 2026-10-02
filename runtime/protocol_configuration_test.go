@@ -585,6 +585,11 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		disconnectedDoc := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"UNSET_SETUP_KEY"},"discovery":false,"models":{"m":{"context_window":4096}}}}}`
 		r, _ := openConfigurationRuntimeWithEnv(t, store, e, disconnectedDoc, configurationAgentsDocument)
 		defer closeProjectionRuntime(r)
+		setupSub, err := r.Subscribe(64)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(setupSub.Close)
 
 		// Disconnected: no_provider plus the primary model's unavailability.
 		snap, err := r.getWarnings(context.Background())
@@ -602,12 +607,29 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		}
 
 		// Connect (the managed key writes through the retained path) and
-		// reload: the setup warnings clear and the revision advances once.
+		// reload: the setup warnings clear and the publication carries its
+		// warning hint — one configuration event then one runtime-scoped
+		// warning event with the advanced revision.
 		if err := r.managedEnv.Set("UNSET_SETUP_KEY", "setup-secret"); err != nil {
 			t.Fatalf("managed set: %v", err)
 		}
 		if _, err := r.Reload(context.Background()); err != nil {
 			t.Fatalf("Reload: %v", err)
+		}
+		clearingConfig, ok := nextEvent(t, setupSub)
+		if !ok || eventKind(t, clearingConfig) != "configuration_changed" {
+			t.Fatalf("clearing reload's configuration event = %s (ok=%v)", eventJSON(t, clearingConfig), ok)
+		}
+		clearingWarning, ok := nextEvent(t, setupSub)
+		if !ok || eventKind(t, clearingWarning) != "warning_changed" {
+			t.Fatalf("clearing reload's warning event = %s (ok=%v), want the required warning hint after the configuration event", eventJSON(t, clearingWarning), ok)
+		}
+		clearingBody, err := clearingWarning.AsWarningChangedEvent()
+		if err != nil {
+			t.Fatalf("warning event body: %v", err)
+		}
+		if clearingBody.Scope.Kind != protocol.ScopeKindRuntime {
+			t.Fatalf("clearing reload's warning scope = %+v, want the runtime scope", clearingBody.Scope)
 		}
 		clear, err := r.getWarnings(context.Background())
 		if err != nil {
@@ -623,10 +645,20 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 			t.Fatalf("warning revision after the clearing reload = %v, want an advanced nonzero counter", clear.WarningsRevision.Revision)
 		}
 
-		// Idempotent reports advance nothing: reload again with no change.
+		if clearingBody.WarningsRevision.Revision != clear.WarningsRevision.Revision {
+			t.Fatalf("clearing reload's warning hint revision = %q, want the store's current value %q", clearingBody.WarningsRevision.Revision, clear.WarningsRevision.Revision)
+		}
+
+		// Idempotent reports advance nothing: reload again with no change —
+		// exactly one configuration event and NO warning hint.
 		if _, err := r.Reload(context.Background()); err != nil {
 			t.Fatalf("Reload again: %v", err)
 		}
+		idempotentConfig, ok := nextEvent(t, setupSub)
+		if !ok || eventKind(t, idempotentConfig) != "configuration_changed" {
+			t.Fatalf("unchanged reload's configuration event = %s (ok=%v)", eventJSON(t, idempotentConfig), ok)
+		}
+		assertNoEvent(t, setupSub)
 		idempotent, err := r.getWarnings(context.Background())
 		if err != nil {
 			t.Fatalf("getWarnings after idempotent reload: %v", err)

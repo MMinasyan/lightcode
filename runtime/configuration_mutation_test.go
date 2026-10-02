@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -242,9 +243,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	}
 
 	// One event for the successful edit, at the written generation.
-	if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != "2" {
-		t.Fatalf("edit event = %+v (ok=%v), want the generation 2 configuration event", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
 	assertNoEvent(t, sub)
 }
 
@@ -273,9 +272,7 @@ func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), editSettings(settings)); err != nil {
 		t.Fatalf("first mutate: %v", err)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-		t.Fatalf("first mutate event = %+v (ok=%v), want generation 2", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
 	if syncs := probe.count(); syncs != 1 {
 		t.Fatalf("owning writes so far = %d, want 1", syncs)
 	}
@@ -289,9 +286,7 @@ func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	if candidate.generation != 3 || svc.current() != candidate {
 		t.Fatalf("identical mutate = generation %d, want 3 published", candidate.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "3" {
-		t.Fatalf("identical mutate event = %+v (ok=%v), want generation 3", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "3")
 	if syncs := probe.count(); syncs != 2 {
 		t.Fatalf("owning writes after the identical edit = %d, want 2", syncs)
 	}
@@ -313,9 +308,7 @@ func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	if candidate.generation != 4 {
 		t.Fatalf("generation = %d, want 4 — external byte equality must not skip publication", candidate.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "4" {
-		t.Fatalf("event = %+v (ok=%v), want generation 4", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "4")
 	if syncs := probe.count(); syncs != 3 {
 		t.Fatalf("owning writes after the external-editor edit = %d, want 3", syncs)
 	}
@@ -543,9 +536,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if found, model := hasDefinition(candidate, "worker"); !found || model != "prov/m" {
 		t.Fatalf("worker definition = (%v, %q), want the new override", found, model)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-		t.Fatalf("set event = %+v (ok=%v), want generation 2", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
 	if root := fileRoot(t, agentsPath); compactJSON(t, root["worker"]) != `{"model":"prov/m","system_prompt":"simple"}` {
 		t.Fatalf("worker entry = %s, want the model added beside the kept member", root["worker"])
 	}
@@ -555,9 +546,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if err != nil || candidate.generation != 3 {
 		t.Fatalf("identical model edit = (%v, generation %d), want generation 3", err, candidate.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "3" {
-		t.Fatalf("identical edit event = %+v (ok=%v), want generation 3", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "3")
 
 	// Clear: the override is removed, the entry's other member kept.
 	candidate, err = svc.mutate(context.Background(), svc.editAgentModel("worker", ""))
@@ -567,9 +556,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if found, model := hasDefinition(candidate, "worker"); !found || model != "" {
 		t.Fatalf("worker definition = (%v, %q), want the cleared override", found, model)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "4" {
-		t.Fatalf("clear event = %+v (ok=%v), want generation 4", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "4")
 	if root := fileRoot(t, agentsPath); compactJSON(t, root["worker"]) != `{"system_prompt":"simple"}` {
 		t.Fatalf("worker entry = %s, want the model member removed", root["worker"])
 	}
@@ -585,9 +572,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if err != nil || candidate.generation != 5 {
 		t.Fatalf("absent-override clear = (%v, generation %d), want a successful edit at generation 5", err, candidate.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "5" {
-		t.Fatalf("absent-override clear event = %+v (ok=%v), want generation 5", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "5")
 	if syncs := probe.count(); syncs != 1 {
 		t.Fatalf("owning writes for the absent-override clear = %d, want a real write", syncs)
 	}
@@ -605,9 +590,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if found, model := hasDefinition(candidate, "primary"); !found || model != "prov/m" {
 		t.Fatalf("primary definition = (%v, %q), want the new override", found, model)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "6" {
-		t.Fatalf("builtin edit event = %+v (ok=%v), want generation 6", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "6")
 	if root := fileRoot(t, agentsPath); compactJSON(t, root["primary"]) != `{"model":"prov/m"}` {
 		t.Fatalf("primary entry = %s, want the bare model-only overlay", root["primary"])
 	}
@@ -644,9 +627,7 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 		if got := fmt.Sprint(candidate.generation); got != generation {
 			t.Fatalf("empty-ref clear generation = %s, want %s — the repeat must advance again", got, generation)
 		}
-		if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != generation {
-			t.Fatalf("empty-ref clear event = %+v (ok=%v), want generation %s", event, ok, generation)
-		}
+		nextConfigurationEvent(t, sub, generation)
 	}
 	if syncs := probe.count(); syncs != 2 {
 		t.Fatalf("owning writes = %d, want a real write per request", syncs)
@@ -910,9 +891,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			if err != nil || candidate.generation != 2 || svc.current() != candidate {
 				t.Fatalf("inverse edit = (%v, generation %d), want a successful publication at 2", err, candidate.generation)
 			}
-			if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-				t.Fatalf("inverse event = %+v (ok=%v), want generation 2", event, ok)
-			}
+			nextConfigurationEvent(t, sub, "2")
 		})
 	}
 }
@@ -1066,9 +1045,7 @@ func TestConfigurationMutateCompletesPublicationAfterWriteStarts(t *testing.T) {
 	if got.cfg.generation != 2 || svc.current() != got.cfg {
 		t.Fatalf("post-cancel publication = generation %d, want 2 published", got.cfg.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-		t.Fatalf("event = %+v (ok=%v), want the generation 2 configuration event", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
 	root := fileRoot(t, h.configPath)
 	if !strings.Contains(compactJSON(t, root["sessions"]), `"archive_after_days":5`) {
 		t.Fatalf("owning file = %s, want the written sessions member", root["sessions"])
@@ -1177,12 +1154,8 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 	if got := <-reload; got.err != nil || got.revision != "3" {
 		t.Fatalf("reload = %+v, want generation 3 after the serialized mutation", got)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-		t.Fatalf("first event = %+v (ok=%v), want generation 2", event, ok)
-	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "3" {
-		t.Fatalf("second event = %+v (ok=%v), want generation 3", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
+	nextConfigurationEvent(t, sub, "3")
 }
 
 // --- Runtime clients ---
@@ -1239,9 +1212,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 			t.Fatalf("fresh settings = rev %+v sessions %+v, want the stale writer's value at generation 3", fresh.ConfigurationRevision, fresh.Settings.Sessions)
 		}
 		for _, want := range []string{"2", "3"} {
-			if event, ok := nextEvent(t, sub); !ok || event.Kind != EventConfiguration || event.ConfigurationRevision != want {
-				t.Fatalf("event = %+v (ok=%v), want configuration %s", event, ok, want)
-			}
+			nextConfigurationEvent(t, sub, want)
 		}
 	})
 }
@@ -1502,9 +1473,7 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	if got.cfg.generation != 2 || svc.current() != got.cfg {
 		t.Fatalf("race mutation = generation %d, want 2 published", got.cfg.generation)
 	}
-	if event, ok := nextEvent(t, sub); !ok || event.ConfigurationRevision != "2" {
-		t.Fatalf("race event = %+v (ok=%v), want exactly the generation 2 configuration event", event, ok)
-	}
+	nextConfigurationEvent(t, sub, "2")
 
 	// The file: the complete earlier candidate bytes won — the captured old
 	// provider value is preserved, the external member is gone, and the
@@ -1538,5 +1507,72 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	view := svc.current().settings
 	if view.Sessions != mutationSettings().Sessions || view.Plugins.Tools == nil || (*view.Plugins.Tools).MaxOutputBytes != 2048 {
 		t.Fatalf("published settings = %+v, want the requested shape", view)
+	}
+}
+
+// nextConfigurationEvent reads one event and proves it is the configuration
+// publication of the given generation.
+func nextConfigurationEvent(t *testing.T, sub *Subscription, generation string) {
+	t.Helper()
+	event, ok := nextEvent(t, sub)
+	if !ok || eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != generation {
+		t.Fatalf("event = %s (ok=%v), want the generation %s configuration event", eventJSON(t, event), ok, generation)
+	}
+}
+
+// drainMutationEventWithWarning consumes the events of one successful
+// warning-changing edit: the generation's configuration event plus the one
+// REQUIRED global warning event — its revision must be a real store state,
+// nonzero and never beyond the store's current value — and then pins the
+// stream silent.
+func drainMutationEventWithWarning(t *testing.T, sub *Subscription, generation string, store *warningStore) {
+	t.Helper()
+	nextConfigurationEvent(t, sub, generation)
+	event, ok := nextEvent(t, sub)
+	if !ok || eventKind(t, event) != "warning_changed" {
+		t.Fatalf("warning-changing edit event = %s (ok=%v), want the global warning event", eventJSON(t, event), ok)
+	}
+	requireRealWarningRevision(t, event, store)
+}
+
+// consumeOptionalWarningEvent consumes the global warning event when one
+// immediately follows the just-read configuration event, requiring its
+// revision to be a real store value. It asserts no silence — the batched
+// sequence's later publications are still queued — so the caller's final
+// silence check closes the sequence.
+func consumeOptionalWarningEvent(t *testing.T, sub *Subscription, store *warningStore) {
+	t.Helper()
+	select {
+	case event, ok := <-sub.Events():
+		if !ok {
+			t.Fatal("the subscription closed before the end of its batch")
+		}
+		if eventKind(t, event) != "warning_changed" {
+			t.Fatalf("batched publication event = %s, want the optional global warning event", eventJSON(t, event))
+		}
+		requireRealWarningRevision(t, event, store)
+	default:
+	}
+}
+
+// requireRealWarningRevision proves one warning event carries a real store
+// revision: nonzero and never beyond the store's current value — in a
+// batched sequence each event names the revision of its own publication.
+func requireRealWarningRevision(t *testing.T, event Event, store *warningStore) {
+	t.Helper()
+	body, err := event.AsWarningChangedEvent()
+	if err != nil {
+		t.Fatalf("warning event body: %v", err)
+	}
+	if body.Scope.Kind != protocol.ScopeKindRuntime {
+		t.Fatalf("warning event scope kind = %q, want the runtime scope", body.Scope.Kind)
+	}
+	revision, err := strconv.ParseUint(body.WarningsRevision.Revision, 10, 64)
+	if err != nil || revision == 0 {
+		t.Fatalf("warning event revision = %q, want a real advanced value", body.WarningsRevision.Revision)
+	}
+	current, _ := store.snapshot()
+	if revision > current {
+		t.Fatalf("warning event revision = %d, beyond the store's current value %d", revision, current)
 	}
 }
