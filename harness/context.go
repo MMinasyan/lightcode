@@ -171,8 +171,11 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			c.discardBuffers()
+			discarded := c.discardBuffers()
 			c.mu.Unlock()
+			if discarded {
+				h.observeInvalidation(c)
+			}
 			return
 		}
 		if ctx.Err() != nil { // a canceled boundary context leaves unpopped items for the post-terminal drain
@@ -187,6 +190,7 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 		c.steering = c.steering[1:]
 		c.bumpLocalRevision() // the pop is a coordinator-local publication; the durable delivery follows in its own hold
 		c.mu.Unlock()
+		h.observeInvalidation(c)
 		if err := h.commitSteeringInput(h.ctx, c, operationID, item.origin, item.content); err != nil {
 			_ = err // one failed delivery attempt is final for the item; the next proceeds
 		}
@@ -320,5 +324,6 @@ func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, opera
 	c.graph.Entries = append(c.graph.Entries, graphEntry{Envelope: inserted, Input: &input})
 	c.graph.Session = committedSession
 	c.mu.Unlock()
+	h.observeInvalidation(c) // the durable steering-input advance
 	return nil
 }

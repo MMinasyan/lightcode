@@ -613,7 +613,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("coordinatorFor(child): %v", err)
 	}
-	release, err := childC.reserve(context.Background())
+	release, err := h.reserve(context.Background(), childC)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}

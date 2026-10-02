@@ -163,7 +163,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			}
 			stream, attemptErr := attempt(ctx, req)
 			if attemptErr == nil && stream != nil {
-				output, attemptErr = assemble(intent.expected, stream) // exactly one assembly after acceptance
+				output, attemptErr = assemble(intent.expected, h.observeStream(intent.sessionID, operationID, stream)) // exactly one assembly after acceptance
 				if attemptErr != nil {
 					return settle(attemptErr)
 				}
@@ -604,6 +604,8 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 	c.graph.replaceOperation(operationID, committedOp)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
+	h.observeInvalidation(c) // every result/terminal Session register replacement advances
+	h.emitToolResultFacts(newEntries, sessionID, operationID)
 	return committedOp, nil
 }
 
@@ -1143,6 +1145,17 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 		if err != nil {
 			return model.ToolResult{}, err
 		}
+		// The live dispatcher entry: one started fact after the durable pending
+		// call resolved, before any validation, hook, permission or execution.
+		// A dispatched denial, error, immediate or interrupted call shares it.
+		h.emitFact(HarnessFact{
+			Kind:        FactToolStarted,
+			SessionID:   pending.AssistantEntry.SessionID,
+			OperationID: operationID,
+			CallID:      record.ID,
+			Ordinal:     record.Ordinal,
+			Name:        record.Name,
+		})
 		settleCtx := context.WithoutCancel(h.ctx)
 		if ctx.Err() != nil { // execution cancellation prevents later preparation: interrupted-before-execution
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, false)
@@ -1447,6 +1460,8 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	c.graph.replaceOperation(operationID, updated)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
+	h.observeInvalidation(c) // every tool result replaces the Session register
+	h.emitToolResultFacts(newEntries, sessionID, operationID)
 	return outcome.Result, nil
 }
 
@@ -1701,6 +1716,7 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 	c.graph.replaceOperation(operationID, updated)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
+	h.observeInvalidation(c) // every hook result replaces the Session register; hooks have no progress kind
 	return committed, nil
 }
 

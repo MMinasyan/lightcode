@@ -21,12 +21,16 @@ type JobStopper interface {
 }
 
 // Dependencies are the construction inputs of one Harness: the durable
-// Storage and the single preparation callback shared by every admission
-// producer.
+// Storage, the single preparation callback shared by every admission
+// producer, and the optional passive observer of committed invalidation and
+// transient model/tool progress. The observer is synchronous, expected
+// nonblocking, and grants no authority: a nil observer is a no-op and a
+// failing observer never changes a transition or a settlement.
 type Dependencies struct {
 	Storage Storage
 	Prepare func(context.Context, PreparationRequest) (PreparedExecution, error)
 	Jobs    JobStopper
+	Observe func(HarnessFact)
 }
 
 // PreparationSession is the revision-free owned Session view one preparation
@@ -299,9 +303,11 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	}); err != nil {
 		return SessionRecord{}, err
 	}
+	created := &coordinator{graph: &sessionGraph{Session: record}, bgState: bgOpen}
 	h.mu.Lock()
-	h.sessions[sessionID] = &coordinator{graph: &sessionGraph{Session: record}, bgState: bgOpen}
+	h.sessions[sessionID] = created
 	h.mu.Unlock()
+	h.observeInvalidation(created) // the durable creation is the first Session publication
 	return ownSessionRecord(record), nil
 }
 
@@ -415,6 +421,7 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 		c.graph.Session = updated
 		result := ownSessionRecord(updated)
 		c.mu.Unlock()
+		h.observeInvalidation(c) // the durable Agent-type advance
 		return result, nil
 	}
 }
@@ -446,7 +453,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	release, err := c.reserve(ctx) // the reservation precedes every routing decision
+	release, err := h.reserve(ctx, c) // the reservation precedes every routing decision
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -492,6 +499,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		}
 		c.bumpLocalRevision() // the buffer enqueue is a coordinator-local publication
 		c.mu.Unlock()
+		h.observeInvalidation(c)
 		return SubmitResult{Disposition: disposition}, nil
 	}
 	c.mu.Unlock()
@@ -561,7 +569,7 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 	if err != nil || existing {
 		return rec, err
 	}
-	release, err := c.reserve(ctx)
+	release, err := h.reserve(ctx, c)
 	if err != nil {
 		return OperationRecord{}, err
 	}
@@ -657,6 +665,7 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 		c.graph.Session = updated
 		result := ownSessionRecord(updated)
 		c.mu.Unlock()
+		h.observeInvalidation(c) // the durable reopen advance
 		return result, nil
 	}
 }
@@ -744,6 +753,7 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 		result := ownSessionRecord(updated)
 		c.steering, c.queued = nil, nil // the buffers clear only after the commit
 		c.mu.Unlock()
+		h.observeInvalidation(c) // the durable archive advance covers the buffer clear
 		return result, nil
 	}
 }
@@ -951,6 +961,9 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 			c.steering, c.queued = nil, nil // like ArchiveSession: the buffers clear only after the commit
 		}
 		c.mu.Unlock()
+		if didArchive {
+			h.observeInvalidation(c) // the durable sweep archive advance
+		}
 		return false, nil
 	}
 }
@@ -965,15 +978,17 @@ func (c *coordinator) bumpLocalRevision() {
 }
 
 // discardBuffers clears both process-local FIFOs under the caller-held
-// coordinator mutex, advancing the local revision when the discard changed
-// any buffered item. Lifecycle and sweep clears ride their newer Session
-// register and the deletion invalidation clears an absent coordinator, so
-// neither goes through here.
-func (c *coordinator) discardBuffers() {
-	if len(c.steering) > 0 || len(c.queued) > 0 {
+// coordinator mutex, reporting whether the discard changed any buffered item
+// and advanced the local revision. Lifecycle and sweep clears ride their newer
+// Session register and the deletion invalidation clears an absent coordinator,
+// so neither goes through here.
+func (c *coordinator) discardBuffers() bool {
+	changed := len(c.steering) > 0 || len(c.queued) > 0
+	if changed {
 		c.localRev++
 	}
 	c.steering, c.queued = nil, nil
+	return changed
 }
 
 // invalidate marks one coordinator absent under the caller-held coordinator
@@ -1091,15 +1106,19 @@ func (h *Harness) markCorrupt(sessionID string, err error) {
 
 // reserve takes the Session's single admission reservation, waiting while
 // another reservation is held, subject to the caller's context. The returned
-// release resolves it exactly once.
-func (c *coordinator) reserve(ctx context.Context) (func(), error) {
+// release resolves it exactly once. The reservation is a coordinator-local
+// publication and emits its invalidation after the coordinator mutex is
+// released; the reservation channel is not a state mutex, so ordinary reads
+// proceed while it is held.
+func (h *Harness) reserve(ctx context.Context, c *coordinator) (func(), error) {
 	for {
 		c.mu.Lock()
 		if c.reserved == nil {
 			c.reserved = make(chan struct{})
 			c.bumpLocalRevision() // the reservation is an ExecutionBusy publication
 			c.mu.Unlock()
-			return c.releaseReservation, nil
+			h.observeInvalidation(c)
+			return func() { h.releaseReservation(c) }, nil
 		}
 		held := c.reserved
 		c.mu.Unlock()
@@ -1111,14 +1130,19 @@ func (c *coordinator) reserve(ctx context.Context) (func(), error) {
 	}
 }
 
-func (c *coordinator) releaseReservation() {
+func (h *Harness) releaseReservation(c *coordinator) {
 	c.mu.Lock()
+	released := false
 	if c.reserved != nil {
 		close(c.reserved)
 		c.reserved = nil
 		c.bumpLocalRevision() // the release is an ExecutionBusy publication
+		released = true
 	}
 	c.mu.Unlock()
+	if released {
+		h.observeInvalidation(c)
+	}
 }
 
 // waitIdle waits until no admission reservation is held. A caller that
@@ -1219,7 +1243,7 @@ func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRec
 	}
 	c.mu.Unlock()
 
-	release, err := c.reserve(ctx)
+	release, err := h.reserve(ctx, c)
 	if err != nil {
 		return OperationRecord{}, "", err
 	}
@@ -1451,6 +1475,7 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 	c.graph.Operations = append(c.graph.Operations, published)
 	c.graph.Session = newSession
 	c.mu.Unlock()
+	h.observeInvalidation(c) // the durable admission advance
 	return published, false, nil
 }
 
@@ -1610,16 +1635,22 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	c.run = run
 	c.bumpLocalRevision() // the run slot's installation is an ExecutionBusy publication
 	c.mu.Unlock()
+	h.observeInvalidation(c)
 	go func() {
 		err := h.execute(c, operationID, prepared, run.execCtx)
 		h.recordStorageFailure(err)
 		h.drainBuffers(c, run)
+		retired := false
 		c.mu.Lock()
 		if c.run == run { // a buffered drain may have installed the next execution already
 			c.run = nil
 			c.bumpLocalRevision()
+			retired = true
 		}
 		c.mu.Unlock()
+		if retired {
+			h.observeInvalidation(c)
+		}
 		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
 		h.childCompletionSettled(c, operationID)
 		close(run.done)
@@ -1639,7 +1670,7 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
 	c.mu.Unlock()
-	release, err := c.reserve(h.ctx)
+	release, err := h.reserve(h.ctx, c)
 	if err != nil {
 		return
 	}
@@ -1647,8 +1678,11 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			c.discardBuffers()
+			discarded := c.discardBuffers()
 			c.mu.Unlock()
+			if discarded {
+				h.observeInvalidation(c)
+			}
 			return
 		}
 		if c.graph.Session.State.CurrentOperationID != "" { // the drain publishes only after terminal commit
@@ -1662,15 +1696,21 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 		case len(c.queued) > 0:
 			item, c.queued = c.queued[0], c.queued[1:]
 		default: // the FIFO scan is empty: retire this run's slot in the same critical section
+			retired := false
 			if c.run == run { // never clear a replacement run
 				c.run = nil
 				c.bumpLocalRevision()
+				retired = true
 			}
 			c.mu.Unlock()
+			if retired {
+				h.observeInvalidation(c)
+			}
 			return
 		}
 		c.bumpLocalRevision() // the pop is a coordinator-local publication; the delivery attempt happens outside this hold
 		c.mu.Unlock()
+		h.observeInvalidation(c)
 		rec, prepared, disposition, err := h.admitReserved(h.ctx, c, admissionRequest{
 			SessionID:   sessionID,
 			OperationID: item.operationID,
@@ -1770,8 +1810,11 @@ func (h *Harness) Wait(ctx context.Context) error {
 			if c.reserved != nil || c.run != nil {
 				busy = true
 			}
-			c.discardBuffers() // Harness loss discards both buffers on every coordinator
+			discarded := c.discardBuffers() // Harness loss discards both buffers on every coordinator
 			c.mu.Unlock()
+			if discarded {
+				h.observeInvalidation(c)
+			}
 		}
 		if !busy {
 			h.mu.Lock()

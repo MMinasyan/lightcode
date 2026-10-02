@@ -1,0 +1,192 @@
+package harness
+
+import "github.com/MMinasyan/lightcode/model"
+
+// HarnessFactKind is the closed kind of one passive HarnessFact. It is exactly
+// the set of SSE-originating progress and invalidation facts; no other kind is
+// added by a plugin, an adapter, or a caller.
+type HarnessFactKind string
+
+const (
+	// FactInvalidation reports that one Session's durable register revision or
+	// its coordinator-local revision advanced. It carries the Session identity
+	// and the current value pair; a job member admission or finish additionally
+	// names the Job.
+	FactInvalidation HarnessFactKind = "invalidation"
+	// FactTextDelta reports one nonempty transient text fragment of an accepted
+	// model stream. It carries no authority: the committed assistant entry is
+	// the authoritative value.
+	FactTextDelta HarnessFactKind = "text_delta"
+	// FactToolStarted reports one dispatched tool call. It is emitted once at
+	// the live dispatcher entry, before any branch-specific validation, hook,
+	// permission decision, or execution.
+	FactToolStarted HarnessFactKind = "tool_started"
+	// FactToolFinished reports one committed tool result, including the
+	// synthetic interrupted result a terminal settlement writes for a call
+	// that was never dispatched.
+	FactToolFinished HarnessFactKind = "tool_finished"
+)
+
+// SessionRevision is the value identity of one Session's revision pair: the
+// durable Session register revision and the coordinator-local publication
+// counter. It carries no instance identity and no codec; the wire adds the
+// owning Runtime instance separately.
+type SessionRevision struct {
+	DurableRevision int64
+	LocalRevision   uint64
+}
+
+// HarnessFact is one passive observation of the Harness: a closed union whose
+// members are exactly the fields the fact's Kind requires. An invalidation
+// carries SessionID, the optional JobID of a job member admission or finish,
+// and Revision; a text delta carries SessionID, OperationID, Position, and the
+// nonempty Content; a tool start carries SessionID, OperationID, CallID,
+// Ordinal, and Name; a tool finish carries SessionID, OperationID, CallID, and
+// the closed Status. Every field a kind does not require stays zero. A fact
+// grants no authority: it can never alter an admission, an effect, a
+// settlement, or a lifecycle transition.
+type HarnessFact struct {
+	Kind        HarnessFactKind
+	SessionID   string
+	OperationID string
+	JobID       string
+	Revision    SessionRevision
+	Position    int
+	Content     string
+	CallID      string
+	Ordinal     int64
+	Name        string
+	Status      model.ToolResultStatus
+}
+
+// emitFact delivers one passive fact to the optional observer. A nil observer
+// is a no-op, delivery is synchronous, and a panicking observer is contained:
+// passive observation never changes settlement and is never retried.
+func (h *Harness) emitFact(fact HarnessFact) {
+	if h.deps.Observe == nil {
+		return
+	}
+	defer func() { _ = recover() }() // the callback alone is contained; no logging, retry, or error return
+	h.deps.Observe(fact)
+}
+
+// currentRevision samples one coordinator's current revision pair after the
+// producer released its state lock. The coordinator mutex carries the pair and
+// the deletion flag, and the registry mutex taken inside that hold (the
+// permitted c.mu→h.mu order) carries the corruption marker, whose writers may
+// not hold the coordinator mutex; a deleted or corrupt coordinator therefore
+// suppresses a delayed stale hint. No snapshot or history copy is built to
+// read the pair.
+func (h *Harness) currentRevision(c *coordinator) (string, SessionRevision, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gone {
+		return "", SessionRevision{}, false
+	}
+	sessionID := c.graph.Session.Identity.SessionID
+	h.mu.Lock()
+	corrupt := c.corru
+	h.mu.Unlock()
+	if corrupt != nil {
+		return "", SessionRevision{}, false
+	}
+	return sessionID, SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev}, true
+}
+
+// observeInvalidation emits one Session-scoped invalidation with the current
+// pair. It is the one emission every durable Session advance and every
+// coordinator-local publication calls after releasing its lock and transaction.
+func (h *Harness) observeInvalidation(c *coordinator) {
+	if h.deps.Observe == nil {
+		return
+	}
+	sessionID, rev, ok := h.currentRevision(c)
+	if !ok {
+		return
+	}
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, Revision: rev})
+}
+
+// observeMemberInvalidation emits one Job-scoped invalidation for a job
+// member's admission or finish: the owning Session identity, the Job identity,
+// and the current pair. Child members and group transitions use
+// observeInvalidation and never name a Job.
+func (h *Harness) observeMemberInvalidation(c *coordinator, jobID string) {
+	if h.deps.Observe == nil {
+		return
+	}
+	sessionID, rev, ok := h.currentRevision(c)
+	if !ok {
+		return
+	}
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, JobID: jobID, Revision: rev})
+}
+
+// emitToolResultFacts delivers one finished fact per committed tool-result
+// entry, derived from the adopted entries rather than a started registry: a
+// live dispatched result and a terminal settlement's synthetic unstarted
+// result both finish through this one path.
+func (h *Harness) emitToolResultFacts(entries []graphEntry, sessionID, operationID string) {
+	for _, entry := range entries {
+		if entry.ToolResult == nil {
+			continue
+		}
+		h.emitFact(HarnessFact{
+			Kind:        FactToolFinished,
+			SessionID:   sessionID,
+			OperationID: operationID,
+			CallID:      entry.ToolResult.ToolCallID,
+			Status:      entry.ToolResult.Status,
+		})
+	}
+}
+
+// observeStream wraps one accepted model stream for passive text-delta
+// observation; without an observer the stream passes through untouched. The
+// wrapper is the single accepted→assemble handoff for both the conversation
+// and the compact model transport.
+func (h *Harness) observeStream(sessionID, operationID string, stream model.Stream) model.Stream {
+	if h.deps.Observe == nil {
+		return stream
+	}
+	return observedStream{inner: stream, emit: func(position int, content string) {
+		h.emitFact(HarnessFact{
+			Kind:        FactTextDelta,
+			SessionID:   sessionID,
+			OperationID: operationID,
+			Position:    position,
+			Content:     content,
+		})
+	}}
+}
+
+// observedStream is the one accepted-stream wrapper: Recv delegates unchanged,
+// Close delegates exactly once, and only a successfully parsed choice-bearing
+// delta contributes one fact per nonempty text fragment. An empty, non-text,
+// or invalid delta emits nothing, and a delta returned together with an error
+// (EOF included) emits nothing; the original delta and error are always
+// returned exactly as received. No reasoning, tool, refusal, or finish
+// fragment is interpreted, and no second assembler or accumulator exists.
+type observedStream struct {
+	inner model.Stream
+	emit  func(position int, content string)
+}
+
+func (s observedStream) Recv() (model.StreamDelta, error) {
+	delta, err := s.inner.Recv()
+	if err != nil || !delta.HasChoice {
+		return delta, err
+	}
+	owned, verr := model.NewStreamDelta(delta) // validation gate only; the original delta is returned unchanged
+	if verr != nil {
+		return delta, err
+	}
+	for _, fragment := range owned.ContentFragments {
+		if fragment.Kind == model.PartText && fragment.Text != "" {
+			s.emit(fragment.Position, fragment.Text)
+		}
+	}
+	return delta, err
+}
+
+func (s observedStream) Close() error { return s.inner.Close() }

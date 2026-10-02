@@ -64,7 +64,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 	if err != nil {
 		return ForkResult{}, err
 	}
-	release, err := c.reserve(ctx)
+	release, err := h.reserve(ctx, c)
 	if err != nil {
 		return ForkResult{}, err
 	}
@@ -113,6 +113,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 	h.mu.Lock()
 	h.sessions[destID] = dest
 	h.mu.Unlock()
+	h.observeInvalidation(dest)                       // the durable fork destination creation
 	h.startExecution(dest, req.OperationID, prepared) // destination execution starts after commit
 	return ForkResult{Session: ownSessionRecord(commit.session), Operation: ownOperationRecord(commit.operation)}, nil
 }

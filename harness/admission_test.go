@@ -144,7 +144,7 @@ func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID 
 	if err != nil {
 		t.Fatalf("coordinator: %v", err)
 	}
-	release, err := c.reserve(context.Background())
+	release, err := h.reserve(context.Background(), c)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}

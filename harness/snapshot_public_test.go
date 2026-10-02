@@ -343,6 +343,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 			t.Fatalf("submit: %v", err)
 		}
 		awaitTerminal(t, f.h, session, "op-1")
+		awaitQuiet(t, f.h, session) // the retiring run's drain publications land before the stable baseline
 		before, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
 			t.Fatalf("snapshot before the compact: %v", err)
@@ -350,6 +351,11 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 
 		compactPrepStarted := make(chan struct{})
 		compactGate := make(chan struct{})
+		releaseCompactGate := sync.OnceFunc(func() { close(compactGate) })
+		// registered after the fixture close, so the parked preparation is
+		// released before the fixture's cancellation and the store close on
+		// every exit.
+		defer releaseCompactGate()
 		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
 			if req.RequestKind == harness.RequestKindCompact {
 				compactPrepStarted <- struct{}{}
@@ -362,7 +368,11 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 			_, err := f.h.Compact(ctx, harness.CompactRequest{SessionID: session, OperationID: "comp-1"})
 			compactDone <- err
 		}()
-		<-compactPrepStarted
+		select {
+		case <-compactPrepStarted: // the compact preparation is parked on its gate holding the reservation
+		case err := <-compactDone: // a rejection before the preparation reports instead of parking the test forever
+			t.Fatalf("Compact returned before its preparation started: %v", err)
+		}
 		duringCompact, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
 			t.Fatalf("snapshot during the compact preparation: %v", err)
@@ -378,7 +388,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		if duringCompact.LocalRevision <= before.LocalRevision {
 			t.Fatalf("reservation revision = %d, want an advance past %d", duringCompact.LocalRevision, before.LocalRevision)
 		}
-		close(compactGate)
+		releaseCompactGate()
 		if err := <-compactDone; err != nil {
 			t.Fatalf("Compact: %v", err)
 		}
