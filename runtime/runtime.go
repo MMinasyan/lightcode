@@ -369,25 +369,34 @@ func (r *Runtime) withHarness(ctx context.Context, fn func(context.Context, *har
 	return fn(ctx, r.harness)
 }
 
-// createSession is the private root Session creation: it normalizes the
-// Workspace with filepath.Abs alone and uses the same admitted-call gate.
+// createSession is the private root Session creation: it runs the one
+// normalized creation core inside the shared admitted-call gate.
 func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
-	if workspace == "" {
-		return harness.SessionRecord{}, errors.New("runtime: workspace must be non-empty")
-	}
-	normalized, err := filepath.Abs(workspace)
-	if err != nil {
-		return harness.SessionRecord{}, fmt.Errorf("normalize workspace: %w", err)
-	}
 	var record harness.SessionRecord
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		record, err = h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentType: agentType})
+		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
 		return err
 	}); err != nil {
 		return harness.SessionRecord{}, err
 	}
 	return record, nil
+}
+
+// createSessionRecord is the one root creation core: the existing empty
+// workspace check wraps the shared harness.ErrInvalid sentinel, the Workspace
+// is normalized with filepath.Abs alone, and the Harness retains its
+// nonempty-only Agent-type selection. It executes inside the caller's
+// admission.
+func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, workspace, agentType string) (harness.SessionRecord, error) {
+	if workspace == "" {
+		return harness.SessionRecord{}, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
+	}
+	normalized, err := filepath.Abs(workspace)
+	if err != nil {
+		return harness.SessionRecord{}, fmt.Errorf("normalize workspace: %w", err)
+	}
+	return h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentType: agentType})
 }
 
 // deleteSession is the private canonical Session deletion: the whole body

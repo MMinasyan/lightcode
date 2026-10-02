@@ -835,22 +835,36 @@ func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protoco
 // resolveForkBoundary resolves one client boundary item ID against the one
 // snapshot's committed user-origin input facts and their namespace-derived
 // projected identities, returning the private entry identity for the
-// Harness Fork command. A foreign, non-user, or nonexistent item fails with
-// the shared harness.ErrInvalid sentinel; no client item ID ever passes to
-// the Harness as an entry identity.
+// Harness Fork command. It is the single-read wrapper over the shared pure
+// resolver. A foreign, non-user, or nonexistent item fails with the shared
+// harness.ErrInvalid sentinel; no client item ID ever passes to the Harness
+// as an entry identity.
 func (r *Runtime) resolveForkBoundary(ctx context.Context, sessionID, boundaryItemID string) (string, error) {
 	var entryID string
 	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		for _, fact := range snap.Facts {
-			if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginUser &&
-				projectItemID(sessionID, fact.EntryID) == boundaryItemID {
-				entryID = fact.EntryID
-				return nil
-			}
-		}
-		return fmt.Errorf("boundary item %q is not a committed user input of session %q: %w", boundaryItemID, sessionID, harness.ErrInvalid)
+		var err error
+		entryID, err = resolveBoundaryEntry(snap, boundaryItemID)
+		return err
 	}); err != nil {
 		return "", err
 	}
 	return entryID, nil
+}
+
+// resolveBoundaryEntry resolves one client boundary item ID against one
+// owned snapshot's committed user-origin input facts and their
+// namespace-derived projected identities, returning the private entry
+// identity for the Harness Fork command. It is pure over the snapshot, so the
+// admitted fork command and the single-read resolver share exactly one rule.
+// A foreign, non-user, or nonexistent item — and an empty boundary item — fails
+// with the shared harness.ErrInvalid sentinel.
+func resolveBoundaryEntry(snap harness.SessionSnapshot, boundaryItemID string) (string, error) {
+	sessionID := snap.Session.Identity.SessionID
+	for _, fact := range snap.Facts {
+		if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginUser &&
+			projectItemID(sessionID, fact.EntryID) == boundaryItemID {
+			return fact.EntryID, nil
+		}
+	}
+	return "", fmt.Errorf("boundary item %q is not a committed user input of session %q: %w", boundaryItemID, sessionID, harness.ErrInvalid)
 }
