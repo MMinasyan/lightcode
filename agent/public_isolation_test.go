@@ -68,6 +68,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		snapshotPkg   = publicModule + "/internal/snapshot"
 		editprePkg    = publicModule + "/internal/editpreview"
 		pathutilPkg   = publicModule + "/internal/pathutil"
+		permissionPkg = publicModule + "/internal/permission"
+		safefsPkg     = publicModule + "/internal/safefs"
 		agentsPkg     = publicModule + "/internal/agents"
 		catalogPkg    = publicModule + "/internal/catalog"
 		atomicfsPkg   = publicModule + "/internal/atomicfs"
@@ -110,8 +112,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", "+agentPkg+", and "+tiktokenPkg)
 			}
 		case "runtime":
-			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && !std[imp] {
-				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", and "+adaptationPkg+" helpers, never "+legacyAgent+", "+storagePkg+", any concrete plugin under "+pluginsPkg+", or the SQLite driver")
+			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != permissionPkg && imp != safefsPkg && imp != pathutilPkg && !std[imp] {
+				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+permissionPkg+", "+safefsPkg+", and "+pathutilPkg+" helpers, never "+legacyAgent+", "+storagePkg+", any concrete plugin under "+pluginsPkg+", or the SQLite driver")
 			}
 		case "internal/storage":
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {
@@ -310,10 +312,11 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 		}
 	}
 	// The runtime target layer consumes the public model, harness, and
-	// protocol contracts and the retained internal configuration helpers
-	// only; the legacy owner, durable storage, concrete plugins, the public
-	// agent package and the driver never enter it.
-	if problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/config", publicModule + "/internal/agents", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/internal/prompt", publicModule + "/internal/adaptation"}, std); len(problems) != 0 {
+	// protocol contracts and the retained internal configuration, snapshot,
+	// permission, safefs and path helpers only; the legacy owner, durable
+	// storage, concrete plugins, the public agent package and the driver
+	// never enter it.
+	if problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/config", publicModule + "/internal/agents", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/internal/prompt", publicModule + "/internal/adaptation", publicModule + "/internal/snapshot", publicModule + "/internal/permission", publicModule + "/internal/safefs", publicModule + "/internal/pathutil"}, std); len(problems) != 0 {
 		t.Errorf("allowed runtime imports flagged: %v", problems)
 	}
 	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tasks"} {
