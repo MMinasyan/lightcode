@@ -466,7 +466,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			t.Fatalf("publish: %v", err)
 		}
 		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, warnings, nil)
+		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, warnings, nil, nil)
 
 		prepared, err := p.bind()(context.Background(), compactPrepRequest())
 		if err != nil {

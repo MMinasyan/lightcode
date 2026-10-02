@@ -222,7 +222,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		Discovery:        &[]bool{false}[0],
 		ProtocolMetadata: &meta,
 	}
-	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(" new ", patch, models))
+	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(" new ", patch, models, nil))
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	window2 := 1
 	if _, err := svc.mutate(context.Background(), svc.editProviderCreate("noheaders",
 		protocol.ProviderEdit{BaseUrl: &[]string{"https://nh.test/v1"}[0], Headers: &emptyHeaders},
-		map[string]protocol.ModelEdit{"m": {ContextWindow: &window2}})); err != nil {
+		map[string]protocol.ModelEdit{"m": {ContextWindow: &window2}}, nil)); err != nil {
 		t.Fatalf("empty-headers create: %v", err)
 	}
 	drainMutationEvent(t, sub, "3")
@@ -351,7 +351,7 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			_, err := svc.mutate(context.Background(), svc.editProviderCreate(row.id, row.patch, row.models))
+			_, err := svc.mutate(context.Background(), svc.editProviderCreate(row.id, row.patch, row.models, nil))
 			assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, row.want)
 		})
 	}
@@ -361,7 +361,7 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	external := strings.Replace(metadataConfigDocument, `"prov": {`, `"ghost": {"transport": {"base_url": "https://ghost.test/v1"}, "models": {"g": {"context_window": 1}}}, "prov": {`, 1)
 	writeServiceFile(t, h.configPath, external)
 	dupBefore, dupFirst, dupWarnRev := metadataBaseline(t, svc, h.configPath)
-	_, dupErr := svc.mutate(context.Background(), svc.editProviderCreate("ghost", protocol.ProviderEdit{BaseUrl: &base}, valid))
+	_, dupErr := svc.mutate(context.Background(), svc.editProviderCreate("ghost", protocol.ProviderEdit{BaseUrl: &base}, valid, nil))
 	assertMetadataRefused(t, svc, sub, h.configPath, dupBefore, dupFirst, dupWarnRev, dupErr, harness.ErrInvalid)
 }
 
@@ -719,7 +719,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	window := 1
 	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 	if _, err := svc.mutate(context.Background(), svc.editProviderCreate("keyless",
-		protocol.ProviderEdit{BaseUrl: &[]string{"https://keyless.test/v1"}[0]}, valid)); err != nil {
+		protocol.ProviderEdit{BaseUrl: &[]string{"https://keyless.test/v1"}[0]}, valid, nil)); err != nil {
 		t.Fatalf("create keyless: %v", err)
 	}
 	drainMutationEvent(t, sub, "2")
@@ -773,7 +773,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	// delete.
 	window = 1
 	if _, err := svc.mutate(context.Background(), svc.editProviderCreate("temp",
-		protocol.ProviderEdit{BaseUrl: &[]string{"https://temp.test/v1"}[0]}, valid)); err != nil {
+		protocol.ProviderEdit{BaseUrl: &[]string{"https://temp.test/v1"}[0]}, valid, nil)); err != nil {
 		t.Fatalf("create temp: %v", err)
 	}
 	drainMutationEvent(t, sub, "5")
@@ -1373,7 +1373,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 
 		// The create: the projected result is the new provider view.
 		mutation, err := r.addProvider(ctx, "newp",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://new.test/v1"}[0]}, models)
+			protocol.ProviderEdit{BaseUrl: &[]string{"https://new.test/v1"}[0]}, models, nil)
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		}
@@ -1405,7 +1405,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 			want error
 		}{
 			{"duplicate create", func() error {
-				_, err := r.addProvider(ctx, "prov", protocol.ProviderEdit{BaseUrl: &[]string{"https://x.test/v1"}[0]}, models)
+				_, err := r.addProvider(ctx, "prov", protocol.ProviderEdit{BaseUrl: &[]string{"https://x.test/v1"}[0]}, models, nil)
 				return err
 			}, harness.ErrInvalid},
 			{"builtin delete", func() error {
@@ -1823,7 +1823,7 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 
 		// The connected keyless custom provider: its model is visible.
 		mutation, err := r.addProvider(ctx, "keyless2",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://k2.test/v1"}[0]}, models)
+			protocol.ProviderEdit{BaseUrl: &[]string{"https://k2.test/v1"}[0]}, models, nil)
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		}
@@ -1915,7 +1915,7 @@ func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 				window := 1
 				models := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 
-				mutation, err := r.addProvider(ctx, id, protocol.ProviderEdit{BaseUrl: &[]string{"https://id.test/v1"}[0]}, models)
+				mutation, err := r.addProvider(ctx, id, protocol.ProviderEdit{BaseUrl: &[]string{"https://id.test/v1"}[0]}, models, nil)
 				if err != nil || mutation.ConfigurationRevision.Generation != "2" || mutation.Result.Id != id {
 					t.Fatalf("addProvider(%q) = (%v, %+v), want the exact ID at generation 2", id, err, mutation.Result)
 				}

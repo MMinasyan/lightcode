@@ -320,6 +320,25 @@ func LoadDotEnv() (*ManagedEnv, error) {
 	return m, nil
 }
 
+// SubprocessEnv returns one owned, non-nil snapshot of the process
+// environment with every key currently in the managed set removed. It holds
+// the same mutex as Set/TrySet/Remove/TryRemove, so a concurrent managed
+// write is either fully applied before the snapshot or fully absent from it.
+// Shell-exported keys that Lightcode does not own pass through. A nil
+// receiver returns a non-nil empty slice — never the ambient environment.
+func (m *ManagedEnv) SubprocessEnv() []string {
+	if m == nil {
+		return []string{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.managed))
+	for key := range m.managed {
+		keys = append(keys, key)
+	}
+	return EnvWithoutKeys(os.Environ(), keys)
+}
+
 // EnvWithoutKeys returns env with every entry whose name is in keys removed.
 // Order otherwise preserved; nil keys returns env unchanged.
 func EnvWithoutKeys(env []string, keys []string) []string {

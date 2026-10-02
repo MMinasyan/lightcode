@@ -275,3 +275,107 @@ func TestLoaderLoadCapturedAllowRefreshFilterRetained(t *testing.T) {
 		t.Fatalf("cached input lost under the filter: %v", err)
 	}
 }
+
+// TestLoaderLoadCapturedConnectionOverlaysOneProviderWithoutRefresh proves
+// the connection-candidate entry: the same captured bundled FS, discovery
+// cache read, and Build producer — no network fetch, no cache write, no
+// refresh — with a nonnil fetched result overlaying only that provider's
+// in-memory record (fingerprint over the original configured transport,
+// fetched model values carried verbatim) and a nil result leaving the
+// ordinary cached inputs.
+func TestLoaderLoadCapturedConnectionOverlaysOneProviderWithoutRefresh(t *testing.T) {
+	var fetches int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches++
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","context_window":1000}]}`))
+	}))
+	t.Cleanup(server.Close)
+	fsys := fstest.MapFS{
+		"builtin/base.json": {Data: []byte(`{
+			"id": "base",
+			"transport": {"base_url": "http://base.test/v1", "api_key_env": ""},
+			"discovery": false,
+			"models": {"known": {"context_window": 1000}}
+		}`)},
+		"builtin/remote.json": {Data: []byte(`{
+			"id": "remote",
+			"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": "REMOTE_KEY"},
+			"discovery": true,
+			"models": {}
+		}`)},
+	}
+	userRaw := map[string]any{"local": map[string]any{
+		"transport": map[string]any{"base_url": "http://local.test/v1", "api_key_env": ""},
+		"models":    map[string]any{},
+	}}
+	home := t.TempDir()
+	loader := NewLoader(home, fsys)
+
+	// The fetched discovery for the connection candidate is carried verbatim
+	// with its unexported metadata intact: the explicitly filtered metadata
+	// type stays absent, while the chat and nil-metadata siblings reach the
+	// catalog.
+	fetched := map[string]DiscoveredModel{
+		"fresh":   {Name: "Fresh", ContextWindow: 4096, metadata: &discoveryModelMetadata{Type: "chat"}},
+		"blocked": {Name: "Blocked", ContextWindow: 4096, metadata: &discoveryModelMetadata{Type: "embedding"}},
+		"plain":   {Name: "Plain", ContextWindow: 4096},
+	}
+	transport := Transport{BaseURL: server.URL + "/v1", APIKeyEnv: "REMOTE_KEY"}
+
+	result, err := loader.LoadCapturedConnection(context.Background(), userRaw, "remote", transport, &DiscoveredProvider{Models: fetched})
+	if err != nil {
+		t.Fatalf("LoadCapturedConnection: %v", err)
+	}
+	if fetches != 0 {
+		t.Fatalf("connection candidate performed %d network fetches, want none", fetches)
+	}
+	prov := result.Catalog.Providers["remote"]
+	if prov == nil {
+		t.Fatal("remote provider missing from the connection candidate")
+	}
+	if entry := prov.Models["fresh"]; entry == nil || entry.ContextWindow != 4096 {
+		t.Fatalf("overlay record missing the fetched model: %#v", prov.Models)
+	}
+	if entry := prov.Models["fresh"]; entry != nil && entry.Source != SourceDiscovered {
+		t.Fatalf("overlay model source = %q, want discovered", entry.Source)
+	}
+	if entry := prov.Models["plain"]; entry == nil || entry.ContextWindow != 4096 || entry.Source != SourceDiscovered {
+		t.Fatalf("nil-metadata overlay sibling = %#v, want the allowed discovered model", prov.Models["plain"])
+	}
+	if entry, ok := prov.Models["blocked"]; ok {
+		t.Fatalf("filtered metadata model reached the catalog: %#v", entry)
+	}
+	if _, ok := result.Catalog.Providers["local"]; !ok {
+		t.Fatal("the non-connection sibling disappeared from the candidate")
+	}
+
+	// Nil discovery: the ordinary cached inputs, still no fetch and no
+	// cache write.
+	result, err = loader.LoadCapturedConnection(context.Background(), userRaw, "remote", transport, nil)
+	if err != nil {
+		t.Fatalf("LoadCapturedConnection nil discovery: %v", err)
+	}
+	if fetches != 0 {
+		t.Fatalf("nil-discovery candidate performed %d network fetches, want none", fetches)
+	}
+	if prov = result.Catalog.Providers["remote"]; prov == nil || len(prov.Models) != 0 {
+		t.Fatalf("nil-discovery candidate carried %v, want the empty cached model set", prov.Models)
+	}
+	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "base", Model: "known"}); err != nil {
+		t.Fatalf("bundled provider missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); !os.IsNotExist(err) {
+		t.Fatalf("the connection candidate wrote a cache file: %v", err)
+	}
+
+	// A fingerprint over a different transport never binds the overlay: the
+	// same Build producer computes it inside catalog.
+	other := Transport{BaseURL: "http://other.test/v1", APIKeyEnv: "REMOTE_KEY"}
+	result, err = loader.LoadCapturedConnection(context.Background(), userRaw, "remote", other, &DiscoveredProvider{Models: fetched})
+	if err != nil {
+		t.Fatalf("LoadCapturedConnection other transport: %v", err)
+	}
+	if prov = result.Catalog.Providers["remote"]; prov != nil && len(prov.Models) != 0 {
+		t.Fatalf("misbound overlay contributed %v, want no models", prov.Models)
+	}
+}

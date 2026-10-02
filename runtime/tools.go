@@ -69,15 +69,23 @@ func (b *backgroundBridge) DeliverCompletion(ctx context.Context, sessionID, com
 
 // ToolContext carries what one tool call needs beyond the call itself: the
 // Workspace, the calling Operation's admitted-input identity, the captured
-// Invocation, the selected Agent's hard constraints, and the armed background
-// services bridge. It exposes neither the complete admission register nor
-// file/command-specific numeric fields.
+// Invocation, the selected Agent's hard constraints, the armed background
+// services bridge, and the call-time subprocess environment producer. It
+// exposes neither the complete admission register nor file/command-specific
+// numeric fields.
 type ToolContext struct {
 	Workspace     string
 	AdmittedEntry harness.EntryRef
 	Invocation    Invocation
 	Constraints   ToolConstraints
 	Background    BackgroundServices
+
+	// SubprocessEnv is invoked at each concrete process start — foreground
+	// Execute and the admitted Jobs start handoff alike — and returns the
+	// exact environment slice that process runs with: the live ambient
+	// environment filtered by the Runtime's current managed-key set. A nil
+	// callback fails the cooperative command; there is no ambient fallback.
+	SubprocessEnv func() []string
 }
 
 // Tool is one concrete tool capability: pure terminating argument

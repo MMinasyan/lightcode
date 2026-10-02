@@ -51,10 +51,9 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 // discovery cache keep their home-based paths: neither option relocates them
 // nor changes owner identity. prepare is the controlled preparation function
 // supplied by tests; a nil prepare selects the concrete production
-// preparation.
-// sweepTicks optionally replaces the automatic sweep scheduler's owned
-// hourly ticker with a controlled tick stream whose sends carry each pass's
-// explicit time; the zero value keeps the production time.Ticker.
+// preparation. sweepTicks optionally replaces the automatic sweep scheduler's
+// owned hourly ticker with a controlled tick stream whose sends carry each
+// pass's explicit time; the zero value keeps the production time.Ticker.
 type options struct {
 	DataDir, ConfigPath string
 	Plugins             []Plugin
@@ -166,8 +165,10 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	// The warning store initializes before any plugin scope opens: scopes
 	// and preparations report into it from the moment they exist.
 	warnings := newWarningStore()
-	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath, obs)
+	loader := catalog.NewLoader(home, nil)
+	configService := newConfigurationService(work, c, loader, configPath, obs)
 	configService.attachWarnings(warnings)
+	configService.attachEnv(managedEnv)
 	if _, err := configService.publish(work); err != nil {
 		// Initial publication supplies the owned context as both caller and
 		// owner, so its caller-first checkpoints report a canceled
@@ -177,7 +178,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedEnv.ManagedKeys()}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
 	if err != nil {
 		return unlock(err)
 	}
@@ -204,10 +205,17 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 
 	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	background := &backgroundBridge{}
+	// The call-time subprocess environment producer exists only when the
+	// retained manager exists; without it no manager is constructed on
+	// demand and every cooperative command fails.
+	var subprocessEnv func() []string
+	if managedEnv != nil {
+		subprocessEnv = managedEnv.SubprocessEnv
+	}
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, warnings, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, warnings, subprocessEnv, options.prepare).bind(),
 	})
 	if err != nil {
 		return unwind(err)

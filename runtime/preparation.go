@@ -141,24 +141,34 @@ type preparation struct {
 	background  BackgroundServices
 	warnings    *warningStore
 	prepare     prepare
+
+	// subprocessEnv is the Runtime's live managed-environment producer,
+	// supplied only when the retained manager exists; nil leaves every
+	// prepared command without an environment producer and the cooperative
+	// command fails. It is invoked at each process start, never at
+	// preparation.
+	subprocessEnv func() []string
 }
 
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
 // once-resolved home, the background services bridge armed after harness.New
 // returns, the Runtime-owned warning store (nil in isolated preparation
-// tests, dropping only passive presentation), and the controlled preparation
-// function; nil selects the concrete production preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, warnings *warningStore, prepare prepare) *preparation {
+// tests, dropping only passive presentation), the Runtime's live
+// managed-environment producer (nil without a retained manager), and the
+// controlled preparation function; nil selects the concrete production
+// preparation.
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, warnings *warningStore, subprocessEnv func() []string, prepare prepare) *preparation {
 	return &preparation{
-		config:      config,
-		composition: c,
-		runtime:     runtime,
-		workspaces:  workspaces,
-		home:        home,
-		background:  background,
-		warnings:    warnings,
-		prepare:     prepare,
+		config:        config,
+		composition:   c,
+		runtime:       runtime,
+		workspaces:    workspaces,
+		home:          home,
+		background:    background,
+		warnings:      warnings,
+		subprocessEnv: subprocessEnv,
+		prepare:       prepare,
 	}
 }
 
@@ -647,6 +657,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			Invocation:    sel.invocation,
 			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 			Background:    p.background,
+			SubprocessEnv: p.subprocessEnv,
 		}
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {

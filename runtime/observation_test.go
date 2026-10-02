@@ -19,9 +19,7 @@ import (
 
 const obsWorkspace = "/ws"
 
-// equalEvent compares two Events field-for-field: every comparable field with
-// == and the slice-typed ManagedEnvKeys with slices.Equal, since the slice
-// keeps Event non-comparable.
+// equalEvent compares two Events field-for-field with ==.
 func equalEvent(a, b Event) bool {
 	return a.Kind == b.Kind &&
 		a.ConfigurationRevision == b.ConfigurationRevision &&
@@ -29,8 +27,7 @@ func equalEvent(a, b Event) bool {
 		a.Scope.DataDir == b.Scope.DataDir &&
 		a.Scope.Workspace == b.Scope.Workspace &&
 		a.Scope.SessionID == b.Scope.SessionID &&
-		a.Scope.OperationID == b.Scope.OperationID &&
-		slices.Equal(a.Scope.ManagedEnvKeys, b.Scope.ManagedEnvKeys)
+		a.Scope.OperationID == b.Scope.OperationID
 }
 
 func nextEvent(t *testing.T, sub *Subscription) (Event, bool) {

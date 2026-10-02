@@ -72,6 +72,12 @@ type configurationService struct {
 	// (isolated service tests) drops only that passive presentation.
 	warnings *warningStore
 
+	// env is the Runtime's retained managed-environment manager, attached
+	// like the warning store; nil (isolated service tests) makes every key
+	// action the manager's own typed failure — no manager is constructed on
+	// demand.
+	env *config.ManagedEnv
+
 	buildMu   sync.Mutex
 	published atomic.Pointer[configuration]
 }
@@ -117,6 +123,12 @@ func (s *configurationService) current() *configuration {
 // build refreshes nothing.
 func (s *configurationService) attachWarnings(warnings *warningStore) {
 	s.warnings = warnings
+}
+
+// attachEnv wires the Runtime's retained managed-environment manager: the
+// one connection key actions write through.
+func (s *configurationService) attachEnv(env *config.ManagedEnv) {
+	s.env = env
 }
 
 // publish runs one serialized initial-load or reload build and publishes the
@@ -213,24 +225,34 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 	if err != nil {
 		return nil, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
 	}
-	return s.buildCaptured(ctx, generation, configData, agentsData)
+	return s.buildCaptured(ctx, generation, configData, agentsData, nil)
 }
 
 // buildCaptured is the one candidate construction every publisher — Reload's
 // capture and a mutation's edited bytes — runs: the captured documents are
-// decoded once, the captured providers layer is delegated to
-// Loader.LoadCaptured so provider assembly and every cost protection use
-// that one read, sessions and agent definitions are parsed against the
-// ordinary visible export IDs and the compiled tool universe, the Workspace
-// permission inventory is enumerated once into the candidate, and the plugin
-// section is validated against the owned declarations. Nothing is returned
-// until the complete candidate survives all of it.
-func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData, agentsData []byte) (*configuration, error) {
+// decoded once, the captured providers layer is delegated to the Loader so
+// provider assembly and every cost protection use that one read, sessions
+// and agent definitions are parsed against the ordinary visible export IDs
+// and the compiled tool universe, the Workspace permission inventory is
+// enumerated once into the candidate, and the plugin section is validated
+// against the owned declarations. Nothing is returned until the complete
+// candidate survives all of it. A nil conn builds over the ordinary
+// LoadCaptured inputs (which may refresh due providers and write their
+// cache); a connection candidate instead selects the non-refreshing
+// LoadCapturedConnection entry, optionally overlaying the fetched discovery
+// for that one provider — a connection candidate is fully validated before
+// its caller's first persistence and is never rebuilt after it.
+func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData, agentsData []byte, conn *connectionEffects) (*configuration, error) {
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
-	built, err := s.loader.LoadCaptured(ctx, doc.Providers)
+	var built catalog.BuildResult
+	if conn == nil {
+		built, err = s.loader.LoadCaptured(ctx, doc.Providers)
+	} else {
+		built, err = s.loader.LoadCapturedConnection(ctx, doc.Providers, conn.providerID, conn.transport, conn.discovered)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err

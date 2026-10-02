@@ -221,16 +221,20 @@ func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef str
 
 // addProvider creates one custom provider with its models through the one
 // mutation path: a new trimmed nonempty no-slash ID, a required base URL,
-// normalized unique model IDs, and at least one usable model. The candidate
-// check proves the created subject survived the shared catalog validation
-// before the owning write.
-func (r *Runtime) addProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit) (protocol.ProviderMutation, error) {
+// normalized unique model IDs, and at least one usable model. The optional
+// write-only key is never written to the raw layer: a missing api_key_env
+// member with a supplied key generates the retained unique env name, the
+// candidate validates completely before any write, and the managed key is
+// persisted only after the owning file — a failure there restores the exact
+// prior bytes. The candidate check proves the created subject survived the
+// shared catalog validation before the owning write.
+func (r *Runtime) addProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models))
+	candidate, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models, key))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}

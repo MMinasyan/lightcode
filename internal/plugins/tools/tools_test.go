@@ -31,8 +31,8 @@ const (
 
 // directTools constructs the plugin's tool exports from one instance the
 // way open publishes them, without opening the plugin.
-func directTools(dataDir string, managedKeys []string) map[string]runtime.Tool {
-	inst := &instance{dataDir: dataDir, managedKeys: managedKeys}
+func directTools(dataDir string) map[string]runtime.Tool {
+	inst := &instance{dataDir: dataDir}
 	return map[string]runtime.Tool{
 		"read_file":   readTool{inst},
 		"write_file":  writeTool{inst},
@@ -232,7 +232,7 @@ func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
 }
 
 func TestNormalizeArguments(t *testing.T) {
-	byID := directTools(t.TempDir(), nil)
+	byID := directTools(t.TempDir())
 	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
 
 	t.Run("read_file applies defaults and strips private fields", func(t *testing.T) {
@@ -361,7 +361,7 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 	for _, cell := range cells {
 		cell := cell
 		t.Run(cell.name, func(t *testing.T) {
-			byID := directTools(t.TempDir(), nil)
+			byID := directTools(t.TempDir())
 			var workspace, link, flipTo, preFlipWriteDir string
 			var constraints runtime.ToolConstraints
 			if cell.slot == "root" {

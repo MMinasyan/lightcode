@@ -292,16 +292,25 @@ func requireCandidateModel(c *configuration, providerID, modelID string) error {
 
 // editProviderCreate builds the custom-provider create edit: a new trimmed
 // nonempty ID, a required base URL, a models map with normalized unique IDs
-// and at least one usable model, and no secret parameter — the create
-// accepts only a non-secret env name. The candidate check proves the created
-// provider survived the shared catalog validation with a usable model.
-func (s *configurationService) editProviderCreate(providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit) configurationEdit {
+// and at least one usable model, and no secret parameter in the edit — the
+// create accepts a non-secret env name plus the optional write-only key
+// value, which is never written to the raw layer. A missing api_key_env
+// member with a supplied nonempty key generates the current unique name
+// inside the build hold; an explicitly empty member stays keyless. The
+// candidate check proves the created provider survived the shared catalog
+// validation with a usable model, and the edit's connection data carries the
+// one managed-key write that follows the owning file.
+func (s *configurationService) editProviderCreate(providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) configurationEdit {
 	// The create identity is trim-normalized once at the constructor entry:
 	// the apply and the candidate check resolve the same canonicalized ID
 	// (the Runtime operator's separate by-value parameter still canonicalizes
 	// its own result lookup — normalization does not propagate back from the
 	// callee).
 	providerID = strings.TrimSpace(providerID)
+	// The create's connection data is one plain record the apply fills and
+	// the writer consumes after the owning file: the key action is None
+	// unless a managed key must be persisted.
+	plan := &connectionEffects{}
 	return configurationEdit{
 		apply: func(roots rawRoots) (editedFile, bool, error) {
 			if providerID == "" {
@@ -336,9 +345,33 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 				}
 				headers = *patch.Headers
 			}
+			// The env name resolves inside the build hold: the pointer
+			// presence is the patch — an explicitly empty member stays
+			// keyless — and the generated name for a supplied key occupies
+			// the current catalog's api_key_env set. The one credential rule
+			// resolves a nonempty name: a managed name (including a
+			// generated-name collision with a managed orphan) is updated by
+			// a supplied nonempty value or used as-is when it already holds
+			// one; an external shell key wins and is never persisted; every
+			// resolution failure is the shared configuration failure class.
+			keyEnv := ""
 			if patch.ApiKeyEnv != nil {
-				if env := strings.TrimSpace(*patch.ApiKeyEnv); env != "" && s.envNameInUse(env, providerID) {
-					return 0, false, invalidEdit("api_key_env %s is already used by another provider", env)
+				keyEnv = strings.TrimSpace(*patch.ApiKeyEnv)
+				if keyEnv != "" && s.envNameInUse(keyEnv, providerID) {
+					return 0, false, invalidEdit("api_key_env %s is already used by another provider", keyEnv)
+				}
+			} else if key != nil && *key != "" {
+				keyEnv = generatedAPIKeyEnvName(providerID, s.current().catalog)
+			}
+			if keyEnv != "" {
+				_, persist, err := resolveConnectKey(keyEnv, key, s.env)
+				if err != nil {
+					return 0, false, configurationFailure(err)
+				}
+				if persist {
+					plan.keyAction = keyActionSet
+					plan.keyEnv = keyEnv
+					plan.keyValue = *key // the exact supplied value; never trim-normalized
 				}
 			}
 			modelsRaw := map[string]any{}
@@ -362,7 +395,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 				return 0, false, invalidEdit("custom provider requires at least one usable model")
 			}
 			providerMap := map[string]any{
-				"transport": providerTransportRaw(patch, baseURL, headers),
+				"transport": providerTransportRaw(patch, baseURL, headers, keyEnv),
 				"models":    modelsRaw,
 			}
 			writeProviderEditMembers(providerMap, patch)
@@ -372,6 +405,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			}
 			return editMainConfig, true, nil
 		},
+		connection: plan,
 		check: func(c *configuration) error {
 			return requireCandidateProvider(c, providerID)
 		},
@@ -380,15 +414,12 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 
 // providerTransportRaw renders the create patch's transport members. The
 // api_key_env member is always present in a created transport — the raw
-// validator requires the member itself and admits an empty value — the
-// provided name is stored trim-normalized, and the provided headers go
-// through the same wholesale writer as the update, so an empty provided map
-// leaves the raw headers member absent.
-func providerTransportRaw(patch protocol.ProviderEdit, baseURL string, headers map[string]string) map[string]any {
-	transport := map[string]any{"base_url": baseURL, "api_key_env": ""}
-	if patch.ApiKeyEnv != nil {
-		transport["api_key_env"] = strings.TrimSpace(*patch.ApiKeyEnv)
-	}
+// validator requires the member itself and admits an empty value — with the
+// resolved name (explicit, generated, or empty for keyless) written by the
+// caller, and the provided headers go through the same wholesale writer as
+// the update, so an empty provided map leaves the raw headers member absent.
+func providerTransportRaw(patch protocol.ProviderEdit, baseURL string, headers map[string]string, keyEnv string) map[string]any {
+	transport := map[string]any{"base_url": baseURL, "api_key_env": keyEnv}
 	if patch.Headers != nil {
 		writeTransportHeaders(transport, headers)
 	}
