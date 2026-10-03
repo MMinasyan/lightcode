@@ -78,6 +78,9 @@ type Runtime struct {
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
 	dataDir      string
+	// protocol is the one attached isolated protocol server, set under mu by
+	// OpenProtocol and frozen once closure begins; nil when none is attached.
+	protocol *ProtocolServer
 
 	// mu guards only the admission transition below; it is never held across
 	// any call, wait, or I/O.
@@ -460,19 +463,32 @@ func (r *Runtime) Close(ctx context.Context) error {
 }
 
 // beginShutdown first closes admission and cancels the owned work context,
-// then starts the one shared cleanup asynchronously. Repeat callers only join.
+// then closes the attached protocol server's listener and every active
+// connection outside the mutex — before any admitted call is joined — and
+// only then starts the one shared cleanup asynchronously. Repeat callers
+// only join.
 func (r *Runtime) beginShutdown() {
 	r.shutdownOnce.Do(func() {
 		r.mu.Lock()
 		r.closed = true
+		server := r.protocol
 		r.mu.Unlock()
 		// The warning store's admission closes with the Runtime: later
 		// reports are ignored presentation. Short in-memory coordination
 		// only — no network or plugin work runs here.
 		r.warnings.close()
 		r.cancelWork()
+		// The attached server's listener and every active stream close
+		// before admitted calls converge: an events stream never holds the
+		// call wait open, and a served request observes its own work
+		// context end instead of a live server. Once attached, the serving
+		// goroutine always started, so this close always joins it.
+		var closeErr error
+		if server != nil {
+			closeErr = server.closeNetwork()
+		}
 		go func() {
-			r.shutdownErr = r.joinShutdown()
+			r.shutdownErr = errors.Join(closeErr, r.joinShutdown())
 			close(r.shutdownDone)
 		}()
 	})
@@ -485,7 +501,8 @@ func (r *Runtime) beginShutdown() {
 // execution, and required terminal commit, then closes every
 // live Workspace scope in sorted path order and the Runtime scope in reverse
 // dependency order, closes every passive subscription once those cleanup
-// events have been published, and releases the lock as the final ownership
+// events have been published, withdraws the attached protocol server's
+// remembered discovery record, and releases the lock as the final ownership
 // action. Every required close is attempted and all errors are joined; no
 // state-owning mutex is held across any of it.
 func (r *Runtime) joinShutdown() error {
@@ -504,6 +521,18 @@ func (r *Runtime) joinShutdown() error {
 		errs = append(errs, err)
 	}
 	r.obs.closeAll()
+	// The remembered discovery record is withdrawn after the Harness and
+	// every scope have converged and before the owner lock is released, so
+	// no successor observes a record this owner cannot answer. After closure
+	// began, the attached server is frozen, so this read is stable.
+	r.mu.Lock()
+	server := r.protocol
+	r.mu.Unlock()
+	if server != nil {
+		if err := server.withdrawDiscovery(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := r.lock.Release(); err != nil {
 		errs = append(errs, err)
 	}

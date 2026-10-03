@@ -23,9 +23,14 @@ type Event = protocol.Event
 // veto transitions, decide execution, or own cleanup. There is no replay:
 // buffered events may drain before closure is observed, missed events are
 // repaired from authoritative reads, and transient progress may be lost.
+// The closed channel signals the subscription's removal exactly once — by
+// its subscriber, by saturation, or after Runtime cleanup — without
+// competing with the event queue; a delivery goroutine may select on it to
+// release resources the queue alone cannot reach.
 type Subscription struct {
 	observation *observation
 	events      chan Event
+	closed      chan struct{}
 	closeOnce   sync.Once
 }
 
@@ -72,6 +77,7 @@ func (o *observation) publish(produce func() []Event) {
 			default:
 				delete(o.subs, sub)
 				close(sub.events)
+				close(sub.closed)
 			}
 		}
 	}
@@ -85,7 +91,11 @@ func (o *observation) subscribe(capacity int) (*Subscription, error) {
 	if o.closed {
 		return nil, ErrClosed
 	}
-	sub := &Subscription{observation: o, events: make(chan Event, capacity)}
+	sub := &Subscription{
+		observation: o,
+		events:      make(chan Event, capacity),
+		closed:      make(chan struct{}),
+	}
 	o.subs[sub] = struct{}{}
 	return sub, nil
 }
@@ -98,6 +108,7 @@ func (o *observation) unsubscribe(s *Subscription) {
 	if _, ok := o.subs[s]; ok {
 		delete(o.subs, s)
 		close(s.events)
+		close(s.closed)
 	}
 }
 
@@ -110,6 +121,7 @@ func (o *observation) closeAll() {
 	for sub := range o.subs {
 		delete(o.subs, sub)
 		close(sub.events)
+		close(sub.closed)
 	}
 }
 

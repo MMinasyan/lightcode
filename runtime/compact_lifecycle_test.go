@@ -2920,57 +2920,63 @@ func productionAgentsWithFreedHook() string {
 // --- the protocol and client surface pin ---
 
 // TestCompactLifecycleRuntimeSurfaceUnchanged pins the runtime package's
-// exported declaration set against the fixed pre-compaction set — top-level
+// exported declaration set against the fixed current set — top-level
 // exported declarations under their bare names and exported methods on
 // exported receiver types under receiver-qualified names, with pointer and
 // value receivers distinguished in the key the same way the exported check
 // distinguishes them — so an added (*Runtime) method cannot hide behind the
 // top-level-only scan and same-named methods on different receivers cannot
-// collide: the compaction lifecycle added no runtime-level protocol or
-// client surface, and a source scan of the package's production files must
-// find exactly the pinned names and no others.
+// collide: the mounted server transport exposes only the Runtime's
+// OpenProtocol and the ProtocolServer's endpoint and discovery publication,
+// while the generated handler methods live on the private transport receiver
+// and are not public surface. A source scan of the package's production
+// files must find exactly the pinned names and no others.
 func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 	want := map[string]bool{
-		"(*Runtime).Close":        true,
-		"(*Runtime).Reload":       true,
-		"(*Runtime).Subscribe":    true,
-		"(*Subscription).Close":   true,
-		"(*Subscription).Events":  true,
-		"(Invocation).AgentTypes": true,
-		"(Invocation).Config":     true,
-		"(Invocation).Revision":   true,
-		"Adaptation":              true,
-		"BackgroundServices":      true,
-		"Bind":                    true,
-		"Bindings":                true,
-		"CapabilitySpec":          true,
-		"ErrClosed":               true,
-		"ErrComposition":          true,
-		"ErrConfiguration":        true,
-		"ErrOwned":                true,
-		"Event":                   true,
-		"Instance":                true,
-		"Invocation":              true,
-		"ModelAdaptation":         true,
-		"Open":                    true,
-		"Options":                 true,
-		"Plugin":                  true,
-		"PreparationHook":         true,
-		"Runtime":                 true,
-		"ScopeAgent":              true,
-		"ScopeInfo":               true,
-		"ScopeKind":               true,
-		"ScopeOperation":          true,
-		"ScopeRuntime":            true,
-		"ScopeWorkspace":          true,
-		"Spec":                    true,
-		"Subscription":            true,
-		"Tool":                    true,
-		"ToolArgumentsHook":       true,
-		"ToolConstraints":         true,
-		"ToolContext":             true,
-		"ToolDescription":         true,
-		"ToolSpec":                true,
+		"(*ProtocolServer).Endpoint":         true,
+		"(*ProtocolServer).PublishDiscovery": true,
+		"(*Runtime).Close":                   true,
+		"(*Runtime).OpenProtocol":            true,
+		"(*Runtime).Reload":                  true,
+		"(*Runtime).Subscribe":               true,
+		"(*Subscription).Close":              true,
+		"(*Subscription).Events":             true,
+		"(Invocation).AgentTypes":            true,
+		"(Invocation).Config":                true,
+		"(Invocation).Revision":              true,
+		"Adaptation":                         true,
+		"BackgroundServices":                 true,
+		"Bind":                               true,
+		"Bindings":                           true,
+		"CapabilitySpec":                     true,
+		"ErrClosed":                          true,
+		"ErrComposition":                     true,
+		"ErrConfiguration":                   true,
+		"ErrOwned":                           true,
+		"Event":                              true,
+		"Instance":                           true,
+		"Invocation":                         true,
+		"ModelAdaptation":                    true,
+		"Open":                               true,
+		"Options":                            true,
+		"Plugin":                             true,
+		"PreparationHook":                    true,
+		"ProtocolServer":                     true,
+		"Runtime":                            true,
+		"ScopeAgent":                         true,
+		"ScopeInfo":                          true,
+		"ScopeKind":                          true,
+		"ScopeOperation":                     true,
+		"ScopeRuntime":                       true,
+		"ScopeWorkspace":                     true,
+		"Spec":                               true,
+		"Subscription":                       true,
+		"Tool":                               true,
+		"ToolArgumentsHook":                  true,
+		"ToolConstraints":                    true,
+		"ToolContext":                        true,
+		"ToolDescription":                    true,
+		"ToolSpec":                           true,
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")
