@@ -295,9 +295,46 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)
 	ctx := context.Background()
+
+	// One failure-safe cleanup in explicit order: release the storage gate,
+	// join a started shutdown, join the delete client goroutine, then close
+	// and join the stream. Every completion channel is received at most
+	// once, and the ordinary deferred owner disposal registered above runs
+	// last.
+	releaseGate := sync.OnceFunc(blocked.releaseBlock)
+	var (
+		stream        *sseStream
+		streamClosed  chan struct{}
+		streamJoined  bool
+		deleteDone    chan error
+		deleteStarted bool
+		deleteJoined  bool
+		closeDone     chan error
+		closeStarted  bool
+		closeJoined   bool
+	)
+	defer func() {
+		releaseGate()
+		if closeStarted && !closeJoined {
+			closeJoined = true
+			<-closeDone
+		}
+		if deleteStarted && !deleteJoined {
+			deleteJoined = true
+			<-deleteDone
+		}
+		if stream != nil {
+			stream.close()
+		}
+		if streamClosed != nil && !streamJoined {
+			streamJoined = true
+			<-streamClosed
+		}
+	}()
 
 	// One published discovery record the shutdown must withdraw.
 	record := filepath.Join(t.TempDir(), "discovery.json")
@@ -316,8 +353,8 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 	}
 
 	// One active stream closes when the server's connections close.
-	stream := openSSEStream(t, ps)
-	streamClosed := make(chan struct{})
+	stream = openSSEStream(t, ps)
+	streamClosed = make(chan struct{})
 	go func() {
 		defer close(streamClosed)
 		_, _, _ = stream.readSSEFrame()
@@ -330,10 +367,12 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 
 	// One separately blocked command: the archived Session's deletion parks
 	// inside its storage transaction, holding its admitted call open. Its
-	// HTTP response may be undeliverable once shutdown closes the
-	// connection — the admitted call itself still converges.
+	// HTTP result is only the transport outcome — native Server.Close is
+	// required to close the parked connection, so the client may observe
+	// EOF long before the backend call converges.
 	blocked.block(session)
-	deleteDone := make(chan error, 1)
+	deleteDone = make(chan error, 1)
+	deleteStarted = true
 	go func() {
 		_, err := client.DeleteSessionWithResponse(ctx, session)
 		deleteDone <- err
@@ -344,24 +383,22 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 		t.Fatal("the parked deletion never entered its transaction")
 	}
 
-	closeDone := make(chan error, 1)
+	closeDone = make(chan error, 1)
+	closeStarted = true
 	go func() { closeDone <- r.Close(context.Background()) }()
 
 	// The stream observes the server's connection close while the parked
-	// deletion still holds its admitted call — the deletion's own rendezvous
-	// proves the close has not converged the call yet.
+	// deletion still holds its admitted call: the parked transaction is the
+	// gate-held oracle that the owner shutdown has not converged.
 	select {
 	case <-streamClosed:
+		streamJoined = true
 	case <-time.After(10 * time.Second):
 		t.Fatal("the active stream was not closed before the admitted-call wait")
 	}
 	select {
-	case err := <-deleteDone:
-		t.Fatalf("the blocked command settled before release: %v", err)
-	default:
-	}
-	select {
 	case <-closeDone:
+		closeJoined = true
 		t.Fatal("the owner shutdown completed while the parked command still held its admitted call")
 	default:
 	}
@@ -376,18 +413,21 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 		t.Fatalf("post-shutdown attachment = (%v, %v), want the closed refusal", second, err)
 	}
 
-	// Releasing the command lets the deletion settle, the close converge,
-	// the record withdraw, and the lock release — in that order.
-	blocked.releaseBlock()
+	// Releasing the parked transaction lets the deletion settle, the close
+	// converge, the record withdraw, and the lock release — in that order.
+	releaseGate()
 	select {
 	case <-deleteDone:
-		// The deletion's admitted call settled; its response was delivered
-		// or its connection already closed with the shutdown.
+		// The delete client goroutine joined; its transport result may be
+		// the EOF the connection close produced, never the backend
+		// settlement.
+		deleteJoined = true
 	case <-time.After(10 * time.Second):
-		t.Fatal("the released deletion never settled")
+		t.Fatal("the delete client goroutine never joined")
 	}
 	select {
 	case err := <-closeDone:
+		closeJoined = true
 		if err != nil {
 			t.Fatalf("Close: %v", err)
 		}
