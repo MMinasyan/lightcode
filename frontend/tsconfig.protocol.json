@@ -7,5 +7,5 @@
     "moduleResolution": "bundler",
     "lib": ["es2023", "dom", "dom.iterable"]
   },
-  "include": ["src/generated/protocol/**/*.ts", "protocol-contract.fixture.ts"]
+  "include": ["src/generated/protocol/**/*.ts"]
 }

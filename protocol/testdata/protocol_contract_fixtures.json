@@ -1,0 +1,2219 @@
+{
+ "components": [
+  {
+   "schema": "Agent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"name\":\"fixture\",\"description\":\"fixture\",\"subagent\":false,\"model\":\"fixture\",\"readonly\":false,\"write_dir\":\"fixture\",\"tools\":[],\"capabilities\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "AgentMutation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"name\":\"fixture\",\"description\":\"fixture\",\"subagent\":false,\"model\":\"fixture\",\"readonly\":false,\"write_dir\":\"fixture\",\"tools\":[],\"capabilities\":[]}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "AssistantItem",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"status\":\"completed\",\"source\":\"fixture\",\"content\":[],\"tool_calls\":[]}"
+    },
+    {
+     "name": "full",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
+    },
+    {
+     "name": "refusal-only",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}],\"refusal\":\"no\",\"tool_calls\":[],\"extra\":{\"reasoning\":\"completed\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-status",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"done\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
+    },
+    {
+     "name": "missing-tool-calls",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":null,\"extra\":{\"reasoning\":\"completed\"}}"
+    },
+    {
+     "name": "input-kind",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":1}"
+    },
+    {
+     "name": "tool-call-metadata-null",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":null,\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}",
+     "typescript": false
+    }
+   ]
+  },
+  {
+   "schema": "BackgroundMember",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"child\",\"id\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "CodeRevertError",
+   "accept": [
+    {
+     "name": "CodeRevertResult",
+     "json": "{\"restored\":[],\"skipped\":[]}"
+    },
+    {
+     "name": "Error",
+     "json": "{\"code\":\"invalid\",\"message\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "CodeRevertResult",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"restored\":[],\"skipped\":[]}"
+    },
+    {
+     "name": "partial-with-error",
+     "json": "{\"restored\":[],\"skipped\":[{\"path\":\"/workspace/a.txt\",\"reason\":\"changed\"}],\"error\":{\"code\":\"storage\",\"message\":\"io\"}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "CodeSnapshotGroup",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"operation_id\":\"fixture\",\"group_item_id\":\"fixture\",\"files\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "CompactRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"operation_id\":\"fixture\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-operation-id",
+     "json": "{}"
+    }
+   ]
+  },
+  {
+   "schema": "CompactionItem",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"summary\":\"fixture\",\"model\":\"fixture\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-model",
+     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":null}"
+    }
+   ]
+  },
+  {
+   "schema": "ConfigurationChangedEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":{\"kind\":\"runtime\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"}}"
+    },
+    {
+     "name": "revisioned",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":{\"kind\":\"runtime\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":{\"kind\":\"runtime\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "missing-revision",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":{\"kind\":\"runtime\"}}"
+    },
+    {
+     "name": "null-scope",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":null,\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
+    }
+   ]
+  },
+  {
+   "schema": "ConfigurationRevision",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ConfigurationView",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"settings\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}},\"agents\":[],\"providers\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ConnectRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "keyless",
+     "json": "{}"
+    },
+    {
+     "name": "write-only-key",
+     "json": "{\"api_key\":\"secret\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-member",
+     "json": "{\"token\":\"x\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ContentPart",
+   "accept": [
+    {
+     "name": "TextPart",
+     "json": "{\"kind\":\"text\",\"text\":\"fixture\"}"
+    },
+    {
+     "name": "ImageURLPart",
+     "json": "{\"kind\":\"image_url\",\"url\":\"fixture\"}"
+    },
+    {
+     "name": "OpaquePart",
+     "json": "{\"kind\":\"opaque\",\"opaque_wire_type\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ConversationItem",
+   "accept": [
+    {
+     "name": "InputItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[]}"
+    },
+    {
+     "name": "AssistantItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"status\":\"completed\",\"source\":\"fixture\",\"content\":[],\"tool_calls\":[]}"
+    },
+    {
+     "name": "SignalItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"subtype\":\"interruption\",\"content\":\"fixture\"}"
+    },
+    {
+     "name": "CompactionItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"summary\":\"fixture\",\"model\":\"fixture\"}"
+    },
+    {
+     "name": "OperationEndItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"status\":\"success\",\"detail\":\"fixture\"}"
+    },
+    {
+     "name": "input",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}"
+    },
+    {
+     "name": "assistant",
+     "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
+    },
+    {
+     "name": "signal",
+     "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}}"
+    },
+    {
+     "name": "compaction",
+     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"}"
+    },
+    {
+     "name": "operation-end",
+     "json": "{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"success\",\"detail\":\"done\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-kind",
+     "json": "{\"kind\":\"note\",\"item_id\":\"x\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ConversationPage",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"items\":[]}"
+    },
+    {
+     "name": "with-older-cursor",
+     "json": "{\"items\":[],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Cost",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "double-precision",
+     "json": "{\"input\":0.123456789,\"output\":0.987654321,\"cache_read\":0.123456789,\"cache_write\":0.123456789}"
+    },
+    {
+     "name": "partial",
+     "json": "{\"input\":0.25}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "string-input",
+     "json": "{\"input\":\"cheap\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"input\":0.1,\"extra\":1}"
+    }
+   ]
+  },
+  {
+   "schema": "CreateProviderRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"fixture\",\"provider\":{},\"models\":{}}"
+    },
+    {
+     "name": "with-write-only-key",
+     "json": "{\"id\":\"custom\",\"provider\":{\"base_url\":\"https://custom.test/v1\"},\"models\":{\"m\":{\"context_window\":4096}},\"api_key\":\"write-only\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "CreateSessionRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"workspace\":\"fixture\",\"agent_type\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "DeletionMutation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":null}"
+    },
+    {
+     "name": "explicit-null",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
+    },
+    {
+     "name": "non-null-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":{\"removed\":true}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null,\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "DiscoveredModelCandidate",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"context_window\":0,\"max_output_tokens\":0,\"usable\":false}"
+    },
+    {
+     "name": "with-cost",
+     "json": "{\"id\":\"candidate\",\"name\":\"Candidate\",\"context_window\":4096,\"max_output_tokens\":1024,\"cost\":{\"input\":0.1},\"usable\":true}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "DiscoveryRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"base_url\":\"fixture\",\"api_key_env\":\"fixture\"}"
+    },
+    {
+     "name": "with-headers",
+     "json": "{\"base_url\":\"https://discover.test/v1\",\"api_key_env\":\"DISCOVER_KEY\",\"headers\":{\"X-Discovery\":\"1\"}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Error",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"code\":\"invalid\",\"message\":\"fixture\"}"
+    },
+    {
+     "name": "code-unauthorized",
+     "json": "{\"code\":\"unauthorized\",\"message\":\"missing credential\"}"
+    },
+    {
+     "name": "code-not-found",
+     "json": "{\"code\":\"not_found\",\"message\":\"missing\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "code-conflict",
+     "json": "{\"code\":\"conflict\",\"message\":\"first writer won\"}"
+    },
+    {
+     "name": "code-corrupt",
+     "json": "{\"code\":\"corrupt\",\"message\":\"unreadable session\"}"
+    },
+    {
+     "name": "code-closed",
+     "json": "{\"code\":\"closed\",\"message\":\"owner stopped\"}"
+    },
+    {
+     "name": "code-configuration",
+     "json": "{\"code\":\"configuration\",\"message\":\"candidate rejected\"}"
+    },
+    {
+     "name": "code-storage",
+     "json": "{\"code\":\"storage\",\"message\":\"write failed\"}"
+    },
+    {
+     "name": "code-internal",
+     "json": "{\"code\":\"internal\",\"message\":\"unexpected\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-code",
+     "json": "{\"code\":\"teapot\",\"message\":\"x\"}"
+    },
+    {
+     "name": "missing-message",
+     "json": "{\"code\":\"invalid\"}"
+    },
+    {
+     "name": "bad-session-pattern",
+     "json": "{\"code\":\"invalid\",\"message\":\"x\",\"session_id\":\"not-hex\"}",
+     "typescript": false
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"code\":\"invalid\",\"message\":\"x\",\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "Event",
+   "accept": [
+    {
+     "name": "ConfigurationChangedEvent",
+     "json": "{\"kind\":\"configuration_changed\",\"scope\":{\"kind\":\"runtime\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"}}"
+    },
+    {
+     "name": "ScopeEvent",
+     "json": "{\"kind\":\"scope_opened\",\"scope\":{\"kind\":\"runtime\"}}"
+    },
+    {
+     "name": "SessionChangedEvent",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"runtime\"},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}}"
+    },
+    {
+     "name": "WarningChangedEvent",
+     "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"}}"
+    },
+    {
+     "name": "TextDeltaEvent",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
+    },
+    {
+     "name": "ToolStartedEvent",
+     "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"ordinal\":0,\"name\":\"fixture\"}"
+    },
+    {
+     "name": "ToolFinishedEvent",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"status\":\"success\"}"
+    },
+    {
+     "name": "scope-closed",
+     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"job_id\":\"job-1\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-kind",
+     "json": "{\"kind\":\"event_unknown\",\"scope\":{\"kind\":\"runtime\"}}"
+    },
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ForkRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"boundary_item_id\":\"fixture\",\"operation_id\":\"fixture\",\"content\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ForkResult",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session\":{\"session_id\":\"0123456789abcdef0123456789abcdef\",\"workspace\":\"fixture\",\"lifecycle\":\"open\",\"agent_type\":\"fixture\",\"created_at\":\"2026-01-02T03:04:05Z\",\"last_activity\":\"2026-01-02T03:04:05Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}},\"operation\":{\"operation_id\":\"fixture\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"agent_type\":\"fixture\",\"model\":\"fixture\",\"usage\":{\"by_model\":[]}}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Health",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"1\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "foreign-version",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\"}"
+    },
+    {
+     "name": "bad-instance-pattern",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"1\"}",
+     "typescript": false
+    },
+    {
+     "name": "missing-instance",
+     "json": "{\"protocol_version\":\"1\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"1\",\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "HistoryPage",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"},\"items\":[]}"
+    },
+    {
+     "name": "with-older-cursor",
+     "json": "{\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"items\":[],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Hydration",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session\":{\"session_id\":\"0123456789abcdef0123456789abcdef\",\"workspace\":\"fixture\",\"lifecycle\":\"open\",\"agent_type\":\"fixture\",\"created_at\":\"2026-01-02T03:04:05Z\",\"last_activity\":\"2026-01-02T03:04:05Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"},\"operations\":[],\"pending\":{\"steering\":[],\"queued\":[]},\"conversation\":{\"items\":[]},\"usage\":{\"totals\":{\"by_model\":[]},\"context\":{\"used_tokens\":\"fixture\",\"context_window\":0}},\"warnings\":[],\"background\":[]}"
+    },
+    {
+     "name": "with-active-operation",
+     "json": "{\"session\":{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"},\"operations\":[{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}],\"active_operation\":{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}},\"pending\":{\"steering\":[{\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}],\"queued\":[]},\"conversation\":{\"items\":[{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]},{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}},{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}},{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"},{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"success\",\"detail\":\"done\"}],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"},\"usage\":{\"totals\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]},\"context\":{\"used_tokens\":\"154\",\"context_window\":8192}},\"warnings\":[{\"source\":\"catalog\",\"kind\":\"unusable_model\",\"message\":\"no key\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"background\":[{\"kind\":\"child\",\"id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ImageURLPart",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"image_url\",\"url\":\"fixture\"}"
+    },
+    {
+     "name": "with-extra",
+     "json": "{\"kind\":\"image_url\",\"url\":\"https://example.invalid/i.png\",\"extra\":{}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-url",
+     "json": "{\"kind\":\"image_url\"}"
+    }
+   ]
+  },
+  {
+   "schema": "InputItem",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[]}"
+    },
+    {
+     "name": "plugin-origin",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"plugin\",\"content\":[{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"}]}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "assistant-kind",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}"
+    },
+    {
+     "name": "missing-content",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":null}"
+    },
+    {
+     "name": "unknown-origin",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"system\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}],\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "InputModality",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"text\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "InputOrigin",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"user\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "JSONObject",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "raw-numbers",
+     "json": "{\"n\":9007199254740993,\"big\":1e1000}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "null-literal",
+     "json": "null"
+    },
+    {
+     "name": "array-literal",
+     "json": "[1,2,3]"
+    }
+   ]
+  },
+  {
+   "schema": "JobsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"max_background_processes\":0,\"max_output_bytes\":0,\"read_line_max_chars\":0}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelEdit",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "full-patch",
+     "json": "{\"name\":\"Edited\",\"context_window\":8192,\"max_output_tokens\":4096,\"input_modalities\":[\"text\",\"image\"],\"system_role\":\"developer\",\"usage_in_stream\":true,\"extra_body\":{\"temperature\":0.2},\"cost\":{\"input\":0.1},\"protocol_metadata\":{\"family\":\"openai\"},\"hidden\":true}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-field",
+     "json": "{\"nope\":true}"
+    },
+    {
+     "name": "unknown-modality",
+     "json": "{\"input_modalities\":[\"video\"]}"
+    }
+   ]
+  },
+  {
+   "schema": "ModelList",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"models\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelListEntry",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"ref\":\"fixture\",\"provider\":\"fixture\",\"provider_name\":\"fixture\",\"model\":\"fixture\",\"display_name\":\"fixture\",\"context_window\":0,\"max_output_tokens\":0,\"hidden\":false,\"provider_hidden\":false,\"incomplete\":false,\"source\":\"bundled\"}"
+    },
+    {
+     "name": "with-cost",
+     "json": "{\"ref\":\"prov/m\",\"provider\":\"prov\",\"provider_name\":\"Provider\",\"model\":\"m\",\"display_name\":\"M\",\"context_window\":4096,\"max_output_tokens\":1024,\"cost\":{\"input\":0.1},\"hidden\":false,\"provider_hidden\":false,\"incomplete\":false,\"source\":\"bundled\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelMutation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"context_window\":0,\"max_output_tokens\":0,\"input_modalities\":[],\"system_role\":\"system\",\"usage_in_stream\":false,\"hidden\":false,\"source\":\"bundled\",\"incomplete\":false,\"provider_hidden\":false,\"usable\":false}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelRef",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"fixture\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelSource",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"bundled\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ModelUsage",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"model\":\"fixture\",\"usage\":{\"input_tokens\":\"fixture\",\"cached_input_tokens\":\"fixture\",\"output_tokens\":\"fixture\"}}"
+    },
+    {
+     "name": "slash-model",
+     "json": "{\"model\":\"openrouter/team/model\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "split-provider-member",
+     "json": "{\"provider\":\"openrouter\",\"model\":\"openrouter/team/model\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}"
+    },
+    {
+     "name": "missing-usage",
+     "json": "{\"model\":\"prov/m\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ModelView",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"context_window\":0,\"max_output_tokens\":0,\"input_modalities\":[],\"system_role\":\"system\",\"usage_in_stream\":false,\"hidden\":false,\"source\":\"bundled\",\"incomplete\":false,\"provider_hidden\":false,\"usable\":false}"
+    },
+    {
+     "name": "with-extras",
+     "json": "{\"id\":\"m\",\"name\":\"M\",\"context_window\":4096,\"max_output_tokens\":1024,\"input_modalities\":[\"text\"],\"system_role\":\"system\",\"usage_in_stream\":false,\"extra_body\":{\"temperature\":0.2},\"cost\":{\"input\":0.1},\"protocol_metadata\":{\"family\":\"openai\"},\"hidden\":false,\"source\":\"bundled\",\"incomplete\":false,\"provider_hidden\":false,\"usable\":true}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "OpaquePart",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"opaque\",\"opaque_wire_type\":\"fixture\"}"
+    },
+    {
+     "name": "with-extra",
+     "json": "{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\",\"extra\":{}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-wire-type",
+     "json": "{\"kind\":\"opaque\"}"
+    }
+   ]
+  },
+  {
+   "schema": "Operation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"operation_id\":\"fixture\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"agent_type\":\"fixture\",\"model\":\"fixture\",\"usage\":{\"by_model\":[]}}"
+    },
+    {
+     "name": "settled",
+     "json": "{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-status",
+     "json": "{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"done\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}"
+    },
+    {
+     "name": "missing-usage",
+     "json": "{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\"}"
+    },
+    {
+     "name": "bad-model-type",
+     "json": "{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":7,\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]},\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "OperationEndItem",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"status\":\"success\",\"detail\":\"fixture\"}"
+    },
+    {
+     "name": "failure",
+     "json": "{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"failure\",\"detail\":\"boom\"}"
+    },
+    {
+     "name": "interruption",
+     "json": "{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"interruption\",\"detail\":\"stopped\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "running-status",
+     "json": "{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"running\",\"detail\":\"done\"}"
+    }
+   ]
+  },
+  {
+   "schema": "PendingInput",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"operation_id\":\"fixture\",\"origin\":\"user\",\"content\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "PendingQueues",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"steering\":[],\"queued\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "PendingSnapshot",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"},\"pending\":{\"steering\":[],\"queued\":[]}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "PluginsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "full",
+     "json": "{\"tools\":{\"max_output_bytes\":1024,\"read_max_lines\":100,\"read_line_max_chars\":200,\"command_timeout\":30},\"jobs\":{\"max_background_processes\":2,\"max_output_bytes\":1024,\"read_line_max_chars\":200},\"tasks\":{\"max_concurrent\":2,\"max_output_bytes\":1024}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ProtocolMetadata",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "full",
+     "json": "{\"family\":\"openai\",\"must_preserve\":[\"a\"],\"drop\":[\"b\"]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Provider",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}"
+    },
+    {
+     "name": "with-extras",
+     "json": "{\"id\":\"prov\",\"name\":\"Provider\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"https://provider.test/v1\",\"api_key_env\":\"\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"max_tokens\",\"discovery\":false,\"hidden\":false,\"connectable\":true,\"disconnectable\":false,\"removable\":true,\"models\":[],\"generated_key_env\":\"PROV_KEY\",\"options\":{\"a\":1},\"extra_body\":{\"temperature\":0.1},\"protocol_metadata\":{\"family\":\"openai\"}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ProviderDetail",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"provider\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ProviderEdit",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "full-patch",
+     "json": "{\"name\":\"Renamed\",\"base_url\":\"https://edited.test/v1\",\"api_key_env\":\"EDITED_KEY\",\"headers\":{\"X-Edit\":\"1\"},\"options\":{\"a\":1},\"system_role\":\"user\",\"usage_in_stream\":true,\"max_tokens_field\":\"max_completion_tokens\",\"extra_body\":{\"temperature\":0.1},\"discovery\":true,\"protocol_metadata\":{\"family\":\"openai\"},\"hidden\":false}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-field",
+     "json": "{\"nope\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "ProviderList",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"providers\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ProviderModelList",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"models\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ProviderMutation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ReadFileRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"workspace\":\"fixture\",\"path\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ReadFileResult",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"content\":\"fixture\",\"canonical_path\":\"fixture\",\"truncated\":false}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "wrong-truncated-type",
+     "json": "{\"content\":\"x\",\"canonical_path\":\"/x\",\"truncated\":1}"
+    }
+   ]
+  },
+  {
+   "schema": "RetainedRevertRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"workspace\":\"fixture\",\"session_id\":\"01234567\",\"after_turn\":0}"
+    },
+    {
+     "name": "after-zero",
+     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":0}"
+    },
+    {
+     "name": "after-negative",
+     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":-1}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-workspace",
+     "json": "{\"session_id\":\"01234567\",\"after_turn\":0}"
+    }
+   ]
+  },
+  {
+   "schema": "RetainedTurn",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"turn\":1,\"files\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "RetainedTurns",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"turns\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "RevertCodeRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"boundary_operation_id\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "RevisionResponse",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Scope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"runtime\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"operation\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-kind",
+     "json": "{\"kind\":\"galaxy\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"kind\":\"runtime\",\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "ScopeEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"scope_opened\",\"scope\":{\"kind\":\"runtime\"}}"
+    },
+    {
+     "name": "scope-closed-job",
+     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"job_id\":\"job-1\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-scope-kind",
+     "json": "{\"kind\":\"scope_opened\",\"scope\":{\"kind\":\"galaxy\"}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"kind\":\"scope_opened\",\"scope\":{\"kind\":\"runtime\"},\"extra\":1}"
+    },
+    {
+     "name": "scope-missing-kind",
+     "json": "{\"kind\":\"scope_opened\",\"scope\":{}}"
+    }
+   ]
+  },
+  {
+   "schema": "Session",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session_id\":\"0123456789abcdef0123456789abcdef\",\"workspace\":\"fixture\",\"lifecycle\":\"open\",\"agent_type\":\"fixture\",\"created_at\":\"2026-01-02T03:04:05Z\",\"last_activity\":\"2026-01-02T03:04:05Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}}"
+    },
+    {
+     "name": "full",
+     "json": "{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"parent_session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"source_session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"current_operation_id\":\"op-1\",\"archived_at\":\"2026-01-02T04:00:00Z\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-session-id",
+     "json": "{\"session_id\":null,\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}}"
+    },
+    {
+     "name": "unknown-lifecycle",
+     "json": "{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"closed\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}}"
+    },
+    {
+     "name": "bad-session-pattern",
+     "json": "{\"session_id\":\"nope\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}}",
+     "typescript": false
+    },
+    {
+     "name": "null-optional",
+     "json": "{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"parent_session_id\":null}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "SessionChangedEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"runtime\"},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}}"
+    },
+    {
+     "name": "revisioned",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "bad-revision-pattern",
+     "json": "{\"kind\":\"session_changed\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"session_revision\":{\"instance_id\":\"XYZ\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}}",
+     "typescript": false
+    }
+   ]
+  },
+  {
+   "schema": "SessionLifecycle",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"open\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SessionRevision",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SessionsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SetAgentTypeModelRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"model\":\"fixture\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-model",
+     "json": "{}"
+    }
+   ]
+  },
+  {
+   "schema": "SetSessionAgentTypeRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"agent_type\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Settings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SettingsMutation",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SignalItem",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"subtype\":\"interruption\",\"content\":\"fixture\"}"
+    },
+    {
+     "name": "interruption",
+     "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"interruption\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}}"
+    },
+    {
+     "name": "model-failure-continuation",
+     "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"model_failure_continuation\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"job\",\"id\":\"job-9\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-subtype",
+     "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"finished\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}}"
+    },
+    {
+     "name": "missing-content",
+     "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":null,\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}}"
+    }
+   ]
+  },
+  {
+   "schema": "SkippedFile",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"path\":\"fixture\",\"reason\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SnapshotFile",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"path\":\"fixture\",\"existed\":false}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "wrong-existed-type",
+     "json": "{\"path\":\"/x\",\"existed\":\"yes\"}"
+    }
+   ]
+  },
+  {
+   "schema": "SubmitRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"operation_id\":\"fixture\",\"mode\":\"regular\",\"content\":[]}"
+    },
+    {
+     "name": "queued",
+     "json": "{\"operation_id\":\"op-3\",\"mode\":\"queued\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}"
+    },
+    {
+     "name": "steering-content",
+     "json": "{\"operation_id\":\"op-4\",\"mode\":\"regular\",\"content\":[{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}]}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-mode",
+     "json": "{\"operation_id\":\"op-1\",\"mode\":\"later\",\"content\":[]}"
+    }
+   ]
+  },
+  {
+   "schema": "SubmitResult",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"disposition\":\"admitted\"}"
+    },
+    {
+     "name": "with-operation",
+     "json": "{\"disposition\":\"admitted\",\"operation\":{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SystemRole",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"system\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "TasksSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"max_concurrent\":0,\"max_output_bytes\":0}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "TextDeltaEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
+    },
+    {
+     "name": "progress",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"position\":3,\"content\":\"delta\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"position\":3,\"content\":\"delta\",\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "empty-content",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"position\":3,\"content\":\"\"}",
+     "typescript": false
+    }
+   ]
+  },
+  {
+   "schema": "TextPart",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"text\",\"text\":\"fixture\"}"
+    },
+    {
+     "name": "with-extra",
+     "json": "{\"kind\":\"text\",\"text\":\"hello\",\"extra\":{\"origin\":\"input\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-text",
+     "json": "{\"kind\":\"text\"}"
+    },
+    {
+     "name": "foreign-kind",
+     "json": "{\"kind\":\"assistant\",\"text\":\"x\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"kind\":\"text\",\"text\":\"x\",\"extra\":true}"
+    }
+   ]
+  },
+  {
+   "schema": "ToolCallStatus",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"success\""
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "ToolCallView",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"arguments\":\"fixture\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
+    },
+    {
+     "name": "second-call",
+     "json": "{\"id\":\"call-2\",\"name\":\"grep\",\"arguments\":\"{}\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "metadata-null",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"metadata\":null}",
+     "typescript": false
+    },
+    {
+     "name": "unknown-status",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"status\":\"maybe\"}"
+    },
+    {
+     "name": "missing-arguments",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"extra\":1}"
+    }
+   ]
+  },
+  {
+   "schema": "ToolFinishedEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"status\":\"success\"}"
+    },
+    {
+     "name": "progress",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"denied\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"denied\",\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "unknown-status",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"maybe\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ToolMetadata",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"tool-metadata\""
+    },
+    {
+     "name": "large-integer",
+     "json": "9007199254740993"
+    },
+    {
+     "name": "extreme-exponent",
+     "json": "1e1000"
+    },
+    {
+     "name": "array",
+     "json": "[1,\"two\",false]"
+    },
+    {
+     "name": "string",
+     "json": "\"line count\""
+    },
+    {
+     "name": "boolean",
+     "json": "true"
+    },
+    {
+     "name": "object",
+     "json": "{\"rows\":[null,{\"depth\":1}]}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "null-literal",
+     "json": "null",
+     "typescript": false
+    }
+   ]
+  },
+  {
+   "schema": "ToolStartedEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"ordinal\":0,\"name\":\"fixture\"}"
+    },
+    {
+     "name": "progress",
+     "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"ordinal\":0,\"name\":\"read\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"ordinal\":0,\"name\":\"read\",\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "missing-call-id",
+     "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":null,\"ordinal\":0,\"name\":\"read\"}"
+    }
+   ]
+  },
+  {
+   "schema": "ToolsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"max_output_bytes\":0,\"read_max_lines\":0,\"read_line_max_chars\":0,\"command_timeout\":0}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UpdateProviderDetailRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"provider\":{}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UpdateProviderModelRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"model\":{}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UpdateSettingsRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"settings\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UsageContext",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"used_tokens\":\"fixture\",\"context_window\":0}"
+    },
+    {
+     "name": "zero-window",
+     "json": "{\"used_tokens\":\"0\",\"context_window\":0}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "negative-window",
+     "json": "{\"used_tokens\":\"0\",\"context_window\":-1}",
+     "typescript": false
+    },
+    {
+     "name": "missing-used-tokens",
+     "json": "{\"context_window\":1}"
+    }
+   ]
+  },
+  {
+   "schema": "UsageCount",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"input_tokens\":\"fixture\",\"cached_input_tokens\":\"fixture\",\"output_tokens\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UsageProjection",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"totals\":{\"by_model\":[]},\"context\":{\"used_tokens\":\"fixture\",\"context_window\":0}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UsageSnapshot",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"usage\":{\"totals\":{\"by_model\":[]},\"context\":{\"used_tokens\":\"fixture\",\"context_window\":0}}}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "UsageTotals",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"by_model\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Warning",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"source\":\"setup\",\"kind\":\"fixture\",\"message\":\"fixture\"}"
+    },
+    {
+     "name": "with-session",
+     "json": "{\"source\":\"prompt\",\"kind\":\"prepare\",\"message\":\"warning\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "WarningChangedEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"}}"
+    },
+    {
+     "name": "revisioned",
+     "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"},\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    }
+   ]
+  },
+  {
+   "schema": "WarningsRevision",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "WarningsSnapshot",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"},\"warnings\":[]}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "Workspace",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"root\":\"fixture\",\"display_name\":\"fixture\"}"
+    }
+   ],
+   "reject": []
+  }
+ ],
+ "operations": [
+  {
+   "operation_id": "ArchiveSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/archive",
+   "request": null,
+   "responses": {
+    "200": "Session",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "CompactSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/compact",
+   "request": "CompactRequest",
+   "responses": {
+    "200": "Operation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ConnectProvider",
+   "method": "post",
+   "path": "/v1/providers/connect",
+   "request": "ConnectRequest",
+   "responses": {
+    "200": "ProviderMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "CreateProvider",
+   "method": "post",
+   "path": "/v1/providers",
+   "request": "CreateProviderRequest",
+   "responses": {
+    "200": "ProviderMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "CreateSession",
+   "method": "post",
+   "path": "/v1/sessions",
+   "request": "CreateSessionRequest",
+   "responses": {
+    "201": "Session",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DeleteProviderDetail",
+   "method": "delete",
+   "path": "/v1/providers/detail",
+   "request": null,
+   "responses": {
+    "200": "DeletionMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DeleteProviderModel",
+   "method": "delete",
+   "path": "/v1/providers/models",
+   "request": null,
+   "responses": {
+    "200": "DeletionMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DeleteSession",
+   "method": "delete",
+   "path": "/v1/sessions/{id}",
+   "request": null,
+   "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DisconnectProvider",
+   "method": "post",
+   "path": "/v1/providers/disconnect",
+   "request": null,
+   "responses": {
+    "200": "ProviderMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DiscoverProviderCandidates",
+   "method": "post",
+   "path": "/v1/providers/discover",
+   "request": "DiscoveryRequest",
+   "responses": {
+    "200": "DiscoveredModelCandidate[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "DiscoverProviderModelCandidates",
+   "method": "post",
+   "path": "/v1/providers/models/discover",
+   "request": null,
+   "responses": {
+    "200": "DiscoveredModelCandidate[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ForkSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/fork",
+   "request": "ForkRequest",
+   "responses": {
+    "200": "ForkResult",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetConfiguration",
+   "method": "get",
+   "path": "/v1/configuration",
+   "request": null,
+   "responses": {
+    "200": "ConfigurationView",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetEvents",
+   "method": "get",
+   "path": "/v1/events",
+   "request": null,
+   "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetHealth",
+   "method": "get",
+   "path": "/v1/health",
+   "request": null,
+   "responses": {
+    "200": "Health",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetProviderDetail",
+   "method": "get",
+   "path": "/v1/providers/detail",
+   "request": null,
+   "responses": {
+    "200": "ProviderDetail",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetRetainedCodeSnapshots",
+   "method": "get",
+   "path": "/v1/retained-code-snapshots",
+   "request": null,
+   "responses": {
+    "200": "RetainedTurns",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSession",
+   "method": "get",
+   "path": "/v1/sessions/{id}",
+   "request": null,
+   "responses": {
+    "200": "Session",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSessionCodeSnapshots",
+   "method": "get",
+   "path": "/v1/sessions/{id}/code-snapshots",
+   "request": null,
+   "responses": {
+    "200": "CodeSnapshotGroup[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSessionHistory",
+   "method": "get",
+   "path": "/v1/sessions/{id}/history",
+   "request": null,
+   "responses": {
+    "200": "HistoryPage",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSessionHydration",
+   "method": "get",
+   "path": "/v1/sessions/{id}/hydration",
+   "request": null,
+   "responses": {
+    "200": "Hydration",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSessionPending",
+   "method": "get",
+   "path": "/v1/sessions/{id}/pending",
+   "request": null,
+   "responses": {
+    "200": "PendingSnapshot",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetSessionUsage",
+   "method": "get",
+   "path": "/v1/sessions/{id}/usage",
+   "request": null,
+   "responses": {
+    "200": "UsageSnapshot",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "GetWarnings",
+   "method": "get",
+   "path": "/v1/warnings",
+   "request": null,
+   "responses": {
+    "200": "WarningsSnapshot",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "InterruptSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/interrupt",
+   "request": "",
+   "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListModels",
+   "method": "get",
+   "path": "/v1/models",
+   "request": null,
+   "responses": {
+    "200": "ModelList",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListProviderModels",
+   "method": "get",
+   "path": "/v1/providers/models",
+   "request": null,
+   "responses": {
+    "200": "ProviderModelList",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListProviders",
+   "method": "get",
+   "path": "/v1/providers",
+   "request": null,
+   "responses": {
+    "200": "ProviderList",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListSessions",
+   "method": "get",
+   "path": "/v1/sessions",
+   "request": null,
+   "responses": {
+    "200": "Session[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListWorkspaces",
+   "method": "get",
+   "path": "/v1/workspaces",
+   "request": null,
+   "responses": {
+    "200": "Workspace[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ReadWorkspaceFile",
+   "method": "post",
+   "path": "/v1/workspaces/files/read",
+   "request": "ReadFileRequest",
+   "responses": {
+    "200": "ReadFileResult",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ReloadConfiguration",
+   "method": "post",
+   "path": "/v1/configuration/reload",
+   "request": null,
+   "responses": {
+    "200": "RevisionResponse",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ReopenSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/reopen",
+   "request": null,
+   "responses": {
+    "200": "Session",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ResetProviderField",
+   "method": "delete",
+   "path": "/v1/providers/fields/{field}",
+   "request": null,
+   "responses": {
+    "200": "ProviderMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ResetProviderModelField",
+   "method": "delete",
+   "path": "/v1/providers/models/fields/{field}",
+   "request": null,
+   "responses": {
+    "200": "ModelMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "RevertRetainedCode",
+   "method": "post",
+   "path": "/v1/retained-code-snapshots/revert",
+   "request": "RetainedRevertRequest",
+   "responses": {
+    "200": "CodeRevertResult",
+    "default": "CodeRevertError"
+   }
+  },
+  {
+   "operation_id": "RevertSessionCode",
+   "method": "post",
+   "path": "/v1/sessions/{id}/revert-code",
+   "request": "RevertCodeRequest",
+   "responses": {
+    "200": "CodeRevertResult",
+    "default": "CodeRevertError"
+   }
+  },
+  {
+   "operation_id": "SetAgentTypeModel",
+   "method": "put",
+   "path": "/v1/agent-types/model",
+   "request": "SetAgentTypeModelRequest",
+   "responses": {
+    "200": "AgentMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "SetSessionAgentType",
+   "method": "put",
+   "path": "/v1/sessions/{id}/agent-type",
+   "request": "SetSessionAgentTypeRequest",
+   "responses": {
+    "200": "Session",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "StopSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/stop",
+   "request": "",
+   "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "SubmitSession",
+   "method": "post",
+   "path": "/v1/sessions/{id}/submit",
+   "request": "SubmitRequest",
+   "responses": {
+    "200": "SubmitResult",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "UpdateConfigurationSettings",
+   "method": "put",
+   "path": "/v1/configuration/settings",
+   "request": "UpdateSettingsRequest",
+   "responses": {
+    "200": "SettingsMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "UpdateProviderDetail",
+   "method": "put",
+   "path": "/v1/providers/detail",
+   "request": "UpdateProviderDetailRequest",
+   "responses": {
+    "200": "ProviderMutation",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "UpdateProviderModel",
+   "method": "put",
+   "path": "/v1/providers/models",
+   "request": "UpdateProviderModelRequest",
+   "responses": {
+    "200": "ModelMutation",
+    "default": "Error"
+   }
+  }
+ ],
+ "raw_fidelity": [
+  {
+   "schema": "ToolMetadata",
+   "json": "9007199254740993",
+   "preserve": [
+    "9007199254740993"
+   ]
+  },
+  {
+   "schema": "ToolMetadata",
+   "json": "1e1000",
+   "preserve": [
+    "1e1000"
+   ]
+  },
+  {
+   "schema": "JSONObject",
+   "json": "{\"n\":9007199254740993,\"big\":1e1000}",
+   "preserve": [
+    "9007199254740993",
+    "1e1000"
+   ]
+  },
+  {
+   "schema": "ToolCallView",
+   "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}",
+   "preserve": [
+    "9007199254740993",
+    "1e1000"
+   ]
+  },
+  {
+   "schema": "AssistantItem",
+   "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}",
+   "preserve": [
+    "9007199254740993",
+    "1e1000"
+   ]
+  }
+ ]
+}

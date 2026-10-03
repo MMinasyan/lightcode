@@ -9,7 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "generate-protocol": "openapi-ts",
-    "typecheck:protocol": "tsc --noEmit -p tsconfig.protocol.json"
+    "typecheck:protocol": "node scripts/check-protocol-fixtures.mjs"
   },
   "dependencies": {
     "markdown-it": "^14.0.0"
