@@ -198,6 +198,11 @@ type controlledPrep struct {
 	modelArrived chan struct{}
 	cleanups     chan struct{}
 	cleanupSeen  int
+	// closeGate when non-nil blocks every supplied execution's Close after it
+	// signals the cleanups channel: a deterministic cleanup-phase barrier.
+	closeGate chan struct{}
+	// openErr when non-nil fails every supplied execution's opener.
+	openErr error
 }
 
 func newControlledPrep() *controlledPrep {
@@ -228,8 +233,12 @@ func (p *controlledPrep) prepare(_ context.Context, req harness.PreparationReque
 func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
 	p.mu.Lock()
 	p.openCalls++
+	openErr := p.openErr
 	gate := p.modelGate
 	p.mu.Unlock()
+	if openErr != nil {
+		return harness.Execution{}, openErr
+	}
 	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
 		select {
 		case p.modelArrived <- struct{}{}:
@@ -255,6 +264,12 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 			select {
 			case p.cleanups <- struct{}{}:
 			default:
+			}
+			p.mu.Lock()
+			gate := p.closeGate
+			p.mu.Unlock()
+			if gate != nil {
+				<-gate
 			}
 			return nil
 		},

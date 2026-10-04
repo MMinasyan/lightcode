@@ -69,7 +69,7 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil)
+	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil, nil)
 }
 
 func compactToolsPlugin() Plugin {

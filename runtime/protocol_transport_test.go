@@ -734,3 +734,89 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 		t.Fatalf("unknown-boundary revert = (%d, %+v), want the typed invalid 400", refusal.HTTPResponse.StatusCode, typed)
 	}
 }
+
+// TestProtocolServerIntervalProtectionAndAvailability proves the artifact
+// interval rows through the mounted generated client: a parked mounted
+// restore owns the Session's artifact interval, so a mounted deletion cannot
+// destroy the protected state, a second mounted rewind conflicts, the
+// metadata-only agent-type change stays available, and the parked restore
+// completes with its own result through the client once its FIFO released.
+func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+		ctx := context.Background()
+
+		workspace := filepath.Join(e.home, "interval-mounted")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+		file := filepath.Join(workspace, "mounted.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, "v1")
+
+		// The mounted restore parks inside its traversal: its HTTP handler is
+		// mid-restore while the client waits.
+		type mountedRestore struct {
+			response *protocol.RevertSessionCodeResponse
+			err      error
+		}
+		parked := make(chan mountedRestore, 1)
+		go func() {
+			response, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "op-1"})
+			parked <- mountedRestore{response: response, err: err}
+		}()
+		// The shared FIFO park returns only once the mounted restore's
+		// reader is parked in restoreFile's os.Open.
+		park := parkFIFO(t, fifo)
+		defer park.flush()
+
+		// A mounted deletion cannot destroy the protected state.
+		if del, err := client.DeleteSessionWithResponse(ctx, session); err != nil || del.JSONDefault == nil ||
+			del.HTTPResponse.StatusCode != http.StatusConflict {
+			body, _ := json.Marshal(del.JSONDefault)
+			t.Fatalf("mounted delete during a parked restore = (%d, %s, %v), want the typed conflict 409", del.HTTPResponse.StatusCode, body, err)
+		}
+		if hydration, err := client.GetSessionHydrationWithResponse(ctx, session); err != nil || hydration.JSON200 == nil {
+			t.Fatalf("hydration after the refused delete = (%v, %+v), want the surviving Session", err, hydration.JSON200)
+		}
+
+		// A second mounted rewind conflicts.
+		if rewind, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "op-1"}); err != nil ||
+			rewind.JSONDefault == nil || rewind.HTTPResponse.StatusCode != http.StatusConflict {
+			body, _ := json.Marshal(rewind.JSONDefault)
+			t.Fatalf("second mounted rewind = (%d, %s, %v), want the typed conflict 409", rewind.HTTPResponse.StatusCode, body, err)
+		}
+
+		// The metadata-only transition stays available inside the interval.
+		changed, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		if err != nil || changed.JSON200 == nil || changed.JSON200.AgentType != "worker" {
+			t.Fatalf("mounted agent-type change during a parked restore = (%v, %+v), want the changed selection", err, changed.JSON200)
+		}
+
+		// The parked mounted restore completes with its own result.
+		park.release("restored")
+		var out mountedRestore
+		select {
+		case out = <-parked:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked mounted restore never returned after its FIFO completed")
+		}
+		if out.err != nil || out.response.JSON200 == nil {
+			t.Fatalf("mounted restore = (%+v, %v), want the restored result", out.response, out.err)
+		}
+		if len(out.response.JSON200.Restored) != 1 || out.response.JSON200.Restored[0] != file {
+			t.Fatalf("restored = %v, want the parked group's restore", out.response.JSON200.Restored)
+		}
+		if data, err := os.ReadFile(file); err != nil || string(data) != "restored" {
+			t.Fatalf("file = (%q, %v), want the FIFO content", data, err)
+		}
+	})
+}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -589,12 +590,13 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 
 // --- concurrent admission and partial traversal ---
 
-// TestCodeRevertConcurrentAdmission proves restore holds no reservation with a
-// test-owned FIFO saved original: the restore parks on the FIFO reader, a
-// gated Operation is admitted while it is parked, and the later-visited bad
-// group returns the partial result after the parked group's restore. No
-// production hook or CodeStore change backs the fixture.
-func TestCodeRevertConcurrentAdmission(t *testing.T) {
+// TestCodeRevertPartialTraversalParkedGroup is the partial-traversal fixture:
+// a restore parked on a test-owned FIFO saved original completes its parked
+// group's restore, and the later-visited bad group returns the partial
+// accumulated result with the internal error class — restored content, a
+// non-nil skip list, and no target Session id on the error. No production
+// hook or CodeStore change backs the fixture.
+func TestCodeRevertPartialTraversalParkedGroup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
@@ -623,99 +625,14 @@ func TestCodeRevertConcurrentAdmission(t *testing.T) {
 		}
 		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, second.Admission.AdmittedEntry.EntryID), target, "current")
 
-		gate := make(chan struct{})
-		var gateOnce sync.Once
-		releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
-		e.prep.modelGate = gate
-		var writerFD = -1
-		writerReleased := false
-		defer func() {
-			if writerFD >= 0 {
-				_ = unix.Close(writerFD)
-				return
-			}
-			if !writerReleased { // a failed row must still release any parked reader
-				go func() {
-					localFD, err := unix.Open(fifo, unix.O_WRONLY, 0)
-					if err == nil {
-						_, _ = unix.Write(localFD, []byte("released"))
-						_ = unix.Close(localFD)
-					}
-				}()
-			}
-		}()
-		defer releaseGate()
+		park, outcomes := parkRestore(t, r, session, "op-first", fifo)
+		defer park.flush()
 
-		type outcome struct {
-			result protocol.CodeRevertResult
-			err    error
-		}
-		done := make(chan outcome, 1)
-		go func() {
-			result, err := r.revertSessionCode(context.Background(), session, "op-first")
-			done <- outcome{result: result, err: err}
-		}()
+		park.release("restored")
 
-		// The nonblocking writer open succeeds only once the restore reader
-		// is already parked in restoreFile's os.Open.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK, 0)
-			if err == nil {
-				writerFD = fd
-				break
-			}
-			if !errors.Is(err, unix.ENXIO) {
-				t.Fatalf("FIFO writer open: %v", err)
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the restore never parked on the FIFO saved original")
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-
-		// Admission proceeds while the restore is parked: a reservation would
-		// hold this Submit behind the filesystem work.
-		admitted := make(chan error, 1)
-		go func() {
-			admitted <- r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-				res, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID:   session,
-					OperationID: "op-admit",
-					Origin:      harness.InputOriginUser,
-					Content:     []model.ContentPart{{Kind: model.PartText, Text: "while parked"}},
-					Mode:        harness.MessageModeRegular,
-				})
-				if err != nil {
-					return err
-				}
-				if res.Disposition != harness.DispositionAdmitted {
-					return fmt.Errorf("disposition %q, want admitted", res.Disposition)
-				}
-				return nil
-			})
-		}()
+		var out restoreOutcome
 		select {
-		case err := <-admitted:
-			if err != nil {
-				t.Fatalf("admission during a parked restore: %v", err)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("admission blocked during a parked restore: the restore is not a reservation")
-		}
-
-		if _, err := unix.Write(writerFD, []byte("restored")); err != nil {
-			t.Fatalf("FIFO write: %v", err)
-		}
-		if err := unix.Close(writerFD); err != nil {
-			t.Fatalf("FIFO close: %v", err)
-		}
-		writerFD = -1
-		writerReleased = true
-
-		var out outcome
-		select {
-		case out = <-done:
+		case out = <-outcomes:
 		case <-time.After(10 * time.Second):
 			t.Fatal("the restore never returned after its parked group completed")
 		}
@@ -731,9 +648,6 @@ func TestCodeRevertConcurrentAdmission(t *testing.T) {
 		if data, err := os.ReadFile(target); err != nil || string(data) != "restored" {
 			t.Fatalf("parked target = (%q, %v), want the FIFO restore to complete", data, err)
 		}
-		releaseGate()
-		awaitOperation(t, r, session, "op-admit", harness.OperationSuccess)
-		awaitIdleSession(t, r, session)
 	})
 }
 
@@ -763,6 +677,332 @@ func seedFIFOCodeEntry(t *testing.T, groupRoot, target, content string) string {
 	}
 	writeRetainedJSON(t, filepath.Join(entryDir, "meta.json"), meta)
 	return fifo
+}
+
+// --- artifact interval oracles ---
+
+// restoreOutcome carries one revertSessionCode result across a goroutine.
+type restoreOutcome struct {
+	result protocol.CodeRevertResult
+	err    error
+}
+
+// fifoPark holds the writer side of one parked restore: the writer's
+// nonblocking open succeeds only once the restore's reader is parked inside
+// restoreFile, and release completes that restore's admitted traversal.
+type fifoPark struct {
+	writerFD int
+	fifo     string
+}
+
+// parkFIFO starts no restore of its own: it returns the parking writer once
+// any restore's reader is parked on the FIFO saved original. The caller
+// defers flush so a failing test releases the parked reader before the
+// owner's shutdown joins the admitted restores.
+func parkFIFO(t *testing.T, fifo string) *fifoPark {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+		if err == nil {
+			return &fifoPark{writerFD: fd, fifo: fifo}
+		}
+		if !errors.Is(err, unix.ENXIO) {
+			t.Fatalf("FIFO writer open: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the restore never parked on the FIFO saved original")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// parkRestore starts one restore in the background and returns its parking
+// writer once the restore is parked on the FIFO saved original. The caller
+// defers flush so a failing test releases every parked reader before the
+// owner's shutdown joins the admitted restores.
+func parkRestore(t *testing.T, r *Runtime, sessionID, boundary, fifo string) (*fifoPark, <-chan restoreOutcome) {
+	t.Helper()
+	outcomes := make(chan restoreOutcome, 1)
+	go func() {
+		result, err := r.revertSessionCode(context.Background(), sessionID, boundary)
+		outcomes <- restoreOutcome{result: result, err: err}
+	}()
+	return parkFIFO(t, fifo), outcomes
+}
+
+// release completes the parked restore: the FIFO bytes become the restored
+// content of its saved original, and closing the held writer ends every
+// connected reader.
+func (p *fifoPark) release(content string) {
+	if p.writerFD < 0 {
+		return
+	}
+	_, _ = unix.Write(p.writerFD, []byte(content))
+	_ = unix.Close(p.writerFD)
+	p.writerFD = -1
+}
+
+// flush tears a failing test's parked reader down: closing the held writer
+// gives every connected FIFO reader an end-of-file, so the admitted restores
+// finish and the owner's shutdown can join them.
+func (p *fifoPark) flush() {
+	p.release("released")
+}
+
+// TestCodeRevertCrossGroupSkipLedger proves the whole-restore traversal
+// ledger: the newest group's externally-changed identity is skipped once, and
+// the older group's snapshot of the same canonical identity — recorded through
+// a display alias — is never restored, so the external content survives.
+func TestCodeRevertCrossGroupSkipLedger(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "ledger-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		first := submitCodeOperation(t, r, session, "op-first", "first")
+		second := submitCodeOperation(t, r, session, "op-second", "second")
+		awaitRestorableSession(t, r, session)
+
+		file := filepath.Join(workspace, "chain.txt")
+		if err := os.WriteFile(file, []byte("v0"), 0o600); err != nil {
+			t.Fatalf("write v0: %v", err)
+		}
+		// The older group records the file through a display alias: an
+		// absolute symlink resolving to the same canonical identity.
+		alias := filepath.Join(workspace, "alias.txt")
+		if err := os.Symlink(file, alias); err != nil {
+			t.Fatalf("symlink alias: %v", err)
+		}
+		captureCodeMutation(t, codeGroupRoot(r, session, first.Admission.AdmittedEntry.EntryID), alias, file, []byte("v1"))
+		captureCodeMutation(t, codeGroupRoot(r, session, second.Admission.AdmittedEntry.EntryID), file, file, []byte("v2"))
+		// The external edit matches the older group's last-write identity, so
+		// only a shared ledger keeps the older group from restoring.
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write external v1: %v", err)
+		}
+
+		result, err := r.revertSessionCode(context.Background(), session, "op-first")
+		if err != nil {
+			t.Fatalf("cross-group restore = %v, want the skip-ledger success", err)
+		}
+		if len(result.Restored) != 0 {
+			t.Fatalf("restored = %v, want no restore after the newer group's skip", result.Restored)
+		}
+		if len(result.Skipped) != 1 || result.Skipped[0].Path != file {
+			t.Fatalf("skipped = %+v, want exactly one reported skip for %s", result.Skipped, file)
+		}
+		data, err := os.ReadFile(file)
+		if err != nil || string(data) != "v1" {
+			t.Fatalf("file = (%q, %v), want the external v1 preserved", data, err)
+		}
+	})
+}
+
+// TestCodeRewindConflictWhileParked proves two concurrent rewinds of one
+// Session conflict: the parked restore owns the whole artifact interval, so
+// the second rewind refuses before any directory work and mutates nothing.
+func TestCodeRewindConflictWhileParked(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "rewind-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		first := submitCodeOperation(t, r, session, "op-first", "first")
+		second := submitCodeOperation(t, r, session, "op-second", "second")
+		awaitRestorableSession(t, r, session)
+
+		keep := filepath.Join(workspace, "keep.txt")
+		if err := os.WriteFile(keep, []byte("v0"), 0o600); err != nil {
+			t.Fatalf("write keep v0: %v", err)
+		}
+		captureCodeMutation(t, codeGroupRoot(r, session, first.Admission.AdmittedEntry.EntryID), keep, keep, []byte("v1"))
+		rewind := filepath.Join(workspace, "rewind.txt")
+		if err := os.WriteFile(rewind, []byte("v2"), 0o600); err != nil {
+			t.Fatalf("write rewind v2: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, second.Admission.AdmittedEntry.EntryID), rewind, "v2")
+
+		park, outcomes := parkRestore(t, r, session, "op-first", fifo)
+
+		defer park.flush()
+
+		rewound := make(chan restoreOutcome, 1)
+		go func() {
+			result, err := r.revertSessionCode(context.Background(), session, "op-first")
+			rewound <- restoreOutcome{result: result, err: err}
+		}()
+		var retry restoreOutcome
+		select {
+		case retry = <-rewound:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the second rewind waited behind the parked restore instead of conflicting")
+		}
+		if !errors.Is(retry.err, harness.ErrConflict) {
+			t.Fatalf("second rewind = (%+v, %v), want the conflict class with zero mutation", retry.result, retry.err)
+		}
+		if data, err := os.ReadFile(keep); err != nil || string(data) != "v1" {
+			t.Fatalf("keep = (%q, %v), want it untouched by the refused rewind", data, err)
+		}
+
+		park.release("restored")
+		var parked restoreOutcome
+		select {
+		case parked = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parked.err != nil {
+			t.Fatalf("parked restore = %v", parked.err)
+		}
+		if len(parked.result.Restored) != 2 {
+			t.Fatalf("restored = %v, want both groups' preimages", parked.result.Restored)
+		}
+		if data, err := os.ReadFile(keep); err != nil || string(data) != "v0" {
+			t.Fatalf("keep = (%q, %v), want the restored preimage v0", data, err)
+		}
+	})
+}
+
+// TestDeleteSessionConflictsWithRestoreInterval proves a committed deletion
+// cannot destroy protected state: while a restore owns the artifact interval
+// the deletion refuses, the archived Session and its artifacts stay intact,
+// and the same deletion succeeds once the restore released the interval.
+func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "delete-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+		file := filepath.Join(workspace, "deleted.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		groupRoot := codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID)
+		fifo := seedFIFOCodeEntry(t, groupRoot, file, "v1")
+		if _, err := r.archiveSession(context.Background(), session); err != nil {
+			t.Fatalf("archiveSession: %v", err)
+		}
+
+		park, outcomes := parkRestore(t, r, session, "op-1", fifo)
+
+		defer park.flush()
+		if err := r.deleteSession(context.Background(), session); !errors.Is(err, harness.ErrConflict) {
+			t.Fatalf("delete during a parked restore = %v, want the conflict class", err)
+		}
+		if header := headerThroughRuntime(t, r, session); header.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("refused delete changed the Session lifecycle to %v", header.Lifecycle)
+		}
+		if _, err := os.Stat(groupRoot); err != nil {
+			t.Fatalf("refused delete touched the artifacts: %v", err)
+		}
+
+		park.release("restored")
+		var parked restoreOutcome
+		select {
+		case parked = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parked.err != nil {
+			t.Fatalf("parked restore = %v", parked.err)
+		}
+		// The interval, not the Session, blocked the deletion.
+		if err := r.deleteSession(context.Background(), session); err != nil {
+			t.Fatalf("delete after the restore completed = %v", err)
+		}
+		if _, err := os.Stat(groupRoot); !os.IsNotExist(err) {
+			t.Fatalf("group root after the deletion = %v, want it removed", err)
+		}
+	})
+}
+
+// TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable proves the
+// metadata-only transitions stay available inside a restore interval: they
+// acquire no artifact token, so the agent-type change, the archive and the
+// reopen all succeed while the restore is parked, and the restore still
+// completes with its own result.
+func TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "meta-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+
+		keep := filepath.Join(workspace, "keep.txt")
+		if err := os.WriteFile(keep, []byte("v0"), 0o600); err != nil {
+			t.Fatalf("write keep v0: %v", err)
+		}
+		group := codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID)
+		captureCodeMutation(t, group, keep, keep, []byte("v1"))
+		parked := filepath.Join(workspace, "parked.txt")
+		if err := os.WriteFile(parked, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write parked v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, group, parked, "v1")
+
+		park, outcomes := parkRestore(t, r, session, "op-1", fifo)
+
+		defer park.flush()
+
+		changed, err := r.setSessionAgentType(context.Background(), session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		if err != nil {
+			t.Fatalf("agent-type change during a parked restore: %v", err)
+		}
+		if changed.AgentType != "worker" {
+			t.Fatalf("changed header agent type = %q, want worker", changed.AgentType)
+		}
+		archived, err := r.archiveSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("archive during a parked restore: %v", err)
+		}
+		if archived.Lifecycle != protocol.Archived {
+			t.Fatalf("archived header lifecycle = %v, want archived", archived.Lifecycle)
+		}
+		reopened, err := r.reopenSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("reopen during a parked restore: %v", err)
+		}
+		if reopened.Lifecycle != protocol.Open || reopened.AgentType != "worker" {
+			t.Fatalf("reopened header = %+v, want open with the changed selection", reopened)
+		}
+
+		park.release("restored")
+		var out restoreOutcome
+		select {
+		case out = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if out.err != nil {
+			t.Fatalf("parked restore = %v", out.err)
+		}
+		if len(out.result.Restored) != 2 {
+			t.Fatalf("restored = %v, want both group entries", out.result.Restored)
+		}
+		if data, err := os.ReadFile(keep); err != nil || string(data) != "v0" {
+			t.Fatalf("keep = (%q, %v), want the restored preimage v0", data, err)
+		}
+		if data, err := os.ReadFile(parked); err != nil || string(data) != "restored" {
+			t.Fatalf("parked = (%q, %v), want the FIFO restore to complete", data, err)
+		}
+	})
 }
 
 // --- retained pre-cutover rows ---
@@ -1326,4 +1566,356 @@ func sha256Hex(data []byte) string {
 func sha256Hex16(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// awaitOpenerRegistered polls the owned registry state until the Session's
+// artifact interval shows the held token plus one registered waiter — the
+// deterministic parked-opener rendezvous.
+func awaitOpenerRegistered(t *testing.T, r *Runtime, sessionID string) {
+	t.Helper()
+	awaitRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, sessionID), 2)
+}
+
+// awaitNoRegistryEntries polls until the Session's artifact interval entry is
+// reclaimed: every lease released and every attempt dropped.
+func awaitNoRegistryEntries(t *testing.T, r *Runtime, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r.artifacts.mu.Lock()
+		entries := len(r.artifacts.entries)
+		r.artifacts.mu.Unlock()
+		if entries == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s left %d registry entries, want the reclaimed empty registry", what, entries)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestQueuedDrainOpenerWaitsForRestoreInterval proves the queued-drain entry
+// path through the interval: with the restore parked, the direct submit's
+// opener registers as the token's waiter and the queued input stays buffered;
+// after the restore releases, the first execution runs to its terminal and
+// the drain admits the queued input through the same opener site, both
+// settling in order with the restore's result intact and the registry
+// reclaimed at the end.
+func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "drain-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+		file := filepath.Join(workspace, "queued.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, "v1")
+
+		park, outcomes := parkRestore(t, r, session, "op-1", fifo)
+		defer park.flush()
+		drainCommandModelArrivals(e)
+
+		gate := make(chan struct{})
+		var gateOnce sync.Once
+		releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
+		defer releaseGate()
+		e.prep.modelGate = gate
+
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			res, err := h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   session,
+				OperationID: "op-run",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "run first"}},
+				Mode:        harness.MessageModeRegular,
+			})
+			if err != nil {
+				return err
+			}
+			if res.Disposition != harness.DispositionAdmitted {
+				return fmt.Errorf("disposition %q, want admitted", res.Disposition)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("direct submit during a parked restore: %v", err)
+		}
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			res, err := h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   session,
+				OperationID: "op-queued",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "queued behind"}},
+				Mode:        harness.MessageModeQueued,
+			})
+			if err != nil {
+				return err
+			}
+			if res.Disposition != harness.DispositionQueued {
+				return fmt.Errorf("disposition %q, want queued", res.Disposition)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("queued submit during a parked restore: %v", err)
+		}
+
+		awaitOpenerRegistered(t, r, session)
+		select { // neither execution's model effect began inside the interval
+		case <-e.prep.modelArrived:
+			t.Fatal("a model effect began inside the restore interval")
+		default:
+		}
+
+		park.release("restored")
+		var parkedRestore restoreOutcome
+		select {
+		case parkedRestore = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parkedRestore.err != nil || len(parkedRestore.result.Restored) != 1 {
+			t.Fatalf("parked restore = (%+v, %v)", parkedRestore.result, parkedRestore.err)
+		}
+
+		awaitModelArrival(t, e) // the direct submit's opener won the released interval
+		releaseGate()
+		awaitOperation(t, r, session, "op-run", harness.OperationSuccess)
+		awaitOperation(t, r, session, "op-queued", harness.OperationSuccess) // the drain's opener ran
+		awaitIdleSession(t, r, session)
+		awaitNoRegistryEntries(t, r, "the settled drain")
+	})
+}
+
+// TestBackgroundWakeOpenerWaitsForRestoreInterval proves the
+// background-completion-wake entry path through the interval: with the
+// restore parked, a real job's completion delivery admits its completion
+// Operation through the idle path, whose opener registers as the token's
+// waiter; after the restore releases, the wake's execution runs and settles.
+func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+		stopper := &stubStopper{events: e.events}
+		r, err := e.open(context.Background(), e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "wake-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+		file := filepath.Join(workspace, "wake.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, "v1")
+
+		park, outcomes := parkRestore(t, r, session, "op-1", fifo)
+		defer park.flush()
+		drainCommandModelArrivals(e)
+
+		gate := make(chan struct{})
+		var gateOnce sync.Once
+		releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
+		defer releaseGate()
+		e.prep.modelGate = gate
+
+		var completionID string
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			return h.StartJob(ctx, session, "0a1b2c3d", func(_ context.Context, id string) error {
+				completionID = id
+				return nil
+			})
+		}); err != nil {
+			t.Fatalf("StartJob during a parked restore: %v", err)
+		}
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			return h.DeliverBackgroundCompletion(ctx, session, completionID, "job report")
+		}); err != nil {
+			t.Fatalf("DeliverBackgroundCompletion during a parked restore: %v", err)
+		}
+
+		awaitOpenerRegistered(t, r, session) // the wake's opener is the registered waiter
+		select {
+		case <-e.prep.modelArrived:
+			t.Fatal("the wake's model effect began inside the restore interval")
+		default:
+		}
+
+		park.release("restored")
+		var parkedRestore restoreOutcome
+		select {
+		case parkedRestore = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parkedRestore.err != nil || len(parkedRestore.result.Restored) != 1 {
+			t.Fatalf("parked restore = (%+v, %v)", parkedRestore.result, parkedRestore.err)
+		}
+
+		awaitModelArrival(t, e) // the wake's opener won the released interval
+		releaseGate()
+		awaitOperation(t, r, session, completionID, harness.OperationSuccess)
+		awaitNoRegistryEntries(t, r, "the settled wake")
+	})
+}
+
+// TestExecutionOpenerFailureReleasesInterval proves the opening-failure row:
+// a failed opener releases the Session's artifact token before returning, so
+// the registry is reclaimed and the next execution runs normally.
+func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "openerr-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+
+		e.prep.openErr = errors.New("boom")
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   session,
+				OperationID: "op-fail",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "fail"}},
+				Mode:        harness.MessageModeRegular,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		awaitNoRegistryEntries(t, r, "the failed opening") // the unwind released the token
+		awaitRestorableSession(t, r, session)              // the failed execution's slot retired
+
+		e.prep.openErr = nil
+		submitCodeOperation(t, r, session, "op-next", "next") // the next execution runs normally
+		awaitNoRegistryEntries(t, r, "the settled successor")
+	})
+}
+
+// TestExecutionCleanupReleasesIntervalLast proves the release-last ordering:
+// while the concrete execution's cleanup phase is held open, the token is
+// still held — a restore conflicts — and only after the cleanup and the
+// scoped closes complete is the registry reclaimed and the same restore
+// admitted.
+func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "cleanup-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+
+		closeGate := make(chan struct{})
+		var gateOnce sync.Once
+		releaseCleanup := func() { gateOnce.Do(func() { close(closeGate) }) }
+		defer releaseCleanup() // a failing assertion must not leak a held execution Close
+		e.prep.closeGate = closeGate
+		submitThroughRuntime(t, r, session, "op-1", "run")
+		e.prep.awaitCleanups(1) // the concrete execution's Close started and blocked
+
+		// The token is still held through the blocked cleanup and the not-yet-
+		// closed scopes: a restore conflicts before any directory work.
+		if _, err := r.revertSessionCode(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrConflict) {
+			t.Fatalf("restore during the blocked cleanup = %v, want the conflict class", err)
+		}
+		assertRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, session), 1, 1, true)
+
+		releaseCleanup() // the cleanup completes; the scoped closes and the release follow
+		awaitRestorableSession(t, r, session)
+		awaitNoRegistryEntries(t, r, "the settled cleanup")
+		result, err := r.revertSessionCode(context.Background(), session, "op-1")
+		if err != nil || result.Restored == nil {
+			t.Fatalf("restore after the cleanup = (%+v, %v), want the admitted traversal", result, err)
+		}
+	})
+}
+
+// TestRestoreIntervalCancellationAndShutdownOutcomes proves the cancellation
+// rows: a caller canceled before ownership touches no token and no file; an
+// opener canceled by an interrupt while parked on the token drops its
+// reference and settles without success; and a begun restore finishes its
+// admitted result under the managed shutdown, which joins it.
+func TestRestoreIntervalCancellationAndShutdownOutcomes(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r) // every early failure joins the ordinary Runtime cleanup
+		workspace := filepath.Join(e.home, "cancel-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "only")
+		awaitRestorableSession(t, r, session)
+		file := filepath.Join(workspace, "cancel.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, "v1")
+
+		// A canceled caller before ownership: no token, no file effect.
+		canceledCtx, cancelCaller := context.WithCancel(context.Background())
+		cancelCaller()
+		if _, err := r.revertSessionCode(canceledCtx, session, "op-1"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled restore = %v, want the caller's cancellation", err)
+		}
+		assertRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, session), 0, 0, false)
+
+		park, outcomes := parkRestore(t, r, session, "op-1", fifo)
+		defer park.flush()
+		drainCommandModelArrivals(e)
+
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   session,
+				OperationID: "op-parked",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "parked"}},
+				Mode:        harness.MessageModeRegular,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("submit during a parked restore: %v", err)
+		}
+		awaitOpenerRegistered(t, r, session)
+
+		// The managed shutdown begins while the opener is parked: its
+		// execution context cancels, the parked acquisition fails, and the
+		// waiter's reference drops while the restore keeps its own.
+		r.beginShutdown()
+		awaitRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, session), 1)
+
+		// The begun restore finishes its admitted result under the shutdown.
+		park.release("restored")
+		var parkedRestore restoreOutcome
+		select {
+		case parkedRestore = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the begun restore never finished under the shutdown")
+		}
+		if parkedRestore.err != nil || len(parkedRestore.result.Restored) != 1 || parkedRestore.result.Restored[0] != file {
+			t.Fatalf("begun restore = (%+v, %v), want its admitted result", parkedRestore.result, parkedRestore.err)
+		}
+		if data, err := os.ReadFile(file); err != nil || string(data) != "restored" {
+			t.Fatalf("file = (%q, %v), want the restore's FIFO content", data, err)
+		}
+		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
 }

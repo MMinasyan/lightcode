@@ -153,6 +153,13 @@ type preparation struct {
 	passive     *observationAdapter
 	prepare     prepare
 
+	// artifacts is the Runtime's private per-Session artifact interval
+	// registry. Every committed opener acquires its Session's token here
+	// before any scope, plugin, model, tool or hook effect and releases it
+	// last, after the scoped cleanup; nil leaves an isolated preparation
+	// without artifact ownership.
+	artifacts *artifactIntervals
+
 	// subprocessEnv is the Runtime's live managed-environment producer,
 	// supplied only when the retained manager exists; nil leaves every
 	// prepared command without an environment producer and the cooperative
@@ -165,11 +172,12 @@ type preparation struct {
 // composition with its constructed Runtime scope and Workspace registry, the
 // once-resolved home, the background services bridge armed after harness.New
 // returns, the Runtime's passive publication adapter (nil in isolated
-// preparation tests, dropping only passive presentation), the Runtime's live
-// managed-environment producer (nil without a retained manager), and the
+// preparation tests, dropping only passive presentation), the Runtime's
+// private artifact interval registry (nil without a Runtime), the Runtime's
+// live managed-environment producer (nil without a retained manager), and the
 // controlled preparation function; nil selects the concrete production
 // preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, subprocessEnv func() []string, prepare prepare) *preparation {
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string, prepare prepare) *preparation {
 	return &preparation{
 		config:        config,
 		composition:   c,
@@ -178,6 +186,7 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 		home:          home,
 		background:    background,
 		passive:       passive,
+		artifacts:     artifacts,
 		subprocessEnv: subprocessEnv,
 		prepare:       prepare,
 	}
@@ -278,37 +287,48 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 	return Bindings{entries: entries}
 }
 
-// open turns the committed admission into the execution: it opens the
-// Operation then the Agent scope, enters the Agent-scope guard, creates the
-// execution selection from the same snapshot, and hands that new value with
-// the actual committed admission to this preparation's opener, so hooks'
-// final prompt and tools can never be replaced by stale pre-hook values. The
-// guard covers opening, every Harness-driven effect callback and terminal
-// settlement until the returned Close releases it and closes the Agent then
-// the Operation scope; opening failure releases the guard and unwinds owned
-// scopes first. Only after the opener succeeds does the collected prompt
-// presentation publish, so a failed fork or admission never creates warnings
-// for an unpublished Session and a successful opener publishes before any
-// progress.
+// open turns the committed admission into the execution: it first acquires
+// the Session's whole artifact interval — before any scope, plugin, model,
+// tool or hook effect — then opens the Operation then the Agent scope, enters
+// the Agent-scope guard, creates the execution selection from the same
+// snapshot, and hands that new value with the actual committed admission to
+// this preparation's opener, so hooks' final prompt and tools can never be
+// replaced by stale pre-hook values. The guard covers opening, every
+// Harness-driven effect callback and terminal settlement until the returned
+// Close releases it and closes the Agent then the Operation scope; the
+// artifact token releases last, after that scoped cleanup, and an opening
+// failure releases it before returning. Only after the opener succeeds does
+// the collected prompt presentation publish, so a failed fork or admission
+// never creates warnings for an unpublished Session and a successful opener
+// publishes before any progress.
 func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openExecution) (harness.Execution, error) {
+	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(p.runtime.info.DataDir, admission.SessionID))
+	if err != nil {
+		return harness.Execution{}, err
+	}
 	base := ScopeInfo{DataDir: p.runtime.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
 	operation, err := p.composition.openScope(ctx, operationInfo, []*scope{p.runtime, workspaceScope})
 	if err != nil {
+		releaseArtifacts()
 		return harness.Execution{}, err
 	}
 	agentInfo := base
 	agentInfo.Kind = ScopeAgent
 	agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
 	if err != nil {
-		return harness.Execution{}, errors.Join(err, operation.close())
+		err = errors.Join(err, operation.close())
+		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
+		return harness.Execution{}, err
 	}
 	unwind := func(cause error, release func()) (harness.Execution, error) {
 		if release != nil {
 			release()
 		}
-		return harness.Execution{}, errors.Join(cause, agentScope.close(), operation.close())
+		err := errors.Join(cause, agentScope.close(), operation.close())
+		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
+		return harness.Execution{}, err
 	}
 	callCtx, release, err := agentScope.enter(ctx)
 	if err != nil {
@@ -352,7 +372,9 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		ToolHooks:     hooks,
 		Close: func() error {
 			release()
-			return errors.Join(agentScope.close(), operation.close())
+			err := errors.Join(agentScope.close(), operation.close())
+			releaseArtifacts() // the token releases last, after the scoped cleanup
+			return err
 		},
 	}, nil
 }

@@ -2673,21 +2673,21 @@ func TestPublicSweepListFailureReturnsNoIdentities(t *testing.T) {
 	})
 }
 
-// TestPublicSweepWaitsForBlockedPreparation proves the sweep's transition
-// serialization through public operations: a Sweep that reaches a Session with
-// an in-flight preparation (reservation held) waits for it to resolve instead
-// of transitioning the Session under it — the admission commits, the running
-// Session is left unchanged, and the sweep returns nil.
-func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
+// TestPublicSweepSkipsBlockedPreparation proves the sweep's nonwaiting busy
+// rule: a Sweep that reaches a Session with an in-flight preparation
+// (reservation held) applies the same no-transition outcome as running or
+// buffered work and returns without waiting — the Session stays unchanged
+// while the preparation is still parked, and the released admission commits
+// and settles normally.
+func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
-		counting := &listCountingStore{Storage: store, listed: make(chan struct{}, 1)}
 		script := newScriptModel()
 		gate := make(chan struct{})
 		script.gate = gate
-		f := newPublicFixture(t, counting, script, nil)
+		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
 		ctx := context.Background()
-		session := createSession(t, f.h) // the only Session: after enumeration the sweep is parked on it
+		session := createSession(t, f.h) // the only Session: the sweep reaches the reserved candidate
 		first, err := f.h.ReadSessionHeader(ctx, session)
 		if err != nil {
 			t.Fatalf("read created session: %v", err)
@@ -2697,7 +2697,7 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 		releasePrep := make(chan struct{})
 		prepared := scriptPrepared(script)
 		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
-			if call == 0 { // the first admission's preparation is blocked while the sweep waits
+			if call == 0 { // the first admission's preparation is blocked while the sweep passes
 				select {
 				case prepStarted <- struct{}{}:
 				default:
@@ -2730,22 +2730,32 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 			_, err := f.h.Sweep(ctx, policy, first.LastActivity.Add(100*time.Hour))
 			sweepDone <- err
 		}()
-		<-counting.listed // the sweep enumerated and is waiting for the idle reservation
+		select {
+		case err := <-sweepDone:
+			if err != nil {
+				t.Fatalf("sweep over a blocked preparation = %v, want the no-transition skip", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the sweep waited for the blocked preparation: busy candidates skip without waiting")
+		}
+		// The skip happened before the preparation released: nothing
+		// transitioned while the reservation was still held.
+		still, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.CurrentOperationID != "" {
+			t.Fatalf("sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
+		}
 
 		close(releasePrep) // the preparation completes: the admission commits and the Session becomes running
 		out := <-submitDone
 		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted {
 			t.Fatalf("first submit = %+v err %v, want admitted", out.res, out.err)
 		}
-		if err := <-sweepDone; err != nil {
-			t.Fatalf("sweep over a blocked preparation = %v, want it to wait and then skip the running Session", err)
-		}
-		still, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.CurrentOperationID != "op-1" {
-			t.Fatalf("sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
+		settled, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || settled.Lifecycle != harness.LifecycleOpen || settled.CurrentOperationID != "op-1" {
+			t.Fatalf("post-commit header = %+v err %v, want the running Session unchanged", settled, err)
 		}
 		if _, err := f.h.ReadOperation(ctx, session, "op-1"); err != nil {
-			t.Fatalf("blocked-preparation admission = err %v, want it admitted after the sweep waited", err)
+			t.Fatalf("blocked-preparation admission = err %v, want it admitted after the sweep skipped", err)
 		}
 
 		script.releaseGate()

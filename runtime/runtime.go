@@ -78,6 +78,7 @@ type Runtime struct {
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
+	artifacts    *artifactIntervals
 	dataDir      string
 	// protocol is the one attached isolated protocol server, set under mu by
 	// OpenProtocol and frozen once closure begins; nil when none is attached.
@@ -215,6 +216,11 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 
 	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	background := &backgroundBridge{}
+	// The private per-Session artifact interval registry initializes before
+	// the Harness: every committed opener, restore, committed deletion and
+	// sweep candidate coordinates on it, and no caller can observe an
+	// unarmed registry because the owner is unpublished.
+	artifacts := newArtifactIntervals()
 	// The call-time subprocess environment producer exists only when the
 	// retained manager exists; without it no manager is constructed on
 	// demand and every cooperative command fails.
@@ -225,7 +231,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, subprocessEnv, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv, options.prepare).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {
@@ -249,6 +255,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
+		artifacts:    artifacts,
 		dataDir:      dataDir,
 		shutdownDone: make(chan struct{}),
 	}
@@ -414,15 +421,23 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 
 // deleteSession is the private canonical Session deletion: the whole body
 // runs inside one admitted call, so shutdown joins the deletion and its
-// cleanup together. After Harness.DeleteSession commits — or reports the
-// Session already absent for a valid identity, the same idempotent result —
-// the Session's warning groups are removed in one observation section with
+// cleanup together. The deletion takes the Session's artifact interval
+// nonblockingly around its Harness transition and retains it through the
+// warning and artifact cleanup, so a held interval refuses the deletion
+// before any transition; after Harness.DeleteSession commits — or reports
+// the Session already absent for a valid identity, the same idempotent result
+// — the Session's warning groups are removed in one observation section with
 // one runtime-scoped hint, then its artifact tree is removed once. Any other
 // Harness error (invalid input, corruption, revision races, a closed
 // admission) returns as-is and authorizes no cleanup.
 func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		err := h.DeleteSession(ctx, sessionID)
+		releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
+		if err != nil {
+			return err
+		}
+		defer releaseArtifacts()
+		err = h.DeleteSession(ctx, sessionID)
 		if err != nil && !errors.Is(err, harness.ErrNotFound) {
 			return err
 		}

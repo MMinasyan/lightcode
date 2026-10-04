@@ -83,6 +83,13 @@ func targetCodeGroupDir(dataDir, sessionID, entryID string) string {
 	return filepath.Join(dataDir, "code", sessionID, entryID)
 }
 
+// sessionArtifactDir is the one server-derived Session artifact directory:
+// the interval key every committed opener, restore, committed deletion and
+// sweep candidate coordinates on.
+func sessionArtifactDir(dataDir, sessionID string) string {
+	return filepath.Join(dataDir, "code", sessionID)
+}
+
 // listSessionCodeSnapshots projects every recorded target code group of one
 // Session, ascending by the owning Operation's admitted-entry sequence, from
 // one admitted Harness snapshot. Only groups that recorded files are listed;
@@ -137,12 +144,20 @@ func projectCodeSnapshotGroups(snap harness.SessionSnapshot, dataDir string) ([]
 }
 
 // revertSessionCode restores one target Session's recorded code groups at or
-// after the boundary Operation in reverse admission order, from one admitted
-// snapshot. Every group's partial result is accumulated before its error is
-// handled; a traversal failure returns that accumulated result with the
-// internal error class, while a pre-traversal refusal returns no result.
+// after the boundary Operation in reverse admission order. It takes the
+// Session's artifact interval nonblockingly — contention is a conflict — and
+// captures and validates its one owned snapshot while holding the token,
+// then traverses under it. Every group's partial result is accumulated before
+// its error is handled; a traversal failure returns that accumulated result
+// with the internal error class, while a pre-traversal refusal returns no
+// result.
 func (r *Runtime) revertSessionCode(ctx context.Context, sessionID, boundaryOperationID string) (protocol.CodeRevertResult, error) {
 	var result protocol.CodeRevertResult
+	releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
+	if err != nil {
+		return result, err
+	}
+	defer releaseArtifacts()
 	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
 		projected, err := restoreSessionCode(snap, r.dataDir, boundaryOperationID)
 		result = projected
@@ -154,10 +169,12 @@ func (r *Runtime) revertSessionCode(ctx context.Context, sessionID, boundaryOper
 }
 
 // restoreSessionCode is the pure restore body over one owned snapshot: the
-// one idle gate, boundary resolution, then one fresh CodeStore per group from
-// the last admitted group down to the boundary. Its existing canonical and
-// last-write proof reports changed or unproven files as skipped, never
-// overwritten, and removes only the snapshot entries it restored.
+// one idle gate, boundary resolution, then one traversal from the last
+// admitted group down to the boundary. The shared whole-invocation traversal
+// owns the skip and reported-skip ledgers across every group, so an identity
+// skipped in a newer group is never restored by an older one. Its existing
+// canonical and last-write proof reports changed or unproven files as skipped,
+// never overwritten, and removes only the snapshot entries it restored.
 func restoreSessionCode(snap harness.SessionSnapshot, dataDir, boundaryOperationID string) (protocol.CodeRevertResult, error) {
 	sessionID := snap.Session.Identity.SessionID
 	if err := codeRestoreRefusal(snap); err != nil {
@@ -174,17 +191,15 @@ func restoreSessionCode(snap harness.SessionSnapshot, dataDir, boundaryOperation
 	if boundary < 0 {
 		return protocol.CodeRevertResult{}, fmt.Errorf("boundary operation %q names no admitted message of session %q: %w", boundaryOperationID, sessionID, harness.ErrInvalid)
 	}
-	result := newCodeRevertResult()
+	directories := make([]string, 0, len(groups)-boundary)
 	for i := len(groups) - 1; i >= boundary; i-- {
-		store, err := snapshot.OpenCodeStore(targetCodeGroupDir(dataDir, sessionID, groups[i].entryID))
-		if err != nil {
-			return codeRevertFailure(result, err)
-		}
-		groupResult, err := store.RevertCode(0)
-		accumulateCodeRevert(&result, groupResult)
-		if err != nil {
-			return codeRevertFailure(result, err)
-		}
+		directories = append(directories, targetCodeGroupDir(dataDir, sessionID, groups[i].entryID))
+	}
+	result := newCodeRevertResult()
+	traversed, err := snapshot.RevertCodeGroups(directories, 0)
+	accumulateCodeRevert(&result, traversed)
+	if err != nil {
+		return codeRevertFailure(result, err)
 	}
 	return result, nil
 }
@@ -341,9 +356,13 @@ func (r *Runtime) listRetainedCodeSnapshots(ctx context.Context, workspace, lega
 }
 
 // revertRetainedCode restores the proven legacy directory's recorded turns
-// after the caller's turn through the retained CodeStore order, canonical and
-// last-write proof, and partial-result contract. `after_turn` is used
-// directly; no target Operation ID is fabricated for a legacy turn choice.
+// after the caller's turn through the shared whole-invocation traversal,
+// canonical and last-write proof, and partial-result contract. The retained
+// proof occurs before the directory is leased: the proved session directory
+// is the one artifact interval the restore takes nonblockingly — contention
+// is a conflict — and the token remains held through the traversal and every
+// exit. `after_turn` is used directly; no target Operation ID is fabricated
+// for a legacy turn choice.
 func (r *Runtime) revertRetainedCode(ctx context.Context, req protocol.RetainedRevertRequest) (protocol.CodeRevertResult, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -354,11 +373,12 @@ func (r *Runtime) revertRetainedCode(ctx context.Context, req protocol.RetainedR
 	if err != nil {
 		return protocol.CodeRevertResult{}, err
 	}
-	store, err := snapshot.OpenCodeStore(sessionDir)
+	releaseArtifacts, err := r.artifacts.acquireTry(sessionDir)
 	if err != nil {
 		return protocol.CodeRevertResult{}, err
 	}
-	restored, err := store.RevertCode(req.AfterTurn)
+	defer releaseArtifacts()
+	restored, err := snapshot.RevertCodeGroups([]string{sessionDir}, req.AfterTurn)
 	result := newCodeRevertResult()
 	accumulateCodeRevert(&result, restored)
 	if err != nil {

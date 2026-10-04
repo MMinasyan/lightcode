@@ -1235,7 +1235,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil)
+	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	if err != nil {
@@ -1460,6 +1460,99 @@ func TestProductionKeylessProvider(t *testing.T) {
 		data, err := os.ReadFile(filepath.Join(e.workspace("keyless-ws"), "out.txt"))
 		if err != nil || string(data) != "written by production" {
 			t.Fatalf("prod_write effect = (%q, %v), want the written content", data, err)
+		}
+	})
+}
+
+// TestExecutionOpenerToolWriteWaitsForRestoreInterval proves the interval
+// with a real Harness-mediated mutating tool: the parked restore owns the
+// Session's artifact interval, the racing admission still commits
+// (Harness-owned), and the committed opener — registered as a waiter in the
+// owned registry state — cannot begin the prod_write effect until the restore
+// released the interval. The durable Operation outcome and the actual file
+// content prove the ordering: the restore's FIFO content lands first, the
+// tool's real write last.
+func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer r.Close(ctx)
+		workspace := e.workspace("interval-ws")
+		session, err := r.createSession(ctx, workspace, "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		sessionID := session.Identity.SessionID
+		op := submitCodeOperation(t, r, sessionID, "op-1", "first")
+		awaitRestorableSession(t, r, sessionID)
+
+		file := filepath.Join(workspace, "out.txt") // the prod_write target
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, sessionID, op.Admission.AdmittedEntry.EntryID), file, "written by production")
+
+		park, outcomes := parkRestore(t, r, sessionID, "op-1", fifo)
+		defer park.flush()
+
+		admitted := make(chan error, 1)
+		go func() {
+			admitted <- r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				res, err := h.Submit(ctx, harness.SubmitRequest{
+					SessionID:   sessionID,
+					OperationID: "op-write",
+					Origin:      harness.InputOriginUser,
+					Content:     []model.ContentPart{{Kind: model.PartText, Text: "write it"}},
+					Mode:        harness.MessageModeRegular,
+				})
+				if err != nil {
+					return err
+				}
+				if res.Disposition != harness.DispositionAdmitted {
+					return fmt.Errorf("disposition %q, want admitted", res.Disposition)
+				}
+				return nil
+			})
+		}()
+		select {
+		case err := <-admitted:
+			if err != nil {
+				t.Fatalf("admission during a parked restore: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("admission blocked during a parked restore: admission stays Harness-owned")
+		}
+
+		// The owned registry state is the deterministic parked-opener proof:
+		// the restore holds the token and the opener's acquisition is
+		// registered as its waiter. The tool effect runs strictly after the
+		// opener wins, so this state cannot coexist with a begun write.
+		awaitOpenerRegistered(t, r, sessionID)
+
+		// The real write has not begun: the opener cannot have won the token.
+		if data, err := os.ReadFile(file); err != nil || len(data) != 0 {
+			t.Fatalf("the tool write began inside the restore interval: (%q, %v)", data, err)
+		}
+
+		park.release("restored")
+		var parkedRestore restoreOutcome
+		select {
+		case parkedRestore = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parkedRestore.err != nil {
+			t.Fatalf("parked restore = %v", parkedRestore.err)
+		}
+		if len(parkedRestore.result.Restored) != 1 || parkedRestore.result.Restored[0] != file {
+			t.Fatalf("restored = %v, want the parked group's restore", parkedRestore.result.Restored)
+		}
+
+		// The opener won the released interval: the real tool effect ran and
+		// the durable Operation settled.
+		awaitOperation(t, r, sessionID, "op-write", harness.OperationSuccess)
+		if data, err := os.ReadFile(file); err != nil || string(data) != "written by production" {
+			t.Fatalf("file after the tool write = (%q, %v), want the tool's content", data, err)
 		}
 	})
 }

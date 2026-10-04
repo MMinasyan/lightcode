@@ -1497,3 +1497,86 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		}
 	})
 }
+
+// TestSweepSkipsHeldArtifactInterval proves the pass's ownership row: a
+// header-enumerated candidate whose artifact interval is held by a parked
+// restore is skipped for that pass without blocking the sibling's transition
+// and cleanup; the held Session keeps its artifacts and register until a later
+// pass owns the interval and completes the deletion.
+func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		ctx := context.Background()
+		r, err := e.open(ctx, e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		heldWorkspace := filepath.Join(e.dataDir, "held-ws")
+		if err := os.MkdirAll(heldWorkspace, 0o700); err != nil {
+			t.Fatalf("mkdir held workspace: %v", err)
+		}
+		held := projectionSession(t, r, heldWorkspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, held, "op-1", "held")
+		file := filepath.Join(heldWorkspace, "held.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, held, op.Admission.AdmittedEntry.EntryID), file, "v1")
+		if _, err := r.archiveSession(ctx, held); err != nil {
+			t.Fatalf("archive the held session: %v", err)
+		}
+		heldCode := filepath.Join(e.dataDir, "code", held)
+
+		sibling := projectionSession(t, r, filepath.Join(e.dataDir, "swept-ws"), "solo").Identity.SessionID
+		if _, err := r.archiveSession(ctx, sibling); err != nil {
+			t.Fatalf("archive the sibling session: %v", err)
+		}
+		siblingCode := plantSessionCode(t, e.dataDir, sibling)
+
+		park, outcomes := parkRestore(t, r, held, "op-1", fifo)
+
+		defer park.flush()
+
+		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
+
+		if _, err := os.Stat(siblingCode); !os.IsNotExist(err) {
+			t.Fatalf("sibling artifacts = %v, want them swept by the pass", err)
+		}
+		if err := headerErrorThroughRuntime(ctx, r, sibling); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("sibling after the pass = %v, want the committed deletion", err)
+		}
+		if _, err := os.Stat(heldCode); err != nil {
+			t.Fatalf("held artifacts after the pass = %v, want them intact", err)
+		}
+		if header := headerThroughRuntime(t, r, held); header.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("held candidate lifecycle = %v, want it left archived", header.Lifecycle)
+		}
+
+		park.release("restored")
+		var parked restoreOutcome
+		select {
+		case parked = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parked.err != nil {
+			t.Fatalf("parked restore = %v", parked.err)
+		}
+		if len(parked.result.Restored) != 1 || parked.result.Restored[0] != file {
+			t.Fatalf("restored = %v, want the parked group's restore", parked.result.Restored)
+		}
+
+		// A later pass owns the interval and completes the deletion.
+		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
+		if _, err := os.Stat(heldCode); !os.IsNotExist(err) {
+			t.Fatalf("held artifacts after the later pass = %v, want them removed", err)
+		}
+		if err := headerErrorThroughRuntime(ctx, r, held); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("held candidate after the later pass = %v, want the committed deletion", err)
+		}
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
