@@ -33,29 +33,10 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 	captured := r.config.current()
 	return protocol.ConfigurationView{
 		ConfigurationRevision: configurationRevision(captured),
-		Settings:              ownSettings(captured.settings),
+		Settings:              projectSettings(captured.sessions, captured.plugins),
 		Agents:                projectAgents(captured),
 		Providers:             projectProviders(captured, r.managedEnv),
 	}, nil
-}
-
-// ownSettings copies the projected settings with fresh optional-section
-// pointers, so a caller's mutation never reaches the captured snapshot.
-func ownSettings(in protocol.Settings) protocol.Settings {
-	out := in
-	if in.Plugins.Tools != nil {
-		tools := *in.Plugins.Tools
-		out.Plugins.Tools = &tools
-	}
-	if in.Plugins.Jobs != nil {
-		jobs := *in.Plugins.Jobs
-		out.Plugins.Jobs = &jobs
-	}
-	if in.Plugins.Tasks != nil {
-		tasks := *in.Plugins.Tasks
-		out.Plugins.Tasks = &tasks
-	}
-	return out
 }
 
 // listModels projects the flat model picker: the visible (non-hidden) list
@@ -159,13 +140,14 @@ func (r *Runtime) getWarnings(ctx context.Context) (protocol.WarningsSnapshot, e
 }
 
 // updateSettings replaces the complete settings shape through the one
-// configuration mutation path: the whole sessions and whole plugins members
-// are written as the generated target shape — an omitted optional plugin
-// section removing any newer one — and a successful edit atomically rewrites
-// the owning main configuration and publishes the next generation, identical
-// bytes included. Unowned top-level root members are untouched. The result
-// projects the returned candidate, never a second current() load that could
-// see a later writer.
+// configuration mutation path: the whole sessions member and the whole
+// plugins member are written as the generated target shape — each plugin
+// document string becomes that plugin's owned raw section, an omitted
+// section removing any newer one — and every successful edit atomically
+// rewrites the owning main configuration and publishes the next generation,
+// identical bytes and absent-member resets included. Unowned top-level root
+// members are untouched. The result projects the returned candidate, never a
+// second current() load that could see a later writer.
 func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings) (protocol.SettingsMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -178,7 +160,7 @@ func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings
 	}
 	return protocol.SettingsMutation{
 		ConfigurationRevision: configurationRevision(candidate),
-		Result:                ownSettings(candidate.settings),
+		Result:                projectSettings(candidate.sessions, candidate.plugins),
 	}, nil
 }
 

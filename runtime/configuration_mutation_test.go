@@ -19,6 +19,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -32,12 +33,14 @@ import (
 // permissions member, and an unowned unknown top-level member.
 const mutationConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"One","context_window":9007199254740993}}}},"permissions":{"rules":[{"permission":"file.write","target":"*","access":"allow"}]},"custom_flag":true}`
 
-// mutationSettings is one complete settings shape the tests write.
+// mutationSettings is one complete settings shape the tests write: the
+// sessions policy beside one opaque tools document string.
 func mutationSettings() protocol.Settings {
-	tools := protocol.ToolsSettings{CommandTimeout: 60, MaxOutputBytes: 2048, ReadLineMaxChars: 3000, ReadMaxLines: 100}
 	return protocol.Settings{
 		Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 5, DeleteAfterArchiveDays: 2},
-		Plugins:  protocol.PluginsSettings{Tools: &tools},
+		Plugins: protocol.PluginsSettings{
+			"tools": `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100}`,
+		},
 	}
 }
 
@@ -53,6 +56,85 @@ func compactJSON(t *testing.T, data []byte) string {
 		t.Fatalf("compact %s: %v", data, err)
 	}
 	return buf.String()
+}
+
+// opaqueSettingsDocument is the settings round-trip fixture: two compiled
+// plugin sections carrying fields common Runtime does not know plus one
+// int64 lexeme beyond JS number precision, one empty compiled section, and
+// one unowned provider model carrying the same kind of lexeme.
+const opaqueSettingsDocument = `{
+  "providers": {"prov": {"transport": {"base_url": "https://prov.test/v1", "api_key_env": ""}, "discovery": false, "models": {"m": {"name": "One", "context_window": 9007199254740993}}}},
+  "sessions": {"archive_after_days": 3},
+  "plugins": {
+    "alpha": {"kept": 1, "exact": 9007199254740993},
+    "tools": {"max_output_bytes": 42, "exact": 9007199254740993},
+    "tasks": {}
+  }
+}`
+
+// TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments proves
+// the representable-domain rule across a read-to-save round trip: every
+// compiled plugin section returns as its exact owned document string —
+// unknown fields and the int64 lexeme included — and writing the returned
+// view back preserves every section while unowned numeric lexemes survive.
+func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testing.T) {
+	store := storage.NewMemory()
+	var opens atomic.Int64
+	r, e := openConfigurationRuntime(t, store, opaqueSettingsDocument, configurationAgentsDocument,
+		append(settingsPlugins(), servicePlugin("alpha", &opens, acceptValidator))...)
+	defer closeProjectionRuntime(r)
+	ctx := context.Background()
+	sub, err := r.Subscribe(8)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	view, err := r.getConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("getConfiguration: %v", err)
+	}
+	read := view.Settings.Plugins
+	want := map[string]string{
+		"alpha": `{"kept":1,"exact":9007199254740993}`,
+		"tools": `{"max_output_bytes":42,"exact":9007199254740993}`,
+		"tasks": `{}`,
+	}
+	if len(read) != len(want) {
+		t.Fatalf("settings plugins = %v, want exactly the owned sections %v", read, want)
+	}
+	for id, wantDoc := range want {
+		got, ok := read[id]
+		if !ok {
+			t.Fatalf("plugins.%s is absent from the read; want the owned document %s", id, wantDoc)
+		}
+		if got := compactJSON(t, []byte(got)); got != wantDoc {
+			t.Fatalf("plugins.%s read document = %s, want the owned %s", id, got, wantDoc)
+		}
+	}
+
+	// Read-to-save: the whole plugins member round-trips its documents
+	// and the unowned provider lexeme survives the owning write.
+	if _, err := r.updateSettings(ctx, view.Settings); err != nil {
+		t.Fatalf("updateSettings: %v", err)
+	}
+	nextConfigurationEvent(t, sub, "2")
+	root := fileRoot(t, e.configPath)
+	var plugins map[string]json.RawMessage
+	if err := json.Unmarshal(root["plugins"], &plugins); err != nil {
+		t.Fatalf("decode written plugins member: %v", err)
+	}
+	if len(plugins) != len(want) {
+		t.Fatalf("written plugins = %v, want exactly %v", plugins, want)
+	}
+	for id, wantDoc := range want {
+		if got := compactJSON(t, plugins[id]); got != wantDoc {
+			t.Fatalf("written plugins.%s = %s, want the round-tripped %s", id, got, wantDoc)
+		}
+	}
+	if got := string(root["providers"]); !strings.Contains(got, "9007199254740993") {
+		t.Fatalf("written providers = %s, want the unowned int64 lexeme preserved", got)
+	}
 }
 
 // assertNoEvent proves one subscription is silent without blocking.
@@ -198,8 +280,8 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	if candidate.generation != 2 || svc.current() != candidate {
 		t.Fatalf("mutate = generation %d (current published %v), want generation 2 published", candidate.generation, svc.current() == candidate)
 	}
-	if candidate.settings.Sessions != wantSettings.Sessions {
-		t.Fatalf("published sessions = %+v, want the written shape", candidate.settings.Sessions)
+	if got := projectSettings(candidate.sessions, candidate.plugins).Sessions; got != wantSettings.Sessions {
+		t.Fatalf("published sessions = %+v, want the written shape", got)
 	}
 
 	// The owning file: the written members are the marshaled shape, the
@@ -212,7 +294,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	if err := json.Unmarshal(root["plugins"], &plugins); err != nil {
 		t.Fatalf("decode plugins member: %v", err)
 	}
-	if got, want := compactJSON(t, plugins["tools"]), compactJSON(t, mustMarshal(t, wantSettings.Plugins.Tools)); got != want {
+	if got, want := compactJSON(t, plugins["tools"]), compactJSON(t, []byte(wantSettings.Plugins["tools"])); got != want {
 		t.Fatalf("plugins.tools member = %s, want %s", got, want)
 	}
 	for _, omitted := range []string{"jobs", "tasks"} {
@@ -323,25 +405,27 @@ func mustMarshal(t *testing.T, value any) []byte {
 	return data
 }
 
-// TestConfigurationMutateSettingsReplacesWholePluginsMember pins the
-// whole-plugins rule: the PUT replaces both whole sessions and whole plugins
-// members with the generated target shape — an old compiled plugin's valid
-// nonempty section absent from the target is gone (its validator receives
-// nil, defaults govern), while unowned top-level members and the agents file
-// stay untouched. No per-key merge or preserve logic inside plugins.
-func TestConfigurationMutateSettingsReplacesWholePluginsMember(t *testing.T) {
+// TestConfigurationMutateSettingsOwnsOpaquePluginDocuments pins the
+// whole-plugins rule under the opaque-document domain: the PUT replaces both
+// whole sessions and whole plugins members with the generated target shape —
+// each document string becomes its plugin's owned raw section, an old
+// compiled plugin's valid section absent from the target is gone (its
+// validator receives nil, defaults govern), an unknown target ID or a
+// non-object/invalid inner document refuses the complete candidate before
+// any write, and an empty complete map is valid. No per-key merge or
+// preserve logic inside plugins; unowned top-level members and the agents
+// file stay untouched.
+func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	h := newServiceHarness(t)
 	var received []json.RawMessage
 	var mu sync.Mutex
 	// The fixture document carries the old alpha section the stale save must
 	// remove wholesale.
-	withAlpha := strings.TrimSuffix(mutationConfigDocument, "}") + `,"plugins":{"alpha":{"kept":1}}}`
-	writeServiceFile(t, h.configPath, withAlpha)
+	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument, "}")+`,"plugins":{"alpha":{"kept":1},"tools":{"max_output_bytes":42}}}`)
 	if err := os.MkdirAll(h.dataDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"system_prompt":"simple"}}`)
-	alphaRaw := `{"kept":1}`
 	svc := h.service(context.Background(),
 		servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
 			mu.Lock()
@@ -351,34 +435,47 @@ func TestConfigurationMutateSettingsReplacesWholePluginsMember(t *testing.T) {
 		}),
 		servicePlugin("tools", &h.opens, acceptValidator),
 	)
+	svc.attachWarnings(newWarningStore())
 	if _, err := svc.publish(context.Background()); err != nil {
 		t.Fatalf("initial publish: %v", err)
 	}
-	// The old alpha section the stale save must remove wholesale.
-	root := fileRoot(t, h.configPath)
-	if got := compactJSON(t, root["plugins"]); !strings.Contains(got, `"kept"`) {
-		t.Fatalf("fixture plugins member = %s, want the old alpha section %s present", got, alphaRaw)
+	sub, err := svc.obs.subscribe(8)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
 	}
+	t.Cleanup(sub.Close)
 	agentsPath := filepath.Join(h.dataDir, "agents.json")
 	agentsBefore, err := os.ReadFile(agentsPath)
 	if err != nil {
 		t.Fatalf("read agents file: %v", err)
 	}
 
+	// The omission domain: the target carries only the tools document; the
+	// old alpha section is removed wholesale even though it is valid.
 	stale := protocol.Settings{
 		Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7},
-		Plugins:  protocol.PluginsSettings{Tools: &protocol.ToolsSettings{CommandTimeout: 30, MaxOutputBytes: 1024, ReadLineMaxChars: 2000, ReadMaxLines: 50}},
+		Plugins: protocol.PluginsSettings{
+			"tools": `{"command_timeout":30,"max_output_bytes":1024,"read_line_max_chars":2000,"read_max_lines":50}`,
+		},
 	}
 	candidate, err := svc.mutate(context.Background(), editSettings(stale))
 	if err != nil {
 		t.Fatalf("mutate: %v", err)
 	}
-	if candidate.settings.Plugins.Jobs != nil || candidate.settings.Plugins.Tasks != nil {
-		t.Fatalf("published optional sections = %+v, want the omitted ones removed", candidate.settings.Plugins)
+	published := projectSettings(candidate.sessions, candidate.plugins)
+	if len(published.Plugins) != 1 || compactJSON(t, []byte(published.Plugins["tools"])) != compactJSON(t, []byte(stale.Plugins["tools"])) {
+		t.Fatalf("published plugins = %v, want only the written tools document", published.Plugins)
 	}
-	root = fileRoot(t, h.configPath)
-	if got, want := compactJSON(t, root["plugins"]), compactJSON(t, mustMarshal(t, stale.Plugins)); got != want {
-		t.Fatalf("plugins member = %s, want the complete target shape %s — the old alpha section must be gone", got, want)
+	root := fileRoot(t, h.configPath)
+	var plugins map[string]json.RawMessage
+	if err := json.Unmarshal(root["plugins"], &plugins); err != nil {
+		t.Fatalf("decode plugins member: %v", err)
+	}
+	if got, want := compactJSON(t, plugins["tools"]), compactJSON(t, []byte(stale.Plugins["tools"])); got != want {
+		t.Fatalf("plugins.tools member = %s, want %s", got, want)
+	}
+	if _, ok := plugins["alpha"]; ok {
+		t.Fatalf("plugins.alpha member = %s, want it removed by the omitted section", plugins["alpha"])
 	}
 	if got, want := compactJSON(t, root["sessions"]), compactJSON(t, mustMarshal(t, stale.Sessions)); got != want {
 		t.Fatalf("sessions member = %s, want %s", got, want)
@@ -401,27 +498,63 @@ func TestConfigurationMutateSettingsReplacesWholePluginsMember(t *testing.T) {
 		t.Fatalf("the settings edit changed the agents file (%v)", err)
 	}
 	// The removed section is gone for its plugin too: the edit build's alpha
-	// validator call received nil, so defaults govern.
+	// validator received nil, so defaults govern.
 	mu.Lock()
-	defer mu.Unlock()
-	if len(received) != 2 {
-		t.Fatalf("alpha validator calls = %d, want one per build", len(received))
+	alphaCalls := len(received)
+	var alphaEditRaw json.RawMessage
+	if alphaCalls == 2 {
+		alphaEditRaw = received[1]
 	}
-	if got := received[1]; got != nil {
-		t.Fatalf("the edit build's alpha validator received %s, want nil defaults", got)
+	mu.Unlock()
+	if alphaCalls != 2 || alphaEditRaw != nil {
+		t.Fatalf("alpha validator calls = %d (edit build received %s), want nil defaults on the omitted section", alphaCalls, alphaEditRaw)
 	}
+	nextConfigurationEvent(t, sub, "2")
+
+	// The refusal domain: an unknown ID, invalid inner JSON, and a valid but
+	// non-object document each fail the complete candidate with no file,
+	// generation, warning, or event change.
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
+	for _, row := range []struct {
+		name    string
+		plugins protocol.PluginsSettings
+	}{
+		{"unknown id", protocol.PluginsSettings{"ghost": `{}`}},
+		{"invalid document", protocol.PluginsSettings{"alpha": `{not json`}},
+		{"non-object document", protocol.PluginsSettings{"alpha": `1`}},
+		{"null document", protocol.PluginsSettings{"alpha": `null`}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			_, err := svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Plugins: row.plugins}))
+			assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+		})
+	}
+
+	// An empty complete map is valid: it removes every owned section.
+	candidate, err = svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Plugins: protocol.PluginsSettings{}}))
+	if err != nil {
+		t.Fatalf("empty plugins mutate: %v", err)
+	}
+	if got := projectSettings(candidate.sessions, candidate.plugins).Plugins; len(got) != 0 {
+		t.Fatalf("published plugins after the empty map = %v, want none", got)
+	}
+	root = fileRoot(t, h.configPath)
+	if got := compactJSON(t, root["plugins"]); got != `{}` {
+		t.Fatalf("plugins member = %s, want the empty complete map", got)
+	}
+	nextConfigurationEvent(t, sub, "3")
 }
 
-// TestConfigurationMutateNoEditReturnsCurrentGeneration proves the internal
-// no-edit contract: an explicit no-user-override reset reports changed=false,
-// the mutation returns the current publication with its existing generation,
-// and nothing is written, published, or notified.
-func TestConfigurationMutateNoEditReturnsCurrentGeneration(t *testing.T) {
+// TestConfigurationMutateEverySuccessfulEditWritesAndPublishes pins the one
+// shared successful-edit rule that replaced the old changed/no-edit branch:
+// an apply that reports the owning file still performs the owning write and
+// publishes the next generation with its event even when it changed no
+// member.
+func TestConfigurationMutateEverySuccessfulEditWritesAndPublishes(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument)
 	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
-	first, err := svc.publish(context.Background())
-	if err != nil {
+	if _, err := svc.publish(context.Background()); err != nil {
 		t.Fatalf("initial publish: %v", err)
 	}
 	sub, err := svc.obs.subscribe(4)
@@ -429,26 +562,23 @@ func TestConfigurationMutateNoEditReturnsCurrentGeneration(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 	t.Cleanup(sub.Close)
-	data, err := os.ReadFile(h.configPath)
-	if err != nil {
-		t.Fatalf("read owning file: %v", err)
-	}
+	probe := installOwningSyncProbe(t, h.configPath)
+	defer probe.restore()
 
-	noEdit := configurationEdit{apply: func(rawRoots) (editedFile, bool, error) {
-		return editMainConfig, false, nil
+	noChange := configurationEdit{apply: func(rawRoots) (editedFile, error) {
+		return editMainConfig, nil
 	}}
-	candidate, err := svc.mutate(context.Background(), noEdit)
+	candidate, err := svc.mutate(context.Background(), noChange)
 	if err != nil {
-		t.Fatalf("no-edit mutate: %v", err)
+		t.Fatalf("no-change mutate: %v", err)
 	}
-	if candidate != first || candidate.generation != 1 {
-		t.Fatalf("no-edit mutate = generation %d, want the existing publication at 1", candidate.generation)
+	if candidate.generation != 2 || svc.current() != candidate {
+		t.Fatalf("no-change mutate = generation %d, want 2 published", candidate.generation)
 	}
-	after, err := os.ReadFile(h.configPath)
-	if err != nil || string(after) != string(data) {
-		t.Fatalf("a no-edit mutate changed the owning file (%v)", err)
+	nextConfigurationEvent(t, sub, "2")
+	if syncs := probe.count(); syncs != 1 {
+		t.Fatalf("owning writes = %d, want the shared successful edit to write", syncs)
 	}
-	assertNoEvent(t, sub)
 }
 
 // --- owning file identity, mode, and no side effects ---
@@ -1183,9 +1313,9 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 		if view.ConfigurationRevision.Generation != "1" {
 			t.Fatalf("initial revision = %+v, want generation 1", view.ConfigurationRevision)
 		}
-		stale := ownSettings(view.Settings) // client 2's older whole-section document
+		stale := view.Settings // value copy: client 2's older whole-section document
 
-		first := ownSettings(view.Settings)
+		first := view.Settings
 		first.Sessions.ArchiveAfterDays = 9
 		mutation, err := r.updateSettings(ctx, first)
 		if err != nil {
@@ -1234,12 +1364,12 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 			t.Fatalf("mutation revision = %+v, want generation 2 with the empty pre-server instance", mutation.ConfigurationRevision)
 		}
 		mutation.Result.Sessions.ArchiveAfterDays = 999
-		(*mutation.Result.Plugins.Tools).MaxOutputBytes = 999
+		mutation.Result.Plugins["tools"] = `{"mutated":true}`
 		fresh, err := r.getConfiguration(ctx)
 		if err != nil {
 			t.Fatalf("getConfiguration: %v", err)
 		}
-		if fresh.Settings.Sessions.ArchiveAfterDays != 5 || (*fresh.Settings.Plugins.Tools).MaxOutputBytes != 2048 {
+		if fresh.Settings.Sessions.ArchiveAfterDays != 5 || compactJSON(t, []byte(fresh.Settings.Plugins["tools"])) != compactJSON(t, []byte(mutationSettings().Plugins["tools"])) {
 			t.Fatalf("a mutation of the returned result reached the published settings: %+v", fresh.Settings)
 		}
 	})
@@ -1499,13 +1629,17 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	if got, want := compactJSON(t, root["sessions"]), compactJSON(t, mustMarshal(t, mutationSettings().Sessions)); got != want {
 		t.Fatalf("sessions member = %s, want the requested %s", got, want)
 	}
-	if got, want := compactJSON(t, root["plugins"]), compactJSON(t, mustMarshal(t, mutationSettings().Plugins)); got != want {
+	var writtenPlugins map[string]json.RawMessage
+	if err := json.Unmarshal(root["plugins"], &writtenPlugins); err != nil {
+		t.Fatalf("decode plugins member: %v", err)
+	}
+	if got, want := compactJSON(t, writtenPlugins["tools"]), compactJSON(t, []byte(mutationSettings().Plugins["tools"])); got != want {
 		t.Fatalf("plugins member = %s, want the requested %s", got, want)
 	}
 
 	// The published projection: the same winning candidate's settings.
-	view := svc.current().settings
-	if view.Sessions != mutationSettings().Sessions || view.Plugins.Tools == nil || (*view.Plugins.Tools).MaxOutputBytes != 2048 {
+	view := projectSettings(svc.current().sessions, svc.current().plugins)
+	if view.Sessions != mutationSettings().Sessions || compactJSON(t, []byte(view.Plugins["tools"])) != compactJSON(t, []byte(mutationSettings().Plugins["tools"])) {
 		t.Fatalf("published settings = %+v, want the requested shape", view)
 	}
 }

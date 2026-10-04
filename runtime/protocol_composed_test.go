@@ -826,9 +826,12 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 
 		// 7. Settings: the stale whole-section save succeeds under
-		// last-writer-wins; the invalid candidate never publishes.
-		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}}
-		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}}
+		// last-writer-wins; each compiled plugin's own document string
+		// round-trips through the mounted generated client; the invalid
+		// candidate never publishes.
+		settingsADocument := `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}`
+		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Plugins: protocol.PluginsSettings{"tools": settingsADocument}}
+		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Plugins: protocol.PluginsSettings{}}
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
 			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: settings})
@@ -838,20 +841,22 @@ func TestProtocolComposedFlow(t *testing.T) {
 			return resp
 		}
 		firstPut := put(settingsA)
-		if firstPut.JSON200 == nil || !firstPut.JSON200.Result.Sessions.AutoArchive || firstPut.JSON200.Result.Sessions.ArchiveAfterDays != 3 {
-			t.Fatalf("settings write A = %+v, want the published A section", firstPut.JSON200)
+		if firstPut.JSON200 == nil || !firstPut.JSON200.Result.Sessions.AutoArchive || firstPut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
+			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
+			t.Fatalf("settings write A = %+v, want the published A section with its exact tools document", firstPut.JSON200)
 		}
 		secondPut := put(settingsB)
-		if secondPut.JSON200 == nil || secondPut.JSON200.Result.Sessions.AutoArchive {
-			t.Fatalf("settings write B = %+v, want the published B section", secondPut.JSON200)
+		if secondPut.JSON200 == nil || secondPut.JSON200.Result.Sessions.AutoArchive || len(secondPut.JSON200.Result.Plugins) != 0 {
+			t.Fatalf("settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
 		}
 		stalePut := put(settingsA)
 		if stalePut.JSON200 == nil || !stalePut.JSON200.Result.Sessions.AutoArchive || stalePut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
-			stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays != 0 {
+			stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays != 0 ||
+			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
 			t.Fatalf("stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		}
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
-		invalid := protocol.Settings{Sessions: settingsA.Sessions, Plugins: protocol.PluginsSettings{Tasks: &protocol.TasksSettings{MaxConcurrent: 99, MaxOutputBytes: 4096}}}
+		invalid := protocol.Settings{Sessions: settingsA.Sessions, Plugins: protocol.PluginsSettings{"tasks": `{"max_concurrent":99,"max_output_bytes":4096}`}}
 		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: invalid})
 		if err != nil {
 			t.Fatalf("invalid settings write: %v", err)
@@ -866,7 +871,8 @@ func TestProtocolComposedFlow(t *testing.T) {
 		if view.JSON200 == nil {
 			t.Fatalf("GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
 		}
-		if view.JSON200.ConfigurationRevision.Generation != publishedGeneration || !view.JSON200.Settings.Sessions.AutoArchive || view.JSON200.Settings.Sessions.ArchiveAfterDays != 3 {
+		if view.JSON200.ConfigurationRevision.Generation != publishedGeneration || !view.JSON200.Settings.Sessions.AutoArchive || view.JSON200.Settings.Sessions.ArchiveAfterDays != 3 ||
+			compactComposed(t, []byte(view.JSON200.Settings.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
 			t.Fatalf("configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
 		}
 

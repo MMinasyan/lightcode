@@ -557,6 +557,34 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 			t.Fatal("an invalid candidate changed the published revision")
 		}
 
+		// The settings outer shape stays closed and its plugins member is a
+		// required complete map: a missing or null member, a wrong-typed
+		// member, a null document value, and an unknown settings member are
+		// all invalid-request failures before any candidate work.
+		for _, row := range []struct{ name, body string }{
+			{"missing plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0}}}`},
+			{"null plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":null}}`},
+			{"wrong-typed plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":[]}}`},
+			{"null document value", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":{"alpha":null}}}`},
+			{"unknown settings member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":{},"forged":1}}`},
+		} {
+			response := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential, row.body)
+			if response.StatusCode != http.StatusBadRequest {
+				response.Body.Close()
+				t.Fatalf("%s = %d, want the typed invalid 400", row.name, response.StatusCode)
+			}
+			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
+				t.Fatalf("%s error = %+v, want invalid", row.name, typed)
+			}
+		}
+		finalRead, err := client.GetConfigurationWithResponse(ctx)
+		if err != nil || finalRead.JSON200 == nil {
+			t.Fatalf("read after settings shape failures: %v", err)
+		}
+		if finalRead.JSON200.ConfigurationRevision.Generation != before.JSON200.ConfigurationRevision.Generation {
+			t.Fatal("a rejected settings shape changed the published revision")
+		}
+
 		// A restore attempt against a busy Session answers the conflict
 		// class from the one idle gate.
 		session := projectionSession(t, r, filepath.Join(e.home, "busy"), "solo").Identity.SessionID

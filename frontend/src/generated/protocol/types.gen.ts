@@ -383,28 +383,16 @@ export type SessionsSettings = {
     delete_after_archive_days: number;
 };
 
-export type ToolsSettings = {
-    max_output_bytes: number;
-    read_max_lines: number;
-    read_line_max_chars: number;
-    command_timeout: number;
-};
+/**
+ * One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
+ */
+export type PluginConfigDocument = string;
 
-export type JobsSettings = {
-    max_background_processes: number;
-    max_output_bytes: number;
-    read_line_max_chars: number;
-};
-
-export type TasksSettings = {
-    max_concurrent: number;
-    max_output_bytes: number;
-};
-
+/**
+ * Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
+ */
 export type PluginsSettings = {
-    tools?: ToolsSettings;
-    jobs?: JobsSettings;
-    tasks?: TasksSettings;
+    [key: string]: PluginConfigDocument;
 };
 
 export type Settings = {

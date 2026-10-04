@@ -1813,58 +1813,19 @@ components:
           type: integer
         delete_after_archive_days:
           type: integer
-    ToolsSettings:
-      type: object
-      additionalProperties: false
-      required:
-        - max_output_bytes
-        - read_max_lines
-        - read_line_max_chars
-        - command_timeout
-      properties:
-        max_output_bytes:
-          type: integer
-        read_max_lines:
-          type: integer
-        read_line_max_chars:
-          type: integer
-        command_timeout:
-          type: integer
-    JobsSettings:
-      type: object
-      additionalProperties: false
-      required:
-        - max_background_processes
-        - max_output_bytes
-        - read_line_max_chars
-      properties:
-        max_background_processes:
-          type: integer
-        max_output_bytes:
-          type: integer
-        read_line_max_chars:
-          type: integer
-    TasksSettings:
-      type: object
-      additionalProperties: false
-      required:
-        - max_concurrent
-        - max_output_bytes
-      properties:
-        max_concurrent:
-          type: integer
-        max_output_bytes:
-          type: integer
+    PluginConfigDocument:
+      type: string
+      description: >-
+        One compiled plugin's own configuration document: the exact JSON
+        object text the selected plugin declaration owns, carried as a string
+        so the transport never interprets, renumbers or drops its members.
     PluginsSettings:
       type: object
-      additionalProperties: false
-      properties:
-        tools:
-          $ref: "#/components/schemas/ToolsSettings"
-        jobs:
-          $ref: "#/components/schemas/JobsSettings"
-        tasks:
-          $ref: "#/components/schemas/TasksSettings"
+      description: >-
+        Every owned plugin section as its JSON document string, keyed by the
+        compiled plugin ID; an absent ID uses that plugin's own defaults.
+      additionalProperties:
+        $ref: "#/components/schemas/PluginConfigDocument"
     Settings:
       type: object
       additionalProperties: false

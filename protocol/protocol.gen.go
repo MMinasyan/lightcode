@@ -1040,13 +1040,6 @@ type InputOrigin string
 // JSONObject One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
 type JSONObject = map[string]json.RawMessage
 
-// JobsSettings defines model for JobsSettings.
-type JobsSettings struct {
-	MaxBackgroundProcesses int `json:"max_background_processes"`
-	MaxOutputBytes         int `json:"max_output_bytes"`
-	ReadLineMaxChars       int `json:"read_line_max_chars"`
-}
-
 // ModelEdit defines model for ModelEdit.
 type ModelEdit struct {
 	ContextWindow    *int                    `json:"context_window,omitempty"`
@@ -1190,12 +1183,11 @@ type PendingSnapshot struct {
 	SessionRevision SessionRevision `json:"session_revision"`
 }
 
-// PluginsSettings defines model for PluginsSettings.
-type PluginsSettings struct {
-	Jobs  *JobsSettings  `json:"jobs,omitempty"`
-	Tasks *TasksSettings `json:"tasks,omitempty"`
-	Tools *ToolsSettings `json:"tools,omitempty"`
-}
+// PluginConfigDocument One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
+type PluginConfigDocument = string
+
+// PluginsSettings Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
+type PluginsSettings map[string]PluginConfigDocument
 
 // ProtocolMetadata defines model for ProtocolMetadata.
 type ProtocolMetadata struct {
@@ -1390,6 +1382,7 @@ type SetSessionAgentTypeRequest struct {
 
 // Settings defines model for Settings.
 type Settings struct {
+	// Plugins Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
 	Plugins  PluginsSettings  `json:"plugins"`
 	Sessions SessionsSettings `json:"sessions"`
 }
@@ -1450,12 +1443,6 @@ type SubmitResultDisposition string
 
 // SystemRole defines model for SystemRole.
 type SystemRole string
-
-// TasksSettings defines model for TasksSettings.
-type TasksSettings struct {
-	MaxConcurrent  int `json:"max_concurrent"`
-	MaxOutputBytes int `json:"max_output_bytes"`
-}
 
 // TextDeltaEvent defines model for TextDeltaEvent.
 type TextDeltaEvent struct {
@@ -1525,14 +1512,6 @@ type ToolStartedEvent struct {
 
 // ToolStartedEventKind defines model for ToolStartedEvent.Kind.
 type ToolStartedEventKind string
-
-// ToolsSettings defines model for ToolsSettings.
-type ToolsSettings struct {
-	CommandTimeout   int `json:"command_timeout"`
-	MaxOutputBytes   int `json:"max_output_bytes"`
-	ReadLineMaxChars int `json:"read_line_max_chars"`
-	ReadMaxLines     int `json:"read_max_lines"`
-}
 
 // UpdateProviderDetailRequest defines model for UpdateProviderDetailRequest.
 type UpdateProviderDetailRequest struct {

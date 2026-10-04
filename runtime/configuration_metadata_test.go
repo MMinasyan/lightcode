@@ -787,9 +787,9 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 // transport keys refuse through the candidate check, the connected
 // api_key_env reset is refused, resetting hidden is invalid, a builtin's
 // fixture-seeded base_url and disconnected api_key_env overrides restore
-// their bundled values with only their own raw member changed, a second
-// base_url reset is the permitted no-op, and an absent override is a no-edit
-// result with no file write, generation, or event.
+// their bundled values with only their own raw member changed, and a reset
+// with no override left still rewrites the owning file and publishes the
+// next generation under the one shared successful-edit rule.
 func TestMetadataEditResetProviderFields(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataBuiltinOverrideDocument())
@@ -869,7 +869,6 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	// The required custom transport keys fail the candidate validation
 	// before the write.
 	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
-	var candidate *configuration
 	for _, field := range []protocol.ResetProviderFieldParamsField{
 		protocol.ResetProviderFieldParamsFieldBaseUrl,
 		protocol.ResetProviderFieldParamsFieldEnvironmentVariable,
@@ -888,7 +887,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	// resets to the bundled URL: only its own raw member changes.
 	unsetenv(t, "BUILTIN_OVERRIDE_KEY") // the builtin env override is disconnected
 	builtinBefore := metadataRawProvider(t, h.configPath, "bstatic")
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
 	if err != nil {
 		t.Fatalf("builtin base_url reset: %v", err)
 	}
@@ -920,7 +919,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	// The builtin DISCONNECTED api_key_env override resets to the bundled
 	// empty name (the connected guard stays silent: the captured provider is
 	// disconnected before the reset).
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldEnvironmentVariable))
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldEnvironmentVariable))
 	if err != nil {
 		t.Fatalf("builtin api_key_env reset: %v", err)
 	}
@@ -933,40 +932,35 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 		t.Fatal("the builtin transport member vanished")
 	}
 
-	// A second base_url reset has no override left: the permitted no-op —
-	// no write, no generation, no event.
-	before, first, _ = metadataBaseline(t, svc, h.configPath)
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
-	if err != nil || candidate != first || candidate.generation != first.generation {
-		t.Fatalf("second builtin base_url reset = (%v, %p), want the unchanged publication", err, candidate)
+	// A second base_url reset has no override left: the shared successful
+	// edit rule still rewrites the owning file and publishes the next
+	// generation with its event.
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
+	if err != nil {
+		t.Fatalf("second builtin base_url reset: %v", err)
 	}
-	afterNoOp, rerr := os.ReadFile(h.configPath)
-	if rerr != nil || string(before) != string(afterNoOp) {
-		t.Fatalf("the no-op reset wrote the owning file (%v)", rerr)
-	}
-	assertNoEvent(t, sub)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
 
-	// An absent override is the no-edit result: no write, no generation, no
-	// event, the current publication returned.
-	before, first, _ = metadataBaseline(t, svc, h.configPath)
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ResetProviderFieldParamsFieldName))
-	if err != nil || candidate != first || candidate.generation != first.generation {
-		t.Fatalf("absent-override reset = (%v, %p), want the unchanged publication", err, candidate)
+	// An absent override is the same successful edit: no member to remove,
+	// yet the owning file is rewritten and the next generation published.
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ResetProviderFieldParamsFieldName))
+	if err != nil {
+		t.Fatalf("absent-override reset: %v", err)
 	}
-	after, rerr := os.ReadFile(h.configPath)
-	if rerr != nil || string(before) != string(after) {
-		t.Fatalf("an absent-override reset wrote the owning file (%v)", rerr)
-	}
-	assertNoEvent(t, sub)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
 
 	// The builtin reset removes its own user override and restores the
-	// bundled value; a builtin with no raw entry no-ops.
+	// bundled value; a builtin with no raw entry follows the same shared
+	// successful-edit rule.
 	userHeaders := map[string]string{"X-Custom": "c"}
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", protocol.ProviderEdit{Headers: &userHeaders})); err != nil {
 		t.Fatalf("builtin override seed: %v", err)
 	}
-	drainMutationEvent(t, sub, strconv.Itoa(generation+1))
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldHeaders))
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldHeaders))
 	if err != nil {
 		t.Fatalf("builtin reset: %v", err)
 	}
@@ -974,13 +968,14 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	if bundled["HTTP-Referer"] == "" || bundled["X-Title"] == "" || len(bundled) != 2 {
 		t.Fatalf("builtin reset headers = %v, want the bundled attribution headers restored", bundled)
 	}
-	drainMutationEvent(t, sub, strconv.Itoa(generation+2))
-	_, first, _ = metadataBaseline(t, svc, h.configPath)
-	candidate, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldOptions))
-	if err != nil || candidate != first {
-		t.Fatalf("builtin absent-override reset = (%v, %p), want the unchanged publication", err, candidate)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
+	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldOptions))
+	if err != nil {
+		t.Fatalf("builtin absent-override reset: %v", err)
 	}
-	assertNoEvent(t, sub)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
 }
 
 // --- model upsert ---
@@ -1148,8 +1143,9 @@ func TestMetadataEditModelDelete(t *testing.T) {
 // reset is refused (the user layer is that model's whole definition), a
 // bundled model's reset restores the bundled value, a discovered model's
 // context_window override resets to the accepted record's window, resetting
-// hidden is invalid, and an absent override is a no-edit result with no file
-// write, generation, or event.
+// hidden is invalid, and a reset with no override left still rewrites the
+// owning file and publishes the next generation under the one shared
+// successful-edit rule.
 func TestMetadataEditResetModelFields(t *testing.T) {
 	h := newMetadataHarness(t)
 	unsetenv(t, "DISCO_TEST_KEY") // never ready: no network anywhere below
@@ -1222,27 +1218,28 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
 
 	// A bundled model's override reset restores the bundled value; an
-	// absent override no-ops without any write.
+	// absent override publishes under the same shared successful-edit rule.
 	window := 50
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{ContextWindow: &window})); err != nil {
 		t.Fatalf("bundled override seed: %v", err)
 	}
-	drainMutationEvent(t, sub, strconv.Itoa(generation+1))
-	candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldContextWindow))
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
+	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldContextWindow))
 	if err != nil || svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow != 1000 {
 		t.Fatalf("bundled reset = (%v, window %d), want the bundled 1000 restored", err, svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow)
 	}
-	drainMutationEvent(t, sub, strconv.Itoa(generation+2))
-	before, first, _ = metadataBaseline(t, svc, h.configPath)
-	candidate, err = svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldCost))
-	if err != nil || candidate != first || candidate.generation != first.generation {
-		t.Fatalf("absent-override reset = (%v, %p), want the unchanged publication", err, candidate)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
+	// An absent override is the shared successful edit too: no member to
+	// remove, yet the owning file is rewritten and the next generation
+	// published.
+	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldCost))
+	if err != nil {
+		t.Fatalf("absent-override reset: %v", err)
 	}
-	after, rerr := os.ReadFile(h.configPath)
-	if rerr != nil || string(before) != string(after) {
-		t.Fatalf("an absent-override reset wrote the owning file (%v)", rerr)
-	}
-	assertNoEvent(t, sub)
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
 
 	// The discovered model's context_window override resets to the accepted
 	// discovery record's window: the override lands first, the reset removes
@@ -1251,13 +1248,14 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{ContextWindow: &recordWindow})); err != nil {
 		t.Fatalf("discovered override seed: %v", err)
 	}
-	drainMutationEvent(t, sub, strconv.Itoa(generation+3))
-	candidate, err = svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ResetProviderModelFieldParamsFieldContextWindow))
+	generation++
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
+	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ResetProviderModelFieldParamsFieldContextWindow))
 	if err != nil {
 		t.Fatalf("discovered context_window reset: %v", err)
 	}
 	generation++
-	drainMutationEvent(t, sub, strconv.Itoa(generation+3))
+	drainMutationEvent(t, sub, strconv.Itoa(generation))
 	entry := svc.current().catalog.Providers["disco"].Models["disc-model"]
 	if entry == nil || entry.ContextWindow != 2048 || entry.Source != catalog.SourceDiscovered {
 		t.Fatalf("discovered model after reset = %+v, want the record window 2048 restored with its source", entry)

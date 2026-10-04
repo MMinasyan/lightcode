@@ -79,6 +79,26 @@ const (
 	usageJSON    = `{"input_tokens": "12", "cached_input_tokens": "0", "output_tokens": "34"}`
 )
 
+// TestPluginsSettingsDocumentsStayNamedOpaqueStrings keeps the settings
+// plugins member a map of the one named PluginConfigDocument scalar: an
+// inline or structured replacement would silently re-interpret plugin
+// documents and fails here.
+func TestPluginsSettingsDocumentsStayNamedOpaqueStrings(t *testing.T) {
+	plugins := componentSchema(t, "PluginsSettings")
+	if ref := plugins.AdditionalProperties.Schema; ref == nil || ref.Ref != "#/components/schemas/PluginConfigDocument" {
+		t.Fatalf("PluginsSettings additionalProperties = %+v, want the named PluginConfigDocument scalar", ref)
+	}
+	if len(plugins.Properties) != 0 {
+		t.Fatalf("PluginsSettings declares named members %v, want the opaque map only", plugins.Properties)
+	}
+	document := componentSchema(t, "PluginConfigDocument")
+	if document.Type == nil || !document.Type.Is("string") {
+		t.Fatalf("PluginConfigDocument type = %v, want string", document.Type)
+	}
+	acceptJSON(t, document, `"{\"kept\":1,\"exact\":9007199254740993}"`)
+	rejectJSON(t, document, `{"kept":1}`)
+}
+
 func TestDeletionMutationCarriesRequiredNullResult(t *testing.T) {
 	s := componentSchema(t, "DeletionMutation")
 	acceptJSON(t, s, `{"configuration_revision": `+revisionJSON+`, "result": null}`)

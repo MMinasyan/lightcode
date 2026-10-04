@@ -193,15 +193,15 @@ func (r *Runtime) discoverProviderModels(ctx context.Context, providerID string)
 
 // editProviderConnect builds the existing-provider connect edit: it owns no
 // file and always edits — a successful repeat connection consumes a
-// generation, never the absent-override reset. Its check revalidates the
-// phase-1 identity against the live publication, then requires the ready
+// generation under the one shared successful-edit rule. Its check revalidates
+// the phase-1 identity against the live publication, then requires the ready
 // candidate to be usable before any side effect: a connect that would
 // publish an unusable provider — a latest raw layer that removed the only
 // model window included — refuses even when no discovery was fetched.
 func (s *configurationService) editProviderConnect(plan *connectionEffects) configurationEdit {
 	return configurationEdit{
-		apply: func(rawRoots) (editedFile, bool, error) {
-			return editConnection, true, nil
+		apply: func(rawRoots) (editedFile, error) {
+			return editConnection, nil
 		},
 		connection: plan,
 		check: func(c *configuration) error {
@@ -225,24 +225,24 @@ func (s *configurationService) editProviderConnect(plan *connectionEffects) conf
 // transport, decides which key is removed.
 func (s *configurationService) editProviderDisconnect(providerID string, plan *connectionEffects) configurationEdit {
 	return configurationEdit{
-		apply: func(rawRoots) (editedFile, bool, error) {
+		apply: func(rawRoots) (editedFile, error) {
 			prov, err := capturedProvider(s.current(), providerID)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			envName := prov.Transport.APIKeyEnv
 			if envName == "" {
-				return 0, false, invalidEdit("provider %q is keyless; remove it instead", providerID)
+				return 0, invalidEdit("provider %q is keyless; remove it instead", providerID)
 			}
 			plan.providerID = providerID
 			if s.env != nil && s.env.IsManaged(envName) {
 				plan.keyAction, plan.keyEnv = keyActionRemove, envName
 			} else if os.Getenv(envName) != "" {
-				return 0, false, configurationFailure(fmt.Errorf("provider %q is connected via environment; unset %s outside Lightcode", providerID, envName))
+				return 0, configurationFailure(fmt.Errorf("provider %q is connected via environment; unset %s outside Lightcode", providerID, envName))
 			}
 			// An absent unmanaged key: nothing to remove; the disconnect
 			// still publishes the ready next generation.
-			return editConnection, true, nil
+			return editConnection, nil
 		},
 		connection: plan,
 		check: func(c *configuration) error {

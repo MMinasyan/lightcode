@@ -867,8 +867,9 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			t.Fatalf("UpdateProviderModel: %v", err)
 		}
 
-		// The absent-override field reset is the one no-edit mutation: the
-		// unchanged provider view returns under the current revision.
+		// The absent-override field reset publishes under the shared
+		// successful-edit rule: the unchanged provider view returns under the
+		// next generation.
 		beforeReset, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "stub"})
 		if err != nil || beforeReset.JSON200 == nil {
 			t.Fatalf("read before reset: %v", err)
@@ -886,9 +887,9 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			other, _ := json.Marshal(beforeReset.JSON200.Provider)
 			t.Fatalf("absent-override reset = %s, want the unchanged view %s", body, other)
 		}
-		if reset.JSON200.ConfigurationRevision.Generation != beforeReset.JSON200.ConfigurationRevision.Generation {
-			t.Fatalf("absent-override reset published generation %s, want the unchanged %s",
-				reset.JSON200.ConfigurationRevision.Generation, beforeReset.JSON200.ConfigurationRevision.Generation)
+		if reset.JSON200.ConfigurationRevision.Generation == beforeReset.JSON200.ConfigurationRevision.Generation {
+			t.Fatalf("absent-override reset kept generation %s, want the shared successful-edit publication",
+				reset.JSON200.ConfigurationRevision.Generation)
 		}
 
 		modelReset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ResetProviderModelFieldParamsField("name"), &protocol.ResetProviderModelFieldParams{ProviderId: "stub", ModelId: "stub/m"})
@@ -937,6 +938,43 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		}
 		if settings.JSON200.ConfigurationRevision.InstanceId != ps.instance {
 			t.Fatalf("settings revision instance = %q", settings.JSON200.ConfigurationRevision.InstanceId)
+		}
+
+		// The settings boundary negatives over the mounted generated client:
+		// an unknown compiled ID, a malformed document string, and a valid
+		// but non-object document each refuse the complete candidate with the
+		// typed configuration 422. The existing refusal oracles pin the
+		// latest owning bytes, publication generation, warning revision and
+		// event silence for every row. The row IDs are the composition's own
+		// compiled "core" declaration, so only the document boundary is
+		// exercised.
+		refusalSub, err := r.Subscribe(64)
+		if err != nil {
+			t.Fatalf("subscribe for settings refusals: %v", err)
+		}
+		defer refusalSub.Close()
+		refusalFile, refusalGeneration, refusalWarnRev := runtimeMutationBaseline(t, r)
+		for _, row := range []struct {
+			name    string
+			plugins protocol.PluginsSettings
+		}{
+			{"unknown plugin id", protocol.PluginsSettings{"ghost": `{}`}},
+			{"malformed document", protocol.PluginsSettings{"core": `{not json`}},
+			{"non-object document", protocol.PluginsSettings{"core": `1`}},
+		} {
+			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
+				Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
+				Plugins:  row.plugins,
+			}})
+			if err != nil {
+				t.Fatalf("%s: UpdateConfigurationSettings: %v", row.name, err)
+			}
+			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.Configuration {
+				body, _ := json.Marshal(response)
+				t.Fatalf("%s = %s (status %d), want the typed configuration 422", row.name, body, response.HTTPResponse.StatusCode)
+			}
+			assertRuntimeMutationRefused(t, r, refusalSub, refusalFile, refusalGeneration, refusalWarnRev,
+				fmt.Errorf("mounted settings refusal %s: %w", row.name, ErrConfiguration), ErrConfiguration)
 		}
 
 		// The one publication operation makes a real hand-edit current: the

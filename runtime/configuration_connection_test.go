@@ -353,7 +353,7 @@ func TestConnectProviderRepeatStillPublishes(t *testing.T) {
 		t.Setenv("CONNECTION_USABLE_KEY", "usable-key-value")
 
 		// A repeat connection of an already-connected usable provider is a
-		// real publication, never the absent-override reset no-op.
+		// real publication under the one shared successful-edit rule.
 		first, err := r.connectProvider(ctx, "usablep", nil)
 		if err != nil || first.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("first connect = (%v, %q), want generation 2", err, first.ConfigurationRevision.Generation)

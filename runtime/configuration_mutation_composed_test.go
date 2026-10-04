@@ -22,13 +22,15 @@ import (
 // in-package fake validators alone do not prove the real limits.
 
 // composedMutationSettings is one complete settings shape the real
-// validators accept.
+// validators accept: each compiled plugin's section as its opaque document
+// string.
 func composedMutationSettings() protocol.Settings {
-	tools := protocol.ToolsSettings{CommandTimeout: 90, MaxOutputBytes: 4096, ReadLineMaxChars: 4000, ReadMaxLines: 200}
-	jobs := protocol.JobsSettings{MaxBackgroundProcesses: 5, MaxOutputBytes: 8192, ReadLineMaxChars: 4000}
 	return protocol.Settings{
 		Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 14, DeleteAfterArchiveDays: 3},
-		Plugins:  protocol.PluginsSettings{Tools: &tools, Jobs: &jobs},
+		Plugins: protocol.PluginsSettings{
+			"tools": `{"command_timeout":90,"max_output_bytes":4096,"read_line_max_chars":4000,"read_max_lines":200}`,
+			"jobs":  `{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000}`,
+		},
 	}
 }
 
@@ -66,7 +68,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	if mutation.ConfigurationRevision.Generation != "2" {
 		t.Fatalf("mutation revision = %+v, want generation 2", mutation.ConfigurationRevision)
 	}
-	if mutation.Result.Sessions.ArchiveAfterDays != 14 || mutation.Result.Plugins.Jobs == nil || mutation.Result.Plugins.Jobs.MaxBackgroundProcesses != 5 {
+	if mutation.Result.Sessions.ArchiveAfterDays != 14 || compactComposed(t, []byte(mutation.Result.Plugins["jobs"])) != compactComposed(t, []byte(composedMutationSettings().Plugins["jobs"])) {
 		t.Fatalf("mutation result = %+v, want the written shape", mutation.Result)
 	}
 	data, err := os.ReadFile(e.configPath)
@@ -101,8 +103,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 		t.Fatalf("getWarnings: %v", err)
 	}
 	rejected := composedMutationSettings()
-	zero := protocol.ToolsSettings{}
-	rejected.Plugins.Tools = &zero
+	rejected.Plugins["tools"] = `{"command_timeout":0,"max_output_bytes":0,"read_line_max_chars":0,"read_max_lines":0}`
 	if mutation, err := runtime.UpdateSettingsForTest(r, rejected); err == nil {
 		t.Fatalf("rejected mutation = %+v, want the real tools validator's failure", mutation)
 	}

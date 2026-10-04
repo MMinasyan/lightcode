@@ -11,12 +11,14 @@ import { expect, test } from 'vitest';
 import {
   connectProvider,
   createProvider,
+  getConfiguration,
   getHealth,
   getProviderDetail,
   listProviderModels,
   resetProviderField,
   resetProviderModelField,
   setAgentTypeModel,
+  updateConfigurationSettings,
   updateProviderDetail,
   updateProviderModel,
 } from './src/generated/protocol';
@@ -43,6 +45,32 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
   expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '1' });
+
+  // The settings round-trip carries each compiled plugin's own document as
+  // one opaque string: the int64 lexeme never passes through a JS number,
+  // the real tools validator accepts the document, and the read returns the
+  // same values. Whitespace is normalized because the owning writer keeps
+  // its existing pretty-printed raw-root bytes — value fidelity, not a new
+  // byte-formatting contract.
+  const canonical = (text) => text.replace(/\s+/g, '');
+  const toolsDocument =
+    '{"command_timeout":60,"max_output_bytes":4096,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}';
+  const initial = await getConfiguration({ client });
+  expect(initial.error).toBeUndefined();
+  const written = await updateConfigurationSettings({
+    client,
+    body: { settings: { sessions: initial.data.settings.sessions, plugins: { tools: toolsDocument } } },
+  });
+  expect(written.error).toBeUndefined();
+  const writtenDocument = written.data?.result.plugins.tools;
+  expect(writtenDocument).toBeTypeOf('string');
+  expect(canonical(writtenDocument)).toBe(canonical(toolsDocument));
+  const reread = await getConfiguration({ client });
+  expect(reread.error).toBeUndefined();
+  const rereadDocument = reread.data?.settings.plugins.tools;
+  expect(rereadDocument).toBeTypeOf('string');
+  expect(rereadDocument).toContain('9007199254740993');
+  expect(canonical(rereadDocument)).toBe(canonical(toolsDocument));
 
   const window = 4096;
   for (const id of ['.', '..', '?', '#', '%']) {

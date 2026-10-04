@@ -312,36 +312,36 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 	// unless a managed key must be persisted.
 	plan := &connectionEffects{}
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			if providerID == "" {
-				return 0, false, invalidEdit("provider id is required")
+				return 0, invalidEdit("provider id is required")
 			}
 			captured := s.catalogProvider(providerID)
 			if captured != nil {
-				return 0, false, invalidEdit("provider %q already exists", providerID)
+				return 0, invalidEdit("provider %q already exists", providerID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if pm != nil {
-				return 0, false, invalidEdit("provider %q already exists", providerID)
+				return 0, invalidEdit("provider %q already exists", providerID)
 			}
 			baseURL := ""
 			if patch.BaseUrl != nil {
 				baseURL = strings.TrimSpace(*patch.BaseUrl)
 			}
 			if baseURL == "" {
-				return 0, false, invalidEdit("base_url is required")
+				return 0, invalidEdit("base_url is required")
 			}
 			headers := map[string]string(nil)
 			if patch.Headers != nil {
 				if err := refuseCredentialHeaders(*patch.Headers); err != nil {
-					return 0, false, err
+					return 0, err
 				}
 				headers = *patch.Headers
 			}
@@ -358,7 +358,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			if patch.ApiKeyEnv != nil {
 				keyEnv = strings.TrimSpace(*patch.ApiKeyEnv)
 				if keyEnv != "" && s.envNameInUse(keyEnv, providerID) {
-					return 0, false, invalidEdit("api_key_env %s is already used by another provider", keyEnv)
+					return 0, invalidEdit("api_key_env %s is already used by another provider", keyEnv)
 				}
 			} else if key != nil && *key != "" {
 				keyEnv = generatedAPIKeyEnvName(providerID, s.current().catalog)
@@ -366,7 +366,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			if keyEnv != "" {
 				_, persist, err := resolveConnectKey(keyEnv, key, s.env)
 				if err != nil {
-					return 0, false, configurationFailure(err)
+					return 0, configurationFailure(err)
 				}
 				if persist {
 					plan.keyAction = keyActionSet
@@ -379,10 +379,10 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			for modelID, edit := range models {
 				normalized := strings.TrimSpace(modelID)
 				if normalized == "" {
-					return 0, false, invalidEdit("model id is required")
+					return 0, invalidEdit("model id is required")
 				}
 				if _, exists := modelsRaw[normalized]; exists {
-					return 0, false, invalidEdit("duplicate model id %q", normalized)
+					return 0, invalidEdit("duplicate model id %q", normalized)
 				}
 				modelMap := map[string]any{}
 				mergeModelEdit(modelMap, edit)
@@ -392,7 +392,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 				}
 			}
 			if usable == 0 {
-				return 0, false, invalidEdit("custom provider requires at least one usable model")
+				return 0, invalidEdit("custom provider requires at least one usable model")
 			}
 			providerMap := map[string]any{
 				"transport": providerTransportRaw(patch, baseURL, headers, keyEnv),
@@ -401,9 +401,9 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			writeProviderEditMembers(providerMap, patch)
 			providers[providerID] = providerMap
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 		connection: plan,
 		check: func(c *configuration) error {
@@ -457,20 +457,20 @@ func providerRawTarget(providers map[string]any, providerID string, builtin bool
 // member, headers written wholesale with the bundled-key strip.
 func (s *configurationService) editProviderUpdate(providerID string, patch protocol.ProviderEdit) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			captured, err := capturedProvider(s.current(), providerID)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if captured.Builtin {
 				if err := refuseBuiltinProviderFields(patch, providerID); err != nil {
-					return 0, false, err
+					return 0, err
 				}
 			}
 			headers := map[string]string(nil)
 			if patch.Headers != nil {
 				if err := refuseCredentialHeaders(*patch.Headers); err != nil {
-					return 0, false, err
+					return 0, err
 				}
 				headers = *patch.Headers
 				if captured.Builtin {
@@ -487,24 +487,24 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 				env = strings.TrimSpace(*patch.ApiKeyEnv)
 				if env != captured.Transport.APIKeyEnv {
 					if catalog.ProviderConnected(captured, liveEnvIsSet) {
-						return 0, false, invalidEdit("disconnect provider %q before changing its API key variable", providerID)
+						return 0, invalidEdit("disconnect provider %q before changing its API key variable", providerID)
 					}
 					if env != "" && s.envNameInUse(env, providerID) {
-						return 0, false, invalidEdit("api_key_env %s is already used by another provider", env)
+						return 0, invalidEdit("api_key_env %s is already used by another provider", env)
 					}
 				}
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := providerRawTarget(providers, providerID, captured.Builtin)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			transport, err := rawObjectMember(pm, "transport", "providers transport", true)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if patch.BaseUrl != nil {
 				transport["base_url"] = strings.TrimSpace(*patch.BaseUrl)
@@ -520,9 +520,9 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 			}
 			writeProviderEditMembers(pm, patch)
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 		check: func(c *configuration) error {
 			return requireCandidateProvider(c, providerID)
@@ -560,29 +560,29 @@ func refuseBuiltinProviderFields(patch protocol.ProviderEdit, providerID string)
 // its owning user definition.
 func (s *configurationService) editProviderDelete(providerID string) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			captured, err := capturedProvider(s.current(), providerID)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if captured.Builtin {
-				return 0, false, invalidEdit("cannot remove bundled provider %q", providerID)
+				return 0, invalidEdit("cannot remove bundled provider %q", providerID)
 			}
 			if catalog.ProviderConnected(captured, liveEnvIsSet) && captured.Transport.APIKeyEnv != "" {
-				return 0, false, invalidEdit("disconnect provider %q before removing it", providerID)
+				return 0, invalidEdit("disconnect provider %q before removing it", providerID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if _, err := requireCustomRawEntry(providers, providerID); err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			delete(providers, providerID)
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 	}
 }
@@ -597,51 +597,52 @@ var providerResetTransport = map[protocol.ResetProviderFieldParamsField]bool{
 
 // editProviderFieldReset builds the provider-field reset edit: a closed
 // generated field enum, the retained connected-provider api_key_env refusal,
-// and the deletion of exactly one user override from its owning raw path.
-// No override is a no-edit result — no write, no generation, no event. The
-// candidate check proves the reset subject still validates (a custom
-// provider losing a required key is refused before the write).
+// and the deletion of exactly one user override from its owning raw path. A
+// successful reset with no override present still rewrites the owning file
+// and publishes the next generation — the one shared edit rule. The candidate
+// check proves the reset subject still validates (a custom provider losing a
+// required key is refused before the write).
 func (s *configurationService) editProviderFieldReset(providerID string, field protocol.ResetProviderFieldParamsField) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			if !field.Valid() {
-				return 0, false, invalidEdit("field %q cannot be reset", field)
+				return 0, invalidEdit("field %q cannot be reset", field)
 			}
 			captured, err := capturedProvider(s.current(), providerID)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if field == protocol.ResetProviderFieldParamsFieldEnvironmentVariable && catalog.ProviderConnected(captured, liveEnvIsSet) {
-				return 0, false, invalidEdit("disconnect provider %q before resetting its API key variable", providerID)
+				return 0, invalidEdit("disconnect provider %q before resetting its API key variable", providerID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if pm == nil {
-				return 0, false, nil // no user override exists: nothing to reset
+				return editMainConfig, nil // no user override: the reset still rewrites and publishes
 			}
 			target := pm
 			if providerResetTransport[field] {
 				if target, err = rawObjectMember(pm, "transport", "providers transport", false); err != nil {
-					return 0, false, err
+					return 0, err
 				}
 				if target == nil {
-					return 0, false, nil
+					return editMainConfig, nil
 				}
 			}
 			if _, present := target[string(field)]; !present {
-				return 0, false, nil
+				return editMainConfig, nil
 			}
 			delete(target, string(field))
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 		check: func(c *configuration) error {
 			return requireCandidateProvider(c, providerID)
@@ -658,37 +659,37 @@ func (s *configurationService) editProviderFieldReset(providerID string, field p
 // definition; builtin providers scaffold their user override.
 func (s *configurationService) editModelSave(providerID, modelID string, patch protocol.ModelEdit) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			if providerID == "" || modelID == "" {
-				return 0, false, invalidEdit("provider and model id are required")
+				return 0, invalidEdit("provider and model id are required")
 			}
 			captured, lookupErr := capturedProvider(s.current(), providerID)
 			if lookupErr != nil {
-				return 0, false, lookupErr
+				return 0, lookupErr
 			}
 			if entry := captured.Models[modelID]; entry != nil && entry.Source != catalog.SourceUser {
 				if err := refusedModelFields(patch, modelID); err != nil {
-					return 0, false, err
+					return 0, err
 				}
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := providerRawTarget(providers, providerID, captured.Builtin)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			models, err := rawObjectMember(pm, "models", "providers models", true)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			// The patch merges into the model's prior raw entry — a partial
 			// patch preserves every unsupplied member, and an empty patch
 			// wipes nothing — with a fresh entry only for a new model.
 			rawModel, err := rawObjectMember(models, modelID, "models."+modelID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if rawModel == nil {
 				rawModel = map[string]any{}
@@ -696,9 +697,9 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 			mergeModelEdit(rawModel, patch)
 			models[modelID] = rawModel
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 		check: func(c *configuration) error {
 			return requireCandidateModel(c, providerID, modelID)
@@ -711,102 +712,103 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 // silent success), and the latest raw layer loses only that model entry.
 func (s *configurationService) editModelDelete(providerID, modelID string) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			if providerID == "" || modelID == "" {
-				return 0, false, invalidEdit("provider and model id are required")
+				return 0, invalidEdit("provider and model id are required")
 			}
 			captured, lookupErr := capturedProvider(s.current(), providerID)
 			if lookupErr != nil {
-				return 0, false, lookupErr
+				return 0, lookupErr
 			}
 			entry := captured.Models[modelID]
 			if entry == nil {
-				return 0, false, unknownModel(providerID, modelID)
+				return 0, unknownModel(providerID, modelID)
 			}
 			if entry.Source != catalog.SourceUser {
-				return 0, false, invalidEdit("cannot delete model %q: only user-added models can be removed; hide or reset it instead", modelID)
+				return 0, invalidEdit("cannot delete model %q: only user-added models can be removed; hide or reset it instead", modelID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if pm == nil {
-				return 0, false, unknownModel(providerID, modelID)
+				return 0, unknownModel(providerID, modelID)
 			}
 			models, err := rawObjectMember(pm, "models", "providers models", false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if _, present := models[modelID]; !present {
-				return 0, false, unknownModel(providerID, modelID)
+				return 0, unknownModel(providerID, modelID)
 			}
 			delete(models, modelID)
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 	}
 }
 
 // editModelFieldReset builds the model-field reset edit: a closed generated
 // field enum, the retained user-model context_window refusal, and the
-// deletion of exactly one user override. No override is a no-edit result.
+// deletion of exactly one user override. A successful reset with no override
+// present still rewrites the owning file and publishes the next generation.
 // The candidate check proves the reset subject still validates.
 func (s *configurationService) editModelFieldReset(providerID, modelID string, field protocol.ResetProviderModelFieldParamsField) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, bool, error) {
+		apply: func(roots rawRoots) (editedFile, error) {
 			if providerID == "" || modelID == "" {
-				return 0, false, invalidEdit("provider and model id are required")
+				return 0, invalidEdit("provider and model id are required")
 			}
 			if !field.Valid() {
-				return 0, false, invalidEdit("field %q cannot be reset", field)
+				return 0, invalidEdit("field %q cannot be reset", field)
 			}
 			captured, lookupErr := capturedProvider(s.current(), providerID)
 			if lookupErr != nil {
-				return 0, false, lookupErr
+				return 0, lookupErr
 			}
 			entry := captured.Models[modelID]
 			if entry == nil {
-				return 0, false, unknownModel(providerID, modelID)
+				return 0, unknownModel(providerID, modelID)
 			}
 			if field == protocol.ResetProviderModelFieldParamsFieldContextWindow && entry.Source == catalog.SourceUser {
-				return 0, false, invalidEdit("cannot reset context_window for user-added model %q", modelID)
+				return 0, invalidEdit("cannot reset context_window for user-added model %q", modelID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if pm == nil {
-				return 0, false, nil // no user override exists: nothing to reset
+				return editMainConfig, nil // no user override: the reset still rewrites and publishes
 			}
 			models, err := rawObjectMember(pm, "models", "providers models", false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			rawModel, err := rawObjectMember(models, modelID, "models."+modelID, false)
 			if err != nil {
-				return 0, false, err
+				return 0, err
 			}
 			if rawModel == nil {
-				return 0, false, nil
+				return editMainConfig, nil
 			}
 			if _, present := rawModel[string(field)]; !present {
-				return 0, false, nil
+				return editMainConfig, nil
 			}
 			delete(rawModel, string(field))
 			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, false, err
+				return 0, err
 			}
-			return editMainConfig, true, nil
+			return editMainConfig, nil
 		},
 		check: func(c *configuration) error {
 			return requireCandidateModel(c, providerID, modelID)

@@ -678,16 +678,6 @@
    ]
   },
   {
-   "schema": "JobsSettings",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"max_background_processes\":0,\"max_output_bytes\":0,\"read_line_max_chars\":0}"
-    }
-   ],
-   "reject": []
-  },
-  {
    "schema": "ModelEdit",
    "accept": [
     {
@@ -905,6 +895,29 @@
    "reject": []
   },
   {
+   "schema": "PluginConfigDocument",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"{\\\"kept\\\":1}\""
+    },
+    {
+     "name": "int64-lexeme",
+     "json": "\"{\\\"exact\\\":9007199254740993}\""
+    }
+   ],
+   "reject": [
+    {
+     "name": "object",
+     "json": "{\"kept\":1}"
+    },
+    {
+     "name": "null",
+     "json": "null"
+    }
+   ]
+  },
+  {
    "schema": "PluginsSettings",
    "accept": [
     {
@@ -912,11 +925,28 @@
      "json": "{}"
     },
     {
-     "name": "full",
-     "json": "{\"tools\":{\"max_output_bytes\":1024,\"read_max_lines\":100,\"read_line_max_chars\":200,\"command_timeout\":30},\"jobs\":{\"max_background_processes\":2,\"max_output_bytes\":1024,\"read_line_max_chars\":200},\"tasks\":{\"max_concurrent\":2,\"max_output_bytes\":1024}}"
+     "name": "documents",
+     "json": "{\"alpha\":\"{\\\"kept\\\":1,\\\"exact\\\":9007199254740993}\",\"tools\":\"{\\\"max_output_bytes\\\":42}\"}"
+    },
+    {
+     "name": "empty-document",
+     "json": "{\"tasks\":\"{}\"}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "object-document",
+     "json": "{\"tools\":{\"max_output_bytes\":42}}"
+    },
+    {
+     "name": "null-document",
+     "json": "{\"tools\":null}"
+    },
+    {
+     "name": "array",
+     "json": "[]"
+    }
+   ]
   },
   {
    "schema": "ProtocolMetadata",
@@ -1378,16 +1408,6 @@
    "reject": []
   },
   {
-   "schema": "TasksSettings",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"max_concurrent\":0,\"max_output_bytes\":0}"
-    }
-   ],
-   "reject": []
-  },
-  {
    "schema": "TextDeltaEvent",
    "accept": [
     {
@@ -1569,16 +1589,6 @@
      "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":null,\"ordinal\":0,\"name\":\"read\"}"
     }
    ]
-  },
-  {
-   "schema": "ToolsSettings",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"max_output_bytes\":0,\"read_max_lines\":0,\"read_line_max_chars\":0,\"command_timeout\":0}"
-    }
-   ],
-   "reject": []
   },
   {
    "schema": "UpdateProviderDetailRequest",

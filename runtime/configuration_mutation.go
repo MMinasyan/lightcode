@@ -31,9 +31,8 @@ const (
 	editAgentsFile
 	// editConnection owns no file: the existing-provider connect and
 	// disconnect publish one ready next-generation candidate and event while
-	// leaving the main and agents bytes untouched. changed=false never means
-	// this kind — a successful repeat connection still consumes a
-	// generation.
+	// leaving the main and agents bytes untouched. Every successful
+	// connection edit therefore consumes a generation.
 	editConnection
 )
 
@@ -75,17 +74,16 @@ type connectionEffects struct {
 
 // configurationEdit is one narrow mutation of the owned decoded root maps of
 // the latest raw user layer. apply mutates the roots in place and reports the
-// owning file it edited and whether the edit changed anything; changed=false
-// is exclusively an explicit no-user-override reset that found nothing to
-// edit, and a successful edit is always changed=true, identical bytes
-// included. check is the optional pure edited-subject check over the built
-// candidate — it runs after the one build and before the write, so a touched
-// subject the catalog validation dropped is refused without a write, and no
-// fallible projection ever runs after the commit. connection carries the one
-// narrow side-effect chain of the connection-bearing edits; nil on every
-// other edit.
+// owning file it edited; every successful apply — an absent-member reset that
+// changed no member included — is a real edit that writes its owning file and
+// publishes the next generation. check is the optional pure edited-subject
+// check over the built candidate — it runs after the one build and before the
+// write, so a touched subject the catalog validation dropped is refused
+// without a write, and no fallible projection ever runs after the commit.
+// connection carries the one narrow side-effect chain of the
+// connection-bearing edits; nil on every other edit.
 type configurationEdit struct {
-	apply      func(rawRoots) (editedFile, bool, error)
+	apply      func(rawRoots) (editedFile, error)
 	check      func(*configuration) error
 	connection *connectionEffects
 }
@@ -101,16 +99,16 @@ type configurationEdit struct {
 // file — is atomically rewritten mode 0600 after the candidate validates,
 // the edit's candidate check passes, and the final caller-first cancellation
 // check passes; a connection-bearing edit owns no file and runs its
-// side-effect chain in the same position. A no-edit result returns the
-// current publication without consuming a generation; a failed candidate, a
-// failed check, or a cancellation before the write leaves the file and
-// publication unchanged; after the write starts, no further cancellation
-// check, rebuild, or fallible stage runs before the ready snapshot, its one
-// event, and the mutex release — an admitted call completes publication
-// despite caller disconnect or owner shutdown. A connection-bearing create's
-// managed-key failure restores the exact prior owning bytes before returning
-// and joins that restore error with the key failure; no atomic success is
-// claimed.
+// side-effect chain in the same position. Every successful apply writes and
+// publishes the next generation, an absent-member reset that changed nothing
+// included; a failed candidate, a failed check, or a cancellation before the
+// write leaves the file and publication unchanged; after the write starts,
+// no further cancellation check, rebuild, or fallible stage runs before the
+// ready snapshot, its one event, and the mutex release — an admitted call
+// completes publication despite caller disconnect or owner shutdown. A
+// connection-bearing create's managed-key failure restores the exact prior
+// owning bytes before returning and joins that restore error with the key
+// failure; no atomic success is claimed.
 func (s *configurationService) mutate(ctx context.Context, edit configurationEdit) (*configuration, error) {
 	if err := s.canceled(ctx); err != nil {
 		return nil, err
@@ -142,16 +140,10 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return nil, configurationFailure(err)
 	}
-	owning, changed, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot})
+	owning, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot})
 	if err != nil {
 		s.buildMu.Unlock()
 		return nil, err
-	}
-	if !changed {
-		// The explicit no-user-override reset: no edit, no write, no new
-		// generation. A connection edit never takes this path.
-		s.buildMu.Unlock()
-		return s.published.Load(), nil
 	}
 	generation, err := s.nextGeneration()
 	if err != nil {
@@ -306,25 +298,30 @@ func restoreOwningBytes(path string, prior []byte, existed bool) error {
 	return nil
 }
 
-// editSettings replaces the complete settings shape wholesale: the whole
-// sessions member and the whole plugins member are written as the generated
-// target shape — an omitted optional plugin section removes any newer
-// section, and a section present only in the old raw document is absent
-// from the new complete plugins document. Never merged per field. Every
-// other top-level root member is unowned and kept untouched.
+// editSettings builds the settings edit: the whole sessions member and the
+// whole plugins member are written as the generated target shape — each
+// plugin ID's opaque document string becomes that plugin's owned raw
+// section, and an ID absent from the target removes any newer section,
+// exactly one object per document — and every other top-level root member is
+// unowned and kept untouched. Never merged per field. The selected
+// declaration's validator, not this edit, interprets each document.
 func editSettings(settings protocol.Settings) configurationEdit {
-	return configurationEdit{apply: func(roots rawRoots) (editedFile, bool, error) {
+	return configurationEdit{apply: func(roots rawRoots) (editedFile, error) {
 		sessions, err := json.Marshal(settings.Sessions)
 		if err != nil {
-			return 0, false, err
+			return 0, err
 		}
-		plugins, err := json.Marshal(settings.Plugins)
+		plugins := make(map[string]json.RawMessage, len(settings.Plugins))
+		for id, document := range settings.Plugins {
+			plugins[id] = json.RawMessage(document) // string→[]byte conversion owns the bytes
+		}
+		pluginsRaw, err := json.Marshal(plugins)
 		if err != nil {
-			return 0, false, err
+			return 0, configurationFailure(fmt.Errorf("encode plugins documents: %w", err))
 		}
 		roots.config["sessions"] = sessions
-		roots.config["plugins"] = plugins
-		return editMainConfig, true, nil
+		roots.config["plugins"] = pluginsRaw
+		return editMainConfig, nil
 	}}
 }
 
@@ -332,36 +329,36 @@ func editSettings(settings protocol.Settings) configurationEdit {
 // latest agents root: a nonempty ref replaces the user model override, an
 // empty ref clears it. Every successful set or clear — absent override and
 // identical bytes included — is a real edit that writes the owning file and
-// publishes the next generation; only the retained public field reset
-// operator carries a no-override exception, and this edit is not it. The
-// known-type check resolves the latest raw
+// publishes the next generation; the retained public field reset operator
+// carries the same shared publication rule. The known-type check resolves
+// the latest raw
 // bytes' definitions through the ordinary admission projection, so unknown
 // or dropped/invalid types fail harness.ErrInvalid before any bare
 // definition is created; builtins that need no explicit user entry stay
 // addressable.
 func (s *configurationService) editAgentModel(agentType, ref string) configurationEdit {
-	return configurationEdit{apply: func(roots rawRoots) (editedFile, bool, error) {
+	return configurationEdit{apply: func(roots rawRoots) (editedFile, error) {
 		agentsRoot := roots.agents
 		if ref != "" {
 			if _, err := model.Parse(ref); err != nil {
-				return 0, false, fmt.Errorf("model ref %q: %v: %w", ref, err, harness.ErrInvalid)
+				return 0, fmt.Errorf("model ref %q: %v: %w", ref, err, harness.ErrInvalid)
 			}
 		}
 		data, err := json.Marshal(agentsRoot)
 		if err != nil {
-			return 0, false, err
+			return 0, err
 		}
 		parsed, err := agents.ParseWithCapabilities(data, s.capabilityIDs, s.toolIDs, s.defaultCapabilityIDs)
 		if err != nil {
-			return 0, false, configurationFailure(err)
+			return 0, configurationFailure(err)
 		}
 		if _, err := harness.ResolveAgentType(agentType, projectAgentTypes(parsed.All())); err != nil {
-			return 0, false, err
+			return 0, err
 		}
 		var fields map[string]json.RawMessage
 		if raw, ok := agentsRoot[agentType]; ok {
 			if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-				return 0, false, fmt.Errorf("agents.%s must be an object: %w", agentType, harness.ErrInvalid)
+				return 0, fmt.Errorf("agents.%s must be an object: %w", agentType, harness.ErrInvalid)
 			}
 		} else {
 			fields = map[string]json.RawMessage{}
@@ -370,13 +367,13 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 			delete(fields, "model")
 		} else {
 			if fields["model"], err = json.Marshal(ref); err != nil {
-				return 0, false, err
+				return 0, err
 			}
 		}
 		if agentsRoot[agentType], err = json.Marshal(fields); err != nil {
-			return 0, false, err
+			return 0, err
 		}
-		return editAgentsFile, true, nil
+		return editAgentsFile, nil
 	}}
 }
 

@@ -258,11 +258,11 @@ func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *own
 	return r, e
 }
 
-// TestConfigurationViewProjectsSettingsAndRoster pins the effective settings
-// view: the parsed session policy, present plugin sections projected with
-// the exact existing decoder defaults plus supplied values and unknown
-// members ignored, absent sections omitted, and the Agent roster's public
-// fields.
+// TestConfigurationViewProjectsSettingsAndRoster pins the settings view: the
+// parsed session policy, each owned plugin section returned as its exact
+// opaque document string — no ID-chosen decoder, no injected defaults, an
+// owned empty object as `{}` — absent sections omitted, and the Agent
+// roster's public fields.
 func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
@@ -276,38 +276,34 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		if sessions.AutoArchive || sessions.ArchiveAfterDays != 3 || sessions.DeleteAfterArchiveDays != 7 {
 			t.Fatalf("sessions settings = %+v, want the supplied values with the 7-day delete default", sessions)
 		}
-		if view.Settings.Plugins.Tools == nil {
-			t.Fatal("plugins.tools missing, want the projected present section")
+		wantDocs := map[string]string{
+			"tools": `{"max_output_bytes":42}`,
+			"jobs":  `{"max_background_processes":20}`,
+			"tasks": `{}`,
 		}
-		tools := *view.Settings.Plugins.Tools
-		if tools.MaxOutputBytes != 42 || tools.ReadMaxLines != 500 || tools.ReadLineMaxChars != 5000 || tools.CommandTimeout != 120 {
-			t.Fatalf("tools settings = %+v, want the supplied value with the exact decoder defaults", tools)
+		if len(view.Settings.Plugins) != len(wantDocs) {
+			t.Fatalf("plugins = %v, want exactly the owned sections %v", view.Settings.Plugins, wantDocs)
 		}
-		if view.Settings.Plugins.Jobs == nil {
-			t.Fatal("plugins.jobs missing, want the projected present section")
-		}
-		jobs := *view.Settings.Plugins.Jobs
-		if jobs.MaxBackgroundProcesses != 20 || jobs.MaxOutputBytes != 15360 || jobs.ReadLineMaxChars != 5000 {
-			t.Fatalf("jobs settings = %+v, want the supplied value consumed with the exact decoder defaults", jobs)
-		}
-		if view.Settings.Plugins.Tasks == nil {
-			t.Fatal("plugins.tasks missing, want the present empty section projected")
-		}
-		tasks := *view.Settings.Plugins.Tasks
-		if tasks.MaxConcurrent != 4 || tasks.MaxOutputBytes != 15360 {
-			t.Fatalf("tasks settings = %+v, want the default-only section's exact decoder defaults", tasks)
+		for id, wantDoc := range wantDocs {
+			got, ok := view.Settings.Plugins[id]
+			if !ok {
+				t.Fatalf("plugins.%s missing, want the owned document %s", id, wantDoc)
+			}
+			if got := compactJSON(t, []byte(got)); got != wantDoc {
+				t.Fatalf("plugins.%s = %s, want the exact owned document %s (no decoder defaults)", id, got, wantDoc)
+			}
 		}
 
 		// Absent sections stay omitted: a configuration without the plugin
-		// sections projects all three as absent.
+		// sections projects an empty complete map.
 		absent, _ := openConfigurationRuntime(t, store, `{"providers":{}}`, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(absent)
 		absentView, err := absent.getConfiguration(context.Background())
 		if err != nil {
 			t.Fatalf("getConfiguration absent: %v", err)
 		}
-		if absentView.Settings.Plugins.Tools != nil || absentView.Settings.Plugins.Jobs != nil || absentView.Settings.Plugins.Tasks != nil {
-			t.Fatalf("absent plugin sections projected = %+v, want all three omitted", absentView.Settings.Plugins)
+		if len(absentView.Settings.Plugins) != 0 {
+			t.Fatalf("absent plugin sections projected = %+v, want none", absentView.Settings.Plugins)
 		}
 
 		// The Agent roster: the primary model selection and the worker's
@@ -465,7 +461,7 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		(*model.ExtraBody)["side"] = "mutated"
 		model.InputModalities[0] = "mutated"
 		baseline.Settings.Sessions.ArchiveAfterDays = 999
-		(*baseline.Settings.Plugins.Tools).MaxOutputBytes = 999
+		baseline.Settings.Plugins["tools"] = `{"mutated":true}`
 		for i := range baseline.Agents {
 			if baseline.Agents[i].Name == "worker" && len(baseline.Agents[i].Tools) > 0 {
 				baseline.Agents[i].Tools[0] = "mutated"
