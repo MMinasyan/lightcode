@@ -14,6 +14,7 @@ import {
   getConfiguration,
   getHealth,
   getProviderDetail,
+  getWarnings,
   listProviderModels,
   resetProviderField,
   resetProviderModelField,
@@ -45,6 +46,19 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
   expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '1' });
+
+  // The open warning source crosses the generated TypeScript boundary: the
+  // mounted owner's real Runtime-scoped reporter plugin attributes its report
+  // to its own registered ID, and the generated record accepts the arbitrary
+  // plugin:<ID> string.
+  const warnings = await getWarnings({ client });
+  expect(warnings.error).toBeUndefined();
+  const reporter = warnings.data.warnings.find((warning) => warning.source === 'plugin:mounted_reporter');
+  expect(reporter).toEqual({
+    source: 'plugin:mounted_reporter',
+    kind: 'mounted_notice',
+    message: 'mounted plugin warning',
+  });
 
   // The settings round-trip carries each compiled plugin's own document as
   // one opaque string: the int64 lexeme never passes through a JS number,

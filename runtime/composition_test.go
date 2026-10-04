@@ -1204,3 +1204,63 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 		t.Fatalf("describe failure = %v, want the source error", err)
 	}
 }
+
+// TestCompositionBindsReportWarningPerRuntimeFactory proves the factory-bound
+// warning ingress: each Runtime-scoped factory's copied ScopeInfo carries a
+// callback that fixes its own registered ID, a Workspace-scoped factory never
+// receives one even with a reporter installed, an isolated composition
+// without a reporter supplies nil, and a callback whose scope was canceled
+// drops the report.
+func TestCompositionBindsReportWarningPerRuntimeFactory(t *testing.T) {
+	captures := map[string]func(kind, message string){}
+	plugin := func(id string, scope ScopeKind) Plugin {
+		return Plugin{
+			ID:       id,
+			Scope:    scope,
+			Provides: []CapabilitySpec{Spec[any](id + ".cap")},
+			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+				captures[id] = info.ReportWarning
+				return Instance{Values: map[string]any{id + ".cap": id}}, nil
+			},
+		}
+	}
+
+	// An isolated composition installs no reporter: even a Runtime-scoped
+	// factory receives nil.
+	isolated := mustComposition(t, plugin("isolated", ScopeRuntime))
+	owner, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mustOpenScope(t, isolated, owner, runtimeScopeInfo(), nil)
+	if captures["isolated"] != nil {
+		t.Fatal("an isolated composition supplied a ReportWarning callback")
+	}
+
+	// The owner's composition binds each Runtime-scoped factory to its own
+	// registered ID; a Workspace-scoped factory never receives the ingress.
+	var reported []string
+	c := mustComposition(t, plugin("alpha", ScopeRuntime), plugin("beta", ScopeRuntime), plugin("gamma", ScopeWorkspace))
+	c.reportWarning = func(pluginID, kind, message string) {
+		reported = append(reported, pluginID+"|"+kind+"|"+message)
+	}
+	runtimeScope := mustOpenScope(t, c, owner, runtimeScopeInfo(), nil)
+	mustOpenScope(t, c, owner, workspaceScopeInfo("/ws"), []*scope{runtimeScope})
+	if captures["alpha"] == nil || captures["beta"] == nil {
+		t.Fatal("a Runtime-scoped factory received no ReportWarning callback")
+	}
+	if captures["gamma"] != nil {
+		t.Fatal("a Workspace-scoped factory received the Runtime warning ingress")
+	}
+	captures["alpha"]("a_kind", "a_message")
+	captures["beta"]("b_kind", "b_message")
+	if want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}; !slices.Equal(reported, want) {
+		t.Fatalf("reported = %v, want each factory's own registered ID", reported)
+	}
+
+	// The scope's cancellation is the callback's boundary: a canceled scope
+	// drops the report.
+	cancel()
+	captures["alpha"]("late_kind", "late_message")
+	if want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}; !slices.Equal(reported, want) {
+		t.Fatalf("a canceled scope's report reached the sink: %v", reported)
+	}
+}

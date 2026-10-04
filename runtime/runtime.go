@@ -73,6 +73,7 @@ type Runtime struct {
 	config       *configurationService
 	obs          *observation
 	warnings     *warningStore
+	passive      *observationAdapter
 	managedEnv   *config.ManagedEnv
 	runtimeScope *scope
 	workspaces   *workspaceScopes
@@ -166,11 +167,14 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 
 	obs := newObservation()
 	// The warning store and the passive publication adapter initialize
-	// before any plugin scope opens: the Runtime scope's identity carries
-	// the adapter's LSP closure, and scopes and preparations report into the
-	// store from the moment they exist.
+	// before any plugin scope opens: the Runtime installs the adapter's
+	// neutral plugin-warning sink on the composition, which binds each
+	// Runtime-scoped factory's copied ScopeInfo to its own registered ID, and
+	// scopes and preparations report into the store from the moment they
+	// exist.
 	warnings := newWarningStore()
 	adapter := newObservationAdapter(obs, warnings)
+	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(home, nil)
 	configService := newConfigurationService(work, c, loader, configPath, obs)
 	configService.attachWarnings(warnings)
@@ -184,7 +188,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ReportWarning: adapter.reportLSP}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
 	if err != nil {
 		return unlock(err)
 	}
@@ -240,6 +244,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		config:       configService,
 		obs:          obs,
 		warnings:     warnings,
+		passive:      adapter,
 		managedEnv:   managedEnv,
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
@@ -411,15 +416,17 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 // runs inside one admitted call, so shutdown joins the deletion and its
 // cleanup together. After Harness.DeleteSession commits — or reports the
 // Session already absent for a valid identity, the same idempotent result —
-// the Session's artifact tree is removed once. Any other Harness error
-// (invalid input, corruption, revision races, a closed admission) returns
-// as-is and authorizes no cleanup.
+// the Session's warning groups are removed in one observation section with
+// one runtime-scoped hint, then its artifact tree is removed once. Any other
+// Harness error (invalid input, corruption, revision races, a closed
+// admission) returns as-is and authorizes no cleanup.
 func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		err := h.DeleteSession(ctx, sessionID)
 		if err != nil && !errors.Is(err, harness.ErrNotFound) {
 			return err
 		}
+		r.passive.removeSessionWarnings([]string{sessionID})
 		return r.removeSessionCode(sessionID)
 	})
 }

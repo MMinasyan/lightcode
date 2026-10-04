@@ -263,7 +263,7 @@ export type UsageSnapshot = {
 };
 
 export type Warning = {
-    source: 'setup' | 'prompt' | 'catalog' | 'agents' | 'lsp' | 'protocol';
+    source: string;
     kind: string;
     message: string;
     session_id?: string;
@@ -1882,7 +1882,7 @@ export type GetWarningsError = GetWarningsErrors[keyof GetWarningsErrors];
 
 export type GetWarningsResponses = {
     /**
-     * Every warning group in producer order.
+     * Every currently owned warning group in deterministic order.
      */
     200: WarningsSnapshot;
 };

@@ -251,9 +251,9 @@ func (s *configurationService) commit(candidate *configuration) configurationCap
 	s.obs.publish(func() []Event {
 		warningChanged := false
 		if s.warnings != nil {
-			warningChanged = s.warnings.setGlobal("setup", setupWarnings(candidate, credentials)) || warningChanged
-			warningChanged = s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings)) || warningChanged
-			warningChanged = s.warnings.setGlobal("agents", agentWarnings(candidate.agentWarnings)) || warningChanged
+			warningChanged = s.warnings.setGlobal(setupSource, setupWarnings(candidate, credentials)) || warningChanged
+			warningChanged = s.warnings.setGlobal(catalogSource, catalogWarnings(candidate.catalogWarnings)) || warningChanged
+			warningChanged = s.warnings.setGlobal(agentsSource, agentWarnings(candidate.agentWarnings)) || warningChanged
 		}
 		revision := s.warnings.storeRevision()
 		s.published.Store(candidate)

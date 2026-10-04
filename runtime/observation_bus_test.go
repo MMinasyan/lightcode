@@ -15,7 +15,7 @@ import (
 // The passive event bus rows: the current-pair sample inside the publication
 // section, root/child scope tagging, the two-healthy/one-saturated order with
 // no replay, the job member's job-scoped hints against internal transitions,
-// and the Runtime scope's LSP report closure.
+// and the factory-bound plugin warning ingress.
 
 // TestObservationPausedFactEmitsCurrentRevision proves a notification delayed
 // behind a paused publication carries the Session's CURRENT revision pair,
@@ -456,28 +456,31 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 	})
 }
 
-// TestObservationRuntimeScopeReportWarningLandsGlobally proves the Runtime
-// scope's ReportWarning closure is the Runtime's LSP ingest: a report lands
-// in the global LSP group with the runtime-scoped warning_changed event,
-// identical reports dedupe without a second event, every Session's hydration
-// and the unfiltered read carry the group, and reports after the warning
-// store's closure are ignored.
-func TestObservationRuntimeScopeReportWarningLandsGlobally(t *testing.T) {
+// TestObservationPluginReportsLandWithRealAttribution proves the composition
+// binds each Runtime-scoped factory's copied ScopeInfo to its own registered
+// plugin ID: two factories in one scope report distinct real sources, each
+// report lands only in its own global plugin group with the runtime-scoped
+// warning_changed event, identical reports dedupe without a second event,
+// every Session's hydration and the unfiltered read carry both groups, and
+// reports after the warning store's closure are ignored.
+func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		e := newOwnerEnv(t)
-		var report func(kind, message string)
-		reporterPlugin := Plugin{
-			ID:       "reporter",
-			Scope:    ScopeRuntime,
-			Provides: []CapabilitySpec{Spec[any]("reporter.cap")},
-			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-				report = info.ReportWarning
-				e.events.add("open:reporter")
-				return Instance{Values: map[string]any{"reporter.cap": "reporter"}}, nil
-			},
+		reports := make(map[string]func(kind, message string))
+		reporterPlugin := func(id string) Plugin {
+			return Plugin{
+				ID:       id,
+				Scope:    ScopeRuntime,
+				Provides: []CapabilitySpec{Spec[any]("reporter." + id)},
+				Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+					reports[id] = info.ReportWarning
+					e.events.add("open:" + id)
+					return Instance{Values: map[string]any{"reporter." + id: id}}, nil
+				},
+			}
 		}
-		r, err := e.open(ctx, e.storagePlugin(store), reporterPlugin)
+		r, err := e.open(ctx, e.storagePlugin(store), reporterPlugin("alpha"), reporterPlugin("beta"))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -486,8 +489,8 @@ func TestObservationRuntimeScopeReportWarningLandsGlobally(t *testing.T) {
 				t.Errorf("Close: %v", err)
 			}
 		}()
-		if report == nil {
-			t.Fatal("the Runtime scope carried no ReportWarning closure")
+		if reports["alpha"] == nil || reports["beta"] == nil {
+			t.Fatal("the Runtime scope carried no per-plugin ReportWarning closure")
 		}
 		session, err := r.createSession(ctx, e.dataDir, "solo")
 		if err != nil {
@@ -502,12 +505,12 @@ func TestObservationRuntimeScopeReportWarningLandsGlobally(t *testing.T) {
 			t.Fatalf("Subscribe: %v", err)
 		}
 
-		// One report: the global group gains the entry with the
-		// runtime-scoped warning event. The initial configuration
+		// One report: the reporting plugin's own global group gains the entry
+		// with the runtime-scoped warning event. The initial configuration
 		// publication may already have advanced the store, so the expected
 		// revisions are relative to the store's current value.
 		baseRevision, _ := r.warnings.snapshot()
-		report("lsp_install_failed", "clangd must be installed via your system package manager")
+		reports["alpha"]("install_failed", "alpha must be installed")
 		event, ok := nextEvent(t, sub)
 		if !ok || eventKind(t, event) != "warning_changed" {
 			t.Fatalf("report event = %s (ok=%v), want the warning_changed hint", eventJSON(t, event), ok)
@@ -524,14 +527,9 @@ func TestObservationRuntimeScopeReportWarningLandsGlobally(t *testing.T) {
 		}
 		assertNoEvent(t, sub)
 
-		// An identical report dedupes: no second entry, no second event.
-		report("lsp_install_failed", "clangd must be installed via your system package manager")
-		assertNoEvent(t, sub)
-
-		// A distinct report appends (the retained shape: append, never
-		// replace) and every hydration plus the unfiltered read carry the
-		// whole group.
-		report("lsp_server_unavailable", "clangd is unavailable")
+		// The second factory's report is attributed to its own registration
+		// ID: the two closures never share one source.
+		reports["beta"]("server_unavailable", "beta is unavailable")
 		event, ok = nextEvent(t, sub)
 		if !ok || eventKind(t, event) != "warning_changed" {
 			t.Fatalf("second report event = %s (ok=%v), want the warning_changed hint", eventJSON(t, event), ok)
@@ -543,38 +541,41 @@ func TestObservationRuntimeScopeReportWarningLandsGlobally(t *testing.T) {
 		if body.WarningsRevision.Revision != strconv.FormatUint(baseRevision+2, 10) {
 			t.Fatalf("second report event revision = %q, want the second advance", body.WarningsRevision.Revision)
 		}
+
+		// An identical report dedupes: no second entry, no second event.
+		reports["alpha"]("install_failed", "alpha must be installed")
+		assertNoEvent(t, sub)
+
 		for _, sessionID := range []string{session.Identity.SessionID, other.Identity.SessionID} {
 			hydration, err := r.buildHydration(ctx, sessionID)
 			if err != nil {
 				t.Fatalf("buildHydration(%s): %v", sessionID, err)
 			}
-			if warningOf(hydration.Warnings, "lsp", "lsp_install_failed", "") == nil ||
-				warningOf(hydration.Warnings, "lsp", "lsp_server_unavailable", "") == nil {
-				t.Fatalf("hydration of %s misses the global LSP group: %+v", sessionID, hydration.Warnings)
+			if warningOf(hydration.Warnings, "plugin:alpha", "install_failed", "") == nil ||
+				warningOf(hydration.Warnings, "plugin:beta", "server_unavailable", "") == nil {
+				t.Fatalf("hydration of %s misses a plugin group: %+v", sessionID, hydration.Warnings)
 			}
 		}
 		all, err := r.getWarnings(ctx)
 		if err != nil {
 			t.Fatalf("getWarnings: %v", err)
 		}
-		if warningOf(all.Warnings, "lsp", "lsp_install_failed", "") == nil ||
-			warningOf(all.Warnings, "lsp", "lsp_server_unavailable", "") == nil {
-			t.Fatalf("the unfiltered read misses the global LSP group: %+v", all.Warnings)
+		if warningOf(all.Warnings, "plugin:alpha", "install_failed", "") == nil ||
+			warningOf(all.Warnings, "plugin:beta", "server_unavailable", "") == nil {
+			t.Fatalf("the unfiltered read misses a plugin group: %+v", all.Warnings)
 		}
-		lspCount := 0
+		counts := map[string]int{}
 		for _, warning := range all.Warnings {
-			if warning.Source == "lsp" {
-				lspCount++
-			}
+			counts[string(warning.Source)]++
 		}
-		if lspCount != 2 {
-			t.Fatalf("LSP entries after the identical re-report = %d, want the deduped pair", lspCount)
+		if counts["plugin:alpha"] != 1 || counts["plugin:beta"] != 1 {
+			t.Fatalf("plugin entries after the identical re-report = %v, want one deduped value per factory", counts)
 		}
 
 		// Reports after the warning store's closure are ignored.
 		revision, _ := r.warnings.snapshot()
 		r.warnings.close()
-		report("lsp_install_failed", "a late report")
+		reports["alpha"]("install_failed", "a late report")
 		assertNoEvent(t, sub)
 		if after, _ := r.warnings.snapshot(); after != revision {
 			t.Fatalf("a late report advanced the store: %d → %d", revision, after)

@@ -699,7 +699,7 @@ func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
 // rules and its refresh at the shared publication path: the disconnected
 // state reports no_provider and the primary model's unavailability, the
 // connected state clears them, a catalog warning appears and clears, and the
-// unfiltered read orders the fixed source groups.
+// unfiltered read orders the actual stored groups lexically.
 func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "UNSET_SETUP_KEY")
@@ -720,7 +720,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		}
 		var setupKinds []string
 		for _, warning := range snap.Warnings {
-			if warning.Source == "setup" {
+			if warning.Source == "runtime:setup" {
 				setupKinds = append(setupKinds, warning.Kind)
 			}
 		}
@@ -758,7 +758,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 			t.Fatalf("getWarnings after connect: %v", err)
 		}
 		for _, warning := range clear.Warnings {
-			if warning.Source == "setup" {
+			if warning.Source == "runtime:setup" {
 				t.Fatalf("setup warning survived the connected reload: %+v", warning)
 			}
 		}
@@ -789,9 +789,10 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 			t.Fatalf("warning revision advanced on an unchanged publication: %s → %s", clear.WarningsRevision.Revision, idempotent.WarningsRevision.Revision)
 		}
 
-		// A catalog warning rides the published candidate and clears with the
-		// fixed source order preserved: setup, prompt, catalog, agents, lsp,
-		// protocol.
+		// A catalog warning rides the published candidate; reads enumerate
+		// the actual stored groups deterministically — global groups ordered
+		// lexically by source, never a fixed source list — and the broken
+		// provider also restores the setup group.
 		brokenDoc := strings.Replace(disconnectedDoc, `"base_url":"https://prov.test/v1"`, `"base_url":""`, 1)
 		writeServiceFile(t, e.configPath, brokenDoc)
 		if _, err := r.Reload(context.Background()); err != nil {
@@ -801,17 +802,22 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings broken: %v", err)
 		}
-		if len(broken.Warnings) == 0 || broken.Warnings[0].Source != "setup" {
-			t.Fatalf("broken-reload warnings = %+v, want the setup group first", broken.Warnings)
-		}
-		var catalogSeen bool
+		var sources []string
+		var catalogSeen, setupSeen bool
 		for _, warning := range broken.Warnings {
-			if warning.Source == "catalog" {
+			sources = append(sources, string(warning.Source))
+			switch warning.Source {
+			case "runtime:catalog":
 				catalogSeen = true
+			case "runtime:setup":
+				setupSeen = true
 			}
 		}
-		if !catalogSeen {
-			t.Fatalf("broken-reload warnings carry no catalog warning: %+v", broken.Warnings)
+		if !slices.IsSorted(sources) || len(sources) < 2 || sources[0] != "runtime:agents" {
+			t.Fatalf("broken-reload warning order = %v, want the lexical global groups with the agents group first", sources)
+		}
+		if !catalogSeen || !setupSeen {
+			t.Fatalf("broken-reload warnings = %+v, want both the catalog and setup groups", broken.Warnings)
 		}
 	})
 }

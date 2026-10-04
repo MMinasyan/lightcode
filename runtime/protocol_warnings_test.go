@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -28,14 +29,26 @@ import (
 // revision's independence and dedupe.
 
 // warningOf finds one store warning by source, kind, and session.
-func warningOf(warnings []protocol.Warning, source protocol.WarningSource, kind, sessionID string) *protocol.Warning {
+func warningOf(warnings []protocol.Warning, source string, kind, sessionID string) *protocol.Warning {
 	for i := range warnings {
 		warning := &warnings[i]
-		if warning.Source == source && warning.Kind == kind && (sessionID == "" || (warning.SessionId != nil && *warning.SessionId == sessionID)) {
+		if string(warning.Source) == source && warning.Kind == kind && (sessionID == "" || (warning.SessionId != nil && *warning.SessionId == sessionID)) {
 			return warning
 		}
 	}
 	return nil
+}
+
+// sessionWarningPresent reports whether any stored warning belongs to the
+// Session, regardless of source: the presence-only oracle used where the
+// lifetime rule, not the attribution rule, is under test.
+func sessionWarningPresent(warnings []protocol.Warning, sessionID string) bool {
+	for i := range warnings {
+		if warnings[i].SessionId != nil && *warnings[i].SessionId == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 // TestWarningsPromptReplaceClearAndFailedPreparationNoChange pins the prompt
@@ -107,11 +120,11 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings: %v", err)
 		}
-		found := warningOf(first.Warnings, "prompt", "rules_not_found", sessionID)
+		found := warningOf(first.Warnings, "runtime:prompt", "rules_not_found", sessionID)
 		if found == nil || found.Message != "No AGENTS.md found" {
 			t.Fatalf("prompt warning after successful preparation = %+v, want the assembled rules warning for the session", found)
 		}
-		if warningOf(first.Warnings, "setup", "setup_no_model", "") == nil {
+		if warningOf(first.Warnings, "runtime:setup", "setup_no_model", "") == nil {
 			t.Fatalf("global setup warning missing: %+v", first.Warnings)
 		}
 		if first.WarningsRevision.Revision == "0" {
@@ -130,7 +143,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings cleared: %v", err)
 		}
-		if warningOf(cleared.Warnings, "prompt", "rules_not_found", sessionID) != nil {
+		if warningOf(cleared.Warnings, "runtime:prompt", "rules_not_found", sessionID) != nil {
 			t.Fatalf("the warning-free preparation kept the session's prompt warning: %+v", cleared.Warnings)
 		}
 		if revision, err := warnRevision(cleared.WarningsRevision.Revision); err != nil || revision == 0 {
@@ -291,20 +304,20 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings: %v", err)
 		}
-		if warningOf(all.Warnings, "prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
+		if warningOf(all.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
 			t.Fatalf("unfiltered read misses session A's prompt warning: %+v", all.Warnings)
 		}
-		if warningOf(all.Warnings, "prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
+		if warningOf(all.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
 			t.Fatalf("unfiltered read misses session B's prompt warning: %+v", all.Warnings)
 		}
-		if warningOf(all.Warnings, "setup", "setup_no_model", "") == nil {
+		if warningOf(all.Warnings, "runtime:setup", "setup_no_model", "") == nil {
 			t.Fatalf("unfiltered read misses the global setup warning: %+v", all.Warnings)
 		}
-		catalogWarning := warningOf(all.Warnings, "catalog", "incomplete_model", "")
+		catalogWarning := warningOf(all.Warnings, "runtime:catalog", "incomplete_model", "")
 		if catalogWarning == nil || !strings.Contains(catalogWarning.Message, "prov/inc") {
 			t.Fatalf("unfiltered read misses the real catalog warning: %+v", all.Warnings)
 		}
-		if warningOf(all.Warnings, "agents", "invalid_agent_type", "") == nil {
+		if warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
 			t.Fatalf("unfiltered read misses the global agents warning: %+v", all.Warnings)
 		}
 
@@ -316,29 +329,29 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		if err != nil {
 			t.Fatalf("hydration B: %v", err)
 		}
-		if warningOf(hydrationA.Warnings, "prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
+		if warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
 			t.Fatalf("hydration A misses its own prompt warning: %+v", hydrationA.Warnings)
 		}
-		if warningOf(hydrationA.Warnings, "prompt", "rules_read_error", sessionB.Identity.SessionID) != nil {
+		if warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil {
 			t.Fatalf("hydration A contains the sibling's prompt warning: %+v", hydrationA.Warnings)
 		}
-		if warningOf(hydrationA.Warnings, "agents", "invalid_agent_type", "") == nil {
+		if warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
 			t.Fatalf("hydration A misses the global agents warning: %+v", hydrationA.Warnings)
 		}
-		if warningOf(hydrationB.Warnings, "prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
+		if warningOf(hydrationB.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
 			t.Fatalf("hydration B misses its own prompt warning: %+v", hydrationB.Warnings)
 		}
-		if warningOf(hydrationB.Warnings, "prompt", "rules_not_found", sessionA.Identity.SessionID) != nil {
+		if warningOf(hydrationB.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil {
 			t.Fatalf("hydration B contains the sibling's prompt warning: %+v", hydrationB.Warnings)
 		}
 		for _, hydration := range []protocol.Hydration{hydrationA, hydrationB} {
-			if warningOf(hydration.Warnings, "setup", "setup_no_model", "") == nil {
+			if warningOf(hydration.Warnings, "runtime:setup", "setup_no_model", "") == nil {
 				t.Fatalf("hydration misses the global setup warning: %+v", hydration.Warnings)
 			}
-			if warningOf(hydration.Warnings, "catalog", "incomplete_model", "") == nil {
+			if warningOf(hydration.Warnings, "runtime:catalog", "incomplete_model", "") == nil {
 				t.Fatalf("hydration misses the global catalog warning: %+v", hydration.Warnings)
 			}
-			if warningOf(hydration.Warnings, "agents", "invalid_agent_type", "") == nil {
+			if warningOf(hydration.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
 				t.Fatalf("hydration misses the global agents warning: %+v", hydration.Warnings)
 			}
 			if hydration.WarningsRevision.Revision != all.WarningsRevision.Revision {
@@ -449,7 +462,7 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings: %v", err)
 		}
-		found := warningOf(first.Warnings, "protocol", "protocol_must_preserve_missing", sessionID)
+		found := warningOf(first.Warnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID)
 		if found == nil || found.Message == "" {
 			t.Fatalf("protocol warning after the tool turn = %+v, want the MustPreserve diagnostic for the session", found)
 		}
@@ -472,7 +485,7 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		// warning's (kind,message) is retained exactly once.
 		firstReports := 0
 		for _, warning := range second.Warnings {
-			if warning.Source == "protocol" && warning.SessionId != nil && *warning.SessionId == sessionID {
+			if warning.Source == "runtime:protocol" && warning.SessionId != nil && *warning.SessionId == sessionID {
 				firstReports++
 			}
 		}
@@ -506,7 +519,7 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getWarnings after failure: %v", err)
 		}
-		if warningOf(third.Warnings, "protocol", "protocol_must_preserve_missing", failing.Identity.SessionID) == nil {
+		if warningOf(third.Warnings, "runtime:protocol", "protocol_must_preserve_missing", failing.Identity.SessionID) == nil {
 			t.Fatalf("the post-encode transport failure dropped its diagnostics: %+v", third.Warnings)
 		}
 		if third.WarningsRevision.Revision == revisionAfterSecond {
@@ -531,13 +544,31 @@ func (e *countingFailingEndpoint) serve(w http.ResponseWriter, r *http.Request) 
 }
 
 // TestWarningsCompactClosureRecordsWithPostEncodeFailure pins the compact
-// model's transport closure through the real prepared-execution opener: a
-// compaction-shaped real request over the compact transport's MustPreserve
-// metadata records its diagnostics under the admission's Session identity
-// even when the physical request fails after encoding, dedupes identical
-// re-reports, and ignores every report after owner closure.
+// model's transport closure through the real prepared-execution opener over a
+// real existing Harness subject: a compaction-shaped real request over the
+// compact transport's MustPreserve metadata records its diagnostics under the
+// admitted Session identity even when the physical request fails after
+// encoding, an identical attempt dedupes, a diagnostic-free attempt replaces
+// the group with nothing, a late attempt for a deleted subject changes
+// nothing, and reports after owner closure are ignored.
 func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
-	{
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+
+		// One real existing subject: the direct compact opener records under
+		// this admitted Session identity, and the new
+		// existence-before-publication rule observes the same Harness.
+		session, err := r.createSession(ctx, e.workspace("compact-warn"), "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		sessionID := session.Identity.SessionID
+
 		sh := newServiceHarness(t)
 		t.Setenv("PREP_COMPACT_KEY", "compact-secret")
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -550,21 +581,22 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		defer cancel()
 		comp := mustComposition(t, compactToolsPlugin())
 		runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
-		obs := newObservation()
-		warnings := newWarningStore()
-		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
-		svc.attachWarnings(warnings)
+		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
+		svc.attachWarnings(r.warnings)
 		if _, err := svc.publish(context.Background()); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
-		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, newObservationAdapter(obs, warnings), nil, nil)
+		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, r.obs)
+		adapter := newObservationAdapter(r.obs, r.warnings)
+		adapter.h = r.harness
+		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, adapter, nil, nil)
 
-		prepared, err := p.bind()(context.Background(), compactPrepRequest())
+		request := compactPrepRequest()
+		request.Session.Identity.SessionID = sessionID
+		prepared, err := p.bind()(context.Background(), request)
 		if err != nil {
 			t.Fatalf("bind: %v", err)
 		}
-		sessionID := compactPrepRequest().Session.Identity.SessionID
 		execution, err := prepared.Open(context.Background(), harness.OperationAdmission{
 			SessionID:   sessionID,
 			OperationID: "op-compact",
@@ -574,44 +606,77 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
+		defer func() {
+			if err := execution.Close(); err != nil {
+				t.Errorf("execution close: %v", err)
+			}
+		}()
 
 		// The compaction shape's system+user messages carry no diagnostics;
 		// an assistant-with-tool-calls message replay-kept for the compact
 		// model fires the missing must-preserve field.
-		request := model.Request{Messages: []model.Message{
+		diagnostic := model.Request{Messages: []model.Message{
 			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
 			{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "prov", Model: "m2"},
 				ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}},
 		}}
-		if _, err := execution.CompactModel(context.Background(), request); err == nil {
+		if _, err := execution.CompactModel(context.Background(), diagnostic); err == nil {
 			t.Fatal("compact transport request over the failing endpoint succeeded, want the transport failure")
 		}
-		revision, storeWarnings := warnings.hydrate(sessionID)
-		if warningOf(storeWarnings, "protocol", "protocol_must_preserve_missing", sessionID) == nil {
+		revision, storeWarnings := r.warnings.hydrate(sessionID)
+		if warningOf(storeWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) == nil {
 			t.Fatalf("the compact closure dropped its post-encode diagnostics: %+v", storeWarnings)
 		}
-		if revision == 0 {
-			t.Fatalf("warning revision = %d, want the advanced counter", revision)
+
+		// An identical attempt replaces with the same list: no advance.
+		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		deduped, dedupedWarnings := r.warnings.hydrate(sessionID)
+		if deduped != revision || !slices.Equal(warningBodies(dedupedWarnings), warningBodies(storeWarnings)) {
+			t.Fatalf("an identical attempt advanced the store: revision %d → %d", revision, deduped)
 		}
 
-		// An identical re-report dedupes and advances nothing.
-		_, _ = execution.CompactModel(context.Background(), request)
-		deduped, dedupedWarnings := warnings.hydrate(sessionID)
-		if deduped != revision || !slices.Equal(warningBodies(dedupedWarnings), warningBodies(storeWarnings)) {
-			t.Fatalf("an identical re-report advanced the store: revision %d → %d", revision, deduped)
+		// A diagnostic-free attempt is a complete computation: it replaces
+		// the group with nothing and clears the obsolete value.
+		clean := model.Request{Messages: []model.Message{
+			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
+		}}
+		if _, err := execution.CompactModel(context.Background(), clean); err == nil {
+			t.Fatal("diagnostic-free compact request over the failing endpoint succeeded, want the transport failure")
+		}
+		cleared, clearedWarnings := r.warnings.hydrate(sessionID)
+		if warningOf(clearedWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil {
+			t.Fatalf("the diagnostic-free attempt kept the obsolete diagnostics: %+v", clearedWarnings)
+		}
+		if cleared == deduped {
+			t.Fatalf("clearing the group advanced nothing: revision %d", cleared)
+		}
+
+		// The committed deletion removes the subject's groups; a late attempt
+		// for the deleted subject cannot reintroduce them.
+		if _, err := r.archiveSession(ctx, sessionID); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		if err := r.deleteSession(ctx, sessionID); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		beforeLate, _ := r.warnings.snapshot()
+		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		afterLate, lateWarnings := r.warnings.snapshot()
+		if afterLate != beforeLate {
+			t.Fatalf("a late attempt for the deleted subject advanced the store: %d → %d", beforeLate, afterLate)
+		}
+		if warningOf(lateWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil {
+			t.Fatalf("a late attempt resurrected the deleted subject's diagnostics: %+v", lateWarnings)
 		}
 
 		// Reports after the owner's warning-store closure are ignored.
-		warnings.close()
-		_, _ = execution.CompactModel(context.Background(), request)
-		closed, closedWarnings := warnings.hydrate(sessionID)
-		if closed != deduped || !slices.Equal(warningBodies(closedWarnings), warningBodies(dedupedWarnings)) {
+		r.warnings.close()
+		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		closed, closedWarnings := r.warnings.snapshot()
+		if closed != afterLate || !slices.Equal(warningBodies(closedWarnings), warningBodies(lateWarnings)) {
 			t.Fatalf("a report after closure changed the store")
 		}
-		if err := execution.Close(); err != nil {
-			t.Fatalf("execution close: %v", err)
-		}
-	}
+	})
 }
 
 // warnCompactConfigDocument points both the conversation and the compact
@@ -637,11 +702,11 @@ const warnCompactConfigDocument = `{
 func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	store := newWarningStore()
 	managedID := "0123456789abcdef0123456789abcdef"
-	store.setGlobal("setup", []protocol.Warning{{Source: "setup", Kind: "setup_k", Message: "setup_m"}})
+	store.setGlobal("runtime:setup", []protocol.Warning{{Source: "runtime:setup", Kind: "setup_k", Message: "setup_m"}})
 	promptID := managedID
-	store.setSessionPrompt(managedID, []protocol.Warning{{Source: "prompt", Kind: "prompt_k", Message: "prompt_m", SessionId: &promptID}})
+	store.setSessionPrompt(managedID, []protocol.Warning{{Source: "runtime:prompt", Kind: "prompt_k", Message: "prompt_m", SessionId: &promptID}})
 	protocolID := managedID
-	store.appendProtocol(managedID, []protocol.Warning{{Source: "protocol", Kind: "protocol_k", Message: "protocol_m", SessionId: &protocolID}})
+	store.setSessionProtocol(managedID, []protocol.Warning{{Source: "runtime:protocol", Kind: "protocol_k", Message: "protocol_m", SessionId: &protocolID}})
 
 	// The immutable serialized baseline, taken before any mutation.
 	revision, warnings := store.snapshot()
@@ -654,7 +719,7 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	}
 	for _, warning := range warnings {
 		switch warning.Source {
-		case "setup":
+		case "runtime:setup":
 			if warning.SessionId != nil {
 				t.Fatalf("global warning carries an identity: %+v", warning)
 			}
@@ -705,7 +770,7 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	// A next identical report still dedupes correctly against the untouched
 	// group: no revision advance, no duplicate.
 	sameID := managedID
-	store.setSessionPrompt(managedID, []protocol.Warning{{Source: "prompt", Kind: "prompt_k", Message: "prompt_m", SessionId: &sameID}})
+	store.setSessionPrompt(managedID, []protocol.Warning{{Source: "runtime:prompt", Kind: "prompt_k", Message: "prompt_m", SessionId: &sameID}})
 	final, finalWarnings := store.snapshot()
 	if final != revision {
 		t.Fatalf("an identical report advanced the revision: %d → %d", revision, final)
@@ -717,4 +782,375 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	if string(finalGot) != string(expected) {
 		t.Fatalf("the identical report changed the store's read:\n%s\nwant\n%s", finalGot, expected)
 	}
+}
+
+// TestWarningStoreReadsDynamicDeterministicGroups pins the shared read
+// producer over groups it did not know at compile time: every actually stored
+// group is enumerated — global groups before Session groups, then lexical
+// Session ID and lexical source — never a fixed source list, so an arbitrary
+// plugin source is a first-class group.
+func TestWarningStoreReadsDynamicDeterministicGroups(t *testing.T) {
+	store := newWarningStore()
+	sessionA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sessionB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	idA, idB := sessionA, sessionB
+	store.setSessionPrompt(sessionB, []protocol.Warning{{Source: "runtime:prompt", Kind: "b", Message: "b", SessionId: &idB}})
+	store.setGlobal("plugin:zeta", []protocol.Warning{{Source: "plugin:zeta", Kind: "z", Message: "z"}})
+	store.setSessionPrompt(sessionA, []protocol.Warning{{Source: "runtime:prompt", Kind: "a", Message: "a", SessionId: &idA}})
+	store.setGlobal("runtime:setup", []protocol.Warning{{Source: "runtime:setup", Kind: "s", Message: "s"}})
+
+	revision, warnings := store.snapshot()
+	if revision != 4 {
+		t.Fatalf("revision after four distinct groups = %d, want 4", revision)
+	}
+	want := []string{
+		"plugin:zeta/z/z/",
+		"runtime:setup/s/s/",
+		"runtime:prompt/a/a/" + sessionA,
+		"runtime:prompt/b/b/" + sessionB,
+	}
+	if got := warningBodies(warnings); !slices.Equal(got, want) {
+		t.Fatalf("dynamic read order = %v, want %v", got, want)
+	}
+
+	// The Session filter carries every global group plus only that Session's
+	// own groups, in the same deterministic order.
+	_, hydrated := store.hydrate(sessionA)
+	wantHydrated := []string{
+		"plugin:zeta/z/z/",
+		"runtime:setup/s/s/",
+		"runtime:prompt/a/a/" + sessionA,
+	}
+	if got := warningBodies(hydrated); !slices.Equal(got, wantHydrated) {
+		t.Fatalf("filtered read = %v, want %v", got, wantHydrated)
+	}
+
+	// Replacing with the identical list and clearing an absent group advance
+	// nothing.
+	store.setGlobal("runtime:setup", []protocol.Warning{{Source: "runtime:setup", Kind: "s", Message: "s"}})
+	store.setGlobal("plugin:absent", nil)
+	if after, _ := store.snapshot(); after != revision {
+		t.Fatalf("an identical or absent-clear report advanced the revision: %d → %d", revision, after)
+	}
+}
+
+// TestWarningStoreReplacementAlgebra pins the two mutation shapes: a complete
+// computation — one model or compact Stream attempt's returned diagnostics —
+// replaces its Session group, including an empty list clearing the obsolete
+// value, while individual Runtime-scoped plugin reports append and dedupe
+// within their own global group.
+func TestWarningStoreReplacementAlgebra(t *testing.T) {
+	store := newWarningStore()
+	id := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	store.setSessionProtocol(id, []protocol.Warning{{Source: "runtime:protocol", Kind: "k1", Message: "m1", SessionId: &id}})
+	store.setSessionProtocol(id, []protocol.Warning{{Source: "runtime:protocol", Kind: "k2", Message: "m2", SessionId: &id}})
+	_, warnings := store.snapshot()
+	if warningOf(warnings, "runtime:protocol", "k1", id) != nil {
+		t.Fatalf("a new attempt kept the previous attempt's diagnostics: %+v", warnings)
+	}
+	if warningOf(warnings, "runtime:protocol", "k2", id) == nil {
+		t.Fatalf("the new attempt's diagnostics are missing: %+v", warnings)
+	}
+	store.setSessionProtocol(id, nil)
+	_, cleared := store.snapshot()
+	if warningOf(cleared, "runtime:protocol", "k2", id) != nil {
+		t.Fatalf("an empty attempt kept the obsolete diagnostics: %+v", cleared)
+	}
+
+	store.appendPlugin("lsp", "notice", "one")
+	store.appendPlugin("lsp", "notice", "one")
+	store.appendPlugin("lsp", "other", "two")
+	_, plugins := store.snapshot()
+	if warningOf(plugins, "plugin:lsp", "notice", "") == nil || warningOf(plugins, "plugin:lsp", "other", "") == nil {
+		t.Fatalf("plugin reports are missing from their own global group: %+v", plugins)
+	}
+	count := 0
+	for _, warning := range plugins {
+		if string(warning.Source) == "plugin:lsp" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("plugin group members after the identical report = %d, want the deduped pair", count)
+	}
+
+	// A nil store is inert for every mutation: the shared core's nil guard
+	// covers the append path too.
+	var absent *warningStore
+	if absent.appendPlugin("lsp", "k", "m") || absent.setGlobal("runtime:setup", nil) ||
+		absent.setSessionProtocol(id, nil) || absent.removeSessions([]string{id}) {
+		t.Fatal("a nil store mutated")
+	}
+}
+
+// TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup proves prompt
+// presentation is published only by the committed opener: a fork and an
+// admission whose transactions fail after preparation both leave the warning
+// store byte-identical, while a later successful admission still publishes its
+// own Session's group.
+func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		wrapped := newSweepStore(e.store)
+		e.store = wrapped
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+
+		// A real committed source with a valid boundary: the source's own
+		// successful preparation already published its prompt group.
+		source, err := r.createSession(ctx, e.workspace("orphan-src"), "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		sourceID := source.Identity.SessionID
+		submitThroughRuntime(t, r, sourceID, "op-src", "boundary")
+		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
+		awaitIdleSession(t, r, sourceID)
+		snap := snapshotThroughRuntime(t, r, sourceID)
+		boundaryItem := projectItemID(sourceID, commandUserInputEntry(t, snap, "op-src"))
+
+		beforeFork, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings before fork: %v", err)
+		}
+		forkFailure := errors.New("test fork transaction failure")
+		wrapped.armFailAfterRelease(forkFailure)
+		forkDone := make(chan error, 1)
+		go func() {
+			_, err := r.forkSession(ctx, sourceID, protocol.ForkRequest{
+				BoundaryItemId: boundaryItem,
+				OperationId:    "op-orphan-fork",
+				Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+			})
+			forkDone <- err
+		}()
+		select {
+		case <-wrapped.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the failed fork never reached its transaction")
+		}
+		wrapped.releaseBlock()
+		if err := <-forkDone; !errors.Is(err, forkFailure) {
+			t.Fatalf("failed fork = %v, want the injected transaction failure", err)
+		}
+		afterFork, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after fork: %v", err)
+		}
+		if afterFork.WarningsRevision.Revision != beforeFork.WarningsRevision.Revision {
+			t.Fatalf("failed fork advanced the warning revision: %s → %s", beforeFork.WarningsRevision.Revision, afterFork.WarningsRevision.Revision)
+		}
+		if !slices.Equal(warningBodies(beforeFork.Warnings), warningBodies(afterFork.Warnings)) {
+			t.Fatalf("failed fork changed the warning store:\n%v\n%v", warningBodies(beforeFork.Warnings), warningBodies(afterFork.Warnings))
+		}
+
+		// The failed-admission sibling: the preparation runs, the admission
+		// transaction fails, and the preparation's prompt values stay
+		// unpublished.
+		victim, err := r.createSession(ctx, e.workspace("orphan-admit"), "worker")
+		if err != nil {
+			t.Fatalf("createSession(victim): %v", err)
+		}
+		beforeAdmit, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings before admission: %v", err)
+		}
+		admissionFailure := errors.New("test admission transaction failure")
+		wrapped.armFailAfterRelease(admissionFailure)
+		admitDone := make(chan error, 1)
+		go func() {
+			admitDone <- submitExpectFailure(r, victim.Identity.SessionID, "op-orphan-admit")
+		}()
+		select {
+		case <-wrapped.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the failed admission never reached its transaction")
+		}
+		wrapped.releaseBlock()
+		if err := <-admitDone; !errors.Is(err, admissionFailure) {
+			t.Fatalf("failed admission = %v, want the injected transaction failure", err)
+		}
+		afterAdmit, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after admission: %v", err)
+		}
+		if afterAdmit.WarningsRevision.Revision != beforeAdmit.WarningsRevision.Revision {
+			t.Fatalf("failed admission advanced the warning revision: %s → %s", beforeAdmit.WarningsRevision.Revision, afterAdmit.WarningsRevision.Revision)
+		}
+		if !slices.Equal(warningBodies(beforeAdmit.Warnings), warningBodies(afterAdmit.Warnings)) {
+			t.Fatalf("failed admission changed the warning store:\n%v\n%v", warningBodies(beforeAdmit.Warnings), warningBodies(afterAdmit.Warnings))
+		}
+
+		// The oracle flips: an unarmed successful admission publishes its own
+		// Session's prompt group and advances the revision.
+		good, err := r.createSession(ctx, e.workspace("orphan-ok"), "worker")
+		if err != nil {
+			t.Fatalf("createSession(good): %v", err)
+		}
+		submitThroughRuntime(t, r, good.Identity.SessionID, "op-good", "please write")
+		awaitOperation(t, r, good.Identity.SessionID, "op-good", harness.OperationSuccess)
+		afterSuccess, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after success: %v", err)
+		}
+		if afterSuccess.WarningsRevision.Revision == afterAdmit.WarningsRevision.Revision {
+			t.Fatalf("a successful admission did not publish its prompt group: revision stayed %s", afterSuccess.WarningsRevision.Revision)
+		}
+		if warningOf(afterSuccess.Warnings, "runtime:prompt", "rules_not_found", good.Identity.SessionID) == nil {
+			t.Fatalf("the successful admission's prompt group is missing: %+v", afterSuccess.Warnings)
+		}
+	})
+}
+
+// TestWarningsDeleteArchiveAndLateReportLifetime proves the Session group
+// lifetime: archive retains the group, a committed deletion removes it in one
+// observation section with one runtime-scoped warning_changed hint, a sibling
+// Session's group survives, and late prompt or protocol reports for the
+// deleted subject can neither write the group nor publish a hint.
+func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+
+		victim, err := r.createSession(ctx, e.workspace("warn-delete"), "worker")
+		if err != nil {
+			t.Fatalf("createSession(victim): %v", err)
+		}
+		sibling, err := r.createSession(ctx, e.workspace("warn-keep"), "worker")
+		if err != nil {
+			t.Fatalf("createSession(sibling): %v", err)
+		}
+		victimID, siblingID := victim.Identity.SessionID, sibling.Identity.SessionID
+		submitThroughRuntime(t, r, victimID, "op-victim", "please write")
+		awaitOperation(t, r, victimID, "op-victim", harness.OperationSuccess)
+		submitThroughRuntime(t, r, siblingID, "op-sibling", "please write")
+		awaitOperation(t, r, siblingID, "op-sibling", harness.OperationSuccess)
+
+		// Archive retains the group; hydration of the archived subject still
+		// carries it.
+		if _, err := r.archiveSession(ctx, victimID); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		archived, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after archive: %v", err)
+		}
+		if !sessionWarningPresent(archived.Warnings, victimID) {
+			t.Fatalf("archive dropped the Session's warning group: %+v", archived.Warnings)
+		}
+		hydration, err := r.buildHydration(ctx, victimID)
+		if err != nil {
+			t.Fatalf("hydration of the archived subject: %v", err)
+		}
+		if !sessionWarningPresent(hydration.Warnings, victimID) {
+			t.Fatalf("the archived subject's hydration dropped its group: %+v", hydration.Warnings)
+		}
+
+		sub, err := r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		baseRevision, _ := r.warnings.snapshot()
+
+		// The committed deletion removes the group in one observation section
+		// and publishes exactly one runtime-scoped hint.
+		if err := r.deleteSession(ctx, victimID); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		afterDelete, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after delete: %v", err)
+		}
+		if sessionWarningPresent(afterDelete.Warnings, victimID) {
+			t.Fatalf("the committed deletion kept the Session's group: %+v", afterDelete.Warnings)
+		}
+		if warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) == nil {
+			t.Fatalf("the deletion removed the sibling's group: %+v", afterDelete.Warnings)
+		}
+		if _, err := r.buildHydration(ctx, victimID); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("hydration of the deleted subject = %v, want the typed absence", err)
+		}
+
+		var hint *protocol.WarningChangedEvent
+		for hint == nil {
+			event, ok := nextEvent(t, sub)
+			if !ok {
+				t.Fatal("the subscription closed before the deletion's warning hint")
+			}
+			if eventKind(t, event) != "warning_changed" {
+				continue
+			}
+			body, err := event.AsWarningChangedEvent()
+			if err != nil {
+				t.Fatalf("warning event body: %v", err)
+			}
+			if body.Scope.Kind != protocol.ScopeKindRuntime {
+				t.Fatalf("deletion warning hint scope = %+v, want the runtime scope", body.Scope)
+			}
+			hint = &body
+		}
+		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
+			t.Fatalf("deletion warning hint revision = %q, want the single advance from %d", hint.WarningsRevision.Revision, baseRevision)
+		}
+		assertNoEvent(t, sub)
+
+		// Late reports for the deleted subject through a real adapter bound to
+		// the owner's Harness: neither prompt nor protocol can reintroduce the
+		// group or publish a hint.
+		late := newObservationAdapter(r.obs, r.warnings)
+		late.h = r.harness
+		lateID := victimID
+		late.publishPrompt(lateID, []protocol.Warning{{Source: "runtime:prompt", Kind: "late_prompt", Message: "late", SessionId: &lateID}})
+		late.replaceProtocolWarnings(lateID, []protocol.Warning{{Source: "runtime:protocol", Kind: "late_protocol", Message: "late", SessionId: &lateID}})
+		assertNoEvent(t, sub)
+		lateRead, err := r.getWarnings(ctx)
+		if err != nil {
+			t.Fatalf("getWarnings after late reports: %v", err)
+		}
+		if lateRead.WarningsRevision.Revision != afterDelete.WarningsRevision.Revision {
+			t.Fatalf("a late report advanced the warning revision: %s → %s", afterDelete.WarningsRevision.Revision, lateRead.WarningsRevision.Revision)
+		}
+		if !slices.Equal(warningBodies(afterDelete.Warnings), warningBodies(lateRead.Warnings)) {
+			t.Fatalf("a late report changed the store:\n%v\n%v", warningBodies(afterDelete.Warnings), warningBodies(lateRead.Warnings))
+		}
+
+		// A committed deletion with no owned groups is a store no-op: no
+		// revision advance and no warning hint.
+		bare, err := r.createSession(ctx, e.workspace("warn-bare"), "worker")
+		if err != nil {
+			t.Fatalf("createSession(bare): %v", err)
+		}
+		if _, err := r.archiveSession(ctx, bare.Identity.SessionID); err != nil {
+			t.Fatalf("archive(bare): %v", err)
+		}
+		beforeBare, _ := r.warnings.snapshot()
+		if err := r.deleteSession(ctx, bare.Identity.SessionID); err != nil {
+			t.Fatalf("delete(bare): %v", err)
+		}
+		if afterBare, _ := r.warnings.snapshot(); afterBare != beforeBare {
+			t.Fatalf("a no-op deletion advanced the warning revision: %d → %d", beforeBare, afterBare)
+		}
+		for {
+			select {
+			case event, ok := <-sub.Events():
+				if !ok {
+					t.Fatal("the subscription closed around the no-op deletion")
+				}
+				if eventKind(t, event) == "warning_changed" {
+					t.Fatalf("a no-op deletion published a warning hint: %+v", event)
+				}
+				continue
+			default:
+			}
+			break
+		}
+	})
 }

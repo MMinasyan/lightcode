@@ -791,7 +791,7 @@ paths:
       operationId: GetWarnings
       responses:
         "200":
-          description: Every warning group in producer order.
+          description: Every currently owned warning group in deterministic order.
           content:
             application/json:
               schema:
@@ -1510,13 +1510,6 @@ components:
       properties:
         source:
           type: string
-          enum:
-            - setup
-            - prompt
-            - catalog
-            - agents
-            - lsp
-            - protocol
         kind:
           type: string
         message:

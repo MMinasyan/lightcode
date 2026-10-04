@@ -71,6 +71,24 @@ func isolateMountedBundledCredentials(t *testing.T) {
 	}
 }
 
+// mountedReporterPlugin is the mounted owner's real-attribution fixture: one
+// Runtime-scoped factory that reports one warning through its
+// composition-bound callback at Open, so the generated TypeScript client reads
+// a real plugin:<registered ID> source over the wire.
+func mountedReporterPlugin() runtime.Plugin {
+	return runtime.Plugin{
+		ID:       "mounted_reporter",
+		Scope:    runtime.ScopeRuntime,
+		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("mounted.reporter")},
+		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+			if info.ReportWarning != nil {
+				info.ReportWarning("mounted_notice", "mounted plugin warning")
+			}
+			return runtime.Instance{Values: map[string]any{"mounted.reporter": "ok"}}, nil
+		},
+	}
+}
+
 // TestMountedGeneratedTypeScriptClient mounts the real isolated owner once
 // and proves the generated TypeScript SDK addresses its special provider and
 // Agent identity query values over the real discovery-file handshake. The
@@ -99,7 +117,7 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	owner, err := runtime.Open(context.Background(), runtime.Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,
-		Plugins:    builtin.Plugins(),
+		Plugins:    append(builtin.Plugins(), mountedReporterPlugin()),
 	})
 	if err != nil {
 		t.Fatalf("runtime.Open: %v", err)

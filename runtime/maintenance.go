@@ -51,7 +51,9 @@ func (r *Runtime) startMaintenance(ticks <-chan time.Time, stopTicker func()) {
 // only that transition, and calls Harness.Sweep with the explicit time on
 // the Runtime-owned context through the ordinary admitted-call gate. Every
 // committed deleted identity's artifact tree is removed inside the same
-// admission — including successes collected before a pass failure — and
+// admission — including successes collected before a pass failure — and all
+// of their Session warning groups are removed together in one observation
+// section with one runtime-scoped hint before any pass error returns;
 // cleanup failures join the pass result, so one diagnostic reports
 // everything. The diagnostic decision is sampled once after the pass
 // returns: a failure while the owned context is live is reported through the
@@ -79,6 +81,10 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 				cleanErrs = append(cleanErrs, err)
 			}
 		}
+		// The committed batch's warning cleanup is one section and one hint,
+		// and it runs for every returned committed identity before the pass
+		// error is returned.
+		r.passive.removeSessionWarnings(ids)
 		return errors.Join(append([]error{passErr}, cleanErrs...)...)
 	})
 	if err != nil && ctx.Err() == nil && !errors.Is(err, ErrClosed) {

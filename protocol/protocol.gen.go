@@ -635,36 +635,6 @@ func (e ToolStartedEventKind) Valid() bool {
 	}
 }
 
-// Defines values for WarningSource.
-const (
-	Agents   WarningSource = "agents"
-	Catalog  WarningSource = "catalog"
-	Lsp      WarningSource = "lsp"
-	Prompt   WarningSource = "prompt"
-	Protocol WarningSource = "protocol"
-	Setup    WarningSource = "setup"
-)
-
-// Valid indicates whether the value is a known member of the WarningSource enum.
-func (e WarningSource) Valid() bool {
-	switch e {
-	case Agents:
-		return true
-	case Catalog:
-		return true
-	case Lsp:
-		return true
-	case Prompt:
-		return true
-	case Protocol:
-		return true
-	case Setup:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for WarningChangedEventKind.
 const (
 	WarningChanged WarningChangedEventKind = "warning_changed"
@@ -1561,14 +1531,11 @@ type UsageTotals struct {
 
 // Warning defines model for Warning.
 type Warning struct {
-	Kind      string        `json:"kind"`
-	Message   string        `json:"message"`
-	SessionId *string       `json:"session_id,omitempty"`
-	Source    WarningSource `json:"source"`
+	Kind      string  `json:"kind"`
+	Message   string  `json:"message"`
+	SessionId *string `json:"session_id,omitempty"`
+	Source    string  `json:"source"`
 }
-
-// WarningSource defines model for Warning.Source.
-type WarningSource string
 
 // WarningChangedEvent defines model for WarningChangedEvent.
 type WarningChangedEvent struct {

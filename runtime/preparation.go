@@ -53,9 +53,9 @@ type selection struct {
 
 	// warnings is the per-preparation private presentation collector: the
 	// concrete preparation assigns the assembled prompt warnings into it and
-	// the binder publishes them under the admitted Session identity only
-	// after every preparation step succeeded. It is never the Invocation or
-	// the durable capture.
+	// the committed opener publishes them under the admitted Session identity
+	// only after the opener succeeded, so a failed fork or admission
+	// publishes nothing. It is never the Invocation or the durable capture.
 	warnings *preparationWarnings
 }
 
@@ -68,7 +68,8 @@ type preparationWarnings struct {
 
 // publish replaces the owning Session's prompt group with the collected
 // values through the passive publication adapter; a nil adapter drops the
-// presentation.
+// presentation. The committed opener calls it exactly once per successful
+// execution.
 func (w *preparationWarnings) publish() {
 	if w == nil {
 		return
@@ -85,7 +86,7 @@ func promptWarnings(sessionID string, warnings []prompt.Warning) []protocol.Warn
 	out := make([]protocol.Warning, 0, len(warnings))
 	for _, warning := range warnings {
 		id := sessionID
-		out = append(out, protocol.Warning{Source: "prompt", Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+		out = append(out, protocol.Warning{Source: promptSource, Kind: warning.Kind, Message: warning.Message, SessionId: &id})
 	}
 	return out
 }
@@ -99,7 +100,7 @@ func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []prot
 	out := make([]protocol.Warning, 0, len(warnings))
 	for _, warning := range warnings {
 		id := sessionID
-		out = append(out, protocol.Warning{Source: "protocol", Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+		out = append(out, protocol.Warning{Source: protocolSource, Kind: warning.Kind, Message: warning.Message, SessionId: &id})
 	}
 	return out
 }
@@ -246,11 +247,14 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
-		input.warnings.publish()
+		// The collected presentation rides the prepared opener: only the
+		// committed admission's opener publishes it, so a failed fork or
+		// admission never creates warnings for an unpublished Session.
+		warnings := input.warnings
 		return harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, workspaceScope, agent, snapshot, opener)
+				return p.open(openCtx, admission, workspace, workspaceScope, agent, snapshot, warnings, opener)
 			},
 		}, nil
 	}
@@ -282,8 +286,11 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 // guard covers opening, every Harness-driven effect callback and terminal
 // settlement until the returned Close releases it and closes the Agent then
 // the Operation scope; opening failure releases the guard and unwinds owned
-// scopes first.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, opener openExecution) (harness.Execution, error) {
+// scopes first. Only after the opener succeeds does the collected prompt
+// presentation publish, so a failed fork or admission never creates warnings
+// for an unpublished Session and a successful opener publishes before any
+// progress.
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openExecution) (harness.Execution, error) {
 	base := ScopeInfo{DataDir: p.runtime.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
@@ -326,6 +333,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	if err != nil {
 		return unwind(err, release)
 	}
+	// The committed opener owns the collected presentation: the successful
+	// execution publishes its Session's prompt group before any model or tool
+	// progress.
+	warnings.publish()
 	if execution.Close != nil {
 		// The concrete execution cleanup joins the Agent scope's closer stack last,
 		// so reverse disposal runs it before that scope's plugins.
@@ -682,12 +693,12 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 				// The attempt's diagnostics are recorded under the admitted
 				// Session identity even when the physical request failed after
 				// encoding succeeded — a diagnostic is presentation only.
-				p.passive.appendProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
+				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
 				stream, warnings, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
-				p.passive.appendProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
+				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			// A nil Retry selects the standard classifier.

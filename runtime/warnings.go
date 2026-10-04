@@ -14,15 +14,22 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
-// warningSources is the closed retained source set in the fixed group order
-// every read preserves.
-var warningSources = []protocol.WarningSource{"setup", "prompt", "catalog", "agents", "lsp", "protocol"}
+// The Core producer source names. A source is an open string, not a closed
+// capability taxonomy: these constants name the Runtime's own producers, and
+// every registered plugin producer is named "plugin:<registered ID>".
+const (
+	setupSource    = "runtime:setup"
+	promptSource   = "runtime:prompt"
+	catalogSource  = "runtime:catalog"
+	agentsSource   = "runtime:agents"
+	protocolSource = "runtime:protocol"
+)
 
-// warningGroup is one store group's key: a source with an optional Session
-// identity. Setup, catalog, agents, and LSP groups are global; prompt and
-// protocol groups are per Session.
+// warningGroup is one store group's key: an open producer source with an
+// optional Session identity. Global groups carry no Session identity; prompt
+// and protocol groups are per Session.
 type warningGroup struct {
-	source    protocol.WarningSource
+	source    string
 	sessionID string
 }
 
@@ -51,33 +58,38 @@ func (s *warningStore) close() {
 	s.mu.Unlock()
 }
 
-// setGroup replaces one group, deduplicating identical (kind,message) pairs
-// in producer order. It is the non-reentrant mutation core: an unchanged
-// replacement advances nothing; a changed one replaces or deletes the group
-// and advances the revision — a successful preparation with no warnings
-// clears its Session's prior group. Publication (the warning_changed hint)
-// is composed by the caller inside its observation section; this core never
-// publishes.
-func (s *warningStore) setGroup(group warningGroup, warnings []protocol.Warning) bool {
+// mutateGroup is the one group mutation core shared by the two contracted
+// shapes: a complete computation replaces its group with the returned list
+// (appendMode false, including an empty list clearing the obsolete value),
+// while an incremental report appends and dedupes within its producer group
+// (appendMode true). The resulting members are deduplicated on (kind,message)
+// in producer order; an unchanged result — including clearing an absent group
+// — advances nothing, while a real change replaces or deletes the group and
+// advances the revision. Publication (the warning_changed hint) is composed
+// by the caller inside its observation section; this core never publishes.
+func (s *warningStore) mutateGroup(group warningGroup, warnings []protocol.Warning, appendMode bool) bool {
 	if s == nil {
 		return false
 	}
-	deduped := dedupeWarnings(warnings)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return false
 	}
-	if existing, ok := s.groups[group]; ok && equalWarnings(existing, deduped) {
+	current := s.groups[group]
+	var next []protocol.Warning
+	if appendMode {
+		next = dedupeWarnings(slices.Concat(current, warnings))
+	} else {
+		next = dedupeWarnings(warnings)
+	}
+	if equalWarnings(current, next) {
 		return false
 	}
-	if len(deduped) == 0 {
-		if _, ok := s.groups[group]; !ok {
-			return false // clearing an absent group changed nothing
-		}
+	if len(next) == 0 {
 		delete(s.groups, group)
 	} else {
-		s.groups[group] = deduped
+		s.groups[group] = next
 	}
 	s.revision++
 	return true
@@ -85,62 +97,59 @@ func (s *warningStore) setGroup(group warningGroup, warnings []protocol.Warning)
 
 // setGlobal replaces one global group from a successful configuration
 // publication.
-func (s *warningStore) setGlobal(source protocol.WarningSource, warnings []protocol.Warning) bool {
-	return s.setGroup(warningGroup{source: source}, warnings)
+func (s *warningStore) setGlobal(source string, warnings []protocol.Warning) bool {
+	return s.mutateGroup(warningGroup{source: source}, warnings, false)
 }
 
 // setSessionPrompt replaces one Session's prompt group from a successful
-// preparation.
+// admitted preparation.
 func (s *warningStore) setSessionPrompt(sessionID string, warnings []protocol.Warning) bool {
-	return s.setGroup(warningGroup{source: "prompt", sessionID: sessionID}, warnings)
+	return s.mutateGroup(warningGroup{source: promptSource, sessionID: sessionID}, warnings, false)
 }
 
-// appendProtocol adds one execution's protocol diagnostics to the owning
-// Session's protocol group, deduplicating identical (kind,message) pairs
-// while preserving producer order. Encoding succeeded whenever diagnostics
-// are present, including a physical transport failure after encoding. The
-// core never publishes.
-func (s *warningStore) appendProtocol(sessionID string, warnings []protocol.Warning) bool {
-	if s == nil || len(warnings) == 0 {
+// setSessionProtocol replaces one Session's protocol diagnostics with the
+// complete returned list of one model or compact Stream attempt, including an
+// empty list: a diagnostic-free attempt clears the obsolete value.
+func (s *warningStore) setSessionProtocol(sessionID string, warnings []protocol.Warning) bool {
+	return s.mutateGroup(warningGroup{source: protocolSource, sessionID: sessionID}, warnings, false)
+}
+
+// appendPlugin adds one Runtime-scoped plugin report to its own global group,
+// deduplicating identical (kind,message) pairs in producer order. Reports
+// after closure are ignored; the core never publishes.
+func (s *warningStore) appendPlugin(pluginID, kind, message string) bool {
+	source := "plugin:" + pluginID
+	return s.mutateGroup(warningGroup{source: source}, []protocol.Warning{{Source: source, Kind: kind, Message: message}}, true)
+}
+
+// removeSessions removes every group owned by the named Sessions in one
+// in-memory section: a committed deletion — explicit or swept — takes its
+// Session groups with it, and a batch of deletions advances the revision once
+// and publishes one hint. Global groups are never touched. A closed store
+// ignores the removal like every later mutation.
+func (s *warningStore) removeSessions(ids []string) bool {
+	if s == nil || len(ids) == 0 {
 		return false
 	}
-	return s.appendGroup(warningGroup{source: "protocol", sessionID: sessionID}, warnings)
-}
-
-// addLSP appends one Runtime-scoped plugin report to the Runtime-global LSP
-// group — the retained append shape, never a replacement — deduplicating
-// identical (kind,message) pairs in producer order. Reports after closure are
-// ignored; the core never publishes.
-func (s *warningStore) addLSP(kind, message string) bool {
-	if s == nil {
-		return false
-	}
-	return s.appendGroup(warningGroup{source: "lsp"}, []protocol.Warning{{Source: "lsp", Kind: kind, Message: message}})
-}
-
-// appendGroup is the shared append core: producer order with (kind,message)
-// dedupe, change-gated on real growth.
-func (s *warningStore) appendGroup(group warningGroup, warnings []protocol.Warning) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return false
 	}
-	merged := append([]protocol.Warning(nil), s.groups[group]...)
 	changed := false
-	for _, warning := range warnings {
-		if slices.ContainsFunc(merged, func(existing protocol.Warning) bool { return warningIdentity(existing, warning) }) {
+	for group := range s.groups {
+		if group.sessionID == "" {
 			continue
 		}
-		merged = append(merged, warning)
-		changed = true
+		if slices.Contains(ids, group.sessionID) {
+			delete(s.groups, group)
+			changed = true
+		}
 	}
-	if !changed {
-		return false
+	if changed {
+		s.revision++
 	}
-	s.groups[group] = merged
-	s.revision++
-	return true
+	return changed
 }
 
 // storeRevision reads the current revision under the store mutex; every
@@ -166,47 +175,39 @@ func (s *warningStore) hydrate(sessionID string) (uint64, []protocol.Warning) {
 	return s.read(&sessionID)
 }
 
-// read is the shared captured read: global groups in fixed source order,
-// then per-Session groups in sorted Session ID order with each Session's
-// sources in fixed order. A nil filter is the complete unfiltered read; a
-// Session filter looks up the global groups plus only that Session's own
-// groups directly — a foreign Session's warnings never appear. The returned
-// warnings are fully owned copies (including every SessionId pointee), so a
-// caller's mutation cannot reach the groups, the dedupe, or another read.
-// The revision and the warnings are captured once under the same mutex hold.
+// read is the shared captured read: every actually stored group is
+// enumerated deterministically — global groups before Session groups, then
+// lexical Session ID and lexical source within a Session — never a fixed
+// source list, so an arbitrary plugin source is a first-class group. A nil
+// filter is the complete unfiltered read; a Session filter looks up the
+// global groups plus only that Session's own groups directly — a foreign
+// Session's warnings never appear. The returned warnings are fully owned
+// copies (including every SessionId pointee), so a caller's mutation cannot
+// reach the groups, the dedupe, or another read. The revision and the
+// warnings are captured once under the same mutex hold.
 func (s *warningStore) read(sessionFilter *string) (uint64, []protocol.Warning) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	revision := s.revision
-	out := make([]protocol.Warning, 0) // a present collection reads [], never null
-	for _, source := range warningSources {
-		if warnings, ok := s.groups[warningGroup{source: source}]; ok {
-			out = append(out, ownWarnings(warnings)...)
+	groups := make([]warningGroup, 0, len(s.groups))
+	for group := range s.groups {
+		if group.sessionID == "" || sessionFilter == nil || group.sessionID == *sessionFilter {
+			groups = append(groups, group)
 		}
 	}
-	if sessionFilter == nil {
-		seen := make(map[string]bool, len(s.groups))
-		var ids []string
-		for group := range s.groups {
-			if group.sessionID != "" && !seen[group.sessionID] {
-				seen[group.sessionID] = true
-				ids = append(ids, group.sessionID)
-			}
+	sort.Slice(groups, func(i, j int) bool {
+		left, right := groups[i], groups[j]
+		if (left.sessionID == "") != (right.sessionID == "") {
+			return left.sessionID == ""
 		}
-		sort.Strings(ids)
-		for _, id := range ids {
-			for _, source := range warningSources {
-				if warnings, ok := s.groups[warningGroup{source: source, sessionID: id}]; ok {
-					out = append(out, ownWarnings(warnings)...)
-				}
-			}
+		if left.sessionID != right.sessionID {
+			return left.sessionID < right.sessionID
 		}
-	} else {
-		for _, source := range warningSources {
-			if warnings, ok := s.groups[warningGroup{source: source, sessionID: *sessionFilter}]; ok {
-				out = append(out, ownWarnings(warnings)...)
-			}
-		}
+		return left.source < right.source
+	})
+	out := make([]protocol.Warning, 0) // a present collection reads [], never null
+	for _, group := range groups {
+		out = append(out, ownWarnings(s.groups[group])...)
 	}
 	return revision, out
 }
@@ -225,15 +226,16 @@ func ownWarnings(warnings []protocol.Warning) []protocol.Warning {
 	return out
 }
 
-// warningIdentity is the contracted (kind,message) comparator: a group's
-// Session identity is fixed by its key, so dedupe and change detection
-// compare Kind and Message only.
+// warningIdentity is the contracted (source,session_id,kind,message)
+// comparator within a producer group: a group's source and Session identity
+// are fixed by its key, so dedupe and change detection compare Kind and
+// Message only.
 func warningIdentity(a, b protocol.Warning) bool {
 	return a.Kind == b.Kind && a.Message == b.Message
 }
 
 // dedupeWarnings keeps the first occurrence of each (kind,message) pair in
-// producer order; a group's Session identity is fixed by its key.
+// producer order; a group's source and Session identity are fixed by its key.
 func dedupeWarnings(warnings []protocol.Warning) []protocol.Warning {
 	if len(warnings) == 0 {
 		return nil
@@ -290,7 +292,7 @@ func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []p
 		}
 	}
 	if !anyConnected {
-		out = append(out, protocol.Warning{Source: "setup", Kind: setupNoProviderKind, Message: setupNoProviderMessage})
+		out = append(out, protocol.Warning{Source: setupSource, Kind: setupNoProviderKind, Message: setupNoProviderMessage})
 	}
 	// The primary selection comes from the same agentTypes normalization
 	// admission uses: its Model is the resolved ref, zero when the definition
@@ -305,7 +307,7 @@ func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []p
 	}
 	switch {
 	case configured.IsZero():
-		out = append(out, protocol.Warning{Source: "setup", Kind: setupNoModelKind, Message: setupNoModelMessage})
+		out = append(out, protocol.Warning{Source: setupSource, Kind: setupNoModelKind, Message: setupNoModelMessage})
 	default:
 		available := false
 		prov, entry, lookupErr := c.catalog.LookupOrIncomplete(catalog.ModelRef{Provider: configured.Provider, Model: configured.Model})
@@ -313,13 +315,13 @@ func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []p
 			available = true
 		}
 		if !available {
-			out = append(out, protocol.Warning{Source: "setup", Kind: setupModelUnavailable, Message: fmt.Sprintf(unavailableModelTemplate, configured.String())})
+			out = append(out, protocol.Warning{Source: setupSource, Kind: setupModelUnavailable, Message: fmt.Sprintf(unavailableModelTemplate, configured.String())})
 		}
 	}
 	return out
 }
 
-// catalogWarning composes one catalog build warning's retained message form:
+// catalogWarnings composes one catalog build warning's retained message form:
 // the message (or its kind when empty) prefixed by the provider and model
 // identities when present.
 func catalogWarnings(warnings []catalog.Warning) []protocol.Warning {
@@ -334,7 +336,7 @@ func catalogWarnings(warnings []catalog.Warning) []protocol.Warning {
 		} else if w.Provider != "" {
 			message = fmt.Sprintf("%s: %s", w.Provider, message)
 		}
-		out = append(out, protocol.Warning{Source: "catalog", Kind: w.Kind, Message: message})
+		out = append(out, protocol.Warning{Source: catalogSource, Kind: w.Kind, Message: message})
 	}
 	return out
 }
@@ -344,7 +346,7 @@ func catalogWarnings(warnings []catalog.Warning) []protocol.Warning {
 func agentWarnings(warnings []agents.Warning) []protocol.Warning {
 	out := make([]protocol.Warning, 0, len(warnings))
 	for _, w := range warnings {
-		out = append(out, protocol.Warning{Source: "agents", Kind: w.Kind, Message: w.Error()})
+		out = append(out, protocol.Warning{Source: agentsSource, Kind: w.Kind, Message: w.Error()})
 	}
 	return out
 }

@@ -135,8 +135,9 @@ func eventString(value string) *string {
 }
 
 // runtimeEventScope is the scope of every Runtime-global publication: the
-// configuration generation, the global warning groups, and the LSP ingest
-// own no narrower attribution.
+// configuration generation, the global warning groups including every plugin
+// group, and a committed deletion's batch warning removal own no narrower
+// attribution.
 func runtimeEventScope() protocol.Scope {
 	return protocol.Scope{Kind: protocol.ScopeKindRuntime}
 }
@@ -270,14 +271,16 @@ func toolFinishedEvent(scope protocol.Scope, callID string, status model.ToolRes
 // observationAdapter is the Runtime's one passive publication adapter: it
 // maps committed Harness facts and warning-store changes onto the bounded
 // observation bus as generated protocol events. It is created before any
-// plugin scope opens — the Runtime scope's ScopeInfo carries its LSP closure —
-// and its Harness handle is bound before work admission, so no caller can
-// observe it unarmed: facts and warning publications only exist for admitted
-// work. Every publication samples the subject's identity and current
-// revision inside the observation section through the cached-only
+// plugin scope opens — the Runtime supplies its neutral plugin-warning sink to
+// the composition — and its Harness handle is bound before work admission, so
+// no caller can observe it unarmed: facts and warning publications only exist
+// for admitted work. Every publication samples the subject's identity and
+// current revision inside the observation section through the cached-only
 // Harness read, so a notification delayed behind a later commit carries the
-// current state, never the producer's stale pair; an unavailable subject
-// suppresses its hint while the underlying store change stands.
+// current state, never the producer's stale pair. A Harness fact whose
+// subject is unavailable suppresses only its hint while the durable commit
+// stands; every Session warning publication checks the subject before
+// mutating, so a deleted or unknown subject is never reintroduced.
 type observationAdapter struct {
 	obs      *observation
 	warnings *warningStore
@@ -335,62 +338,80 @@ func (a *observationAdapter) readSubject(sessionID string) (harness.SessionIdent
 }
 
 // publishPrompt replaces one Session's prompt group and publishes its
-// warning_changed hint in the same section as the group change and revision
-// capture. Only a successful preparation calls it.
+// warning_changed hint in the same section as the subject check, the group
+// change and the revision capture. Every Session publication checks that its
+// subject still exists inside that same observation section, so a deleted or
+// unknown subject cannot be reintroduced by a late report; only a successful
+// admitted preparation calls it.
 func (a *observationAdapter) publishPrompt(sessionID string, warnings []protocol.Warning) {
 	if a == nil {
 		return
 	}
 	a.obs.publish(func() []Event {
+		identity, _, ok := a.readSubject(sessionID)
+		if !ok {
+			return nil
+		}
 		if !a.warnings.setSessionPrompt(sessionID, warnings) {
 			return nil
 		}
-		return a.sessionWarningEvents(sessionID)
+		return []Event{warningChangedEvent(sessionEventScope(identity.Workspace, sessionID), a.warnings.storeRevision())}
 	})
 }
 
-// appendProtocolWarnings adds one transport attempt's diagnostics to the
-// owning Session's protocol group and publishes its warning_changed hint in
-// the same section.
-func (a *observationAdapter) appendProtocolWarnings(sessionID string, warnings []protocol.Warning) {
+// replaceProtocolWarnings replaces one Session's protocol diagnostics with
+// one model or compact Stream attempt's complete returned list — including an
+// empty list — and publishes its warning_changed hint in the same section.
+// The subject-existence check runs before the store mutation inside that
+// section, so a late attempt for a deleted subject changes nothing.
+func (a *observationAdapter) replaceProtocolWarnings(sessionID string, warnings []protocol.Warning) {
 	if a == nil {
 		return
 	}
 	a.obs.publish(func() []Event {
-		if !a.warnings.appendProtocol(sessionID, warnings) {
+		identity, _, ok := a.readSubject(sessionID)
+		if !ok {
 			return nil
 		}
-		return a.sessionWarningEvents(sessionID)
+		if !a.warnings.setSessionProtocol(sessionID, warnings) {
+			return nil
+		}
+		return []Event{warningChangedEvent(sessionEventScope(identity.Workspace, sessionID), a.warnings.storeRevision())}
 	})
 }
 
-// reportLSP is the Runtime scope's passive warning callback: it appends one
-// report into the Runtime-global LSP group and publishes the runtime-scoped
-// warning_changed hint in the same section. Reports after the warning
-// store's closure are ignored by the store core.
-func (a *observationAdapter) reportLSP(kind, message string) {
-	if a == nil {
+// removeSessionWarnings removes the named Sessions' warning groups in one
+// observation section and publishes exactly one runtime-scoped
+// warning_changed hint when anything changed. The deleted subject has no
+// Session scope left to name, and a batch sweep's committed deletions share
+// the one section.
+func (a *observationAdapter) removeSessionWarnings(ids []string) {
+	if a == nil || len(ids) == 0 {
 		return
 	}
 	a.obs.publish(func() []Event {
-		if !a.warnings.addLSP(kind, message) {
+		if !a.warnings.removeSessions(ids) {
 			return nil
 		}
 		return []Event{warningChangedEvent(runtimeEventScope(), a.warnings.storeRevision())}
 	})
 }
 
-// sessionWarningEvents builds one Session-scoped warning change hint: the
-// scope's Workspace comes from the cached identity read, and an unavailable
-// Session suppresses the hint while the store change stands — every prompt or
-// protocol publication runs while its Session is busy, so the branch is the
-// uniform suppression rule.
-func (a *observationAdapter) sessionWarningEvents(sessionID string) []Event {
-	identity, _, ok := a.readSubject(sessionID)
-	if !ok {
-		return nil
+// reportPluginWarning is the Runtime scope's neutral passive warning sink: it
+// appends one registered plugin's report into that plugin's own global group
+// and publishes the runtime-scoped warning_changed hint in the same section.
+// The composition's factory-bound callback supplies the registered ID;
+// reports after the warning store's closure are ignored by the store core.
+func (a *observationAdapter) reportPluginWarning(pluginID, kind, message string) {
+	if a == nil {
+		return
 	}
-	return []Event{warningChangedEvent(sessionEventScope(identity.Workspace, sessionID), a.warnings.storeRevision())}
+	a.obs.publish(func() []Event {
+		if !a.warnings.appendPlugin(pluginID, kind, message) {
+			return nil
+		}
+		return []Event{warningChangedEvent(runtimeEventScope(), a.warnings.storeRevision())}
+	})
 }
 
 // Subscribe attaches one bounded passive observer of committed configuration,

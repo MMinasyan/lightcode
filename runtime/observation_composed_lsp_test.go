@@ -172,7 +172,7 @@ func TestComposedLSPWarningLandsInGlobalStoreAndEvents(t *testing.T) {
 	}
 	found := false
 	for _, warning := range warnings.Warnings {
-		if warning.Source == "lsp" && strings.Contains(warning.Kind, "lsp_") {
+		if warning.Source == "plugin:lsp" && strings.Contains(warning.Kind, "lsp_") {
 			found = true
 		}
 	}

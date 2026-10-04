@@ -15,12 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // ownerSweepDocument builds one owner configuration document with the fixed
@@ -1376,6 +1378,122 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		mustNotExist(t, firstCode, "the committed deletion's artifacts after the joined pass")
 		if err := r.Close(context.Background()); err != nil {
 			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion proves the
+// batch warning cleanup over the broad sweep loop: with the third stale
+// archived Session's deletion rolled back, both committed deletions — and only
+// those — have their Session warning groups removed before the pass error
+// returns, in one observation section with exactly one runtime-scoped
+// warning_changed hint, while an unrelated Session's group survives.
+func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		var ids []string
+		for _, name := range []string{"a", "b", "c"} {
+			ids = append(ids, seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, name), 100*time.Hour))
+		}
+		slices.Sort(ids)
+		first, second, third := ids[0], ids[1], ids[2]
+
+		wrapped := newSweepStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(wrapped))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() {
+			if err := r.Close(context.Background()); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+
+		keeper, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "keeper"), "solo")
+		if err != nil {
+			t.Fatalf("createSession(keeper): %v", err)
+		}
+		keeperID := keeper.Identity.SessionID
+		seed := func(sessionID, kind string) {
+			id := sessionID
+			r.warnings.setSessionPrompt(sessionID, []protocol.Warning{{Source: "runtime:prompt", Kind: kind, Message: kind, SessionId: &id}})
+		}
+		seed(first, "first")
+		seed(second, "second")
+		seed(third, "third")
+		seed(keeperID, "keeper")
+
+		sub, err := r.Subscribe(64)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		baseRevision, _ := r.warnings.snapshot()
+
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		if _, err := r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		wrapped.armDeleteTarget(third)
+		stderr := captureSweepStderr(t)
+		now := time.Now().Add(200 * time.Hour)
+		sendTick(t, ticks, now) // the pass commits first and second, then rolls third back
+
+		// The batch hint is the failed pass's warning-cleanup completion
+		// barrier: it publishes after every returned committed identity was
+		// cleaned.
+		var hint *protocol.WarningChangedEvent
+		for hint == nil {
+			event, ok := nextEvent(t, sub)
+			if !ok {
+				t.Fatal("the subscription closed before the sweep's warning hint")
+			}
+			if eventKind(t, event) != "warning_changed" {
+				continue
+			}
+			body, err := event.AsWarningChangedEvent()
+			if err != nil {
+				t.Fatalf("warning event body: %v", err)
+			}
+			if body.Scope.Kind != protocol.ScopeKindRuntime {
+				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
+			}
+			hint = &body
+		}
+		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
+			t.Fatalf("sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
+		}
+		assertNoEvent(t, sub)
+
+		for _, id := range []string{first, second} {
+			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("committed deletion of %s = err %v, want the register gone", id, err)
+			}
+			if _, warnings := r.warnings.snapshot(); sessionWarningPresent(warnings, id) {
+				t.Fatalf("committed deletion of %s kept its warning group: %+v", id, warnings)
+			}
+		}
+		readSweepRegister(t, wrapped, third)
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, third) {
+			t.Fatalf("the rolled-back deletion dropped its warning group")
+		}
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, keeperID) {
+			t.Fatalf("the unrelated Session's warning group was removed")
+		}
+
+		// The pass error's one retained diagnostic may land just after the
+		// hint; poll it under a bounded budget.
+		deadline := time.Now().Add(5 * time.Second)
+		for strings.Count(stderr(), "lightcode: sweep:") == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
 		}
 	})
 }
