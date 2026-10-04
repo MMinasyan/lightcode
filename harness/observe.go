@@ -10,8 +10,8 @@ type HarnessFactKind string
 const (
 	// FactInvalidation reports that one Session's durable register revision or
 	// its coordinator-local revision advanced. It carries the Session identity
-	// and the current value pair; a job member admission or finish additionally
-	// names the Job.
+	// only; a job member admission or finish additionally names the Job. The
+	// passive publisher samples the current pair at publication time.
 	FactInvalidation HarnessFactKind = "invalidation"
 	// FactTextDelta reports one nonempty transient text fragment of an accepted
 	// model stream. It carries no authority: the committed assistant entry is
@@ -38,19 +38,20 @@ type SessionRevision struct {
 
 // HarnessFact is one passive observation of the Harness: a closed union whose
 // members are exactly the fields the fact's Kind requires. An invalidation
-// carries SessionID, the optional JobID of a job member admission or finish,
-// and Revision; a text delta carries SessionID, OperationID, Position, and the
+// carries SessionID and the optional JobID of a job member admission or
+// finish; a text delta carries SessionID, OperationID, Position, and the
 // nonempty Content; a tool start carries SessionID, OperationID, CallID,
 // Ordinal, and Name; a tool finish carries SessionID, OperationID, CallID, and
 // the closed Status. Every field a kind does not require stays zero. A fact
 // grants no authority: it can never alter an admission, an effect, a
-// settlement, or a lifecycle transition.
+// settlement, or a lifecycle transition. A fact carries no revision pair: no
+// producer sample can become notification authority; passive publishers read
+// the current pair at publication time.
 type HarnessFact struct {
 	Kind        HarnessFactKind
 	SessionID   string
 	OperationID string
 	JobID       string
-	Revision    SessionRevision
 	Position    int
 	Content     string
 	CallID      string
@@ -71,37 +72,32 @@ func (h *Harness) emitFact(fact HarnessFact) {
 }
 
 // readObservation samples one coordinator's current identity and revision
-// pair under the coordinator mutex, reading the corruption marker through
-// the registry mutex taken inside that hold (the permitted c.mu→h.mu order),
-// whose writers may not hold the coordinator mutex. A deleted or corrupt
-// coordinator reports false. No snapshot or history copy is built to read
-// the pair; the identity is copied by value from the cached graph.
+// pair under the coordinator mutex, using the shared unavailable check (gone
+// and the sticky corruption marker, the latter read through the registry
+// mutex taken inside that hold — the permitted c.mu→h.mu order). A deleted or
+// corrupt coordinator reports false. No snapshot or history copy is built to
+// read the pair; the identity is copied by value from the cached graph.
 func (h *Harness) readObservation(c *coordinator) (SessionIdentity, SessionRevision, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.gone {
+	if h.unavailableLocked(c, c.graph.Session.Identity.SessionID) != nil {
 		return SessionIdentity{}, SessionRevision{}, false
 	}
-	identity := c.graph.Session.Identity
-	h.mu.Lock()
-	corrupt := c.corru
-	h.mu.Unlock()
-	if corrupt != nil {
-		return SessionIdentity{}, SessionRevision{}, false
-	}
-	return identity, SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev}, true
+	return c.graph.Session.Identity,
+		SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev},
+		true
 }
 
-// currentRevision samples one coordinator's current revision pair after the
-// producer released its state lock, delegating to the shared cached sample.
-// A deleted or corrupt coordinator suppresses a delayed stale hint. No
-// snapshot or history copy is built to read the pair.
-func (h *Harness) currentRevision(c *coordinator) (string, SessionRevision, bool) {
-	identity, revision, ok := h.readObservation(c)
+// currentSubject samples one coordinator's stored identity after a producer
+// released its state lock, delegating to the shared cached availability
+// check. A deleted or corrupt coordinator suppresses a delayed stale hint.
+// No snapshot, history, or revision copy is built.
+func (h *Harness) currentSubject(c *coordinator) (string, bool) {
+	identity, _, ok := h.readObservation(c)
 	if !ok {
-		return "", SessionRevision{}, false
+		return "", false
 	}
-	return identity.SessionID, revision, true
+	return identity.SessionID, true
 }
 
 // ReadObservation reads one Session's current identity and revision pair
@@ -121,33 +117,33 @@ func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRev
 	return h.readObservation(c)
 }
 
-// observeInvalidation emits one Session-scoped invalidation with the current
-// pair. It is the one emission every durable Session advance and every
-// coordinator-local publication calls after releasing its lock and transaction.
+// observeInvalidation emits one Session-scoped invalidation. It is the one
+// emission every durable Session advance and every coordinator-local
+// publication calls after releasing its lock and transaction.
 func (h *Harness) observeInvalidation(c *coordinator) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, rev, ok := h.currentRevision(c)
+	sessionID, ok := h.currentSubject(c)
 	if !ok {
 		return
 	}
-	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, Revision: rev})
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID})
 }
 
 // observeMemberInvalidation emits one Job-scoped invalidation for a job
-// member's admission or finish: the owning Session identity, the Job identity,
-// and the current pair. Child members and group transitions use
-// observeInvalidation and never name a Job.
+// member's admission or finish: the owning Session identity and the Job
+// identity. Child members and group transitions use observeInvalidation and
+// never name a Job.
 func (h *Harness) observeMemberInvalidation(c *coordinator, jobID string) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, rev, ok := h.currentRevision(c)
+	sessionID, ok := h.currentSubject(c)
 	if !ok {
 		return
 	}
-	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, JobID: jobID, Revision: rev})
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, JobID: jobID})
 }
 
 // emitToolResultFacts delivers one finished fact per committed tool-result

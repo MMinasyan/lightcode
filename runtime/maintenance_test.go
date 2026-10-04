@@ -258,12 +258,12 @@ func (c *deadlineContext) Err() error {
 
 func (c *deadlineContext) expire() { close(c.done) }
 
-func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.SessionRecord, error) {
+func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.SessionHeader, error) {
 	t.Helper()
-	var rec harness.SessionRecord
+	var rec harness.SessionHeader
 	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		rec, err = h.ReadSession(ctx, sessionID)
+		rec, err = h.ReadSessionHeader(ctx, sessionID)
 		return err
 	})
 	return rec, err
@@ -367,8 +367,8 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if rec.State.Lifecycle != harness.LifecycleArchived || rec.State.ArchivedAt == nil {
-			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec.State)
+		if rec.Lifecycle != harness.LifecycleArchived || rec.ArchivedAt == nil {
+			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec)
 		}
 		if calls, opens := e.prep.counts(); calls != 0 || opens != 0 {
 			t.Fatalf("preparation/opener calls during startup = %d/%d, want the sweep to admit no model work", calls, opens)
@@ -423,11 +423,11 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadSession after the archive ticks: %v", err)
 		}
-		if archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != created.Revision+1 {
-			t.Fatalf("Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d", archived.State, archived.Revision, created.Revision+1)
+		if archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != created.Revision+1 {
+			t.Fatalf("Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d", archived, archived.Revision.DurableRevision, created.Revision+1)
 		}
-		if archived.State.ArchivedAt == nil || !archived.State.ArchivedAt.Equal(archivedAt) {
-			t.Fatalf("sweep stamped %v, want the archive tick's explicit time %v", archived.State.ArchivedAt, archivedAt)
+		if archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(archivedAt) {
+			t.Fatalf("sweep stamped %v, want the archive tick's explicit time %v", archived.ArchivedAt, archivedAt)
 		}
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour))                 // exact delete boundary
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour+time.Nanosecond)) // one nanosecond past: delete
@@ -484,7 +484,7 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				sendTick(t, ticks, tick) // this pass lists, fails, and reports
 				sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
 				waitWritten(t, wrapped)  // the later tick committed the archive
-				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 					t.Fatalf("Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
 				}
 				if err := r.Close(context.Background()); err != nil {
@@ -741,7 +741,7 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
 			t.Fatalf("the sweep changed the running Session's register (%d -> %d), want it left unchanged", before.Revision, after.Revision)
 		}
-		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("idle sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
 		if calls, opens := e.prep.counts(); calls != 1 || opens != 1 {
@@ -789,7 +789,7 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		tick := valid.State.LastActivity.Add(100 * time.Hour)
 		sendTick(t, ticks, tick)
 		sendTick(t, ticks, tick)
-		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("valid sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
 		// Shutdown still converges — Close returns, joining the latched
@@ -1015,7 +1015,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
 		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.ReadSession(ctx, archivedID)
+			_, err := h.ReadSessionHeader(ctx, archivedID)
 			return err
 		}); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("read after delete = err %v, want ErrNotFound", err)

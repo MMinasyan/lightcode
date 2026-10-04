@@ -952,7 +952,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		if deleted.HTTPResponse.StatusCode != http.StatusNoContent {
 			t.Fatalf("delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
 		}
-		missing, err := c.GetSessionWithResponse(ctx, main)
+		missing, err := c.GetSessionHydrationWithResponse(ctx, main)
 		if err != nil {
 			t.Fatalf("deleted session read: %v", err)
 		}

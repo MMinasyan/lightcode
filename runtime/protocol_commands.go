@@ -12,10 +12,10 @@ import (
 
 // createSessionHeader is the protocol-shaped root Session creation: one
 // admitted call runs the shared creation core and then projects the header
-// from a real SnapshotSession taken after the transition, so the revision
-// pair is the coordinator's own publication. A failed fresh read propagates
-// its typed error; the committed creation is never rolled back and no
-// synthetic revision is invented.
+// from the narrow post-transition metadata read, so the revision pair is the
+// coordinator's own publication. A failed fresh read propagates its typed
+// error; the committed creation is never rolled back and no synthetic
+// revision is invented.
 func (r *Runtime) createSessionHeader(ctx context.Context, workspace, agentType string) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
@@ -93,10 +93,10 @@ func (r *Runtime) compactSession(ctx context.Context, sessionID string, req prot
 
 // forkSession is the protocol-shaped Fork command. One admitted call resolves
 // the raw boundary entry — from an already-committed destination of this
-// request when one exists, otherwise from the live source snapshot — then
-// delegates to Harness.Fork with that raw identity, so first-writer/conflict
-// and the normal new-fork transaction stay Harness authority. The destination
-// header comes from a real post-transition snapshot.
+// request when one exists, otherwise from the live narrow history capture —
+// then delegates to Harness.Fork with that raw identity, so first-writer/
+// conflict and the normal new-fork transaction stay Harness authority. The
+// destination header comes from the narrow post-transition metadata read.
 func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protocol.ForkRequest) (protocol.ForkResult, error) {
 	content, err := convertContentParts(req.Content)
 	if err != nil {
@@ -130,10 +130,10 @@ func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protoco
 }
 
 // forkBoundaryEntry resolves the raw boundary entry identity for one fork
-// request inside the caller's single admission. The live source snapshot
-// resolves the projected boundary first and, on success, is returned
+// request inside the caller's single admission. The live source history
+// capture resolves the projected boundary first and, on success, is returned
 // immediately — a valid source never falls back to a destination scan, so an
-// invalid boundary item fails exactly like the single-read resolver. Only a
+// invalid boundary item fails exactly like the pure resolver. Only a
 // typed-unavailable source (deleted or corrupt) scans an already-committed
 // destination of this caller Operation ID whose durable lineage names this
 // source Session, whose lineage boundary projects to the requested boundary
@@ -148,27 +148,27 @@ func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protoco
 // O(Sessions) and may validate a cold coordinator; no dedup or index state is
 // added, and every normal new fork is revalidated by the Harness transaction.
 func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string, req protocol.ForkRequest) (string, error) {
-	snap, err := h.SnapshotSession(ctx, sourceID)
+	facts, _, err := h.ReadSessionHistory(ctx, sourceID)
 	if err == nil {
-		return resolveBoundaryEntry(snap, req.BoundaryItemId)
+		return resolveBoundaryEntry(sourceID, facts, req.BoundaryItemId)
 	}
 	if !errors.Is(err, harness.ErrNotFound) && !errors.Is(err, harness.ErrCorrupt) {
 		return "", err
 	}
 	sourceErr := err
-	records, err := h.ListSessions(ctx)
+	rows, err := h.ListSessions(ctx)
 	if err != nil {
 		return "", err
 	}
-	for _, record := range records {
-		boundary := record.Identity.SourceBoundaryEntryID
-		if record.Identity.SourceSessionID != sourceID || boundary == "" {
+	for _, row := range rows {
+		boundary := row.Identity.SourceBoundaryEntryID
+		if row.Identity.SourceSessionID != sourceID || boundary == "" {
 			continue
 		}
 		if projectItemID(sourceID, boundary) != req.BoundaryItemId {
 			continue
 		}
-		operation, err := h.ReadOperation(ctx, record.Identity.SessionID, req.OperationId)
+		operation, err := h.ReadOperation(ctx, row.Identity.SessionID, req.OperationId)
 		if errors.Is(err, harness.ErrNotFound) || errors.Is(err, harness.ErrCorrupt) {
 			continue // not a valid matching destination
 		}
@@ -185,8 +185,8 @@ func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string,
 
 // setSessionAgentType is the protocol-shaped Agent-type change: the Harness
 // keeps its nonempty-only selection (an unknown type fails at the next
-// preparation, not here), and the returned header is the real
-// post-transition snapshot.
+// preparation, not here), and the returned header is the narrow
+// post-transition metadata read.
 func (r *Runtime) setSessionAgentType(ctx context.Context, sessionID string, req protocol.SetSessionAgentTypeRequest) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
@@ -204,7 +204,7 @@ func (r *Runtime) setSessionAgentType(ctx context.Context, sessionID string, req
 
 // archiveSession is the protocol-shaped archive: the Harness-owned
 // idle/live-background gates stay in force, and the archived header is the
-// real post-transition snapshot.
+// narrow post-transition metadata read.
 func (r *Runtime) archiveSession(ctx context.Context, sessionID string) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
@@ -221,8 +221,8 @@ func (r *Runtime) archiveSession(ctx context.Context, sessionID string) (protoco
 }
 
 // reopenSession is the protocol-shaped reopen: an already open Session is the
-// Harness no-write success, and the header is the real post-transition
-// snapshot.
+// Harness no-write success, and the header is the narrow post-transition
+// metadata read.
 func (r *Runtime) reopenSession(ctx context.Context, sessionID string) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
@@ -256,15 +256,16 @@ func (r *Runtime) stopSession(ctx context.Context, sessionID string) error {
 	})
 }
 
-// sessionHeaderAfter projects one Session header from a fresh SnapshotSession
-// taken inside the caller's admission after a committed transition. A failing
-// fresh read returns its typed error; no synthetic revision is invented.
+// sessionHeaderAfter projects one Session header from a fresh narrow
+// metadata read taken inside the caller's admission after a committed
+// transition. A failing fresh read returns its typed error; no synthetic
+// revision is invented.
 func sessionHeaderAfter(ctx context.Context, h *harness.Harness, sessionID string) (protocol.Session, error) {
-	snap, err := h.SnapshotSession(ctx, sessionID)
+	header, err := h.ReadSessionHeader(ctx, sessionID)
 	if err != nil {
 		return protocol.Session{}, err
 	}
-	return projectSession(snap), nil
+	return projectSession(header), nil
 }
 
 // convertContentParts maps one generated content union list to canonical

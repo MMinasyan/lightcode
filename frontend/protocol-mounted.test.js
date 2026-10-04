@@ -11,14 +11,20 @@ import { expect, test } from 'vitest';
 import {
   connectProvider,
   createProvider,
+  createSession,
   getConfiguration,
   getHealth,
   getProviderDetail,
+  getSessionHistory,
+  getSessionHydration,
   getWarnings,
+  interruptSession,
   listProviderModels,
+  listSessions,
   resetProviderField,
   resetProviderModelField,
   setAgentTypeModel,
+  stopSession,
   updateConfigurationSettings,
   updateProviderDetail,
   updateProviderModel,
@@ -157,6 +163,34 @@ mounted('generated SDK round-trips special identity query values over the mounte
   expect(agentEdit.error).toBeUndefined();
   expect(agentEdit.data?.result.name).toBe('..');
   expect(agentEdit.data?.result.model).toBe('prov/m');
+
+  // The Session hydration carries the required nullable next-admission
+  // selection: a resolved Agent type names its configured model, and an
+  // unresolvable type is null over the generated TypeScript boundary.
+  const configured = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_type: 'solo' } });
+  expect(configured.error).toBeUndefined();
+  const configuredHydration = await getSessionHydration({ client, path: { id: configured.data.session_id } });
+  expect(configuredHydration.error).toBeUndefined();
+  expect(configuredHydration.data?.selected_model).toBe('prov/m');
+  const unresolved = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_type: 'ghost' } });
+  expect(unresolved.error).toBeUndefined();
+  const unresolvedHydration = await getSessionHydration({ client, path: { id: unresolved.data.session_id } });
+  expect(unresolvedHydration.error).toBeUndefined();
+  expect(unresolvedHydration.data?.selected_model).toBeNull();
+
+  // Navigation reads the list headers and the anchored history under their
+  // own revisions, and the argument-free controls need no request body.
+  const listed = await listSessions({ client, query: { workspace: '/tmp/mounted-ts', lifecycle: 'open' } });
+  expect(listed.error).toBeUndefined();
+  expect(listed.data.some((row) => row.session_id === configured.data.session_id)).toBe(true);
+  const history = await getSessionHistory({ client, path: { id: configured.data.session_id } });
+  expect(history.error).toBeUndefined();
+  expect(history.data?.items).toEqual([]);
+  expect(history.data?.session_revision.instance_id).toBe(discovery.instance_id);
+  const stopped = await stopSession({ client, path: { id: unresolved.data.session_id } });
+  expect(stopped.error).toBeUndefined();
+  const interrupted = await interruptSession({ client, path: { id: unresolved.data.session_id } });
+  expect(interrupted.error).toBeUndefined();
 
   // A missing identity is the typed refusal over the same authenticated
   // connection.

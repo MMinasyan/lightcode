@@ -318,16 +318,6 @@ func (rt *protocolHandlers) CreateSession(w http.ResponseWriter, r *http.Request
 	rt.writeQualifiedJSON(w, http.StatusCreated, &header)
 }
 
-// GetSession serves one Session header without history.
-func (rt *protocolHandlers) GetSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	header, err := rt.getSession(r.Context(), id)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &header)
-}
-
 // DeleteSession serves the archived-Session deletion with its idempotent
 // no-content result.
 func (rt *protocolHandlers) DeleteSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
@@ -338,8 +328,8 @@ func (rt *protocolHandlers) DeleteSession(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ArchiveSession serves the archive control; the returned header is the real
-// post-transition snapshot.
+// ArchiveSession serves the archive control; the returned header is the
+// narrow post-transition metadata read.
 func (rt *protocolHandlers) ArchiveSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
 	header, err := rt.archiveSession(r.Context(), id)
 	if err != nil {
@@ -393,13 +383,9 @@ func (rt *protocolHandlers) CompactSession(w http.ResponseWriter, r *http.Reques
 
 // InterruptSession serves the interrupt control: the control is issued
 // immediately and its no-content result does not wait for the terminal
-// commit.
+// commit. The POST is argument-free: the authenticated addressed Session and
+// the existing control transition decide the outcome, with no request body.
 func (rt *protocolHandlers) InterruptSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	var body protocol.InterruptSessionJSONBody
-	if err := decodeEmptyBody(r, &body); err != nil {
-		writeProtocolError(w, err)
-		return
-	}
 	if err := rt.interruptSession(r.Context(), id); err != nil {
 		writeProtocolError(w, err)
 		return
@@ -408,13 +394,8 @@ func (rt *protocolHandlers) InterruptSession(w http.ResponseWriter, r *http.Requ
 }
 
 // StopSession serves the stop control; its no-content result follows the
-// background convergence wait.
+// background convergence wait. The POST is argument-free, like interrupt.
 func (rt *protocolHandlers) StopSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	var body protocol.StopSessionJSONBody
-	if err := decodeEmptyBody(r, &body); err != nil {
-		writeProtocolError(w, err)
-		return
-	}
 	if err := rt.stopSession(r.Context(), id); err != nil {
 		writeProtocolError(w, err)
 		return
@@ -472,27 +453,6 @@ func (rt *protocolHandlers) GetSessionHistory(w http.ResponseWriter, r *http.Req
 		return
 	}
 	rt.writeQualifiedJSON(w, http.StatusOK, &page)
-}
-
-// GetSessionPending serves both process-local pending queues.
-func (rt *protocolHandlers) GetSessionPending(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	pending, err := rt.getPending(r.Context(), id)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &pending)
-}
-
-// GetSessionUsage serves the canonical totals and the display context
-// estimate under the same revisions.
-func (rt *protocolHandlers) GetSessionUsage(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	usage, err := rt.getUsage(r.Context(), id)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &usage)
 }
 
 // GetSessionCodeSnapshots serves the per-Operation snapshot groups.

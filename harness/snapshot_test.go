@@ -149,6 +149,140 @@ func onlyMember(t *testing.T, fact HistoryFact) EntryKind {
 	return kind
 }
 
+// FactIdentity is one expected committed fact's envelope identity.
+type FactIdentity struct {
+	EntryID     string
+	OperationID string
+	Kind        EntryKind
+}
+
+// FactFixture is the owning fact fixture's committed history exposed to the
+// external storage-axis test: the Session identity, each expected committed
+// entry's envelope identity and kind in order (hook evidence excluded), and
+// the hook entry identity that must never appear.
+type FactFixture struct {
+	SessionID   string
+	Identities  []FactIdentity
+	HookEntryID string
+}
+
+// seedTestGraph writes one fixture graph into any Storage through the public
+// transaction contract, preserving each key's record and entry order.
+func seedTestGraph(t *testing.T, store Storage, g *testGraph) {
+	t.Helper()
+	src := g.storage(t)
+	err := store.Transact(context.Background(), func(tx Transaction) error {
+		for _, regs := range src.registers {
+			for _, reg := range regs {
+				if _, err := tx.InsertRegister(RegisterDraft{Key: reg.Key, Payload: reg.Payload}); err != nil {
+					return err
+				}
+			}
+		}
+		for sessionID, entries := range src.entries {
+			for _, entry := range entries {
+				if _, err := tx.InsertEntry(EntryDraft{
+					SessionID:   sessionID,
+					ID:          entry.ID,
+					OperationID: entry.OperationID,
+					Kind:        entry.Kind,
+					Payload:     entry.Payload,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed fixture graph: %v", err)
+	}
+}
+
+// SeedFactFixture writes the owning fact fixture graph into any Storage and
+// returns its expected committed-history envelopes for the external
+// storage-axis oracle.
+func SeedFactFixture(t *testing.T, store Storage) FactFixture {
+	t.Helper()
+	g := factFixtureGraph()
+	seedTestGraph(t, store, g)
+	fixture := FactFixture{SessionID: g.session.Identity.SessionID}
+	for _, entry := range g.entries {
+		if entry.env.Kind == EntryHookResult {
+			fixture.HookEntryID = entry.env.ID
+			continue
+		}
+		fixture.Identities = append(fixture.Identities, FactIdentity{
+			EntryID:     entry.env.ID,
+			OperationID: entry.env.OperationID,
+			Kind:        entry.env.Kind,
+		})
+	}
+	return fixture
+}
+
+// TestNarrowReadsCopyOnlyTheirOwnState proves the narrow producers copy no
+// unrelated state: warm header and history allocations do not grow when
+// Operations, FIFO members, and usage rows are added, the header stays
+// constant when history entries are added, and the history capture copies
+// only its facts.
+func TestNarrowReadsCopyOnlyTheirOwnState(t *testing.T) {
+	h := newTestHarness(t, factFixtureGraph().storage(t), nil)
+	ctx := context.Background()
+	if _, err := h.ReadSessionHeader(ctx, testSessionID); err != nil {
+		t.Fatalf("warm ReadSessionHeader: %v", err)
+	}
+	measure := func() (header, history float64) {
+		header = testing.AllocsPerRun(200, func() {
+			if _, err := h.ReadSessionHeader(ctx, testSessionID); err != nil {
+				t.Fatalf("ReadSessionHeader: %v", err)
+			}
+		})
+		history = testing.AllocsPerRun(200, func() {
+			if _, _, err := h.ReadSessionHistory(ctx, testSessionID); err != nil {
+				t.Fatalf("ReadSessionHistory: %v", err)
+			}
+		})
+		return header, history
+	}
+	headerBefore, historyBefore := measure()
+
+	h.mu.Lock()
+	c := h.sessions[testSessionID]
+	h.mu.Unlock()
+	if c == nil {
+		t.Fatal("the warmed coordinator is absent")
+	}
+	c.mu.Lock()
+	for i := 0; i < 2000; i++ {
+		c.graph.Operations = append(c.graph.Operations, validOperationRecord())
+		c.steering = append(c.steering, &pendingMessage{operationID: "s", origin: InputOriginUser, content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}})
+		c.queued = append(c.queued, &pendingMessage{operationID: "q", origin: InputOriginUser, content: []model.ContentPart{{Kind: model.PartText, Text: "y"}}})
+	}
+	c.graph.Session.State.Usage.ByModel = append(c.graph.Session.State.Usage.ByModel, make([]ModelUsage, 5000)...)
+	c.mu.Unlock()
+
+	headerAfter, historyAfter := measure()
+	if headerAfter != headerBefore {
+		t.Fatalf("header allocations = %v after adding Operations/FIFOs/usage, want the unchanged %v", headerAfter, headerBefore)
+	}
+	if historyAfter != historyBefore {
+		t.Fatalf("history allocations = %v after adding Operations/FIFOs/usage, want the unchanged %v", historyAfter, historyBefore)
+	}
+
+	// Added history entries may grow the history copy's own allocations, but
+	// the metadata header never copies them.
+	c.mu.Lock()
+	for i := 0; i < 2000; i++ {
+		c.graph.Entries = append(c.graph.Entries, c.graph.Entries[0])
+	}
+	c.mu.Unlock()
+	headerWithHistory, _ := measure()
+	if headerWithHistory != headerBefore {
+		t.Fatalf("header allocations = %v after adding history entries, want the unchanged %v", headerWithHistory, headerBefore)
+	}
+}
+
 // TestSnapshotSessionFactUnionAndOwnership proves the public fact union: one
 // typed member per committed entry selected by kind, hook_result excluded
 // from the facts while its validation stays active, ascending sequence order,

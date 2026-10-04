@@ -225,18 +225,18 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("compaction entries = %v, want exactly one", ids)
 		}
 		// The piece usage landed keyed by the compact model.
-		sess, err := f.h.ReadSession(context.Background(), session)
+		sess, err := f.h.SnapshotSession(context.Background(), session)
 		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
+			t.Fatalf("SnapshotSession: %v", err)
 		}
 		found := false
-		for _, mu := range sess.State.Usage.ByModel {
+		for _, mu := range sess.Session.State.Usage.ByModel {
 			if mu.Model == compactModelRef {
 				found = mu.Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5})
 			}
 		}
 		if !found {
-			t.Fatalf("session usage = %+v, want the piece counts keyed by the compact model", sess.State.Usage)
+			t.Fatalf("session usage = %+v, want the piece counts keyed by the compact model", sess.Session.State.Usage)
 		}
 		// The compact preparation carried the compact request kind while the
 		// conversation turn's preparation carried the message kind.
@@ -448,12 +448,12 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 		if ids := compactionEntryIDs(t, store, session); len(ids) != 0 {
 			t.Fatalf("compaction entries = %v, want none", ids)
 		}
-		sess, err := f.h.ReadSession(context.Background(), session)
+		sess, err := f.h.SnapshotSession(context.Background(), session)
 		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
+			t.Fatalf("SnapshotSession: %v", err)
 		}
-		if sess.State.CompactionEntryID != "" {
-			t.Fatalf("compaction_entry_id = %q, want it unchanged", sess.State.CompactionEntryID)
+		if sess.Session.State.CompactionEntryID != "" {
+			t.Fatalf("compaction_entry_id = %q, want it unchanged", sess.Session.State.CompactionEntryID)
 		}
 		// Subsequent messages never see a synthetic compact request.
 		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {

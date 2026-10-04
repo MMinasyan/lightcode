@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, ServerSentEventsResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ArchiveSessionData, ArchiveSessionErrors, ArchiveSessionResponses, CompactSessionData, CompactSessionErrors, CompactSessionResponses, ConnectProviderData, ConnectProviderErrors, ConnectProviderResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteProviderDetailData, DeleteProviderDetailErrors, DeleteProviderDetailResponses, DeleteProviderModelData, DeleteProviderModelErrors, DeleteProviderModelResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, DisconnectProviderData, DisconnectProviderErrors, DisconnectProviderResponses, DiscoverProviderCandidatesData, DiscoverProviderCandidatesErrors, DiscoverProviderCandidatesResponses, DiscoverProviderModelCandidatesData, DiscoverProviderModelCandidatesErrors, DiscoverProviderModelCandidatesResponses, ForkSessionData, ForkSessionErrors, ForkSessionResponses, GetConfigurationData, GetConfigurationErrors, GetConfigurationResponses, GetEventsData, GetEventsErrors, GetEventsResponse, GetEventsResponses, GetHealthData, GetHealthErrors, GetHealthResponses, GetProviderDetailData, GetProviderDetailErrors, GetProviderDetailResponses, GetRetainedCodeSnapshotsData, GetRetainedCodeSnapshotsErrors, GetRetainedCodeSnapshotsResponses, GetSessionCodeSnapshotsData, GetSessionCodeSnapshotsErrors, GetSessionCodeSnapshotsResponses, GetSessionData, GetSessionErrors, GetSessionHistoryData, GetSessionHistoryErrors, GetSessionHistoryResponses, GetSessionHydrationData, GetSessionHydrationErrors, GetSessionHydrationResponses, GetSessionPendingData, GetSessionPendingErrors, GetSessionPendingResponses, GetSessionResponses, GetSessionUsageData, GetSessionUsageErrors, GetSessionUsageResponses, GetWarningsData, GetWarningsErrors, GetWarningsResponses, InterruptSessionData, InterruptSessionErrors, InterruptSessionResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProviderModelsData, ListProviderModelsErrors, ListProviderModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ListWorkspacesData, ListWorkspacesErrors, ListWorkspacesResponses, ReadWorkspaceFileData, ReadWorkspaceFileErrors, ReadWorkspaceFileResponses, ReloadConfigurationData, ReloadConfigurationErrors, ReloadConfigurationResponses, ReopenSessionData, ReopenSessionErrors, ReopenSessionResponses, ResetProviderFieldData, ResetProviderFieldErrors, ResetProviderFieldResponses, ResetProviderModelFieldData, ResetProviderModelFieldErrors, ResetProviderModelFieldResponses, RevertRetainedCodeData, RevertRetainedCodeErrors, RevertRetainedCodeResponses, RevertSessionCodeData, RevertSessionCodeErrors, RevertSessionCodeResponses, SetAgentTypeModelData, SetAgentTypeModelErrors, SetAgentTypeModelResponses, SetSessionAgentTypeData, SetSessionAgentTypeErrors, SetSessionAgentTypeResponses, StopSessionData, StopSessionErrors, StopSessionResponses, SubmitSessionData, SubmitSessionErrors, SubmitSessionResponses, UpdateConfigurationSettingsData, UpdateConfigurationSettingsErrors, UpdateConfigurationSettingsResponses, UpdateProviderDetailData, UpdateProviderDetailErrors, UpdateProviderDetailResponses, UpdateProviderModelData, UpdateProviderModelErrors, UpdateProviderModelResponses } from './types.gen';
+import type { ArchiveSessionData, ArchiveSessionErrors, ArchiveSessionResponses, CompactSessionData, CompactSessionErrors, CompactSessionResponses, ConnectProviderData, ConnectProviderErrors, ConnectProviderResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteProviderDetailData, DeleteProviderDetailErrors, DeleteProviderDetailResponses, DeleteProviderModelData, DeleteProviderModelErrors, DeleteProviderModelResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, DisconnectProviderData, DisconnectProviderErrors, DisconnectProviderResponses, DiscoverProviderCandidatesData, DiscoverProviderCandidatesErrors, DiscoverProviderCandidatesResponses, DiscoverProviderModelCandidatesData, DiscoverProviderModelCandidatesErrors, DiscoverProviderModelCandidatesResponses, ForkSessionData, ForkSessionErrors, ForkSessionResponses, GetConfigurationData, GetConfigurationErrors, GetConfigurationResponses, GetEventsData, GetEventsErrors, GetEventsResponse, GetEventsResponses, GetHealthData, GetHealthErrors, GetHealthResponses, GetProviderDetailData, GetProviderDetailErrors, GetProviderDetailResponses, GetRetainedCodeSnapshotsData, GetRetainedCodeSnapshotsErrors, GetRetainedCodeSnapshotsResponses, GetSessionCodeSnapshotsData, GetSessionCodeSnapshotsErrors, GetSessionCodeSnapshotsResponses, GetSessionHistoryData, GetSessionHistoryErrors, GetSessionHistoryResponses, GetSessionHydrationData, GetSessionHydrationErrors, GetSessionHydrationResponses, GetWarningsData, GetWarningsErrors, GetWarningsResponses, InterruptSessionData, InterruptSessionErrors, InterruptSessionResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProviderModelsData, ListProviderModelsErrors, ListProviderModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ListWorkspacesData, ListWorkspacesErrors, ListWorkspacesResponses, ReadWorkspaceFileData, ReadWorkspaceFileErrors, ReadWorkspaceFileResponses, ReloadConfigurationData, ReloadConfigurationErrors, ReloadConfigurationResponses, ReopenSessionData, ReopenSessionErrors, ReopenSessionResponses, ResetProviderFieldData, ResetProviderFieldErrors, ResetProviderFieldResponses, ResetProviderModelFieldData, ResetProviderModelFieldErrors, ResetProviderModelFieldResponses, RevertRetainedCodeData, RevertRetainedCodeErrors, RevertRetainedCodeResponses, RevertSessionCodeData, RevertSessionCodeErrors, RevertSessionCodeResponses, SetAgentTypeModelData, SetAgentTypeModelErrors, SetAgentTypeModelResponses, SetSessionAgentTypeData, SetSessionAgentTypeErrors, SetSessionAgentTypeResponses, StopSessionData, StopSessionErrors, StopSessionResponses, SubmitSessionData, SubmitSessionErrors, SubmitSessionResponses, UpdateConfigurationSettingsData, UpdateConfigurationSettingsErrors, UpdateConfigurationSettingsResponses, UpdateProviderDetailData, UpdateProviderDetailErrors, UpdateProviderDetailResponses, UpdateProviderModelData, UpdateProviderModelErrors, UpdateProviderModelResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -52,12 +52,6 @@ export const deleteSession = <ThrowOnError extends boolean = false>(options: Opt
     ...options
 });
 
-export const getSession = <ThrowOnError extends boolean = false>(options: Options<GetSessionData, ThrowOnError>): RequestResult<GetSessionResponses, GetSessionErrors, ThrowOnError> => (options.client ?? client).get<GetSessionResponses, GetSessionErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v1/sessions/{id}',
-    ...options
-});
-
 export const archiveSession = <ThrowOnError extends boolean = false>(options: Options<ArchiveSessionData, ThrowOnError>): RequestResult<ArchiveSessionResponses, ArchiveSessionErrors, ThrowOnError> => (options.client ?? client).post<ArchiveSessionResponses, ArchiveSessionErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sessions/{id}/archive',
@@ -93,21 +87,13 @@ export const compactSession = <ThrowOnError extends boolean = false>(options: Op
 export const interruptSession = <ThrowOnError extends boolean = false>(options: Options<InterruptSessionData, ThrowOnError>): RequestResult<InterruptSessionResponses, InterruptSessionErrors, ThrowOnError> => (options.client ?? client).post<InterruptSessionResponses, InterruptSessionErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sessions/{id}/interrupt',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
+    ...options
 });
 
 export const stopSession = <ThrowOnError extends boolean = false>(options: Options<StopSessionData, ThrowOnError>): RequestResult<StopSessionResponses, StopSessionErrors, ThrowOnError> => (options.client ?? client).post<StopSessionResponses, StopSessionErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sessions/{id}/stop',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
+    ...options
 });
 
 export const forkSession = <ThrowOnError extends boolean = false>(options: Options<ForkSessionData, ThrowOnError>): RequestResult<ForkSessionResponses, ForkSessionErrors, ThrowOnError> => (options.client ?? client).post<ForkSessionResponses, ForkSessionErrors, ThrowOnError>({
@@ -139,18 +125,6 @@ export const getSessionHydration = <ThrowOnError extends boolean = false>(option
 export const getSessionHistory = <ThrowOnError extends boolean = false>(options: Options<GetSessionHistoryData, ThrowOnError>): RequestResult<GetSessionHistoryResponses, GetSessionHistoryErrors, ThrowOnError> => (options.client ?? client).get<GetSessionHistoryResponses, GetSessionHistoryErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sessions/{id}/history',
-    ...options
-});
-
-export const getSessionPending = <ThrowOnError extends boolean = false>(options: Options<GetSessionPendingData, ThrowOnError>): RequestResult<GetSessionPendingResponses, GetSessionPendingErrors, ThrowOnError> => (options.client ?? client).get<GetSessionPendingResponses, GetSessionPendingErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v1/sessions/{id}/pending',
-    ...options
-});
-
-export const getSessionUsage = <ThrowOnError extends boolean = false>(options: Options<GetSessionUsageData, ThrowOnError>): RequestResult<GetSessionUsageResponses, GetSessionUsageErrors, ThrowOnError> => (options.client ?? client).get<GetSessionUsageResponses, GetSessionUsageErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v1/sessions/{id}/usage',
     ...options
 });
 

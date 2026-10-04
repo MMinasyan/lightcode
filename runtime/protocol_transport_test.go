@@ -310,26 +310,30 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			t.Fatalf("null header value = %d, want 400", nullHeader.StatusCode)
 		}
 
-		// The empty control bodies accept one empty object and reject null,
-		// any member, and trailing documents.
-		interrupt := func(body string) *http.Response {
-			return rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/sessions/"+session+"/interrupt"), ps.credential, body)
+		// The controls are argument-free POSTs: no request-body schema
+		// exists, so any body is ignored and the addressed Session decides.
+		// The nearest forbidden sibling is that addressed-Session rule: an
+		// unknown target still answers the typed not-found, body or no body.
+		interrupt := func(target, body string) *http.Response {
+			return rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/sessions/"+target+"/interrupt"), ps.credential, body)
 		}
 		for name, body := range map[string]string{
+			"no control body":          "",
+			"empty object body":        "{}",
 			"control body with member": `{"x":1}`,
 			"control null body":        `null`,
 			"control trailing member":  `{} {}`,
 		} {
-			response := interrupt(body)
+			response := interrupt(session, body)
 			response.Body.Close()
-			if response.StatusCode != http.StatusBadRequest {
-				t.Fatalf("%s = %d, want 400", name, response.StatusCode)
+			if response.StatusCode != http.StatusNoContent {
+				t.Fatalf("%s = %d, want the accepted 204", name, response.StatusCode)
 			}
 		}
-		if response := interrupt("{}"); response.StatusCode != http.StatusNoContent {
-			t.Fatalf("empty control body = %d, want the accepted 204", response.StatusCode)
-		} else {
-			response.Body.Close()
+		unknown := interrupt("0123456789abcdef0123456789abcdef", "")
+		unknown.Body.Close()
+		if unknown.StatusCode != http.StatusNotFound {
+			t.Fatalf("unknown control target = %d, want the typed not-found 404", unknown.StatusCode)
 		}
 	})
 }
@@ -373,6 +377,22 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 			t.Fatalf("wrong method error = %+v, want not_found", typed)
 		}
 
+		// The removed standalone Session reads are unregistered routes: each
+		// answers the existing typed catch-all, never a partial handler.
+		for _, removed := range []string{
+			"/v1/sessions/" + session,
+			"/v1/sessions/" + session + "/pending",
+			"/v1/sessions/" + session + "/usage",
+		} {
+			response := rawProtocol(t, http.MethodGet, protocolTarget(ps, removed), ps.credential, "")
+			if response.StatusCode != http.StatusNotFound {
+				t.Fatalf("removed route %s = %d, want the typed 404", removed, response.StatusCode)
+			}
+			if typed := decodeProtocolError(t, response); typed.Code != protocol.NotFound {
+				t.Fatalf("removed route %s error = %+v, want not_found", removed, typed)
+			}
+		}
+
 		trailing := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health/"), ps.credential, "")
 		if trailing.StatusCode != http.StatusNotFound || trailing.Header.Get("Location") != "" {
 			t.Fatalf("trailing slash = (%d, location %q), want the typed 404 with no redirect",
@@ -396,13 +416,13 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 
 		// An unclean Session path is transport-redirected to its clean
 		// spelling; following it with the credential reaches the clean
-		// handler and reads exactly the addressed Session.
-		uncleanSessionPath := "/v1//sessions/" + session
+		// hydration handler and reads exactly the addressed Session.
+		uncleanSessionPath := "/v1//sessions/" + session + "/hydration"
 		uncleanSession := rawProtocol(t, http.MethodGet, protocolTarget(ps, uncleanSessionPath), ps.credential, "")
 		if uncleanSession.StatusCode != http.StatusTemporaryRedirect {
 			t.Fatalf("unclean Session path = %d, want the transport-level 307", uncleanSession.StatusCode)
 		}
-		if location := uncleanSession.Header.Get("Location"); location != "/v1/sessions/"+session {
+		if location := uncleanSession.Header.Get("Location"); location != "/v1/sessions/"+session+"/hydration" {
 			t.Fatalf("unclean Session redirect location = %q, want the cleaned Session path", location)
 		}
 		uncleanSession.Body.Close()
@@ -419,14 +439,14 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 			redirected.Body.Close()
 			t.Fatalf("followed unclean Session path = %d, want the clean 200", redirected.StatusCode)
 		}
-		var followedSession protocol.Session
+		var followedSession protocol.Hydration
 		if err := json.NewDecoder(redirected.Body).Decode(&followedSession); err != nil {
 			redirected.Body.Close()
 			t.Fatalf("decode the followed Session: %v", err)
 		}
 		redirected.Body.Close()
-		if followedSession.SessionId != session {
-			t.Fatalf("followed Session = %q, want the addressed %q", followedSession.SessionId, session)
+		if followedSession.Session.SessionId != session {
+			t.Fatalf("followed Session = %q, want the addressed %q", followedSession.Session.SessionId, session)
 		}
 
 		// The asterisk-form OPTIONS request is answered by the server layer
@@ -473,12 +493,12 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 
 		// A well-formed but absent session identity answers not_found.
 		unused := newLifecycleID(t)
-		if missing, err := client.GetSessionWithResponse(ctx, unused); err != nil || missing.JSONDefault == nil ||
+		if missing, err := client.GetSessionHydrationWithResponse(ctx, unused); err != nil || missing.JSONDefault == nil ||
 			missing.JSONDefault.Code != protocol.NotFound || missing.HTTPResponse.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown session = (%d, %+v, %v), want the typed 404", missing.HTTPResponse.StatusCode, missing.JSONDefault, err)
 		}
 		// A target route never accepts a legacy 8-hex identity.
-		legacy := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/sessions/decafbad"), ps.credential, "")
+		legacy := rawProtocol(t, http.MethodDelete, protocolTarget(ps, "/v1/sessions/decafbad"), ps.credential, "")
 		if legacy.StatusCode != http.StatusBadRequest {
 			t.Fatalf("legacy identity on a target route = %d, want invalid 400", legacy.StatusCode)
 		}
@@ -521,7 +541,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		corruptID := newLifecycleID(t)
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: corruptID, Kind: harness.RegisterSession}, `{"not":"a session register"}`)
 		valid := projectionSession(t, r, workspace, "solo").Identity.SessionID
-		corrupt, err := client.GetSessionWithResponse(ctx, corruptID)
+		corrupt, err := client.GetSessionHydrationWithResponse(ctx, corruptID)
 		if err != nil || corrupt.JSONDefault == nil || corrupt.JSONDefault.Code != protocol.Corrupt ||
 			corrupt.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
 			t.Fatalf("corrupt session = (%d, %+v, %v), want the typed corrupt 422", corrupt.HTTPResponse.StatusCode, corrupt.JSONDefault, err)

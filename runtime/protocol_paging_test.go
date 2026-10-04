@@ -43,16 +43,58 @@ func pageSnapshot(n int) harness.SessionSnapshot {
 	return convSnapshot(facts)
 }
 
+// wireItemID reads one projected wire item's stable identity through the
+// generated union accessors: the producer keeps each source-known identity
+// alongside its item, and the tests verify the emitted wire identity.
+func wireItemID(t *testing.T, item protocol.ConversationItem) string {
+	t.Helper()
+	discriminator, err := item.Discriminator()
+	if err != nil {
+		t.Fatalf("conversation item discriminator: %v", err)
+	}
+	switch discriminator {
+	case "input":
+		v, err := item.AsInputItem()
+		if err != nil {
+			t.Fatalf("AsInputItem: %v", err)
+		}
+		return v.ItemId
+	case "assistant":
+		v, err := item.AsAssistantItem()
+		if err != nil {
+			t.Fatalf("AsAssistantItem: %v", err)
+		}
+		return v.ItemId
+	case "signal":
+		v, err := item.AsSignalItem()
+		if err != nil {
+			t.Fatalf("AsSignalItem: %v", err)
+		}
+		return v.ItemId
+	case "compaction":
+		v, err := item.AsCompactionItem()
+		if err != nil {
+			t.Fatalf("AsCompactionItem: %v", err)
+		}
+		return v.ItemId
+	case "operation_end":
+		v, err := item.AsOperationEndItem()
+		if err != nil {
+			t.Fatalf("AsOperationEndItem: %v", err)
+		}
+		return v.ItemId
+	default:
+		t.Fatalf("conversation item kind %q is outside the closed set", discriminator)
+		return ""
+	}
+}
+
 // pageItemIDs reads one page's item identities in order.
 func pageItemIDs(t *testing.T, page protocol.HistoryPage) []string {
 	t.Helper()
 	ids := make([]string, 0, len(page.Items))
 	for _, item := range page.Items {
-		id, err := conversationItemID(item)
-		if err != nil {
-			t.Fatalf("conversationItemID: %v", err)
-		}
-		ids = append(ids, id)
+		ids = append(ids, wireItemID(t, item))
 	}
 	return ids
 }
@@ -69,7 +111,7 @@ func wantPageItemID(i int) string {
 func TestHistoryPagePureThreePages(t *testing.T) {
 	snap := pageSnapshot(120)
 
-	page1, err := projectHistoryPage(snap, nil)
+	page1, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), nil)
 	if err != nil {
 		t.Fatalf("initial page: %v", err)
 	}
@@ -96,7 +138,7 @@ func TestHistoryPagePureThreePages(t *testing.T) {
 		t.Fatalf("older cursor = %+v, want version 1, this session, older, anchored at item 70", cursor1)
 	}
 
-	page2, err := projectHistoryPage(snap, page1.OlderCursor)
+	page2, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page1.OlderCursor)
 	if err != nil {
 		t.Fatalf("second page: %v", err)
 	}
@@ -125,7 +167,7 @@ func TestHistoryPagePureThreePages(t *testing.T) {
 		t.Fatalf("second cursor anchor = %q, want item 20", cursor2.AnchorItemID)
 	}
 
-	page3, err := projectHistoryPage(snap, page2.OlderCursor)
+	page3, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page2.OlderCursor)
 	if err != nil {
 		t.Fatalf("third page: %v", err)
 	}
@@ -163,7 +205,7 @@ func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	facts = append(facts, convResultFact(resultID, assistantID, "call-1", "success", "tool output", ""))
 
 	snap := convSnapshot(facts)
-	page1, err := projectHistoryPage(snap, nil)
+	page1, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), nil)
 	if err != nil {
 		t.Fatalf("initial page: %v", err)
 	}
@@ -183,7 +225,7 @@ func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	if page1.OlderCursor == nil {
 		t.Fatal("initial page produced no older cursor with one older item")
 	}
-	page2, err := projectHistoryPage(snap, page1.OlderCursor)
+	page2, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page1.OlderCursor)
 	if err != nil {
 		t.Fatalf("older page: %v", err)
 	}
@@ -236,7 +278,7 @@ func cursorJSON(sessionID, anchor, direction string) string {
 func TestHistoryCursorStrictValidation(t *testing.T) {
 	snap := pageSnapshot(3)
 	valid := cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1), "older"))
-	if _, err := projectHistoryPage(snap, valid); err != nil {
+	if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), valid); err != nil {
 		t.Fatalf("valid cursor rejected: %v", err)
 	}
 
@@ -255,14 +297,14 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 		"nonexistent anchor": cursorBody(t, cursorJSON(convSessionID, "missing", "older")),
 	}
 	for name, cursor := range rejections {
-		if _, err := projectHistoryPage(snap, cursor); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursor); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("%s: projectHistoryPage = %v, want harness.ErrInvalid", name, err)
 		}
 	}
 
 	// The one uniform slicing rule for a resolvable anchor with nothing
 	// older: a present empty page with no next cursor.
-	page, err := projectHistoryPage(snap, cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0), "older")))
+	page, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0), "older")))
 	if err != nil {
 		t.Fatalf("oldest-anchor page: %v", err)
 	}
@@ -456,28 +498,31 @@ func TestSessionContextWindowPureClocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembleConfiguration: %v", err)
 	}
+	window := func(snap harness.SessionSnapshot) int {
+		return sessionContextWindow(snap, resolveSessionSelection(snap.Session.State.CurrentAgentType, captured))
+	}
 
 	// The active Operation's capture wins over the distinct catalog window.
 	active := windowSnapshot("op-1", "solo", true, windowOperation("op-1", 4096))
-	if got := sessionContextWindow(active, captured); got != 4096 {
+	if got := window(active); got != 4096 {
 		t.Fatalf("active window = %d, want the captured 4096", got)
 	}
 
 	// The busy fact and a retiring run alone are not an active Operation:
 	// with no durably running current Operation the idle clock applies.
 	retiring := windowSnapshot("", "solo", true)
-	if got := sessionContextWindow(retiring, captured); got != 8192 {
+	if got := window(retiring); got != 8192 {
 		t.Fatalf("retiring-run window = %d, want the captured catalog 8192", got)
 	}
 
 	idle := windowSnapshot("", "solo", false)
-	if got := sessionContextWindow(idle, captured); got != 8192 {
+	if got := window(idle); got != 8192 {
 		t.Fatalf("idle window = %d, want the catalog 8192", got)
 	}
-	if got := sessionContextWindow(windowSnapshot("", "modelless", false), captured); got != 0 {
+	if got := window(windowSnapshot("", "modelless", false)); got != 0 {
 		t.Fatalf("modelless window = %d, want 0", got)
 	}
-	if got := sessionContextWindow(windowSnapshot("", "unknown", false), captured); got != 0 {
+	if got := window(windowSnapshot("", "unknown", false)); got != 0 {
 		t.Fatalf("unknown type window = %d, want 0", got)
 	}
 }
@@ -753,9 +798,13 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 
 		archivedReads := []func() error{
 			func() error { _, err := r.getHistory(context.Background(), archived, nil); return err },
-			func() error { _, err := r.getPending(context.Background(), archived); return err },
-			func() error { _, err := r.getUsage(context.Background(), archived); return err },
 			func() error { _, err := r.buildHydration(context.Background(), archived); return err },
+			func() error {
+				return headerErrorThroughRuntime(context.Background(), r, archived)
+			},
+			func() error {
+				return historyErrorThroughRuntime(context.Background(), r, archived)
+			},
 		}
 		for i, read := range archivedReads {
 			if err := read(); err != nil {
@@ -764,10 +813,13 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 		}
 		deletedReads := []func() error{
 			func() error { _, err := r.getHistory(context.Background(), deleted, nil); return err },
-			func() error { _, err := r.getPending(context.Background(), deleted); return err },
-			func() error { _, err := r.getUsage(context.Background(), deleted); return err },
 			func() error { _, err := r.buildHydration(context.Background(), deleted); return err },
-			func() error { _, err := r.resolveForkBoundary(context.Background(), deleted, "any"); return err },
+			func() error {
+				return headerErrorThroughRuntime(context.Background(), r, deleted)
+			},
+			func() error {
+				return historyErrorThroughRuntime(context.Background(), r, deleted)
+			},
 		}
 		for i, read := range deletedReads {
 			if err := read(); !errors.Is(err, harness.ErrNotFound) {
@@ -820,10 +872,11 @@ func TestForkBoundaryResolution(t *testing.T) {
 		submitConvergedThroughRuntime(t, r, session, "op-2", "second turn", harness.OperationSuccess)
 		awaitIdleSession(t, r, session)
 
+		facts, _ := historyThroughRuntime(t, r, session)
 		entryID := inputEntryID(t, r, session, "op-1")
-		boundary, err := r.resolveForkBoundary(context.Background(), session, projectItemID(session, entryID))
+		boundary, err := resolveBoundaryEntry(session, facts, projectItemID(session, entryID))
 		if err != nil {
-			t.Fatalf("resolveForkBoundary: %v", err)
+			t.Fatalf("resolveBoundaryEntry: %v", err)
 		}
 		if boundary != entryID {
 			t.Fatalf("resolved boundary = %q, want the private entry identity %q", boundary, entryID)
@@ -831,23 +884,22 @@ func TestForkBoundaryResolution(t *testing.T) {
 
 		// The user input of a different Session's namespace never resolves.
 		foreign := projectItemID("ffffffffffffffffffffffffffffffff", entryID)
-		if _, err := r.resolveForkBoundary(context.Background(), session, foreign); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, facts, foreign); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("foreign boundary = %v, want harness.ErrInvalid", err)
 		}
 		// A committed non-user item never resolves: find the first turn's
 		// assistant item identity.
-		snap := snapshotThroughRuntime(t, r, session)
 		var assistantItem string
-		for _, fact := range snap.Facts {
+		for _, fact := range facts {
 			if fact.Kind == harness.EntryAssistant {
 				assistantItem = projectItemID(session, fact.EntryID)
 				break
 			}
 		}
-		if _, err := r.resolveForkBoundary(context.Background(), session, assistantItem); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, facts, assistantItem); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("assistant boundary = %v, want harness.ErrInvalid", err)
 		}
-		if _, err := r.resolveForkBoundary(context.Background(), session, "no-such-item"); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, facts, "no-such-item"); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("nonexistent boundary = %v, want harness.ErrInvalid", err)
 		}
 	})
@@ -891,38 +943,28 @@ func TestHydrationPendingFIFOsAndActiveOperation(t *testing.T) {
 		submitQueuedThroughRuntime(t, r, session, "op-q1", "queued one")
 		submitQueuedThroughRuntime(t, r, session, "op-q2", "queued two")
 
-		pending, err := r.getPending(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getPending: %v", err)
-		}
-		if len(pending.Pending.Steering) != 1 || len(pending.Pending.Queued) != 2 {
-			t.Fatalf("pending = %+v, want one steering and two queued members", pending.Pending)
-		}
-		steerText := pendingText(t, pending.Pending.Steering[0])
-		if pending.Pending.Steering[0].OperationId != "op-s1" || steerText != "steer me" ||
-			pending.Pending.Steering[0].Origin != protocol.InputOriginUser {
-			t.Fatalf("steering member = %+v (%q), want op-s1's user text", pending.Pending.Steering[0], steerText)
-		}
-		if pending.Pending.Queued[0].OperationId != "op-q1" || pendingText(t, pending.Pending.Queued[0]) != "queued one" ||
-			pending.Pending.Queued[1].OperationId != "op-q2" || pendingText(t, pending.Pending.Queued[1]) != "queued two" {
-			t.Fatalf("queued members = %+v, want the FIFO order q1 then q2", pending.Pending.Queued)
-		}
-
 		hydration, err := r.buildHydration(context.Background(), session)
 		if err != nil {
 			t.Fatalf("buildHydration: %v", err)
 		}
-		if !reflect.DeepEqual(hydration.Pending, pending.Pending) {
-			t.Fatalf("hydration pending = %+v, want the pending read's %+v", hydration.Pending, pending.Pending)
+		pending := hydration.Pending
+		if len(pending.Steering) != 1 || len(pending.Queued) != 2 {
+			t.Fatalf("pending = %+v, want one steering and two queued members", pending)
+		}
+		steerText := pendingText(t, pending.Steering[0])
+		if pending.Steering[0].OperationId != "op-s1" || steerText != "steer me" ||
+			pending.Steering[0].Origin != protocol.InputOriginUser {
+			t.Fatalf("steering member = %+v (%q), want op-s1's user text", pending.Steering[0], steerText)
+		}
+		if pending.Queued[0].OperationId != "op-q1" || pendingText(t, pending.Queued[0]) != "queued one" ||
+			pending.Queued[1].OperationId != "op-q2" || pendingText(t, pending.Queued[1]) != "queued two" {
+			t.Fatalf("queued members = %+v, want the FIFO order q1 then q2", pending.Queued)
 		}
 		if hydration.ActiveOperation == nil || hydration.ActiveOperation.OperationId != "op-1" ||
 			hydration.ActiveOperation.Status != protocol.OperationStatusRunning {
 			t.Fatalf("active operation = %+v, want the durably running op-1", hydration.ActiveOperation)
 		}
-		header, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession: %v", err)
-		}
+		header := projectSession(headerThroughRuntime(t, r, session))
 		if !reflect.DeepEqual(hydration.Session, header) {
 			t.Fatalf("hydration session = %+v, want the header read %+v", hydration.Session, header)
 		}
@@ -1051,32 +1093,21 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 
 		// The delivered runtime-origin input is committed non-user history:
 		// its item identity never resolves as a fork boundary.
-		snap := snapshotThroughRuntime(t, bg.r, root)
-		for _, fact := range snap.Facts {
+		facts, _ := historyThroughRuntime(t, bg.r, root)
+		for _, fact := range facts {
 			if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginRuntime {
-				if _, err := bg.r.resolveForkBoundary(context.Background(), root, projectItemID(root, fact.EntryID)); !errors.Is(err, harness.ErrInvalid) {
+				if _, err := resolveBoundaryEntry(root, facts, projectItemID(root, fact.EntryID)); !errors.Is(err, harness.ErrInvalid) {
 					t.Fatalf("runtime-origin boundary = %v, want harness.ErrInvalid", err)
 				}
 			}
 		}
 
 		// The equality oracle at the settled stable state: every hydration
-		// member equals the separate producers' reads of the same snapshot.
-		childHeader, err := bg.r.getSession(context.Background(), child)
-		if err != nil {
-			t.Fatalf("getSession(child): %v", err)
-		}
+		// member equals its own narrow producer's read of the same state.
+		childHeader := projectSession(headerThroughRuntime(t, bg.r, child))
 		childPage, err := bg.r.getHistory(context.Background(), child, nil)
 		if err != nil {
 			t.Fatalf("getHistory(child): %v", err)
-		}
-		childPending, err := bg.r.getPending(context.Background(), child)
-		if err != nil {
-			t.Fatalf("getPending(child): %v", err)
-		}
-		childUsage, err := bg.r.getUsage(context.Background(), child)
-		if err != nil {
-			t.Fatalf("getUsage(child): %v", err)
 		}
 		childHydration, err = bg.r.buildHydration(context.Background(), child)
 		if err != nil {
@@ -1086,10 +1117,9 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 			childHydration.SessionRevision != childPage.SessionRevision ||
 			!reflect.DeepEqual(childHydration.Conversation.Items, childPage.Items) ||
 			!reflect.DeepEqual(childHydration.Conversation.OlderCursor, childPage.OlderCursor) ||
-			!reflect.DeepEqual(childHydration.Pending, childPending.Pending) ||
-			!reflect.DeepEqual(childHydration.Usage, childUsage.Usage) ||
+			len(childHydration.Pending.Steering) != 0 || len(childHydration.Pending.Queued) != 0 ||
 			childHydration.ActiveOperation != nil {
-			t.Fatalf("settled child hydration disagrees with the separate producers: %+v", childHydration)
+			t.Fatalf("settled child hydration disagrees with the narrow producers: %+v", childHydration)
 		}
 	})
 }
@@ -1144,13 +1174,13 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		modelless := newLifecycleID(t)
 		usageSeedSession(t, store, modelless, "", "", "modelless", emptyUsageWireTotals())
 
-		usageRow := func(t *testing.T, sessionID string) protocol.UsageSnapshot {
+		usageRow := func(t *testing.T, sessionID string) protocol.Hydration {
 			t.Helper()
-			snapshot, err := r.getUsage(ctx, sessionID)
+			hydration, err := r.buildHydration(ctx, sessionID)
 			if err != nil {
-				t.Fatalf("getUsage(%s): %v", sessionID, err)
+				t.Fatalf("buildHydration(%s): %v", sessionID, err)
 			}
-			return snapshot
+			return hydration
 		}
 
 		// Generation 1: the fixture catalog's 4096 window for idle reads,
@@ -1174,8 +1204,8 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		if busyRow.Usage.Context.ContextWindow != 4096 {
 			t.Fatalf("busy window = %d, want the captured 4096", busyRow.Usage.Context.ContextWindow)
 		}
-		if _, err := r.getUsage(ctx, modelless); err != nil {
-			t.Fatalf("getUsage(modelless): %v", err)
+		if modellessRow := usageRow(t, modelless); modellessRow.Usage.Context.ContextWindow != 0 {
+			t.Fatalf("modelless window = %d, want 0", modellessRow.Usage.Context.ContextWindow)
 		}
 
 		// Reload to a distinct positive catalog window plus the modelless
@@ -1225,6 +1255,150 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 	})
 }
 
+// TestHydrationSelectedModelFollowsNextAdmission proves the required nullable
+// selection member: an idle Session names its configured model and window, a
+// definition with no model or an unknown type yields null, an unavailable
+// configured ref stays identifiable with a zero window, and a running
+// Operation keeps its captured active model/window while selected_model names
+// the next admission's selection under the same captured configuration.
+func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}}}}`)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"alternate":{"model":"prov/m2","system_prompt":"simple"},"modelless":{"system_prompt":"simple"},"gone":{"model":"prov/gone","system_prompt":"simple"}}`)
+		r, err := e.open(context.Background(), e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+
+		// An idle Session resolves the selected definition in the captured
+		// catalog: one shared selection supplies the model and the window.
+		solo := projectionSession(t, r, "/tmp/selection-solo", "solo").Identity.SessionID
+		idle, err := r.buildHydration(context.Background(), solo)
+		if err != nil {
+			t.Fatalf("buildHydration(solo): %v", err)
+		}
+		if idle.SelectedModel == nil || *idle.SelectedModel != "prov/m" || idle.Usage.Context.ContextWindow != 4096 {
+			t.Fatalf("idle selection = model %v window %d, want prov/m under 4096", idle.SelectedModel, idle.Usage.Context.ContextWindow)
+		}
+		if idle.Session.AgentType != "solo" {
+			t.Fatalf("idle session agent type = %q, want solo", idle.Session.AgentType)
+		}
+
+		// No configured ref and an unresolvable type both yield null rather
+		// than a fallback model.
+		for _, tc := range []struct{ name, agentType string }{{"modelless", "modelless"}, {"unknown", "ghost"}} {
+			session := projectionSession(t, r, "/tmp/selection-"+tc.name, tc.agentType).Identity.SessionID
+			hydration, err := r.buildHydration(context.Background(), session)
+			if err != nil {
+				t.Fatalf("buildHydration(%s): %v", tc.name, err)
+			}
+			if hydration.SelectedModel != nil || hydration.Usage.Context.ContextWindow != 0 {
+				t.Fatalf("%s selection = model %v window %d, want null and 0", tc.name, hydration.SelectedModel, hydration.Usage.Context.ContextWindow)
+			}
+		}
+
+		// A configured but unavailable ref stays identifiable while admission
+		// still refuses it: the window is 0, the model is not invented away.
+		gone := projectionSession(t, r, "/tmp/selection-gone", "gone").Identity.SessionID
+		goneHydration, err := r.buildHydration(context.Background(), gone)
+		if err != nil {
+			t.Fatalf("buildHydration(gone): %v", err)
+		}
+		if goneHydration.SelectedModel == nil || *goneHydration.SelectedModel != "prov/gone" || goneHydration.Usage.Context.ContextWindow != 0 {
+			t.Fatalf("gone selection = model %v window %d, want the configured prov/gone identifiable at 0", goneHydration.SelectedModel, goneHydration.Usage.Context.ContextWindow)
+		}
+
+		// A running Operation keeps its capture: an Agent-type change while
+		// it runs names the next admission's selection, while the active
+		// model and window stay the captured pair under one configuration
+		// revision.
+		gate := make(chan struct{})
+		e.prep.modelGate = gate
+		release := sync.OnceFunc(func() { close(gate) })
+		defer release()
+		active := projectionSession(t, r, "/tmp/selection-active", "solo").Identity.SessionID
+		submitThroughRuntime(t, r, active, "op-1", "running")
+		awaitModelArrival(t, e)
+		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ChangeAgentType(ctx, active, "alternate")
+			return err
+		}); err != nil {
+			t.Fatalf("ChangeAgentType: %v", err)
+		}
+		activeHydration, err := r.buildHydration(context.Background(), active)
+		if err != nil {
+			t.Fatalf("buildHydration(active): %v", err)
+		}
+		if activeHydration.ActiveOperation == nil || activeHydration.ActiveOperation.Model != "prov/m" ||
+			activeHydration.Usage.Context.ContextWindow != 4096 {
+			t.Fatalf("active hydration = active %+v window %d, want the captured prov/m under 4096",
+				activeHydration.ActiveOperation, activeHydration.Usage.Context.ContextWindow)
+		}
+		if activeHydration.SelectedModel == nil || *activeHydration.SelectedModel != "prov/m2" {
+			t.Fatalf("active next selection = %v, want the changed prov/m2", activeHydration.SelectedModel)
+		}
+		if activeHydration.Session.AgentType != "alternate" {
+			t.Fatalf("active session agent type = %q, want alternate", activeHydration.Session.AgentType)
+		}
+		if activeHydration.SessionRevision != activeHydration.Session.SessionRevision {
+			t.Fatalf("hydration revision = %+v, want the same captured session revision %+v", activeHydration.SessionRevision, activeHydration.Session.SessionRevision)
+		}
+
+		// Once idle, the shared resolution supplies the new model's window.
+		release()
+		awaitIdleSession(t, r, active)
+		settled, err := r.buildHydration(context.Background(), active)
+		if err != nil {
+			t.Fatalf("buildHydration(settled): %v", err)
+		}
+		if settled.SelectedModel == nil || *settled.SelectedModel != "prov/m2" || settled.Usage.Context.ContextWindow != 8192 {
+			t.Fatalf("settled selection = model %v window %d, want prov/m2 under 8192", settled.SelectedModel, settled.Usage.Context.ContextWindow)
+		}
+
+		// A reload re-points the selected Agent type to another model while a
+		// second Operation is blocked: selected_model follows the reloaded
+		// catalog under the response's captured configuration revision, while
+		// the active Operation keeps its captured model and window.
+		secondGate := make(chan struct{})
+		e.prep.modelGate = secondGate
+		releaseSecond := sync.OnceFunc(func() { close(secondGate) })
+		defer releaseSecond()
+		submitThroughRuntime(t, r, active, "op-2", "running again")
+		awaitModelArrival(t, e)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"alternate":{"model":"prov/m","system_prompt":"simple"},"modelless":{"system_prompt":"simple"},"gone":{"model":"prov/gone","system_prompt":"simple"}}`)
+		if _, err := r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		reloaded, err := r.buildHydration(context.Background(), active)
+		if err != nil {
+			t.Fatalf("buildHydration(reloaded): %v", err)
+		}
+		if reloaded.ActiveOperation == nil || reloaded.ActiveOperation.Model != "prov/m2" ||
+			reloaded.Usage.Context.ContextWindow != 4096 {
+			t.Fatalf("reloaded active capture = active %+v window %d, want the captured prov/m2 under the controlled 4096",
+				reloaded.ActiveOperation, reloaded.Usage.Context.ContextWindow)
+		}
+		if reloaded.SelectedModel == nil || *reloaded.SelectedModel != "prov/m" {
+			t.Fatalf("reloaded selected model = %v, want the re-pointed prov/m", reloaded.SelectedModel)
+		}
+		if reloaded.ConfigurationRevision.Generation != "2" {
+			t.Fatalf("reloaded configuration revision = %+v, want generation 2", reloaded.ConfigurationRevision)
+		}
+
+		releaseSecond()
+		awaitIdleSession(t, r, active)
+		afterReload, err := r.buildHydration(context.Background(), active)
+		if err != nil {
+			t.Fatalf("buildHydration(after reload): %v", err)
+		}
+		if afterReload.SelectedModel == nil || *afterReload.SelectedModel != "prov/m" || afterReload.Usage.Context.ContextWindow != 4096 {
+			t.Fatalf("after-reload selection = model %v window %d, want prov/m under 4096", afterReload.SelectedModel, afterReload.Usage.Context.ContextWindow)
+		}
+	})
+}
+
 // TestProjectionReadsClosedAndCanceledCallers proves the new reads hold the
 // admission gate: closed owners reject with ErrClosed and canceled callers
 // with their own context error.
@@ -1237,10 +1411,13 @@ func TestProjectionReadsClosedAndCanceledCallers(t *testing.T) {
 	}
 	closed := []func() error{
 		func() error { _, err := r.getHistory(context.Background(), sessionID, nil); return err },
-		func() error { _, err := r.getPending(context.Background(), sessionID); return err },
-		func() error { _, err := r.getUsage(context.Background(), sessionID); return err },
 		func() error { _, err := r.buildHydration(context.Background(), sessionID); return err },
-		func() error { _, err := r.resolveForkBoundary(context.Background(), sessionID, "x"); return err },
+		func() error {
+			return headerErrorThroughRuntime(context.Background(), r, sessionID)
+		},
+		func() error {
+			return historyErrorThroughRuntime(context.Background(), r, sessionID)
+		},
 	}
 	for i, call := range closed {
 		if err := call(); !errors.Is(err, ErrClosed) {
@@ -1254,10 +1431,13 @@ func TestProjectionReadsClosedAndCanceledCallers(t *testing.T) {
 	cancel()
 	canceledCalls := []func() error{
 		func() error { _, err := r2.getHistory(canceled, sessionID, nil); return err },
-		func() error { _, err := r2.getPending(canceled, sessionID); return err },
-		func() error { _, err := r2.getUsage(canceled, sessionID); return err },
 		func() error { _, err := r2.buildHydration(canceled, sessionID); return err },
-		func() error { _, err := r2.resolveForkBoundary(canceled, sessionID, "x"); return err },
+		func() error {
+			return headerErrorThroughRuntime(canceled, r2, sessionID)
+		},
+		func() error {
+			return historyErrorThroughRuntime(canceled, r2, sessionID)
+		},
 	}
 	for i, call := range canceledCalls {
 		if err := call(); !errors.Is(err, context.Canceled) {

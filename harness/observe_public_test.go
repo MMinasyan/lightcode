@@ -106,8 +106,7 @@ func newObservedPublicHarnessWithTool(t *testing.T, store harness.Storage, scrip
 }
 
 // awaitPublicQuiet waits until one Session is quiet and the observer has
-// delivered the publication matching its current pair, the deterministic
-// post-terminal barrier.
+// delivered at least one publication, the deterministic post-terminal barrier.
 func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *publicFactSink) harness.SessionSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -116,10 +115,7 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 		if err != nil {
 			t.Fatalf("SnapshotSession: %v", err)
 		}
-		current := harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
-		invalidations := sink.invalidations()
-		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" &&
-			len(invalidations) > 0 && invalidations[len(invalidations)-1].Revision == current {
+		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" && len(sink.invalidations()) > 0 {
 			return snap
 		}
 		if time.Now().After(deadline) {
@@ -130,9 +126,9 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 }
 
 // TestObservePublicBothStores proves the public observer over memory and
-// SQLite: the committed invalidation sequence is monotonic and ends at the
-// authoritative snapshot pair, text and tool progress carry the Operation and
-// call identities, and a restarted owner replays nothing.
+// SQLite: invalidation, text and tool progress carry their Session/Operation
+// identities, the cached publication read returns the authoritative snapshot
+// pair, and a restarted owner replays nothing.
 func TestObservePublicBothStores(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		sink := &publicFactSink{}
@@ -152,13 +148,9 @@ func TestObservePublicBothStores(t *testing.T) {
 		snap := awaitPublicQuiet(t, h, session, sink)
 
 		var (
-			prev       harness.SessionRevision
-			last       harness.SessionRevision
-			haveLast   bool
-			createSeen bool
-			deltas     int
-			started    int
-			finished   int
+			deltas   int
+			started  int
+			finished int
 		)
 		for _, fact := range sink.snapshot() {
 			if fact.SessionID != session {
@@ -166,15 +158,6 @@ func TestObservePublicBothStores(t *testing.T) {
 			}
 			switch fact.Kind {
 			case harness.FactInvalidation:
-				if fact.Revision.DurableRevision < prev.DurableRevision ||
-					(fact.Revision.DurableRevision == prev.DurableRevision && fact.Revision.LocalRevision < prev.LocalRevision) {
-					t.Fatalf("non-monotonic invalidation %+v after %+v", fact.Revision, prev)
-				}
-				prev = fact.Revision
-				last, haveLast = fact.Revision, true
-				if fact.Revision == (harness.SessionRevision{DurableRevision: 1, LocalRevision: 0}) {
-					createSeen = true
-				}
 			case harness.FactTextDelta:
 				deltas++
 				if fact.OperationID != "op-1" || fact.Position < 0 || fact.Content == "" {
@@ -194,12 +177,12 @@ func TestObservePublicBothStores(t *testing.T) {
 				t.Fatalf("fact kind %q is outside the closed set", fact.Kind)
 			}
 		}
-		if !createSeen || !haveLast {
-			t.Fatalf("the create invalidation or a later one is missing: %+v", sink.snapshot())
+		if len(sink.invalidations()) == 0 {
+			t.Fatalf("no invalidation was delivered: %+v", sink.snapshot())
 		}
 		current := harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
-		if last != current {
-			t.Fatalf("last invalidation = %+v, quiet snapshot = %+v", last, current)
+		if _, pair, ok := h.ReadObservation(session); !ok || pair != current {
+			t.Fatalf("cached publication read = %+v %v, quiet snapshot = %+v", pair, ok, current)
 		}
 		if deltas != 2 || started != 1 || finished != 1 {
 			t.Fatalf("progress counts = deltas %d started %d finished %d", deltas, started, finished)
@@ -219,7 +202,7 @@ func TestObservePublicBothStores(t *testing.T) {
 		if _, err := restarted.ListSessions(context.Background()); err != nil {
 			t.Fatalf("ListSessions: %v", err)
 		}
-		if _, err := restarted.ReadSession(context.Background(), session); err != nil {
+		if _, err := restarted.ReadSessionHeader(context.Background(), session); err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if _, err := restarted.SnapshotSession(context.Background(), session); err != nil {
@@ -279,9 +262,9 @@ func TestObservePublicObserverFailures(t *testing.T) {
 	})
 }
 
-// TestObservePublicJobAndChild proves job member admission and finish carry
-// their exact current revision pair and name the Job, while child member and
-// child creation facts never do, over both stores.
+// TestObservePublicJobAndChild proves job member admission and finish name
+// the Job and advance the owning-state pair as expected, while child member
+// and child creation facts never name a Job, over both stores.
 func TestObservePublicJobAndChild(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		sink := &publicFactSink{}
@@ -309,9 +292,13 @@ func TestObservePublicJobAndChild(t *testing.T) {
 		if len(jobFacts) != 1 {
 			t.Fatalf("job admission facts = %+v, want one job-attributed invalidation", jobFacts)
 		}
-		wantAdmit := harness.SessionRevision{DurableRevision: beforeAdmit.Session.Revision, LocalRevision: beforeAdmit.LocalRevision + 1}
-		if jobFacts[0].Revision != wantAdmit {
-			t.Fatalf("job admission pair = %+v, want %+v", jobFacts[0].Revision, wantAdmit)
+		afterAdmit, err := h.SnapshotSession(context.Background(), root)
+		if err != nil {
+			t.Fatalf("SnapshotSession after the job admission: %v", err)
+		}
+		if afterAdmit.Session.Revision != beforeAdmit.Session.Revision || afterAdmit.LocalRevision != beforeAdmit.LocalRevision+1 {
+			t.Fatalf("job admission pair = %d/%d, want one local publication over %d/%d",
+				afterAdmit.Session.Revision, afterAdmit.LocalRevision, beforeAdmit.Session.Revision, beforeAdmit.LocalRevision)
 		}
 
 		beforeFinish, err := h.SnapshotSession(context.Background(), root)
@@ -329,12 +316,9 @@ func TestObservePublicJobAndChild(t *testing.T) {
 		if len(jobFacts) != 2 {
 			t.Fatalf("job facts = %+v, want the admission and the finish", jobFacts)
 		}
-		wantFinish := harness.SessionRevision{DurableRevision: afterFinish.Session.Revision, LocalRevision: afterFinish.LocalRevision}
-		if jobFacts[1].Revision != wantFinish {
-			t.Fatalf("job finish pair = %+v, want the independent after snapshot %+v", jobFacts[1].Revision, wantFinish)
-		}
-		if jobFacts[1].Revision.DurableRevision <= beforeFinish.Session.Revision {
-			t.Fatalf("job finish pair = %+v, want a durable advance past the before snapshot %d", jobFacts[1].Revision, beforeFinish.Session.Revision)
+		if afterFinish.Session.Revision <= beforeFinish.Session.Revision {
+			t.Fatalf("job finish pair = %d/%d, want a durable advance past the before snapshot %d",
+				afterFinish.Session.Revision, afterFinish.LocalRevision, beforeFinish.Session.Revision)
 		}
 		script.releaseGate()
 		if rec := awaitTerminal(t, h, root, completionID); rec.State.Status != harness.OperationSuccess {

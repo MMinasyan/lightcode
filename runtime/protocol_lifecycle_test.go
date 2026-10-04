@@ -186,7 +186,7 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("post-flood submit: %v", err)
 	}
-	if _, err := client.GetSessionWithResponse(ctx, session); err != nil {
+	if _, err := client.GetSessionHydrationWithResponse(ctx, session); err != nil {
 		t.Fatalf("post-flood session read: %v", err)
 	}
 	awaitHealthy(before + 1)

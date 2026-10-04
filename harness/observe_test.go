@@ -75,12 +75,14 @@ func snapshotPair(t *testing.T, h *Harness, sessionID string) SessionRevision {
 	return SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
 }
 
-// wantPair asserts one fact's exact revision pair.
-func wantPair(t *testing.T, fact HarnessFact, durable int64, local uint64) {
+// wantPairAt asserts that one Session's current revision pair equals the
+// expected value; the pair is read after the producer released its lock, the
+// same publication-time rule the passive publishers use.
+func wantPairAt(t *testing.T, h *Harness, sessionID string, durable int64, local uint64) {
 	t.Helper()
 	want := SessionRevision{DurableRevision: durable, LocalRevision: local}
-	if fact.Revision != want {
-		t.Fatalf("fact revision = %+v, want %+v", fact.Revision, want)
+	if got := snapshotPair(t, h, sessionID); got != want {
+		t.Fatalf("session pair = %+v, want %+v", got, want)
 	}
 }
 
@@ -138,28 +140,25 @@ func TestObserveFactKinds(t *testing.T) {
 				fact.Name != "" || fact.Status != "" {
 				t.Fatalf("invalidation fact carries unrelated fields: %+v", fact)
 			}
-			if fact.Revision.DurableRevision == 0 {
-				t.Fatalf("invalidation carries no durable revision: %+v", fact)
-			}
 		case FactTextDelta:
 			deltas++
 			if fact.SessionID != sessionID || fact.OperationID != testOpID || fact.Position != 0 ||
 				fact.Content != "done" || fact.JobID != "" || fact.CallID != "" || fact.Ordinal != 0 ||
-				fact.Name != "" || fact.Status != "" || fact.Revision != (SessionRevision{}) {
+				fact.Name != "" || fact.Status != "" {
 				t.Fatalf("text_delta fact carries unrelated fields: %+v", fact)
 			}
 		case FactToolStarted:
 			started++
 			if fact.SessionID != sessionID || fact.OperationID != testOpID || fact.CallID != "call-1" ||
 				fact.Ordinal != 0 || fact.Name != "echo" || fact.JobID != "" || fact.Position != 0 ||
-				fact.Content != "" || fact.Status != "" || fact.Revision != (SessionRevision{}) {
+				fact.Content != "" || fact.Status != "" {
 				t.Fatalf("tool_started fact carries unrelated fields: %+v", fact)
 			}
 		case FactToolFinished:
 			finished++
 			if fact.SessionID != sessionID || fact.OperationID != testOpID || fact.CallID != "call-1" ||
 				fact.Status != model.ResultSuccess || fact.JobID != "" || fact.Position != 0 ||
-				fact.Content != "" || fact.Ordinal != 0 || fact.Name != "" || fact.Revision != (SessionRevision{}) {
+				fact.Content != "" || fact.Ordinal != 0 || fact.Name != "" {
 				t.Fatalf("tool_finished fact carries unrelated fields: %+v", fact)
 			}
 		default:
@@ -188,8 +187,7 @@ func TestObserveReservationClocks(t *testing.T) {
 	if len(facts) != 2 {
 		t.Fatalf("reservation facts = %d, want exactly the acquisition and release", len(facts))
 	}
-	wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+1)
-	wantPair(t, facts[1], base.DurableRevision, base.LocalRevision+2)
+	wantPairAt(t, h, sessionID, base.DurableRevision, base.LocalRevision+2)
 	for _, fact := range facts {
 		if fact.SessionID != sessionID || fact.JobID != "" || fact.OperationID != "" {
 			t.Fatalf("reservation fact carries unrelated identity: %+v", fact)
@@ -220,7 +218,7 @@ func TestObserveRunLifecycle(t *testing.T) {
 		if len(facts) != 1 {
 			t.Fatalf("installation facts = %d, want one", len(facts))
 		}
-		wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+1) // the run slot's installation
+		wantPairAt(t, h, testSessionID, base.DurableRevision, base.LocalRevision+1) // the run slot's installation
 
 		c.mu.Lock()
 		run := c.run
@@ -235,9 +233,9 @@ func TestObserveRunLifecycle(t *testing.T) {
 			t.Fatalf("the execution never converged")
 		}
 		final := snapshotPair(t, h, testSessionID)
-		facts = col.invalidations()
-		wantPair(t, facts[len(facts)-1], final.DurableRevision, final.LocalRevision)   // the drain's release
-		wantPair(t, facts[len(facts)-2], final.DurableRevision, final.LocalRevision-1) // the drain's retire
+		if final.DurableRevision <= base.DurableRevision || final.LocalRevision <= base.LocalRevision {
+			t.Fatalf("converged pair = %+v, want the model result's durable advance and the drain's local publications over %+v", final, base)
+		}
 	})
 
 	t.Run("successor slot survives the predecessor", func(t *testing.T) {
@@ -266,6 +264,7 @@ func TestObserveRunLifecycle(t *testing.T) {
 		}
 		c := cachedCoordinator(t, h, session)
 		col := observeHarness(h)
+		base := snapshotPair(t, h, session)
 
 		close(gate1)
 		c.mu.Lock()
@@ -291,8 +290,12 @@ func TestObserveRunLifecycle(t *testing.T) {
 		close(gate2)
 		final := awaitHarnessQuiet(t, h, session)
 		facts := col.invalidations()
-		wantPair(t, facts[len(facts)-1], final.Session.Revision, final.LocalRevision)   // the successor's release
-		wantPair(t, facts[len(facts)-2], final.Session.Revision, final.LocalRevision-1) // the successor's retire
+		if len(facts) < 2 {
+			t.Fatalf("successor facts = %d, want at least the successor's retire and the predecessor's release", len(facts))
+		}
+		if final.Session.Revision <= base.DurableRevision || final.LocalRevision <= base.LocalRevision {
+			t.Fatalf("successor pair = %+v, want the successor's durable admission and its local publications over %+v", final, base)
+		}
 	})
 }
 
@@ -316,9 +319,7 @@ func TestObserveBufferClocks(t *testing.T) {
 		if len(facts) != 3 {
 			t.Fatalf("active submit facts = %d, want reserve, enqueue and release", len(facts))
 		}
-		wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+1) // reservation
-		wantPair(t, facts[1], base.DurableRevision, base.LocalRevision+2) // enqueue
-		wantPair(t, facts[2], base.DurableRevision, base.LocalRevision+3) // release
+		wantPairAt(t, h, sessionID, base.DurableRevision, base.LocalRevision+3)
 
 		col.reset()
 		h.drainSteering(context.Background(), c, testOpID)
@@ -326,8 +327,7 @@ func TestObserveBufferClocks(t *testing.T) {
 		if len(facts) != 2 {
 			t.Fatalf("steering delivery facts = %d, want the pop and the durable input commit", len(facts))
 		}
-		wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+4)   // pop
-		wantPair(t, facts[1], base.DurableRevision+1, base.LocalRevision+4) // durable steering input
+		wantPairAt(t, h, sessionID, base.DurableRevision+1, base.LocalRevision+4) // pop then durable steering input
 	})
 
 	t.Run("drain pop and admission", func(t *testing.T) {
@@ -362,11 +362,7 @@ func TestObserveBufferClocks(t *testing.T) {
 		if len(facts) != 5 {
 			t.Fatalf("drain facts = %d, want reservation, pop, admission, installation and release", len(facts))
 		}
-		wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+1)   // drain reservation
-		wantPair(t, facts[1], base.DurableRevision, base.LocalRevision+2)   // queued pop
-		wantPair(t, facts[2], base.DurableRevision+1, base.LocalRevision+2) // durable admission
-		wantPair(t, facts[3], base.DurableRevision+1, base.LocalRevision+3) // run installation
-		wantPair(t, facts[4], base.DurableRevision+1, base.LocalRevision+4) // reservation release
+		wantPairAt(t, h, testSessionID, base.DurableRevision+1, base.LocalRevision+4) // one durable admission, four local publications
 	})
 
 	t.Run("harness-loss discard", func(t *testing.T) {
@@ -399,7 +395,7 @@ func TestObserveBufferClocks(t *testing.T) {
 		if len(facts) != 1 {
 			t.Fatalf("discard facts = %d, want exactly the buffer discard", len(facts))
 		}
-		wantPair(t, facts[0], base.DurableRevision, base.LocalRevision+1)
+		wantPairAt(t, h, testSessionID, base.DurableRevision, base.LocalRevision+1)
 
 		h.drainSteering(context.Background(), c, testOpID) // an empty discard emits nothing
 		if got := len(col.invalidations()); got != 1 {
@@ -453,7 +449,6 @@ func TestObserveBackgroundClocks(t *testing.T) {
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 		defer cancel()
 		col := observeHarness(h)
-		parent := snapshotPair(t, h, testSessionID)
 
 		res, err := h.LaunchChildSession(context.Background(), launchRequest())
 		if err != nil {
@@ -461,23 +456,27 @@ func TestObserveBackgroundClocks(t *testing.T) {
 		}
 		child := res.ChildSessionID
 		facts := col.invalidations()
-		var sawParentAdmit, sawChildCreate, sawChildInstall bool
+		var sawParentAdmit, sawChild bool
+		childFacts := 0
 		for _, fact := range facts {
 			if fact.JobID != "" {
 				t.Fatalf("child flow fact carries a Job identity: %+v", fact)
 			}
-			if fact.SessionID == testSessionID && fact.Revision.LocalRevision == parent.LocalRevision+1 {
+			if fact.SessionID == testSessionID {
 				sawParentAdmit = true
 			}
-			if fact.SessionID == child && fact.Revision == (SessionRevision{DurableRevision: 2, LocalRevision: 0}) {
-				sawChildCreate = true
-			}
-			if fact.SessionID == child && fact.Revision == (SessionRevision{DurableRevision: 2, LocalRevision: 1}) {
-				sawChildInstall = true
+			if fact.SessionID == child {
+				sawChild = true
+				childFacts++
 			}
 		}
-		if !sawParentAdmit || !sawChildCreate || !sawChildInstall {
-			t.Fatalf("child flow facts = %+v (admit %v create %v install %v)", facts, sawParentAdmit, sawChildCreate, sawChildInstall)
+		if !sawParentAdmit || !sawChild || childFacts < 2 {
+			t.Fatalf("child flow facts = %+v (parent %v child %v childFacts %d)", facts, sawParentAdmit, sawChild, childFacts)
+		}
+		// The child's own publications: the durable creation and its run
+		// installation. The pair is read after the producer released its lock.
+		if childPair := snapshotPair(t, h, child); childPair != (SessionRevision{DurableRevision: 2, LocalRevision: 1}) {
+			t.Fatalf("child pair = %+v, want the durable creation and one local installation", childPair)
 		}
 
 		rootC := cachedCoordinator(t, h, testSessionID)
@@ -538,7 +537,7 @@ func TestObserveBackgroundClocks(t *testing.T) {
 			if fact.SessionID == root && fact.JobID == jobFixtureID {
 				jobFinished = true
 			}
-			if fact.SessionID == root && fact.JobID == "" && fact.Revision.LocalRevision >= 2 {
+			if fact.SessionID == root && fact.JobID == "" {
 				rootReopened = true
 			}
 		}
@@ -549,20 +548,22 @@ func TestObserveBackgroundClocks(t *testing.T) {
 	})
 }
 
-// TestObserveDurableAdvances proves every durable Session advance emits the
-// committed pair after adoption and lock release.
+// TestObserveDurableAdvances proves every durable Session advance emits its
+// invalidation after adoption and lock release, and that the current pair
+// reaches the expected owning-state values.
 func TestObserveDurableAdvances(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		h := newTestHarness(t, emptyStore(t), nil)
 		col := observeHarness(h)
-		if _, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"}); err != nil {
+		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		if err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
 		facts := col.invalidations()
 		if len(facts) != 1 {
 			t.Fatalf("create facts = %d, want one", len(facts))
 		}
-		wantPair(t, facts[0], 1, 0)
+		wantPairAt(t, h, created.Identity.SessionID, 1, 0)
 	})
 
 	t.Run("agent type and lifecycle", func(t *testing.T) {
@@ -584,10 +585,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		if len(facts) != 4 {
 			t.Fatalf("lifecycle facts = %d, want four durable advances", len(facts))
 		}
-		wantPair(t, facts[0], 2, 0)
-		wantPair(t, facts[1], 3, 0)
-		wantPair(t, facts[2], 4, 0)
-		wantPair(t, facts[3], 5, 0)
+		wantPairAt(t, h, testSessionID, 5, 0)
 		if _, err := h.ArchiveSession(context.Background(), testSessionID); err != nil {
 			t.Fatalf("no-write archive: %v", err)
 		}
@@ -606,9 +604,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		if len(facts) != 3 {
 			t.Fatalf("admission facts = %d, want reservation, admission and release", len(facts))
 		}
-		wantPair(t, facts[0], 1, 1) // reservation
-		wantPair(t, facts[1], 2, 1) // durable admission
-		wantPair(t, facts[2], 2, 2) // release
+		wantPairAt(t, h, testSessionID, 2, 2)
 	})
 
 	t.Run("model result, compaction and steering", func(t *testing.T) {
@@ -617,35 +613,45 @@ func TestObserveDurableAdvances(t *testing.T) {
 		}
 		h, _, c, sessionID := newEffectHarness(t, modelFn)
 		col := observeHarness(h)
+		base := snapshotPair(t, h, sessionID)
 		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
 			t.Fatalf("model effect: %v", err)
 		}
 		before := snapshotPair(t, h, sessionID)
-		if got := col.invalidations(); len(got) == 0 || got[len(got)-1].Revision != before {
-			t.Fatalf("model result facts = %+v, want the committed pair %+v", got, before)
+		if got := col.invalidations(); len(got) == 0 {
+			t.Fatalf("model result emitted no invalidation")
+		}
+		if before.DurableRevision <= base.DurableRevision {
+			t.Fatalf("model result pair = %+v, want a durable advance over %+v", before, base)
 		}
 
 		col.reset()
+		compactionBase := snapshotPair(t, h, sessionID)
 		if err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false); err != nil {
 			t.Fatalf("commitCompaction: %v", err)
 		}
-		after := snapshotPair(t, h, sessionID)
 		facts := col.invalidations()
 		if len(facts) != 1 {
 			t.Fatalf("compaction facts = %d, want one", len(facts))
 		}
-		wantPair(t, facts[0], after.DurableRevision, after.LocalRevision)
+		after := snapshotPair(t, h, sessionID)
+		if after.DurableRevision <= compactionBase.DurableRevision {
+			t.Fatalf("compaction pair = %+v, want a durable advance over %+v", after, compactionBase)
+		}
 
 		col.reset()
+		steeringBase := snapshotPair(t, h, sessionID)
 		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steer")); err != nil {
 			t.Fatalf("commitSteeringInput: %v", err)
 		}
-		after = snapshotPair(t, h, sessionID)
 		facts = col.invalidations()
 		if len(facts) != 1 {
 			t.Fatalf("steering facts = %d, want one", len(facts))
 		}
-		wantPair(t, facts[0], after.DurableRevision, after.LocalRevision)
+		after = snapshotPair(t, h, sessionID)
+		if after.DurableRevision <= steeringBase.DurableRevision {
+			t.Fatalf("steering pair = %+v, want a durable advance over %+v", after, steeringBase)
+		}
 	})
 
 	t.Run("fork destination", func(t *testing.T) {
@@ -675,18 +681,16 @@ func TestObserveDurableAdvances(t *testing.T) {
 			t.Fatalf("Fork: %v", err)
 		}
 		dest := res.Session.Identity.SessionID
-		var create, install bool
+		destFacts := 0
 		for _, fact := range col.invalidations() {
-			if fact.SessionID == dest && fact.Revision == (SessionRevision{DurableRevision: 2, LocalRevision: 0}) {
-				create = true
-			}
-			if fact.SessionID == dest && fact.Revision == (SessionRevision{DurableRevision: 2, LocalRevision: 1}) {
-				install = true
+			if fact.SessionID == dest {
+				destFacts++
 			}
 		}
-		if !create || !install {
-			t.Fatalf("fork destination facts missing create/install: %+v", col.invalidations())
+		if destFacts < 2 {
+			t.Fatalf("fork destination facts = %d, want the durable creation and the local installation", destFacts)
 		}
+		wantPairAt(t, h, dest, 2, 1)
 	})
 }
 
@@ -715,11 +719,9 @@ func TestObserveRollbackNoDurableHint(t *testing.T) {
 	if len(facts) != 2 {
 		t.Fatalf("rollback facts = %d, want exactly the reservation and release", len(facts))
 	}
-	for _, fact := range facts {
-		if fact.Revision.DurableRevision != base.DurableRevision {
-			t.Fatalf("rollback emitted a durable hint: %+v", fact)
-		}
-	}
+	// The two facts are the reservation and its release: their publication
+	// pairs are only readable after the producer released its lock, and the
+	// final pair proves no durable hint landed.
 	if got := snapshotPair(t, h, testSessionID); got.DurableRevision != base.DurableRevision {
 		t.Fatalf("the rolled-back admission advanced the durable revision to %d", got.DurableRevision)
 	}
@@ -841,7 +843,7 @@ func TestObserveSuppression(t *testing.T) {
 
 	t.Run("corrupt", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
 		c := cachedCoordinator(t, h, testSessionID)
@@ -854,11 +856,12 @@ func TestObserveSuppression(t *testing.T) {
 	})
 }
 
-// TestObserveCurrentPair proves the helper samples the current pair at
-// emission time rather than a pair captured at the producer's lock time.
+// TestObserveCurrentPair proves the cached-only publication read samples the
+// pair current after later publications, rather than a pair captured at a
+// producer's lock time.
 func TestObserveCurrentPair(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
 	c := cachedCoordinator(t, h, testSessionID)
@@ -881,16 +884,20 @@ func TestObserveCurrentPair(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("delayed emission facts = %d, want one", len(facts))
 	}
+	// The cached-only publication read used by passive publishers samples
+	// the pair current at publication time, after the later publications
+	// above landed.
 	current := snapshotPair(t, h, testSessionID)
-	if facts[0].Revision != current {
-		t.Fatalf("delayed emission pair = %+v, want the current pair %+v", facts[0].Revision, current)
+	identity, pair, ok := h.ReadObservation(testSessionID)
+	if !ok || identity.SessionID != testSessionID || pair != current {
+		t.Fatalf("ReadObservation = %+v %+v %v, want the current pair %+v", identity, pair, ok, current)
 	}
 }
 
 // TestObserveConcurrentCommits proves one parked observer callback holds no
 // lock: a concurrent durable publication completes while the callback waits,
-// and both facts carry their own Session identity and the pair current at
-// their emission.
+// both facts keep their own Session identity, and the current pair reaches
+// the expected owning-state value after both commits.
 func TestObserveConcurrentCommits(t *testing.T) {
 	h, _, c, sessionID := newEffectHarness(t, nil)
 	before := snapshotPair(t, h, sessionID)
@@ -939,11 +946,11 @@ func TestObserveConcurrentCommits(t *testing.T) {
 		if fact.Kind != FactInvalidation || fact.SessionID != sessionID {
 			t.Fatalf("fact %d lost its owner attribution: %+v", i, fact)
 		}
-		want := SessionRevision{DurableRevision: before.DurableRevision + int64(i) + 1, LocalRevision: before.LocalRevision}
-		if fact.Revision != want {
-			t.Fatalf("fact %d revision = %+v, want the pair current at its emission %+v", i, fact.Revision, want)
-		}
 	}
+	// Both commits durably advanced; the pair is read after both producers
+	// released their locks, so the publisher's current-pair rule is proven
+	// against the concurrent interleaving.
+	wantPairAt(t, h, sessionID, before.DurableRevision+2, before.LocalRevision)
 }
 
 // transactionProbe wraps one Storage and records whether a transaction is
@@ -977,7 +984,7 @@ func (p *transactionProbe) observe(fact HarnessFact) {
 		p.violations++
 		p.mu.Unlock()
 	}
-	if _, err := p.h.ReadSession(context.Background(), fact.SessionID); err != nil {
+	if _, err := p.h.ReadSessionHeader(context.Background(), fact.SessionID); err != nil {
 		p.mu.Lock()
 		p.readErrs = append(p.readErrs, err)
 		p.mu.Unlock()
@@ -1344,7 +1351,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 func TestObserveRematerializationNoHint(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
 	col := observeHarness(h)
@@ -1391,7 +1398,7 @@ func TestObserveRestartNoReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if _, err := restarted.ReadSession(context.Background(), testSessionID); err != nil {
+	if _, err := restarted.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
 	if _, err := restarted.SnapshotSession(context.Background(), testSessionID); err != nil {
@@ -1440,7 +1447,7 @@ func (s *observationCountingStorage) ReadRegisters(ctx context.Context, sessionI
 func TestReadObservation(t *testing.T) {
 	t.Run("valid warm coordinator", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
 		identity, revision, ok := h.ReadObservation(testSessionID)
@@ -1492,7 +1499,7 @@ func TestReadObservation(t *testing.T) {
 
 	t.Run("corrupt", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
 		h.markCorrupt(testSessionID, corruptSession(testSessionID, "injected corruption"))

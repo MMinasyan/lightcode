@@ -77,19 +77,6 @@ paths:
         default:
           $ref: "#/components/responses/Error"
   /v1/sessions/{id}:
-    get:
-      operationId: GetSession
-      parameters:
-        - $ref: "#/components/parameters/SessionID"
-      responses:
-        "200":
-          description: The projected Session header without history.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Session"
-        default:
-          $ref: "#/components/responses/Error"
     delete:
       operationId: DeleteSession
       parameters:
@@ -172,13 +159,6 @@ paths:
       operationId: InterruptSession
       parameters:
         - $ref: "#/components/parameters/SessionID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
       responses:
         "204":
           description: The interrupt control was issued; it does not wait for the terminal commit.
@@ -189,13 +169,6 @@ paths:
       operationId: StopSession
       parameters:
         - $ref: "#/components/parameters/SessionID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
       responses:
         "204":
           description: The stop control completed its background convergence wait.
@@ -272,34 +245,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HistoryPage"
-        default:
-          $ref: "#/components/responses/Error"
-  /v1/sessions/{id}/pending:
-    get:
-      operationId: GetSessionPending
-      parameters:
-        - $ref: "#/components/parameters/SessionID"
-      responses:
-        "200":
-          description: Both process-local pending queues from the Session snapshot producer.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PendingSnapshot"
-        default:
-          $ref: "#/components/responses/Error"
-  /v1/sessions/{id}/usage:
-    get:
-      operationId: GetSessionUsage
-      parameters:
-        - $ref: "#/components/parameters/SessionID"
-      responses:
-        "200":
-          description: The canonical usage totals and the display context estimate.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/UsageSnapshot"
         default:
           $ref: "#/components/responses/Error"
   /v1/sessions/{id}/code-snapshots:
@@ -1226,17 +1171,6 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PendingInput"
-    PendingSnapshot:
-      type: object
-      additionalProperties: false
-      required:
-        - session_revision
-        - pending
-      properties:
-        session_revision:
-          $ref: "#/components/schemas/SessionRevision"
-        pending:
-          $ref: "#/components/schemas/PendingQueues"
     BackgroundMember:
       type: object
       additionalProperties: false
@@ -1486,20 +1420,6 @@ components:
             $ref: "#/components/schemas/ConversationItem"
         older_cursor:
           type: string
-    UsageSnapshot:
-      type: object
-      additionalProperties: false
-      required:
-        - session_revision
-        - configuration_revision
-        - usage
-      properties:
-        session_revision:
-          $ref: "#/components/schemas/SessionRevision"
-        configuration_revision:
-          $ref: "#/components/schemas/ConfigurationRevision"
-        usage:
-          $ref: "#/components/schemas/UsageProjection"
     Warning:
       type: object
       additionalProperties: false
@@ -1544,9 +1464,14 @@ components:
         - usage
         - warnings
         - background
+        - selected_model
       properties:
         session:
           $ref: "#/components/schemas/Session"
+        selected_model:
+          type: string
+          nullable: true
+          x-go-type: ModelRef
         session_revision:
           $ref: "#/components/schemas/SessionRevision"
         configuration_revision:

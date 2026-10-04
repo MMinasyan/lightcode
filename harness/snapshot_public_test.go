@@ -42,6 +42,142 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	}
 }
 
+// TestPublicReadSessionHistoryOwnedCapture proves the direct narrow history
+// producer over both stores: exact envelope identity/kind/order of every
+// committed entry with hook evidence excluded, the revision pair sampled in
+// the same hold as the full snapshot pair, cross-producer equality with the
+// full snapshot's facts, and nested returned-value ownership against a
+// serialized expectation captured before mutation.
+func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		fixture := harness.SeedFactFixture(t, store)
+		hctx, cancel := context.WithCancel(ctx)
+		h, err := harness.New(hctx, harness.Dependencies{
+			Storage: store,
+			Prepare: func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
+				return harness.PreparedExecution{}, errors.New("the narrow read fixture never prepares")
+			},
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() {
+			cancel()
+			_ = h.Wait(context.Background())
+		}()
+
+		facts, pair, err := h.ReadSessionHistory(ctx, fixture.SessionID)
+		if err != nil {
+			t.Fatalf("ReadSessionHistory: %v", err)
+		}
+		if fixture.HookEntryID == "" {
+			t.Fatal("the owning fixture lost its hook evidence entry")
+		}
+		if len(facts) != len(fixture.Identities) {
+			t.Fatalf("history = %d facts, want the %d non-hook entries", len(facts), len(fixture.Identities))
+		}
+		for i, want := range fixture.Identities {
+			got := facts[i]
+			if got.EntryID != want.EntryID || got.OperationID != want.OperationID || got.Kind != want.Kind {
+				t.Fatalf("fact %d = (%s/%s/%s), want the fixture envelope (%s/%s/%s)",
+					i, got.EntryID, got.OperationID, got.Kind, want.EntryID, want.OperationID, want.Kind)
+			}
+			if got.EntryID == fixture.HookEntryID {
+				t.Fatalf("fact %d leaked the hook evidence entry", i)
+			}
+		}
+
+		snap, err := h.SnapshotSession(ctx, fixture.SessionID)
+		if err != nil {
+			t.Fatalf("SnapshotSession: %v", err)
+		}
+		wantPair := harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
+		if pair != wantPair {
+			t.Fatalf("history pair = %+v, want the full snapshot's %+v", pair, wantPair)
+		}
+		if !reflect.DeepEqual(facts, snap.Facts) {
+			t.Fatal("the narrow history producer and the full snapshot disagree on the committed facts")
+		}
+
+		// The serialized expectation is captured BEFORE any mutation: the
+		// returned values are owned, so both a fresh narrow read and a fresh
+		// full snapshot must still serialize to it.
+		expected, err := json.Marshal(facts)
+		if err != nil {
+			t.Fatalf("marshal the baseline history: %v", err)
+		}
+		for i := range facts {
+			fact := &facts[i]
+			if fact.Input != nil && len(fact.Input.Content) > 0 {
+				fact.Input.Content[0].Text = "mutated"
+				if fact.Input.Content[0].Extra == nil {
+					fact.Input.Content[0].Extra = model.Extra{}
+				}
+				fact.Input.Content[0].Extra["part"] = json.RawMessage(`"mutated"`)
+			}
+			if fact.Assistant != nil {
+				if len(fact.Assistant.Content) > 0 {
+					fact.Assistant.Content[0].Text = "mutated"
+				}
+				if fact.Assistant.Extra == nil {
+					fact.Assistant.Extra = model.Extra{}
+				}
+				fact.Assistant.Extra["reasoning"] = json.RawMessage(`null`)
+				if fact.Assistant.Usage != nil {
+					fact.Assistant.Usage.InputTokens = 999
+				}
+				if len(fact.Assistant.ToolCalls) > 0 {
+					fact.Assistant.ToolCalls[0].NormalizedArguments = json.RawMessage(`{"mutated":true}`)
+					if fact.Assistant.ToolCalls[0].Extra == nil {
+						fact.Assistant.ToolCalls[0].Extra = model.Extra{}
+					}
+					fact.Assistant.ToolCalls[0].Extra["call"] = json.RawMessage(`null`)
+				}
+			}
+			if fact.ToolResult != nil {
+				fact.ToolResult.Metadata = json.RawMessage(`"mutated"`)
+			}
+			if fact.Signal != nil && fact.Signal.RelatedMember != nil {
+				fact.Signal.RelatedMember.ID = "mutated"
+			}
+			if fact.Compaction != nil && fact.Compaction.Usage != nil {
+				fact.Compaction.Usage.InputTokens = 999
+			}
+			if fact.Settlement != nil {
+				if fact.Settlement.Model != nil {
+					fact.Settlement.Model.Model = "mutated"
+				}
+				if fact.Settlement.Usage != nil {
+					fact.Settlement.Usage.InputTokens = 999
+				}
+			}
+		}
+		again, _, err := h.ReadSessionHistory(ctx, fixture.SessionID)
+		if err != nil {
+			t.Fatalf("ReadSessionHistory after mutation: %v", err)
+		}
+		got, err := json.Marshal(again)
+		if err != nil {
+			t.Fatalf("marshal the fresh history: %v", err)
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("a mutation of the returned history reached the owner or another read")
+		}
+		snapAfter, err := h.SnapshotSession(ctx, fixture.SessionID)
+		if err != nil {
+			t.Fatalf("SnapshotSession after mutation: %v", err)
+		}
+		snapGot, err := json.Marshal(snapAfter.Facts)
+		if err != nil {
+			t.Fatalf("marshal the fresh snapshot facts: %v", err)
+		}
+		if !bytes.Equal(snapGot, expected) {
+			t.Fatal("a mutation of the returned history reached the full snapshot producer")
+		}
+	})
+}
+
 // TestPublicSnapshotSessionReadsAndOwns proves the complete owned read over
 // both stores: sorted warm Operations, the typed fact union in ascending
 // sequence, the durable Session record, and the quiet busy fact.
@@ -1150,7 +1286,7 @@ func TestPublicListSessionsStaleEnumeratedRow(t *testing.T) {
 		if _, err := f.h.ArchiveSession(ctx, sibling); err != nil {
 			t.Fatalf("ArchiveSession: %v", err)
 		}
-		survivor, err := f.h.ReadSession(ctx, sibling)
+		survivor, err := f.h.ReadSessionHeader(ctx, sibling)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
@@ -1160,7 +1296,7 @@ func TestPublicListSessionsStaleEnumeratedRow(t *testing.T) {
 		wrapped.listed = make(chan struct{})
 		wrapped.listRelease = make(chan struct{})
 		type listResult struct {
-			rows []harness.SessionRecord
+			rows []harness.SessionHeader
 			err  error
 		}
 		listDone := make(chan listResult, 1)
@@ -1641,10 +1777,33 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 	})
 }
 
+// awaitStoreQuiet waits until one Session holds no current Operation, no
+// installed run, and no reservation: the post-terminal retirement is a
+// coordinator-local publication, so a pair-sensitive baseline must be taken
+// only after it lands.
+func awaitStoreQuiet(t *testing.T, h *harness.Harness, session string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		snap, err := h.SnapshotSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("SnapshotSession: %v", err)
+		}
+		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session %s never reached the quiet pair", session)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestPublicListSessionsRowOwnership proves the listing rows are owned
 // copies against an immutable serialized expectation: mutating a returned
-// row's archived time, usage references, identity, and slice length must
-// never reach the coordinator or another listing.
+// row's archived time, identity, lifecycle metadata, and slice length must
+// never reach the coordinator or another listing. Usage totals are not a
+// listing-row member; their ownership is covered by the snapshot matrix.
 func TestPublicListSessionsRowOwnership(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -1660,13 +1819,14 @@ func TestPublicListSessionsRowOwnership(t *testing.T) {
 		if _, err := f.h.ArchiveSession(ctx, session); err != nil {
 			t.Fatalf("ArchiveSession: %v", err)
 		}
+		awaitStoreQuiet(t, f.h, session)
 
 		rows, err := f.h.ListSessions(ctx)
 		if err != nil || len(rows) != 1 {
 			t.Fatalf("ListSessions = %+v err %v", rows, err)
 		}
-		if rows[0].State.ArchivedAt == nil || len(rows[0].State.Usage.ByModel) == 0 {
-			t.Fatalf("row fixture lost its archived time or usage references: %+v", rows[0].State)
+		if rows[0].ArchivedAt == nil {
+			t.Fatalf("row fixture lost its archived time: %+v", rows[0])
 		}
 		expected, err := json.Marshal(rows)
 		if err != nil {
@@ -1677,14 +1837,11 @@ func TestPublicListSessionsRowOwnership(t *testing.T) {
 		if err != nil || len(mutated) != 1 {
 			t.Fatalf("second ListSessions = %+v err %v", mutated, err)
 		}
-		*mutated[0].State.ArchivedAt = mutated[0].State.ArchivedAt.Add(time.Hour)
-		mutated[0].State.Usage.ByModel[0].Model.Provider = "mutated"
-		mutated[0].State.Usage.ByModel[0].Usage.InputTokens = 999
-		mutated[0].State.Usage.ByModel = append(mutated[0].State.Usage.ByModel, harness.ModelUsage{})
+		*mutated[0].ArchivedAt = mutated[0].ArchivedAt.Add(time.Hour)
 		mutated[0].Identity.Workspace = "mutated"
-		mutated[0].State.Lifecycle = "mutated"
-		mutated[0].State.CurrentAgentType = "mutated"
-		mutated = append(mutated, harness.SessionRecord{})
+		mutated[0].Lifecycle = "mutated"
+		mutated[0].CurrentAgentType = "mutated"
+		mutated = append(mutated, harness.SessionHeader{})
 
 		fresh, err := f.h.ListSessions(ctx)
 		if err != nil || len(fresh) != 1 {

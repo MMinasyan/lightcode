@@ -150,11 +150,6 @@ export type PendingQueues = {
     queued: Array<PendingInput>;
 };
 
-export type PendingSnapshot = {
-    session_revision: SessionRevision;
-    pending: PendingQueues;
-};
-
 export type BackgroundMember = {
     kind: 'child' | 'job';
     id: string;
@@ -256,12 +251,6 @@ export type HistoryPage = {
     older_cursor?: string;
 };
 
-export type UsageSnapshot = {
-    session_revision: SessionRevision;
-    configuration_revision: ConfigurationRevision;
-    usage: UsageProjection;
-};
-
 export type Warning = {
     source: string;
     kind: string;
@@ -276,6 +265,7 @@ export type WarningsSnapshot = {
 
 export type Hydration = {
     session: Session;
+    selected_model: string | null;
     session_revision: SessionRevision;
     configuration_revision: ConfigurationRevision;
     warnings_revision: WarningsRevision;
@@ -836,33 +826,6 @@ export type DeleteSessionResponses = {
 
 export type DeleteSessionResponse = DeleteSessionResponses[keyof DeleteSessionResponses];
 
-export type GetSessionData = {
-    body?: never;
-    path: {
-        id: string;
-    };
-    query?: never;
-    url: '/v1/sessions/{id}';
-};
-
-export type GetSessionErrors = {
-    /**
-     * One schema-defined typed error.
-     */
-    default: Error;
-};
-
-export type GetSessionError = GetSessionErrors[keyof GetSessionErrors];
-
-export type GetSessionResponses = {
-    /**
-     * The projected Session header without history.
-     */
-    200: Session;
-};
-
-export type GetSessionResponse = GetSessionResponses[keyof GetSessionResponses];
-
 export type ArchiveSessionData = {
     body?: never;
     path: {
@@ -972,9 +935,7 @@ export type CompactSessionResponses = {
 export type CompactSessionResponse = CompactSessionResponses[keyof CompactSessionResponses];
 
 export type InterruptSessionData = {
-    body: {
-        [key: string]: never;
-    };
+    body?: never;
     path: {
         id: string;
     };
@@ -1001,9 +962,7 @@ export type InterruptSessionResponses = {
 export type InterruptSessionResponse = InterruptSessionResponses[keyof InterruptSessionResponses];
 
 export type StopSessionData = {
-    body: {
-        [key: string]: never;
-    };
+    body?: never;
     path: {
         id: string;
     };
@@ -1138,60 +1097,6 @@ export type GetSessionHistoryResponses = {
 };
 
 export type GetSessionHistoryResponse = GetSessionHistoryResponses[keyof GetSessionHistoryResponses];
-
-export type GetSessionPendingData = {
-    body?: never;
-    path: {
-        id: string;
-    };
-    query?: never;
-    url: '/v1/sessions/{id}/pending';
-};
-
-export type GetSessionPendingErrors = {
-    /**
-     * One schema-defined typed error.
-     */
-    default: Error;
-};
-
-export type GetSessionPendingError = GetSessionPendingErrors[keyof GetSessionPendingErrors];
-
-export type GetSessionPendingResponses = {
-    /**
-     * Both process-local pending queues from the Session snapshot producer.
-     */
-    200: PendingSnapshot;
-};
-
-export type GetSessionPendingResponse = GetSessionPendingResponses[keyof GetSessionPendingResponses];
-
-export type GetSessionUsageData = {
-    body?: never;
-    path: {
-        id: string;
-    };
-    query?: never;
-    url: '/v1/sessions/{id}/usage';
-};
-
-export type GetSessionUsageErrors = {
-    /**
-     * One schema-defined typed error.
-     */
-    default: Error;
-};
-
-export type GetSessionUsageError = GetSessionUsageErrors[keyof GetSessionUsageErrors];
-
-export type GetSessionUsageResponses = {
-    /**
-     * The canonical usage totals and the display context estimate.
-     */
-    200: UsageSnapshot;
-};
-
-export type GetSessionUsageResponse = GetSessionUsageResponses[keyof GetSessionUsageResponses];
 
 export type GetSessionCodeSnapshotsData = {
     body?: never;

@@ -318,14 +318,14 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		session := created.JSON201.SessionId
 		assertQualifiedInstance(t, "created header", created.JSON201.SessionRevision, ps.instance)
 
-		header, err := client.GetSessionWithResponse(ctx, session)
+		header, err := client.GetSessionHydrationWithResponse(ctx, session)
 		if err != nil {
-			t.Fatalf("GetSession: %v", err)
+			t.Fatalf("GetSessionHydration: %v", err)
 		}
-		if header.JSON200 == nil || header.JSON200.SessionId != session {
+		if header.JSON200 == nil || header.JSON200.Session.SessionId != session {
 			t.Fatalf("read header = %v, want the created session", header.JSON200)
 		}
-		assertQualifiedInstance(t, "read header", header.JSON200.SessionRevision, ps.instance)
+		assertQualifiedInstance(t, "read header", header.JSON200.Session.SessionRevision, ps.instance)
 
 		// The mounted list route normalizes one relative workspace root
 		// before filtering; the literal compare is the forbidden sibling.
@@ -433,22 +433,25 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			t.Fatalf("steering submit = %s, want the steering disposition", body)
 		}
 
-		pending, err := client.GetSessionPendingWithResponse(ctx, session)
-		if err != nil {
-			t.Fatalf("GetSessionPending: %v", err)
-		}
-		if pending.JSON200 == nil || len(pending.JSON200.Pending.Steering) != 1 || len(pending.JSON200.Pending.Queued) != 1 {
-			body, _ := json.Marshal(pending.JSON200)
-			t.Fatalf("pending queues = %s, want one steering and one queued item", body)
-		}
-		assertQualifiedInstance(t, "pending", pending.JSON200.SessionRevision, ps.instance)
-
 		hydration, err := client.GetSessionHydrationWithResponse(ctx, session)
 		if err != nil {
 			t.Fatalf("GetSessionHydration: %v", err)
 		}
 		if hydration.JSON200 == nil {
 			t.Fatalf("hydration = %d with no typed body", hydration.HTTPResponse.StatusCode)
+		}
+		if len(hydration.JSON200.Pending.Steering) != 1 || len(hydration.JSON200.Pending.Queued) != 1 {
+			body, _ := json.Marshal(hydration.JSON200.Pending)
+			t.Fatalf("pending queues = %s, want one steering and one queued item", body)
+		}
+		if hydration.JSON200.Usage.Totals.ByModel == nil {
+			t.Fatalf("hydration usage totals = %+v, want the present by-model array", hydration.JSON200.Usage.Totals)
+		}
+		if hydration.JSON200.SelectedModel == nil || *hydration.JSON200.SelectedModel != "prov/m" {
+			t.Fatalf("hydration selected model = %v, want the configured prov/m", hydration.JSON200.SelectedModel)
+		}
+		if hydration.JSON200.Usage.Context.ContextWindow != 4096 {
+			t.Fatalf("hydration context window = %d, want the captured 4096", hydration.JSON200.Usage.Context.ContextWindow)
 		}
 		assertQualifiedInstance(t, "hydration", hydration.JSON200.SessionRevision, ps.instance)
 		if hydration.JSON200.Session.SessionId != session || hydration.JSON200.Session.SessionRevision.InstanceId != ps.instance {
@@ -461,13 +464,18 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			t.Fatalf("hydration's warnings revision instance = %q", hydration.JSON200.WarningsRevision.InstanceId)
 		}
 
-		usage, err := client.GetSessionUsageWithResponse(ctx, session)
-		if err != nil {
-			t.Fatalf("GetSessionUsage: %v", err)
+		// An unresolvable Agent type yields the required null selection over
+		// the mounted wire, never a fallback model.
+		ghostSession, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "ghost"})
+		if err != nil || ghostSession.JSON201 == nil {
+			t.Fatalf("create unresolved-type session: %v", err)
 		}
-		if usage.JSON200 == nil || usage.JSON200.SessionRevision.InstanceId != ps.instance ||
-			usage.JSON200.ConfigurationRevision.InstanceId != ps.instance {
-			t.Fatalf("usage revisions are not instance-qualified: %+v", usage.JSON200)
+		ghostHydration, err := client.GetSessionHydrationWithResponse(ctx, ghostSession.JSON201.SessionId)
+		if err != nil || ghostHydration.JSON200 == nil {
+			t.Fatalf("hydration of an unresolved type = (%d, %v), want a typed body", ghostHydration.HTTPResponse.StatusCode, err)
+		}
+		if ghostHydration.JSON200.SelectedModel != nil {
+			t.Fatalf("unresolved-type selected model = %v, want null", ghostHydration.JSON200.SelectedModel)
 		}
 
 		groups, err := client.GetSessionCodeSnapshotsWithResponse(ctx, session)
@@ -482,7 +490,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		// The interrupt control answers 204 while the gated Operation runs;
 		// the queued and steering buffers then drain and the whole Session
 		// converges before the fork addresses it.
-		if response, err := client.InterruptSessionWithResponse(ctx, session, protocol.InterruptSessionJSONBody{}); err != nil || response.HTTPResponse.StatusCode != http.StatusNoContent {
+		if response, err := client.InterruptSessionWithResponse(ctx, session); err != nil || response.HTTPResponse.StatusCode != http.StatusNoContent {
 			t.Fatalf("interrupt = (%d, %v), want 204", response.HTTPResponse.StatusCode, err)
 		}
 		release()
@@ -533,7 +541,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		// idle root Session, and the compact command admits its Operation on
 		// the same idle discipline.
 		other := projectionSession(t, r, filepath.Join(e.home, "other"), "solo").Identity.SessionID
-		if response, err := client.StopSessionWithResponse(ctx, other, protocol.StopSessionJSONBody{}); err != nil || response.HTTPResponse.StatusCode != http.StatusNoContent {
+		if response, err := client.StopSessionWithResponse(ctx, other); err != nil || response.HTTPResponse.StatusCode != http.StatusNoContent {
 			t.Fatalf("stop = (%d, %v), want 204", response.HTTPResponse.StatusCode, err)
 		}
 		compacted, err := client.CompactSessionWithResponse(ctx, other, protocol.CompactRequest{OperationId: "compact-1"})
@@ -604,7 +612,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		if deleted.HTTPResponse.StatusCode != http.StatusNoContent {
 			t.Fatalf("delete = %d, want 204", deleted.HTTPResponse.StatusCode)
 		}
-		if missing, err := client.GetSessionWithResponse(ctx, other); err != nil || missing.JSON200 != nil {
+		if missing, err := client.GetSessionHydrationWithResponse(ctx, other); err != nil || missing.JSON200 != nil {
 			t.Fatalf("deleted session read = (%d, %+v), want the typed not-found", missing.HTTPResponse.StatusCode, missing.JSON200)
 		} else if missing.JSONDefault == nil || missing.JSONDefault.Code != protocol.NotFound {
 			t.Fatalf("deleted session read error = %+v, want not_found", missing.JSONDefault)

@@ -43,6 +43,21 @@ type HistoryFact struct {
 	Settlement  *OperationSettlementEntry
 }
 
+// SessionHeader is one owned metadata read of one Session: the identity and
+// lifecycle state that list rows, command results, and navigation consume,
+// plus the revision pair. It copies no usage totals, context state,
+// Operations, history facts, or pending FIFO members; the archived-time
+// pointee is the only referenced value and is copied.
+type SessionHeader struct {
+	Identity           SessionIdentity
+	Lifecycle          SessionLifecycle
+	CurrentAgentType   string
+	CurrentOperationID string
+	LastActivity       time.Time
+	ArchivedAt         *time.Time
+	Revision           SessionRevision
+}
+
 // SessionSnapshot is one coherent owned read of one Session's complete
 // validated state: the durable Session record, every Operation record sorted
 // lexicographically by Operation identity, the committed history facts in
@@ -131,19 +146,80 @@ func (h *Harness) SnapshotSession(ctx context.Context, sessionID string) (Sessio
 	return snap, nil
 }
 
+// unavailableLocked reports one coordinator's availability as a typed error:
+// nil means available, a gone coordinator maps to the not-found class, and the
+// sticky corruption marker maps to its typed corruption error. The caller
+// holds c.mu; the marker is read through the registry mutex taken inside that
+// hold (the permitted c.mu→h.mu order). The passive publication read consumes
+// the same check.
+func (h *Harness) unavailableLocked(c *coordinator, sessionID string) error {
+	if c.gone {
+		return notFoundSession(sessionID)
+	}
+	h.mu.Lock()
+	corrupt := c.corru
+	h.mu.Unlock()
+	return corrupt
+}
+
+// ReadSessionHeader materializes one Session and returns its owned metadata
+// header under one coordinator-mutex hold. The revision pair is computed
+// directly inside that hold and the shared unavailable check runs there. A
+// deleted Session returns the not-found class, a corrupt Session its typed
+// corruption error, and a storage or context failure passes through
+// unmodified.
+func (h *Harness) ReadSessionHeader(ctx context.Context, sessionID string) (SessionHeader, error) {
+	c, err := h.coordinatorFor(ctx, sessionID)
+	if err != nil {
+		return SessionHeader{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return SessionHeader{}, err
+	}
+	return sessionHeaderLocked(c), nil
+}
+
+// ReadSessionHistory materializes one Session and returns its owned committed
+// history facts in ascending sequence plus the revision pair, under one
+// coordinator-mutex hold with the shared unavailable check. It copies no
+// Operation registers, pending FIFO members, usage totals, or context state.
+// A hook_result entry contributes no fact. A deleted Session returns the
+// not-found class, a corrupt Session its typed corruption error, and a storage
+// or context failure passes through unmodified.
+func (h *Harness) ReadSessionHistory(ctx context.Context, sessionID string) ([]HistoryFact, SessionRevision, error) {
+	c, err := h.coordinatorFor(ctx, sessionID)
+	if err != nil {
+		return nil, SessionRevision{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return nil, SessionRevision{}, err
+	}
+	facts := make([]HistoryFact, 0, len(c.graph.Entries))
+	for _, entry := range c.graph.Entries {
+		if fact, ok := ownHistoryFact(entry); ok {
+			facts = append(facts, fact)
+		}
+	}
+	return facts, sessionRevisionLocked(c), nil
+}
+
 // ListSessions enumerates the durable Session identities through storage and
-// returns each available Session's owned materialized record in the sorted
+// returns each available Session's owned metadata header in the sorted
 // listing order. A Session that fails validation is unavailable: absent from
 // the returned list while valid siblings stay listed, with its direct reads
 // returning the typed error. A malformed stored identity is omitted, like the
 // sweep and recovery passes. Enumeration, storage, and context failures
 // propagate: no misleading successful partial list is returned.
-func (h *Harness) ListSessions(ctx context.Context) ([]SessionRecord, error) {
+func (h *Harness) ListSessions(ctx context.Context) ([]SessionHeader, error) {
 	ids, err := h.deps.Storage.ListSessionIDs(ctx)
 	if err != nil {
 		return nil, err
 	}
-	records := make([]SessionRecord, 0, len(ids))
+	headers := make([]SessionHeader, 0, len(ids))
 	for _, sessionID := range ids {
 		if err := validateHexID(sessionID, "session id"); err != nil {
 			continue
@@ -156,14 +232,39 @@ func (h *Harness) ListSessions(ctx context.Context) ([]SessionRecord, error) {
 			return nil, err
 		}
 		c.mu.Lock()
-		if c.gone { // a deletion committed between the lookup and the read
+		if h.unavailableLocked(c, sessionID) != nil { // deletion or corruption committed between the lookup and the read
 			c.mu.Unlock()
 			continue
 		}
-		records = append(records, ownSessionRecord(c.graph.Session))
+		headers = append(headers, sessionHeaderLocked(c))
 		c.mu.Unlock()
 	}
-	return records, nil
+	return headers, nil
+}
+
+// sessionHeaderLocked copies one coordinator's metadata header; the caller
+// holds the coordinator mutex.
+func sessionHeaderLocked(c *coordinator) SessionHeader {
+	record := c.graph.Session
+	header := SessionHeader{
+		Identity:           record.Identity,
+		Lifecycle:          record.State.Lifecycle,
+		CurrentAgentType:   record.State.CurrentAgentType,
+		CurrentOperationID: record.State.CurrentOperationID,
+		LastActivity:       record.State.LastActivity,
+		Revision:           sessionRevisionLocked(c),
+	}
+	if record.State.ArchivedAt != nil {
+		stamped := *record.State.ArchivedAt
+		header.ArchivedAt = &stamped
+	}
+	return header
+}
+
+// sessionRevisionLocked computes one coordinator's revision pair; the caller
+// holds the coordinator mutex.
+func sessionRevisionLocked(c *coordinator) SessionRevision {
+	return SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev}
 }
 
 // ownHistoryFact maps one validated graph entry to its owned public fact. A

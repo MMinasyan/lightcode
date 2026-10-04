@@ -579,7 +579,7 @@ func assertOperationScoped(t *testing.T, event Event, sessionID, operationID str
 func snapshotPairOf(t *testing.T, r *Runtime, sessionID string) protocol.SessionRevision {
 	t.Helper()
 	snap := snapshotThroughRuntime(t, r, sessionID)
-	return sessionRevision(snap)
+	return wireRevision(snapshotRevision(snap))
 }
 
 // lessPair reports whether one wire revision pair is strictly older than

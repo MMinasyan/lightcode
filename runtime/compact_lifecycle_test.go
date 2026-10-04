@@ -474,12 +474,15 @@ func (f *compactLifecycle) readSession(sessionID string) harness.SessionRecord {
 	f.t.Helper()
 	var rec harness.SessionRecord
 	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		rec, err = h.ReadSession(ctx, sessionID)
-		return err
+		snap, err := h.SnapshotSession(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		rec = snap.Session
+		return nil
 	})
 	if err != nil {
-		f.t.Fatalf("ReadSession(%s): %v", sessionID, err)
+		f.t.Fatalf("SnapshotSession(%s): %v", sessionID, err)
 	}
 	return rec
 }
@@ -2546,12 +2549,12 @@ func TestCompactLifecycleCorruptCompactionEntry(t *testing.T) {
 
 		f := openCompactLifecycle(t, store)
 		err := f.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.ReadSession(ctx, corrupt)
+			_, err := h.ReadSessionHeader(ctx, corrupt)
 			return err
 		})
 		var corruptErr *harness.CorruptionError
 		if !errors.As(err, &corruptErr) || !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("ReadSession(corrupt) = %v, want a corruption error", err)
+			t.Fatalf("ReadSessionHeader(corrupt) = %v, want a corruption error", err)
 		}
 		if got := f.readSession(sibling).Identity.SessionID; got != sibling {
 			t.Fatalf("sibling session read = %q, want %q usable", got, sibling)

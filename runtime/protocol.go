@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -36,29 +35,14 @@ func (r *Runtime) withSessionSnapshot(ctx context.Context, sessionID string, cal
 	})
 }
 
-// getSession projects one Session's header from one coherent Harness
-// snapshot inside a single admitted call. A deleted or corrupt Session
-// returns the Harness's own typed error unchanged; the projection adds no
-// validation of already-validated facts.
-func (r *Runtime) getSession(ctx context.Context, sessionID string) (protocol.Session, error) {
-	var header protocol.Session
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		header = projectSession(snap)
-		return nil
-	}); err != nil {
-		return protocol.Session{}, err
-	}
-	return header, nil
-}
-
 // listSessions projects Session headers under one required workspace and
 // lifecycle filter set, inside a single admitted call. Absent, empty, or
 // unknown filter members and a failing workspace normalization wrap the
 // shared harness.ErrInvalid sentinel; a nonempty relative workspace is
-// normalized with filepath.Abs before filtering. The scan is fresh: every
-// candidate is re-read through SnapshotSession, so a candidate that became
-// deleted or corrupt is skipped while its valid siblings stay listed; any
-// other failure propagates with no partial list.
+// normalized with filepath.Abs before filtering. The scan is the Harness's
+// own metadata listing: every row is a fresh header and an unavailable
+// Session is already omitted there, while any other failure propagates with
+// no partial list.
 func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessionsParams) ([]protocol.Session, error) {
 	if params.Workspace == "" {
 		return nil, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
@@ -72,26 +56,19 @@ func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessions
 	}
 	var headers []protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		records, err := h.ListSessions(ctx)
+		rows, err := h.ListSessions(ctx)
 		if err != nil {
 			return err
 		}
-		headers = make([]protocol.Session, 0, len(records))
-		for _, record := range records {
-			if record.Identity.Workspace != workspace {
+		headers = make([]protocol.Session, 0, len(rows))
+		for _, row := range rows {
+			if row.Identity.Workspace != workspace {
 				continue // workspace identity is immutable under every supported mutation
 			}
-			snap, err := h.SnapshotSession(ctx, record.Identity.SessionID)
-			if err != nil {
-				if errors.Is(err, harness.ErrNotFound) || errors.Is(err, harness.ErrCorrupt) {
-					continue // the candidate became unavailable: absent, like the fresh scan's own rule
-				}
-				return err
-			}
-			if snap.Session.State.Lifecycle != harness.SessionLifecycle(params.Lifecycle) {
+			if row.Lifecycle != harness.SessionLifecycle(params.Lifecycle) {
 				continue
 			}
-			headers = append(headers, projectSession(snap))
+			headers = append(headers, projectSession(row))
 		}
 		return nil
 	}); err != nil {
@@ -101,19 +78,20 @@ func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessions
 }
 
 // listWorkspaces projects the distinct Workspace roots of every validated
-// Session from one fresh scan, sorted by root, inside a single admitted call.
-// It is derived navigation: no Project record, count, or owning revision.
+// Session from one fresh metadata scan, sorted by root, inside a single
+// admitted call. It is derived navigation: no Project record, count, or
+// owning revision.
 func (r *Runtime) listWorkspaces(ctx context.Context) ([]protocol.Workspace, error) {
 	var out []protocol.Workspace
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		records, err := h.ListSessions(ctx)
+		rows, err := h.ListSessions(ctx)
 		if err != nil {
 			return err
 		}
-		roots := make([]string, 0, len(records))
-		seen := make(map[string]bool, len(records))
-		for _, record := range records {
-			root := record.Identity.Workspace
+		roots := make([]string, 0, len(rows))
+		seen := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			root := row.Identity.Workspace
 			if !seen[root] {
 				seen[root] = true
 				roots = append(roots, root)
@@ -131,38 +109,62 @@ func (r *Runtime) listWorkspaces(ctx context.Context) ([]protocol.Workspace, err
 	return out, nil
 }
 
-// projectSession maps one owned snapshot to its generated Session header.
-// Every field comes from the snapshot's validated record and coordinator
-// counter; timestamps are UTC. The instance identifier stays empty in these
-// pre-server values: the protocol server supplies it before wire emission.
-func projectSession(snap harness.SessionSnapshot) protocol.Session {
-	record := snap.Session
-	header := protocol.Session{
-		AgentType:       record.State.CurrentAgentType,
-		CreatedAt:       record.Identity.CreatedAt.UTC(),
-		LastActivity:    record.State.LastActivity.UTC(),
-		Lifecycle:       protocol.SessionLifecycle(record.State.Lifecycle),
-		SessionId:       record.Identity.SessionID,
-		SessionRevision: sessionRevision(snap),
-		Workspace:       record.Identity.Workspace,
+// snapshotRevision derives the value revision pair from one full snapshot:
+// the durable register revision and the coordinator-local counter.
+func snapshotRevision(snap harness.SessionSnapshot) harness.SessionRevision {
+	return harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
+}
+
+// snapshotHeader adapts one owned full snapshot to the metadata value the
+// narrow header producer returns, for projections that already hold the
+// complete snapshot (hydration).
+func snapshotHeader(snap harness.SessionSnapshot) harness.SessionHeader {
+	header := harness.SessionHeader{
+		Identity:           snap.Session.Identity,
+		Lifecycle:          snap.Session.State.Lifecycle,
+		CurrentAgentType:   snap.Session.State.CurrentAgentType,
+		CurrentOperationID: snap.Session.State.CurrentOperationID,
+		LastActivity:       snap.Session.State.LastActivity,
+		Revision:           snapshotRevision(snap),
 	}
-	if record.State.ArchivedAt != nil {
-		archived := record.State.ArchivedAt.UTC()
-		header.ArchivedAt = &archived
-	}
-	if record.State.CurrentOperationID != "" {
-		current := record.State.CurrentOperationID
-		header.CurrentOperationId = &current
-	}
-	if record.Identity.ParentSessionID != "" {
-		parent := record.Identity.ParentSessionID
-		header.ParentSessionId = &parent
-	}
-	if record.Identity.SourceSessionID != "" {
-		source := record.Identity.SourceSessionID
-		header.SourceSessionId = &source
+	if snap.Session.State.ArchivedAt != nil {
+		stamped := *snap.Session.State.ArchivedAt
+		header.ArchivedAt = &stamped
 	}
 	return header
+}
+
+// projectSession maps one owned metadata header to its generated Session
+// header. Every field comes from the header's validated values; timestamps
+// are UTC. The instance identifier stays empty in these pre-server values:
+// the protocol server supplies it before wire emission.
+func projectSession(header harness.SessionHeader) protocol.Session {
+	out := protocol.Session{
+		AgentType:       header.CurrentAgentType,
+		CreatedAt:       header.Identity.CreatedAt.UTC(),
+		LastActivity:    header.LastActivity.UTC(),
+		Lifecycle:       protocol.SessionLifecycle(header.Lifecycle),
+		SessionId:       header.Identity.SessionID,
+		SessionRevision: wireRevision(header.Revision),
+		Workspace:       header.Identity.Workspace,
+	}
+	if header.ArchivedAt != nil {
+		archived := header.ArchivedAt.UTC()
+		out.ArchivedAt = &archived
+	}
+	if header.CurrentOperationID != "" {
+		current := header.CurrentOperationID
+		out.CurrentOperationId = &current
+	}
+	if header.Identity.ParentSessionID != "" {
+		parent := header.Identity.ParentSessionID
+		out.ParentSessionId = &parent
+	}
+	if header.Identity.SourceSessionID != "" {
+		source := header.Identity.SourceSessionID
+		out.SourceSessionId = &source
+	}
+	return out
 }
 
 // projectOperation maps one owned Operation register to its generated header:
@@ -218,20 +220,27 @@ func projectItemID(sessionID, entryID string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:16])
 }
 
+// projectedItem is one generated conversation item alongside the stable
+// identity its source fact produced: the identity travels with the item from
+// its source, so paging anchors and cursors never re-decode a union variant.
+type projectedItem struct {
+	id   string
+	item protocol.ConversationItem
+}
+
 // projectConversation derives the complete client conversation from one owned
-// Session snapshot's validated facts, in committed order. It consumes only
-// the snapshot: the facts are already materialized, validated, and owned, so
-// no storage payload is re-decoded and no model-context projection is
-// consulted. Tool results never become separate items — every terminal
-// result is absorbed into the assistant item that published its call, matched
-// by the full assistant-entry reference, the reserved result entry identity,
-// and the call ID — while an unresolved call keeps its assistant item without
-// terminal members and gains them on a later read under the same item ID.
-func projectConversation(snap harness.SessionSnapshot) ([]protocol.ConversationItem, error) {
-	sessionID := snap.Session.Identity.SessionID
-	results := indexToolResults(snap.Facts)
-	items := make([]protocol.ConversationItem, 0, len(snap.Facts))
-	for _, fact := range snap.Facts {
+// Session's validated facts, in committed order. It consumes only the facts:
+// they are already materialized, validated, and owned, so no storage payload
+// is re-decoded and no model-context projection is consulted. Tool results
+// never become separate items — every terminal result is absorbed into the
+// assistant item that published its call, matched by the full assistant-entry
+// reference, the reserved result entry identity, and the call ID — while an
+// unresolved call keeps its assistant item without terminal members and gains
+// them on a later read under the same item ID.
+func projectConversation(sessionID string, facts []harness.HistoryFact) ([]projectedItem, error) {
+	results := indexToolResults(facts)
+	items := make([]projectedItem, 0, len(facts))
+	for _, fact := range facts {
 		item, err := projectConversationItem(sessionID, fact, results)
 		if err != nil {
 			return nil, err
@@ -274,9 +283,9 @@ func indexToolResults(facts []harness.HistoryFact) map[toolResultKey]harness.Too
 }
 
 // projectConversationItem maps one validated fact to its generated client
-// item. Tool-result facts are absorbed into their publishing assistant and
-// produce no item of their own.
-func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[toolResultKey]harness.ToolResultEntry) (*protocol.ConversationItem, error) {
+// item and source-known stable identity. Tool-result facts are absorbed into
+// their publishing assistant and produce no item of their own.
+func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[toolResultKey]harness.ToolResultEntry) (*projectedItem, error) {
 	var item protocol.ConversationItem
 	var err error
 	switch fact.Kind {
@@ -322,7 +331,7 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 	if err != nil {
 		return nil, fmt.Errorf("project %s entry %q: %w", fact.Kind, fact.EntryID, err)
 	}
-	return &item, nil
+	return &projectedItem{id: projectItemID(sessionID, fact.EntryID), item: item}, nil
 }
 
 // operationAttribution points at a fact's owning Operation when it has one;
@@ -462,13 +471,13 @@ func extraObject(extra model.Extra) *protocol.JSONObject {
 	return &out
 }
 
-// sessionRevision derives the wire revision pair from one snapshot: the
+// wireRevision derives the wire revision pair from one value pair: the
 // durable register revision and the coordinator-local counter as decimal
 // strings, with the empty pre-server instance identity.
-func sessionRevision(snap harness.SessionSnapshot) protocol.SessionRevision {
+func wireRevision(revision harness.SessionRevision) protocol.SessionRevision {
 	return protocol.SessionRevision{
-		DurableRevision: strconv.FormatInt(snap.Session.Revision, 10),
-		LocalRevision:   strconv.FormatUint(snap.LocalRevision, 10),
+		DurableRevision: strconv.FormatInt(revision.DurableRevision, 10),
+		LocalRevision:   strconv.FormatUint(revision.LocalRevision, 10),
 	}
 }
 
@@ -526,101 +535,65 @@ func decodeHistoryCursor(raw, sessionID string) (historyCursor, error) {
 	return c, nil
 }
 
-// conversationItemID reads one projected item's stable identity through the
-// generated union accessors.
-func conversationItemID(item protocol.ConversationItem) (string, error) {
-	discriminator, err := item.Discriminator()
-	if err != nil {
-		return "", err
-	}
-	switch discriminator {
-	case "input":
-		v, err := item.AsInputItem()
-		return v.ItemId, err
-	case "assistant":
-		v, err := item.AsAssistantItem()
-		return v.ItemId, err
-	case "signal":
-		v, err := item.AsSignalItem()
-		return v.ItemId, err
-	case "compaction":
-		v, err := item.AsCompactionItem()
-		return v.ItemId, err
-	case "operation_end":
-		v, err := item.AsOperationEndItem()
-		return v.ItemId, err
-	default:
-		return "", fmt.Errorf("unknown conversation item kind %q", discriminator)
-	}
-}
-
-// projectHistoryPage slices one owned snapshot's complete projected
+// projectHistoryPage slices one owned history capture's complete projected
 // conversation into one anchored page: exactly historyPageSize indivisible
 // items in ascending display order, the newest 50 for the nil initial
 // cursor, otherwise the newest items strictly before the anchor item —
-// whose identity is resolved among this same snapshot's projected items.
-// The oldest returned item anchors the next older cursor exactly when older
-// items remain. A nil cursor is the initial page; an empty supplied cursor,
-// a malformed document, or an anchor that resolves to no item of this
-// Session fails with harness.ErrInvalid.
-func projectHistoryPage(snap harness.SessionSnapshot, cursor *string) (protocol.HistoryPage, error) {
-	items, err := projectConversation(snap)
+// whose identity is resolved among this same projection's source-known item
+// identities. The oldest returned item anchors the next older cursor exactly
+// when older items remain. A nil cursor is the initial page; an empty
+// supplied cursor, a malformed document, or an anchor that resolves to no
+// item of this Session fails with harness.ErrInvalid.
+func projectHistoryPage(sessionID string, facts []harness.HistoryFact, revision harness.SessionRevision, cursor *string) (protocol.HistoryPage, error) {
+	items, err := projectConversation(sessionID, facts)
 	if err != nil {
 		return protocol.HistoryPage{}, err
 	}
 	end := len(items)
 	if cursor != nil {
-		decoded, err := decodeHistoryCursor(*cursor, snap.Session.Identity.SessionID)
+		decoded, err := decodeHistoryCursor(*cursor, sessionID)
 		if err != nil {
 			return protocol.HistoryPage{}, err
 		}
 		end = -1
 		for i, item := range items {
-			id, err := conversationItemID(item)
-			if err != nil {
-				return protocol.HistoryPage{}, err
-			}
-			if id == decoded.AnchorItemID {
+			if item.id == decoded.AnchorItemID {
 				end = i
 				break
 			}
 		}
 		if end < 0 {
-			return protocol.HistoryPage{}, fmt.Errorf("history cursor anchor %q names no item of session %q: %w", decoded.AnchorItemID, snap.Session.Identity.SessionID, harness.ErrInvalid)
+			return protocol.HistoryPage{}, fmt.Errorf("history cursor anchor %q names no item of session %q: %w", decoded.AnchorItemID, sessionID, harness.ErrInvalid)
 		}
 	}
 	start := max(end-historyPageSize, 0)
 	page := protocol.HistoryPage{
-		SessionRevision: sessionRevision(snap),
+		SessionRevision: wireRevision(revision),
 		Items:           make([]protocol.ConversationItem, end-start),
 	}
-	copy(page.Items, items[start:end])
+	for i, item := range items[start:end] {
+		page.Items[i] = item.item
+	}
 	if start > 0 {
-		anchor, err := conversationItemID(items[start])
-		if err != nil {
-			return protocol.HistoryPage{}, err
-		}
-		encoded := encodeHistoryCursor(historyCursor{Version: 1, SessionID: snap.Session.Identity.SessionID, AnchorItemID: anchor, Direction: "older"})
+		encoded := encodeHistoryCursor(historyCursor{Version: 1, SessionID: sessionID, AnchorItemID: items[start].id, Direction: "older"})
 		page.OlderCursor = &encoded
 	}
 	return page, nil
 }
 
 // projectPending maps one owned snapshot's both pending FIFOs to their
-// generated shape, reusing the conversation content projection.
-func projectPending(snap harness.SessionSnapshot) (protocol.PendingSnapshot, error) {
+// generated shape, reusing the conversation content projection. Queue
+// inspection rides hydration; no separate pending read exists.
+func projectPending(snap harness.SessionSnapshot) (protocol.PendingQueues, error) {
 	steering, err := projectPendingInputs(snap.Steering)
 	if err != nil {
-		return protocol.PendingSnapshot{}, err
+		return protocol.PendingQueues{}, err
 	}
 	queued, err := projectPendingInputs(snap.Queued)
 	if err != nil {
-		return protocol.PendingSnapshot{}, err
+		return protocol.PendingQueues{}, err
 	}
-	return protocol.PendingSnapshot{
-		Pending:         protocol.PendingQueues{Steering: steering, Queued: queued},
-		SessionRevision: sessionRevision(snap),
-	}, nil
+	return protocol.PendingQueues{Steering: steering, Queued: queued}, nil
 }
 
 // projectPendingInputs maps one FIFO's members: the operation identity, the
@@ -637,13 +610,46 @@ func projectPendingInputs(items []harness.PendingInput) ([]protocol.PendingInput
 	return out, nil
 }
 
+// sessionSelection is the shared pure resolution of one Session's current
+// Agent type under one captured configuration: the configured model identity
+// when the resolved definition names one, and that exact model's catalog
+// context window when it is usable there. It resolves the selected
+// definition once through the captured roster and the captured catalog and
+// joins nothing else.
+type sessionSelection struct {
+	model  *model.ModelRef
+	window int
+}
+
+// resolveSessionSelection resolves the current Agent type's model selection
+// and window. An unknown, duplicate, or empty-name definition and a
+// definition with no configured model yield no selection. A configured model
+// that is absent from the captured catalog, or whose entry has no positive
+// window, stays identifiable with a zero window: admission still refuses it
+// and no fallback model is invented.
+func resolveSessionSelection(agentType string, captured *configuration) sessionSelection {
+	agent, err := harness.ResolveAgentType(agentType, captured.agentTypes())
+	if err != nil {
+		return sessionSelection{}
+	}
+	if agent.Model.IsZero() {
+		return sessionSelection{}
+	}
+	selected := agent.Model
+	_, entry, err := captured.catalog.Lookup(catalog.ModelRef{Provider: agent.Model.Provider, Model: agent.Model.Model})
+	if err != nil || entry.ContextWindow <= 0 {
+		return sessionSelection{model: &selected}
+	}
+	return sessionSelection{model: &selected, window: entry.ContextWindow}
+}
+
 // projectSessionUsage maps one owned snapshot's usage onto its two distinct
 // clocks: the canonical register totals as they stand, and the display
-// estimate plus context window under the captured configuration.
-func projectSessionUsage(snap harness.SessionSnapshot, captured *configuration) protocol.UsageProjection {
+// estimate plus the context window of the shared selection resolution.
+func projectSessionUsage(snap harness.SessionSnapshot, selection sessionSelection) protocol.UsageProjection {
 	return protocol.UsageProjection{
 		Totals:  projectUsage(snap.Session.State.Usage),
-		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(snap.Facts, snap.Session.State.CompactionEntryID), ContextWindow: sessionContextWindow(snap, captured)},
+		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(snap.Facts, snap.Session.State.CompactionEntryID), ContextWindow: sessionContextWindow(snap, selection)},
 	}
 }
 
@@ -687,12 +693,11 @@ func projectUsedTokens(facts []harness.HistoryFact, compactionEntryID string) st
 
 // sessionContextWindow resolves the context window: the durably running
 // current Operation's captured window while one is admitted — a retiring run
-// or reservation alone is not an active Operation — otherwise the currently
-// selected Agent type's model window in the captured configuration. An
-// unavailable Agent-type resolution or unusable model there reports 0 rather
-// than an admission error; a usable model always has a positive window, so
-// 0 never invents a model.
-func sessionContextWindow(snap harness.SessionSnapshot, captured *configuration) int {
+// or reservation alone is not an active Operation — otherwise the shared
+// selection's catalog window. An unavailable selection reports 0 rather than
+// an admission error; a usable model always has a positive window, so 0
+// never invents a model.
+func sessionContextWindow(snap harness.SessionSnapshot, selection sessionSelection) int {
 	if opID := snap.Session.State.CurrentOperationID; opID != "" {
 		for _, op := range snap.Operations {
 			if op.Admission.OperationID == opID {
@@ -700,29 +705,19 @@ func sessionContextWindow(snap harness.SessionSnapshot, captured *configuration)
 			}
 		}
 	}
-	agent, err := harness.ResolveAgentType(snap.Session.State.CurrentAgentType, captured.agentTypes())
-	if err != nil {
-		return 0
-	}
-	if err := requireCatalogModel(captured, agent.Model); err != nil {
-		return 0
-	}
-	// requireCatalogModel already resolved this exact entry in the same
-	// immutable captured catalog with a positive window; the retrieval
-	// cannot fail.
-	_, entry, _ := captured.catalog.Lookup(catalog.ModelRef{Provider: agent.Model.Provider, Model: agent.Model.Model})
-	return entry.ContextWindow
+	return selection.window
 }
 
 // projectHydration assembles the complete Session-owned hydration body from
 // one owned snapshot and one captured configuration: the newest conversation
-// page, one Session header, the sorted Operation headers with the active
-// pointer into them, both pending FIFOs, background membership, the usage
-// projection, and the warning presentation — every global group plus this
-// Session's own prompt and protocol warnings, under the independently
-// captured warning revision.
+// page, one Session header, the next-admission model selection, the sorted
+// Operation headers with the active pointer into them, both pending FIFOs,
+// background membership, the usage projection, and the warning presentation —
+// every global group plus this Session's own prompt and protocol warnings,
+// under the independently captured warning revision.
 func projectHydration(snap harness.SessionSnapshot, captured *configuration, warnings []protocol.Warning, warningsRevision uint64) (protocol.Hydration, error) {
-	page, err := projectHistoryPage(snap, nil)
+	revision := snapshotRevision(snap)
+	page, err := projectHistoryPage(snap.Session.Identity.SessionID, snap.Facts, revision, nil)
 	if err != nil {
 		return protocol.Hydration{}, err
 	}
@@ -744,14 +739,21 @@ func projectHydration(snap harness.SessionSnapshot, captured *configuration, war
 	for _, member := range snap.Background {
 		background = append(background, protocol.BackgroundMember{Kind: protocol.BackgroundMemberKind(member.Kind), Id: member.ID})
 	}
+	selection := resolveSessionSelection(snap.Session.State.CurrentAgentType, captured)
+	var selectedModel *protocol.ModelRef
+	if selection.model != nil {
+		rendered := selection.model.String()
+		selectedModel = &rendered
+	}
 	return protocol.Hydration{
-		Session:               projectSession(snap),
-		SessionRevision:       sessionRevision(snap),
+		Session:               projectSession(snapshotHeader(snap)),
+		SessionRevision:       wireRevision(revision),
+		SelectedModel:         selectedModel,
 		Operations:            operations,
 		ActiveOperation:       active,
-		Pending:               pending.Pending,
+		Pending:               pending,
 		Conversation:          protocol.ConversationPage{Items: page.Items, OlderCursor: page.OlderCursor},
-		Usage:                 projectSessionUsage(snap, captured),
+		Usage:                 projectSessionUsage(snap, selection),
 		Background:            background,
 		Warnings:              warnings, // the shared read producer returns owned non-nil slices
 		WarningsRevision:      protocol.WarningsRevision{Revision: formatWarningRevision(warningsRevision)},
@@ -767,51 +769,22 @@ func configurationRevision(captured *configuration) protocol.ConfigurationRevisi
 }
 
 // getHistory is the private paged history read: one admitted call taking
-// exactly one Harness snapshot and projecting the whole conversation before
-// slicing, so an assistant and its tool result never split and no storage
-// read spans requests.
+// exactly one owned history capture — the committed facts and revision, no
+// Operations, FIFOs, or usage — and projecting the whole conversation before
+// slicing, so an assistant and its tool result never split.
 func (r *Runtime) getHistory(ctx context.Context, sessionID string, cursor *string) (protocol.HistoryPage, error) {
 	var page protocol.HistoryPage
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		var err error
-		page, err = projectHistoryPage(snap, cursor)
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		facts, revision, err := h.ReadSessionHistory(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		page, err = projectHistoryPage(sessionID, facts, revision, cursor)
 		return err
 	}); err != nil {
 		return protocol.HistoryPage{}, err
 	}
 	return page, nil
-}
-
-// getPending is the private pending read: the same single-snapshot
-// producer, no second queue authority.
-func (r *Runtime) getPending(ctx context.Context, sessionID string) (protocol.PendingSnapshot, error) {
-	var pending protocol.PendingSnapshot
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		var err error
-		pending, err = projectPending(snap)
-		return err
-	}); err != nil {
-		return protocol.PendingSnapshot{}, err
-	}
-	return pending, nil
-}
-
-// getUsage is the private usage read: the captured configuration snapshot is
-// taken exactly once per read, independently of the Session revision, and
-// the one Harness snapshot supplies both usage clocks.
-func (r *Runtime) getUsage(ctx context.Context, sessionID string) (protocol.UsageSnapshot, error) {
-	var snapshot protocol.UsageSnapshot
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, captured *configuration) error {
-		snapshot = protocol.UsageSnapshot{
-			SessionRevision:       sessionRevision(snap),
-			ConfigurationRevision: configurationRevision(captured),
-			Usage:                 projectSessionUsage(snap, captured),
-		}
-		return nil
-	}); err != nil {
-		return protocol.UsageSnapshot{}, err
-	}
-	return snapshot, nil
 }
 
 // buildHydration is the private Session-owned hydration builder: one Harness
@@ -832,35 +805,15 @@ func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protoco
 	return hydration, nil
 }
 
-// resolveForkBoundary resolves one client boundary item ID against the one
-// snapshot's committed user-origin input facts and their namespace-derived
-// projected identities, returning the private entry identity for the
-// Harness Fork command. It is the single-read wrapper over the shared pure
-// resolver. A foreign, non-user, or nonexistent item fails with the shared
-// harness.ErrInvalid sentinel; no client item ID ever passes to the Harness
-// as an entry identity.
-func (r *Runtime) resolveForkBoundary(ctx context.Context, sessionID, boundaryItemID string) (string, error) {
-	var entryID string
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		var err error
-		entryID, err = resolveBoundaryEntry(snap, boundaryItemID)
-		return err
-	}); err != nil {
-		return "", err
-	}
-	return entryID, nil
-}
-
-// resolveBoundaryEntry resolves one client boundary item ID against one
-// owned snapshot's committed user-origin input facts and their
+// resolveBoundaryEntry resolves one client boundary item ID against one owned
+// history capture's committed user-origin input facts and their
 // namespace-derived projected identities, returning the private entry
-// identity for the Harness Fork command. It is pure over the snapshot, so the
-// admitted fork command and the single-read resolver share exactly one rule.
-// A foreign, non-user, or nonexistent item — and an empty boundary item — fails
-// with the shared harness.ErrInvalid sentinel.
-func resolveBoundaryEntry(snap harness.SessionSnapshot, boundaryItemID string) (string, error) {
-	sessionID := snap.Session.Identity.SessionID
-	for _, fact := range snap.Facts {
+// identity for the Harness Fork command. It is pure over the capture, so the
+// admitted fork command and every test share exactly one rule. A foreign,
+// non-user, or nonexistent item — and an empty boundary item — fails with the
+// shared harness.ErrInvalid sentinel.
+func resolveBoundaryEntry(sessionID string, facts []harness.HistoryFact, boundaryItemID string) (string, error) {
+	for _, fact := range facts {
 		if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginUser &&
 			projectItemID(sessionID, fact.EntryID) == boundaryItemID {
 			return fact.EntryID, nil

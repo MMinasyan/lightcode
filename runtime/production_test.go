@@ -518,8 +518,8 @@ func awaitIdleSession(t *testing.T, r *Runtime, sessionID string) {
 	for {
 		var idle bool
 		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			rec, rerr := h.ReadSession(ctx, sessionID)
-			idle = rerr == nil && rec.State.CurrentOperationID == ""
+			rec, rerr := h.ReadSessionHeader(ctx, sessionID)
+			idle = rerr == nil && rec.CurrentOperationID == ""
 			return rerr
 		})
 		if err == nil && idle {

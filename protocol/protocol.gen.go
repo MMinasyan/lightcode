@@ -970,6 +970,7 @@ type Hydration struct {
 	Conversation          ConversationPage      `json:"conversation"`
 	Operations            []Operation           `json:"operations"`
 	Pending               PendingQueues         `json:"pending"`
+	SelectedModel         *ModelRef             `json:"selected_model"`
 	Session               Session               `json:"session"`
 	SessionRevision       SessionRevision       `json:"session_revision"`
 	Usage                 UsageProjection       `json:"usage"`
@@ -1145,12 +1146,6 @@ type PendingInput struct {
 type PendingQueues struct {
 	Queued   []PendingInput `json:"queued"`
 	Steering []PendingInput `json:"steering"`
-}
-
-// PendingSnapshot defines model for PendingSnapshot.
-type PendingSnapshot struct {
-	Pending         PendingQueues   `json:"pending"`
-	SessionRevision SessionRevision `json:"session_revision"`
 }
 
 // PluginConfigDocument One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
@@ -1517,13 +1512,6 @@ type UsageProjection struct {
 	Totals  UsageTotals  `json:"totals"`
 }
 
-// UsageSnapshot defines model for UsageSnapshot.
-type UsageSnapshot struct {
-	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-	SessionRevision       SessionRevision       `json:"session_revision"`
-	Usage                 UsageProjection       `json:"usage"`
-}
-
 // UsageTotals defines model for UsageTotals.
 type UsageTotals struct {
 	ByModel []ModelUsage `json:"by_model"`
@@ -1671,12 +1659,6 @@ type GetSessionHistoryParams struct {
 	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
 
-// InterruptSessionJSONBody defines parameters for InterruptSession.
-type InterruptSessionJSONBody = map[string]interface{}
-
-// StopSessionJSONBody defines parameters for StopSession.
-type StopSessionJSONBody = map[string]interface{}
-
 // SetAgentTypeModelJSONRequestBody defines body for SetAgentTypeModel for application/json ContentType.
 type SetAgentTypeModelJSONRequestBody = SetAgentTypeModelRequest
 
@@ -1713,14 +1695,8 @@ type CompactSessionJSONRequestBody = CompactRequest
 // ForkSessionJSONRequestBody defines body for ForkSession for application/json ContentType.
 type ForkSessionJSONRequestBody = ForkRequest
 
-// InterruptSessionJSONRequestBody defines body for InterruptSession for application/json ContentType.
-type InterruptSessionJSONRequestBody = InterruptSessionJSONBody
-
 // RevertSessionCodeJSONRequestBody defines body for RevertSessionCode for application/json ContentType.
 type RevertSessionCodeJSONRequestBody = RevertCodeRequest
-
-// StopSessionJSONRequestBody defines body for StopSession for application/json ContentType.
-type StopSessionJSONRequestBody = StopSessionJSONBody
 
 // SubmitSessionJSONRequestBody defines body for SubmitSession for application/json ContentType.
 type SubmitSessionJSONRequestBody = SubmitRequest
@@ -2560,9 +2536,6 @@ type ClientInterface interface {
 	// DeleteSession performs a DELETE /v1/sessions/{id} (the `DeleteSession` operationId) request.
 	DeleteSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// GetSession performs a GET /v1/sessions/{id} (the `GetSession` operationId) request.
-	GetSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// SetSessionAgentTypeWithBody performs a PUT /v1/sessions/{id}/agent-type (the `SetSessionAgentType` operationId) request,
 	// with any type of body and a specified content type.
 	SetSessionAgentTypeWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2599,16 +2572,8 @@ type ClientInterface interface {
 	// GetSessionHydration performs a GET /v1/sessions/{id}/hydration (the `GetSessionHydration` operationId) request.
 	GetSessionHydration(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// InterruptSessionWithBody performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request,
-	// with any type of body and a specified content type.
-	InterruptSessionWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// InterruptSession performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
-	// Takes a body of the `application/json` content type.
-	InterruptSession(ctx context.Context, id SessionID, body InterruptSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetSessionPending performs a GET /v1/sessions/{id}/pending (the `GetSessionPending` operationId) request.
-	GetSessionPending(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
+	InterruptSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ReopenSession performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	ReopenSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2621,13 +2586,8 @@ type ClientInterface interface {
 	// Takes a body of the `application/json` content type.
 	RevertSessionCode(ctx context.Context, id SessionID, body RevertSessionCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// StopSessionWithBody performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request,
-	// with any type of body and a specified content type.
-	StopSessionWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// StopSession performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
-	// Takes a body of the `application/json` content type.
-	StopSession(ctx context.Context, id SessionID, body StopSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	StopSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// SubmitSessionWithBody performs a POST /v1/sessions/{id}/submit (the `SubmitSession` operationId) request,
 	// with any type of body and a specified content type.
@@ -2636,9 +2596,6 @@ type ClientInterface interface {
 	// SubmitSession performs a POST /v1/sessions/{id}/submit (the `SubmitSession` operationId) request.
 	// Takes a body of the `application/json` content type.
 	SubmitSession(ctx context.Context, id SessionID, body SubmitSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// GetSessionUsage performs a GET /v1/sessions/{id}/usage (the `GetSessionUsage` operationId) request.
-	GetSessionUsage(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetWarnings performs a GET /v1/warnings (the `GetWarnings` operationId) request.
 	GetWarnings(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -3128,19 +3085,6 @@ func (c *Client) DeleteSession(ctx context.Context, id SessionID, reqEditors ...
 	return c.Client.Do(req)
 }
 
-// GetSession performs a GET /v1/sessions/{id} (the `GetSession` operationId) request.
-func (c *Client) GetSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetSessionRequest(c.Server, id)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // SetSessionAgentTypeWithBody performs a PUT /v1/sessions/{id}/agent-type (the `SetSessionAgentType` operationId) request,
 // with any type of body and a specified content type.
 func (c *Client) SetSessionAgentTypeWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -3277,37 +3221,9 @@ func (c *Client) GetSessionHydration(ctx context.Context, id SessionID, reqEdito
 	return c.Client.Do(req)
 }
 
-// InterruptSessionWithBody performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request,
-// with any type of body and a specified content type.
-func (c *Client) InterruptSessionWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewInterruptSessionRequestWithBody(c.Server, id, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // InterruptSession performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
-// Takes a body of the `application/json` content type.
-func (c *Client) InterruptSession(ctx context.Context, id SessionID, body InterruptSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewInterruptSessionRequest(c.Server, id, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// GetSessionPending performs a GET /v1/sessions/{id}/pending (the `GetSessionPending` operationId) request.
-func (c *Client) GetSessionPending(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetSessionPendingRequest(c.Server, id)
+func (c *Client) InterruptSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInterruptSessionRequest(c.Server, id)
 	if err != nil {
 		return nil, err
 	}
@@ -3359,24 +3275,9 @@ func (c *Client) RevertSessionCode(ctx context.Context, id SessionID, body Rever
 	return c.Client.Do(req)
 }
 
-// StopSessionWithBody performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request,
-// with any type of body and a specified content type.
-func (c *Client) StopSessionWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewStopSessionRequestWithBody(c.Server, id, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // StopSession performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
-// Takes a body of the `application/json` content type.
-func (c *Client) StopSession(ctx context.Context, id SessionID, body StopSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewStopSessionRequest(c.Server, id, body)
+func (c *Client) StopSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewStopSessionRequest(c.Server, id)
 	if err != nil {
 		return nil, err
 	}
@@ -3405,19 +3306,6 @@ func (c *Client) SubmitSessionWithBody(ctx context.Context, id SessionID, conten
 // Takes a body of the `application/json` content type.
 func (c *Client) SubmitSession(ctx context.Context, id SessionID, body SubmitSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewSubmitSessionRequest(c.Server, id, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// GetSessionUsage performs a GET /v1/sessions/{id}/usage (the `GetSessionUsage` operationId) request.
-func (c *Client) GetSessionUsage(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetSessionUsageRequest(c.Server, id)
 	if err != nil {
 		return nil, err
 	}
@@ -4707,40 +4595,6 @@ func NewDeleteSessionRequest(server string, id SessionID) (*http.Request, error)
 	return req, nil
 }
 
-// NewGetSessionRequest constructs an http.Request for the GetSession method
-func NewGetSessionRequest(server string, id SessionID) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/sessions/%s", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
-
 // NewSetSessionAgentTypeRequest calls the generic SetSessionAgentType builder with application/json body
 func NewSetSessionAgentTypeRequest(server string, id SessionID, body SetSessionAgentTypeJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -5045,19 +4899,8 @@ func NewGetSessionHydrationRequest(server string, id SessionID) (*http.Request, 
 	return req, nil
 }
 
-// NewInterruptSessionRequest calls the generic InterruptSession builder with application/json body
-func NewInterruptSessionRequest(server string, id SessionID, body InterruptSessionJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewInterruptSessionRequestWithBody(server, id, "application/json", bodyReader)
-}
-
-// NewInterruptSessionRequestWithBody constructs an http.Request for the InterruptSession method, with any body, and a specified content type
-func NewInterruptSessionRequestWithBody(server string, id SessionID, contentType string, body io.Reader) (*http.Request, error) {
+// NewInterruptSessionRequest constructs an http.Request for the InterruptSession method
+func NewInterruptSessionRequest(server string, id SessionID) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -5082,43 +4925,7 @@ func NewInterruptSessionRequestWithBody(server string, id SessionID, contentType
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
-// NewGetSessionPendingRequest constructs an http.Request for the GetSessionPending method
-func NewGetSessionPendingRequest(server string, id SessionID) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/sessions/%s/pending", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -5207,19 +5014,8 @@ func NewRevertSessionCodeRequestWithBody(server string, id SessionID, contentTyp
 	return req, nil
 }
 
-// NewStopSessionRequest calls the generic StopSession builder with application/json body
-func NewStopSessionRequest(server string, id SessionID, body StopSessionJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewStopSessionRequestWithBody(server, id, "application/json", bodyReader)
-}
-
-// NewStopSessionRequestWithBody constructs an http.Request for the StopSession method, with any body, and a specified content type
-func NewStopSessionRequestWithBody(server string, id SessionID, contentType string, body io.Reader) (*http.Request, error) {
+// NewStopSessionRequest constructs an http.Request for the StopSession method
+func NewStopSessionRequest(server string, id SessionID) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -5244,12 +5040,10 @@ func NewStopSessionRequestWithBody(server string, id SessionID, contentType stri
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -5297,40 +5091,6 @@ func NewSubmitSessionRequestWithBody(server string, id SessionID, contentType st
 	}
 
 	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
-// NewGetSessionUsageRequest constructs an http.Request for the GetSessionUsage method
-func NewGetSessionUsageRequest(server string, id SessionID) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/sessions/%s/usage", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
 
 	return req, nil
 }
@@ -5648,11 +5408,6 @@ type ClientWithResponsesInterface interface {
 	// Returns a wrapper object for the known response body format(s).
 	DeleteSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*DeleteSessionResponse, error)
 
-	// GetSessionWithResponse performs a GET /v1/sessions/{id} (the `GetSession` operationId) request.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	GetSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionResponse, error)
-
 	// SetSessionAgentTypeWithBodyWithResponse performs a PUT /v1/sessions/{id}/agent-type (the `SetSessionAgentType` operationId) request,
 	// with any type of body and a specified content type.
 	//
@@ -5703,20 +5458,10 @@ type ClientWithResponsesInterface interface {
 	// Returns a wrapper object for the known response body format(s).
 	GetSessionHydrationWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionHydrationResponse, error)
 
-	// InterruptSessionWithBodyWithResponse performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request,
-	// with any type of body and a specified content type.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	InterruptSessionWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error)
-
 	// InterruptSessionWithResponse performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	InterruptSessionWithResponse(ctx context.Context, id SessionID, body InterruptSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error)
-
-	// GetSessionPendingWithResponse performs a GET /v1/sessions/{id}/pending (the `GetSessionPending` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
-	GetSessionPendingWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionPendingResponse, error)
+	InterruptSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error)
 
 	// ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	//
@@ -5733,15 +5478,10 @@ type ClientWithResponsesInterface interface {
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	RevertSessionCodeWithResponse(ctx context.Context, id SessionID, body RevertSessionCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*RevertSessionCodeResponse, error)
 
-	// StopSessionWithBodyWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request,
-	// with any type of body and a specified content type.
+	// StopSessionWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
-	StopSessionWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*StopSessionResponse, error)
-
-	// StopSessionWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	StopSessionWithResponse(ctx context.Context, id SessionID, body StopSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*StopSessionResponse, error)
+	StopSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*StopSessionResponse, error)
 
 	// SubmitSessionWithBodyWithResponse performs a POST /v1/sessions/{id}/submit (the `SubmitSession` operationId) request,
 	// with any type of body and a specified content type.
@@ -5752,11 +5492,6 @@ type ClientWithResponsesInterface interface {
 	// SubmitSessionWithResponse performs a POST /v1/sessions/{id}/submit (the `SubmitSession` operationId) request.
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	SubmitSessionWithResponse(ctx context.Context, id SessionID, body SubmitSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*SubmitSessionResponse, error)
-
-	// GetSessionUsageWithResponse performs a GET /v1/sessions/{id}/usage (the `GetSessionUsage` operationId) request.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	GetSessionUsageWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionUsageResponse, error)
 
 	// GetWarningsWithResponse performs a GET /v1/warnings (the `GetWarnings` operationId) request.
 	//
@@ -7013,54 +6748,6 @@ func (r DeleteSessionResponse) ContentType() string {
 	return ""
 }
 
-type GetSessionResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *Session
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetSessionResponse) GetJSON200() *Session {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r GetSessionResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r GetSessionResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetSessionResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetSessionResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetSessionResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
 type SetSessionAgentTypeResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -7438,54 +7125,6 @@ func (r InterruptSessionResponse) ContentType() string {
 	return ""
 }
 
-type GetSessionPendingResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *PendingSnapshot
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetSessionPendingResponse) GetJSON200() *PendingSnapshot {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r GetSessionPendingResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r GetSessionPendingResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetSessionPendingResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetSessionPendingResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetSessionPendingResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
 type ReopenSessionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -7665,54 +7304,6 @@ func (r SubmitSessionResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r SubmitSessionResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetSessionUsageResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *UsageSnapshot
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetSessionUsageResponse) GetJSON200() *UsageSnapshot {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r GetSessionUsageResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r GetSessionUsageResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetSessionUsageResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetSessionUsageResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetSessionUsageResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -8248,17 +7839,6 @@ func (c *ClientWithResponses) DeleteSessionWithResponse(ctx context.Context, id 
 	return ParseDeleteSessionResponse(rsp)
 }
 
-// GetSessionWithResponse performs a GET /v1/sessions/{id} (the `GetSession` operationId) request.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) GetSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionResponse, error) {
-	rsp, err := c.GetSession(ctx, id, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetSessionResponse(rsp)
-}
-
 // SetSessionAgentTypeWithBodyWithResponse performs a PUT /v1/sessions/{id}/agent-type (the `SetSessionAgentType` operationId) request,
 // with any type of body and a specified content type.
 //
@@ -8369,37 +7949,15 @@ func (c *ClientWithResponses) GetSessionHydrationWithResponse(ctx context.Contex
 	return ParseGetSessionHydrationResponse(rsp)
 }
 
-// InterruptSessionWithBodyWithResponse performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request,
-// with any type of body and a specified content type.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) InterruptSessionWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error) {
-	rsp, err := c.InterruptSessionWithBody(ctx, id, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseInterruptSessionResponse(rsp)
-}
-
 // InterruptSessionWithResponse performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) InterruptSessionWithResponse(ctx context.Context, id SessionID, body InterruptSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error) {
-	rsp, err := c.InterruptSession(ctx, id, body, reqEditors...)
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) InterruptSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error) {
+	rsp, err := c.InterruptSession(ctx, id, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
 	return ParseInterruptSessionResponse(rsp)
-}
-
-// GetSessionPendingWithResponse performs a GET /v1/sessions/{id}/pending (the `GetSessionPending` operationId) request.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) GetSessionPendingWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionPendingResponse, error) {
-	rsp, err := c.GetSessionPending(ctx, id, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetSessionPendingResponse(rsp)
 }
 
 // ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
@@ -8435,22 +7993,11 @@ func (c *ClientWithResponses) RevertSessionCodeWithResponse(ctx context.Context,
 	return ParseRevertSessionCodeResponse(rsp)
 }
 
-// StopSessionWithBodyWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request,
-// with any type of body and a specified content type.
+// StopSessionWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) StopSessionWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*StopSessionResponse, error) {
-	rsp, err := c.StopSessionWithBody(ctx, id, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseStopSessionResponse(rsp)
-}
-
-// StopSessionWithResponse performs a POST /v1/sessions/{id}/stop (the `StopSession` operationId) request.
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) StopSessionWithResponse(ctx context.Context, id SessionID, body StopSessionJSONRequestBody, reqEditors ...RequestEditorFn) (*StopSessionResponse, error) {
-	rsp, err := c.StopSession(ctx, id, body, reqEditors...)
+func (c *ClientWithResponses) StopSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*StopSessionResponse, error) {
+	rsp, err := c.StopSession(ctx, id, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -8477,17 +8024,6 @@ func (c *ClientWithResponses) SubmitSessionWithResponse(ctx context.Context, id 
 		return nil, err
 	}
 	return ParseSubmitSessionResponse(rsp)
-}
-
-// GetSessionUsageWithResponse performs a GET /v1/sessions/{id}/usage (the `GetSessionUsage` operationId) request.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) GetSessionUsageWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*GetSessionUsageResponse, error) {
-	rsp, err := c.GetSessionUsage(ctx, id, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetSessionUsageResponse(rsp)
 }
 
 // GetWarningsWithResponse performs a GET /v1/warnings (the `GetWarnings` operationId) request.
@@ -9381,39 +8917,6 @@ func ParseDeleteSessionResponse(rsp *http.Response) (*DeleteSessionResponse, err
 	return response, nil
 }
 
-// ParseGetSessionResponse parses an HTTP response from a GetSessionWithResponse call
-func ParseGetSessionResponse(rsp *http.Response) (*GetSessionResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &GetSessionResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest Session
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
-}
-
 // ParseSetSessionAgentTypeResponse parses an HTTP response from a SetSessionAgentTypeWithResponse call
 func ParseSetSessionAgentTypeResponse(rsp *http.Response) (*SetSessionAgentTypeResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -9674,39 +9177,6 @@ func ParseInterruptSessionResponse(rsp *http.Response) (*InterruptSessionRespons
 	return response, nil
 }
 
-// ParseGetSessionPendingResponse parses an HTTP response from a GetSessionPendingWithResponse call
-func ParseGetSessionPendingResponse(rsp *http.Response) (*GetSessionPendingResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &GetSessionPendingResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest PendingSnapshot
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
-}
-
 // ParseReopenSessionResponse parses an HTTP response from a ReopenSessionWithResponse call
 func ParseReopenSessionResponse(rsp *http.Response) (*ReopenSessionResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -9818,39 +9288,6 @@ func ParseSubmitSessionResponse(rsp *http.Response) (*SubmitSessionResponse, err
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest SubmitResult
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
-}
-
-// ParseGetSessionUsageResponse parses an HTTP response from a GetSessionUsageWithResponse call
-func ParseGetSessionUsageResponse(rsp *http.Response) (*GetSessionUsageResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &GetSessionUsageResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest UsageSnapshot
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -10048,9 +9485,6 @@ type ServerInterface interface {
 	// (DELETE /v1/sessions/{id})
 	DeleteSession(w http.ResponseWriter, r *http.Request, id SessionID)
 
-	// (GET /v1/sessions/{id})
-	GetSession(w http.ResponseWriter, r *http.Request, id SessionID)
-
 	// (PUT /v1/sessions/{id}/agent-type)
 	SetSessionAgentType(w http.ResponseWriter, r *http.Request, id SessionID)
 
@@ -10075,9 +9509,6 @@ type ServerInterface interface {
 	// (POST /v1/sessions/{id}/interrupt)
 	InterruptSession(w http.ResponseWriter, r *http.Request, id SessionID)
 
-	// (GET /v1/sessions/{id}/pending)
-	GetSessionPending(w http.ResponseWriter, r *http.Request, id SessionID)
-
 	// (POST /v1/sessions/{id}/reopen)
 	ReopenSession(w http.ResponseWriter, r *http.Request, id SessionID)
 
@@ -10089,9 +9520,6 @@ type ServerInterface interface {
 
 	// (POST /v1/sessions/{id}/submit)
 	SubmitSession(w http.ResponseWriter, r *http.Request, id SessionID)
-
-	// (GET /v1/sessions/{id}/usage)
-	GetSessionUsage(w http.ResponseWriter, r *http.Request, id SessionID)
 
 	// (GET /v1/warnings)
 	GetWarnings(w http.ResponseWriter, r *http.Request)
@@ -10856,32 +10284,6 @@ func (siw *ServerInterfaceWrapper) DeleteSession(w http.ResponseWriter, r *http.
 	handler.ServeHTTP(w, r)
 }
 
-// GetSession operation middleware
-func (siw *ServerInterfaceWrapper) GetSession(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "id" -------------
-	var id SessionID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetSession(w, r, id)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
 // SetSessionAgentType operation middleware
 func (siw *ServerInterfaceWrapper) SetSessionAgentType(w http.ResponseWriter, r *http.Request) {
 
@@ -11106,32 +10508,6 @@ func (siw *ServerInterfaceWrapper) InterruptSession(w http.ResponseWriter, r *ht
 	handler.ServeHTTP(w, r)
 }
 
-// GetSessionPending operation middleware
-func (siw *ServerInterfaceWrapper) GetSessionPending(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "id" -------------
-	var id SessionID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetSessionPending(w, r, id)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
 // ReopenSession operation middleware
 func (siw *ServerInterfaceWrapper) ReopenSession(w http.ResponseWriter, r *http.Request) {
 
@@ -11227,32 +10603,6 @@ func (siw *ServerInterfaceWrapper) SubmitSession(w http.ResponseWriter, r *http.
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.SubmitSession(w, r, id)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
-// GetSessionUsage operation middleware
-func (siw *ServerInterfaceWrapper) GetSessionUsage(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "id" -------------
-	var id SessionID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetSessionUsage(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -11429,7 +10779,6 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions", wrapper.ListSessions)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions", wrapper.CreateSession)
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/v1/sessions/{id}", wrapper.DeleteSession)
-	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}", wrapper.GetSession)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/archive", wrapper.ArchiveSession)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/reopen", wrapper.ReopenSession)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/submit", wrapper.SubmitSession)
@@ -11440,8 +10789,6 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/sessions/{id}/agent-type", wrapper.SetSessionAgentType)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/hydration", wrapper.GetSessionHydration)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/history", wrapper.GetSessionHistory)
-	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/pending", wrapper.GetSessionPending)
-	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/usage", wrapper.GetSessionUsage)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/code-snapshots", wrapper.GetSessionCodeSnapshots)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/revert-code", wrapper.RevertSessionCode)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/workspaces", wrapper.ListWorkspaces)

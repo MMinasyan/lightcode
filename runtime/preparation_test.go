@@ -1351,10 +1351,11 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 					if err != nil {
 						t.Fatalf("ReadEntries: %v", err)
 					}
-					sourceBefore, err := e.h.ReadSession(context.Background(), session)
+					sourceBeforeSnap, err := e.h.SnapshotSession(context.Background(), session)
 					if err != nil {
-						t.Fatalf("ReadSession: %v", err)
+						t.Fatalf("SnapshotSession: %v", err)
 					}
+					sourceBefore := sourceBeforeSnap.Session
 					tc.arm(e)
 					res, err := e.h.Fork(context.Background(), harness.ForkRequest{
 						SourceSessionID: session,
@@ -1379,10 +1380,11 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 					if len(entriesAfter) != len(entriesBefore) {
 						t.Fatalf("source entries after the failed fork = %d, want unchanged %d", len(entriesAfter), len(entriesBefore))
 					}
-					sourceAfter, err := e.h.ReadSession(context.Background(), session)
+					sourceAfterSnap, err := e.h.SnapshotSession(context.Background(), session)
 					if err != nil {
-						t.Fatalf("ReadSession: %v", err)
+						t.Fatalf("SnapshotSession: %v", err)
 					}
+					sourceAfter := sourceAfterSnap.Session
 					if !reflect.DeepEqual(sourceAfter, sourceBefore) {
 						t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfter, sourceBefore)
 					}

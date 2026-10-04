@@ -1076,12 +1076,12 @@ func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 	if len(deleted) != 0 {
 		t.Fatalf("Sweep deleted %v, want the live member to skip the Session", deleted)
 	}
-	rec, err := h.ReadSession(context.Background(), testSessionID)
+	rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if rec.State.Lifecycle != LifecycleOpen {
-		t.Fatalf("swept lifecycle = %q, want the skipped open Session", rec.State.Lifecycle)
+	if rec.Lifecycle != LifecycleOpen {
+		t.Fatalf("swept lifecycle = %q, want the skipped open Session", rec.Lifecycle)
 	}
 
 	h.finishBackgroundMember(c, member) // the member finishes: both paths proceed

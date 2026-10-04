@@ -2646,14 +2646,14 @@ func TestBackgroundLifecycleSharedPreparation(t *testing.T) {
 			}
 			var childIdentity harness.SessionIdentity
 			if err := bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				rec, err := h.ReadSession(ctx, child)
+				rec, err := h.ReadSessionHeader(ctx, child)
 				if err != nil {
 					return err
 				}
 				childIdentity = rec.Identity
 				return nil
 			}); err != nil {
-				t.Fatalf("ReadSession(child): %v", err)
+				t.Fatalf("ReadSessionHeader(child): %v", err)
 			}
 			if !req.Session.Identity.CreatedAt.Equal(childIdentity.CreatedAt) {
 				t.Fatalf("prepared CreatedAt = %v, want the durable child identity's %v", req.Session.Identity.CreatedAt, childIdentity.CreatedAt)

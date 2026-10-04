@@ -65,6 +65,62 @@ func snapshotThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.
 	return snap
 }
 
+// headerThroughRuntime reads one Session's owned metadata header through the
+// Runtime's admission gate: the narrow producer list rows and command results
+// consume.
+func headerThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.SessionHeader {
+	t.Helper()
+	var header harness.SessionHeader
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		header, err = h.ReadSessionHeader(ctx, sessionID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ReadSessionHeader(%s): %v", sessionID, err)
+	}
+	return header
+}
+
+// historyThroughRuntime reads one Session's owned committed history and
+// revision through the Runtime's admission gate: the narrow producer the
+// live fork boundary consumes.
+func historyThroughRuntime(t *testing.T, r *Runtime, sessionID string) ([]harness.HistoryFact, harness.SessionRevision) {
+	t.Helper()
+	var (
+		facts    []harness.HistoryFact
+		revision harness.SessionRevision
+	)
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		facts, revision, err = h.ReadSessionHistory(ctx, sessionID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ReadSessionHistory(%s): %v", sessionID, err)
+	}
+	return facts, revision
+}
+
+// headerErrorThroughRuntime reads one Session header through the Runtime's
+// admission gate and returns its typed error unchanged, so closed/canceled/
+// corrupt/deleted oracles share one admission-gated callback path.
+func headerErrorThroughRuntime(ctx context.Context, r *Runtime, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		_, err := h.ReadSessionHeader(ctx, sessionID)
+		return err
+	})
+}
+
+// historyErrorThroughRuntime reads one Session history through the Runtime's
+// admission gate and returns its typed error unchanged.
+func historyErrorThroughRuntime(ctx context.Context, r *Runtime, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		_, _, err := h.ReadSessionHistory(ctx, sessionID)
+		return err
+	})
+}
+
 // submitQueuedThroughRuntime submits one buffered queued message.
 func submitQueuedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string) {
 	t.Helper()
@@ -215,10 +271,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		root := projectionSession(t, r, workspace, "solo")
 
 		// The root header before any Operation starts.
-		rootHeader, err := r.getSession(context.Background(), root.Identity.SessionID)
-		if err != nil {
-			t.Fatalf("getSession root: %v", err)
-		}
+		rootHeader := projectSession(headerThroughRuntime(t, r, root.Identity.SessionID))
 		assertStableHeader(t, rootHeader, snapshotThroughRuntime(t, r, root.Identity.SessionID),
 			root.Identity.SessionID, workspace, "solo", "")
 		if rootHeader.ParentSessionId != nil || rootHeader.SourceSessionId != nil {
@@ -240,10 +293,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 
 		forked := forkThroughRuntime(t, r, root.Identity.SessionID, boundary, "fork-op-1")
 		awaitModelArrival(t, e)
-		forkHeader, err := r.getSession(context.Background(), forked)
-		if err != nil {
-			t.Fatalf("getSession fork: %v", err)
-		}
+		forkHeader := projectSession(headerThroughRuntime(t, r, forked))
 		assertStableHeader(t, forkHeader, snapshotThroughRuntime(t, r, forked),
 			forked, workspace, "solo", "fork-op-1")
 		if forkHeader.SourceSessionId == nil || *forkHeader.SourceSessionId != root.Identity.SessionID {
@@ -255,10 +305,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 
 		child := launchChildThroughRuntime(t, r, root.Identity.SessionID, "child-op-1")
 		awaitModelArrival(t, e)
-		childHeader, err := r.getSession(context.Background(), child)
-		if err != nil {
-			t.Fatalf("getSession child: %v", err)
-		}
+		childHeader := projectSession(headerThroughRuntime(t, r, child))
 		assertStableHeader(t, childHeader, snapshotThroughRuntime(t, r, child),
 			child, workspace, "worker", "child-op-1")
 		if childHeader.ParentSessionId == nil || *childHeader.ParentSessionId != root.Identity.SessionID {
@@ -432,10 +479,10 @@ func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
 			t.Fatalf("list = %+v, want exactly the valid %s", list, valid)
 		}
 
-		if _, err := r.getSession(context.Background(), deleted); !errors.Is(err, harness.ErrNotFound) {
+		if err := headerErrorThroughRuntime(context.Background(), r, deleted); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("deleted read = %v, want harness.ErrNotFound", err)
 		}
-		_, err = r.getSession(context.Background(), corruptID)
+		err = headerErrorThroughRuntime(context.Background(), r, corruptID)
 		if !errors.Is(err, harness.ErrCorrupt) {
 			t.Fatalf("corrupt read = %v, want the harness.ErrCorrupt class", err)
 		}
@@ -482,10 +529,7 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 		ws := filepath.Join(e.home, "owned")
 		session := projectionSession(t, r, ws, "solo").Identity.SessionID
 
-		header, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession: %v", err)
-		}
+		header := projectSession(headerThroughRuntime(t, r, session))
 		wantHeader := header
 		header.AgentType = "mutated"
 		header.Workspace = "mutated"
@@ -511,10 +555,7 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 			workspaces[0].Root = "mutated"
 		}
 
-		reread, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession re-read: %v", err)
-		}
+		reread := projectSession(headerThroughRuntime(t, r, session))
 		if reread != wantHeader {
 			t.Fatalf("re-read header = %+v, want the immutable pre-mutation %+v", reread, wantHeader)
 		}
@@ -555,10 +596,7 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 
 		// The complete old outcome: a read that finishes before the deletion
 		// commit returns the full header.
-		before, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession before delete: %v", err)
-		}
+		before := projectSession(headerThroughRuntime(t, r, session))
 		if before.SessionId != session || before.Lifecycle != protocol.Archived {
 			t.Fatalf("pre-delete header = %+v, want the complete archived header", before)
 		}
@@ -583,8 +621,7 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 		}
 		readDone := make(chan error, 1)
 		go func() {
-			_, err := r.getSession(context.Background(), session)
-			readDone <- err
+			readDone <- headerErrorThroughRuntime(context.Background(), r, session)
 		}()
 		release()
 		if err := <-deleteDone; err != nil {
@@ -613,17 +650,11 @@ func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
 		e.prep.modelGate = gate
 		submitThroughRuntime(t, r, session, "op-1", "running")
 		awaitModelArrival(t, e)
-		before, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession: %v", err)
-		}
+		before := projectSession(headerThroughRuntime(t, r, session))
 
 		submitQueuedThroughRuntime(t, r, session, "op-2", "queued")
 
-		after, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession after queue: %v", err)
-		}
+		after := projectSession(headerThroughRuntime(t, r, session))
 		if after.SessionRevision.DurableRevision != before.SessionRevision.DurableRevision {
 			t.Fatalf("durable revision = %s, want the unchanged %s", after.SessionRevision.DurableRevision, before.SessionRevision.DurableRevision)
 		}
@@ -655,8 +686,7 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 	}
 	closed := []func() error{
 		func() error {
-			_, err := r.getSession(context.Background(), "0123456789abcdef0123456789abcdef")
-			return err
+			return headerErrorThroughRuntime(context.Background(), r, "0123456789abcdef0123456789abcdef")
 		},
 		func() error {
 			_, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
@@ -675,7 +705,9 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	canceledCalls := []func() error{
-		func() error { _, err := r2.getSession(canceled, "0123456789abcdef0123456789abcdef"); return err },
+		func() error {
+			return headerErrorThroughRuntime(canceled, r2, "0123456789abcdef0123456789abcdef")
+		},
 		func() error {
 			_, err := r2.listSessions(canceled, protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
 			return err
@@ -701,10 +733,7 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 		submitThroughRuntime(t, r, session, "op-1", "work")
 		e.prep.awaitCleanups(1)
 
-		header, err := r.getSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("getSession: %v", err)
-		}
+		header := projectSession(headerThroughRuntime(t, r, session))
 		assertExactJSONKeys(t, header, []string{
 			"agent_type", "created_at", "last_activity", "lifecycle", "session_id",
 			"session_revision", "session_revision.durable_revision", "session_revision.instance_id",
@@ -829,17 +858,20 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		defer closeProjectionRuntime(r)
 		ws := filepath.Join(e.home, "scan")
 		// Two archived Sessions seeded after Open: the lower sorted identity
-		// is the victim, the higher the cold survivor.
+		// is the cold survivor whose parked materialization lets the deletion
+		// land first; the higher sorted identity is the victim copy that a
+		// missed gone check would still list.
 		first := seedStaleArchivedSession(t, store, ws, 0)
 		second := seedStaleArchivedSession(t, store, ws, 0)
-		victim, survivor := first, second
-		if victim > survivor {
-			victim, survivor = survivor, victim
+		survivor, victim := first, second
+		if survivor > victim {
+			survivor, victim = victim, survivor
 		}
-		// Warm the victim before arming, so the scan's first gated entry read
-		// is the cold survivor's validation.
-		if _, err := r.getSession(context.Background(), victim); err != nil {
-			t.Fatalf("warm getSession: %v", err)
+		// Warm the victim before arming: the scan reaches it only after the
+		// parked survivor, so a missed gone check would return its cached
+		// header instead of omitting it.
+		if err := headerErrorThroughRuntime(context.Background(), r, victim); err != nil {
+			t.Fatalf("warm ReadSessionHeader: %v", err)
 		}
 
 		gated.arm()
@@ -873,7 +905,7 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		if len(list) != 1 || list[0].SessionId != survivor || list[0].Lifecycle != protocol.Archived || list[0].ArchivedAt == nil {
 			t.Fatalf("list = %+v, want exactly the complete survivor %s header", list, survivor)
 		}
-		if _, err := r.getSession(context.Background(), victim); !errors.Is(err, harness.ErrNotFound) {
+		if err := headerErrorThroughRuntime(context.Background(), r, victim); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("victim read = %v, want harness.ErrNotFound", err)
 		}
 	})

@@ -266,15 +266,15 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.ReadSession(context.Background(), sessionID)
+	session, err := h.SnapshotSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
+		t.Fatalf("SnapshotSession: %v", err)
 	}
-	if session.State.CurrentOperationID != testOpID {
-		t.Fatalf("current operation %q, want the still-running %q", session.State.CurrentOperationID, testOpID)
+	if session.Session.State.CurrentOperationID != testOpID {
+		t.Fatalf("current operation %q, want the still-running %q", session.Session.State.CurrentOperationID, testOpID)
 	}
-	if !usageTotalsEqual(session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.State.Usage, want)
+	if !usageTotalsEqual(session.Session.State.Usage, want) {
+		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
 	}
 
 	// The second context projection reads the entry the first effect committed.
@@ -341,12 +341,12 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.ReadSession(context.Background(), sessionID)
+	session, err := h.SnapshotSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
+		t.Fatalf("SnapshotSession: %v", err)
 	}
-	if session.State.CurrentOperationID != testOpID || !usageTotalsEqual(session.State.Usage, want) {
-		t.Fatalf("session state = %+v, want the running operation and updated usage", session.State)
+	if session.Session.State.CurrentOperationID != testOpID || !usageTotalsEqual(session.Session.State.Usage, want) {
+		t.Fatalf("session state = %+v, want the running operation and updated usage", session.Session.State)
 	}
 }
 
@@ -563,12 +563,12 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.ReadSession(context.Background(), sessionID)
+	session, err := h.SnapshotSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
+		t.Fatalf("SnapshotSession: %v", err)
 	}
-	if !usageTotalsEqual(session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.State.Usage, want)
+	if !usageTotalsEqual(session.Session.State.Usage, want) {
+		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
 	}
 }
 
@@ -595,12 +595,12 @@ func readReservedIntent(t *testing.T, store *graphStorage, sessionID string) str
 // current Operation after its terminal settlement.
 func requireSessionCleared(t *testing.T, h *Harness, sessionID string) {
 	t.Helper()
-	session, err := h.ReadSession(context.Background(), sessionID)
+	session, err := h.ReadSessionHeader(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if session.State.CurrentOperationID != "" {
-		t.Fatalf("current operation %q survived a terminal settlement", session.State.CurrentOperationID)
+	if session.CurrentOperationID != "" {
+		t.Fatalf("current operation %q survived a terminal settlement", session.CurrentOperationID)
 	}
 }
 
@@ -746,7 +746,7 @@ func TestSignalProjectionEscaping(t *testing.T) {
 // and advances last activity to its commit time.
 func TestSteeringInputHelper(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	before, err := h.ReadSession(context.Background(), sessionID)
+	before, err := h.ReadSessionHeader(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
@@ -778,18 +778,18 @@ func TestSteeringInputHelper(t *testing.T) {
 	if runtime == nil || runtime.Origin != InputOriginRuntime {
 		t.Fatalf("runtime steering entry did not preserve its submission origin: %+v", runtime)
 	}
-	after, err := h.ReadSession(context.Background(), sessionID)
+	after, err := h.ReadSessionHeader(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
 	if after.Identity.SessionID != sessionID {
 		t.Fatalf("session identity changed")
 	}
-	if !after.State.LastActivity.After(before.State.LastActivity) {
-		t.Fatalf("last activity = %v, want it advanced to the steering commit time", after.State.LastActivity)
+	if !after.LastActivity.After(before.LastActivity) {
+		t.Fatalf("last activity = %v, want it advanced to the steering commit time", after.LastActivity)
 	}
-	if after.State.CurrentOperationID != testOpID {
-		t.Fatalf("current operation = %q, want the running operation preserved", after.State.CurrentOperationID)
+	if after.CurrentOperationID != testOpID {
+		t.Fatalf("current operation = %q, want the running operation preserved", after.CurrentOperationID)
 	}
 }
 
@@ -853,7 +853,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
-		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
+		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
@@ -871,7 +871,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("result over a foreign revision = %v, want the revision-race conflict", err)
 		}
-		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
+		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
@@ -881,7 +881,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrConflict) {
 			t.Fatalf("steering over a foreign revision = %v, want the revision-race conflict", err)
 		}
-		if session, err := h.ReadSession(context.Background(), sessionID); err != nil || session.State.CurrentAgentType != "foreign" {
+		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
@@ -1352,12 +1352,12 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		if rec.State.Status != OperationRunning {
 			t.Fatalf("operation status = %s, want the committed running state preserved for recovery", rec.State.Status)
 		}
-		session, err := h.ReadSession(context.Background(), sessionID)
+		session, err := h.ReadSessionHeader(context.Background(), sessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if session.State.CurrentOperationID != testOpID {
-			t.Fatalf("session current operation = %q, want the running Operation still current", session.State.CurrentOperationID)
+		if session.CurrentOperationID != testOpID {
+			t.Fatalf("session current operation = %q, want the running Operation still current", session.CurrentOperationID)
 		}
 	})
 }

@@ -64,26 +64,6 @@ func decodeOneDocument(data []byte, dst any) error {
 	return nil
 }
 
-// decodeEmptyBody decodes the one request shape whose members are all
-// forbidden: the generated empty-map alias. The body must be one JSON object
-// carrying no members; null and any member are invalid.
-func decodeEmptyBody(r *http.Request, dst *map[string]interface{}) error {
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		return invalidRequest("read request body: %v", err)
-	}
-	if isJSONNull(data) {
-		return invalidRequest("request body must be a JSON object, not null")
-	}
-	if err := decodeOneDocument(data, dst); err != nil {
-		return invalidRequest("%v", err)
-	}
-	if len(*dst) != 0 {
-		return invalidRequest("request body must be an empty object")
-	}
-	return nil
-}
-
 // invalidRequest wraps one transport-shape rejection in the shared invalid
 // input sentinel, so the error mapper classifies every decode and validation
 // failure as one class.

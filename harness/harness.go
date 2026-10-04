@@ -311,22 +311,6 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	return ownSessionRecord(record), nil
 }
 
-// ReadSession returns the materialized Session record of one Session. A
-// deletion that committed after materialization resolves to ErrNotFound
-// rather than a stale cached read.
-func (h *Harness) ReadSession(ctx context.Context, sessionID string) (SessionRecord, error) {
-	c, err := h.coordinatorFor(ctx, sessionID)
-	if err != nil {
-		return SessionRecord{}, err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.gone {
-		return SessionRecord{}, notFoundSession(sessionID)
-	}
-	return ownSessionRecord(c.graph.Session), nil
-}
-
 // ReadOperation returns the materialized Operation record of one Operation of
 // one Session. A deletion that committed after materialization resolves to
 // ErrNotFound rather than a stale cached read.

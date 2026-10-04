@@ -101,11 +101,11 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 			t.Fatalf("createSessionHeader: %v", err)
 		}
 		snap := snapshotThroughRuntime(t, r, header.SessionId)
-		if !reflect.DeepEqual(header, projectSession(snap)) {
-			t.Fatalf("create header = %+v, want the real post-transition snapshot projection %+v", header, projectSession(snap))
+		if !reflect.DeepEqual(header, projectSession(snapshotHeader(snap))) {
+			t.Fatalf("create header = %+v, want the real post-transition snapshot projection %+v", header, projectSession(snapshotHeader(snap)))
 		}
-		if header.SessionRevision != sessionRevision(snap) {
-			t.Fatalf("create header revision = %+v, want the snapshot pair %+v", header.SessionRevision, sessionRevision(snap))
+		if header.SessionRevision != wireRevision(snapshotRevision(snap)) {
+			t.Fatalf("create header revision = %+v, want the snapshot pair %+v", header.SessionRevision, wireRevision(snapshotRevision(snap)))
 		}
 		if header.Workspace != workspace || header.AgentType != "solo" || header.Lifecycle != protocol.Open {
 			t.Fatalf("create header = %+v, want workspace %q solo open", header, workspace)
@@ -167,8 +167,8 @@ func TestSessionCommandAgentType(t *testing.T) {
 			t.Fatalf("ghost header agent type = %q, want ghost", header.AgentType)
 		}
 		snap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(header, projectSession(snap)) || header.SessionRevision != sessionRevision(snap) {
-			t.Fatalf("ghost header = %+v, want the real snapshot projection %+v", header, projectSession(snap))
+		if !reflect.DeepEqual(header, projectSession(snapshotHeader(snap))) || header.SessionRevision != wireRevision(snapshotRevision(snap)) {
+			t.Fatalf("ghost header = %+v, want the real snapshot projection %+v", header, projectSession(snapshotHeader(snap)))
 		}
 
 		worker, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
@@ -176,8 +176,8 @@ func TestSessionCommandAgentType(t *testing.T) {
 			t.Fatalf("setSessionAgentType(worker): %v", err)
 		}
 		workerSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(worker, projectSession(workerSnap)) || worker.SessionRevision != sessionRevision(workerSnap) {
-			t.Fatalf("worker header = %+v, want the real snapshot projection %+v", worker, projectSession(workerSnap))
+		if !reflect.DeepEqual(worker, projectSession(snapshotHeader(workerSnap))) || worker.SessionRevision != wireRevision(snapshotRevision(workerSnap)) {
+			t.Fatalf("worker header = %+v, want the real snapshot projection %+v", worker, projectSession(snapshotHeader(workerSnap)))
 		}
 		if worker.SessionRevision.DurableRevision == header.SessionRevision.DurableRevision {
 			t.Fatalf("durable revision did not advance across the committed change: %+v", worker.SessionRevision)
@@ -593,8 +593,8 @@ func TestSessionCommandFork(t *testing.T) {
 			t.Fatalf("fork header rendezvous = (%q, %v), want the destination still running", status, err)
 		}
 		destSnap := snapshotThroughRuntime(t, r, destID)
-		if !reflect.DeepEqual(result.Session, projectSession(destSnap)) || result.Session.SessionRevision != sessionRevision(destSnap) {
-			t.Fatalf("fork header = %+v, want the real snapshot projection %+v", result.Session, projectSession(destSnap))
+		if !reflect.DeepEqual(result.Session, projectSession(snapshotHeader(destSnap))) || result.Session.SessionRevision != wireRevision(snapshotRevision(destSnap)) {
+			t.Fatalf("fork header = %+v, want the real snapshot projection %+v", result.Session, projectSession(snapshotHeader(destSnap)))
 		}
 
 		retry, err := r.forkSession(ctx, sourceID, req)
@@ -762,11 +762,11 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			t.Fatalf("archive header = %+v, want archived with a timestamp", archived)
 		}
 		archivedSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(archived, projectSession(archivedSnap)) || archived.SessionRevision != sessionRevision(archivedSnap) {
-			t.Fatalf("archive header = %+v, want the real snapshot projection %+v", archived, projectSession(archivedSnap))
+		if !reflect.DeepEqual(archived, projectSession(snapshotHeader(archivedSnap))) || archived.SessionRevision != wireRevision(snapshotRevision(archivedSnap)) {
+			t.Fatalf("archive header = %+v, want the real snapshot projection %+v", archived, projectSession(snapshotHeader(archivedSnap)))
 		}
-		if archived.SessionRevision.LocalRevision != sessionRevision(before).LocalRevision {
-			t.Fatalf("archive header local revision = %q, want the real %q", archived.SessionRevision.LocalRevision, sessionRevision(before).LocalRevision)
+		if archived.SessionRevision.LocalRevision != wireRevision(snapshotRevision(before)).LocalRevision {
+			t.Fatalf("archive header local revision = %q, want the real %q", archived.SessionRevision.LocalRevision, wireRevision(snapshotRevision(before)).LocalRevision)
 		}
 
 		reopened, err := r.reopenSession(ctx, sessionID)
@@ -777,8 +777,8 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			t.Fatalf("reopen header = %+v, want open without a timestamp", reopened)
 		}
 		reopenedSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(reopened, projectSession(reopenedSnap)) || reopened.SessionRevision != sessionRevision(reopenedSnap) {
-			t.Fatalf("reopen header = %+v, want the real snapshot projection %+v", reopened, projectSession(reopenedSnap))
+		if !reflect.DeepEqual(reopened, projectSession(snapshotHeader(reopenedSnap))) || reopened.SessionRevision != wireRevision(snapshotRevision(reopenedSnap)) {
+			t.Fatalf("reopen header = %+v, want the real snapshot projection %+v", reopened, projectSession(snapshotHeader(reopenedSnap)))
 		}
 
 		running, err := r.createSession(ctx, filepath.Join(e.home, "life-running"), "solo")
@@ -831,7 +831,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(siblingTree, "snapshots", "1", "f")); err != nil {
 			t.Fatalf("sibling artifact tree was touched: %v", err)
 		}
-		if _, err := r.getSession(ctx, sessionID); !errors.Is(err, harness.ErrNotFound) {
+		if err := headerErrorThroughRuntime(ctx, r, sessionID); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("deleted by-ID read = %v, want harness.ErrNotFound", err)
 		}
 		if err := r.deleteSession(ctx, sessionID); err != nil {
@@ -1075,7 +1075,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 		if _, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: protocol.Open}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("closed list = %v, want ErrClosed", err)
 		}
-		if _, err := r.getSession(ctx, sessionID); !errors.Is(err, ErrClosed) {
+		if err := headerErrorThroughRuntime(ctx, r, sessionID); !errors.Is(err, ErrClosed) {
 			t.Fatalf("closed read = %v, want ErrClosed", err)
 		}
 		if _, err := r.submitSession(ctx, sessionID, req); !errors.Is(err, ErrClosed) {
