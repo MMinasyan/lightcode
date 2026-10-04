@@ -233,6 +233,48 @@ func (e InputOrigin) Valid() bool {
 	}
 }
 
+// Defines values for ModelField.
+const (
+	ModelFieldContextWindow    ModelField = "context_window"
+	ModelFieldCost             ModelField = "cost"
+	ModelFieldExtraBody        ModelField = "extra_body"
+	ModelFieldHidden           ModelField = "hidden"
+	ModelFieldInputModalities  ModelField = "input_modalities"
+	ModelFieldMaxOutputTokens  ModelField = "max_output_tokens"
+	ModelFieldName             ModelField = "name"
+	ModelFieldProtocolMetadata ModelField = "protocol_metadata"
+	ModelFieldSystemRole       ModelField = "system_role"
+	ModelFieldUsageInStream    ModelField = "usage_in_stream"
+)
+
+// Valid indicates whether the value is a known member of the ModelField enum.
+func (e ModelField) Valid() bool {
+	switch e {
+	case ModelFieldContextWindow:
+		return true
+	case ModelFieldCost:
+		return true
+	case ModelFieldExtraBody:
+		return true
+	case ModelFieldHidden:
+		return true
+	case ModelFieldInputModalities:
+		return true
+	case ModelFieldMaxOutputTokens:
+		return true
+	case ModelFieldName:
+		return true
+	case ModelFieldProtocolMetadata:
+		return true
+	case ModelFieldSystemRole:
+		return true
+	case ModelFieldUsageInStream:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ModelSource.
 const (
 	ModelSourceBundled    ModelSource = "bundled"
@@ -365,6 +407,54 @@ func (e ProviderKeySource) Valid() bool {
 	case Managed:
 		return true
 	case None:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProviderField.
+const (
+	ProviderFieldBaseUrl             ProviderField = "base_url"
+	ProviderFieldDiscovery           ProviderField = "discovery"
+	ProviderFieldEnvironmentVariable ProviderField = "api_key_env"
+	ProviderFieldExtraBody           ProviderField = "extra_body"
+	ProviderFieldHeaders             ProviderField = "headers"
+	ProviderFieldHidden              ProviderField = "hidden"
+	ProviderFieldMaxTokensField      ProviderField = "max_tokens_field"
+	ProviderFieldName                ProviderField = "name"
+	ProviderFieldOptions             ProviderField = "options"
+	ProviderFieldProtocolMetadata    ProviderField = "protocol_metadata"
+	ProviderFieldSystemRole          ProviderField = "system_role"
+	ProviderFieldUsageInStream       ProviderField = "usage_in_stream"
+)
+
+// Valid indicates whether the value is a known member of the ProviderField enum.
+func (e ProviderField) Valid() bool {
+	switch e {
+	case ProviderFieldBaseUrl:
+		return true
+	case ProviderFieldDiscovery:
+		return true
+	case ProviderFieldEnvironmentVariable:
+		return true
+	case ProviderFieldExtraBody:
+		return true
+	case ProviderFieldHeaders:
+		return true
+	case ProviderFieldHidden:
+		return true
+	case ProviderFieldMaxTokensField:
+		return true
+	case ProviderFieldName:
+		return true
+	case ProviderFieldOptions:
+		return true
+	case ProviderFieldProtocolMetadata:
+		return true
+	case ProviderFieldSystemRole:
+		return true
+	case ProviderFieldUsageInStream:
 		return true
 	default:
 		return false
@@ -650,90 +740,6 @@ func (e WarningChangedEventKind) Valid() bool {
 	}
 }
 
-// Defines values for ResetProviderFieldParamsField.
-const (
-	ResetProviderFieldParamsFieldBaseUrl             ResetProviderFieldParamsField = "base_url"
-	ResetProviderFieldParamsFieldDiscovery           ResetProviderFieldParamsField = "discovery"
-	ResetProviderFieldParamsFieldEnvironmentVariable ResetProviderFieldParamsField = "api_key_env"
-	ResetProviderFieldParamsFieldExtraBody           ResetProviderFieldParamsField = "extra_body"
-	ResetProviderFieldParamsFieldHeaders             ResetProviderFieldParamsField = "headers"
-	ResetProviderFieldParamsFieldMaxTokensField      ResetProviderFieldParamsField = "max_tokens_field"
-	ResetProviderFieldParamsFieldName                ResetProviderFieldParamsField = "name"
-	ResetProviderFieldParamsFieldOptions             ResetProviderFieldParamsField = "options"
-	ResetProviderFieldParamsFieldProtocolMetadata    ResetProviderFieldParamsField = "protocol_metadata"
-	ResetProviderFieldParamsFieldSystemRole          ResetProviderFieldParamsField = "system_role"
-	ResetProviderFieldParamsFieldUsageInStream       ResetProviderFieldParamsField = "usage_in_stream"
-)
-
-// Valid indicates whether the value is a known member of the ResetProviderFieldParamsField enum.
-func (e ResetProviderFieldParamsField) Valid() bool {
-	switch e {
-	case ResetProviderFieldParamsFieldBaseUrl:
-		return true
-	case ResetProviderFieldParamsFieldDiscovery:
-		return true
-	case ResetProviderFieldParamsFieldEnvironmentVariable:
-		return true
-	case ResetProviderFieldParamsFieldExtraBody:
-		return true
-	case ResetProviderFieldParamsFieldHeaders:
-		return true
-	case ResetProviderFieldParamsFieldMaxTokensField:
-		return true
-	case ResetProviderFieldParamsFieldName:
-		return true
-	case ResetProviderFieldParamsFieldOptions:
-		return true
-	case ResetProviderFieldParamsFieldProtocolMetadata:
-		return true
-	case ResetProviderFieldParamsFieldSystemRole:
-		return true
-	case ResetProviderFieldParamsFieldUsageInStream:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for ResetProviderModelFieldParamsField.
-const (
-	ResetProviderModelFieldParamsFieldContextWindow    ResetProviderModelFieldParamsField = "context_window"
-	ResetProviderModelFieldParamsFieldCost             ResetProviderModelFieldParamsField = "cost"
-	ResetProviderModelFieldParamsFieldExtraBody        ResetProviderModelFieldParamsField = "extra_body"
-	ResetProviderModelFieldParamsFieldInputModalities  ResetProviderModelFieldParamsField = "input_modalities"
-	ResetProviderModelFieldParamsFieldMaxOutputTokens  ResetProviderModelFieldParamsField = "max_output_tokens"
-	ResetProviderModelFieldParamsFieldName             ResetProviderModelFieldParamsField = "name"
-	ResetProviderModelFieldParamsFieldProtocolMetadata ResetProviderModelFieldParamsField = "protocol_metadata"
-	ResetProviderModelFieldParamsFieldSystemRole       ResetProviderModelFieldParamsField = "system_role"
-	ResetProviderModelFieldParamsFieldUsageInStream    ResetProviderModelFieldParamsField = "usage_in_stream"
-)
-
-// Valid indicates whether the value is a known member of the ResetProviderModelFieldParamsField enum.
-func (e ResetProviderModelFieldParamsField) Valid() bool {
-	switch e {
-	case ResetProviderModelFieldParamsFieldContextWindow:
-		return true
-	case ResetProviderModelFieldParamsFieldCost:
-		return true
-	case ResetProviderModelFieldParamsFieldExtraBody:
-		return true
-	case ResetProviderModelFieldParamsFieldInputModalities:
-		return true
-	case ResetProviderModelFieldParamsFieldMaxOutputTokens:
-		return true
-	case ResetProviderModelFieldParamsFieldName:
-		return true
-	case ResetProviderModelFieldParamsFieldProtocolMetadata:
-		return true
-	case ResetProviderModelFieldParamsFieldSystemRole:
-		return true
-	case ResetProviderModelFieldParamsFieldUsageInStream:
-		return true
-	default:
-		return false
-	}
-}
-
 // Agent defines model for Agent.
 type Agent struct {
 	Capabilities []string `json:"capabilities"`
@@ -893,14 +899,6 @@ type CreateSessionRequest struct {
 	Workspace string `json:"workspace"`
 }
 
-// DeletionMutation defines model for DeletionMutation.
-type DeletionMutation struct {
-	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-
-	// Result The removed subject leaves no post-state view; deletion is the one mutation whose result is an explicit null.
-	Result *map[string]interface{} `json:"result"`
-}
-
 // DiscoveredModelCandidate defines model for DiscoveredModelCandidate.
 type DiscoveredModelCandidate struct {
 	ContextWindow   int    `json:"context_window"`
@@ -1025,6 +1023,9 @@ type ModelEdit struct {
 	UsageInStream    *bool                   `json:"usage_in_stream,omitempty"`
 }
 
+// ModelField The one model field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer model member.
+type ModelField string
+
 // ModelList defines model for ModelList.
 type ModelList struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
@@ -1052,7 +1053,9 @@ type ModelListEntry struct {
 // ModelMutation defines model for ModelMutation.
 type ModelMutation struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-	Result                ModelView             `json:"result"`
+
+	// Result The mutated subject's current effective post-state, or null when no subject remains — a removed user node can reveal its inherited base or leave nothing behind through the same operator.
+	Result *ModelView `json:"result"`
 }
 
 // ModelRef A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
@@ -1166,12 +1169,9 @@ type Provider struct {
 	ApiKeyEnv        string                  `json:"api_key_env"`
 	BaseUrl          string                  `json:"base_url"`
 	Builtin          bool                    `json:"builtin"`
-	Connectable      bool                    `json:"connectable"`
 	Connected        bool                    `json:"connected"`
-	Disconnectable   bool                    `json:"disconnectable"`
 	Discovery        bool                    `json:"discovery"`
 	ExtraBody        *map[string]interface{} `json:"extra_body,omitempty"`
-	GeneratedKeyEnv  *string                 `json:"generated_key_env,omitempty"`
 	Headers          map[string]string       `json:"headers"`
 	Hidden           bool                    `json:"hidden"`
 	Id               string                  `json:"id"`
@@ -1181,7 +1181,6 @@ type Provider struct {
 	Name             string                  `json:"name"`
 	Options          *map[string]interface{} `json:"options,omitempty"`
 	ProtocolMetadata *ProtocolMetadata       `json:"protocol_metadata,omitempty"`
-	Removable        bool                    `json:"removable"`
 	SystemRole       SystemRole              `json:"system_role"`
 	UsageInStream    bool                    `json:"usage_in_stream"`
 	UserHeaders      map[string]string       `json:"user_headers"`
@@ -1212,6 +1211,9 @@ type ProviderEdit struct {
 	UsageInStream    *bool                   `json:"usage_in_stream,omitempty"`
 }
 
+// ProviderField The one provider field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer provider member.
+type ProviderField string
+
 // ProviderList defines model for ProviderList.
 type ProviderList struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
@@ -1227,7 +1229,9 @@ type ProviderModelList struct {
 // ProviderMutation defines model for ProviderMutation.
 type ProviderMutation struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-	Result                Provider              `json:"result"`
+
+	// Result The mutated subject's current effective post-state, or null when no subject remains — a removed user node can reveal its inherited base or leave nothing behind through the same operator.
+	Result *Provider `json:"result"`
 }
 
 // ReadFileRequest defines model for ReadFileRequest.
@@ -1608,9 +1612,6 @@ type ResetProviderFieldParams struct {
 	ProviderId ProviderIDQuery `form:"provider_id" json:"provider_id"`
 }
 
-// ResetProviderFieldParamsField defines parameters for ResetProviderField.
-type ResetProviderFieldParamsField string
-
 // DeleteProviderModelParams defines parameters for DeleteProviderModel.
 type DeleteProviderModelParams struct {
 	ProviderId ProviderIDQuery `form:"provider_id" json:"provider_id"`
@@ -1638,9 +1639,6 @@ type ResetProviderModelFieldParams struct {
 	ProviderId ProviderIDQuery `form:"provider_id" json:"provider_id"`
 	ModelId    ModelIDQuery    `form:"model_id" json:"model_id"`
 }
-
-// ResetProviderModelFieldParamsField defines parameters for ResetProviderModelField.
-type ResetProviderModelFieldParamsField string
 
 // GetRetainedCodeSnapshotsParams defines parameters for GetRetainedCodeSnapshots.
 type GetRetainedCodeSnapshotsParams struct {
@@ -2489,7 +2487,7 @@ type ClientInterface interface {
 	DiscoverProviderCandidates(ctx context.Context, body DiscoverProviderCandidatesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ResetProviderField performs a DELETE /v1/providers/fields/{field} (the `ResetProviderField` operationId) request.
-	ResetProviderField(ctx context.Context, field ResetProviderFieldParamsField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+	ResetProviderField(ctx context.Context, field ProviderField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DeleteProviderModel performs a DELETE /v1/providers/models (the `DeleteProviderModel` operationId) request.
 	DeleteProviderModel(ctx context.Context, params *DeleteProviderModelParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2509,7 +2507,7 @@ type ClientInterface interface {
 	DiscoverProviderModelCandidates(ctx context.Context, params *DiscoverProviderModelCandidatesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ResetProviderModelField performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
-	ResetProviderModelField(ctx context.Context, field ResetProviderModelFieldParamsField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+	ResetProviderModelField(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetRetainedCodeSnapshots performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
 	GetRetainedCodeSnapshots(ctx context.Context, params *GetRetainedCodeSnapshotsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2898,7 +2896,7 @@ func (c *Client) DiscoverProviderCandidates(ctx context.Context, body DiscoverPr
 }
 
 // ResetProviderField performs a DELETE /v1/providers/fields/{field} (the `ResetProviderField` operationId) request.
-func (c *Client) ResetProviderField(ctx context.Context, field ResetProviderFieldParamsField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+func (c *Client) ResetProviderField(ctx context.Context, field ProviderField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewResetProviderFieldRequest(c.Server, field, params)
 	if err != nil {
 		return nil, err
@@ -2978,7 +2976,7 @@ func (c *Client) DiscoverProviderModelCandidates(ctx context.Context, params *Di
 }
 
 // ResetProviderModelField performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
-func (c *Client) ResetProviderModelField(ctx context.Context, field ResetProviderModelFieldParamsField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+func (c *Client) ResetProviderModelField(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewResetProviderModelFieldRequest(c.Server, field, params)
 	if err != nil {
 		return nil, err
@@ -4015,7 +4013,7 @@ func NewDiscoverProviderCandidatesRequestWithBody(server string, contentType str
 }
 
 // NewResetProviderFieldRequest constructs an http.Request for the ResetProviderField method
-func NewResetProviderFieldRequest(server string, field ResetProviderFieldParamsField, params *ResetProviderFieldParams) (*http.Request, error) {
+func NewResetProviderFieldRequest(server string, field ProviderField, params *ResetProviderFieldParams) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -4301,7 +4299,7 @@ func NewDiscoverProviderModelCandidatesRequest(server string, params *DiscoverPr
 }
 
 // NewResetProviderModelFieldRequest constructs an http.Request for the ResetProviderModelField method
-func NewResetProviderModelFieldRequest(server string, field ResetProviderModelFieldParamsField, params *ResetProviderModelFieldParams) (*http.Request, error) {
+func NewResetProviderModelFieldRequest(server string, field ModelField, params *ResetProviderModelFieldParams) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -5341,7 +5339,7 @@ type ClientWithResponsesInterface interface {
 	// ResetProviderFieldWithResponse performs a DELETE /v1/providers/fields/{field} (the `ResetProviderField` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
-	ResetProviderFieldWithResponse(ctx context.Context, field ResetProviderFieldParamsField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderFieldResponse, error)
+	ResetProviderFieldWithResponse(ctx context.Context, field ProviderField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderFieldResponse, error)
 
 	// DeleteProviderModelWithResponse performs a DELETE /v1/providers/models (the `DeleteProviderModel` operationId) request.
 	//
@@ -5371,7 +5369,7 @@ type ClientWithResponsesInterface interface {
 	// ResetProviderModelFieldWithResponse performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
-	ResetProviderModelFieldWithResponse(ctx context.Context, field ResetProviderModelFieldParamsField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderModelFieldResponse, error)
+	ResetProviderModelFieldWithResponse(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderModelFieldResponse, error)
 
 	// GetRetainedCodeSnapshotsWithResponse performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
 	//
@@ -5991,13 +5989,13 @@ type DeleteProviderDetailResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *DeletionMutation
+	JSON200 *ProviderMutation
 	// JSONDefault the response for an HTTP default `application/json` response
 	JSONDefault *Error
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r DeleteProviderDetailResponse) GetJSON200() *DeletionMutation {
+func (r DeleteProviderDetailResponse) GetJSON200() *ProviderMutation {
 	return r.JSON200
 }
 
@@ -6279,13 +6277,13 @@ type DeleteProviderModelResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *DeletionMutation
+	JSON200 *ModelMutation
 	// JSONDefault the response for an HTTP default `application/json` response
 	JSONDefault *Error
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r DeleteProviderModelResponse) GetJSON200() *DeletionMutation {
+func (r DeleteProviderModelResponse) GetJSON200() *ModelMutation {
 	return r.JSON200
 }
 
@@ -7688,7 +7686,7 @@ func (c *ClientWithResponses) DiscoverProviderCandidatesWithResponse(ctx context
 // ResetProviderFieldWithResponse performs a DELETE /v1/providers/fields/{field} (the `ResetProviderField` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) ResetProviderFieldWithResponse(ctx context.Context, field ResetProviderFieldParamsField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderFieldResponse, error) {
+func (c *ClientWithResponses) ResetProviderFieldWithResponse(ctx context.Context, field ProviderField, params *ResetProviderFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderFieldResponse, error) {
 	rsp, err := c.ResetProviderField(ctx, field, params, reqEditors...)
 	if err != nil {
 		return nil, err
@@ -7754,7 +7752,7 @@ func (c *ClientWithResponses) DiscoverProviderModelCandidatesWithResponse(ctx co
 // ResetProviderModelFieldWithResponse performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) ResetProviderModelFieldWithResponse(ctx context.Context, field ResetProviderModelFieldParamsField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderModelFieldResponse, error) {
+func (c *ClientWithResponses) ResetProviderModelFieldWithResponse(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderModelFieldResponse, error) {
 	rsp, err := c.ResetProviderModelField(ctx, field, params, reqEditors...)
 	if err != nil {
 		return nil, err
@@ -8408,7 +8406,7 @@ func ParseDeleteProviderDetailResponse(rsp *http.Response) (*DeleteProviderDetai
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest DeletionMutation
+		var dest ProviderMutation
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -8606,7 +8604,7 @@ func ParseDeleteProviderModelResponse(rsp *http.Response) (*DeleteProviderModelR
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest DeletionMutation
+		var dest ModelMutation
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -9453,7 +9451,7 @@ type ServerInterface interface {
 	DiscoverProviderCandidates(w http.ResponseWriter, r *http.Request)
 
 	// (DELETE /v1/providers/fields/{field})
-	ResetProviderField(w http.ResponseWriter, r *http.Request, field ResetProviderFieldParamsField, params ResetProviderFieldParams)
+	ResetProviderField(w http.ResponseWriter, r *http.Request, field ProviderField, params ResetProviderFieldParams)
 
 	// (DELETE /v1/providers/models)
 	DeleteProviderModel(w http.ResponseWriter, r *http.Request, params DeleteProviderModelParams)
@@ -9468,7 +9466,7 @@ type ServerInterface interface {
 	DiscoverProviderModelCandidates(w http.ResponseWriter, r *http.Request, params DiscoverProviderModelCandidatesParams)
 
 	// (DELETE /v1/providers/models/fields/{field})
-	ResetProviderModelField(w http.ResponseWriter, r *http.Request, field ResetProviderModelFieldParamsField, params ResetProviderModelFieldParams)
+	ResetProviderModelField(w http.ResponseWriter, r *http.Request, field ModelField, params ResetProviderModelFieldParams)
 
 	// (GET /v1/retained-code-snapshots)
 	GetRetainedCodeSnapshots(w http.ResponseWriter, r *http.Request, params GetRetainedCodeSnapshotsParams)
@@ -9890,7 +9888,7 @@ func (siw *ServerInterfaceWrapper) ResetProviderField(w http.ResponseWriter, r *
 	_ = err
 
 	// ------------- Path parameter "field" -------------
-	var field ResetProviderFieldParamsField
+	var field ProviderField
 
 	err = runtime.BindStyledParameterWithOptions("simple", "field", r.PathValue("field"), &field, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
 	if err != nil {
@@ -10090,7 +10088,7 @@ func (siw *ServerInterfaceWrapper) ResetProviderModelField(w http.ResponseWriter
 	_ = err
 
 	// ------------- Path parameter "field" -------------
-	var field ResetProviderModelFieldParamsField
+	var field ModelField
 
 	err = runtime.BindStyledParameterWithOptions("simple", "field", r.PathValue("field"), &field, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
 	if err != nil {

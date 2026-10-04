@@ -99,62 +99,10 @@ func TestPluginsSettingsDocumentsStayNamedOpaqueStrings(t *testing.T) {
 	rejectJSON(t, document, `{"kept":1}`)
 }
 
-func TestDeletionMutationCarriesRequiredNullResult(t *testing.T) {
-	s := componentSchema(t, "DeletionMutation")
-	acceptJSON(t, s, `{"configuration_revision": `+revisionJSON+`, "result": null}`)
-	rejectJSON(t, s, `{"configuration_revision": `+revisionJSON+`}`)
-	rejectJSON(t, s, `{"configuration_revision": `+revisionJSON+`, "result": {"removed": true}}`)
-}
-
-func TestBothDeleteOperationsUseTheDeletionMutationEnvelope(t *testing.T) {
-	doc := schema(t)
-	for _, row := range []struct{ path string }{
-		{"/v1/providers/detail"},
-		{"/v1/providers/models"},
-	} {
-		item := doc.Paths.Find(row.path)
-		if item == nil || item.Delete == nil {
-			t.Fatalf("%s has no DELETE operation", row.path)
-		}
-		responseRef := item.Delete.Responses.Status(200)
-		if responseRef == nil || responseRef.Value == nil {
-			t.Fatalf("%s DELETE has no 200 response", row.path)
-		}
-		ref := responseRef.Value.Content.Get("application/json").Schema.Ref
-		if want := "#/components/schemas/DeletionMutation"; ref != want {
-			t.Fatalf("%s DELETE 200 schema ref = %q, want %q", row.path, ref, want)
-		}
-	}
-}
-
 func TestModelUsageCarriesOneSharedModelReference(t *testing.T) {
 	s := componentSchema(t, "ModelUsage")
 	acceptJSON(t, s, `{"model": "openrouter/team/model", "usage": `+usageJSON+`}`)
 	rejectJSON(t, s, `{"provider": "openrouter", "model": "openrouter/team/model", "usage": `+usageJSON+`}`)
-}
-
-func TestGeneratedDeletionResponseSerializesExplicitNullResult(t *testing.T) {
-	response := protocol.DeletionMutation{
-		ConfigurationRevision: protocol.ConfigurationRevision{
-			InstanceId: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
-			Generation: "3",
-		},
-		Result: nil,
-	}
-	data, err := json.Marshal(response)
-	if err != nil {
-		t.Fatalf("marshaling generated DeletionMutation: %v", err)
-	}
-	if !strings.Contains(string(data), `"result":null`) {
-		t.Fatalf("generated deletion response JSON = %s, want an explicit null result", data)
-	}
-	var decoded protocol.DeletionMutation
-	if err := json.Unmarshal([]byte(`{"configuration_revision": `+revisionJSON+`, "result": null}`), &decoded); err != nil {
-		t.Fatalf("decoding a null-result deletion response into the generated type: %v", err)
-	}
-	if decoded.ConfigurationRevision.Generation != "3" {
-		t.Fatalf("decoded generation = %q", decoded.ConfigurationRevision.Generation)
-	}
 }
 
 func TestGeneratedModelUsageSerializesSingleModelReference(t *testing.T) {
@@ -308,40 +256,75 @@ func TestRevertDefaultsShareTheCodeRevertErrorContract(t *testing.T) {
 	rejectJSON(t, s, `{}`)
 }
 
-// TestResetProviderFieldEnumNamingPreservesWireValues keeps the generated
-// gosec-safe identifier for the api_key_env field while the schema retains
-// every original wire enum literal in order.
-func TestResetProviderFieldEnumNamingPreservesWireValues(t *testing.T) {
-	field := protocol.ResetProviderFieldParamsFieldEnvironmentVariable
-	if !field.Valid() {
-		t.Fatalf("generated identifier %q is not a valid enum member", field)
+// TestProviderAndModelFieldSetsShareEditAndResetPaths pins the one shared
+// field vocabulary per subject: the reset path parameters reference the
+// shared components, the components carry the exact editable-member sets
+// including hidden, and each edit request's property names equal its field
+// enum exactly — so the edit and reset paths cannot drift apart. The
+// api_key_env member keeps its gosec-safe generated identifier.
+func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
+	field := protocol.ProviderFieldEnvironmentVariable
+	if !field.Valid() || field != "api_key_env" {
+		t.Fatalf("generated identifier %q is not the valid api_key_env member", field)
 	}
-	if field != "api_key_env" {
-		t.Fatalf("generated identifier encodes %q, want api_key_env", field)
+	if !protocol.ProviderFieldHidden.Valid() || !protocol.ModelFieldHidden.Valid() {
+		t.Fatal("the shared field enums dropped the hidden member")
 	}
 
-	item := schema(t).Paths.Find("/v1/providers/fields/{field}")
-	if item == nil || item.Delete == nil {
-		t.Fatal("/v1/providers/fields/{field} has no DELETE operation")
-	}
-	var param *openapi3.Parameter
-	for _, p := range item.Delete.Parameters {
-		if p.Value != nil && p.Value.Name == "field" {
-			param = p.Value
-			break
+	doc := schema(t)
+	for _, row := range []struct {
+		path      string
+		component string
+		wantEnum  []string
+	}{
+		{"/v1/providers/fields/{field}", "ProviderField", []string{
+			"name", "base_url", "api_key_env", "headers", "options", "system_role",
+			"usage_in_stream", "max_tokens_field", "extra_body", "discovery", "protocol_metadata", "hidden",
+		}},
+		{"/v1/providers/models/fields/{field}", "ModelField", []string{
+			"name", "context_window", "max_output_tokens", "input_modalities", "system_role",
+			"usage_in_stream", "extra_body", "cost", "protocol_metadata", "hidden",
+		}},
+	} {
+		item := doc.Paths.Find(row.path)
+		if item == nil || item.Delete == nil {
+			t.Fatalf("%s has no DELETE operation", row.path)
 		}
-	}
-	if param == nil {
-		t.Fatal("field path parameter is missing")
-	}
-	want := []string{"name", "base_url", "api_key_env", "headers", "options", "system_role", "usage_in_stream", "max_tokens_field", "extra_body", "discovery", "protocol_metadata"}
-	got := param.Schema.Value.Enum
-	if len(got) != len(want) {
-		t.Fatalf("field enum holds %d values, want %d", len(got), len(want))
-	}
-	for i, v := range want {
-		if got[i] != v {
-			t.Fatalf("field enum[%d] = %v, want %q", i, got[i], v)
+		var param *openapi3.Parameter
+		for _, p := range item.Delete.Parameters {
+			if p.Value != nil && p.Value.Name == "field" {
+				param = p.Value
+				break
+			}
+		}
+		if param == nil {
+			t.Fatalf("%s field path parameter is missing", row.path)
+		}
+		if ref := param.Schema.Ref; ref != "#/components/schemas/"+row.component {
+			t.Fatalf("%s field parameter ref = %q, want the shared %s component", row.path, ref, row.component)
+		}
+		component := componentSchema(t, row.component)
+		if len(component.Enum) != len(row.wantEnum) {
+			t.Fatalf("%s enum holds %d values, want %d", row.component, len(component.Enum), len(row.wantEnum))
+		}
+		for i, v := range row.wantEnum {
+			if component.Enum[i] != v {
+				t.Fatalf("%s enum[%d] = %v, want %q", row.component, i, component.Enum[i], v)
+			}
+		}
+		// The edit request's property names are exactly the field enum: one
+		// vocabulary shared by both paths.
+		editName := strings.TrimSuffix(row.component, "Field") + "Edit"
+		edit := componentSchema(t, editName)
+		var properties []string
+		for name := range edit.Properties {
+			properties = append(properties, name)
+		}
+		sort.Strings(properties)
+		want := append([]string(nil), row.wantEnum...)
+		sort.Strings(want)
+		if strings.Join(properties, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s properties %v, want exactly the %s enum %v", editName, properties, row.component, want)
 		}
 	}
 }

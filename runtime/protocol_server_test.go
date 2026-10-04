@@ -21,6 +21,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -863,8 +864,8 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 // TestProtocolServerConfigurationFamily drives the configuration, model, and
 // provider operation families through the mounted server with the generated
 // client: reads carry their instance-qualified revision, the mutation
-// envelope keeps its post-state result, the deletion envelope keeps its
-// explicit null result, the publication reload makes a hand-edited file
+// envelope keeps its required post-state result — null exactly when no
+// subject remains — the publication reload makes a hand-edited file
 // current while a malformed candidate leaves the previous revision, and the
 // discovery read answers candidates from a stub endpoint.
 func TestProtocolServerConfigurationFamily(t *testing.T) {
@@ -1029,7 +1030,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		if err != nil || beforeReset.JSON200 == nil {
 			t.Fatalf("read before reset: %v", err)
 		}
-		reset, err := client.ResetProviderFieldWithResponse(ctx, protocol.ResetProviderFieldParamsField("name"), &protocol.ResetProviderFieldParams{ProviderId: "stub"})
+		reset, err := client.ResetProviderFieldWithResponse(ctx, protocol.ProviderField("name"), &protocol.ResetProviderFieldParams{ProviderId: "stub"})
 		if err != nil {
 			t.Fatalf("ResetProviderField: %v", err)
 		}
@@ -1037,7 +1038,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			body, _ := json.Marshal(reset.JSON200)
 			t.Fatalf("provider field reset = %s (status %d, %v)", body, reset.HTTPResponse.StatusCode, reset.JSONDefault)
 		}
-		if !reflect.DeepEqual(reset.JSON200.Result, beforeReset.JSON200.Provider) {
+		if reset.JSON200.Result == nil || !reflect.DeepEqual(*reset.JSON200.Result, beforeReset.JSON200.Provider) {
 			body, _ := json.Marshal(reset.JSON200.Result)
 			other, _ := json.Marshal(beforeReset.JSON200.Provider)
 			t.Fatalf("absent-override reset = %s, want the unchanged view %s", body, other)
@@ -1047,7 +1048,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 				reset.JSON200.ConfigurationRevision.Generation)
 		}
 
-		modelReset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ResetProviderModelFieldParamsField("name"), &protocol.ResetProviderModelFieldParams{ProviderId: "stub", ModelId: "stub/m"})
+		modelReset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelField("name"), &protocol.ResetProviderModelFieldParams{ProviderId: "stub", ModelId: "stub/m"})
 		if err != nil || modelReset.JSON200 == nil {
 			t.Fatalf("ResetProviderModelField: %v", err)
 		}
@@ -1058,7 +1059,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		}
 		if removed.JSON200 == nil || removed.JSON200.Result != nil {
 			body, _ := json.Marshal(removed.JSON200)
-			t.Fatalf("model deletion = %s, want the explicit null result", body)
+			t.Fatalf("model deletion = %s, want the null post-state", body)
 		}
 		if removed.JSON200.ConfigurationRevision.InstanceId != ps.instance {
 			t.Fatalf("deletion revision instance = %q", removed.JSON200.ConfigurationRevision.InstanceId)
@@ -1070,7 +1071,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		}
 		if deleted.JSON200 == nil || deleted.JSON200.Result != nil {
 			body, _ := json.Marshal(deleted.JSON200)
-			t.Fatalf("provider deletion = %s, want the explicit null result", body)
+			t.Fatalf("provider deletion = %s, want the null post-state", body)
 		}
 
 		// The settings write returns the published settings under the
@@ -1215,6 +1216,182 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		}
 		malformed(`{"providers":`)
 	})
+}
+
+// TestProtocolServerProviderPostStateAndKeyRules pins the post-state and
+// credential rules through the mounted generated client: a bundled model
+// override's delete reveals the base as the non-null result, a keyed create
+// returns its actual binding, a supplied key on an explicitly named external
+// variable refuses before any side effect, and no response byte carries a
+// key value.
+func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
+	reserveEnvKey(t, "LIGHTCODE_GENERATED_API_KEY")
+	e := newOwnerEnv(t)
+	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer closeProjectionRuntime(r)
+	ps := openProtocolServer(t, r)
+	client := protocolClient(t, ps)
+	ctx := context.Background()
+
+	// A bundled openrouter model gains a user override, whose delete then
+	// reveals the bundled base as the required non-null post-state.
+	var bundledModel string
+	for id, m := range r.config.current().catalog.Providers["openrouter"].Models {
+		if m.Source == catalog.SourceBundled {
+			bundledModel = id
+			break
+		}
+	}
+	if bundledModel == "" {
+		t.Fatal("no bundled openrouter model in the published catalog")
+	}
+	name := "Overridden"
+	saved, err := client.UpdateProviderModelWithResponse(ctx, &protocol.UpdateProviderModelParams{ProviderId: "openrouter", ModelId: bundledModel}, protocol.UpdateProviderModelRequest{
+		Model: protocol.ModelEdit{Name: &name},
+	})
+	if err != nil || saved.JSON200 == nil || saved.JSON200.Result == nil || saved.JSON200.Result.Name != name {
+		body, _ := json.Marshal(saved.JSON200)
+		t.Fatalf("bundled override = %s (%v), want the landed override", body, err)
+	}
+	revealed, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "openrouter", ModelId: bundledModel})
+	if err != nil || revealed.JSON200 == nil || revealed.JSON200.Result == nil ||
+		revealed.JSON200.Result.Id != bundledModel || revealed.JSON200.Result.Name == name ||
+		revealed.JSON200.Result.Source != protocol.ModelSourceBundled {
+		body, _ := json.Marshal(revealed.JSON200)
+		t.Fatalf("override delete = %s (%v), want the revealed bundled base under its exact ID and bundled source", body, err)
+	}
+
+	// A keyed create without a binding member allocates a fresh name and
+	// returns it as the actual binding; the key value itself never leaves.
+	key := "mounted-generated-secret"
+	created, err := client.CreateProviderWithResponse(ctx, protocol.CreateProviderRequest{
+		Id:       "generated",
+		Provider: protocol.ProviderEdit{BaseUrl: ptrTo("https://generated.test/v1")},
+		Models:   map[string]protocol.ModelEdit{"m": {ContextWindow: ptrTo(4096)}},
+		ApiKey:   &key,
+	})
+	if err != nil || created.JSON200 == nil || created.JSON200.Result.ApiKeyEnv != "LIGHTCODE_GENERATED_API_KEY" {
+		body, _ := json.Marshal(created.JSON200)
+		t.Fatalf("generated-binding create = %s (%v), want the actual binding in api_key_env", body, err)
+	}
+	if os.Getenv("LIGHTCODE_GENERATED_API_KEY") != key {
+		t.Fatalf("managed key state = %q, want the exact supplied value", os.Getenv("LIGHTCODE_GENERATED_API_KEY"))
+	}
+	body, _ := json.Marshal(created.JSON200)
+	if strings.Contains(string(body), key) {
+		t.Fatalf("the create response carries key bytes: %s", body)
+	}
+
+	// A supplied key on an explicitly named external variable refuses before
+	// any configuration or cache side effect, leaving the variable intact.
+	supplied := "mounted-refused-secret"
+	external := "PATH"
+	refused, err := client.CreateProviderWithResponse(ctx, protocol.CreateProviderRequest{
+		Id:       "external",
+		Provider: protocol.ProviderEdit{BaseUrl: ptrTo("https://external.test/v1"), ApiKeyEnv: &external},
+		Models:   map[string]protocol.ModelEdit{"m": {ContextWindow: ptrTo(4096)}},
+		ApiKey:   &supplied,
+	})
+	if err != nil {
+		t.Fatalf("external-binding create transport: %v", err)
+	}
+	if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.Configuration {
+		body, _ := json.Marshal(refused.JSON200)
+		t.Fatalf("external-binding create = %s (status %d), want the typed configuration refusal", body, refused.HTTPResponse.StatusCode)
+	}
+	if r.managedEnv.IsManaged("PATH") {
+		t.Fatal("the refused create managed the external variable")
+	}
+	if detail, derr := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "external"}); derr != nil || detail.JSONDefault == nil || detail.JSONDefault.Code != protocol.NotFound {
+		t.Fatalf("the refused create registered the provider: (%v, %+v)", derr, detail.JSONDefault)
+	}
+
+	// The same credential rule crosses the mounted connect route for both
+	// credential shapes: a usable keyless provider's connect refuses a
+	// supplied key, and the registered PATH-bound provider's connect refuses
+	// its supplied key — each before any effect, with the owning file, the
+	// publication revision, and the external variable untouched.
+	keyless, err := client.CreateProviderWithResponse(ctx, protocol.CreateProviderRequest{
+		Id:       "keylessc",
+		Provider: protocol.ProviderEdit{BaseUrl: ptrTo("https://keylessc.test/v1")},
+		Models:   map[string]protocol.ModelEdit{"m": {ContextWindow: ptrTo(4096)}},
+	})
+	if err != nil || keyless.JSON200 == nil {
+		body, _ := json.Marshal(keyless.JSON200)
+		t.Fatalf("keyless create = %s (%v, status %d)", body, err, keyless.HTTPResponse.StatusCode)
+	}
+	externalRegistered, err := client.CreateProviderWithResponse(ctx, protocol.CreateProviderRequest{
+		Id:       "externalc",
+		Provider: protocol.ProviderEdit{BaseUrl: ptrTo("https://externalc.test/v1"), ApiKeyEnv: &external},
+		Models:   map[string]protocol.ModelEdit{"m": {ContextWindow: ptrTo(4096)}},
+	})
+	if err != nil || externalRegistered.JSON200 == nil {
+		body, _ := json.Marshal(externalRegistered.JSON200)
+		t.Fatalf("no-key external registration = %s (%v, status %d)", body, err, externalRegistered.HTTPResponse.StatusCode)
+	}
+
+	// Both registered subjects are in place; the refusal baseline sits after
+	// their successful writes so the refused connects are provably silent.
+	configPath := filepath.Join(r.dataDir, "config.json")
+	refusalBaseline, rerr := os.ReadFile(configPath)
+	if rerr != nil {
+		t.Fatalf("read owning config: %v", rerr)
+	}
+	baselineView, err := client.GetConfigurationWithResponse(ctx)
+	if err != nil || baselineView.JSON200 == nil {
+		t.Fatalf("read revision baseline: %v", err)
+	}
+	suppliedConnect := "mounted-connect-secret"
+	keylessConnect, err := client.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "keylessc"}, protocol.ConnectRequest{ApiKey: &suppliedConnect})
+	if err != nil || keylessConnect.JSONDefault == nil || keylessConnect.JSONDefault.Code != protocol.Configuration {
+		body, _ := json.Marshal(keylessConnect.JSON200)
+		t.Fatalf("keyless connect with a supplied key = %s (status %d, %+v), want the typed configuration refusal", body, keylessConnect.HTTPResponse.StatusCode, keylessConnect.JSONDefault)
+	}
+	// The supplied-key connect on the externally defined PATH variable
+	// refuses through the same shared rule.
+	externalConnect, err := client.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "externalc"}, protocol.ConnectRequest{ApiKey: &suppliedConnect})
+	if err != nil || externalConnect.JSONDefault == nil || externalConnect.JSONDefault.Code != protocol.Configuration {
+		body, _ := json.Marshal(externalConnect.JSON200)
+		t.Fatalf("external connect with a supplied key = %s (status %d, %+v), want the typed configuration refusal", body, externalConnect.HTTPResponse.StatusCode, externalConnect.JSONDefault)
+	}
+	if r.managedEnv.IsManaged("PATH") {
+		t.Fatal("a refused connect managed the external variable")
+	}
+	afterConfig, rerr := os.ReadFile(configPath)
+	if rerr != nil || string(afterConfig) != string(refusalBaseline) {
+		t.Fatalf("a refused connect changed the owning config (%v)", rerr)
+	}
+	currentView, err := client.GetConfigurationWithResponse(ctx)
+	if err != nil || currentView.JSON200 == nil {
+		t.Fatalf("read after refusals: %v", err)
+	}
+	if currentView.JSON200.ConfigurationRevision.Generation != baselineView.JSON200.ConfigurationRevision.Generation {
+		t.Fatalf("a refused connect advanced the revision %s -> %s",
+			baselineView.JSON200.ConfigurationRevision.Generation, currentView.JSON200.ConfigurationRevision.Generation)
+	}
+
+	// A field outside the shared enum refuses invalid at the mounted owner
+	// through both reset routes, before any write.
+	for _, target := range []string{
+		"/v1/providers/fields/bogus?provider_id=keylessc",
+		"/v1/providers/models/fields/bogus?provider_id=keylessc&model_id=m",
+	} {
+		refusal := rawProtocol(t, http.MethodDelete, protocolTarget(ps, target), ps.credential, "")
+		defer refusal.Body.Close()
+		if refusal.StatusCode != http.StatusBadRequest {
+			t.Fatalf("reset %q = %d, want the typed invalid rejection 400", target, refusal.StatusCode)
+		}
+		if typed := decodeProtocolError(t, refusal); typed.Code != protocol.Invalid {
+			t.Fatalf("reset %q error = %+v, want invalid", target, typed)
+		}
+	}
+	afterConfig, rerr = os.ReadFile(configPath)
+	if rerr != nil || string(afterConfig) != string(refusalBaseline) {
+		t.Fatalf("a refused reset changed the owning config (%v)", rerr)
+	}
 }
 
 // TestProtocolServerAgentModelEdit pins the agent-model operation and the
@@ -1374,7 +1551,7 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 		if err != nil || saved.JSON200 == nil || !saved.JSON200.Result.Hidden {
 			t.Fatalf("model edit %q = (%v, %+v)", id, err, saved.JSON200)
 		}
-		reset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ResetProviderModelFieldParamsField("name"), &protocol.ResetProviderModelFieldParams{ProviderId: id, ModelId: "m"})
+		reset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelField("name"), &protocol.ResetProviderModelFieldParams{ProviderId: id, ModelId: "m"})
 		if err != nil || reset.JSON200 == nil {
 			t.Fatalf("model reset %q = (%v, %+v)", id, err, reset.JSON200)
 		}
@@ -1383,7 +1560,7 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 			body, _ := json.Marshal(connected.JSON200)
 			t.Fatalf("connect %q = %s (status %d, %v), want the keyless connection under its exact ID", id, body, connected.HTTPResponse.StatusCode, err)
 		}
-		fieldReset, err := client.ResetProviderFieldWithResponse(ctx, protocol.ResetProviderFieldParamsField("name"), &protocol.ResetProviderFieldParams{ProviderId: id})
+		fieldReset, err := client.ResetProviderFieldWithResponse(ctx, protocol.ProviderField("name"), &protocol.ResetProviderFieldParams{ProviderId: id})
 		if err != nil || fieldReset.JSON200 == nil || fieldReset.JSON200.Result.Id != id {
 			body, _ := json.Marshal(fieldReset.JSON200)
 			t.Fatalf("provider field reset %q = %s (status %d, %v), want the exact ID", id, body, fieldReset.HTTPResponse.StatusCode, err)

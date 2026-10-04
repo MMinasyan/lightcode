@@ -16,6 +16,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -168,45 +169,24 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 			t.Fatalf("openrouter model sources = %+v, want bundled labels", openrouter.Models)
 		}
 
-		// Key-source labels: managed (.env), external (pre-exported shell),
-		// none (unset), keyless (empty api_key_env) — and the operation flags
-		// each label implies.
+		// Key-source labels over the capture's own credential sample; the
+		// wire view carries no mutability flags or suggested names — source
+		// labels describe provenance.
 		for _, row := range []struct {
-			id                                   string
-			keySource                            string
-			connected, disconnectable, removable bool
+			id        string
+			keySource string
+			connected bool
 		}{
-			{"prov", "external", true, false, false},
-			{"managedp", "managed", true, true, false},
-			{"unsetp", "none", false, false, true},
-			{"keyless", "keyless", true, false, true},
+			{"prov", "external", true},
+			{"managedp", "managed", true},
+			{"unsetp", "none", false},
+			{"keyless", "keyless", true},
 		} {
 			view := findProvider(view.Providers, row.id)
-			if view.KeySource != protocol.ProviderKeySource(row.keySource) || view.Connected != row.connected ||
-				view.Disconnectable != row.disconnectable || view.Removable != row.removable {
-				t.Fatalf("%s labels = key_source %q connected %v disconnectable %v removable %v, want %q/%v/%v/%v",
-					row.id, view.KeySource, view.Connected, view.Disconnectable, view.Removable,
-					row.keySource, row.connected, row.disconnectable, row.removable)
+			if view.KeySource != protocol.ProviderKeySource(row.keySource) || view.Connected != row.connected {
+				t.Fatalf("%s labels = key_source %q connected %v, want %q/%v",
+					row.id, view.KeySource, view.Connected, row.keySource, row.connected)
 			}
-			if !view.Connectable {
-				t.Fatalf("%s connectable = false, want a nonempty base URL with a usable model", row.id)
-			}
-		}
-
-		// generated_key_env: the retained name rule over captured occupancy —
-		// the base name is free for prov, while managedp occupies nothing
-		// else; a provider whose own env name occupies the base gets the
-		// suffixed 2.
-		if got := *prov.GeneratedKeyEnv; got != "LIGHTCODE_PROV_API_KEY" {
-			t.Fatalf("prov generated_key_env = %q, want the unsuffixed base name", got)
-		}
-		managed := findProvider(view.Providers, "managedp")
-		if got := *managed.GeneratedKeyEnv; got != "LIGHTCODE_MANAGEDP_API_KEY" {
-			t.Fatalf("managedp generated_key_env = %q, want the unsuffixed base name", got)
-		}
-		occupied := findProvider(view.Providers, "occupied")
-		if got := *occupied.GeneratedKeyEnv; got != "LIGHTCODE_OCCUPIED_API_KEY_2" {
-			t.Fatalf("occupied generated_key_env = %q, want the retained suffix-2 name over captured occupancy", got)
 		}
 
 		// The no-authorization response contract: no casing or padding of the
@@ -224,11 +204,12 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 			t.Fatalf("effective headers = %v, want the retained transport header", prov.Headers)
 		}
 
-		// The bundled attribution rule: the builtin's user-layer collision
-		// with a bundled header name is stripped from user_headers, the
-		// unrelated custom header kept, and the user file is never edited.
-		if got := openrouter.UserHeaders; len(got) != 1 || got["X-Custom"] != "keep" {
-			t.Fatalf("openrouter user_headers = %v, want the bundled-collision-stripped custom header only", got)
+		// The user headers projection carries the user layer's own headers
+		// exactly — no source-based stripping — so a user-layer collision
+		// with a bundled header name is visible and editable; the user file
+		// is never edited.
+		if got := openrouter.UserHeaders; len(got) != 2 || got["x-title"] != "user-title" || got["X-Custom"] != "keep" {
+			t.Fatalf("openrouter user_headers = %v, want the user layer's own headers", got)
 		}
 		if len(openrouter.Headers["X-Title"]) == 0 || openrouter.Headers["HTTP-Referer"] == "" {
 			t.Fatalf("openrouter effective headers = %v, want the bundled headers present", openrouter.Headers)
@@ -245,6 +226,84 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 			}
 		}
 	})
+}
+
+// TestRuntimeSharedCredentialReference pins the shared credential
+// reference: three providers naming the same managed variable resolve one
+// credential — a sibling's update (including its connected rebinding away
+// from the shared name) and even a referencing provider's whole deletion
+// leave the variable's exact value and managed ownership and every
+// surviving sibling's connection untouched. One variable, no per-provider
+// leases.
+func TestRuntimeSharedCredentialReference(t *testing.T) {
+	unsetenv(t, "SHARED_CRED_TEST_KEY", "RESHARED_TEST_KEY")
+	store := storage.NewMemory()
+	e := newOwnerEnv(t)
+	writeDotEnv(t, e.home, "SHARED_CRED_TEST_KEY=shared-secret-value\n")
+	doc := `{"providers":{
+			"shalpha": {"transport": {"base_url": "https://a.test/v1", "api_key_env": "SHARED_CRED_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+			"shbeta": {"transport": {"base_url": "https://b.test/v1", "api_key_env": "SHARED_CRED_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+			"shgamma": {"transport": {"base_url": "https://c.test/v1", "api_key_env": "SHARED_CRED_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}}}}`
+	r, _ := openConfigurationRuntimeWithEnv(t, store, e, doc, `{"solo": {"model": "shalpha/m", "system_prompt": "simple"}}`)
+	defer closeProjectionRuntime(r)
+	ctx := context.Background()
+	sub, err := r.Subscribe(8)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	// Every sibling resolves the one shared credential.
+	for _, id := range []string{"shalpha", "shbeta", "shgamma"} {
+		detail, err := r.getProvider(ctx, id)
+		if err != nil || !detail.Provider.Connected || detail.Provider.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
+			t.Fatalf("%s = (%v, %+v), want the shared managed connection", id, err, detail.Provider)
+		}
+	}
+
+	// The sibling's update keeps the shared reference and the variable.
+	name := "Renamed Alpha"
+	if _, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{Name: &name}); err != nil {
+		t.Fatalf("sibling update: %v", err)
+	}
+	drainConnectionEvent(t, r.warnings, sub, "2")
+	if detail, err := r.getProvider(ctx, "shbeta"); err != nil || !detail.Provider.Connected || detail.Provider.ApiKeyEnv != "SHARED_CRED_TEST_KEY" {
+		t.Fatalf("shbeta after the sibling update = (%v, %+v), want the shared reference untouched", err, detail.Provider)
+	}
+	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
+		t.Fatalf("shared variable after the sibling update = (%q, %v), want the exact value and ownership", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
+	}
+
+	// The connected rebinding away from the shared name does not unset
+	// the credential: the variable keeps its value and the sibling keeps
+	// resolving it.
+	fresh := "RESHARED_TEST_KEY"
+	if _, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{ApiKeyEnv: &fresh}); err != nil {
+		t.Fatalf("connected rebinding: %v", err)
+	}
+	drainConnectionEvent(t, r.warnings, sub, "3")
+	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" {
+		t.Fatalf("the rebinding unset the shared credential: %q", os.Getenv("SHARED_CRED_TEST_KEY"))
+	}
+	if detail, err := r.getProvider(ctx, "shbeta"); err != nil || !detail.Provider.Connected {
+		t.Fatalf("shbeta after the rebinding = (%v, %+v), want the connection through the shared variable", err, detail.Provider)
+	}
+
+	// The deletion is the strongest form: removing a provider that
+	// still references the shared variable leaves the variable and every
+	// surviving sibling's connection intact — the variable is not a
+	// per-provider lease.
+	mutation, err := r.deleteProvider(ctx, "shbeta")
+	if err != nil || mutation.Result != nil {
+		t.Fatalf("shared-reference delete = (%v, %+v), want the null post-state", err, mutation)
+	}
+	drainConnectionEvent(t, r.warnings, sub, "4")
+	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
+		t.Fatalf("the deletion removed the shared variable = (%q, %v)", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
+	}
+	if detail, err := r.getProvider(ctx, "shgamma"); err != nil || !detail.Provider.Connected || detail.Provider.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
+		t.Fatalf("shgamma after the sibling deletion = (%v, %+v), want the surviving shared connection", err, detail.Provider)
+	}
 }
 
 // openConfigurationRuntimeWithEnv is openConfigurationRuntime with a
@@ -573,7 +632,6 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		prov := findProvider(baseline.Providers, "prov")
 		prov.Headers["X-Trace"] = "mutated"
 		prov.UserHeaders["X-Trace"] = "mutated"
-		(*prov.GeneratedKeyEnv) = "MUTATED"
 		var model *protocol.ModelView
 		for i := range prov.Models {
 			if prov.Models[i].Id == "m" {

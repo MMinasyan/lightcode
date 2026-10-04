@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
@@ -210,20 +209,46 @@ func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef str
 }
 
 // The provider/model metadata mutations: every operator is one admitted call
-// through the one configuration mutation path, projects its result from the
-// returned candidate only — never a second current() load — and has no
-// fallible step after the publication. Visibility edits ride the patches'
-// Hidden pointers; there is no second setter family and no secret parameter.
+// through the one configuration mutation path and projects its required
+// result from the returned frozen capture — the mutated subject's effective
+// post-state, or null when no subject remains — never a second current()
+// load. Visibility edits ride the patches' Hidden pointers; there is no
+// second setter family and no secret parameter.
+
+// providerPostState projects one provider's effective post-state from the
+// returned capture; a subject the candidate no longer contains is null.
+func providerPostState(captured configurationCapture, providerID string) *protocol.Provider {
+	prov := captured.snapshot.catalog.Providers[providerID]
+	if prov == nil {
+		return nil
+	}
+	view := projectProvider(captured, prov)
+	return &view
+}
+
+// modelPostState projects one model's effective post-state from the returned
+// capture; a subject the candidate no longer contains is null.
+func modelPostState(captured configurationCapture, providerID, modelID string) *protocol.ModelView {
+	prov := captured.snapshot.catalog.Providers[providerID]
+	if prov == nil {
+		return nil
+	}
+	entry := prov.Models[modelID]
+	if entry == nil {
+		return nil
+	}
+	view := projectModelView(prov, entry)
+	return &view
+}
 
 // addProvider creates one custom provider with its models through the one
-// mutation path: a new trimmed nonempty no-slash ID, a required base URL,
-// normalized unique model IDs, and at least one usable model. The optional
-// write-only key is never written to the raw layer: a missing api_key_env
-// member with a supplied key generates the retained unique env name, the
+// mutation path: a new trimmed nonempty no-slash ID and a required base URL;
+// candidate validity, not an editor-only usable-model count, governs the
+// creation. The optional write-only key is never written to the raw layer:
+// the one credential-input rule applies before any side effect, the
 // candidate validates completely before any write, and the managed key is
 // persisted only after the owning file — a failure there restores the exact
-// prior bytes. The candidate check proves the created subject survived the
-// shared catalog validation before the owning write.
+// prior bytes. The result carries the created provider's actual binding.
 func (r *Runtime) addProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -236,17 +261,16 @@ func (r *Runtime) addProvider(ctx context.Context, providerID string, patch prot
 	}
 	// The edit's candidate check already proved the created provider is a
 	// member of this candidate's catalog.
-	prov := captured.snapshot.catalog.Providers[strings.TrimSpace(providerID)]
 	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectProvider(captured, prov),
+		Result:                providerPostState(captured, strings.TrimSpace(providerID)),
 	}, nil
 }
 
 // updateProvider patches one known provider's writable members through the
-// same mutation path: builtin locks, the connected-provider api_key_env
-// prohibition and the wholesale headers rule are the edit's own prewrite
-// checks, and the result projects the returned candidate's effective view.
+// same mutation path: no source-specific lock applies, the wholesale
+// headers rule and the candidate check govern the edit, and the result
+// projects the returned candidate's effective view.
 func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -257,38 +281,35 @@ func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch p
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
-	// The edit's candidate check already proved the patched provider is a
-	// member of this candidate's catalog.
-	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectProvider(captured, prov),
+		Result:                providerPostState(captured, providerID),
 	}, nil
 }
 
-// deleteProvider removes one custom provider's owning user definition. The
-// mutation's result is the generated deletion envelope: no post-state view,
-// an explicit null result.
-func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protocol.DeletionMutation, error) {
+// deleteProvider removes one provider's owning user node through the same
+// mutation path; the result carries the surviving effective post-state, or
+// null when the candidate no longer contains the subject.
+func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
-		return protocol.DeletionMutation{}, err
+		return protocol.ProviderMutation{}, err
 	}
 	defer release()
 	captured, err := r.config.mutate(ctx, r.config.editProviderDelete(providerID))
 	if err != nil {
-		return protocol.DeletionMutation{}, err
+		return protocol.ProviderMutation{}, err
 	}
-	return protocol.DeletionMutation{
+	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                nil,
+		Result:                providerPostState(captured, providerID),
 	}, nil
 }
 
-// resetProviderField removes exactly one provider user-layer override — or
-// no-ops on an absent override, returning the unchanged projection and the
-// current revision with no file write, generation, or event.
-func (r *Runtime) resetProviderField(ctx context.Context, providerID string, field protocol.ResetProviderFieldParamsField) (protocol.ProviderMutation, error) {
+// resetProviderField removes exactly one provider user-layer override under
+// the shared field enum — an absent override publishes the same successful
+// edit — and projects the effective post-state from the returned candidate.
+func (r *Runtime) resetProviderField(ctx context.Context, providerID string, field protocol.ProviderField) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -298,12 +319,9 @@ func (r *Runtime) resetProviderField(ctx context.Context, providerID string, fie
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
-	// The edit's candidate check already proved the reset provider is a
-	// member of this candidate's catalog.
-	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectProvider(captured, prov),
+		Result:                providerPostState(captured, providerID),
 	}, nil
 }
 
@@ -320,37 +338,35 @@ func (r *Runtime) saveModel(ctx context.Context, providerID, modelID string, pat
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
-	// The edit's candidate check already proved the saved model is a member
-	// of this candidate's catalog.
-	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ModelMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectModelView(prov, prov.Models[modelID]),
+		Result:                modelPostState(captured, providerID, modelID),
 	}, nil
 }
 
-// deleteModel removes one user model's owning definition; the result is the
-// generated deletion envelope with its explicit null.
-func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (protocol.DeletionMutation, error) {
+// deleteModel removes one model's owning user node through the same mutation
+// path; the result carries the surviving effective post-state, or null when
+// the candidate no longer contains the subject.
+func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (protocol.ModelMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
-		return protocol.DeletionMutation{}, err
+		return protocol.ModelMutation{}, err
 	}
 	defer release()
 	captured, err := r.config.mutate(ctx, r.config.editModelDelete(providerID, modelID))
 	if err != nil {
-		return protocol.DeletionMutation{}, err
+		return protocol.ModelMutation{}, err
 	}
-	return protocol.DeletionMutation{
+	return protocol.ModelMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                nil,
+		Result:                modelPostState(captured, providerID, modelID),
 	}, nil
 }
 
-// resetModelField removes exactly one model user-layer override — or no-ops
-// on an absent override, returning the unchanged projection and the current
-// revision with no file write, generation, or event.
-func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID string, field protocol.ResetProviderModelFieldParamsField) (protocol.ModelMutation, error) {
+// resetModelField removes exactly one model user-layer override under the
+// shared field enum — an absent override publishes the same successful edit
+// — and projects the effective post-state from the returned candidate.
+func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID string, field protocol.ModelField) (protocol.ModelMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ModelMutation{}, err
@@ -360,12 +376,9 @@ func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID strin
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
-	// The edit's candidate check already proved the reset model is a member
-	// of this candidate's catalog.
-	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ModelMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectModelView(prov, prov.Models[modelID]),
+		Result:                modelPostState(captured, providerID, modelID),
 	}, nil
 }
 
@@ -408,24 +421,20 @@ func projectProviders(captured configurationCapture) []protocol.Provider {
 
 // projectProvider maps one effective catalog provider onto its generated
 // view: the effective and user headers projected separately under the
-// no-authorization response contract, the key-source classification and the
-// connection/operation labels from the capture's own credential sample, and
-// the generated env name over the capture's own catalog. These are labels,
-// never values: no key value appears.
+// no-authorization response contract, and the key-source classification and
+// connection label from the capture's own credential sample. These are
+// labels, never values: no key value, permission suggestion, or generated
+// name suggestion appears.
 func projectProvider(captured configurationCapture, prov *catalog.Provider) protocol.Provider {
 	connected := catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials))
 	keySource := classifyKeySource(prov.Transport.APIKeyEnv, captured.credentials)
-	generated := generatedAPIKeyEnvName(prov.ID, captured.snapshot.catalog)
 	return protocol.Provider{
 		ApiKeyEnv:        prov.Transport.APIKeyEnv,
 		BaseUrl:          prov.Transport.BaseURL,
 		Builtin:          prov.Builtin,
-		Connectable:      prov.Transport.BaseURL != "" && (usableModelCount(prov) > 0 || prov.Discovery),
 		Connected:        connected,
-		Disconnectable:   keySource == config.KeySourceManaged,
 		Discovery:        prov.Discovery,
 		ExtraBody:        jsonMapPointer(prov.ExtraBody),
-		GeneratedKeyEnv:  &generated,
 		Headers:          stripCredentialHeaders(prov.Transport.Headers),
 		Hidden:           prov.Hidden,
 		Id:               prov.ID,
@@ -434,19 +443,17 @@ func projectProvider(captured configurationCapture, prov *catalog.Provider) prot
 		Models:           projectModels(prov),
 		Name:             prov.Name,
 		Options:          jsonMapPointer(prov.Transport.Options),
-		Removable:        !prov.Builtin && (keySource == config.KeySourceKeyless || !connected),
 		SystemRole:       protocol.SystemRole(prov.SystemRole),
 		UsageInStream:    prov.UsageInStream,
-		UserHeaders:      captured.snapshot.userHeaders(prov.ID, prov.Builtin),
+		UserHeaders:      captured.snapshot.userHeaders(prov.ID),
 		ProtocolMetadata: projectProtocolMetadata(prov.ProtocolMetadata),
 	}
 }
 
 // userHeaders extracts one provider's user-layer transport headers from the
-// retained decoded user layer — the additions on top of any bundled headers.
-// For a builtin, bundled attribution keys are stripped by the retained rule
-// so they never appear as editable, and the user file itself is never edited.
-func (c *configuration) userHeaders(providerID string, builtin bool) map[string]string {
+// retained decoded user layer — the additions on top of any bundled headers,
+// exactly as the user file carries them (the file itself is never edited).
+func (c *configuration) userHeaders(providerID string) map[string]string {
 	prov, ok := c.userProviders[providerID].(map[string]any)
 	if !ok {
 		return map[string]string{}
@@ -458,9 +465,6 @@ func (c *configuration) userHeaders(providerID string, builtin bool) map[string]
 		if s, ok := value.(string); ok {
 			headers[name] = s
 		}
-	}
-	if builtin {
-		headers = stripBundledHeaderKeys(headers, providerID)
 	}
 	return stripCredentialHeaders(headers)
 }
@@ -680,38 +684,49 @@ func usableModelCount(prov *catalog.Provider) int {
 	return count
 }
 
-// generatedAPIKeyEnvName applies the retained name-generation rule over the
-// captured catalog's api_key_env occupancy: LIGHTCODE_<UPPER_SNAKE_ID>_API_KEY
-// (or the PROVIDER fallback for an unusable ID), suffixed 2+ when occupied.
-func generatedAPIKeyEnvName(providerID string, cat *catalog.Catalog) string {
+// generateAPIKeyEnvName applies the retained name-generation rule: the base
+// name LIGHTCODE_<UPPER_SNAKE_ID>_API_KEY (or the PROVIDER fallback for an
+// unusable ID), suffixed 2+ while occupied. A name is occupied when the
+// captured catalog references it or the environment defines it — managed
+// orphans and externally defined empty variables included — so allocation
+// never reuses or overwrites an existing binding.
+func (s *configurationService) generateAPIKeyEnvName(providerID string, cat *catalog.Catalog) string {
 	base := "LIGHTCODE_" + upperSnake(providerID) + "_API_KEY"
 	if base == "LIGHTCODE__API_KEY" {
 		base = "LIGHTCODE_PROVIDER_API_KEY"
 	}
-	used := make(map[string]struct{})
+	referenced := make(map[string]bool, len(cat.Providers))
 	for _, prov := range cat.Providers {
 		if prov != nil && prov.Transport.APIKeyEnv != "" {
-			used[prov.Transport.APIKeyEnv] = struct{}{}
+			referenced[prov.Transport.APIKeyEnv] = true
 		}
 	}
-	if _, ok := used[base]; !ok {
-		return base
-	}
-	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s_%d", base, i)
-		if _, ok := used[candidate]; !ok {
+	candidate := base
+	for suffix := 2; ; suffix++ {
+		if !referenced[candidate] && !s.env.Capture([]string{candidate})[candidate].Defined {
 			return candidate
 		}
+		candidate = fmt.Sprintf("%s_%d", base, suffix)
 	}
 }
 
-// upperSnake renders a provider ID as its upper snake-case form.
+// upperSnake renders a provider ID as its upper snake-case form over ASCII
+// letters and digits alone: any other byte run collapses to one underscore
+// and edge underscores are removed.
 func upperSnake(s string) string {
 	var b strings.Builder
 	lastUnderscore := false
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(unicode.ToUpper(r))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		var upper byte
+		switch {
+		case c >= 'a' && c <= 'z':
+			upper = c - 'a' + 'A'
+		case c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			upper = c
+		}
+		if upper != 0 {
+			b.WriteByte(upper)
 			lastUnderscore = false
 			continue
 		}

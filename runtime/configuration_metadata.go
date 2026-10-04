@@ -107,28 +107,6 @@ func refuseCredentialHeaders(headers map[string]string) error {
 	return nil
 }
 
-// stripBundledHeaderKeys removes the supplied keys that case-insensitively
-// collide with the bundled provider's own header names. The one shared
-// predicate of the read projection (user_headers) and the write path, which
-// strips before the wholesale user-layer write, healing any leaked override.
-func stripBundledHeaderKeys(headers map[string]string, providerID string) map[string]string {
-	bundled := catalog.BundledProviderHeaders(providerID)
-	out := make(map[string]string, len(headers))
-	for name, value := range headers {
-		collides := false
-		for bundledName := range bundled {
-			if strings.EqualFold(name, bundledName) {
-				collides = true
-				break
-			}
-		}
-		if !collides {
-			out[name] = value
-		}
-	}
-	return out
-}
-
 // writeTransportHeaders writes the supplied header map wholesale: an empty
 // map deletes the raw user headers member, so removals and clears take
 // effect.
@@ -140,21 +118,6 @@ func writeTransportHeaders(transport map[string]any, headers map[string]string) 
 	transport["headers"] = headers
 }
 
-// requireCustomRawEntry refuses to scaffold a custom provider's owning user
-// definition: a custom definition deleted from the latest raw layer by an
-// external editor is not silently recreated by an update, delete, or model
-// write. Builtin user overrides may be absent — those scaffold.
-func requireCustomRawEntry(providers map[string]any, providerID string) (map[string]any, error) {
-	pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
-	if err != nil {
-		return nil, err
-	}
-	if pm == nil {
-		return nil, fmt.Errorf("provider %q has no user definition in the latest configuration to edit: %w", providerID, catalog.ErrUnknownProvider)
-	}
-	return pm, nil
-}
-
 // capturedCatalogProvider resolves one provider ID against the mutation's
 // captured catalog — the edits resolve subjects against their one owned
 // capture; there is no fallback catalog.
@@ -162,49 +125,77 @@ func capturedCatalogProvider(captured configurationCapture, providerID string) *
 	return captured.snapshot.catalog.Providers[providerID]
 }
 
-// envNameInUse reports whether the captured catalog's other providers occupy
-// the env name.
-func envNameInUse(captured configurationCapture, apiKeyEnv, selfID string) bool {
-	for id, prov := range captured.snapshot.catalog.Providers {
-		if id == selfID || prov == nil {
-			continue
-		}
-		if prov.Transport.APIKeyEnv == apiKeyEnv {
-			return true
-		}
+// providerEditTarget resolves one metadata edit's addressed provider
+// identity and its raw user node. The identity is addressed from the
+// effective catalog OR the latest user layer; one absent from both is the
+// typed not-found. A present raw node is returned decoded (a non-object
+// node is the shared raw-configuration failure), an absent node with a live
+// effective builtin is scaffolded for the write paths, and an absent node
+// with a live effective custom provider stays absent — the latest user
+// layer no longer owns that definition, so the edit applies nothing and the
+// candidate check governs the refusal; no partial patch reconstructs it.
+func providerEditTarget(captured configurationCapture, providers map[string]any, providerID string, scaffold bool) (map[string]any, *catalog.Provider, error) {
+	if providerID == "" {
+		return nil, nil, fmt.Errorf("provider id must be non-empty: %w", harness.ErrInvalid)
 	}
-	return false
+	eff := capturedCatalogProvider(captured, providerID)
+	node, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if eff == nil && node == nil {
+		return nil, nil, fmt.Errorf("provider %q: %w", providerID, catalog.ErrUnknownProvider)
+	}
+	if node == nil && scaffold && eff != nil && eff.Builtin {
+		node = map[string]any{}
+		providers[providerID] = node
+	}
+	return node, eff, nil
 }
 
-// refusedModelFields refuses one identity/protocol member supplied on a
-// bundled or discovered model: those fields belong to their source, and
-// presence — even of an equal value — is the refusal trigger.
-func refusedModelFields(edit protocol.ModelEdit, modelID string) error {
-	switch {
-	case edit.Name != nil:
-		return invalidEdit("cannot rename model %q: its name belongs to its bundled or discovered source", modelID)
-	case edit.SystemRole != nil:
-		return invalidEdit("cannot change the system role of model %q", modelID)
-	case edit.UsageInStream != nil:
-		return invalidEdit("cannot change usage-in-stream of model %q", modelID)
-	case edit.InputModalities != nil:
-		return invalidEdit("cannot change the input modalities of model %q", modelID)
-	case edit.ProtocolMetadata != nil:
-		return invalidEdit("cannot change protocol metadata of model %q", modelID)
+// modelEditTarget resolves one model edit's addressed identities under the
+// same effective-or-latest-user rule: the provider identity first, then the
+// raw models member of the provider's user node (created only for the
+// upsert's scaffolding writes). The model identity itself is checked by the
+// caller: the PUT is an upsert and accepts a missing model, while the
+// delete and the reset require it in the effective models or the latest raw
+// models and fail the typed unknown-model error otherwise.
+func modelEditTarget(captured configurationCapture, providers map[string]any, providerID, modelID string, scaffold bool) (map[string]any, map[string]any, *catalog.Provider, error) {
+	if modelID == "" {
+		return nil, nil, nil, fmt.Errorf("model id must be non-empty: %w", harness.ErrInvalid)
 	}
-	return nil
+	node, eff, err := providerEditTarget(captured, providers, providerID, scaffold)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var rawModels map[string]any
+	if node != nil {
+		if rawModels, err = rawObjectMember(node, "models", "providers models", scaffold); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return node, rawModels, eff, nil
+}
+
+// modelIdentityPresent reports whether the addressed model exists in the
+// effective catalog or the latest raw user layer.
+func modelIdentityPresent(eff *catalog.Provider, rawModels map[string]any, modelID string) bool {
+	if eff != nil && eff.Models[modelID] != nil {
+		return true
+	}
+	_, present := rawModels[modelID]
+	return present
 }
 
 // writeProviderEditMembers writes the eight non-transport ProviderEdit
 // members onto a raw provider map: every provided member replaces its whole
-// value, zeros and falses included — the pointer presence is the patch, and
-// the catalog validators decide validity. The name and max-tokens field are
-// trim-normalized at this one shared write point (the create and the update
-// share it); system_role stays a raw enum value and no other member is
-// normalized.
+// value exactly as supplied, zeros, falses, and whitespace included — the
+// pointer presence is the patch, and the catalog validators decide
+// validity. The create and the update share this one write point; system_role
+// stays a raw enum value and no member is normalized.
 func writeProviderEditMembers(pm map[string]any, patch protocol.ProviderEdit) {
 	if patch.Name != nil {
-		pm["name"] = strings.TrimSpace(*patch.Name)
+		pm["name"] = *patch.Name
 	}
 	if patch.SystemRole != nil {
 		pm["system_role"] = *patch.SystemRole
@@ -213,7 +204,7 @@ func writeProviderEditMembers(pm map[string]any, patch protocol.ProviderEdit) {
 		pm["usage_in_stream"] = *patch.UsageInStream
 	}
 	if patch.MaxTokensField != nil {
-		pm["max_tokens_field"] = strings.TrimSpace(*patch.MaxTokensField)
+		pm["max_tokens_field"] = *patch.MaxTokensField
 	}
 	if patch.ExtraBody != nil {
 		pm["extra_body"] = *patch.ExtraBody
@@ -236,7 +227,7 @@ func writeProviderEditMembers(pm map[string]any, patch protocol.ProviderEdit) {
 // member of the model's user layer.
 func mergeModelEdit(m map[string]any, edit protocol.ModelEdit) {
 	if edit.Name != nil {
-		m["name"] = strings.TrimSpace(*edit.Name)
+		m["name"] = *edit.Name
 	}
 	if edit.ContextWindow != nil {
 		m["context_window"] = *edit.ContextWindow
@@ -291,15 +282,15 @@ func requireCandidateModel(c *configuration, providerID, modelID string) error {
 }
 
 // editProviderCreate builds the custom-provider create edit: a new trimmed
-// nonempty ID, a required base URL, a models map with normalized unique IDs
-// and at least one usable model, and no secret parameter in the edit — the
-// create accepts a non-secret env name plus the optional write-only key
-// value, which is never written to the raw layer. A missing api_key_env
-// member with a supplied nonempty key generates the current unique name
-// inside the build hold; an explicitly empty member stays keyless. The
-// candidate check proves the created provider survived the shared catalog
-// validation with a usable model, and the edit's connection data carries the
-// one managed-key write that follows the owning file.
+// nonempty ID, a required base URL, and a models map with normalized unique
+// IDs — candidate validity, not an editor-only usable-model count, governs
+// metadata creation, so incomplete and model-less definitions are
+// representable. No secret parameter is written to the raw layer: the
+// create carries a non-secret env name plus the optional write-only key
+// value under the one credential-input rule. The candidate check proves the
+// created provider survived the shared catalog validation, and the edit's
+// connection data carries the one managed-key write that follows the owning
+// file.
 func (s *configurationService) editProviderCreate(providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) configurationEdit {
 	// The create identity is trim-normalized once at the constructor entry:
 	// the apply and the candidate check resolve the same canonicalized ID
@@ -332,7 +323,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			}
 			baseURL := ""
 			if patch.BaseUrl != nil {
-				baseURL = strings.TrimSpace(*patch.BaseUrl)
+				baseURL = *patch.BaseUrl
 			}
 			if baseURL == "" {
 				return 0, invalidEdit("base_url is required")
@@ -344,42 +335,37 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 				}
 				headers = *patch.Headers
 			}
-			// The env name resolves inside the build hold: the pointer
-			// presence is the patch — an explicitly empty member stays
-			// keyless — and the generated name for a supplied key occupies
-			// the current catalog's api_key_env set. The one credential rule
-			// resolves a nonempty name: a managed name (including a
-			// generated-name collision with a managed orphan) is updated by
-			// a supplied nonempty value or used as-is when it already holds
-			// one; an external shell key wins and is never persisted; every
-			// resolution failure is the shared configuration failure class.
+			// The env binding resolves inside the build hold under the one
+			// credential-input rule. Without a supplied key the create
+			// performs no credential action and no resolution refusal —
+			// any explicit binding, occupied or absent, is registered
+			// as-is. A supplied nonempty key requires a binding: an
+			// explicitly empty one is invalid, and a missing member
+			// allocates a fresh name; the supplied key itself resolves
+			// through the same shared rule connect uses, so its
+			// external-variable refusal fires before any side effect. The
+			// exact supplied bytes reach only the managed owner.
 			keyEnv := ""
 			if patch.ApiKeyEnv != nil {
-				keyEnv = strings.TrimSpace(*patch.ApiKeyEnv)
-				if keyEnv != "" && envNameInUse(captured, keyEnv, providerID) {
-					return 0, invalidEdit("api_key_env %s is already used by another provider", keyEnv)
+				keyEnv = *patch.ApiKeyEnv
+				if keyEnv == "" && key != nil && *key != "" {
+					return 0, invalidEdit("api_key_env is empty; name a variable or omit it to generate one for the supplied key")
 				}
-			} else if key != nil && *key != "" {
-				keyEnv = generatedAPIKeyEnvName(providerID, captured.snapshot.catalog)
 			}
-			if keyEnv != "" {
-				// The create's binding name is caller-supplied (or freshly
-				// generated), so it cannot be part of the published
-				// catalog's referenced set: it is sampled once directly
-				// through the same environment owner.
-				observed := s.env.Capture([]string{keyEnv})[keyEnv]
-				_, persist, err := resolveConnectKey(keyEnv, key, observed)
-				if err != nil {
-					return 0, configurationFailure(err)
+			if key != nil && *key != "" {
+				if keyEnv == "" {
+					keyEnv = s.generateAPIKeyEnvName(providerID, captured.snapshot.catalog)
 				}
-				if persist {
+				observed := s.env.Capture([]string{keyEnv})[keyEnv]
+				if _, persist, err := resolveConnectKey(keyEnv, key, observed); err != nil {
+					return 0, configurationFailure(err)
+				} else if persist {
 					plan.keyAction = keyActionSet
 					plan.keyEnv = keyEnv
 					plan.keyValue = *key // the exact supplied value; never trim-normalized
 				}
 			}
 			modelsRaw := map[string]any{}
-			usable := 0
 			for modelID, edit := range models {
 				normalized := strings.TrimSpace(modelID)
 				if normalized == "" {
@@ -391,12 +377,6 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 				modelMap := map[string]any{}
 				mergeModelEdit(modelMap, edit)
 				modelsRaw[normalized] = modelMap
-				if edit.ContextWindow != nil && *edit.ContextWindow > 0 {
-					usable++
-				}
-			}
-			if usable == 0 {
-				return 0, invalidEdit("custom provider requires at least one usable model")
 			}
 			providerMap := map[string]any{
 				"transport": providerTransportRaw(patch, baseURL, headers, keyEnv),
@@ -433,43 +413,28 @@ func providerTransportRaw(patch protocol.ProviderEdit, baseURL string, headers m
 	return transport
 }
 
-// providerRawTarget returns the raw provider entry a write edit targets:
-// a builtin's absent user override scaffolds a bare entry (the override may
-// be absent), while a custom provider's owning definition must exist in the
-// latest raw layer and is never silently recreated.
-func providerRawTarget(providers map[string]any, providerID string, builtin bool) (map[string]any, error) {
-	var pm map[string]any
-	var err error
-	if builtin {
-		if pm, err = rawObjectMember(providers, providerID, "providers."+providerID, false); err != nil {
-			return nil, err
-		}
-		if pm == nil {
-			pm = map[string]any{}
-			providers[providerID] = pm
-		}
-		return pm, nil
-	}
-	return requireCustomRawEntry(providers, providerID)
-}
-
-// editProviderUpdate builds the existing-provider patch edit: the captured
-// catalog resolves the subject and its builtin locks (member presence, even
-// of an equal value, is the refusal), the connected-provider api_key_env
-// change prohibition and the env-name uniqueness run before any change, and
-// the latest raw user layer receives the provided members — wholesale per
-// member, headers written wholesale with the bundled-key strip.
+// editProviderUpdate builds the existing-provider patch edit: the addressed
+// identity resolves from the effective catalog or the latest user layer, no
+// source-specific field lock applies — the provided members land on the
+// user layer for every source and the candidate check governs validity —
+// and the latest raw user layer receives the provided members wholesale per
+// member, headers included.
 func (s *configurationService) editProviderUpdate(providerID string, patch protocol.ProviderEdit) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
-			prov, err := capturedProvider(captured.snapshot, providerID)
+			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			if prov.Builtin {
-				if err := refuseBuiltinProviderFields(patch, providerID); err != nil {
-					return 0, err
-				}
+			pm, _, err := providerEditTarget(captured, providers, providerID, true)
+			if err != nil {
+				return 0, err
+			}
+			if pm == nil {
+				// The effective catalog still knows the identity but the
+				// latest user layer no longer owns a definition: nothing is
+				// scaffolded or written, and the candidate check refuses.
+				return editMainConfig, nil
 			}
 			headers := map[string]string(nil)
 			if patch.Headers != nil {
@@ -477,41 +442,20 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 					return 0, err
 				}
 				headers = *patch.Headers
-				if prov.Builtin {
-					headers = stripBundledHeaderKeys(headers, providerID)
-				}
 			}
-			// The env name is trim-normalized before the retained
-			// current-effective comparison, the uniqueness check, and the
-			// raw write: a padded same name is a legitimate no-change, and
-			// any ACTUAL change — a clear to keyless included — is refused
-			// while the current provider is connected.
+			// The binding value is written exactly as supplied; no
+			// connection state or sibling reference constrains the
+			// rebinding — the credential itself is never touched.
 			env := ""
 			if patch.ApiKeyEnv != nil {
-				env = strings.TrimSpace(*patch.ApiKeyEnv)
-				if env != prov.Transport.APIKeyEnv {
-					if catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
-						return 0, invalidEdit("disconnect provider %q before changing its API key variable", providerID)
-					}
-					if env != "" && envNameInUse(captured, env, providerID) {
-						return 0, invalidEdit("api_key_env %s is already used by another provider", env)
-					}
-				}
-			}
-			providers, err := userProvidersMember(roots)
-			if err != nil {
-				return 0, err
-			}
-			pm, err := providerRawTarget(providers, providerID, prov.Builtin)
-			if err != nil {
-				return 0, err
+				env = *patch.ApiKeyEnv
 			}
 			transport, err := rawObjectMember(pm, "transport", "providers transport", true)
 			if err != nil {
 				return 0, err
 			}
 			if patch.BaseUrl != nil {
-				transport["base_url"] = strings.TrimSpace(*patch.BaseUrl)
+				transport["base_url"] = *patch.BaseUrl
 			}
 			if patch.ApiKeyEnv != nil {
 				transport["api_key_env"] = env
@@ -534,52 +478,21 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 	}
 }
 
-// refuseBuiltinProviderFields refuses every locked member supplied on a
-// builtin provider patch. Presence — even of the bundled value itself — is
-// the refusal trigger; headers, api_key_env, extra_body, discovery and
-// hidden stay writable through the candidate path.
-func refuseBuiltinProviderFields(patch protocol.ProviderEdit, providerID string) error {
-	switch {
-	case patch.Name != nil:
-		return invalidEdit("cannot change the name of a built-in provider")
-	case patch.BaseUrl != nil:
-		return invalidEdit("cannot change the base URL of a built-in provider")
-	case patch.Options != nil:
-		return invalidEdit("cannot change the options of a built-in provider")
-	case patch.SystemRole != nil:
-		return invalidEdit("cannot change the system role of a built-in provider")
-	case patch.MaxTokensField != nil:
-		return invalidEdit("cannot change the max-tokens field of a built-in provider")
-	case patch.UsageInStream != nil:
-		return invalidEdit("cannot change usage-in-stream of a built-in provider")
-	case patch.ProtocolMetadata != nil:
-		return invalidEdit("cannot change protocol metadata of a built-in provider")
-	}
-	return nil
-}
-
-// editProviderDelete builds the custom-provider delete edit: the captured
-// catalog refuses builtins and connected env-keyed providers (a connected
-// keyless custom provider is removable), and the latest raw layer loses only
-// its owning user definition.
+// editProviderDelete builds the provider delete edit: the addressed identity
+// resolves from the effective catalog or the latest user layer, and only the
+// user node leaves the latest raw layer — never bundled data or the
+// discovery cache, and no connection state gates the removal. An identity
+// whose user node is already absent still publishes: the post-state is the
+// surviving effective subject, or null when the candidate no longer
+// contains one.
 func (s *configurationService) editProviderDelete(providerID string) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
-			prov, err := capturedProvider(captured.snapshot, providerID)
-			if err != nil {
-				return 0, err
-			}
-			if prov.Builtin {
-				return 0, invalidEdit("cannot remove bundled provider %q", providerID)
-			}
-			if catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) && prov.Transport.APIKeyEnv != "" {
-				return 0, invalidEdit("disconnect provider %q before removing it", providerID)
-			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			if _, err := requireCustomRawEntry(providers, providerID); err != nil {
+			if _, _, err := providerEditTarget(captured, providers, providerID, false); err != nil {
 				return 0, err
 			}
 			delete(providers, providerID)
@@ -592,43 +505,37 @@ func (s *configurationService) editProviderDelete(providerID string) configurati
 }
 
 // providerResetTransport marks the reset fields that own a transport member.
-var providerResetTransport = map[protocol.ResetProviderFieldParamsField]bool{
-	protocol.ResetProviderFieldParamsFieldBaseUrl:             true,
-	protocol.ResetProviderFieldParamsFieldEnvironmentVariable: true,
-	protocol.ResetProviderFieldParamsFieldHeaders:             true,
-	protocol.ResetProviderFieldParamsFieldOptions:             true,
+var providerResetTransport = map[protocol.ProviderField]bool{
+	protocol.ProviderFieldBaseUrl:             true,
+	protocol.ProviderFieldEnvironmentVariable: true,
+	protocol.ProviderFieldHeaders:             true,
+	protocol.ProviderFieldOptions:             true,
 }
 
-// editProviderFieldReset builds the provider-field reset edit: a closed
-// generated field enum, the retained connected-provider api_key_env refusal,
-// and the deletion of exactly one user override from its owning raw path. A
-// successful reset with no override present still rewrites the owning file
-// and publishes the next generation — the one shared edit rule. The candidate
-// check proves the reset subject still validates (a custom provider losing a
-// required key is refused before the write).
-func (s *configurationService) editProviderFieldReset(providerID string, field protocol.ResetProviderFieldParamsField) configurationEdit {
+// editProviderFieldReset builds the provider-field reset edit: the shared
+// closed field enum, and the deletion of exactly one user override from its
+// owning raw path. No connection state or source constrains the reset — the
+// candidate check governs validity, so a required custom transport key that
+// leaves the definition invalid refuses before the write while a builtin
+// override's removal reveals the bundled value. A successful reset with no
+// override present still rewrites the owning file and publishes the next
+// generation — the one shared edit rule.
+func (s *configurationService) editProviderFieldReset(providerID string, field protocol.ProviderField) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if !field.Valid() {
 				return 0, invalidEdit("field %q cannot be reset", field)
 			}
-			prov, err := capturedProvider(captured.snapshot, providerID)
-			if err != nil {
-				return 0, err
-			}
-			if field == protocol.ResetProviderFieldParamsFieldEnvironmentVariable && catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
-				return 0, invalidEdit("disconnect provider %q before resetting its API key variable", providerID)
-			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
+			pm, _, err := providerEditTarget(captured, providers, providerID, false)
 			if err != nil {
 				return 0, err
 			}
 			if pm == nil {
-				return editMainConfig, nil // no user override: the reset still rewrites and publishes
+				return editMainConfig, nil // no user node: the reset still rewrites and publishes
 			}
 			target := pm
 			if providerResetTransport[field] {
@@ -655,38 +562,29 @@ func (s *configurationService) editProviderFieldReset(providerID string, field p
 }
 
 // editModelSave builds the model upsert edit — the same PUT as the retained
-// SaveModel, so a missing model creates a user model. The captured catalog's
-// Model.Source labels the subject: bundled and discovered models refuse
-// their identity/protocol members (presence is the trigger), user models and
-// new models take the provided members merged onto their prior raw entry —
-// no unsupplied member is touched. Custom providers must own a latest raw
-// definition; builtin providers scaffold their user override.
+// SaveModel, so a missing model creates a user model. The provider identity
+// resolves from the effective catalog or the latest user layer and no
+// source-specific field lock applies: the provided members merge onto the
+// model's prior raw entry for every source — no unsupplied member is
+// touched — and the candidate check governs validity. Builtin providers
+// scaffold their user override; a custom provider whose latest raw
+// definition is gone applies nothing and the candidate refuses.
 func (s *configurationService) editModelSave(providerID, modelID string, patch protocol.ModelEdit) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
-			if providerID == "" || modelID == "" {
-				return 0, invalidEdit("provider and model id are required")
-			}
-			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
-			if lookupErr != nil {
-				return 0, lookupErr
-			}
-			if entry := prov.Models[modelID]; entry != nil && entry.Source != catalog.SourceUser {
-				if err := refusedModelFields(patch, modelID); err != nil {
-					return 0, err
-				}
-			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			pm, err := providerRawTarget(providers, providerID, prov.Builtin)
+			pm, models, _, err := modelEditTarget(captured, providers, providerID, modelID, true)
 			if err != nil {
 				return 0, err
 			}
-			models, err := rawObjectMember(pm, "models", "providers models", true)
-			if err != nil {
-				return 0, err
+			if pm == nil {
+				// The latest user layer no longer owns the provider
+				// definition; nothing is scaffolded and the candidate check
+				// refuses.
+				return editMainConfig, nil
 			}
 			// The patch merges into the model's prior raw entry — a partial
 			// patch preserves every unsupplied member, and an empty patch
@@ -711,92 +609,63 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 	}
 }
 
-// editModelDelete builds the user-model delete edit: only user-source models
-// are deletable, missing identities fail their typed unknown errors (no
-// silent success), and the latest raw layer loses only that model entry.
+// editModelDelete builds the model delete edit: the addressed model identity
+// resolves from the effective catalog or the latest user layer (absent from
+// both is the typed not-found), and only its user node leaves the latest raw
+// layer — a bundled or discovered model loses its override and reveals its
+// base, a standalone user model leaves nothing behind. An identity whose
+// user node is already absent still publishes; the post-state decides.
 func (s *configurationService) editModelDelete(providerID, modelID string) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
-			if providerID == "" || modelID == "" {
-				return 0, invalidEdit("provider and model id are required")
-			}
-			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
-			if lookupErr != nil {
-				return 0, lookupErr
-			}
-			entry := prov.Models[modelID]
-			if entry == nil {
-				return 0, unknownModel(providerID, modelID)
-			}
-			if entry.Source != catalog.SourceUser {
-				return 0, invalidEdit("cannot delete model %q: only user-added models can be removed; hide or reset it instead", modelID)
-			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
+			pm, models, eff, err := modelEditTarget(captured, providers, providerID, modelID, false)
 			if err != nil {
 				return 0, err
 			}
-			if pm == nil {
+			if !modelIdentityPresent(eff, models, modelID) {
 				return 0, unknownModel(providerID, modelID)
 			}
-			models, err := rawObjectMember(pm, "models", "providers models", false)
-			if err != nil {
-				return 0, err
-			}
-			if _, present := models[modelID]; !present {
-				return 0, unknownModel(providerID, modelID)
-			}
-			delete(models, modelID)
-			if err := writeUserProvidersMember(roots, providers); err != nil {
-				return 0, err
+			if pm != nil {
+				delete(models, modelID)
+				if err := writeUserProvidersMember(roots, providers); err != nil {
+					return 0, err
+				}
 			}
 			return editMainConfig, nil
 		},
 	}
 }
 
-// editModelFieldReset builds the model-field reset edit: a closed generated
-// field enum, the retained user-model context_window refusal, and the
-// deletion of exactly one user override. A successful reset with no override
+// editModelFieldReset builds the model-field reset edit: the shared closed
+// field enum, and the deletion of exactly one user override from its owning
+// raw path. The addressed model identity resolves from the effective catalog
+// or the latest user layer; no source or member constrains the reset —
+// removing a sole user-model window leaves a valid incomplete model, and the
+// candidate check governs the rest. A successful reset with no override
 // present still rewrites the owning file and publishes the next generation.
-// The candidate check proves the reset subject still validates.
-func (s *configurationService) editModelFieldReset(providerID, modelID string, field protocol.ResetProviderModelFieldParamsField) configurationEdit {
+func (s *configurationService) editModelFieldReset(providerID, modelID string, field protocol.ModelField) configurationEdit {
 	return configurationEdit{
 		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
-			if providerID == "" || modelID == "" {
-				return 0, invalidEdit("provider and model id are required")
-			}
 			if !field.Valid() {
 				return 0, invalidEdit("field %q cannot be reset", field)
-			}
-			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
-			if lookupErr != nil {
-				return 0, lookupErr
-			}
-			entry := prov.Models[modelID]
-			if entry == nil {
-				return 0, unknownModel(providerID, modelID)
-			}
-			if field == protocol.ResetProviderModelFieldParamsFieldContextWindow && entry.Source == catalog.SourceUser {
-				return 0, invalidEdit("cannot reset context_window for user-added model %q", modelID)
 			}
 			providers, err := userProvidersMember(roots)
 			if err != nil {
 				return 0, err
 			}
-			pm, err := rawObjectMember(providers, providerID, "providers."+providerID, false)
+			pm, models, eff, err := modelEditTarget(captured, providers, providerID, modelID, false)
 			if err != nil {
 				return 0, err
+			}
+			if !modelIdentityPresent(eff, models, modelID) {
+				return 0, unknownModel(providerID, modelID)
 			}
 			if pm == nil {
-				return editMainConfig, nil // no user override: the reset still rewrites and publishes
-			}
-			models, err := rawObjectMember(pm, "models", "providers models", false)
-			if err != nil {
-				return 0, err
+				return editMainConfig, nil // no user node: the reset still rewrites and publishes
 			}
 			rawModel, err := rawObjectMember(models, modelID, "models."+modelID, false)
 			if err != nil {

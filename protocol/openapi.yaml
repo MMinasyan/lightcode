@@ -481,7 +481,7 @@ paths:
               $ref: "#/components/schemas/CreateProviderRequest"
       responses:
         "200":
-          description: The added provider view; a generated key name is its generated_key_env.
+          description: The added provider's post-state; a keyed create returns its actual binding in api_key_env.
           content:
             application/json:
               schema:
@@ -528,12 +528,13 @@ paths:
       responses:
         "200":
           description: >
-            The removal published one next generation; the removed subject
-            leaves an explicit null result under the mutation envelope.
+            The user node's removal published one next generation; the
+            result carries the surviving effective post-state, or null when
+            no subject remains.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DeletionMutation"
+                $ref: "#/components/schemas/ProviderMutation"
         default:
           $ref: "#/components/responses/Error"
   /v1/providers/discover:
@@ -632,12 +633,13 @@ paths:
       responses:
         "200":
           description: >
-            The deletion published one next generation; the removed subject
-            leaves an explicit null result under the mutation envelope.
+            The user node's removal published one next generation; the
+            result carries the surviving effective post-state, or null when
+            no subject remains.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DeletionMutation"
+                $ref: "#/components/schemas/ModelMutation"
         default:
           $ref: "#/components/responses/Error"
   /v1/providers/models/discover:
@@ -666,35 +668,11 @@ paths:
           in: path
           required: true
           schema:
-            type: string
-            x-enum-varnames:
-              - Name
-              - BaseUrl
-              - EnvironmentVariable
-              - Headers
-              - Options
-              - SystemRole
-              - UsageInStream
-              - MaxTokensField
-              - ExtraBody
-              - Discovery
-              - ProtocolMetadata
-            enum:
-              - name
-              - base_url
-              - api_key_env
-              - headers
-              - options
-              - system_role
-              - usage_in_stream
-              - max_tokens_field
-              - extra_body
-              - discovery
-              - protocol_metadata
+            $ref: "#/components/schemas/ProviderField"
         - $ref: "#/components/parameters/ProviderIDQuery"
       responses:
         "200":
-          description: The provider view after the reset, under the mutation envelope.
+          description: The provider's effective post-state after the reset, under the mutation envelope.
           content:
             application/json:
               schema:
@@ -709,22 +687,12 @@ paths:
           in: path
           required: true
           schema:
-            type: string
-            enum:
-              - name
-              - context_window
-              - max_output_tokens
-              - input_modalities
-              - system_role
-              - usage_in_stream
-              - extra_body
-              - cost
-              - protocol_metadata
+            $ref: "#/components/schemas/ModelField"
         - $ref: "#/components/parameters/ProviderIDQuery"
         - $ref: "#/components/parameters/ModelIDQuery"
       responses:
         "200":
-          description: The model view after the reset, under the mutation envelope.
+          description: The model's effective post-state after the reset, under the mutation envelope.
           content:
             application/json:
               schema:
@@ -1817,23 +1785,6 @@ components:
       properties:
         configuration_revision:
           $ref: "#/components/schemas/ConfigurationRevision"
-    DeletionMutation:
-      type: object
-      additionalProperties: false
-      required:
-        - configuration_revision
-        - result
-      properties:
-        configuration_revision:
-          $ref: "#/components/schemas/ConfigurationRevision"
-        result:
-          type: object
-          nullable: true
-          enum:
-            - null
-          description: >
-            The removed subject leaves no post-state view; deletion is the
-            one mutation whose result is an explicit null.
     UpdateSettingsRequest:
       type: object
       additionalProperties: false
@@ -1902,6 +1853,53 @@ components:
           type: array
           items:
             type: string
+    ProviderField:
+      type: string
+      x-enum-varnames:
+        - Name
+        - BaseUrl
+        - EnvironmentVariable
+        - Headers
+        - Options
+        - SystemRole
+        - UsageInStream
+        - MaxTokensField
+        - ExtraBody
+        - Discovery
+        - ProtocolMetadata
+        - Hidden
+      enum:
+        - name
+        - base_url
+        - api_key_env
+        - headers
+        - options
+        - system_role
+        - usage_in_stream
+        - max_tokens_field
+        - extra_body
+        - discovery
+        - protocol_metadata
+        - hidden
+      description: >
+        The one provider field vocabulary shared by the edit patch members
+        and the field-reset path: every editable user-layer provider member.
+    ModelField:
+      type: string
+      enum:
+        - name
+        - context_window
+        - max_output_tokens
+        - input_modalities
+        - system_role
+        - usage_in_stream
+        - extra_body
+        - cost
+        - protocol_metadata
+        - hidden
+      description: >
+        The one model field vocabulary shared by the edit patch members and
+        the field-reset path: every editable user-layer model member.
     ProviderEdit:
       type: object
       additionalProperties: false
@@ -2025,9 +2023,6 @@ components:
         - max_tokens_field
         - discovery
         - hidden
-        - connectable
-        - disconnectable
-        - removable
         - models
       properties:
         id:
@@ -2048,8 +2043,6 @@ components:
         base_url:
           type: string
         api_key_env:
-          type: string
-        generated_key_env:
           type: string
         headers:
           type: object
@@ -2074,12 +2067,6 @@ components:
         protocol_metadata:
           $ref: "#/components/schemas/ProtocolMetadata"
         hidden:
-          type: boolean
-        connectable:
-          type: boolean
-        disconnectable:
-          type: boolean
-        removable:
           type: boolean
         models:
           type: array
@@ -2145,7 +2132,14 @@ components:
         configuration_revision:
           $ref: "#/components/schemas/ConfigurationRevision"
         result:
-          $ref: "#/components/schemas/Provider"
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Provider"
+          description: >
+            The mutated subject's current effective post-state, or null when
+            no subject remains — a removed user node can reveal its
+            inherited base or leave nothing behind through the same
+            operator.
     ConnectRequest:
       type: object
       additionalProperties: false
@@ -2207,7 +2201,14 @@ components:
         configuration_revision:
           $ref: "#/components/schemas/ConfigurationRevision"
         result:
-          $ref: "#/components/schemas/ModelView"
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ModelView"
+          description: >
+            The mutated subject's current effective post-state, or null when
+            no subject remains — a removed user node can reveal its
+            inherited base or leave nothing behind through the same
+            operator.
     ModelListEntry:
       type: object
       additionalProperties: false

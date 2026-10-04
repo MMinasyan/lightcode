@@ -212,7 +212,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	patch := protocol.ProviderEdit{
 		Name:             &[]string{"Created"}[0],
 		BaseUrl:          &[]string{"https://new.test/v1"}[0],
-		ApiKeyEnv:        &[]string{"  NEW_KEY  "}[0],
+		ApiKeyEnv:        &[]string{"NEW_KEY"}[0],
 		Headers:          &map[string]string{"X-Custom": "c"},
 		Options:          &map[string]any{"retries": 2},
 		SystemRole:       &[]protocol.SystemRole{"user"}[0],
@@ -261,7 +261,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		t.Fatalf("untouched sibling lexeme = %s, want 9007199254740993", got)
 	}
 	if !strings.Contains(string(root["providers"]), `"NEW_KEY"`) {
-		t.Fatalf("created transport = %s, want the trim-normalized env name", root["providers"])
+		t.Fatalf("created transport = %s, want the named env binding", root["providers"])
 	}
 	// The owning file and the generated mutation result carry the env name
 	// and never the referenced secret value.
@@ -270,7 +270,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	}
 	mutationBytes, err := json.Marshal(protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(candidate.snapshot),
-		Result:                projectProvider(candidate, candidate.snapshot.catalog.Providers["new"]),
+		Result:                providerPostState(candidate, "new"),
 	})
 	if err != nil {
 		t.Fatalf("marshal mutation: %v", err)
@@ -312,7 +312,10 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 
 // TestMetadataEditCreateRefusals pins the create's nearest forbidden
 // siblings: every refusal happens before the owning write, leaving the file,
-// publication, generation, and event stream untouched.
+// publication, generation, and event stream untouched. Catalog-valid
+// incomplete metadata — no usable model, an empty models map, an occupied or
+// absent binding without a supplied key — is representable and covered by
+// the create positives, not refused here.
 func TestMetadataEditCreateRefusals(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
@@ -321,7 +324,6 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	base := "https://new.test/v1"
 	window := 1
 	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
-	zeroWindow := map[string]protocol.ModelEdit{"m": {}}
 
 	rows := []struct {
 		name   string
@@ -333,14 +335,10 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 		{"empty id", "   ", protocol.ProviderEdit{BaseUrl: &base}, valid, harness.ErrInvalid},
 		{"slash id", "a/b", protocol.ProviderEdit{BaseUrl: &base}, valid, ErrConfiguration},
 		{"missing base_url", "new", protocol.ProviderEdit{}, valid, harness.ErrInvalid},
-		{"empty models", "new", protocol.ProviderEdit{BaseUrl: &base}, map[string]protocol.ModelEdit{}, harness.ErrInvalid},
-		{"no usable model", "new", protocol.ProviderEdit{BaseUrl: &base}, zeroWindow, harness.ErrInvalid},
 		{"duplicate normalized model", "new", protocol.ProviderEdit{BaseUrl: &base},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}, " m ": {ContextWindow: &window}}, harness.ErrInvalid},
 		{"empty model id", "new", protocol.ProviderEdit{BaseUrl: &base},
 			map[string]protocol.ModelEdit{"  ": {ContextWindow: &window}}, harness.ErrInvalid},
-		{"occupied env name", "new",
-			protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: &[]string{"OTHER_TEST_KEY"}[0]}, valid, harness.ErrInvalid},
 		{"credential header Authorization", "new",
 			protocol.ProviderEdit{BaseUrl: &base, Headers: &map[string]string{"authorization": "Bearer x"}}, valid, harness.ErrInvalid},
 		{"credential header padded Proxy-Authorization", "new",
@@ -360,6 +358,75 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	dupBefore, dupFirst, dupWarnRev := metadataBaseline(t, svc, h.configPath)
 	_, dupErr := svc.mutate(context.Background(), svc.editProviderCreate("ghost", protocol.ProviderEdit{BaseUrl: &base}, valid, nil))
 	assertMetadataRefused(t, svc, sub, h.configPath, dupBefore, dupFirst, dupWarnRev, dupErr, harness.ErrInvalid)
+}
+
+// TestMetadataEditCreateRegistersIncompleteMetadata pins the
+// candidate-validity rule: an editor-only usable-model count and an
+// env-reference uniqueness guard do not govern metadata creation, so a
+// zero-window model, an empty models map, and a binding another provider
+// references (or no binding at all) register without a credential action.
+func TestMetadataEditCreateRegistersIncompleteMetadata(t *testing.T) {
+	h := newMetadataHarness(t)
+	writeServiceFile(t, h.configPath, metadataConfigDocument)
+	svc, sub := metadataService(t, h)
+	base := "https://new.test/v1"
+	window := 1
+	zeroWindow := map[string]protocol.ModelEdit{"m": {}}
+	empty := map[string]protocol.ModelEdit{}
+
+	generation := 1
+	for _, row := range []struct {
+		name   string
+		id     string
+		patch  protocol.ProviderEdit
+		models map[string]protocol.ModelEdit
+	}{
+		{"zero-window model", "incomplete", protocol.ProviderEdit{BaseUrl: &base}, zeroWindow},
+		{"empty models map", "nomodels", protocol.ProviderEdit{BaseUrl: &base}, empty},
+		{"occupied binding", "occupiedp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: &[]string{"OTHER_TEST_KEY"}[0]}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
+		{"absent binding", "missingp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: &[]string{"MISSING_PROBE_KEY"}[0]}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
+		{"no binding member", "nobinding", protocol.ProviderEdit{BaseUrl: &base}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			// The metadata service runs without a managed-env manager: a
+			// create that planned any key action would fail the manager's
+			// typed refusal, so the row's success itself proves no
+			// credential action was planned.
+			candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(row.id, row.patch, row.models, nil))
+			if err != nil {
+				t.Fatalf("create %s: %v", row.id, err)
+			}
+			generation++
+			if candidate.snapshot.generation != uint64(generation) {
+				t.Fatalf("create generation = %d, want %d", candidate.snapshot.generation, generation)
+			}
+			drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+			created := candidate.snapshot.catalog.Providers[row.id]
+			if created == nil {
+				t.Fatalf("created provider %s missing from the candidate", row.id)
+			}
+			// The real binding truth: the created transport carries exactly
+			// the supplied binding — empty for the keyless shapes — never an
+			// invented one.
+			var transport struct {
+				APIKeyEnv string `json:"api_key_env"`
+			}
+			var rawProviders map[string]map[string]json.RawMessage
+			if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
+				t.Fatalf("decode providers: %v", err)
+			}
+			if err := json.Unmarshal(rawProviders[row.id]["transport"], &transport); err != nil {
+				t.Fatalf("decode created transport: %v", err)
+			}
+			wantEnv := ""
+			if row.patch.ApiKeyEnv != nil {
+				wantEnv = *row.patch.ApiKeyEnv
+			}
+			if transport.APIKeyEnv != wantEnv || created.Transport.APIKeyEnv != wantEnv {
+				t.Fatalf("%s binding = (raw %q, effective %q), want exactly the supplied %q", row.id, transport.APIKeyEnv, created.Transport.APIKeyEnv, wantEnv)
+			}
+		})
+	}
 }
 
 // --- update ---
@@ -523,120 +590,135 @@ func mustRead(t *testing.T, path string) []byte {
 }
 
 // TestMetadataEditUpdateEnvRules pins the api_key_env axes on a custom
-// provider: any ACTUAL change — a clear to keyless included — is refused
-// while the current provider is connected (the retained disconnect-before
-// rule over the new pointer-patch semantics, no empty-means-skip legacy
-// rule), a padded same name is a legitimate no-change stored trim-normalized,
-// the env-name uniqueness over the captured catalog is refused before the
-// write, an unconnected change lands, and a disconnected clear to keyless is
-// allowed. No trim applies to any other field or identity.
+// provider under the user-layer rule: no connection state or sibling
+// reference constrains the rebinding — a connected provider rebinds and its
+// old credential stays untouched — and the supplied binding is the whole
+// value: an invalid padded or non-whitespace identifier refuses through the
+// candidate check exactly like a hand-edited file. No other field or
+// identity is normalized.
 func TestMetadataEditUpdateEnvRules(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
 	unsetenv(t, "META_TEST_KEY", "NEW_TEST_KEY")
 	t.Setenv("META_TEST_KEY", "secret-value") // prov is connected via its env key
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	// The connected refusals: a different nonempty name, and a clear.
+	// The connected rebindings land: a different nonempty name and a clear
+	// to keyless are both user-layer edits, and the referenced credential
+	// itself is never unset.
 	newEnv := "NEW_TEST_KEY"
-	_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &newEnv}))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-	clear := ""
-	_, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &clear}))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-
-	// The padded same name is a legitimate no-change, stored
-	// trim-normalized in the raw transport.
-	padded := "  META_TEST_KEY  "
-	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &padded})); err != nil {
-		t.Fatalf("padded same-name env patch: %v", err)
+	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &newEnv})); err != nil {
+		t.Fatalf("connected env change: %v", err)
 	}
 	drainMutationEvent(t, sub, "2")
-	var transport struct {
-		APIKeyEnv string `json:"api_key_env"`
-	}
-	root := fileRoot(t, h.configPath)
-	var rawProviders map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
-		t.Fatalf("decode providers: %v", err)
-	}
-	if err := json.Unmarshal(rawProviders["prov"]["transport"], &transport); err != nil {
-		t.Fatalf("decode transport: %v", err)
-	}
-	if transport.APIKeyEnv != "META_TEST_KEY" {
-		t.Fatalf("stored api_key_env = %q, want the trim-normalized name", transport.APIKeyEnv)
-	}
-
-	// Uniqueness over the captured catalog, excluding self.
-	otherEnv := "OTHER_TEST_KEY"
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
-	_, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &otherEnv}))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-
-	// The unconnected change lands.
-	for _, key := range []string{"META_TEST_KEY", "NEW_TEST_KEY"} {
-		if err := os.Unsetenv(key); err != nil {
-			t.Fatalf("Unsetenv: %v", err)
-		}
-	}
-	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &newEnv})); err != nil {
-		t.Fatalf("unconnected env change: %v", err)
-	}
 	if got := svc.current().catalog.Providers["prov"].Transport.APIKeyEnv; got != "NEW_TEST_KEY" {
 		t.Fatalf("effective api_key_env = %q, want NEW_TEST_KEY", got)
 	}
+	if os.Getenv("META_TEST_KEY") != "secret-value" {
+		t.Fatalf("the rebinding unset the old credential: %q", os.Getenv("META_TEST_KEY"))
+	}
 
-	// An invalid non-whitespace identifier is still catalog-rejected while
-	// the provider stays unconnected.
+	// The supplied binding is the whole value: a padded invalid env name
+	// refuses through the candidate check with the owning file and
+	// publication untouched — the same governance a hand-edited padded
+	// file gets.
+	padded := "  NEW_TEST_KEY  "
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
+	_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &padded}))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+
+	// An invalid non-whitespace identifier is catalog-rejected the same
+	// way.
 	bogus := "NOT VALID!"
-	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &bogus})); err == nil || !errors.Is(err, ErrConfiguration) {
-		t.Fatalf("invalid env name = %v, want a rejected candidate", err)
-	}
+	_, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &bogus}))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 
-	// The disconnected clear to keyless is allowed.
+	// The clear to keyless lands.
+	clear := ""
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{ApiKeyEnv: &clear})); err != nil {
-		t.Fatalf("disconnected clear: %v", err)
+		t.Fatalf("clear to keyless: %v", err)
 	}
+	drainMutationEvent(t, sub, "3")
 	if got := svc.current().catalog.Providers["prov"].Transport.APIKeyEnv; got != "" {
 		t.Fatalf("cleared api_key_env = %q, want keyless", got)
 	}
+	if os.Getenv("NEW_TEST_KEY") != "" {
+		t.Fatalf("the clear unset the previously referenced credential: %q", os.Getenv("NEW_TEST_KEY"))
+	}
 }
 
-// TestMetadataEditUpdateBuiltinProvider pins the builtin lock tree at its
-// new patch semantics: member presence — even of an equal value — refuses,
-// while headers, api_key_env, extra_body, discovery and hidden stay
-// writable, and the bundled-collision strip heals a leaked raw override
-// before the wholesale write.
+// TestMetadataEditUpdateBuiltinProvider pins the user-layer rule on a
+// builtin: every ProviderField member lands as the bundled provider's user
+// override — presence of an equal value included — the wholesale headers
+// write carries bundled-collision keys exactly as provided (no source-based
+// strip), and the credential-header refusal and the reserved extra_body
+// candidate refusal stay.
 func TestMetadataEditUpdateBuiltinProvider(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	name := "bstatic" // the equal value: presence alone refuses
-	baseURL := "http://bstatic.test/v1"
-	role := protocol.SystemRole("system")
-	stream := true
-	mtf := "max_tokens"
-	options := map[string]any{}
-	meta := protocol.ProtocolMetadata{}
-	for _, patch := range []protocol.ProviderEdit{
-		{Name: &name},
-		{BaseUrl: &baseURL},
-		{Options: &options},
-		{SystemRole: &role},
-		{UsageInStream: &stream},
-		{MaxTokensField: &mtf},
-		{ProtocolMetadata: &meta},
+	// Every non-transport field lands on the builtin's user override.
+	generation := 1
+	for _, row := range []struct {
+		name  string
+		patch protocol.ProviderEdit
+		check func(*catalog.Provider)
+	}{
+		{"name", protocol.ProviderEdit{Name: &[]string{"Renamed"}[0]}, func(p *catalog.Provider) {
+			if p.Name != "Renamed" {
+				t.Fatalf("builtin name = %q, want the override", p.Name)
+			}
+		}},
+		{"base_url", protocol.ProviderEdit{BaseUrl: &[]string{"https://override.test/v1"}[0]}, func(p *catalog.Provider) {
+			if p.Transport.BaseURL != "https://override.test/v1" {
+				t.Fatalf("builtin base_url = %q, want the override", p.Transport.BaseURL)
+			}
+		}},
+		{"system_role", protocol.ProviderEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(p *catalog.Provider) {
+			if p.SystemRole != catalog.SystemRole("user") {
+				t.Fatalf("builtin system_role = %q, want the override", p.SystemRole)
+			}
+		}},
+		{"usage_in_stream", protocol.ProviderEdit{UsageInStream: &[]bool{false}[0]}, func(p *catalog.Provider) {
+			if p.UsageInStream {
+				t.Fatal("builtin usage_in_stream = true, want the override")
+			}
+		}},
+		{"max_tokens_field", protocol.ProviderEdit{MaxTokensField: &[]string{"max_completion_tokens"}[0]}, func(p *catalog.Provider) {
+			if p.MaxTokensField != "max_completion_tokens" {
+				t.Fatalf("builtin max_tokens_field = %q, want the override", p.MaxTokensField)
+			}
+		}},
+		{"protocol_metadata", protocol.ProviderEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(p *catalog.Provider) {
+			if p.ProtocolMetadata == nil || p.ProtocolMetadata.Family != "fam" {
+				t.Fatalf("builtin protocol_metadata = %+v, want the override", p.ProtocolMetadata)
+			}
+		}},
+		{"options", protocol.ProviderEdit{Options: &map[string]any{"retries": 1}}, func(p *catalog.Provider) {
+			if p.Transport.Options == nil || p.Transport.Options["retries"] != json.Number("1") {
+				t.Fatalf("builtin options = %v, want the override", p.Transport.Options)
+			}
+		}},
 	} {
-		_, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", patch))
-		assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+		t.Run(row.name, func(t *testing.T) {
+			candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", row.patch))
+			if err != nil {
+				t.Fatalf("builtin %s patch: %v", row.name, err)
+			}
+			generation++
+			if candidate.snapshot.generation != uint64(generation) {
+				t.Fatalf("builtin %s patch generation = %d, want %d", row.name, candidate.snapshot.generation, generation)
+			}
+			drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+			row.check(candidate.snapshot.catalog.Providers["bstatic"])
+		})
 	}
 
-	// A leaked raw user override is healed: the bundled-collision key is
-	// stripped before the wholesale write, so the raw file carries only the
-	// surviving custom header.
+	// The wholesale headers write carries bundled-collision keys exactly as
+	// provided: a leaked raw override and a provided collision key both land
+	// in the file (the bundled headers come from the real embedded catalog;
+	// nothing strips them anywhere).
 	external := strings.Replace(metadataConfigDocument,
 		`"other": {`,
 		`"bstatic": {"transport": {"headers": {"x-title": "leak", "X-Keep": "k"}}}, "other": {`, 1)
@@ -645,46 +727,41 @@ func TestMetadataEditUpdateBuiltinProvider(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", protocol.ProviderEdit{Headers: &headers})); err != nil {
 		t.Fatalf("builtin headers patch: %v", err)
 	}
-	drainMutationEvent(t, sub, "2")
-	root := fileRoot(t, h.configPath)
-	var rawProviders map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
-		t.Fatalf("decode providers: %v", err)
-	}
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	var transport struct {
 		Headers map[string]string `json:"headers"`
+	}
+	rawProviders := map[string]map[string]json.RawMessage{}
+	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
+		t.Fatalf("decode providers: %v", err)
 	}
 	if err := json.Unmarshal(rawProviders["bstatic"]["transport"], &transport); err != nil {
 		t.Fatalf("decode builtin transport: %v", err)
 	}
-	// The wholesale write replaced the whole raw headers member, so the
-	// leaked bundled-collision key ("x-title") is gone from the file.
 	if len(transport.Headers) != 1 || transport.Headers["X-Custom"] != "c" {
-		t.Fatalf("builtin raw headers = %v, want the wholesale write healing the leak", transport.Headers)
+		t.Fatalf("builtin raw headers = %v, want the wholesale provided map", transport.Headers)
 	}
-	transport.Headers = nil
-
-	// A provided key colliding with a bundled header name is stripped before
-	// the write: only the surviving custom key lands. The bundled headers
-	// come from the real embedded catalog via the retained strip rule.
 	colliding := map[string]string{"x-title": "user", "X-Other": "o"}
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("openrouter", protocol.ProviderEdit{Headers: &colliding})); err != nil {
 		t.Fatalf("bundled-collision patch: %v", err)
 	}
-	drainMutationEvent(t, sub, "3")
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
 		t.Fatalf("decode providers: %v", err)
 	}
+	transport.Headers = nil
 	if err := json.Unmarshal(rawProviders["openrouter"]["transport"], &transport); err != nil {
 		t.Fatalf("decode builtin transport: %v", err)
 	}
-	if len(transport.Headers) != 1 || transport.Headers["X-Other"] != "o" {
-		t.Fatalf("builtin raw headers = %v, want the bundled-collision key stripped", transport.Headers)
+	if len(transport.Headers) != 2 || transport.Headers["x-title"] != "user" || transport.Headers["X-Other"] != "o" {
+		t.Fatalf("builtin raw headers = %v, want the collision key stored as provided", transport.Headers)
 	}
 
 	// The forbidden credential header is refused on a builtin too.
 	forbidden := map[string]string{"Proxy-Authorization": "x"}
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 	_, credErr := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", protocol.ProviderEdit{Headers: &forbidden}))
 	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, credErr, harness.ErrInvalid)
 
@@ -702,94 +779,114 @@ func TestMetadataEditUpdateBuiltinProvider(t *testing.T) {
 
 // --- delete ---
 
-// TestMetadataEditDeleteProvider pins the delete axes: a known custom
-// provider's owning definition is removed with exactly one generation and
-// event and every other definition untouched; the builtin and the connected
-// env-keyed custom are refused; the connected keyless custom succeeds; the
-// unknown and the externally-deleted-from-raw subjects fail without a write.
+// TestMetadataEditDeleteProvider pins the delete axes under the user-layer
+// rule: every addressed identity loses only its user node — a builtin's
+// override removal reveals the bundled base, a connected env-keyed custom is
+// removable, an identity whose raw node an external editor already removed
+// still publishes — and the unknown subject fails without a write.
 func TestMetadataEditDeleteProvider(t *testing.T) {
 	h := newMetadataHarness(t)
-	writeServiceFile(t, h.configPath, metadataConfigDocument)
+	writeServiceFile(t, h.configPath, metadataBuiltinOverrideDocument())
 	svc, sub := metadataService(t, h)
 
-	// The connected keyless custom succeeds — create, then delete.
-	window := 1
-	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
-	if _, err := svc.mutate(context.Background(), svc.editProviderCreate("keyless",
-		protocol.ProviderEdit{BaseUrl: &[]string{"https://keyless.test/v1"}[0]}, valid, nil)); err != nil {
-		t.Fatalf("create keyless: %v", err)
+	// The builtin delete removes only the user node: the bundled base
+	// remains the effective subject.
+	candidate, err := svc.mutate(context.Background(), svc.editProviderDelete("bstatic"))
+	if err != nil || candidate.snapshot.generation != 2 {
+		t.Fatalf("builtin delete = (%v, generation %d), want a publication at 2", err, candidate.snapshot.generation)
 	}
-	drainMutationEventWithWarning(t, sub, "2", svc.warnings)
-	candidate, err := svc.mutate(context.Background(), svc.editProviderDelete("keyless"))
-	if err != nil || candidate.snapshot.generation != 3 {
-		t.Fatalf("keyless delete = (%v, generation %d), want a publication at 3", err, candidate.snapshot.generation)
+	drainConnectionEvent(t, svc.warnings, sub, "2")
+	if got := candidate.snapshot.catalog.Providers["bstatic"]; got == nil || !got.Builtin {
+		t.Fatalf("builtin delete post-state = %+v, want the surviving bundled base", got)
 	}
-	if candidate.snapshot.catalog.Providers["keyless"] != nil {
-		t.Fatal("the deleted provider stayed in the candidate catalog")
+	if got := candidate.snapshot.catalog.Providers["bstatic"].Transport.BaseURL; got != "http://bstatic.test/v1" {
+		t.Fatalf("revealed base_url = %q, want the bundled URL", got)
 	}
-	drainMutationEventWithWarning(t, sub, "3", svc.warnings)
+	var rawProviders map[string]json.RawMessage
+	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
+		t.Fatalf("decode providers: %v", err)
+	}
+	if _, present := rawProviders["bstatic"]; present {
+		t.Fatalf("raw providers = %s, want the user node gone", fileRoot(t, h.configPath)["providers"])
+	}
+	if _, present := rawProviders["prov"]; !present {
+		t.Fatal("the delete touched an unrelated provider")
+	}
 
-	// The connected env-keyed custom is refused (unique at this layer: no
-	// direct Runtime row drives a connected env-keyed deletion).
+	// The connected env-keyed custom is removable too.
 	unsetenv(t, "META_TEST_KEY")
 	t.Setenv("META_TEST_KEY", "secret-value")
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
-	_, err = svc.mutate(context.Background(), svc.editProviderDelete("prov"))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-	for _, key := range []string{"META_TEST_KEY"} {
-		_ = os.Unsetenv(key)
+	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("prov"))
+	if err != nil || candidate.snapshot.generation != 3 {
+		t.Fatalf("connected delete = (%v, generation %d), want a publication at 3", err, candidate.snapshot.generation)
 	}
+	drainConnectionEvent(t, svc.warnings, sub, "3")
+	if candidate.snapshot.catalog.Providers["prov"] != nil {
+		t.Fatal("the deleted custom provider stayed in the candidate catalog")
+	}
+	if os.Getenv("META_TEST_KEY") != "secret-value" {
+		t.Fatalf("the delete unset the referenced credential: %q", os.Getenv("META_TEST_KEY"))
+	}
+	_ = os.Unsetenv("META_TEST_KEY")
 
-	// The successful delete: only the owning definition leaves the raw file.
+	// The successful standalone delete removes only the owning definition.
 	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("other"))
 	if err != nil || candidate.snapshot.generation != 4 {
 		t.Fatalf("delete = (%v, generation %d), want a publication at 4", err, candidate.snapshot.generation)
 	}
-	drainMutationEvent(t, sub, "4")
-	assertNoEvent(t, sub)
-	root := fileRoot(t, h.configPath)
-	var providers map[string]json.RawMessage
-	if err := json.Unmarshal(root["providers"], &providers); err != nil {
+	drainConnectionEvent(t, svc.warnings, sub, "4")
+	rawProviders = map[string]json.RawMessage{}
+	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
 		t.Fatalf("decode providers: %v", err)
 	}
-	if _, present := providers["other"]; present {
-		t.Fatalf("raw providers = %s, want the deleted entry gone", root["providers"])
-	}
-	if _, present := providers["prov"]; !present {
-		t.Fatal("the delete touched an unrelated provider")
+	if _, present := rawProviders["other"]; present {
+		t.Fatalf("raw providers = %s, want the deleted entry gone", fileRoot(t, h.configPath)["providers"])
 	}
 	if got := string(fileRoot(t, h.configPath)["custom_flag"]); got != "true" {
 		t.Fatalf("unowned root member = %s, want true", got)
 	}
 
 	// A custom definition deleted from the latest raw layer by an external
-	// editor (without a reload) is not silently scaffolded back: the
-	// captured catalog still knows it, but there is no owning definition to
-	// delete.
-	window = 1
+	// editor (without a reload) is not reconstructed: the identity is still
+	// effective, so the delete succeeds, publishes, and leaves no subject —
+	// the post-state is null, and the raw file is unchanged apart from the
+	// shared writer's own formatting.
+	window := 1
+	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 	if _, err := svc.mutate(context.Background(), svc.editProviderCreate("temp",
 		protocol.ProviderEdit{BaseUrl: &[]string{"https://temp.test/v1"}[0]}, valid, nil)); err != nil {
 		t.Fatalf("create temp: %v", err)
 	}
-	drainMutationEventWithWarning(t, sub, "5", svc.warnings)
+	drainConnectionEvent(t, svc.warnings, sub, "5")
 	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
-	_, err = svc.mutate(context.Background(), svc.editProviderDelete("temp"))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, catalog.ErrUnknownProvider)
+	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("temp"))
+	if err != nil || candidate.snapshot.generation != 6 {
+		t.Fatalf("externally-removed delete = (%v, generation %d), want a publication at 6", err, candidate.snapshot.generation)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "6")
+	if candidate.snapshot.catalog.Providers["temp"] != nil {
+		t.Fatal("the externally-removed provider stayed in the candidate catalog")
+	}
+
+	// The unknown subject fails its typed not-found without a write.
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
+	_, ghostErr := svc.mutate(context.Background(), svc.editProviderDelete("ghost"))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, ghostErr, catalog.ErrUnknownProvider)
 }
 
 // --- provider field reset ---
 
 // TestMetadataEditResetProviderFields pins the provider reset matrix: every
-// closed field removes exactly its own user override from its owning raw
+// shared field removes exactly its own user override from its owning raw
 // path and restores the effective default, a custom provider's required
-// transport keys refuse through the candidate check, the connected
-// api_key_env reset is refused, resetting hidden is invalid, a builtin's
-// fixture-seeded base_url and disconnected api_key_env overrides restore
-// their bundled values with only their own raw member changed, and a reset
-// with no override left still rewrites the owning file and publishes the
-// next generation under the one shared successful-edit rule.
+// transport keys refuse through the candidate check (a connected reset
+// included — no connection state gates the reset), resetting hidden removes
+// its override, a builtin's fixture-seeded base_url and disconnected
+// api_key_env overrides restore their bundled values with only their own raw
+// member changed, and a reset with no override left still rewrites the
+// owning file and publishes the next generation under the one shared
+// successful-edit rule.
 func TestMetadataEditResetProviderFields(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataBuiltinOverrideDocument())
@@ -803,9 +900,10 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	meta := protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}
 	discovery := false
 	mtf := "max_completion_tokens"
+	hidden := true
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{
 		Name: &name, ExtraBody: &extra, SystemRole: &role, UsageInStream: &stream,
-		ProtocolMetadata: &meta, Discovery: &discovery, MaxTokensField: &mtf,
+		ProtocolMetadata: &meta, Discovery: &discovery, MaxTokensField: &mtf, Hidden: &hidden,
 	})); err != nil {
 		t.Fatalf("override seed: %v", err)
 	}
@@ -813,14 +911,15 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 
 	// Non-transport resets remove exactly their own raw member.
 	generation := 2
-	for _, field := range []protocol.ResetProviderFieldParamsField{
-		protocol.ResetProviderFieldParamsFieldName,
-		protocol.ResetProviderFieldParamsFieldExtraBody,
-		protocol.ResetProviderFieldParamsFieldSystemRole,
-		protocol.ResetProviderFieldParamsFieldUsageInStream,
-		protocol.ResetProviderFieldParamsFieldProtocolMetadata,
-		protocol.ResetProviderFieldParamsFieldDiscovery,
-		protocol.ResetProviderFieldParamsFieldMaxTokensField,
+	for _, field := range []protocol.ProviderField{
+		protocol.ProviderFieldName,
+		protocol.ProviderFieldExtraBody,
+		protocol.ProviderFieldSystemRole,
+		protocol.ProviderFieldUsageInStream,
+		protocol.ProviderFieldProtocolMetadata,
+		protocol.ProviderFieldDiscovery,
+		protocol.ProviderFieldMaxTokensField,
+		protocol.ProviderFieldHidden,
 	} {
 		candidate, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field))
 		if err != nil || candidate.snapshot.generation != svc.current().generation {
@@ -843,9 +942,9 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	}
 
 	// Transport resets remove exactly their own transport member.
-	for _, field := range []protocol.ResetProviderFieldParamsField{
-		protocol.ResetProviderFieldParamsFieldHeaders,
-		protocol.ResetProviderFieldParamsFieldOptions,
+	for _, field := range []protocol.ProviderField{
+		protocol.ProviderFieldHeaders,
+		protocol.ProviderFieldOptions,
 	} {
 		if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field)); err != nil {
 			t.Fatalf("reset %q: %v", field, err)
@@ -867,28 +966,24 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	}
 
 	// The required custom transport keys fail the candidate validation
-	// before the write.
+	// before the write — a connected provider's api_key_env reset included,
+	// since no connection state gates the reset.
+	t.Setenv("META_TEST_KEY", "secret-value")
 	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
-	for _, field := range []protocol.ResetProviderFieldParamsField{
-		protocol.ResetProviderFieldParamsFieldBaseUrl,
-		protocol.ResetProviderFieldParamsFieldEnvironmentVariable,
+	for _, field := range []protocol.ProviderField{
+		protocol.ProviderFieldBaseUrl,
+		protocol.ProviderFieldEnvironmentVariable,
 	} {
 		_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field))
 		assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 	}
-
-	// The connected api_key_env reset is refused.
-	t.Setenv("META_TEST_KEY", "secret-value")
-	_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ResetProviderFieldParamsFieldEnvironmentVariable))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
 	_ = os.Unsetenv("META_TEST_KEY")
 
 	// The builtin base_url override (from the fixture's raw user layer)
 	// resets to the bundled URL: only its own raw member changes.
 	unsetenv(t, "BUILTIN_OVERRIDE_KEY") // the builtin env override is disconnected
 	builtinBefore := metadataRawProvider(t, h.configPath, "bstatic")
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldBaseUrl)); err != nil {
 		t.Fatalf("builtin base_url reset: %v", err)
 	}
 	generation++
@@ -917,10 +1012,8 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	}
 
 	// The builtin DISCONNECTED api_key_env override resets to the bundled
-	// empty name (the connected guard stays silent: the captured provider is
-	// disconnected before the reset).
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldEnvironmentVariable))
-	if err != nil {
+	// empty name: no connection state gates the reset.
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldEnvironmentVariable)); err != nil {
 		t.Fatalf("builtin api_key_env reset: %v", err)
 	}
 	generation++
@@ -935,8 +1028,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	// A second base_url reset has no override left: the shared successful
 	// edit rule still rewrites the owning file and publishes the next
 	// generation with its event.
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldBaseUrl))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldBaseUrl)); err != nil {
 		t.Fatalf("second builtin base_url reset: %v", err)
 	}
 	generation++
@@ -944,8 +1036,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 
 	// An absent override is the same successful edit: no member to remove,
 	// yet the owning file is rewritten and the next generation published.
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ResetProviderFieldParamsFieldName))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ProviderFieldName)); err != nil {
 		t.Fatalf("absent-override reset: %v", err)
 	}
 	generation++
@@ -960,8 +1051,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldHeaders))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldHeaders)); err != nil {
 		t.Fatalf("builtin reset: %v", err)
 	}
 	bundled := svc.current().catalog.Providers["bstatic"].Transport.Headers
@@ -970,8 +1060,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	_, err = svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ResetProviderFieldParamsFieldOptions))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldOptions)); err != nil {
 		t.Fatalf("builtin absent-override reset: %v", err)
 	}
 	generation++
@@ -991,23 +1080,53 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	// Bundled locks: presence, even of an equal value, refuses.
-	bmName := "bm"
-	role := protocol.SystemRole("system")
-	stream := true
-	modalities := &[]protocol.InputModality{"text"}
-	meta := protocol.ProtocolMetadata{}
-	for _, patch := range []protocol.ModelEdit{
-		{Name: &bmName},
-		{SystemRole: &role},
-		{UsageInStream: &stream},
-		{InputModalities: modalities},
-		{ProtocolMetadata: &meta},
+	// No source-specific lock applies: every identity/protocol member lands
+	// on the bundled model as its user override.
+	generation := 1
+	for _, row := range []struct {
+		name  string
+		patch protocol.ModelEdit
+		check func(*catalog.Model)
+	}{
+		{"name", protocol.ModelEdit{Name: &[]string{"Renamed"}[0]}, func(m *catalog.Model) {
+			if m.Name != "Renamed" {
+				t.Fatalf("bundled model name = %q, want the override", m.Name)
+			}
+		}},
+		{"system_role", protocol.ModelEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(m *catalog.Model) {
+			if m.SystemRole != catalog.SystemRole("user") {
+				t.Fatalf("bundled model system_role = %q, want the override", m.SystemRole)
+			}
+		}},
+		{"usage_in_stream", protocol.ModelEdit{UsageInStream: &[]bool{false}[0]}, func(m *catalog.Model) {
+			if m.UsageInStream {
+				t.Fatal("bundled model usage_in_stream = true, want the override")
+			}
+		}},
+		{"input_modalities", protocol.ModelEdit{InputModalities: &[]protocol.InputModality{"text"}}, func(m *catalog.Model) {
+			if len(m.InputModalities) != 1 || m.InputModalities[0] != catalog.Modality("text") {
+				t.Fatalf("bundled model modalities = %v, want the override", m.InputModalities)
+			}
+		}},
+		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(m *catalog.Model) {
+			if m.ProtocolMetadata == nil || m.ProtocolMetadata.Family != "fam" {
+				t.Fatalf("bundled model protocol_metadata = %+v, want the override", m.ProtocolMetadata)
+			}
+		}},
 	} {
-		_, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", patch))
-		assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+		t.Run(row.name, func(t *testing.T) {
+			candidate, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", row.patch))
+			if err != nil {
+				t.Fatalf("bundled %s patch: %v", row.name, err)
+			}
+			generation++
+			if candidate.snapshot.generation != uint64(generation) {
+				t.Fatalf("bundled %s patch generation = %d, want %d", row.name, candidate.snapshot.generation, generation)
+			}
+			drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+			row.check(candidate.snapshot.catalog.Providers["bstatic"].Models["bm"])
+		})
 	}
 
 	// The correctable members land on the bundled model and the reserved
@@ -1016,12 +1135,13 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{ContextWindow: &window})); err != nil {
 		t.Fatalf("bundled correctable patch: %v", err)
 	}
-	drainMutationEvent(t, sub, "2")
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	if got := svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow; got != 2000 {
 		t.Fatalf("bundled window = %d, want 2000", got)
 	}
 	reserved := map[string]any{"stream": true}
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 	_, saveErr := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{ExtraBody: &reserved}))
 	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, saveErr, ErrConfiguration)
 
@@ -1031,7 +1151,8 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "new-model", protocol.ModelEdit{Name: &created, ContextWindow: &window})); err != nil {
 		t.Fatalf("user model create: %v", err)
 	}
-	drainMutationEvent(t, sub, "3")
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	entry := svc.current().catalog.Providers["prov"].Models["new-model"]
 	if entry == nil || entry.Source != catalog.SourceUser || entry.Name != "Created" {
 		t.Fatalf("created model = %+v, want a user-sourced entry", entry)
@@ -1040,7 +1161,8 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "new-model", protocol.ModelEdit{Name: &renamed})); err != nil {
 		t.Fatalf("user model edit: %v", err)
 	}
-	drainMutationEvent(t, sub, "4")
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	edited := svc.current().catalog.Providers["prov"].Models["new-model"]
 	if edited == nil || edited.Name != "Renamed" || edited.ContextWindow != 2000 {
 		t.Fatalf("edited model = %+v, want the renamed entry with its created window 2000 preserved", edited)
@@ -1050,7 +1172,8 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "org/model", protocol.ModelEdit{ContextWindow: &window})); err != nil {
 		t.Fatalf("slash model upsert: %v", err)
 	}
-	drainMutationEvent(t, sub, "5")
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	if svc.current().catalog.Providers["prov"].Models["org/model"] == nil {
 		t.Fatal("the slash model ID is not a catalog member")
 	}
@@ -1064,7 +1187,8 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "bare", protocol.ModelEdit{})); err != nil {
 		t.Fatalf("empty patch upsert: %v", err)
 	}
-	drainMutationEventWithWarning(t, sub, "6", svc.warnings)
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 
 	// An explicit zero context_window is a real value (the typed target and
 	// the catalog admit 0/incomplete models; there is no positivity rule):
@@ -1073,7 +1197,8 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{ContextWindow: &zero})); err != nil {
 		t.Fatalf("explicit zero window patch: %v", err)
 	}
-	drainMutationEventWithWarning(t, sub, "7", svc.warnings)
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
 	zeroEntry := svc.current().catalog.Providers["prov"].Models["m"]
 	if zeroEntry == nil || zeroEntry.ContextWindow != 0 {
 		t.Fatalf("model after explicit zero window = %+v, want the written 0 window retained as incomplete", zeroEntry)
@@ -1086,17 +1211,42 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 // models are deletable, missing identities fail their typed unknown errors
 // (no silent success), a model deleted from the latest raw layer refuses, and
 // the successful delete removes exactly the owning raw entry.
+// TestMetadataEditModelDelete pins the model deletion axes under the
+// user-layer rule: an addressed model loses only its user node — a bundled
+// model's override removal reveals the bundled base, missing identities fail
+// their typed unknown errors — and a model already removed from the latest
+// raw layer still publishes with no subject left behind.
 func TestMetadataEditModelDelete(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	// Bundled and discovered models refuse deletion.
-	_, err := svc.mutate(context.Background(), svc.editModelDelete("bstatic", "bm"))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+	// The bundled model's override removal reveals the bundled base: the
+	// raw entry leaves, the effective model stays.
+	hidden := true
+	if _, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{Hidden: &hidden})); err != nil {
+		t.Fatalf("override seed: %v", err)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "2")
+	candidate, err := svc.mutate(context.Background(), svc.editModelDelete("bstatic", "bm"))
+	if err != nil || candidate.snapshot.generation != 3 {
+		t.Fatalf("bundled model delete = (%v, generation %d), want a publication at 3", err, candidate.snapshot.generation)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "3")
+	entry := candidate.snapshot.catalog.Providers["bstatic"].Models["bm"]
+	if entry == nil || entry.Source != catalog.SourceBundled {
+		t.Fatalf("bundled model after delete = %+v, want the surviving bundled base", entry)
+	}
+	var rawModels map[string]json.RawMessage
+	if err := json.Unmarshal(metadataRawProvider(t, h.configPath, "bstatic")["models"], &rawModels); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if _, present := rawModels["bm"]; present {
+		t.Fatalf("raw models = %s, want the user node gone", metadataRawProvider(t, h.configPath, "bstatic")["models"])
+	}
 
 	// Missing identities fail their typed errors.
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 	_, err = svc.mutate(context.Background(), svc.editModelDelete("ghost", "m"))
 	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, catalog.ErrUnknownProvider)
 	_, err = svc.mutate(context.Background(), svc.editModelDelete("prov", "ghost"))
@@ -1106,7 +1256,7 @@ func TestMetadataEditModelDelete(t *testing.T) {
 	if _, err := svc.mutate(context.Background(), svc.editModelDelete("prov", "wide")); err != nil {
 		t.Fatalf("user model delete: %v", err)
 	}
-	drainMutationEvent(t, sub, "2")
+	drainConnectionEvent(t, svc.warnings, sub, "4")
 	root := fileRoot(t, h.configPath)
 	var rawProviders map[string]map[string]json.RawMessage
 	if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
@@ -1126,14 +1276,20 @@ func TestMetadataEditModelDelete(t *testing.T) {
 		t.Fatal("the delete touched an unrelated provider")
 	}
 
-	// A user model already deleted from the latest raw layer refuses instead
-	// of a legacy silent success. The external corruption is the latest raw
-	// layer; the refusal baseline is taken after the bad write.
-	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY","headers":{"X-Trace":"t1"},"options":{"retries":3}},"discovery":false,"extra_body":{"side":1,"big":9007199254740993},"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":100,"usage_in_stream":false}}},"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
+	// A user model already deleted from the latest raw layer by an external
+	// editor (without a reload) still publishes: the identity is effective,
+	// no user node remains, and the post-state carries no subject. The
+	// external write removes only "m" from the raw layer.
+	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY","headers":{"X-Trace":"t1"},"options":{"retries":3}},"discovery":false,"extra_body":{"side":1,"big":9007199254740993},"models":{"wide":{"context_window":8192}}},"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
-	_, err = svc.mutate(context.Background(), svc.editModelDelete("prov", "wide"))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, catalog.ErrUnknownModel)
+	candidate, err = svc.mutate(context.Background(), svc.editModelDelete("prov", "m"))
+	if err != nil || candidate.snapshot.generation != 5 {
+		t.Fatalf("externally-removed model delete = (%v, generation %d), want a publication at 5", err, candidate.snapshot.generation)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "5")
+	if candidate.snapshot.catalog.Providers["prov"].Models["m"] != nil {
+		t.Fatal("the externally-removed model stayed in the candidate catalog")
+	}
 }
 
 // --- model field reset ---
@@ -1153,10 +1309,18 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
 
-	// The user-model context_window reset refuses before the write.
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
-	_, err := svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ResetProviderModelFieldParamsFieldContextWindow))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+	// The user-model context_window reset lands: removing the sole window
+	// leaves a valid incomplete model that cannot make a new admission
+	// usable.
+	candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ModelFieldContextWindow))
+	if err != nil || candidate.snapshot.generation != 2 {
+		t.Fatalf("user context_window reset = (%v, generation %d), want a publication at 2", err, candidate.snapshot.generation)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "2")
+	entry := candidate.snapshot.catalog.Providers["prov"].Models["m"]
+	if entry == nil || entry.ContextWindow != 0 {
+		t.Fatalf("user model after the window reset = %+v, want the incomplete model retained", entry)
+	}
 
 	// Seed every resettable override on the user model, then reset each one.
 	name := "M2"
@@ -1173,20 +1337,21 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("override seed: %v", err)
 	}
-	drainMutationEvent(t, sub, "2")
+	drainConnectionEvent(t, svc.warnings, sub, "3")
 
 	// The other closed fields remove their own user override from the user
 	// model's raw definition.
-	generation := 2
-	for _, field := range []protocol.ResetProviderModelFieldParamsField{
-		protocol.ResetProviderModelFieldParamsFieldName,
-		protocol.ResetProviderModelFieldParamsFieldMaxOutputTokens,
-		protocol.ResetProviderModelFieldParamsFieldUsageInStream,
-		protocol.ResetProviderModelFieldParamsFieldExtraBody,
-		protocol.ResetProviderModelFieldParamsFieldCost,
-		protocol.ResetProviderModelFieldParamsFieldProtocolMetadata,
-		protocol.ResetProviderModelFieldParamsFieldSystemRole,
-		protocol.ResetProviderModelFieldParamsFieldInputModalities,
+	generation := 3
+	for _, field := range []protocol.ModelField{
+		protocol.ModelFieldName,
+		protocol.ModelFieldMaxOutputTokens,
+		protocol.ModelFieldUsageInStream,
+		protocol.ModelFieldExtraBody,
+		protocol.ModelFieldCost,
+		protocol.ModelFieldProtocolMetadata,
+		protocol.ModelFieldSystemRole,
+		protocol.ModelFieldInputModalities,
+		protocol.ModelFieldHidden,
 	} {
 		candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", field))
 		if err != nil || candidate.snapshot.generation != svc.current().generation {
@@ -1212,11 +1377,6 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 		}
 	}
 
-	// Resetting hidden is invalid on the model enum too.
-	before, first, warnRev = metadataBaseline(t, svc, h.configPath)
-	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ResetProviderModelFieldParamsField("hidden")))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-
 	// A bundled model's override reset restores the bundled value; an
 	// absent override publishes under the same shared successful-edit rule.
 	window := 50
@@ -1225,8 +1385,7 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldContextWindow))
-	if err != nil || svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow != 1000 {
+	if _, err := svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ModelFieldContextWindow)); err != nil || svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow != 1000 {
 		t.Fatalf("bundled reset = (%v, window %d), want the bundled 1000 restored", err, svc.current().catalog.Providers["bstatic"].Models["bm"].ContextWindow)
 	}
 	generation++
@@ -1234,8 +1393,7 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	// An absent override is the shared successful edit too: no member to
 	// remove, yet the owning file is rewritten and the next generation
 	// published.
-	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ResetProviderModelFieldParamsFieldCost))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editModelFieldReset("bstatic", "bm", protocol.ModelFieldCost)); err != nil {
 		t.Fatalf("absent-override reset: %v", err)
 	}
 	generation++
@@ -1250,13 +1408,12 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ResetProviderModelFieldParamsFieldContextWindow))
-	if err != nil {
+	if _, err := svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ModelFieldContextWindow)); err != nil {
 		t.Fatalf("discovered context_window reset: %v", err)
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	entry := svc.current().catalog.Providers["disco"].Models["disc-model"]
+	entry = svc.current().catalog.Providers["disco"].Models["disc-model"]
 	if entry == nil || entry.ContextWindow != 2048 || entry.Source != catalog.SourceDiscovered {
 		t.Fatalf("discovered model after reset = %+v, want the record window 2048 restored with its source", entry)
 	}
@@ -1305,39 +1462,73 @@ func TestMetadataEditDiscoveredModelSource(t *testing.T) {
 	if entry == nil || entry.Source != catalog.SourceDiscovered {
 		t.Fatalf("discovered model = %+v, want a discovered-source entry", entry)
 	}
-	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	// All five identity/protocol members are locked by presence: the exact
-	// input-field guard fires before the write, so even an equal value
-	// refuses and every refusal leaves the file, publication, warning
-	// revision, and event stream untouched.
-	discName := "Disc"
-	discRole := protocol.SystemRole("system")
-	discStream := true
-	discModalities := &[]protocol.InputModality{"text"}
-	discMeta := protocol.ProtocolMetadata{}
-	for _, patch := range []protocol.ModelEdit{
-		{Name: &discName},
-		{SystemRole: &discRole},
-		{UsageInStream: &discStream},
-		{InputModalities: discModalities},
-		{ProtocolMetadata: &discMeta},
+	// No source-specific lock applies: the identity/protocol members land
+	// on the discovered model as its user override.
+	generation := 1
+	for _, row := range []struct {
+		name  string
+		patch protocol.ModelEdit
+		check func(*catalog.Model)
+	}{
+		{"name", protocol.ModelEdit{Name: &[]string{"Renamed"}[0]}, func(m *catalog.Model) {
+			if m.Name != "Renamed" {
+				t.Fatalf("discovered model name = %q, want the override", m.Name)
+			}
+		}},
+		{"system_role", protocol.ModelEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(m *catalog.Model) {
+			if m.SystemRole != catalog.SystemRole("user") {
+				t.Fatalf("discovered model system_role = %q, want the override", m.SystemRole)
+			}
+		}},
+		{"usage_in_stream", protocol.ModelEdit{UsageInStream: &[]bool{false}[0]}, func(m *catalog.Model) {
+			if m.UsageInStream {
+				t.Fatal("discovered model usage_in_stream = true, want the override")
+			}
+		}},
+		{"input_modalities", protocol.ModelEdit{InputModalities: &[]protocol.InputModality{"text"}}, func(m *catalog.Model) {
+			if len(m.InputModalities) != 1 || m.InputModalities[0] != catalog.Modality("text") {
+				t.Fatalf("discovered model modalities = %v, want the override", m.InputModalities)
+			}
+		}},
+		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(m *catalog.Model) {
+			if m.ProtocolMetadata == nil || m.ProtocolMetadata.Family != "fam" {
+				t.Fatalf("discovered model protocol_metadata = %+v, want the override", m.ProtocolMetadata)
+			}
+		}},
 	} {
-		_, lockErr := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", patch))
-		assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, lockErr, harness.ErrInvalid)
+		t.Run(row.name, func(t *testing.T) {
+			candidate, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", row.patch))
+			if err != nil {
+				t.Fatalf("discovered %s patch: %v", row.name, err)
+			}
+			generation++
+			drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+			row.check(candidate.snapshot.catalog.Providers["disco"].Models["disc-model"])
+		})
 	}
 
-	// Deletion refuses.
-	_, deleteErr := svc.mutate(context.Background(), svc.editModelDelete("disco", "disc-model"))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, deleteErr, harness.ErrInvalid)
+	// The override deletion reveals the discovered base.
+	candidate, err := svc.mutate(context.Background(), svc.editModelDelete("disco", "disc-model"))
+	if err != nil {
+		t.Fatalf("discovered model delete: %v", err)
+	}
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+	entry = candidate.snapshot.catalog.Providers["disco"].Models["disc-model"]
+	if entry == nil || entry.Source != catalog.SourceDiscovered || entry.MaxOutputTokens != 256 {
+		t.Fatalf("discovered model after delete = %+v, want the discovered base restored", entry)
+	}
 
-	// The correctable members land; the override resets to the discovered
-	// value.
+	// The correctable member lands again; the override resets to the
+	// discovered value.
 	maxOut := 100
 	if _, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{MaxOutputTokens: &maxOut})); err != nil {
 		t.Fatalf("discovered correctable patch: %v", err)
 	}
-	candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ResetProviderModelFieldParamsFieldMaxOutputTokens))
+	generation++
+	drainConnectionEvent(t, svc.warnings, sub, strconv.Itoa(generation))
+	candidate, err = svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ModelFieldMaxOutputTokens))
 	if err != nil || candidate.snapshot.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens != 256 {
 		t.Fatalf("discovered reset = (%v, max output %d), want the discovered 256 restored", err, candidate.snapshot.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens)
 	}
@@ -1384,11 +1575,30 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 		drainMutationEventWithWarning(t, sub, "3", r.warnings)
 
 		// The reset: the previous effective name is restored.
-		mutation, err = r.resetProviderField(ctx, "prov", protocol.ResetProviderFieldParamsFieldName)
+		mutation, err = r.resetProviderField(ctx, "prov", protocol.ProviderFieldName)
 		if err != nil || mutation.ConfigurationRevision.Generation != "4" || mutation.Result.Name == "Patched" {
 			t.Fatalf("resetProviderField = (%v, %+v), want the restored view at generation 4", err, mutation)
 		}
 		drainMutationEvent(t, sub, "4")
+
+		// The builtin user node's delete reveals the bundled base: the
+		// result carries the surviving effective post-state.
+		mutation, err = r.deleteProvider(ctx, "openrouter")
+		if err != nil || mutation.ConfigurationRevision.Generation != "5" || mutation.Result == nil || mutation.Result.Id != "openrouter" || !mutation.Result.Builtin {
+			t.Fatalf("builtin delete = (%v, %+v), want the revealed bundled base at generation 5", err, mutation)
+		}
+		drainConnectionEvent(t, r.warnings, sub, "5")
+
+		// The hidden reset removes its own override.
+		if _, err := r.updateProvider(ctx, "prov", protocol.ProviderEdit{Hidden: &[]bool{true}[0]}); err != nil {
+			t.Fatalf("hidden seed: %v", err)
+		}
+		drainMutationEvent(t, sub, "6")
+		mutation, err = r.resetProviderField(ctx, "prov", protocol.ProviderFieldHidden)
+		if err != nil || mutation.ConfigurationRevision.Generation != "7" || mutation.Result.Hidden {
+			t.Fatalf("hidden reset = (%v, %+v), want the removed override at generation 7", err, mutation)
+		}
+		drainConnectionEvent(t, r.warnings, sub, "7")
 
 		// The refusals, each with the full state oracle: the typed failure
 		// class and no file write, generation, warning revision, or event.
@@ -1401,18 +1611,10 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 				_, err := r.addProvider(ctx, "prov", protocol.ProviderEdit{BaseUrl: &[]string{"https://x.test/v1"}[0]}, models, nil)
 				return err
 			}, harness.ErrInvalid},
-			{"builtin delete", func() error {
-				_, err := r.deleteProvider(ctx, "openrouter")
-				return err
-			}, harness.ErrInvalid},
 			{"unknown delete", func() error {
 				_, err := r.deleteProvider(ctx, "ghost")
 				return err
 			}, catalog.ErrUnknownProvider},
-			{"hidden reset", func() error {
-				_, err := r.resetProviderField(ctx, "prov", protocol.ResetProviderFieldParamsField("hidden"))
-				return err
-			}, harness.ErrInvalid},
 			{"credential header", func() error {
 				_, err := r.updateProvider(ctx, "prov", protocol.ProviderEdit{Headers: &map[string]string{"Authorization": "x"}})
 				return err
@@ -1426,12 +1628,13 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 			})
 		}
 
-		// The delete: the generated deletion envelope with its null result.
-		deletion, err := r.deleteProvider(ctx, "newp")
-		if err != nil || deletion.ConfigurationRevision.Generation != "5" || deletion.Result != nil {
-			t.Fatalf("deleteProvider = (%v, %+v), want the null deletion result at generation 5", err, deletion)
+		// The standalone user definition's delete: the same operator with a
+		// null post-state — no subject remains.
+		mutation, err = r.deleteProvider(ctx, "newp")
+		if err != nil || mutation.ConfigurationRevision.Generation != "8" || mutation.Result != nil {
+			t.Fatalf("deleteProvider = (%v, %+v), want the null post-state at generation 8", err, mutation)
 		}
-		drainMutationEvent(t, sub, "5")
+		drainMutationEvent(t, sub, "8")
 	})
 }
 
@@ -1459,26 +1662,30 @@ func TestRuntimeModelMetadataOperators(t *testing.T) {
 			t.Fatal("no bundled openrouter model in the published catalog")
 		}
 
-		// The bundled lock: identity presence refuses.
+		// No source-specific lock applies: the rename lands as the bundled
+		// model's user override.
 		lockedName := "x"
-		if _, err := r.saveModel(ctx, "openrouter", bundledModel, protocol.ModelEdit{Name: &lockedName}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("bundled rename = %v, want harness.ErrInvalid", err)
+		mutation, err := r.saveModel(ctx, "openrouter", bundledModel, protocol.ModelEdit{Name: &lockedName})
+		if err != nil || mutation.ConfigurationRevision.Generation != "2" || mutation.Result.Name != lockedName {
+			t.Fatalf("bundled rename = (%v, %+v), want the landed override at generation 2", err, mutation)
 		}
 
 		// The correctable member lands on the bundled model.
 		window := 2048
-		mutation, err := r.saveModel(ctx, "openrouter", bundledModel, protocol.ModelEdit{ContextWindow: &window})
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" || mutation.Result.ContextWindow != 2048 {
-			t.Fatalf("bundled correctable patch = (%v, %+v), want the new window at generation 2", err, mutation)
+		mutation, err = r.saveModel(ctx, "openrouter", bundledModel, protocol.ModelEdit{ContextWindow: &window})
+		if err != nil || mutation.ConfigurationRevision.Generation != "3" || mutation.Result.ContextWindow != 2048 {
+			t.Fatalf("bundled correctable patch = (%v, %+v), want the new window at generation 3", err, mutation)
 		}
 
-		// The bundled delete refuses; the reset restores the bundled window.
-		if _, err := r.deleteModel(ctx, "openrouter", bundledModel); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("bundled delete = %v, want harness.ErrInvalid", err)
+		// The override's delete reveals the bundled base; the reset restores
+		// the bundled window too.
+		mutation2, err := r.deleteModel(ctx, "openrouter", bundledModel)
+		if err != nil || mutation2.ConfigurationRevision.Generation != "4" || mutation2.Result == nil || mutation2.Result.Hidden {
+			t.Fatalf("bundled delete = (%v, %+v), want the revealed base at generation 4", err, mutation2)
 		}
-		mutation, err = r.resetModelField(ctx, "openrouter", bundledModel, protocol.ResetProviderModelFieldParamsFieldContextWindow)
-		if err != nil || mutation.ConfigurationRevision.Generation != "3" {
-			t.Fatalf("bundled reset = (%v, %+v), want generation 3", err, mutation)
+		mutation, err = r.resetModelField(ctx, "openrouter", bundledModel, protocol.ModelFieldContextWindow)
+		if err != nil || mutation.ConfigurationRevision.Generation != "5" {
+			t.Fatalf("bundled reset = (%v, %+v), want generation 5", err, mutation)
 		}
 		if mutation.Result.ContextWindow == 2048 || mutation.Result.ContextWindow == 0 {
 			t.Fatalf("reset window = %d, want the restored bundled value", mutation.Result.ContextWindow)
@@ -1487,17 +1694,18 @@ func TestRuntimeModelMetadataOperators(t *testing.T) {
 		// The slash-containing model ID is an exact query value; the same ID
 		// upserts twice without a duplicate error.
 		slashWindow := 10
-		for _, generation := range []string{"4", "5"} {
+		for _, generation := range []string{"6", "7"} {
 			mutation, err = r.saveModel(ctx, "prov", "org/model", protocol.ModelEdit{ContextWindow: &slashWindow})
 			if err != nil || mutation.ConfigurationRevision.Generation != generation || mutation.Result.Id != "org/model" {
 				t.Fatalf("slash upsert = (%v, %+v), want the model at generation %s", err, mutation, generation)
 			}
 		}
 
-		// The user-model delete: the generated deletion envelope.
+		// The standalone user model's delete: the same operator with a null
+		// post-state.
 		deletion, err := r.deleteModel(ctx, "prov", "org/model")
-		if err != nil || deletion.ConfigurationRevision.Generation != "6" || deletion.Result != nil {
-			t.Fatalf("deleteModel = (%v, %+v), want the null deletion result at generation 6", err, deletion)
+		if err != nil || deletion.ConfigurationRevision.Generation != "8" || deletion.Result != nil {
+			t.Fatalf("deleteModel = (%v, %+v), want the null post-state at generation 8", err, deletion)
 		}
 
 		// The typed unknown failures.
@@ -1924,13 +2132,13 @@ func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 				if err != nil || modelMutation.Result.Id != "m" || modelMutation.Result.ProviderHidden {
 					t.Fatalf("saveModel under %q = (%v, %+v), want the model view", id, err, modelMutation.Result)
 				}
-				mutation, err = r.resetProviderField(ctx, id, protocol.ResetProviderFieldParamsFieldName)
+				mutation, err = r.resetProviderField(ctx, id, protocol.ProviderFieldName)
 				if err != nil || mutation.Result.Id != id || mutation.Result.Name == name {
 					t.Fatalf("resetProviderField(%q) = (%v, %+v), want the restored name", id, err, mutation.Result)
 				}
 				// The model-field reset and the user-model delete keep the
 				// exact identities too: all seven operators.
-				modelMutation, err = r.resetModelField(ctx, id, "m", protocol.ResetProviderModelFieldParamsFieldMaxOutputTokens)
+				modelMutation, err = r.resetModelField(ctx, id, "m", protocol.ModelFieldMaxOutputTokens)
 				if err != nil || modelMutation.Result.Id != "m" || modelMutation.Result.MaxOutputTokens != 0 {
 					t.Fatalf("resetModelField(%q, m) = (%v, %+v), want the restored default", id, err, modelMutation.Result)
 				}
@@ -2077,141 +2285,455 @@ func TestRuntimeMetadataCorruptRawTypesTypedFailure(t *testing.T) {
 	})
 }
 
-// --- retained value normalization at the shared write points ---
+// --- supplied field values: exact truth and file/API equality ---
 
-// TestMetadataEditNormalizesValueFields pins the writer's value
-// normalization: the shared write points trim base_url, provider and model
-// names, and max_tokens_field before storing — a trailing-space base URL
-// would otherwise reach the transport as an escaped /v1%20/ path — while
-// exact query IDs stay untrimmed, system_role stays a raw enum value, and
-// every unsupplied patch member is untouched.
-func TestMetadataEditNormalizesValueFields(t *testing.T) {
+// newOverlayFixture seeds one identically configured service over the
+// metadata fixture and its discovered record, so one instance can receive
+// an overlay through the edit API and the other through a hand-edited file
+// plus reload over the same input.
+func newOverlayFixture(t *testing.T) (*serviceHarness, *configurationService, *Subscription) {
+	t.Helper()
+	h := newMetadataHarness(t)
+	unsetenv(t, "DISCO_TEST_KEY")
+	seedDiscoveredModel(t, h)
+	writeServiceFile(t, h.configPath, metadataConfigDocument)
+	svc, sub := metadataService(t, h)
+	return h, svc, sub
+}
+
+// overlayJSON renders one projected view for the file/API comparison.
+func overlayJSON(t *testing.T, view any) string {
+	t.Helper()
+	data, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal overlay view: %v", err)
+	}
+	return string(data)
+}
+
+// TestMetadataEditFieldValuesExactAndFileAPIEquivalent pins the supplied
+// field's value truth: a provided member replaces its whole VALUE — valid
+// whitespace-containing names and base URLs land exactly as provided, with
+// the selected validators, not the writers, governing them — and the
+// identical overlay through the edit API and through a hand-edited file
+// plus reload produces the equal effective view for every actual source:
+// custom and builtin providers, user, bundled, and discovered models, over
+// two identically seeded fixtures with no reset surgery.
+func TestMetadataEditFieldValuesExactAndFileAPIEquivalent(t *testing.T) {
+	providerRows := []struct {
+		name       string
+		providerID string
+		exactValue string
+		fileDoc    func(doc string) string
+		edit       func(svc *configurationService) (protocol.Provider, error)
+	}{
+		{"custom provider padded name", "prov", "  Padded Prov  ",
+			func(doc string) string {
+				return strings.Replace(doc, `"prov": {`, `"prov": {"name": "  Padded Prov  ",`, 1)
+			},
+			func(svc *configurationService) (protocol.Provider, error) {
+				padded := "  Padded Prov  "
+				candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{Name: &padded}))
+				if err != nil {
+					return protocol.Provider{}, err
+				}
+				return projectProvider(candidate, candidate.snapshot.catalog.Providers["prov"]), nil
+			}},
+		{"builtin provider padded name", "bstatic", "  Builtin Padded  ",
+			func(doc string) string {
+				return strings.Replace(doc, `"other": {`, `"bstatic": {"name": "  Builtin Padded  "}, "other": {`, 1)
+			},
+			func(svc *configurationService) (protocol.Provider, error) {
+				padded := "  Builtin Padded  "
+				candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", protocol.ProviderEdit{Name: &padded}))
+				if err != nil {
+					return protocol.Provider{}, err
+				}
+				return projectProvider(candidate, candidate.snapshot.catalog.Providers["bstatic"]), nil
+			}},
+		{"custom provider padded base_url", "prov", "https://x.test/v1 ",
+			func(doc string) string {
+				return strings.Replace(doc, `"base_url": "https://prov.test/v1"`, `"base_url": "https://x.test/v1 "`, 1)
+			},
+			func(svc *configurationService) (protocol.Provider, error) {
+				padded := "https://x.test/v1 "
+				candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{BaseUrl: &padded}))
+				if err != nil {
+					return protocol.Provider{}, err
+				}
+				return projectProvider(candidate, candidate.snapshot.catalog.Providers["prov"]), nil
+			}},
+		{"custom provider blank name", "prov", "   ",
+			func(doc string) string {
+				return strings.Replace(doc, `"prov": {`, `"prov": {"name": "   ",`, 1)
+			},
+			func(svc *configurationService) (protocol.Provider, error) {
+				blank := "   "
+				candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{Name: &blank}))
+				if err != nil {
+					return protocol.Provider{}, err
+				}
+				return projectProvider(candidate, candidate.snapshot.catalog.Providers["prov"]), nil
+			}},
+	}
+	for _, row := range providerRows {
+		t.Run(row.name, func(t *testing.T) {
+			// Through the edit API.
+			_, svcA, subA := newOverlayFixture(t)
+			viaAPI, err := row.edit(svcA)
+			if err != nil {
+				t.Fatalf("api overlay: %v", err)
+			}
+			drainConnectionEvent(t, svcA.warnings, subA, "2")
+			// Through the file plus reload.
+			hB, svcB, _ := newOverlayFixture(t)
+			writeServiceFile(t, hB.configPath, row.fileDoc(metadataConfigDocument))
+			viaFile, err := svcB.publish(context.Background())
+			if err != nil {
+				t.Fatalf("file overlay publish: %v", err)
+			}
+			fileView := projectProvider(viaFile, viaFile.snapshot.catalog.Providers[row.providerID])
+			apiJSON, fileJSON := overlayJSON(t, viaAPI), overlayJSON(t, fileView)
+			if apiJSON != fileJSON {
+				t.Fatalf("the file-written overlay differs from the api-written one:\napi  = %s\nfile = %s", apiJSON, fileJSON)
+			}
+			if !strings.Contains(apiJSON, row.exactValue) {
+				t.Fatalf("the overlay view = %s, want the exact provided value %q", apiJSON, row.exactValue)
+			}
+		})
+	}
+
+	modelRows := []struct {
+		name       string
+		providerID string
+		modelID    string
+		exactValue string
+		check      func(t *testing.T, view protocol.ModelView)
+		fileDoc    func(doc string) string
+		edit       func(svc *configurationService) (protocol.ModelView, error)
+	}{
+		{"user model padded name", "prov", "m", "  Padded M  ", nil,
+			func(doc string) string {
+				return strings.Replace(doc, `"m": {"name": "M",`, `"m": {"name": "  Padded M  ",`, 1)
+			},
+			func(svc *configurationService) (protocol.ModelView, error) {
+				padded := "  Padded M  "
+				candidate, err := svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{Name: &padded}))
+				if err != nil {
+					return protocol.ModelView{}, err
+				}
+				return projectModelView(candidate.snapshot.catalog.Providers["prov"], candidate.snapshot.catalog.Providers["prov"].Models["m"]), nil
+			}},
+		{"bundled model padded name", "bstatic", "bm", "  Padded Bm  ", nil,
+			func(doc string) string {
+				return strings.Replace(doc, `"other": {`, `"bstatic": {"models": {"bm": {"name": "  Padded Bm  "}}}, "other": {`, 1)
+			},
+			func(svc *configurationService) (protocol.ModelView, error) {
+				padded := "  Padded Bm  "
+				candidate, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{Name: &padded}))
+				if err != nil {
+					return protocol.ModelView{}, err
+				}
+				return projectModelView(candidate.snapshot.catalog.Providers["bstatic"], candidate.snapshot.catalog.Providers["bstatic"].Models["bm"]), nil
+			}},
+		{"bundled multi-member name and context window", "bstatic", "bm", "Renamed", func(t *testing.T, view protocol.ModelView) {
+			if view.ContextWindow != 2000 {
+				t.Fatalf("bundled context_window = %d, want the retained multi-member overlay 2000", view.ContextWindow)
+			}
+		},
+			func(doc string) string {
+				return strings.Replace(doc, `"other": {`, `"bstatic": {"models": {"bm": {"name": "Renamed", "context_window": 2000}}}, "other": {`, 1)
+			},
+			func(svc *configurationService) (protocol.ModelView, error) {
+				renamed := "Renamed"
+				window := 2000
+				candidate, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{Name: &renamed, ContextWindow: &window}))
+				if err != nil {
+					return protocol.ModelView{}, err
+				}
+				return projectModelView(candidate.snapshot.catalog.Providers["bstatic"], candidate.snapshot.catalog.Providers["bstatic"].Models["bm"]), nil
+			}},
+		{"discovered model padded name", "disco", "disc-model", "  Padded Disc  ", nil,
+			func(doc string) string {
+				return strings.Replace(doc, `"other": {`, `"disco": {"models": {"disc-model": {"name": "  Padded Disc  "}}}, "other": {`, 1)
+			},
+			func(svc *configurationService) (protocol.ModelView, error) {
+				padded := "  Padded Disc  "
+				candidate, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{Name: &padded}))
+				if err != nil {
+					return protocol.ModelView{}, err
+				}
+				return projectModelView(candidate.snapshot.catalog.Providers["disco"], candidate.snapshot.catalog.Providers["disco"].Models["disc-model"]), nil
+			}},
+		{"discovered max_output_tokens", "disco", "disc-model", `"max_output_tokens":100`, func(t *testing.T, view protocol.ModelView) {
+			if view.MaxOutputTokens != 100 {
+				t.Fatalf("discovered max_output_tokens = %d, want the retained overlay 100", view.MaxOutputTokens)
+			}
+		},
+			func(doc string) string {
+				return strings.Replace(doc, `"other": {`, `"disco": {"models": {"disc-model": {"max_output_tokens": 100}}}, "other": {`, 1)
+			},
+			func(svc *configurationService) (protocol.ModelView, error) {
+				maxOutput := 100
+				candidate, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{MaxOutputTokens: &maxOutput}))
+				if err != nil {
+					return protocol.ModelView{}, err
+				}
+				return projectModelView(candidate.snapshot.catalog.Providers["disco"], candidate.snapshot.catalog.Providers["disco"].Models["disc-model"]), nil
+			}},
+	}
+	for _, row := range modelRows {
+		t.Run(row.name, func(t *testing.T) {
+			_, svcA, subA := newOverlayFixture(t)
+			viaAPI, err := row.edit(svcA)
+			if err != nil {
+				t.Fatalf("api overlay: %v", err)
+			}
+			drainConnectionEvent(t, svcA.warnings, subA, "2")
+			hB, svcB, _ := newOverlayFixture(t)
+			writeServiceFile(t, hB.configPath, row.fileDoc(metadataConfigDocument))
+			viaFile, err := svcB.publish(context.Background())
+			if err != nil {
+				t.Fatalf("file overlay publish: %v", err)
+			}
+			fileView := projectModelView(viaFile.snapshot.catalog.Providers[row.providerID], viaFile.snapshot.catalog.Providers[row.providerID].Models[row.modelID])
+			apiJSON, fileJSON := overlayJSON(t, viaAPI), overlayJSON(t, fileView)
+			if apiJSON != fileJSON {
+				t.Fatalf("the file-written overlay differs from the api-written one:\napi  = %s\nfile = %s", apiJSON, fileJSON)
+			}
+			if !strings.Contains(apiJSON, row.exactValue) {
+				t.Fatalf("the overlay view = %s, want the exact provided value %q", apiJSON, row.exactValue)
+			}
+			if row.check != nil {
+				row.check(t, viaAPI)
+				row.check(t, fileView)
+			}
+		})
+	}
+}
+
+// TestMetadataEditPaddedInvalidValuesNeverBecomeValid pins the uniform
+// candidate governance for invalid padded values: the selected validators,
+// not the writers, decide them — an api_key_env, max_tokens_field, or
+// system_role carrying padding refuses the edit with the owning file
+// untouched, and the identical file-written member makes the provider
+// invalid in the published catalog (dropped with a warning) so the padded
+// value never becomes effective through either path.
+func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
+	refusals := []struct {
+		name     string
+		patch    protocol.ProviderEdit
+		fileDoc  func(doc string) string
+		rawProbe string
+	}{
+		{"padded api_key_env", protocol.ProviderEdit{ApiKeyEnv: &[]string{"  NEW_TEST_KEY  "}[0]},
+			func(doc string) string {
+				return strings.Replace(doc, `"api_key_env": "META_TEST_KEY"`, `"api_key_env": "  NEW_TEST_KEY  "`, 1)
+			}, `"api_key_env": "  NEW_TEST_KEY  "`},
+		{"padded max_tokens_field", protocol.ProviderEdit{MaxTokensField: &[]string{"  max_completion_tokens  "}[0]},
+			func(doc string) string {
+				return strings.Replace(doc, `"prov": {`, `"prov": {"max_tokens_field": "  max_completion_tokens  ",`, 1)
+			}, `"max_tokens_field": "  max_completion_tokens  "`},
+		{"padded system_role", protocol.ProviderEdit{SystemRole: &[]protocol.SystemRole{"  developer  "}[0]},
+			func(doc string) string {
+				return strings.Replace(doc, `"prov": {`, `"prov": {"system_role": "  developer  ",`, 1)
+			}, `"system_role": "  developer  "`},
+	}
+
+	// The edit API refuses every padded invalid value with the owning file
+	// and publication untouched.
+	_, svc, sub := newOverlayFixture(t)
+	before, first, warnRev := metadataBaseline(t, svc, svc.configPath)
+	for _, row := range refusals {
+		t.Run(row.name, func(t *testing.T) {
+			_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", row.patch))
+			assertMetadataRefused(t, svc, sub, svc.configPath, before, first, warnRev, err, ErrConfiguration)
+		})
+	}
+
+	// The identical file-written member makes the provider invalid in the
+	// published catalog: the reload publishes, the provider is gone from
+	// the effective view, and the padded raw value stays in the file.
+	for _, row := range refusals {
+		t.Run(row.name+"/file", func(t *testing.T) {
+			h, svc, _ := newOverlayFixture(t)
+			writeServiceFile(t, h.configPath, row.fileDoc(metadataConfigDocument))
+			viaFile, err := svc.publish(context.Background())
+			if err != nil {
+				t.Fatalf("file-side publish of the padded value: %v", err)
+			}
+			if viaFile.snapshot.catalog.Providers["prov"] != nil {
+				t.Fatalf("the padded %s became effective through the file path", row.name)
+			}
+			if data, rerr := os.ReadFile(h.configPath); rerr != nil || !strings.Contains(string(data), row.rawProbe) {
+				t.Fatalf("the raw file = (%q, %v), want the padded value retained", data, rerr)
+			}
+		})
+	}
+}
+
+// TestMetadataEditExternalRemovalRefusesWithoutReconstruction pins the
+// externally-removed custom provider: while the captured catalog still
+// knows the identity, the latest raw layer no longer owns a definition — an
+// update and a model save both apply nothing and refuse through the
+// candidate check, and the raw layer is never reconstructed with a
+// providers.<id> node. A model upsert under a provider whose definition is
+// present stays valid (covered by the upsert suite).
+func TestMetadataEditExternalRemovalRefusesWithoutReconstruction(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
+	// The external editor removes the provider from the latest raw layer
+	// without a reload: the captured catalog still knows the identity while
+	// the raw layer no longer owns a definition.
+	external := `{"providers":{"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
+	writeServiceFile(t, h.configPath, external)
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	patch := protocol.ProviderEdit{
-		BaseUrl: &[]string{"https://x.test/v1 "}[0],
-		Name:    &[]string{"  Padded Prov  "}[0],
-	}
-	candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", patch))
-	if err != nil {
-		t.Fatalf("padded provider patch: %v", err)
-	}
-	if candidate.snapshot.generation != 2 {
-		t.Fatalf("padded provider patch generation = %d, want 2", candidate.snapshot.generation)
-	}
-	if got := candidate.snapshot.catalog.Providers["prov"].Transport.BaseURL; got != "https://x.test/v1" {
-		t.Fatalf("stored base_url = %q, want the trimmed URL", got)
-	}
-	if got := candidate.snapshot.catalog.Providers["prov"].Name; got != "Padded Prov" {
-		t.Fatalf("stored name = %q, want the trimmed value", got)
-	}
-	if got := candidate.snapshot.catalog.Providers["prov"].MaxTokensField; got != "max_tokens" {
-		t.Fatalf("stored max_tokens_field = %q, want the bundled default (no padded patch)", got)
-	}
-	drainMutationEvent(t, sub, "2")
-	assertNoEvent(t, sub)
+	// The patch is repair-capable — it names the provider and supplies a
+	// complete transport — so only the no-reconstruction rule keeps the
+	// removed definition from being silently rebuilt: the latest raw layer
+	// owns no definition to write, the candidate check refuses, and the
+	// refusals leave everything untouched.
+	name := "Reconstructed"
+	fixedURL := "https://reconstructed.test/v1"
+	fixedEnv := "RECONSTRUCTED_TEST_KEY"
+	_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{
+		Name: &name, BaseUrl: &fixedURL, ApiKeyEnv: &fixedEnv,
+	}))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 
-	// The raw file: the trimmed exact values, and every untouched member —
-	// models keep their window and sibling entry, extra_body keeps its
-	// lexeme.
-	rawProvider := metadataRawProvider(t, h.configPath, "prov")
-	if got := rawProvider["name"]; string(got) != `"Padded Prov"` {
-		t.Fatalf("raw name = %s, want the trimmed value", got)
-	}
-	var transport map[string]json.RawMessage
-	var rawProviders map[string]map[string]json.RawMessage
+	modelName := "Reconstructed M"
+	_, err = svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{Name: &modelName}))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+
+	// No partial patch reconstructed the removed definition.
+	var rawProviders map[string]json.RawMessage
 	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
 		t.Fatalf("decode providers: %v", err)
 	}
-	if err := json.Unmarshal(rawProviders["prov"]["transport"], &transport); err != nil {
-		t.Fatalf("decode transport: %v", err)
+	if _, present := rawProviders["prov"]; present {
+		t.Fatalf("the refused edits reconstructed the removed definition: %s", fileRoot(t, h.configPath)["providers"])
 	}
-	if got := string(transport["base_url"]); got != `"https://x.test/v1"` {
-		t.Fatalf("raw base_url = %s, want the trimmed exact value", got)
-	}
-	var models map[string]json.RawMessage
-	if err := json.Unmarshal(rawProviders["prov"]["models"], &models); err != nil {
-		t.Fatalf("decode models: %v", err)
-	}
-	var modelM map[string]json.RawMessage
-	if err := json.Unmarshal(models["m"], &modelM); err != nil {
-		t.Fatalf("decode model: %v", err)
-	}
-	if got := string(modelM["context_window"]); got != "4096" {
-		t.Fatalf("untouched model context_window = %s, want 4096", got)
-	}
-	if _, present := models["wide"]; !present {
-		t.Fatal("the normalization patch touched an unrelated model")
-	}
-	if got := bigLexeme(t, mustRead(t, h.configPath), "providers.prov.extra_body.big"); got != "9007199254740993" {
-		t.Fatalf("untouched extra_body lexeme = %s, want 9007199254740993", got)
+}
+
+// TestMetadataEditRawOnlyIdentityAddressable pins the raw-only identity
+// rule: a provider that exists only in the latest raw layer (invalid, so the
+// catalog dropped it) is still addressable — a non-repairing update refuses
+// through the candidate check, a repairing update publishes the now-valid
+// subject, and the delete removes exactly the raw node with no subject
+// remaining.
+func TestMetadataEditRawOnlyIdentityAddressable(t *testing.T) {
+	rawOnlyDoc := strings.Replace(metadataConfigDocument, `"other": {`,
+		`"brokenp": {"transport": {"api_key_env": "BROKEN_TEST_KEY"}, "models": {"m": {}}}, "brokenq": {"transport": {"api_key_env": "BROKENQ_TEST_KEY"}, "models": {"m": {}}}, "other": {`, 1)
+	h := newMetadataHarness(t)
+	writeServiceFile(t, h.configPath, rawOnlyDoc)
+	svc, sub := metadataService(t, h)
+	if svc.current().catalog.Providers["brokenp"] != nil || svc.current().catalog.Providers["brokenq"] != nil {
+		t.Fatal("the raw-only providers were not dropped by the initial publication")
 	}
 
-	// The padded max_tokens_field is trimmed to its exact value at the same
-	// shared write point.
-	trimmedField := "  max_completion_tokens "
-	if candidate, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{MaxTokensField: &trimmedField})); err != nil {
-		t.Fatalf("padded max_tokens_field patch: %v", err)
+	// A non-repairing update applies to the raw node and refuses through the
+	// candidate check: the identity stays addressable, the file unchanged.
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
+	padded := "Still Broken"
+	_, err := svc.mutate(context.Background(), svc.editProviderUpdate("brokenp", protocol.ProviderEdit{Name: &padded}))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+
+	// The repairing update publishes the now-valid subject.
+	fixed := "https://fixed.test/v1"
+	candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("brokenp", protocol.ProviderEdit{BaseUrl: &fixed}))
+	if err != nil || candidate.snapshot.generation != 2 {
+		t.Fatalf("repairing update = (%v, generation %d), want the repaired publication at 2", err, candidate.snapshot.generation)
 	}
-	drainMutationEvent(t, sub, "3")
-	assertNoEvent(t, sub)
-	if got := candidate.snapshot.catalog.Providers["prov"].MaxTokensField; got != "max_completion_tokens" {
-		t.Fatalf("stored max_tokens_field = %q, want the trimmed value", got)
+	repaired := candidate.snapshot.catalog.Providers["brokenp"]
+	if repaired == nil || repaired.Transport.BaseURL != fixed {
+		t.Fatalf("repaired provider = %+v, want the valid subject with its supplied base URL", repaired)
 	}
-	if got := metadataRawProvider(t, h.configPath, "prov")["max_tokens_field"]; string(got) != `"max_completion_tokens"` {
-		t.Fatalf("raw max_tokens_field = %s, want the trimmed exact value", got)
+	drainConnectionEvent(t, svc.warnings, sub, "2")
+
+	// The raw-only delete removes exactly the raw node; no subject remains.
+	deletion, err := svc.mutate(context.Background(), svc.editProviderDelete("brokenq"))
+	if err != nil || deletion.snapshot.generation != 3 {
+		t.Fatalf("raw-only delete = (%v, generation %d), want a publication at 3", err, deletion.snapshot.generation)
+	}
+	drainConnectionEvent(t, svc.warnings, sub, "3")
+	if deletion.snapshot.catalog.Providers["brokenq"] != nil {
+		t.Fatal("the raw-only delete left the subject in the candidate catalog")
+	}
+	var rawProviders map[string]json.RawMessage
+	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
+		t.Fatalf("decode providers: %v", err)
+	}
+	if _, present := rawProviders["brokenq"]; present {
+		t.Fatalf("raw providers = %s, want the raw-only node gone", fileRoot(t, h.configPath)["providers"])
+	}
+	if _, present := rawProviders["brokenp"]; !present {
+		t.Fatal("the raw-only delete touched its repaired sibling")
+	}
+}
+
+// TestMetadataEditProviderTargetUsesSharedRawObjectAccess pins the provider
+// target's absent/null/non-object outcomes while its raw navigation reuses
+// rawObjectMember: absent and explicit null raw-only identities remain
+// not-found, a present non-object remains the typed raw-configuration
+// failure, and a builtin's explicit null override still scaffolds on a write.
+func TestMetadataEditProviderTargetUsesSharedRawObjectAccess(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		doc  string
+		want error
+	}{
+		{"absent", metadataConfigDocument, catalog.ErrUnknownProvider},
+		{"null", strings.Replace(metadataConfigDocument, `"other": {`, `"nullprov": null, "other": {`, 1), catalog.ErrUnknownProvider},
+		{"non-object", strings.Replace(metadataConfigDocument, `"other": {`, `"scalarprov": 5, "other": {`, 1), ErrConfiguration},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newMetadataHarness(t)
+			writeServiceFile(t, h.configPath, row.doc)
+			svc, sub := metadataService(t, h)
+			before, first, warnRev := metadataBaseline(t, svc, h.configPath)
+			id := "absentprov"
+			if row.name == "null" {
+				id = "nullprov"
+			} else if row.name == "non-object" {
+				id = "scalarprov"
+			}
+			name := "X"
+			_, err := svc.mutate(context.Background(), svc.editProviderUpdate(id, protocol.ProviderEdit{Name: &name}))
+			assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, row.want)
+		})
 	}
 
-	// The model name is normalized at the same shared merge point, with the
-	// unsupplied members preserved.
-	paddedModel := "  Padded M  "
-	if candidate, err = svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{Name: &paddedModel})); err != nil {
-		t.Fatalf("padded model patch: %v", err)
+	// A null raw value does not prevent an effective builtin's normal
+	// absent-override scaffold on a write path.
+	h := newMetadataHarness(t)
+	writeServiceFile(t, h.configPath, metadataBuiltinOverrideDocument())
+	svc, _ := metadataService(t, h)
+	writeServiceFile(t, h.configPath, `{"providers":{"bstatic":null}}`)
+	name := "Null Override Replaced"
+	candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("bstatic", protocol.ProviderEdit{Name: &name}))
+	if err != nil || candidate.snapshot.catalog.Providers["bstatic"] == nil || candidate.snapshot.catalog.Providers["bstatic"].Name != name {
+		t.Fatalf("builtin null override update = (%v, %+v), want the ordinary scaffolded override", err, candidate.snapshot.catalog.Providers["bstatic"])
 	}
-	drainMutationEvent(t, sub, "4")
-	assertNoEvent(t, sub)
-	entry := candidate.snapshot.catalog.Providers["prov"].Models["m"]
-	if entry == nil || entry.Name != "Padded M" || entry.ContextWindow != 4096 || entry.UsageInStream {
-		t.Fatalf("model after name normalization = %+v, want the trimmed name with ctx and usage preserved", entry)
+	if _, present := metadataRawProvider(t, h.configPath, "bstatic")["name"]; !present {
+		t.Fatal("the builtin null raw member was not replaced by the user override")
 	}
-	// The catalog identity stays valid under the normalized values: the
-	// provider keeps its ID and its two usable models.
-	normalized := candidate.snapshot.catalog.Providers["prov"]
-	if normalized.ID != "prov" || usableModelCount(normalized) != 2 {
-		t.Fatalf("normalized provider = id %q usable %d, want the valid identity with both usable models", normalized.ID, usableModelCount(normalized))
-	}
+}
 
-	// A pointer-present normalized-EMPTY value still reaches the existing
-	// validation (no empty-as-absence sentinel): a whitespace-only name is
-	// the empty value and the candidate validation refuses it.
-	blank := "   "
-	_, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{Name: &blank}))
-	if err == nil || !errors.Is(err, ErrConfiguration) {
-		t.Fatalf("blank name patch = %v, want the empty value's validation refusal", err)
-	}
+// TestMetadataEditInvalidResetFields pins the closed reset enums: a field
+// outside the shared vocabulary refuses invalid before any write, for the
+// provider and the model reset paths alike.
+func TestMetadataEditInvalidResetFields(t *testing.T) {
+	h := newMetadataHarness(t)
+	writeServiceFile(t, h.configPath, metadataConfigDocument)
+	svc, sub := metadataService(t, h)
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	// SystemRole stays a raw enum value: a padded role is not normalized —
-	// the candidate validation refuses it.
-	paddedRole := protocol.SystemRole("  developer  ")
-	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{SystemRole: &paddedRole})); err == nil || !errors.Is(err, ErrConfiguration) {
-		t.Fatalf("padded system role = %v, want a rejected candidate (no enum normalization)", err)
-	}
-
-	// The exact query IDs are not trimmed: a padded model query on save is a
-	// DIFFERENT exact identity — a new user model " m " next to "m" — never
-	// a normalization onto the existing one.
-	if _, err := svc.mutate(context.Background(), svc.editModelSave("prov", " m ", protocol.ModelEdit{Name: &[]string{"X"}[0]})); err != nil {
-		t.Fatalf("padded model query save: %v", err)
-	}
-	provCatalog := svc.current().catalog.Providers["prov"]
-	if provCatalog.Models[" m "] == nil || provCatalog.Models["m"] == nil {
-		t.Fatalf("models after padded save = %v, want the exact padded ID as a separate entry", provCatalog.Models)
-	}
-	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov ", protocol.ProviderEdit{Name: &[]string{"X"}[0]})); !errors.Is(err, catalog.ErrUnknownProvider) {
-		t.Fatalf("padded provider query = %v, want the typed unknown failure", err)
-	}
+	_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ProviderField("bogus")))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ModelField("bogus")))
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
 }
 
 // TestRuntimeBuiltinWritablePositiveTable proves the builtin's writable
@@ -2278,11 +2800,11 @@ func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
 			})
 		}
 
-		// The refusal siblings stay: identity members and a credential
-		// header refuse without any write.
+		// The refusal sibling stays: a credential header refuses without any
+		// write (the identity members are writable now).
 		before, publishedGeneration, warnRev := runtimeMutationBaseline(t, r)
-		name := "X"
-		_, lockErr := r.updateProvider(ctx, "openrouter", protocol.ProviderEdit{Name: &name})
+		forbidden := map[string]string{"Authorization": "x"}
+		_, lockErr := r.updateProvider(ctx, "openrouter", protocol.ProviderEdit{Headers: &forbidden})
 		assertRuntimeMutationRefused(t, r, sub, before, publishedGeneration, warnRev, lockErr, harness.ErrInvalid)
 	})
 }

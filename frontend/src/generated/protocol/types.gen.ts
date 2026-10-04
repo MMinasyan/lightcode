@@ -412,15 +412,6 @@ export type RevisionResponse = {
     configuration_revision: ConfigurationRevision;
 };
 
-export type DeletionMutation = {
-    configuration_revision: ConfigurationRevision;
-    /**
-     * The removed subject leaves no post-state view; deletion is the one mutation whose result is an explicit null.
-     *
-     */
-    result: null;
-};
-
 export type UpdateSettingsRequest = {
     settings: Settings;
 };
@@ -451,6 +442,18 @@ export type ProtocolMetadata = {
     must_preserve?: Array<string>;
     drop?: Array<string>;
 };
+
+/**
+ * The one provider field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer provider member.
+ *
+ */
+export type ProviderField = 'name' | 'base_url' | 'api_key_env' | 'headers' | 'options' | 'system_role' | 'usage_in_stream' | 'max_tokens_field' | 'extra_body' | 'discovery' | 'protocol_metadata' | 'hidden';
+
+/**
+ * The one model field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer model member.
+ *
+ */
+export type ModelField = 'name' | 'context_window' | 'max_output_tokens' | 'input_modalities' | 'system_role' | 'usage_in_stream' | 'extra_body' | 'cost' | 'protocol_metadata' | 'hidden';
 
 export type ProviderEdit = {
     name?: string;
@@ -516,7 +519,6 @@ export type Provider = {
     key_source: 'none' | 'keyless' | 'managed' | 'external';
     base_url: string;
     api_key_env: string;
-    generated_key_env?: string;
     headers: {
         [key: string]: string;
     };
@@ -535,9 +537,6 @@ export type Provider = {
     discovery: boolean;
     protocol_metadata?: ProtocolMetadata;
     hidden: boolean;
-    connectable: boolean;
-    disconnectable: boolean;
-    removable: boolean;
     models: Array<ModelView>;
 };
 
@@ -566,7 +565,11 @@ export type UpdateProviderDetailRequest = {
 
 export type ProviderMutation = {
     configuration_revision: ConfigurationRevision;
-    result: Provider;
+    /**
+     * The mutated subject's current effective post-state, or null when no subject remains — a removed user node can reveal its inherited base or leave nothing behind through the same operator.
+     *
+     */
+    result: Provider | null;
 };
 
 export type ConnectRequest = {
@@ -596,7 +599,11 @@ export type UpdateProviderModelRequest = {
 
 export type ModelMutation = {
     configuration_revision: ConfigurationRevision;
-    result: ModelView;
+    /**
+     * The mutated subject's current effective post-state, or null when no subject remains — a removed user node can reveal its inherited base or leave nothing behind through the same operator.
+     *
+     */
+    result: ModelView | null;
 };
 
 export type ModelListEntry = {
@@ -1430,7 +1437,7 @@ export type CreateProviderError = CreateProviderErrors[keyof CreateProviderError
 
 export type CreateProviderResponses = {
     /**
-     * The added provider view; a generated key name is its generated_key_env.
+     * The added provider's post-state; a keyed create returns its actual binding in api_key_env.
      */
     200: ProviderMutation;
 };
@@ -1457,10 +1464,10 @@ export type DeleteProviderDetailError = DeleteProviderDetailErrors[keyof DeleteP
 
 export type DeleteProviderDetailResponses = {
     /**
-     * The removal published one next generation; the removed subject leaves an explicit null result under the mutation envelope.
+     * The user node's removal published one next generation; the result carries the surviving effective post-state, or null when no subject remains.
      *
      */
-    200: DeletionMutation;
+    200: ProviderMutation;
 };
 
 export type DeleteProviderDetailResponse = DeleteProviderDetailResponses[keyof DeleteProviderDetailResponses];
@@ -1619,10 +1626,10 @@ export type DeleteProviderModelError = DeleteProviderModelErrors[keyof DeletePro
 
 export type DeleteProviderModelResponses = {
     /**
-     * The deletion published one next generation; the removed subject leaves an explicit null result under the mutation envelope.
+     * The user node's removal published one next generation; the result carries the surviving effective post-state, or null when no subject remains.
      *
      */
-    200: DeletionMutation;
+    200: ModelMutation;
 };
 
 export type DeleteProviderModelResponse = DeleteProviderModelResponses[keyof DeleteProviderModelResponses];
@@ -1713,7 +1720,7 @@ export type DiscoverProviderModelCandidatesResponse = DiscoverProviderModelCandi
 export type ResetProviderFieldData = {
     body?: never;
     path: {
-        field: 'name' | 'base_url' | 'api_key_env' | 'headers' | 'options' | 'system_role' | 'usage_in_stream' | 'max_tokens_field' | 'extra_body' | 'discovery' | 'protocol_metadata';
+        field: ProviderField;
     };
     query: {
         provider_id: string;
@@ -1732,7 +1739,7 @@ export type ResetProviderFieldError = ResetProviderFieldErrors[keyof ResetProvid
 
 export type ResetProviderFieldResponses = {
     /**
-     * The provider view after the reset, under the mutation envelope.
+     * The provider's effective post-state after the reset, under the mutation envelope.
      */
     200: ProviderMutation;
 };
@@ -1742,7 +1749,7 @@ export type ResetProviderFieldResponse = ResetProviderFieldResponses[keyof Reset
 export type ResetProviderModelFieldData = {
     body?: never;
     path: {
-        field: 'name' | 'context_window' | 'max_output_tokens' | 'input_modalities' | 'system_role' | 'usage_in_stream' | 'extra_body' | 'cost' | 'protocol_metadata';
+        field: ModelField;
     };
     query: {
         provider_id: string;
@@ -1762,7 +1769,7 @@ export type ResetProviderModelFieldError = ResetProviderModelFieldErrors[keyof R
 
 export type ResetProviderModelFieldResponses = {
     /**
-     * The model view after the reset, under the mutation envelope.
+     * The model's effective post-state after the reset, under the mutation envelope.
      */
     200: ModelMutation;
 };

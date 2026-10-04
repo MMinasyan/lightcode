@@ -12,6 +12,7 @@ import {
   connectProvider,
   createProvider,
   createSession,
+  deleteProviderModel,
   getConfiguration,
   getHealth,
   getProviderDetail,
@@ -157,6 +158,50 @@ mounted('generated SDK round-trips special identity query values over the mounte
     body: { model: { name: 'Slashed' } },
   });
   expect(slashEdited.data?.result.id).toBe('org/model');
+
+  // The post-state rule crosses the TypeScript boundary: a standalone user
+  // model's delete is the required null result, while a bundled model's
+  // override delete reveals the base as the non-null post-state.
+  const standaloneDelete = await deleteProviderModel({
+    client,
+    query: { provider_id: 'slashmodel', model_id: 'org/model' },
+  });
+  expect(standaloneDelete.error).toBeUndefined();
+  expect(standaloneDelete.data?.result).toBeNull();
+  const configuration = await getConfiguration({ client });
+  expect(configuration.error).toBeUndefined();
+  const openrouter = configuration.data?.providers.find((p) => p.id === 'openrouter');
+  const bundledModel = openrouter?.models.find((m) => m.source === 'bundled');
+  expect(bundledModel).toBeDefined();
+  const overridden = await updateProviderModel({
+    client,
+    query: { provider_id: 'openrouter', model_id: bundledModel.id },
+    body: { model: { name: 'Overridden' } },
+  });
+  expect(overridden.data?.result?.name).toBe('Overridden');
+  const revealed = await deleteProviderModel({
+    client,
+    query: { provider_id: 'openrouter', model_id: bundledModel.id },
+  });
+  expect(revealed.error).toBeUndefined();
+  expect(revealed.data?.result?.id).toBe(bundledModel.id);
+  expect(revealed.data?.result?.name).not.toBe('Overridden');
+  expect(revealed.data?.result?.source).toBe('bundled');
+
+  // A supplied key on an explicitly named external variable refuses before
+  // any side effect, and the refused create registers nothing.
+  const refused = await createProvider({
+    client,
+    body: {
+      id: 'externalk',
+      provider: { base_url: 'https://external.test/v1', api_key_env: 'PATH' },
+      models: { m: { context_window: window } },
+      api_key: 'mounted-refused-secret',
+    },
+  });
+  expect(refused.error?.code).toBe('configuration');
+  const refusedDetail = await getProviderDetail({ client, query: { provider_id: 'externalk' } });
+  expect(refusedDetail.error?.code).toBe('not_found');
 
   // The directory-like Agent type name is addressable for model edits.
   const agentEdit = await setAgentTypeModel({ client, query: { agent_type: '..' }, body: { model: 'prov/m' } });

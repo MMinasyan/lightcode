@@ -347,33 +347,6 @@
    "reject": []
   },
   {
-   "schema": "DeletionMutation",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":null}"
-    },
-    {
-     "name": "explicit-null",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "missing-result",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
-    },
-    {
-     "name": "non-null-result",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":{\"removed\":true}}"
-    },
-    {
-     "name": "unknown-member",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null,\"extra\":true}"
-    }
-   ]
-  },
-  {
    "schema": "DiscoveredModelCandidate",
    "accept": [
     {
@@ -582,7 +555,7 @@
      "json": "{\"session\":{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"},\"operations\":[{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}],\"active_operation\":{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}},\"pending\":{\"steering\":[{\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}],\"queued\":[]},\"conversation\":{\"items\":[{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]},{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}},{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}},{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"},{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"success\",\"detail\":\"done\"}],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"},\"usage\":{\"totals\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]},\"context\":{\"used_tokens\":\"154\",\"context_window\":8192}},\"warnings\":[{\"source\":\"runtime:catalog\",\"kind\":\"unusable_model\",\"message\":\"no key\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"background\":[{\"kind\":\"child\",\"id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"selected_model\":\"prov/m\"}"
     }
    ],
-      "reject": [
+   "reject": [
     {
      "name": "missing-required-selection",
      "json": "{\"session\":{\"session_id\":\"0123456789abcdef0123456789abcdef\",\"workspace\":\"fixture\",\"lifecycle\":\"open\",\"agent_type\":\"fixture\",\"created_at\":\"2026-01-02T03:04:05Z\",\"last_activity\":\"2026-01-02T03:04:05Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"fixture\",\"local_revision\":\"fixture\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"},\"operations\":[],\"pending\":{\"steering\":[],\"queued\":[]},\"conversation\":{\"items\":[]},\"usage\":{\"totals\":{\"by_model\":[]},\"context\":{\"used_tokens\":\"fixture\",\"context_window\":0}},\"warnings\":[],\"background\":[]}"
@@ -735,9 +708,22 @@
     {
      "name": "minimal",
      "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"context_window\":0,\"max_output_tokens\":0,\"input_modalities\":[],\"system_role\":\"system\",\"usage_in_stream\":false,\"hidden\":false,\"source\":\"bundled\",\"incomplete\":false,\"provider_hidden\":false,\"usable\":false}}"
+    },
+    {
+     "name": "null-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "missing-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null,\"extra\":true}"
+    }
+   ]
   },
   {
    "schema": "ModelRef",
@@ -962,11 +948,11 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}"
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}"
     },
     {
      "name": "with-extras",
-     "json": "{\"id\":\"prov\",\"name\":\"Provider\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"https://provider.test/v1\",\"api_key_env\":\"\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"max_tokens\",\"discovery\":false,\"hidden\":false,\"connectable\":true,\"disconnectable\":false,\"removable\":true,\"models\":[],\"generated_key_env\":\"PROV_KEY\",\"options\":{\"a\":1},\"extra_body\":{\"temperature\":0.1},\"protocol_metadata\":{\"family\":\"openai\"}}"
+     "json": "{\"id\":\"prov\",\"name\":\"Provider\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"https://provider.test/v1\",\"api_key_env\":\"\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"max_tokens\",\"discovery\":false,\"hidden\":false,\"models\":[],\"options\":{\"a\":1},\"extra_body\":{\"temperature\":0.1},\"protocol_metadata\":{\"family\":\"openai\"}}"
     }
    ],
    "reject": []
@@ -976,10 +962,64 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"provider\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"provider\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}}"
     }
    ],
    "reject": []
+  },
+  {
+   "schema": "ProviderField",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"name\""
+    },
+    {
+     "name": "environment-variable",
+     "json": "\"api_key_env\""
+    },
+    {
+     "name": "hidden",
+     "json": "\"hidden\""
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-field",
+     "json": "\"prompt\""
+    },
+    {
+     "name": "non-string",
+     "json": "7"
+    }
+   ]
+  },
+  {
+   "schema": "ModelField",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"name\""
+    },
+    {
+     "name": "context-window",
+     "json": "\"context_window\""
+    },
+    {
+     "name": "hidden",
+     "json": "\"hidden\""
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-field",
+     "json": "\"base_url\""
+    },
+    {
+     "name": "non-string",
+     "json": "7"
+    }
+   ]
   },
   {
    "schema": "ProviderEdit",
@@ -1025,10 +1065,23 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"connectable\":false,\"disconnectable\":false,\"removable\":false,\"models\":[]}}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}}"
+    },
+    {
+     "name": "null-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "missing-result",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"}}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"result\":null,\"extra\":true}"
+    }
+   ]
   },
   {
    "schema": "ReadFileRequest",
@@ -1799,7 +1852,7 @@
    "path": "/v1/providers/detail",
    "request": null,
    "responses": {
-    "200": "DeletionMutation",
+    "200": "ProviderMutation",
     "default": "Error"
    }
   },
@@ -1809,7 +1862,7 @@
    "path": "/v1/providers/models",
    "request": null,
    "responses": {
-    "200": "DeletionMutation",
+    "200": "ModelMutation",
     "default": "Error"
    }
   },

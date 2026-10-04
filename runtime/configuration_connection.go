@@ -36,9 +36,11 @@ var connectHTTPClient = &http.Client{Timeout: connectDiscoveryTimeout}
 // mutation path. Phase 1 — under no lock, against the immutable published
 // snapshot — refuses an unusable provider whose discovery is disabled before
 // any credential resolution, captures the provider's transport identity, and
-// resolves the transient credential for every keyed provider through the one
-// retained rule: an external shell key wins and is never persisted, a managed
-// key is used or updated through TrySet, and a missing required key fails. An
+// resolves the transient credential through the one shared rule for both
+// credential shapes: a keyless provider carries no credential (no supplied
+// key means no action, a supplied key refuses), a supplied key on an
+// externally defined variable refuses before any side effect, a managed key
+// is used or updated through TrySet, and a missing required key fails. An
 // already-usable provider is never probed with a network fetch; an empty
 // discovery-backed provider fetches its candidates with the original
 // transport plus a transient Authorization copy. Phase 2 — back inside the
@@ -73,20 +75,20 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 		return protocol.ProviderMutation{}, configurationFailure(fmt.Errorf("provider %q has no usable models and discovery is disabled", prov.ID))
 	}
 	var fetchKey string
-	if envName != "" {
-		// Every keyed provider — usable or not — resolves its credential
-		// through the one retained rule over the capture's own observation.
-		// A usable provider still runs no discovery and no key probe.
-		key, persist, err := resolveConnectKey(envName, optionalKey, captured.credentials[envName])
-		if err != nil {
-			return protocol.ProviderMutation{}, configurationFailure(err)
-		}
-		if persist {
-			plan.keyAction, plan.keyEnv, plan.keyValue = keyActionSet, envName, key
-		}
-		if !usable {
-			fetchKey = key
-		}
+	// Both credential shapes resolve through the one shared rule over the
+	// capture's own observation, before any effect: a keyless provider
+	// carries no credential (a supplied key refuses), and every keyed
+	// provider — usable or not — resolves its binding. A usable provider
+	// still runs no discovery and no key probe.
+	key, persist, err := resolveConnectKey(envName, optionalKey, captured.credentials[envName])
+	if err != nil {
+		return protocol.ProviderMutation{}, configurationFailure(err)
+	}
+	if persist {
+		plan.keyAction, plan.keyEnv, plan.keyValue = keyActionSet, envName, key
+	}
+	if !usable {
+		fetchKey = key
 	}
 	if !usable {
 		discovered, err := connectFetchDiscovery(ctx, prov.ID, transport, fetchKey)
@@ -101,7 +103,7 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 	}
 	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(result.snapshot),
-		Result:                projectProvider(result, result.snapshot.catalog.Providers[prov.ID]),
+		Result:                providerPostState(result, prov.ID),
 	}, nil
 }
 
@@ -125,7 +127,7 @@ func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (pr
 	}
 	return protocol.ProviderMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectProvider(captured, captured.snapshot.catalog.Providers[providerID]),
+		Result:                providerPostState(captured, providerID),
 	}, nil
 }
 
@@ -290,16 +292,32 @@ func checkConnectionCandidate(live *configuration, plan *connectionEffects, cand
 	return nil
 }
 
-// resolveConnectKey applies the retained phase-1 credential resolution over
-// one captured environment observation: a key Lightcode manages is used —
-// updated only by a supplied nonempty value — an external defined key wins
-// and is never persisted, a defined-but-empty value fails uniformly, and an
-// absent key requires a supplied value.
+// resolveConnectKey applies the one credential-input rule over one captured
+// environment observation, for both credential shapes: a keyless binding
+// carries no credential — no supplied key means no action, and a supplied
+// key has no named variable to persist to, so it is refused before any side
+// effect. A named binding with a supplied nonempty key is applied only
+// through the managed owner's ordinary writable-name rule: an explicitly
+// named externally defined variable refuses before any side effect, leaving
+// its value intact — it is never silently substituted for the supplied key.
+// Without a supplied credential the captured configured binding decides: a
+// managed or external defined value is used as-is, a defined-but-empty
+// external value fails uniformly, and an absent key fails the required
+// credential.
 func resolveConnectKey(envName string, optionalKey *string, observed config.EnvValue) (key string, persist bool, err error) {
-	if observed.Managed {
+	if envName == "" {
 		if optionalKey != nil && *optionalKey != "" {
-			return *optionalKey, true, nil
+			return "", false, fmt.Errorf("provider is keyless; a supplied key has no named variable to persist to")
 		}
+		return "", false, nil
+	}
+	if optionalKey != nil && *optionalKey != "" {
+		if observed.Defined && !observed.Managed {
+			return "", false, fmt.Errorf("env var %s is set externally; a supplied key cannot be applied to it", envName)
+		}
+		return *optionalKey, true, nil
+	}
+	if observed.Managed {
 		if observed.Value == "" {
 			return "", false, fmt.Errorf("provider requires API key env var %s", envName)
 		}
@@ -311,10 +329,7 @@ func resolveConnectKey(envName string, optionalKey *string, observed config.EnvV
 		}
 		return observed.Value, false, nil
 	}
-	if optionalKey == nil || *optionalKey == "" {
-		return "", false, fmt.Errorf("provider requires API key env var %s", envName)
-	}
-	return *optionalKey, true, nil
+	return "", false, fmt.Errorf("provider requires API key env var %s", envName)
 }
 
 // connectFetchDiscovery performs one /models fetch for the provider identity

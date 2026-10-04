@@ -160,8 +160,9 @@ func (rt *protocolHandlers) UpdateProviderDetail(w http.ResponseWriter, r *http.
 	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
 }
 
-// DeleteProviderDetail serves the provider removal; the deletion envelope
-// carries the explicit null result.
+// DeleteProviderDetail serves the provider's user-node removal; the mutation
+// envelope carries the surviving effective post-state, or null when no
+// subject remains.
 func (rt *protocolHandlers) DeleteProviderDetail(w http.ResponseWriter, r *http.Request, params protocol.DeleteProviderDetailParams) {
 	mutation, err := rt.deleteProvider(r.Context(), params.ProviderId)
 	if err != nil {
@@ -262,7 +263,7 @@ func (rt *protocolHandlers) DiscoverProviderModelCandidates(w http.ResponseWrite
 
 // ResetProviderField serves the one provider user-layer field reset; the
 // field is a closed path enum and the provider identity is a query value.
-func (rt *protocolHandlers) ResetProviderField(w http.ResponseWriter, r *http.Request, field protocol.ResetProviderFieldParamsField, params protocol.ResetProviderFieldParams) {
+func (rt *protocolHandlers) ResetProviderField(w http.ResponseWriter, r *http.Request, field protocol.ProviderField, params protocol.ResetProviderFieldParams) {
 	mutation, err := rt.resetProviderField(r.Context(), params.ProviderId, field)
 	if err != nil {
 		writeProtocolError(w, err)
@@ -272,7 +273,7 @@ func (rt *protocolHandlers) ResetProviderField(w http.ResponseWriter, r *http.Re
 }
 
 // ResetProviderModelField serves the one model user-layer field reset.
-func (rt *protocolHandlers) ResetProviderModelField(w http.ResponseWriter, r *http.Request, field protocol.ResetProviderModelFieldParamsField, params protocol.ResetProviderModelFieldParams) {
+func (rt *protocolHandlers) ResetProviderModelField(w http.ResponseWriter, r *http.Request, field protocol.ModelField, params protocol.ResetProviderModelFieldParams) {
 	mutation, err := rt.resetModelField(r.Context(), params.ProviderId, params.ModelId, field)
 	if err != nil {
 		writeProtocolError(w, err)

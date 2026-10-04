@@ -12,7 +12,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -248,9 +247,12 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 	if conn := edit.connection; conn != nil && conn.keyAction == keyActionSet {
 		// The custom create writes its owning file first, then takes
 		// publication/capture ownership for its managed-key effect and
-		// holds it through the rollback or the ready publication.
+		// holds it through the rollback or the ready publication. The
+		// owner's actual refusal — a concurrent external change detected at
+		// the write included — propagates; no ErrExternalKey tolerance
+		// disguises it as success.
 		s.captureMu.Lock()
-		if err := setManagedKey(s.env, conn.keyEnv, conn.keyValue); err != nil {
+		if err := s.env.TrySet(conn.keyEnv, conn.keyValue); err != nil {
 			// The restore runs despite a canceled caller: the exact prior
 			// owning bytes go back (or the prior file absence returns) and
 			// the joined failure claims no atomic success.
@@ -286,7 +288,11 @@ func (s *configurationService) applyConnectionEffects(conn *connectionEffects) e
 	}
 	switch conn.keyAction {
 	case keyActionSet:
-		if err := setManagedKey(s.env, conn.keyEnv, conn.keyValue); err != nil {
+		// The owner's actual refusal propagates: an external variable
+		// detected at the write, a nil manager's typed failure, or a
+		// concurrent change under the leaf lock — no tolerance disguises
+		// any of them as success.
+		if err := s.env.TrySet(conn.keyEnv, conn.keyValue); err != nil {
 			return configurationFailure(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err))
 		}
 	case keyActionRemove:
@@ -297,20 +303,6 @@ func (s *configurationService) applyConnectionEffects(conn *connectionEffects) e
 		}
 	}
 	return nil
-}
-
-// setManagedKey persists one credential through the supplied manager with
-// the retained ownership resolution: an ErrExternalKey refusal is tolerated
-// only when the now-external value is nonempty — the shell key wins and is
-// never overwritten — and every other failure, a nil manager's typed
-// refusal included, returns unchanged. The tolerated state is sampled through
-// the environment owner's own capture, not a composed live getter.
-func setManagedKey(env *config.ManagedEnv, name, value string) error {
-	err := env.TrySet(name, value)
-	if errors.Is(err, config.ErrExternalKey) && env.Capture([]string{name})[name].Value != "" {
-		return nil
-	}
-	return err
 }
 
 // restoreOwningBytes puts the exact prior owning bytes back after a failed
