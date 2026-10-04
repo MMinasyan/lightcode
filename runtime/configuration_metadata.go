@@ -155,17 +155,17 @@ func requireCustomRawEntry(providers map[string]any, providerID string) (map[str
 	return pm, nil
 }
 
-// catalogProvider resolves one provider ID against the captured published
-// catalog — the edits resolve subjects against s.current().catalog directly;
-// there is no fallback catalog.
-func (s *configurationService) catalogProvider(providerID string) *catalog.Provider {
-	return s.current().catalog.Providers[providerID]
+// capturedCatalogProvider resolves one provider ID against the mutation's
+// captured catalog — the edits resolve subjects against their one owned
+// capture; there is no fallback catalog.
+func capturedCatalogProvider(captured configurationCapture, providerID string) *catalog.Provider {
+	return captured.snapshot.catalog.Providers[providerID]
 }
 
 // envNameInUse reports whether the captured catalog's other providers occupy
 // the env name.
-func (s *configurationService) envNameInUse(apiKeyEnv, selfID string) bool {
-	for id, prov := range s.current().catalog.Providers {
+func envNameInUse(captured configurationCapture, apiKeyEnv, selfID string) bool {
+	for id, prov := range captured.snapshot.catalog.Providers {
 		if id == selfID || prov == nil {
 			continue
 		}
@@ -312,12 +312,11 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 	// unless a managed key must be persisted.
 	plan := &connectionEffects{}
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if providerID == "" {
 				return 0, invalidEdit("provider id is required")
 			}
-			captured := s.catalogProvider(providerID)
-			if captured != nil {
+			if capturedCatalogProvider(captured, providerID) != nil {
 				return 0, invalidEdit("provider %q already exists", providerID)
 			}
 			providers, err := userProvidersMember(roots)
@@ -357,14 +356,19 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			keyEnv := ""
 			if patch.ApiKeyEnv != nil {
 				keyEnv = strings.TrimSpace(*patch.ApiKeyEnv)
-				if keyEnv != "" && s.envNameInUse(keyEnv, providerID) {
+				if keyEnv != "" && envNameInUse(captured, keyEnv, providerID) {
 					return 0, invalidEdit("api_key_env %s is already used by another provider", keyEnv)
 				}
 			} else if key != nil && *key != "" {
-				keyEnv = generatedAPIKeyEnvName(providerID, s.current().catalog)
+				keyEnv = generatedAPIKeyEnvName(providerID, captured.snapshot.catalog)
 			}
 			if keyEnv != "" {
-				_, persist, err := resolveConnectKey(keyEnv, key, s.env)
+				// The create's binding name is caller-supplied (or freshly
+				// generated), so it cannot be part of the published
+				// catalog's referenced set: it is sampled once directly
+				// through the same environment owner.
+				observed := s.env.Capture([]string{keyEnv})[keyEnv]
+				_, persist, err := resolveConnectKey(keyEnv, key, observed)
 				if err != nil {
 					return 0, configurationFailure(err)
 				}
@@ -406,7 +410,7 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			return editMainConfig, nil
 		},
 		connection: plan,
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateProvider(c, providerID)
 		},
 	}
@@ -457,12 +461,12 @@ func providerRawTarget(providers map[string]any, providerID string, builtin bool
 // member, headers written wholesale with the bundled-key strip.
 func (s *configurationService) editProviderUpdate(providerID string, patch protocol.ProviderEdit) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
-			captured, err := capturedProvider(s.current(), providerID)
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
+			prov, err := capturedProvider(captured.snapshot, providerID)
 			if err != nil {
 				return 0, err
 			}
-			if captured.Builtin {
+			if prov.Builtin {
 				if err := refuseBuiltinProviderFields(patch, providerID); err != nil {
 					return 0, err
 				}
@@ -473,7 +477,7 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 					return 0, err
 				}
 				headers = *patch.Headers
-				if captured.Builtin {
+				if prov.Builtin {
 					headers = stripBundledHeaderKeys(headers, providerID)
 				}
 			}
@@ -485,11 +489,11 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 			env := ""
 			if patch.ApiKeyEnv != nil {
 				env = strings.TrimSpace(*patch.ApiKeyEnv)
-				if env != captured.Transport.APIKeyEnv {
-					if catalog.ProviderConnected(captured, liveEnvIsSet) {
+				if env != prov.Transport.APIKeyEnv {
+					if catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
 						return 0, invalidEdit("disconnect provider %q before changing its API key variable", providerID)
 					}
-					if env != "" && s.envNameInUse(env, providerID) {
+					if env != "" && envNameInUse(captured, env, providerID) {
 						return 0, invalidEdit("api_key_env %s is already used by another provider", env)
 					}
 				}
@@ -498,7 +502,7 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 			if err != nil {
 				return 0, err
 			}
-			pm, err := providerRawTarget(providers, providerID, captured.Builtin)
+			pm, err := providerRawTarget(providers, providerID, prov.Builtin)
 			if err != nil {
 				return 0, err
 			}
@@ -524,7 +528,7 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 			}
 			return editMainConfig, nil
 		},
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateProvider(c, providerID)
 		},
 	}
@@ -560,15 +564,15 @@ func refuseBuiltinProviderFields(patch protocol.ProviderEdit, providerID string)
 // its owning user definition.
 func (s *configurationService) editProviderDelete(providerID string) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
-			captured, err := capturedProvider(s.current(), providerID)
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
+			prov, err := capturedProvider(captured.snapshot, providerID)
 			if err != nil {
 				return 0, err
 			}
-			if captured.Builtin {
+			if prov.Builtin {
 				return 0, invalidEdit("cannot remove bundled provider %q", providerID)
 			}
-			if catalog.ProviderConnected(captured, liveEnvIsSet) && captured.Transport.APIKeyEnv != "" {
+			if catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) && prov.Transport.APIKeyEnv != "" {
 				return 0, invalidEdit("disconnect provider %q before removing it", providerID)
 			}
 			providers, err := userProvidersMember(roots)
@@ -604,15 +608,15 @@ var providerResetTransport = map[protocol.ResetProviderFieldParamsField]bool{
 // required key is refused before the write).
 func (s *configurationService) editProviderFieldReset(providerID string, field protocol.ResetProviderFieldParamsField) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if !field.Valid() {
 				return 0, invalidEdit("field %q cannot be reset", field)
 			}
-			captured, err := capturedProvider(s.current(), providerID)
+			prov, err := capturedProvider(captured.snapshot, providerID)
 			if err != nil {
 				return 0, err
 			}
-			if field == protocol.ResetProviderFieldParamsFieldEnvironmentVariable && catalog.ProviderConnected(captured, liveEnvIsSet) {
+			if field == protocol.ResetProviderFieldParamsFieldEnvironmentVariable && catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
 				return 0, invalidEdit("disconnect provider %q before resetting its API key variable", providerID)
 			}
 			providers, err := userProvidersMember(roots)
@@ -644,7 +648,7 @@ func (s *configurationService) editProviderFieldReset(providerID string, field p
 			}
 			return editMainConfig, nil
 		},
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateProvider(c, providerID)
 		},
 	}
@@ -659,15 +663,15 @@ func (s *configurationService) editProviderFieldReset(providerID string, field p
 // definition; builtin providers scaffold their user override.
 func (s *configurationService) editModelSave(providerID, modelID string, patch protocol.ModelEdit) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if providerID == "" || modelID == "" {
 				return 0, invalidEdit("provider and model id are required")
 			}
-			captured, lookupErr := capturedProvider(s.current(), providerID)
+			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
 			if lookupErr != nil {
 				return 0, lookupErr
 			}
-			if entry := captured.Models[modelID]; entry != nil && entry.Source != catalog.SourceUser {
+			if entry := prov.Models[modelID]; entry != nil && entry.Source != catalog.SourceUser {
 				if err := refusedModelFields(patch, modelID); err != nil {
 					return 0, err
 				}
@@ -676,7 +680,7 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 			if err != nil {
 				return 0, err
 			}
-			pm, err := providerRawTarget(providers, providerID, captured.Builtin)
+			pm, err := providerRawTarget(providers, providerID, prov.Builtin)
 			if err != nil {
 				return 0, err
 			}
@@ -701,7 +705,7 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 			}
 			return editMainConfig, nil
 		},
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateModel(c, providerID, modelID)
 		},
 	}
@@ -712,15 +716,15 @@ func (s *configurationService) editModelSave(providerID, modelID string, patch p
 // silent success), and the latest raw layer loses only that model entry.
 func (s *configurationService) editModelDelete(providerID, modelID string) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if providerID == "" || modelID == "" {
 				return 0, invalidEdit("provider and model id are required")
 			}
-			captured, lookupErr := capturedProvider(s.current(), providerID)
+			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
 			if lookupErr != nil {
 				return 0, lookupErr
 			}
-			entry := captured.Models[modelID]
+			entry := prov.Models[modelID]
 			if entry == nil {
 				return 0, unknownModel(providerID, modelID)
 			}
@@ -761,18 +765,18 @@ func (s *configurationService) editModelDelete(providerID, modelID string) confi
 // The candidate check proves the reset subject still validates.
 func (s *configurationService) editModelFieldReset(providerID, modelID string, field protocol.ResetProviderModelFieldParamsField) configurationEdit {
 	return configurationEdit{
-		apply: func(roots rawRoots) (editedFile, error) {
+		apply: func(roots rawRoots, captured configurationCapture) (editedFile, error) {
 			if providerID == "" || modelID == "" {
 				return 0, invalidEdit("provider and model id are required")
 			}
 			if !field.Valid() {
 				return 0, invalidEdit("field %q cannot be reset", field)
 			}
-			captured, lookupErr := capturedProvider(s.current(), providerID)
+			prov, lookupErr := capturedProvider(captured.snapshot, providerID)
 			if lookupErr != nil {
 				return 0, lookupErr
 			}
-			entry := captured.Models[modelID]
+			entry := prov.Models[modelID]
 			if entry == nil {
 				return 0, unknownModel(providerID, modelID)
 			}
@@ -810,7 +814,7 @@ func (s *configurationService) editModelFieldReset(providerID, modelID string, f
 			}
 			return editMainConfig, nil
 		},
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateModel(c, providerID, modelID)
 		},
 	}

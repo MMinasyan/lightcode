@@ -77,8 +77,27 @@ type configurationService struct {
 	// demand.
 	env *config.ManagedEnv
 
+	// buildMu serializes initial load, reload, and every mutation's input
+	// read through candidate construction. captureMu is the separate
+	// publication/capture owner: readers sample the ready pointer and the
+	// credential names it references under it, and a writer takes it before
+	// any mutable credential effect and holds it through publication. A slow
+	// build therefore never blocks reads, and no reader can observe a
+	// managed effect before the generation that owns it.
 	buildMu   sync.Mutex
+	captureMu sync.Mutex
 	published atomic.Pointer[configuration]
+}
+
+// configurationCapture joins one published immutable configuration revision
+// with the owner-coherent credential observations its catalog references.
+// The named snapshot field keeps the captured revision explicit at every
+// consumer: no promoted access can read a field without naming the snapshot,
+// and the credential map is infrastructure data that never reaches a
+// protocol DTO, durable capture, error, or log.
+type configurationCapture struct {
+	snapshot    *configuration
+	credentials map[string]config.EnvValue
 }
 
 // newConfigurationService binds the service to the composition's owned
@@ -116,6 +135,38 @@ func (s *configurationService) current() *configuration {
 	return s.published.Load()
 }
 
+// capture takes publication/capture ownership, checks cancellation and owner
+// lifetime, loads the ready pointer once, and samples the credential names
+// that pointer's catalog references through the environment owner. The mutex
+// is released before any projection, preparation, plugin, or network work, so
+// callers hold one owned observation and never a lock. A nil pointer (no
+// publication yet) yields the zero capture, matching current()'s contract.
+func (s *configurationService) capture(ctx context.Context) (configurationCapture, error) {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	if err := s.canceled(ctx); err != nil {
+		return configurationCapture{}, err
+	}
+	snapshot := s.published.Load()
+	if snapshot == nil {
+		return configurationCapture{}, nil
+	}
+	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot.catalog)}, nil
+}
+
+// captureCredentials samples every nonempty api_key_env the captured catalog
+// references through the one environment owner; Capture owns the dedupe. A
+// nil manager samples the environment alone (no managed ownership).
+func (s *configurationService) captureCredentials(cat *catalog.Catalog) map[string]config.EnvValue {
+	names := make([]string, 0, len(cat.Providers))
+	for _, prov := range cat.Providers {
+		if prov != nil && prov.Transport.APIKeyEnv != "" {
+			names = append(names, prov.Transport.APIKeyEnv)
+		}
+	}
+	return s.env.Capture(names)
+}
+
 // attachWarnings wires the Runtime-owned warning store. Every successful
 // publication refreshes the global setup/catalog/agents groups from its
 // published candidate at this shared publication path; a failed or canceled
@@ -133,37 +184,39 @@ func (s *configurationService) attachEnv(env *config.ManagedEnv) {
 // publish runs one serialized initial-load or reload build and publishes the
 // complete candidate with its next generation as a single atomic Store,
 // carrying the configuration event in the same observation section as that
-// Store: the build mutex releases inside the commit, before the enqueue.
-func (s *configurationService) publish(ctx context.Context) (*configuration, error) {
+// Store. Publication/capture ownership is taken only after the candidate
+// validated, so the build never blocks reads of the ready revision; the
+// commit releases both mutexes before the enqueue.
+func (s *configurationService) publish(ctx context.Context) (configurationCapture, error) {
 	if err := s.canceled(ctx); err != nil {
-		return nil, err
+		return configurationCapture{}, err
 	}
 	s.buildMu.Lock()
 	// A cancellation observed while waiting is returned after the active
 	// builder releases the mutex, without starting another build.
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	generation, err := s.nextGeneration()
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	candidate, err := s.build(ctx, generation)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	// Immediately before the atomic Store, caller and owner cancellation are
 	// checked once more under the caller-first rule. A publication that wins
 	// this check may finish despite later cancellation; shutdown joins it.
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
-	s.commit(candidate)
-	return candidate, nil
+	s.captureMu.Lock()
+	return s.commit(candidate), nil
 }
 
 // nextGeneration reserves the next publication generation; the caller holds
@@ -181,25 +234,30 @@ func (s *configurationService) nextGeneration() (uint64, error) {
 }
 
 // commit publishes the validated candidate as the ready snapshot with its
-// events; the caller holds the build mutex. The global warning groups follow
-// the published candidate: refreshed through the store's non-reentrant cores
-// inside the one observation section, so a later publication can never
-// interleave an earlier candidate's refresh and no nested publication exists,
-// and reached only after the caller's final cancellation checkpoint, from
-// which no failure returns. The section stores the candidate, releases the
-// build mutex, and enqueues the configuration event plus one final
-// runtime-scoped warning event exactly when any group changed — each changed
-// group keeps its own revision increment.
-func (s *configurationService) commit(candidate *configuration) {
+// events; the caller holds the build and capture mutexes. It captures the
+// candidate catalog's credential observations after every accepted key effect
+// and uses those values for the setup warnings, so the published revision and
+// the credentials its projection consumes are one frozen pair. The global
+// warning groups follow the published candidate inside the one observation
+// section, so a later publication can never interleave an earlier candidate's
+// refresh and no nested publication exists. The section stores the candidate,
+// releases the capture then the build mutex, and enqueues the configuration
+// event plus one final runtime-scoped warning event exactly when any group
+// changed — each changed group keeps its own revision increment. No
+// observation callback reacquires capture ownership.
+func (s *configurationService) commit(candidate *configuration) configurationCapture {
+	credentials := s.captureCredentials(candidate.catalog)
+	captured := configurationCapture{snapshot: candidate, credentials: credentials}
 	s.obs.publish(func() []Event {
 		warningChanged := false
 		if s.warnings != nil {
-			warningChanged = s.warnings.setGlobal("setup", setupWarnings(candidate)) || warningChanged
+			warningChanged = s.warnings.setGlobal("setup", setupWarnings(candidate, credentials)) || warningChanged
 			warningChanged = s.warnings.setGlobal("catalog", catalogWarnings(candidate.catalogWarnings)) || warningChanged
 			warningChanged = s.warnings.setGlobal("agents", agentWarnings(candidate.agentWarnings)) || warningChanged
 		}
 		revision := s.warnings.storeRevision()
 		s.published.Store(candidate)
+		s.captureMu.Unlock()
 		s.buildMu.Unlock()
 		events := []Event{configurationChangedEvent(candidate.generation)}
 		if warningChanged {
@@ -207,6 +265,7 @@ func (s *configurationService) commit(candidate *configuration) {
 		}
 		return events
 	})
+	return captured
 }
 
 // canceled applies the caller-first cancellation rule: a done caller context

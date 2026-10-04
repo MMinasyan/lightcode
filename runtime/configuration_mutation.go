@@ -74,81 +74,99 @@ type connectionEffects struct {
 
 // configurationEdit is one narrow mutation of the owned decoded root maps of
 // the latest raw user layer. apply mutates the roots in place and reports the
-// owning file it edited; every successful apply — an absent-member reset that
+// owning file it edited; it receives the mutation's one short capture of the
+// ready revision, so every subject and credential decision consumes the same
+// owned observation. Every successful apply — an absent-member reset that
 // changed no member included — is a real edit that writes its owning file and
 // publishes the next generation. check is the optional pure edited-subject
-// check over the built candidate — it runs after the one build and before the
-// write, so a touched subject the catalog validation dropped is refused
-// without a write, and no fallible projection ever runs after the commit.
-// connection carries the one narrow side-effect chain of the
-// connection-bearing edits; nil on every other edit.
+// check over the built candidate and the same capture — it runs after the one
+// build and before the write, so a touched subject the catalog validation
+// dropped is refused without a write, and no fallible projection ever runs
+// after the commit. connection carries the one narrow side-effect chain of
+// the connection-bearing edits; nil on every other edit.
 type configurationEdit struct {
-	apply      func(rawRoots) (editedFile, error)
-	check      func(*configuration) error
+	apply      func(rawRoots, configurationCapture) (editedFile, error)
+	check      func(*configuration, configurationCapture) error
 	connection *connectionEffects
 }
 
 // mutate applies one edit to the latest raw user layer and publishes the
 // complete validated candidate through the shared construction and
 // publication path. It holds the build mutex from input read through
-// publication, so Lightcode-side edits and reloads serialize. The latest
-// owning and companion raw user files are read inside that hold — never a
-// stale published snapshot — and decoded as root objects whose raw members
-// keep their exact bytes; a missing file contributes its skeleton bytes in
-// memory and is created by no read. The edit's owning file — and only that
-// file — is atomically rewritten mode 0600 after the candidate validates,
-// the edit's candidate check passes, and the final caller-first cancellation
-// check passes; a connection-bearing edit owns no file and runs its
-// side-effect chain in the same position. Every successful apply writes and
-// publishes the next generation, an absent-member reset that changed nothing
-// included; a failed candidate, a failed check, or a cancellation before the
-// write leaves the file and publication unchanged; after the write starts,
-// no further cancellation check, rebuild, or fallible stage runs before the
-// ready snapshot, its one event, and the mutex release — an admitted call
-// completes publication despite caller disconnect or owner shutdown. A
-// connection-bearing create's managed-key failure restores the exact prior
-// owning bytes before returning and joins that restore error with the key
-// failure; no atomic success is claimed.
-func (s *configurationService) mutate(ctx context.Context, edit configurationEdit) (*configuration, error) {
+// publication, so Lightcode-side edits and reloads serialize. One short
+// capture of the ready revision is taken under the publication/capture mutex
+// and released again before the candidate build, so the edit's subject and
+// credential decisions never compose live getters and a slow build never
+// holds the capture path. The latest owning and companion raw user files are
+// read inside that hold — never a stale published snapshot — and decoded as
+// root objects whose raw members keep their exact bytes; a missing file
+// contributes its skeleton bytes in memory and is created by no read. The
+// edit's owning file — and only that file — is atomically rewritten mode 0600
+// after the candidate validates, the edit's candidate check passes, and the
+// final caller-first cancellation check passes; a connection-bearing edit
+// owns no file and runs its side-effect chain in the same position. Before
+// any mutable credential effect the writer takes publication/capture
+// ownership and holds it through the ready publication, so no reader can
+// observe the new key under the old generation or the old key under the new
+// one; a metadata-only write takes that ownership at publication alone.
+// Every successful apply writes and publishes the next generation, an
+// absent-member reset that changed nothing included; a failed candidate, a
+// failed check, or a cancellation before the write leaves the file and
+// publication unchanged; after the write starts, no further cancellation
+// check, rebuild, or fallible stage runs before the ready snapshot, its one
+// event, and the mutex release — an admitted call completes publication
+// despite caller disconnect or owner shutdown. A connection-bearing create's
+// managed-key failure restores the exact prior owning bytes before returning
+// and joins that restore error with the key failure; no atomic success is
+// claimed. Every error path releases each acquired ownership exactly once.
+func (s *configurationService) mutate(ctx context.Context, edit configurationEdit) (configurationCapture, error) {
 	if err := s.canceled(ctx); err != nil {
-		return nil, err
+		return configurationCapture{}, err
 	}
 	s.buildMu.Lock()
 	// A cancellation observed while waiting is returned after the active
 	// builder releases the mutex, without starting another build.
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
+	}
+	// The one short capture of the ready revision the edit consumes, taken
+	// under the capture mutex (so no supported managed effect is half
+	// published) and released before any file read or candidate build.
+	seed, err := s.capture(ctx)
+	if err != nil {
+		s.buildMu.Unlock()
+		return configurationCapture{}, err
 	}
 	configData, configExisted, err := readCapturedBytes(s.configPath, mainConfigSkeleton)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, configurationFailure(fmt.Errorf("read main configuration: %w", err))
+		return configurationCapture{}, configurationFailure(fmt.Errorf("read main configuration: %w", err))
 	}
 	agentsData, _, err := readCapturedBytes(s.agentsPath, agentsSkeleton)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
+		return configurationCapture{}, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
 	}
 	configRoot, err := decodeRoot(configData)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, configurationFailure(err)
+		return configurationCapture{}, configurationFailure(err)
 	}
 	agentsRoot, err := decodeRoot(agentsData)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, configurationFailure(err)
+		return configurationCapture{}, configurationFailure(err)
 	}
-	owning, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot})
+	owning, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot}, seed)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	generation, err := s.nextGeneration()
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	configCandidate, agentsCandidate := configData, agentsData
 	var owningPath string
@@ -158,21 +176,21 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		owningPath = s.configPath
 		if complete, err = marshalRoot(configRoot); err != nil {
 			s.buildMu.Unlock()
-			return nil, configurationFailure(err)
+			return configurationCapture{}, configurationFailure(err)
 		}
 		configCandidate = complete
 	case editAgentsFile:
 		owningPath = s.agentsPath
 		if complete, err = marshalRoot(agentsRoot); err != nil {
 			s.buildMu.Unlock()
-			return nil, configurationFailure(err)
+			return configurationCapture{}, configurationFailure(err)
 		}
 		agentsCandidate = complete
 	case editConnection:
 		// No owning file: the candidate publishes over the untouched bytes.
 	}
 	// The connection's overlay decision is made under the build mutex
-	// against the live published identity: a concurrent valid writer that
+	// against the captured published identity: a concurrent valid writer that
 	// already supplied usable models under the same identity skips both the
 	// in-memory overlay and the cache write. Only a connection-bearing edit
 	// — one owning no file — selects the non-refreshing connection loader;
@@ -182,25 +200,25 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		conn = edit.connection
 	}
 	if conn != nil && conn.discovered != nil {
-		if live := s.current().catalog.Providers[conn.providerID]; live != nil && usableModelCount(live) > 0 {
+		if live := seed.snapshot.catalog.Providers[conn.providerID]; live != nil && usableModelCount(live) > 0 {
 			conn.discovered = nil
 		}
 	}
 	candidate, err := s.buildCaptured(ctx, generation, configCandidate, agentsCandidate, conn)
 	if err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	// The edit's pure edited-subject check runs once over the built
-	// candidate, before the write: a touched subject the shared catalog
-	// validation dropped — or a connection subject whose live identity
-	// changed or was removed during the gated fetch — refuses the edit here,
-	// with the file and the publication untouched. Nothing fallible runs
-	// after the write.
+	// candidate and the mutation's capture, before the write: a touched
+	// subject the shared catalog validation dropped — or a connection
+	// subject whose live identity changed or was removed during the gated
+	// fetch — refuses the edit here, with the file and the publication
+	// untouched. Nothing fallible runs after the write.
 	if edit.check != nil {
-		if err := edit.check(candidate); err != nil {
+		if err := edit.check(candidate, seed); err != nil {
 			s.buildMu.Unlock()
-			return nil, configurationFailure(err)
+			return configurationCapture{}, configurationFailure(err)
 		}
 	}
 	// The final caller-first cancellation check, immediately before the
@@ -209,32 +227,44 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 	// typed and publish nothing.
 	if err := s.canceled(ctx); err != nil {
 		s.buildMu.Unlock()
-		return nil, err
+		return configurationCapture{}, err
 	}
 	if owning == editConnection {
+		// A connection-bearing edit owns no file: publication/capture
+		// ownership is taken before its mutable credential effects and held
+		// through the ready publication.
+		s.captureMu.Lock()
 		if err := s.applyConnectionEffects(edit.connection); err != nil {
+			s.captureMu.Unlock()
 			s.buildMu.Unlock()
-			return nil, err
+			return configurationCapture{}, err
 		}
-		s.commit(candidate)
-		return candidate, nil
+		return s.commit(candidate), nil
 	}
 	if err := atomicfs.Write(owningPath, complete, 0o600); err != nil {
 		s.buildMu.Unlock()
-		return nil, configurationFailure(fmt.Errorf("write %s: %w", owningPath, err))
+		return configurationCapture{}, configurationFailure(fmt.Errorf("write %s: %w", owningPath, err))
 	}
 	if conn := edit.connection; conn != nil && conn.keyAction == keyActionSet {
+		// The custom create writes its owning file first, then takes
+		// publication/capture ownership for its managed-key effect and
+		// holds it through the rollback or the ready publication.
+		s.captureMu.Lock()
 		if err := setManagedKey(s.env, conn.keyEnv, conn.keyValue); err != nil {
 			// The restore runs despite a canceled caller: the exact prior
 			// owning bytes go back (or the prior file absence returns) and
 			// the joined failure claims no atomic success.
 			restoreErr := restoreOwningBytes(owningPath, configData, configExisted)
+			s.captureMu.Unlock()
 			s.buildMu.Unlock()
-			return nil, configurationFailure(errors.Join(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err), restoreErr))
+			return configurationCapture{}, configurationFailure(errors.Join(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err), restoreErr))
 		}
+		return s.commit(candidate), nil
 	}
-	s.commit(candidate)
-	return candidate, nil
+	// A metadata-only write has no credential effect: capture ownership is
+	// needed only for the publication itself.
+	s.captureMu.Lock()
+	return s.commit(candidate), nil
 }
 
 // applyConnectionEffects runs an existing-provider connection's external
@@ -273,10 +303,11 @@ func (s *configurationService) applyConnectionEffects(conn *connectionEffects) e
 // the retained ownership resolution: an ErrExternalKey refusal is tolerated
 // only when the now-external value is nonempty — the shell key wins and is
 // never overwritten — and every other failure, a nil manager's typed
-// refusal included, returns unchanged.
+// refusal included, returns unchanged. The tolerated state is sampled through
+// the environment owner's own capture, not a composed live getter.
 func setManagedKey(env *config.ManagedEnv, name, value string) error {
 	err := env.TrySet(name, value)
-	if errors.Is(err, config.ErrExternalKey) && os.Getenv(name) != "" {
+	if errors.Is(err, config.ErrExternalKey) && env.Capture([]string{name})[name].Value != "" {
 		return nil
 	}
 	return err
@@ -306,7 +337,7 @@ func restoreOwningBytes(path string, prior []byte, existed bool) error {
 // unowned and kept untouched. Never merged per field. The selected
 // declaration's validator, not this edit, interprets each document.
 func editSettings(settings protocol.Settings) configurationEdit {
-	return configurationEdit{apply: func(roots rawRoots) (editedFile, error) {
+	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
 		sessions, err := json.Marshal(settings.Sessions)
 		if err != nil {
 			return 0, err
@@ -337,7 +368,7 @@ func editSettings(settings protocol.Settings) configurationEdit {
 // definition is created; builtins that need no explicit user entry stay
 // addressable.
 func (s *configurationService) editAgentModel(agentType, ref string) configurationEdit {
-	return configurationEdit{apply: func(roots rawRoots) (editedFile, error) {
+	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
 		agentsRoot := roots.agents
 		if ref != "" {
 			if _, err := model.Parse(ref); err != nil {

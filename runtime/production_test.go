@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // Production composition suite: the concrete preparation through public Open
@@ -674,6 +677,176 @@ func TestProductionKeyResolution(t *testing.T) {
 	})
 }
 
+// TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair parks an
+// accepted managed-key write mid-file and starts a real admission: the
+// admission waits at configuration capture, then runs on the writer's
+// published pair — the published generation and the real model transport's
+// new key.
+func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		// The fixture credential is managed-empty: no shell export, one empty
+		// .env line loaded at startup, so the connect's supplied key is the
+		// one accepted managed write.
+		_ = os.Unsetenv("PRODUCTION_TEST_KEY")
+		writeDotEnv(t, e.home, "PRODUCTION_TEST_KEY=\n")
+		ctx := context.Background()
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer r.Close(ctx)
+		if r.managedEnv == nil || !r.managedEnv.IsManaged("PRODUCTION_TEST_KEY") {
+			t.Fatal("the fixture credential is not managed")
+		}
+		session, err := r.createSession(ctx, e.workspace("race-ws"), "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		submit := func(opID string) error {
+			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				_, err := h.Submit(ctx, harness.SubmitRequest{
+					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
+					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
+				})
+				return err
+			})
+		}
+
+		probe := installOwningSyncProbe(t, r.managedEnv.Path())
+		defer probe.restore()
+		probe.park = true
+		release := sync.OnceFunc(probe.releaseProbe)
+		defer release()
+		key := "sk-published-pair"
+		type connectResult struct {
+			mutation protocol.ProviderMutation
+			err      error
+		}
+		connectDone := make(chan connectResult, 1)
+		go func() {
+			mutation, err := r.connectProvider(ctx, "prov", &key)
+			connectDone <- connectResult{mutation, err}
+		}()
+		probe.awaitWriteStarted(t)
+
+		// The admission must establish its wait at configuration capture
+		// while the writer holds the publication/capture ownership.
+		submitDone := make(chan error, 1)
+		go func() { submitDone <- submit("op-race") }()
+		awaitConfigurationCaptureWait(t)
+		release()
+		connect := <-connectDone
+		if connect.err != nil {
+			t.Fatalf("connect: %v", connect.err)
+		}
+		select {
+		case err := <-submitDone:
+			if err != nil {
+				t.Fatalf("admitted submit: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the admission never resumed after the write published")
+		}
+		e.server.awaitRequests(1)
+		if got := e.server.authAt(0); got != "Bearer "+key {
+			t.Fatalf("model transport authorization = %q, want the published managed key", got)
+		}
+		record := awaitOperation(t, r, session.Identity.SessionID, "op-race", harness.OperationSuccess)
+		if record.Admission.Execution.ConfigurationRevision != connect.mutation.ConfigurationRevision.Generation {
+			t.Fatalf("admitted revision = %q, writer's published generation = %s, want the same published pair",
+				record.Admission.Execution.ConfigurationRevision, connect.mutation.ConfigurationRevision.Generation)
+		}
+		if published := r.config.current(); published == nil || strconv.FormatUint(published.generation, 10) != connect.mutation.ConfigurationRevision.Generation {
+			t.Fatalf("live publication = %v, want the writer's published generation %s", published, connect.mutation.ConfigurationRevision.Generation)
+		}
+	})
+}
+
+// TestProductionAdmissionUsesReadyRevisionDuringParkedBuild parks an unrelated
+// candidate build in a validator and admits real work: the ready revision's
+// capture, transport key, and generation stay available until the build
+// publishes.
+func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		var armed atomic.Bool
+		arrived := make(chan struct{}, 1)
+		ungate := make(chan struct{})
+		releaseGate := sync.OnceFunc(func() { close(ungate) })
+		var opens atomic.Int64
+		gate := servicePlugin("gate", &opens, func(json.RawMessage) error {
+			if !armed.Load() {
+				return nil
+			}
+			select {
+			case arrived <- struct{}{}:
+			default:
+			}
+			<-ungate
+			return nil
+		})
+		ctx := context.Background()
+		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, gate)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		// Teardown order: the ctx-blind validator gate is released first, so
+		// the buffered Reload and Submit result sends complete before the
+		// ordinary owner/store close joins both admission calls. A broken
+		// capture therefore yields the named assertion failure, not a hung
+		// disposal.
+		defer r.Close(ctx)  // registered first: runs last
+		defer releaseGate() // registered second: runs first
+
+		session, err := r.createSession(ctx, e.workspace("ready-ws"), "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		submit := func(opID string) error {
+			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				_, err := h.Submit(ctx, harness.SubmitRequest{
+					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
+					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
+				})
+				return err
+			})
+		}
+
+		armed.Store(true)
+		reloadDone := make(chan error, 1)
+		go func() {
+			_, err := r.Reload(ctx)
+			reloadDone <- err
+		}()
+		select {
+		case <-arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the reload never reached the parked validator")
+		}
+		submitDone := make(chan error, 1)
+		go func() { submitDone <- submit("op-ready") }()
+		select {
+		case err := <-submitDone:
+			if err != nil {
+				t.Fatalf("admitted submit during the parked build: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("admission did not use the ready revision while the build was parked")
+		}
+		e.server.awaitRequests(1)
+		if got := e.server.authAt(0); got != "Bearer production-secret-1" {
+			t.Fatalf("model transport authorization = %q, want the ready revision's captured key", got)
+		}
+		record := awaitOperation(t, r, session.Identity.SessionID, "op-ready", harness.OperationSuccess)
+		if record.Admission.Execution.ConfigurationRevision != "1" {
+			t.Fatalf("admitted revision = %q, want the ready generation 1", record.Admission.Execution.ConfigurationRevision)
+		}
+		releaseGate()
+		if err := <-reloadDone; err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+	})
+}
+
 func TestProductionModelSelectionRejection(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
@@ -1064,7 +1237,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	}
 	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
-	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
+	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	if err != nil {
 		t.Fatalf("catalog lookup: %v", err)
 	}

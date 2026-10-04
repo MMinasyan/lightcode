@@ -277,10 +277,10 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	if err != nil {
 		t.Fatalf("mutate: %v", err)
 	}
-	if candidate.generation != 2 || svc.current() != candidate {
-		t.Fatalf("mutate = generation %d (current published %v), want generation 2 published", candidate.generation, svc.current() == candidate)
+	if candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
+		t.Fatalf("mutate = generation %d (current published %v), want generation 2 published", candidate.snapshot.generation, svc.current() == candidate.snapshot)
 	}
-	if got := projectSettings(candidate.sessions, candidate.plugins).Sessions; got != wantSettings.Sessions {
+	if got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins).Sessions; got != wantSettings.Sessions {
 		t.Fatalf("published sessions = %+v, want the written shape", got)
 	}
 
@@ -365,8 +365,8 @@ func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("identical mutate: %v", err)
 	}
-	if candidate.generation != 3 || svc.current() != candidate {
-		t.Fatalf("identical mutate = generation %d, want 3 published", candidate.generation)
+	if candidate.snapshot.generation != 3 || svc.current() != candidate.snapshot {
+		t.Fatalf("identical mutate = generation %d, want 3 published", candidate.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "3")
 	if syncs := probe.count(); syncs != 2 {
@@ -387,8 +387,8 @@ func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mutate over externally matching bytes: %v", err)
 	}
-	if candidate.generation != 4 {
-		t.Fatalf("generation = %d, want 4 — external byte equality must not skip publication", candidate.generation)
+	if candidate.snapshot.generation != 4 {
+		t.Fatalf("generation = %d, want 4 — external byte equality must not skip publication", candidate.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "4")
 	if syncs := probe.count(); syncs != 3 {
@@ -462,7 +462,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mutate: %v", err)
 	}
-	published := projectSettings(candidate.sessions, candidate.plugins)
+	published := projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins)
 	if len(published.Plugins) != 1 || compactJSON(t, []byte(published.Plugins["tools"])) != compactJSON(t, []byte(stale.Plugins["tools"])) {
 		t.Fatalf("published plugins = %v, want only the written tools document", published.Plugins)
 	}
@@ -535,7 +535,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty plugins mutate: %v", err)
 	}
-	if got := projectSettings(candidate.sessions, candidate.plugins).Plugins; len(got) != 0 {
+	if got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins).Plugins; len(got) != 0 {
 		t.Fatalf("published plugins after the empty map = %v, want none", got)
 	}
 	root = fileRoot(t, h.configPath)
@@ -565,15 +565,15 @@ func TestConfigurationMutateEverySuccessfulEditWritesAndPublishes(t *testing.T) 
 	probe := installOwningSyncProbe(t, h.configPath)
 	defer probe.restore()
 
-	noChange := configurationEdit{apply: func(rawRoots) (editedFile, error) {
+	noChange := configurationEdit{apply: func(rawRoots, configurationCapture) (editedFile, error) {
 		return editMainConfig, nil
 	}}
 	candidate, err := svc.mutate(context.Background(), noChange)
 	if err != nil {
 		t.Fatalf("no-change mutate: %v", err)
 	}
-	if candidate.generation != 2 || svc.current() != candidate {
-		t.Fatalf("no-change mutate = generation %d, want 2 published", candidate.generation)
+	if candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
+		t.Fatalf("no-change mutate = generation %d, want 2 published", candidate.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "2")
 	if syncs := probe.count(); syncs != 1 {
@@ -598,8 +598,8 @@ func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent mutate: %v", err)
 	}
-	if candidate.generation != 1 {
-		t.Fatalf("mutation generation = %d, want 1 from the empty prior publication", candidate.generation)
+	if candidate.snapshot.generation != 1 {
+		t.Fatalf("mutation generation = %d, want 1 from the empty prior publication", candidate.snapshot.generation)
 	}
 	info, err := os.Stat(agentsPath)
 	if err != nil {
@@ -663,7 +663,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set model: %v", err)
 	}
-	if found, model := hasDefinition(candidate, "worker"); !found || model != "prov/m" {
+	if found, model := hasDefinition(candidate.snapshot, "worker"); !found || model != "prov/m" {
 		t.Fatalf("worker definition = (%v, %q), want the new override", found, model)
 	}
 	nextConfigurationEvent(t, sub, "2")
@@ -673,8 +673,8 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 
 	// Identical value: still a real edit and publication.
 	candidate, err = svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
-	if err != nil || candidate.generation != 3 {
-		t.Fatalf("identical model edit = (%v, generation %d), want generation 3", err, candidate.generation)
+	if err != nil || candidate.snapshot.generation != 3 {
+		t.Fatalf("identical model edit = (%v, generation %d), want generation 3", err, candidate.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "3")
 
@@ -683,7 +683,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clear model: %v", err)
 	}
-	if found, model := hasDefinition(candidate, "worker"); !found || model != "" {
+	if found, model := hasDefinition(candidate.snapshot, "worker"); !found || model != "" {
 		t.Fatalf("worker definition = (%v, %q), want the cleared override", found, model)
 	}
 	nextConfigurationEvent(t, sub, "4")
@@ -699,15 +699,15 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	// proven by the sync-seam probe.
 	probe := installOwningSyncProbe(t, agentsPath)
 	candidate, err = svc.mutate(context.Background(), svc.editAgentModel("worker", ""))
-	if err != nil || candidate.generation != 5 {
-		t.Fatalf("absent-override clear = (%v, generation %d), want a successful edit at generation 5", err, candidate.generation)
+	if err != nil || candidate.snapshot.generation != 5 {
+		t.Fatalf("absent-override clear = (%v, generation %d), want a successful edit at generation 5", err, candidate.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "5")
 	if syncs := probe.count(); syncs != 1 {
 		t.Fatalf("owning writes for the absent-override clear = %d, want a real write", syncs)
 	}
 	probe.restore()
-	if found, model := hasDefinition(candidate, "worker"); !found || model != "" {
+	if found, model := hasDefinition(candidate.snapshot, "worker"); !found || model != "" {
 		t.Fatalf("worker definition = (%v, %q), want the resolved inherited state", found, model)
 	}
 
@@ -717,7 +717,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("builtin model edit: %v", err)
 	}
-	if found, model := hasDefinition(candidate, "primary"); !found || model != "prov/m" {
+	if found, model := hasDefinition(candidate.snapshot, "primary"); !found || model != "prov/m" {
 		t.Fatalf("primary definition = (%v, %q), want the new override", found, model)
 	}
 	nextConfigurationEvent(t, sub, "6")
@@ -754,7 +754,7 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 		if err != nil {
 			t.Fatalf("empty-ref clear: %v", err)
 		}
-		if got := fmt.Sprint(candidate.generation); got != generation {
+		if got := fmt.Sprint(candidate.snapshot.generation); got != generation {
 			t.Fatalf("empty-ref clear generation = %s, want %s — the repeat must advance again", got, generation)
 		}
 		nextConfigurationEvent(t, sub, generation)
@@ -905,7 +905,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 				t.Fatalf("read owning file: %v", err)
 			}
 			candidate, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
-			if candidate != nil || !errors.Is(err, ErrConfiguration) {
+			if candidate.snapshot != nil || !errors.Is(err, ErrConfiguration) {
 				t.Fatalf("mutate = (%v, %v), want a rejected candidate", candidate, err)
 			}
 			if row.wantSource != "" && !strings.Contains(err.Error(), row.wantSource) {
@@ -919,7 +919,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 				t.Fatalf("warning revision advanced on a failed candidate: %d → %d", revision, gotRevision)
 			}
 			assertNoEvent(t, sub)
-			if svc.current() != first {
+			if svc.current() != first.snapshot {
 				t.Fatal("a failed candidate replaced the prior publication")
 			}
 		})
@@ -992,7 +992,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 				t.Fatalf("read owning file: %v", err)
 			}
 			candidate, err := svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
-			if candidate != nil || !errors.Is(err, ErrConfiguration) {
+			if candidate.snapshot != nil || !errors.Is(err, ErrConfiguration) {
 				t.Fatalf("agent edit = (%v, %v), want a rejected candidate", candidate, err)
 			}
 			if !strings.Contains(err.Error(), row.wantSource) {
@@ -1010,7 +1010,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 				t.Fatalf("warning revision advanced on a failed candidate: %d → %d", revision, gotRevision)
 			}
 			assertNoEvent(t, sub)
-			if svc.current() != first || first.generation != 1 {
+			if svc.current() != first.snapshot || first.snapshot.generation != 1 {
 				t.Fatal("a failed candidate replaced the prior publication")
 			}
 
@@ -1018,8 +1018,8 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			// succeeds, proving the file/generation/event oracles flip.
 			writeServiceFile(t, h.configPath, mutationConfigDocument)
 			candidate, err = svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
-			if err != nil || candidate.generation != 2 || svc.current() != candidate {
-				t.Fatalf("inverse edit = (%v, generation %d), want a successful publication at 2", err, candidate.generation)
+			if err != nil || candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
+				t.Fatalf("inverse edit = (%v, generation %d), want a successful publication at 2", err, candidate.snapshot.generation)
 			}
 			nextConfigurationEvent(t, sub, "2")
 		})
@@ -1047,7 +1047,7 @@ func TestConfigurationMutateMalformedPermissionsFallbackPublishes(t *testing.T) 
 		t.Fatalf("mutate with a malformed permission file: %v", err)
 	}
 	var builtin harness.PermissionPolicy
-	if got := candidate.permissionPolicy("/ws"); fmt.Sprint(got) != fmt.Sprint(builtin) {
+	if got := candidate.snapshot.permissionPolicy("/ws"); fmt.Sprint(got) != fmt.Sprint(builtin) {
 		t.Fatalf("malformed permission policy = %#v, want the built-in fallback %#v", got, builtin)
 	}
 }
@@ -1080,7 +1080,7 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 			t.Fatalf("read owning file: %v", err)
 		}
 		candidate, err := svc.mutate(ctx, editSettings(mutationSettings()))
-		if candidate != nil || !errors.Is(err, context.Canceled) {
+		if candidate.snapshot != nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("mutate = (%v, %v), want the caller context error before the write", candidate, err)
 		}
 		after, rerr := os.ReadFile(h.configPath)
@@ -1111,7 +1111,7 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 		}
 		cancelOwner()
 		candidate, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
-		if candidate != nil || !errors.Is(err, ErrClosed) {
+		if candidate.snapshot != nil || !errors.Is(err, ErrClosed) {
 			t.Fatalf("mutate = (%v, %v), want ErrClosed before any write", candidate, err)
 		}
 		after, rerr := os.ReadFile(h.configPath)
@@ -1156,7 +1156,7 @@ func TestConfigurationMutateCompletesPublicationAfterWriteStarts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	type result struct {
-		cfg *configuration
+		cfg configurationCapture
 		err error
 	}
 	done := make(chan result, 1)
@@ -1172,8 +1172,8 @@ func TestConfigurationMutateCompletesPublicationAfterWriteStarts(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("mutate after write start = %v, want the admitted call to complete publication", got.err)
 	}
-	if got.cfg.generation != 2 || svc.current() != got.cfg {
-		t.Fatalf("post-cancel publication = generation %d, want 2 published", got.cfg.generation)
+	if got.cfg.snapshot.generation != 2 || svc.current() != got.cfg.snapshot {
+		t.Fatalf("post-cancel publication = generation %d, want 2 published", got.cfg.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "2")
 	root := fileRoot(t, h.configPath)
@@ -1208,7 +1208,7 @@ func TestConfigurationMutateWriteFailureLeavesEverythingUnchanged(t *testing.T) 
 		t.Fatalf("read owning file: %v", err)
 	}
 	candidate, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
-	if candidate != nil || !errors.Is(err, ErrConfiguration) || !errors.Is(err, injected) {
+	if candidate.snapshot != nil || !errors.Is(err, ErrConfiguration) || !errors.Is(err, injected) {
 		t.Fatalf("mutate = (%v, %v), want the injected write failure preserved", candidate, err)
 	}
 	after, rerr := os.ReadFile(h.configPath)
@@ -1259,7 +1259,7 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 			mutation <- result{err: err}
 			return
 		}
-		mutation <- result{revision: fmt.Sprint(cfg.generation)}
+		mutation <- result{revision: fmt.Sprint(cfg.snapshot.generation)}
 	}()
 	<-entered
 	reload := make(chan result, 1)
@@ -1269,7 +1269,7 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 			reload <- result{err: err}
 			return
 		}
-		reload <- result{revision: fmt.Sprint(snapshot.generation)}
+		reload <- result{revision: fmt.Sprint(snapshot.snapshot.generation)}
 	}()
 	// The Reload cannot finish while the mutation holds the shared writer.
 	select {
@@ -1565,7 +1565,7 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 
 	atomic.StoreInt32(&parked, 1)
 	type result struct {
-		cfg *configuration
+		cfg configurationCapture
 		err error
 	}
 	done := make(chan result, 1)
@@ -1600,8 +1600,8 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("mutation after the concurrent external write: %v", got.err)
 	}
-	if got.cfg.generation != 2 || svc.current() != got.cfg {
-		t.Fatalf("race mutation = generation %d, want 2 published", got.cfg.generation)
+	if got.cfg.snapshot.generation != 2 || svc.current() != got.cfg.snapshot {
+		t.Fatalf("race mutation = generation %d, want 2 published", got.cfg.snapshot.generation)
 	}
 	nextConfigurationEvent(t, sub, "2")
 

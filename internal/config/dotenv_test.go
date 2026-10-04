@@ -239,6 +239,35 @@ func TestManagedEnvSetRefusesExternalKey(t *testing.T) {
 	}
 }
 
+func TestManagedEnvRejectsNULValueWithoutFileEffect(t *testing.T) {
+	key := envKeyForTest(t, "NUL_VALUE")
+	broken := "sk-\x00-broken"
+	for _, tc := range []struct {
+		name    string
+		attempt func(*ManagedEnv) error
+	}{
+		{"Set", func(m *ManagedEnv) error { return m.Set(key, broken) }},
+		{"TrySet", func(m *ManagedEnv) error { return m.TrySet(key, broken) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".env")
+			m := NewManagedEnvForTest(path)
+			if err := tc.attempt(m); err == nil {
+				t.Fatal("a NUL value was accepted")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("a NUL value wrote the env file (%v)", err)
+			}
+			if _, defined := os.LookupEnv(key); defined {
+				t.Fatal("a NUL value reached the process environment")
+			}
+			if m.IsManaged(key) {
+				t.Fatal("a NUL value marked the key managed")
+			}
+		})
+	}
+}
+
 func TestManagedEnvRemoveDeletesLineAndUnsets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".env")

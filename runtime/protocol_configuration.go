@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"unicode"
@@ -30,12 +29,15 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 		return protocol.ConfigurationView{}, err
 	}
 	defer release()
-	captured := r.config.current()
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ConfigurationView{}, err
+	}
 	return protocol.ConfigurationView{
-		ConfigurationRevision: configurationRevision(captured),
-		Settings:              projectSettings(captured.sessions, captured.plugins),
-		Agents:                projectAgents(captured),
-		Providers:             projectProviders(captured, r.managedEnv),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
+		Agents:                projectAgents(captured.snapshot),
+		Providers:             projectProviders(captured),
 	}, nil
 }
 
@@ -48,23 +50,26 @@ func (r *Runtime) listModels(ctx context.Context, params protocol.ListModelsPara
 		return protocol.ModelList{}, err
 	}
 	defer release()
-	captured := r.config.current()
-	refs := captured.catalog.VisibleModels()
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ModelList{}, err
+	}
+	refs := captured.snapshot.catalog.VisibleModels()
 	if params.All {
-		refs = captured.catalog.AllModels()
+		refs = captured.snapshot.catalog.AllModels()
 	}
 	models := make([]protocol.ModelListEntry, 0, len(refs))
 	for _, ref := range refs {
 		// The refs enumerate this same immutable catalog's verified provider
 		// and model maps, so the lookup cannot fail; nothing is swallowed.
-		prov, entry, _ := captured.catalog.LookupOrIncomplete(ref)
-		if !catalog.ProviderConnected(prov, liveEnvIsSet) {
+		prov, entry, _ := captured.snapshot.catalog.LookupOrIncomplete(ref)
+		if !catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
 			continue
 		}
 		models = append(models, projectModelListEntry(prov, entry))
 	}
 	return protocol.ModelList{
-		ConfigurationRevision: configurationRevision(captured),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Models:                models,
 	}, nil
 }
@@ -77,10 +82,13 @@ func (r *Runtime) listProviders(ctx context.Context) (protocol.ProviderList, err
 		return protocol.ProviderList{}, err
 	}
 	defer release()
-	captured := r.config.current()
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ProviderList{}, err
+	}
 	return protocol.ProviderList{
-		ConfigurationRevision: configurationRevision(captured),
-		Providers:             projectProviders(captured, r.managedEnv),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Providers:             projectProviders(captured),
 	}, nil
 }
 
@@ -93,14 +101,17 @@ func (r *Runtime) getProvider(ctx context.Context, providerID string) (protocol.
 		return protocol.ProviderDetail{}, err
 	}
 	defer release()
-	captured := r.config.current()
-	prov, err := capturedProvider(captured, providerID)
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ProviderDetail{}, err
+	}
+	prov, err := capturedProvider(captured.snapshot, providerID)
 	if err != nil {
 		return protocol.ProviderDetail{}, err
 	}
 	return protocol.ProviderDetail{
-		ConfigurationRevision: configurationRevision(captured),
-		Provider:              projectProvider(captured, r.managedEnv, prov),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Provider:              projectProvider(captured, prov),
 	}, nil
 }
 
@@ -112,14 +123,17 @@ func (r *Runtime) listProviderModels(ctx context.Context, providerID string) (pr
 		return protocol.ProviderModelList{}, err
 	}
 	defer release()
-	captured := r.config.current()
-	prov, err := capturedProvider(captured, providerID)
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ProviderModelList{}, err
+	}
+	prov, err := capturedProvider(captured.snapshot, providerID)
 	if err != nil {
 		return protocol.ProviderModelList{}, err
 	}
 	models := projectModels(prov) // the projection is a fresh allocation; used directly
 	return protocol.ProviderModelList{
-		ConfigurationRevision: configurationRevision(captured),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Models:                models,
 	}, nil
 }
@@ -154,13 +168,13 @@ func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings
 		return protocol.SettingsMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, editSettings(settings))
+	captured, err := r.config.mutate(ctx, editSettings(settings))
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
 	return protocol.SettingsMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectSettings(candidate.sessions, candidate.plugins),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
 	}, nil
 }
 
@@ -178,12 +192,12 @@ func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef str
 		return protocol.AgentMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editAgentModel(agentType, modelRef))
+	captured, err := r.config.mutate(ctx, r.config.editAgentModel(agentType, modelRef))
 	if err != nil {
 		return protocol.AgentMutation{}, err
 	}
-	mutation := protocol.AgentMutation{ConfigurationRevision: configurationRevision(candidate)}
-	for _, agent := range projectAgents(candidate) {
+	mutation := protocol.AgentMutation{ConfigurationRevision: configurationRevision(captured.snapshot)}
+	for _, agent := range projectAgents(captured.snapshot) {
 		if agent.Name == agentType {
 			mutation.Result = agent
 			break
@@ -216,16 +230,16 @@ func (r *Runtime) addProvider(ctx context.Context, providerID string, patch prot
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models, key))
+	captured, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models, key))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	// The edit's candidate check already proved the created provider is a
 	// member of this candidate's catalog.
-	prov := candidate.catalog.Providers[strings.TrimSpace(providerID)]
+	prov := captured.snapshot.catalog.Providers[strings.TrimSpace(providerID)]
 	return protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, r.managedEnv, prov),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Result:                projectProvider(captured, prov),
 	}, nil
 }
 
@@ -239,16 +253,16 @@ func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch p
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editProviderUpdate(providerID, patch))
+	captured, err := r.config.mutate(ctx, r.config.editProviderUpdate(providerID, patch))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	// The edit's candidate check already proved the patched provider is a
 	// member of this candidate's catalog.
-	prov := candidate.catalog.Providers[providerID]
+	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, r.managedEnv, prov),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Result:                projectProvider(captured, prov),
 	}, nil
 }
 
@@ -261,12 +275,12 @@ func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protoc
 		return protocol.DeletionMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editProviderDelete(providerID))
+	captured, err := r.config.mutate(ctx, r.config.editProviderDelete(providerID))
 	if err != nil {
 		return protocol.DeletionMutation{}, err
 	}
 	return protocol.DeletionMutation{
-		ConfigurationRevision: configurationRevision(candidate),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Result:                nil,
 	}, nil
 }
@@ -280,16 +294,16 @@ func (r *Runtime) resetProviderField(ctx context.Context, providerID string, fie
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editProviderFieldReset(providerID, field))
+	captured, err := r.config.mutate(ctx, r.config.editProviderFieldReset(providerID, field))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	// The edit's candidate check already proved the reset provider is a
 	// member of this candidate's catalog.
-	prov := candidate.catalog.Providers[providerID]
+	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, r.managedEnv, prov),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Result:                projectProvider(captured, prov),
 	}, nil
 }
 
@@ -302,15 +316,15 @@ func (r *Runtime) saveModel(ctx context.Context, providerID, modelID string, pat
 		return protocol.ModelMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editModelSave(providerID, modelID, patch))
+	captured, err := r.config.mutate(ctx, r.config.editModelSave(providerID, modelID, patch))
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
 	// The edit's candidate check already proved the saved model is a member
 	// of this candidate's catalog.
-	prov := candidate.catalog.Providers[providerID]
+	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ModelMutation{
-		ConfigurationRevision: configurationRevision(candidate),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Result:                projectModelView(prov, prov.Models[modelID]),
 	}, nil
 }
@@ -323,12 +337,12 @@ func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (
 		return protocol.DeletionMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editModelDelete(providerID, modelID))
+	captured, err := r.config.mutate(ctx, r.config.editModelDelete(providerID, modelID))
 	if err != nil {
 		return protocol.DeletionMutation{}, err
 	}
 	return protocol.DeletionMutation{
-		ConfigurationRevision: configurationRevision(candidate),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Result:                nil,
 	}, nil
 }
@@ -342,15 +356,15 @@ func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID strin
 		return protocol.ModelMutation{}, err
 	}
 	defer release()
-	candidate, err := r.config.mutate(ctx, r.config.editModelFieldReset(providerID, modelID, field))
+	captured, err := r.config.mutate(ctx, r.config.editModelFieldReset(providerID, modelID, field))
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
 	// The edit's candidate check already proved the reset model is a member
 	// of this candidate's catalog.
-	prov := candidate.catalog.Providers[providerID]
+	prov := captured.snapshot.catalog.Providers[providerID]
 	return protocol.ModelMutation{
-		ConfigurationRevision: configurationRevision(candidate),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
 		Result:                projectModelView(prov, prov.Models[modelID]),
 	}, nil
 }
@@ -369,37 +383,39 @@ func capturedProvider(captured *configuration, providerID string) (*catalog.Prov
 	return prov, nil
 }
 
-// liveEnvIsSet is the shared live connection sample: LoadDotEnv already ran
-// at startup, so a plain non-empty Getenv covers both shell-exported and
-// .env-managed keys. It is presentation only.
-func liveEnvIsSet(name string) bool {
-	return os.Getenv(name) != ""
+// capturedEnvIsSet is the one captured credential predicate: a provider
+// connection decision reads the nonemptiness of the value sampled with its
+// own capture, never a live environment getter.
+func capturedEnvIsSet(credentials map[string]config.EnvValue) func(string) bool {
+	return func(name string) bool {
+		return credentials[name].Value != ""
+	}
 }
 
 // projectProviders projects every effective provider view, sorted by ID.
-func projectProviders(captured *configuration, env *config.ManagedEnv) []protocol.Provider {
-	ids := make([]string, 0, len(captured.catalog.Providers))
-	for id := range captured.catalog.Providers {
+func projectProviders(captured configurationCapture) []protocol.Provider {
+	ids := make([]string, 0, len(captured.snapshot.catalog.Providers))
+	for id := range captured.snapshot.catalog.Providers {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	out := make([]protocol.Provider, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, projectProvider(captured, env, captured.catalog.Providers[id]))
+		out = append(out, projectProvider(captured, captured.snapshot.catalog.Providers[id]))
 	}
 	return out
 }
 
 // projectProvider maps one effective catalog provider onto its generated
 // view: the effective and user headers projected separately under the
-// no-authorization response contract, the key-source classification from the
-// live environment and the retained managed set, and the connection,
-// disconnect, removal, and connect-readiness labels. These are labels, never
-// values: no key value appears.
-func projectProvider(captured *configuration, env *config.ManagedEnv, prov *catalog.Provider) protocol.Provider {
-	connected := catalog.ProviderConnected(prov, liveEnvIsSet)
-	keySource := classifyKeySource(prov.Transport.APIKeyEnv, env)
-	generated := generatedAPIKeyEnvName(prov.ID, captured.catalog)
+// no-authorization response contract, the key-source classification and the
+// connection/operation labels from the capture's own credential sample, and
+// the generated env name over the capture's own catalog. These are labels,
+// never values: no key value appears.
+func projectProvider(captured configurationCapture, prov *catalog.Provider) protocol.Provider {
+	connected := catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials))
+	keySource := classifyKeySource(prov.Transport.APIKeyEnv, captured.credentials)
+	generated := generatedAPIKeyEnvName(prov.ID, captured.snapshot.catalog)
 	return protocol.Provider{
 		ApiKeyEnv:        prov.Transport.APIKeyEnv,
 		BaseUrl:          prov.Transport.BaseURL,
@@ -421,7 +437,7 @@ func projectProvider(captured *configuration, env *config.ManagedEnv, prov *cata
 		Removable:        !prov.Builtin && (keySource == config.KeySourceKeyless || !connected),
 		SystemRole:       protocol.SystemRole(prov.SystemRole),
 		UsageInStream:    prov.UsageInStream,
-		UserHeaders:      captured.userHeaders(prov.ID, prov.Builtin),
+		UserHeaders:      captured.snapshot.userHeaders(prov.ID, prov.Builtin),
 		ProtocolMetadata: projectProtocolMetadata(prov.ProtocolMetadata),
 	}
 }
@@ -640,11 +656,16 @@ func stripCredentialHeaders(headers map[string]string) map[string]string {
 }
 
 // classifyKeySource classifies one provider's credential through the shared
-// classifier with the retained managed-set semantics: a shell-exported key
-// beats .env, a key Lightcode loaded stays managed.
-func classifyKeySource(apiKeyEnv string, env *config.ManagedEnv) string {
-	managed := func(name string) bool { return env.IsManaged(name) }
-	external := func(name string) bool { return os.Getenv(name) != "" && !managed(name) }
+// classifier over the capture's own observation: a defined unmanaged value is
+// external regardless of emptiness — a defined-but-empty external variable
+// supplies no credential but stays external — and managed membership comes
+// from the managed set; neither is reread live.
+func classifyKeySource(apiKeyEnv string, credentials map[string]config.EnvValue) string {
+	managed := func(name string) bool { return credentials[name].Managed }
+	external := func(name string) bool {
+		value := credentials[name]
+		return value.Defined && !value.Managed
+	}
 	return config.ClassifyKeySource(apiKeyEnv, external, managed)
 }
 

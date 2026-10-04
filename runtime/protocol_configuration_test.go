@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -324,6 +326,130 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 			t.Fatalf("worker roster entry = %+v, want the public definition fields with the trimmed write dir", worker)
 		}
 	})
+}
+
+// TestConfigurationReadsRemainAvailableDuringParkedBuild parks a reload build
+// inside a compiled plugin's validator and reads the ready revision through
+// the same owner: a slow candidate build must not hold the publication/capture
+// path, so the ready snapshot, its credential sample, and its revision stay
+// available until the new generation publishes.
+func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
+	store := storage.NewMemory()
+	var armed atomic.Bool
+	gated := make(chan struct{}, 1)
+	ungate := make(chan struct{})
+	releaseGate := sync.OnceFunc(func() { close(ungate) })
+	var opens atomic.Int64
+	gate := servicePlugin("gate", &opens, func(json.RawMessage) error {
+		if !armed.Load() {
+			return nil
+		}
+		select {
+		case gated <- struct{}{}:
+		default:
+		}
+		<-ungate
+		return nil
+	})
+	r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, append(settingsPlugins(), gate)...)
+	defer func() {
+		releaseGate()
+		closeProjectionRuntime(r)
+	}()
+
+	armed.Store(true)
+	reloadDone := make(chan error, 1)
+	go func() {
+		_, err := r.Reload(context.Background())
+		reloadDone <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reload never reached the parked validator")
+	}
+
+	view, err := r.getConfiguration(context.Background())
+	if err != nil {
+		t.Fatalf("read during a parked build: %v", err)
+	}
+	if view.ConfigurationRevision.Generation != "1" {
+		t.Fatalf("read during a parked build = generation %s, want the ready generation 1", view.ConfigurationRevision.Generation)
+	}
+	releaseGate()
+	if err := <-reloadDone; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	after, err := r.getConfiguration(context.Background())
+	if err != nil || after.ConfigurationRevision.Generation != "2" {
+		t.Fatalf("read after the reload = (%v, generation %s), want generation 2", err, after.ConfigurationRevision.Generation)
+	}
+}
+
+// definedEmptyProvidersDocument is the classifier fixture: a defined-but-empty
+// external key, an absent key, a managed-empty key, and one connected keyless
+// sibling that proves the picker still includes the connected set.
+const definedEmptyProvidersDocument = `{
+  "providers": {
+    "emptyext": {"transport": {"base_url": "https://empty.test/v1", "api_key_env": "EMPTY_EXT_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+    "absent": {"transport": {"base_url": "https://absent.test/v1", "api_key_env": "ABSENT_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+    "managedempty": {"transport": {"base_url": "https://managedempty.test/v1", "api_key_env": "MANAGED_EMPTY_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+    "live": {"transport": {"base_url": "https://live.test/v1", "api_key_env": ""}, "discovery": false, "models": {"m": {"context_window": 4096}}}
+  }
+}`
+
+// TestConfigurationDefinedEmptyExternalKeySource pins the classifier rule: a
+// defined-but-empty external variable is external even though it supplies no
+// credential, so the provider stays disconnected and excluded from the
+// picker; the nearest siblings stay absent=none and managed-empty=managed.
+func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
+	store := storage.NewMemory()
+	unsetenv(t, "EMPTY_EXT_TEST_KEY", "ABSENT_TEST_KEY", "MANAGED_EMPTY_TEST_KEY")
+	t.Setenv("EMPTY_EXT_TEST_KEY", "")
+	e := newOwnerEnv(t)
+	writeDotEnv(t, e.home, "MANAGED_EMPTY_TEST_KEY=\n")
+	r, _ := openConfigurationRuntimeWithEnv(t, store, e, definedEmptyProvidersDocument, `{"solo":{"model":"live/m"}}`, settingsPlugins()...)
+	defer closeProjectionRuntime(r)
+	ctx := context.Background()
+
+	view, err := r.getConfiguration(ctx)
+	if err != nil {
+		t.Fatalf("getConfiguration: %v", err)
+	}
+	for _, row := range []struct {
+		id        string
+		source    string
+		connected bool
+	}{
+		{"emptyext", "external", false},
+		{"absent", "none", false},
+		{"managedempty", "managed", false},
+		{"live", "keyless", true},
+	} {
+		prov := findProvider(view.Providers, row.id)
+		if prov.Id != row.id {
+			t.Fatalf("%s view missing: %+v", row.id, prov)
+		}
+		if string(prov.KeySource) != row.source || prov.Connected != row.connected {
+			t.Fatalf("%s = key_source %q connected %v, want %q/%v",
+				row.id, prov.KeySource, prov.Connected, row.source, row.connected)
+		}
+	}
+
+	models, err := r.listModels(ctx, protocol.ListModelsParams{All: true})
+	if err != nil {
+		t.Fatalf("listModels: %v", err)
+	}
+	included := map[string]bool{}
+	for _, entry := range models.Models {
+		included[entry.Provider] = true
+	}
+	if included["emptyext"] || included["absent"] || included["managedempty"] {
+		t.Fatalf("the picker includes disconnected providers: %v", included)
+	}
+	if !included["live"] {
+		t.Fatalf("the picker excludes the connected keyless provider: %v", included)
+	}
 }
 
 // TestConfigurationModelPickerConnectedRules pins the flat picker: both the

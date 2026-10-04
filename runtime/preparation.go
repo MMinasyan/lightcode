@@ -45,6 +45,12 @@ type selection struct {
 	bindings   Bindings
 	invocation Invocation
 
+	// credentials is the preparation's one captured credential observation
+	// set, sampled with the same capture as the Invocation's snapshot: the
+	// concrete preparation resolves its transport secrets from it, and no
+	// value leaves the prepared opener or the durable capture.
+	credentials map[string]config.EnvValue
+
 	// warnings is the per-preparation private presentation collector: the
 	// concrete preparation assigns the assembled prompt warnings into it and
 	// the binder publishes them under the admitted Session identity only
@@ -183,7 +189,14 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 // admission with no partial consequence published.
 func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 	return func(ctx context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
-		snapshot := p.config.current()
+		// Configuration and the credentials its catalog references are one
+		// owner-coherent capture: the selected model, its transport secret,
+		// and the revision all belong to the same ready pair.
+		captured, err := p.config.capture(ctx)
+		if err != nil {
+			return harness.PreparedExecution{}, err
+		}
+		snapshot := captured.snapshot
 		if snapshot == nil {
 			return harness.PreparedExecution{}, fmt.Errorf("agent type %q has no published configuration: %w", req.Session.AgentType, harness.ErrInvalid)
 		}
@@ -200,7 +213,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			return harness.PreparedExecution{}, err
 		}
 		bindings := p.preparationBindings(workspaceScope, agent.Capabilities)
-		sel := selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}}
+		sel := selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
 		if err != nil {
@@ -394,7 +407,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	}
 	apiKey := ""
 	if env := provider.Transport.APIKeyEnv; env != "" {
-		apiKey = os.Getenv(env)
+		apiKey = sel.credentials[env].Value
 		if apiKey == "" {
 			return harness.ExecutionCapture{}, nil, fmt.Errorf("%w: %s (for provider %q): %w", config.ErrMissingEnvVar, env, provider.ID, harness.ErrInvalid)
 		}
@@ -427,7 +440,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 			keyMissing := false
 			compactKey := ""
 			if env := compactProvider.Transport.APIKeyEnv; env != "" {
-				compactKey = os.Getenv(env)
+				compactKey = sel.credentials[env].Value
 				keyMissing = compactKey == ""
 			}
 			if !keyMissing {

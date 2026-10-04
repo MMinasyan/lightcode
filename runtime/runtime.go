@@ -446,7 +446,7 @@ func (r *Runtime) Reload(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strconv.FormatUint(snapshot.generation, 10), nil
+	return strconv.FormatUint(snapshot.snapshot.generation, 10), nil
 }
 
 // Close starts (or joins) the one shared managed shutdown and waits for it.

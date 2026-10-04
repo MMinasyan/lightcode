@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -19,10 +18,11 @@ import (
 // disconnect of existing providers, the custom-provider discovery read, and
 // the provider-model discovery read. The two writes route through the one
 // configuration mutation path — the connect's needed discovery is fetched
-// outside every lock, revalidated against the live published identity inside
-// the build hold, and persisted only after the ready candidate validates;
-// the discovery reads fetch under the retained 30-second timeout and write
-// nothing. No key value ever reaches a status, error, observation, or log.
+// outside every lock, revalidated against the mutation's captured published
+// identity inside the build hold, and persisted only after the ready
+// candidate validates; the discovery reads fetch under the retained
+// 30-second timeout and write nothing. No key value ever reaches a status,
+// error, observation, or log.
 
 // connectDiscoveryTimeout bounds connect-time and discovery-read HTTP calls
 // so a stalled endpoint cannot hold an admitted call indefinitely.
@@ -53,8 +53,11 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	captured := r.config.current()
-	prov, err := capturedProvider(captured, providerID)
+	captured, err := r.config.capture(ctx)
+	if err != nil {
+		return protocol.ProviderMutation{}, err
+	}
+	prov, err := capturedProvider(captured.snapshot, providerID)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
@@ -72,9 +75,9 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 	var fetchKey string
 	if envName != "" {
 		// Every keyed provider — usable or not — resolves its credential
-		// through the one retained rule. A usable provider still runs no
-		// discovery and no key probe.
-		key, persist, err := resolveConnectKey(envName, optionalKey, r.managedEnv)
+		// through the one retained rule over the capture's own observation.
+		// A usable provider still runs no discovery and no key probe.
+		key, persist, err := resolveConnectKey(envName, optionalKey, captured.credentials[envName])
 		if err != nil {
 			return protocol.ProviderMutation{}, configurationFailure(err)
 		}
@@ -92,13 +95,13 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 		}
 		plan.discovered = &discovered
 	}
-	candidate, err := r.config.mutate(ctx, r.config.editProviderConnect(plan))
+	result, err := r.config.mutate(ctx, r.config.editProviderConnect(plan))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	return protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, r.managedEnv, candidate.catalog.Providers[prov.ID]),
+		ConfigurationRevision: configurationRevision(result.snapshot),
+		Result:                projectProvider(result, result.snapshot.catalog.Providers[prov.ID]),
 	}, nil
 }
 
@@ -116,13 +119,13 @@ func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (pr
 	}
 	defer release()
 	plan := &connectionEffects{providerID: providerID}
-	candidate, err := r.config.mutate(ctx, r.config.editProviderDisconnect(providerID, plan))
+	captured, err := r.config.mutate(ctx, r.config.editProviderDisconnect(providerID, plan))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	return protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, r.managedEnv, candidate.catalog.Providers[providerID]),
+		ConfigurationRevision: configurationRevision(captured.snapshot),
+		Result:                projectProvider(captured, captured.snapshot.catalog.Providers[providerID]),
 	}, nil
 }
 
@@ -130,8 +133,8 @@ func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (pr
 // read over the request's transport shape — no cache write, no attempt
 // marker, no env write, no configuration write — returning the sorted
 // candidates. The contract carries no key value: the referenced env name is
-// read live, and a set-but-empty value fails uniformly with the connect
-// path's rule.
+// sampled once through the environment owner, and a defined-but-empty value
+// fails uniformly with the connect path's rule.
 func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRequest) ([]protocol.DiscoveredModelCandidate, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -151,11 +154,12 @@ func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRe
 	}
 	key := ""
 	if envName := strings.TrimSpace(req.ApiKeyEnv); envName != "" {
-		if external, exists := os.LookupEnv(envName); exists {
-			if external == "" {
+		observed := r.managedEnv.Capture([]string{envName})[envName]
+		if observed.Defined {
+			if observed.Value == "" {
 				return nil, configurationFailure(fmt.Errorf("provider env var %s is externally set but empty", envName))
 			}
-			key = external
+			key = observed.Value
 		}
 	}
 	discovered, err := connectFetchDiscovery(ctx, "custom", catalog.Transport{BaseURL: baseURL, Headers: headers}, key)
@@ -166,20 +170,28 @@ func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRe
 }
 
 // discoverProviderModels is one published provider's model-discovery read:
-// the captured current transport resolves its credential live during the
-// fetch, nothing is written, and the returned sorted candidates exclude the
-// provider's already-included usable model IDs.
+// the capture's own transport and credential sample bind one transient fetch
+// transport before HTTP, nothing is written, and the returned sorted
+// candidates exclude the provider's already-included usable model IDs.
 func (r *Runtime) discoverProviderModels(ctx context.Context, providerID string) ([]protocol.DiscoveredModelCandidate, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	prov, err := capturedProvider(r.config.current(), providerID)
+	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return nil, err
 	}
-	discovered, err := discoveryFetch(ctx, prov)
+	prov, err := capturedProvider(captured.snapshot, providerID)
+	if err != nil {
+		return nil, err
+	}
+	key := ""
+	if env := prov.Transport.APIKeyEnv; env != "" {
+		key = captured.credentials[env].Value
+	}
+	discovered, err := connectFetchDiscovery(ctx, prov.ID, prov.Transport, key)
 	if err != nil {
 		return nil, err
 	}
@@ -200,12 +212,12 @@ func (r *Runtime) discoverProviderModels(ctx context.Context, providerID string)
 // model window included — refuses even when no discovery was fetched.
 func (s *configurationService) editProviderConnect(plan *connectionEffects) configurationEdit {
 	return configurationEdit{
-		apply: func(rawRoots) (editedFile, error) {
+		apply: func(rawRoots, configurationCapture) (editedFile, error) {
 			return editConnection, nil
 		},
 		connection: plan,
-		check: func(c *configuration) error {
-			if err := checkConnectionCandidate(s, plan, c); err != nil {
+		check: func(c *configuration, captured configurationCapture) error {
+			if err := checkConnectionCandidate(captured.snapshot, plan, c); err != nil {
 				return err
 			}
 			if cand := c.catalog.Providers[plan.providerID]; usableModelCount(cand) == 0 {
@@ -218,15 +230,15 @@ func (s *configurationService) editProviderConnect(plan *connectionEffects) conf
 
 // editProviderDisconnect builds the existing-provider disconnect edit: the
 // whole resolution runs inside the build hold — there is no out-of-lock
-// work to gate — filling the plan's key action from the live published
+// work to gate — filling the plan's key action from the captured published
 // provider's actual ownership. Disconnect owns no file and publishes the
 // latest raw layer, so its check only proves the touched provider still
 // exists in the ready candidate; the published binding, not the latest raw
 // transport, decides which key is removed.
 func (s *configurationService) editProviderDisconnect(providerID string, plan *connectionEffects) configurationEdit {
 	return configurationEdit{
-		apply: func(rawRoots) (editedFile, error) {
-			prov, err := capturedProvider(s.current(), providerID)
+		apply: func(_ rawRoots, captured configurationCapture) (editedFile, error) {
+			prov, err := capturedProvider(captured.snapshot, providerID)
 			if err != nil {
 				return 0, err
 			}
@@ -235,9 +247,10 @@ func (s *configurationService) editProviderDisconnect(providerID string, plan *c
 				return 0, invalidEdit("provider %q is keyless; remove it instead", providerID)
 			}
 			plan.providerID = providerID
-			if s.env != nil && s.env.IsManaged(envName) {
+			observed := captured.credentials[envName]
+			if observed.Managed {
 				plan.keyAction, plan.keyEnv = keyActionRemove, envName
-			} else if os.Getenv(envName) != "" {
+			} else if observed.Value != "" {
 				return 0, configurationFailure(fmt.Errorf("provider %q is connected via environment; unset %s outside Lightcode", providerID, envName))
 			}
 			// An absent unmanaged key: nothing to remove; the disconnect
@@ -245,25 +258,26 @@ func (s *configurationService) editProviderDisconnect(providerID string, plan *c
 			return editConnection, nil
 		},
 		connection: plan,
-		check: func(c *configuration) error {
+		check: func(c *configuration, _ configurationCapture) error {
 			return requireCandidateProvider(c, providerID)
 		},
 	}
 }
 
-// checkConnectionCandidate revalidates the connect against the live
-// published identity and the ready candidate, before any side effect: the
-// provider must still exist, and its live and candidate transports must both
-// match the phase-1 identity under catalog identity — so a latest raw layer
-// that dropped the provider or changed the transport cannot be published as
-// a successful connection. It is connect-only; disconnect resolves its key
-// action from the published binding and proves candidate presence alone.
-func checkConnectionCandidate(s *configurationService, plan *connectionEffects, candidate *configuration) error {
-	live := s.current().catalog.Providers[plan.providerID]
-	if live == nil {
+// checkConnectionCandidate revalidates the connect against the mutation's
+// captured published identity and the ready candidate, before any side
+// effect: the provider must still exist, and its captured and candidate
+// transports must both match the phase-1 identity under catalog identity — so
+// a latest raw layer that dropped the provider or changed the transport
+// cannot be published as a successful connection. It is connect-only;
+// disconnect resolves its key action from the captured binding and proves
+// candidate presence alone.
+func checkConnectionCandidate(live *configuration, plan *connectionEffects, candidate *configuration) error {
+	liveProvider := live.catalog.Providers[plan.providerID]
+	if liveProvider == nil {
 		return fmt.Errorf("provider %q not found", plan.providerID)
 	}
-	if !catalog.SameTransport(plan.transport, live.Transport) {
+	if !catalog.SameTransport(plan.transport, liveProvider.Transport) {
 		return fmt.Errorf("provider %s changed while connecting; retry", plan.providerID)
 	}
 	cand := candidate.catalog.Providers[plan.providerID]
@@ -276,27 +290,26 @@ func checkConnectionCandidate(s *configurationService, plan *connectionEffects, 
 	return nil
 }
 
-// resolveConnectKey applies the retained phase-1 credential resolution for a
-// needed connect fetch: a key Lightcode manages is used — updated only by a
-// supplied nonempty value — an external shell key wins and is never
-// persisted, a set-but-empty external value fails uniformly, and an unset
-// key requires a supplied value.
-func resolveConnectKey(envName string, optionalKey *string, env *config.ManagedEnv) (key string, persist bool, err error) {
-	if env != nil && env.IsManaged(envName) {
+// resolveConnectKey applies the retained phase-1 credential resolution over
+// one captured environment observation: a key Lightcode manages is used —
+// updated only by a supplied nonempty value — an external defined key wins
+// and is never persisted, a defined-but-empty value fails uniformly, and an
+// absent key requires a supplied value.
+func resolveConnectKey(envName string, optionalKey *string, observed config.EnvValue) (key string, persist bool, err error) {
+	if observed.Managed {
 		if optionalKey != nil && *optionalKey != "" {
 			return *optionalKey, true, nil
 		}
-		key = os.Getenv(envName)
-		if key == "" {
+		if observed.Value == "" {
 			return "", false, fmt.Errorf("provider requires API key env var %s", envName)
 		}
-		return key, false, nil
+		return observed.Value, false, nil
 	}
-	if external, exists := os.LookupEnv(envName); exists {
-		if external == "" {
+	if observed.Defined {
+		if observed.Value == "" {
 			return "", false, fmt.Errorf("provider env var %s is externally set but empty", envName)
 		}
-		return external, false, nil
+		return observed.Value, false, nil
 	}
 	if optionalKey == nil || *optionalKey == "" {
 		return "", false, fmt.Errorf("provider requires API key env var %s", envName)

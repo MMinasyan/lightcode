@@ -136,7 +136,7 @@ func TestConfigurationServiceProjectsDefaultCapabilities(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 	want := []string{"model_adaptation"}
-	for _, def := range snapshot.definitions {
+	for _, def := range snapshot.snapshot.definitions {
 		switch def.Name {
 		case "clear":
 			if def.Capabilities != nil {

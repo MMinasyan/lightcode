@@ -9,6 +9,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -259,8 +260,8 @@ func formatWarningRevision(revision uint64) string {
 // setupWarningKinds are the retained setup diagnostics: no provider is
 // connected, the primary type configures no model, or its model is
 // unavailable because its provider is not connected or the model is
-// incomplete. The connection samples are live-env presentations only, never
-// a second catalog.
+// incomplete. The connection samples come from the candidate's own capture,
+// never a second catalog or a live environment read.
 const (
 	setupNoProviderKind      = "setup_no_provider"
 	setupNoProviderMessage   = "No provider connected — configure a provider with credentials and at least one usable model."
@@ -270,14 +271,15 @@ const (
 	unavailableModelTemplate = "Configured model %q is unavailable because its provider is not connected or the model is incomplete."
 )
 
-// setupWarnings derives the setup group from one published candidate under
-// the retained rules: any connected provider clears no_provider, and the
-// primary definition's configured model must resolve to a usable
-// (positive-window) model of a connected provider. The connection samples
-// are live-env presentations only, never a second catalog.
-func setupWarnings(c *configuration) []protocol.Warning {
+// setupWarnings derives the setup group from one published candidate and its
+// frozen credential observations under the retained rules: any connected
+// provider clears no_provider, and the primary definition's configured model
+// must resolve to a usable (positive-window) model of a connected provider.
+// The connection samples come from the candidate's own capture, never a live
+// environment read.
+func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []protocol.Warning {
 	connected := func(prov *catalog.Provider) bool {
-		return catalog.ProviderConnected(prov, liveEnvIsSet)
+		return catalog.ProviderConnected(prov, capturedEnvIsSet(credentials))
 	}
 	var out []protocol.Warning
 	anyConnected := false

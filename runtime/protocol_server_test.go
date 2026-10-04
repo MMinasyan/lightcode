@@ -705,6 +705,153 @@ func TestProtocolServerHistoryRoundTripsOpaqueNumbers(t *testing.T) {
 	})
 }
 
+// readRawBody reads one response's complete raw bytes and closes it.
+func readRawBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read raw response body: %v", err)
+	}
+	return string(data)
+}
+
+// TestProtocolServerCredentialFlowRawWireSecretFree scans the raw mounted HTTP
+// success and refusal bodies, the raw notification frames, and the real
+// process stderr sink across a successful managed-key publication and a real
+// credential-bearing refusal. Typed re-marshalling and in-process events are
+// not substitutes for these raw oracles.
+func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		reserveEnvKey(t, "RAW_SCAN_KEY")
+		reserveEnvKey(t, "RAW_NUL_KEY")
+		const secret = "sk-raw-wire-secret"
+		const nulSecret = "sk-raw\x00-refused"
+		stderr := captureSweepStderr(t)
+		e := newOwnerEnv(t)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+		// One malformed line makes the startup LoadDotEnv diagnostic run, so
+		// the captured stderr sink is genuinely exercised before the scan.
+		writeDotEnv(t, e.home, "MALFORMED LINE\n")
+		r, err := e.open(context.Background(), e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		stream := openSSEStream(t, ps)
+		defer stream.close()
+
+		window := 4096
+		// scanFrames reads raw notification frames until one
+		// configuration_changed witness, scanning every frame for the key.
+		scanFrames := func(what string) {
+			t.Helper()
+			observed := false
+			for i := 0; i < 4; i++ {
+				frame, ok, err := stream.readSSEFrame()
+				if err != nil || !ok {
+					break
+				}
+				if strings.Contains(string(frame), secret) {
+					t.Fatalf("a raw %s notification frame carries the credential value: %s", what, frame)
+				}
+				if bytes.Contains(frame, []byte(`"configuration_changed"`)) {
+					observed = true
+					break
+				}
+			}
+			if !observed {
+				t.Fatalf("no raw configuration_changed frame was observed for %s", what)
+			}
+		}
+		createBody, err := json.Marshal(protocol.CreateProviderRequest{
+			Id: "rawscan",
+			Provider: protocol.ProviderEdit{
+				BaseUrl:   ptrTo("https://rawscan.test/v1"),
+				ApiKeyEnv: ptrTo("RAW_SCAN_KEY"),
+			},
+			Models: map[string]protocol.ModelEdit{"m": {ContextWindow: &window}},
+			ApiKey: ptrTo(secret),
+		})
+		if err != nil {
+			t.Fatalf("encode create: %v", err)
+		}
+
+		// Successful credential publication: raw response body and witness.
+		resp := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers"), ps.credential, string(createBody))
+		successBody := readRawBody(t, resp)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(successBody, `"rawscan"`) {
+			t.Fatalf("raw create = %d: %s", resp.StatusCode, successBody)
+		}
+		if strings.Contains(successBody, secret) {
+			t.Fatalf("the raw create response carries the credential value: %s", successBody)
+		}
+		scanFrames("create")
+
+		// Real connect response and its raw witness over the same key.
+		connectBody, err := json.Marshal(protocol.ConnectRequest{ApiKey: ptrTo(secret)})
+		if err != nil {
+			t.Fatalf("encode connect: %v", err)
+		}
+		connectResp := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers/connect?provider_id=rawscan"), ps.credential, string(connectBody))
+		connectBytes := readRawBody(t, connectResp)
+		if connectResp.StatusCode != http.StatusOK || !strings.Contains(connectBytes, `"connected":true`) || !strings.Contains(connectBytes, `"key_source":"managed"`) {
+			t.Fatalf("raw connect = %d: %s", connectResp.StatusCode, connectBytes)
+		}
+		if strings.Contains(connectBytes, secret) {
+			t.Fatalf("the raw connect response carries the credential value: %s", connectBytes)
+		}
+		scanFrames("connect")
+
+		// Real disconnect response and its raw witness over the same key.
+		disconnectResp := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers/disconnect?provider_id=rawscan"), ps.credential, "")
+		disconnectBytes := readRawBody(t, disconnectResp)
+		if disconnectResp.StatusCode != http.StatusOK || !strings.Contains(disconnectBytes, `"connected":false`) {
+			t.Fatalf("raw disconnect = %d: %s", disconnectResp.StatusCode, disconnectBytes)
+		}
+		if strings.Contains(disconnectBytes, secret) {
+			t.Fatalf("the raw disconnect response carries the credential value: %s", disconnectBytes)
+		}
+		scanFrames("disconnect")
+
+		// Real credential-bearing refusal: the NUL value fails the native
+		// env-value preflight after the owning config write and its rollback,
+		// and the raw typed refusal body must not echo it.
+		refusalBody, err := json.Marshal(protocol.CreateProviderRequest{
+			Id: "rawnul",
+			Provider: protocol.ProviderEdit{
+				BaseUrl:   ptrTo("https://rawnul.test/v1"),
+				ApiKeyEnv: ptrTo("RAW_NUL_KEY"),
+			},
+			Models: map[string]protocol.ModelEdit{"m": {ContextWindow: &window}},
+			ApiKey: ptrTo(nulSecret),
+		})
+		if err != nil {
+			t.Fatalf("encode refusal: %v", err)
+		}
+		refused := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers"), ps.credential, string(refusalBody))
+		refusalBytes := readRawBody(t, refused)
+		if refused.StatusCode == http.StatusOK || !strings.Contains(refusalBytes, `"configuration"`) {
+			t.Fatalf("raw refusal = %d: %s", refused.StatusCode, refusalBytes)
+		}
+		escaped := strings.ReplaceAll(nulSecret, "\x00", `\u0000`)
+		if strings.Contains(refusalBytes, nulSecret) || strings.Contains(refusalBytes, escaped) {
+			t.Fatalf("the raw refusal body carries the credential value: %s", refusalBytes)
+		}
+
+		// The real process logging sink exercised by the flow: the startup
+		// diagnostic ran, and no credential value reached the sink.
+		logged := stderr()
+		if !strings.Contains(logged, "skipping malformed line") {
+			t.Fatalf("the startup logging path did not run; captured stderr = %q", logged)
+		}
+		if strings.Contains(logged, secret) || strings.Contains(logged, nulSecret) {
+			t.Fatalf("stderr carries a credential value: %q", logged)
+		}
+	})
+}
+
 // TestProtocolServerConfigurationFamily drives the configuration, model, and
 // provider operation families through the mounted server with the generated
 // client: reads carry their instance-qualified revision, the mutation

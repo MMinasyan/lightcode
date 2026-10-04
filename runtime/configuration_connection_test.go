@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +21,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -209,6 +212,26 @@ func assertNoConnectionPublication(t *testing.T, r *Runtime, sub *Subscription, 
 	}
 	assertNoEvent(t, sub)
 	assertConnectionEnvSilent(t, r)
+}
+
+// assertFollowUpEditProvesReleasedOwnership runs one ordinary edit after a
+// failed writer and fails unless it publishes: a leaked build or capture
+// ownership would wedge it on a mutex instead.
+func assertFollowUpEditProvesReleasedOwnership(t *testing.T, r *Runtime, providerID string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.updateProvider(context.Background(), providerID, protocol.ProviderEdit{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("follow-up edit after the failed writer: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failed writer leaked publication ownership")
+	}
 }
 
 // drainConnectionEvent consumes exactly the events a single completed
@@ -1020,6 +1043,7 @@ func TestConnectProviderCacheContentionRefuses(t *testing.T) {
 		if rerr != nil || string(envAfter) != string(envBefore) {
 			t.Fatalf("cache contention reached the key write (%v)", rerr)
 		}
+		assertFollowUpEditProvesReleasedOwnership(t, r, "usablep")
 	})
 }
 
@@ -1109,7 +1133,7 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 	})
 }
 
-func TestConnectProviderPartialNULSetenvFailure(t *testing.T) {
+func TestConnectProviderNULKeyRefusedWithoutFileEffect(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
 		r, _ := openConnectionRuntime(t, store, server.URL)
@@ -1121,19 +1145,25 @@ func TestConnectProviderPartialNULSetenvFailure(t *testing.T) {
 		}
 		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
+		envBefore, err := os.ReadFile(r.managedEnv.Path())
+		if err != nil {
+			t.Fatalf("read .env: %v", err)
+		}
 
-		// The NUL value passes the supplied-key checks; os.Setenv refuses it
-		// hook-free after the .env line is written — the honest partial
-		// state, never a rollback claim.
+		// The NUL value fails the native env-value preflight before any
+		// owning env-file write: no line, no Setenv, no managed membership.
 		broken := "sk-\x00-broken"
 		_, err = r.connectProvider(ctx, "usablep", &broken)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		if os.Getenv("CONNECTION_USABLE_KEY") != "" || r.managedEnv.IsManaged("CONNECTION_USABLE_KEY") {
-			t.Fatal("the failed Setenv left env state behind")
+			t.Fatal("the refused NUL write left env state behind")
 		}
-		envData, rerr := os.ReadFile(r.managedEnv.Path())
-		if rerr != nil || !strings.Contains(string(envData), "CONNECTION_USABLE_KEY=") {
-			t.Fatalf(".env after the partial failure = (%q, %v), want the written line kept", envData, rerr)
+		envAfter, rerr := os.ReadFile(r.managedEnv.Path())
+		if rerr != nil || string(envAfter) != string(envBefore) {
+			t.Fatalf(".env after the NUL refusal = (%q, %v), want the exact prior bytes", envAfter, rerr)
+		}
+		if strings.Contains(err.Error(), broken) {
+			t.Fatal("the refusal error carries the key value")
 		}
 	})
 }
@@ -1340,6 +1370,303 @@ func TestDisconnectProviderManagedKey(t *testing.T) {
 			t.Fatalf("disconnect changed the owning config (%v)", err)
 		}
 	})
+}
+
+// awaitStackMatch polls the process stacks until one stack satisfies match,
+// bounding the wait so a missing owner wait fails fast.
+func awaitStackMatch(t *testing.T, what string, match func(string) bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		stacks := string(buf[:goruntime.Stack(buf, true)])
+		for _, stack := range strings.Split(stacks, "\n\n") {
+			if match(stack) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reached its owner wait", what)
+		}
+		goruntime.Gosched()
+	}
+}
+
+// awaitProviderQueryOwnerWait waits until the running provider query is
+// blocked on the credential owner: the baseline composed projection's
+// managed-environment wait or the corrected configuration-capture wait. Both
+// signatures are retained so the overlap oracle discriminates either
+// implementation.
+func awaitProviderQueryOwnerWait(t *testing.T) {
+	awaitStackMatch(t, "the provider query", func(stack string) bool {
+		if !strings.Contains(stack, "(*Runtime).getProvider") {
+			return false
+		}
+		return strings.Contains(stack, "(*ManagedEnv).IsManaged") || strings.Contains(stack, "configurationService).capture")
+	})
+}
+
+// awaitConfigurationCaptureWait waits until one admission is blocked on the
+// configuration service's capture mutex — the genuine owner wait a writer's
+// parked publication produces, not a timing inference.
+func awaitConfigurationCaptureWait(t *testing.T) {
+	awaitStackMatch(t, "the admission", func(stack string) bool {
+		return strings.Contains(stack, "(*configurationService).capture") && strings.Contains(stack, "sync.(*Mutex).Lock")
+	})
+}
+
+// assertEventStreamSecretFree drains one subscription and proves no event
+// body carries the credential value.
+func assertEventStreamSecretFree(t *testing.T, sub *Subscription, secret string) {
+	t.Helper()
+drain:
+	for {
+		select {
+		case event, ok := <-sub.Events():
+			if !ok {
+				break drain
+			}
+			body, err := event.MarshalJSON()
+			if err != nil {
+				t.Fatalf("event body: %v", err)
+			}
+			if strings.Contains(string(body), secret) {
+				t.Fatalf("an event carries the credential value: %s", body)
+			}
+		default:
+			break drain
+		}
+	}
+}
+
+// TestConnectProviderOverlappingReadSeesPublishedPair parks an accepted
+// managed-key write mid-file, starts one provider read, and releases the
+// writer: the read must observe the published pair — the credential managed
+// and connected under the connect's own generation — never the old revision
+// with the new key. Neither the response nor the event stream carries the
+// key bytes.
+func TestConnectProviderOverlappingReadSeesPublishedPair(t *testing.T) {
+	store := storage.NewMemory()
+	server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
+	r, _ := openConnectionRuntime(t, store, server.URL)
+	defer closeProjectionRuntime(r)
+	ctx := context.Background()
+	sub, err := r.Subscribe(16)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	reserveEnvKey(t, "CONNECTION_USABLE_KEY")
+	probe := installOwningSyncProbe(t, r.managedEnv.Path())
+	defer probe.restore()
+	probe.park = true
+	release := sync.OnceFunc(probe.releaseProbe)
+	defer release()
+
+	type connectResult struct {
+		mutation protocol.ProviderMutation
+		err      error
+	}
+	key := connectionKey
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		mutation, err := r.connectProvider(ctx, "usablep", &key)
+		connectDone <- connectResult{mutation, err}
+	}()
+	probe.awaitWriteStarted(t)
+
+	type readResult struct {
+		view protocol.ProviderDetail
+		err  error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		view, err := r.getProvider(ctx, "usablep")
+		readDone <- readResult{view, err}
+	}()
+	awaitProviderQueryOwnerWait(t)
+	release()
+
+	connect := <-connectDone
+	if connect.err != nil {
+		t.Fatalf("connect: %v", connect.err)
+	}
+	read := <-readDone
+	if read.err != nil {
+		t.Fatal(read.err)
+	}
+	if read.view.Provider.KeySource != protocol.Managed || !read.view.Provider.Connected {
+		t.Fatalf("overlapping read = source %v connected %v, want the published managed pair",
+			read.view.Provider.KeySource, read.view.Provider.Connected)
+	}
+	if read.view.ConfigurationRevision.Generation != connect.mutation.ConfigurationRevision.Generation {
+		t.Fatalf("overlapping read revision = %s, want the connect's published %s",
+			read.view.ConfigurationRevision.Generation, connect.mutation.ConfigurationRevision.Generation)
+	}
+	if body, _ := json.Marshal(read.view); strings.Contains(string(body), key) {
+		t.Fatal("the provider read carries the credential value")
+	}
+	assertEventStreamSecretFree(t, sub, key)
+}
+
+// TestDisconnectProviderOverlappingReadStaysCoherent parks a managed-key
+// removal mid-file, starts one provider read, and releases the writer: the
+// read must observe one real owner state — the key was managed then removed,
+// never external — and the state and revision it reports must be the
+// writer's published pair, not a composition of live getters.
+func TestDisconnectProviderOverlappingReadStaysCoherent(t *testing.T) {
+	store := storage.NewMemory()
+	server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
+	r, _ := openConnectionRuntime(t, store, server.URL)
+	defer closeProjectionRuntime(r)
+	ctx := context.Background()
+	sub, err := r.Subscribe(16)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	if err := r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"); err != nil {
+		t.Fatalf("seed TrySet: %v", err)
+	}
+	before, err := r.getProvider(ctx, "usablep")
+	if err != nil || before.Provider.KeySource != protocol.Managed || !before.Provider.Connected {
+		t.Fatalf("initial provider = (%v, %+v), want the managed connected state", err, before.Provider)
+	}
+	probe := installOwningSyncProbe(t, r.managedEnv.Path())
+	defer probe.restore()
+	probe.park = true
+	release := sync.OnceFunc(probe.releaseProbe)
+	defer release()
+
+	type disconnectResult struct {
+		mutation protocol.ProviderMutation
+		err      error
+	}
+	disconnectDone := make(chan disconnectResult, 1)
+	go func() {
+		mutation, err := r.disconnectProvider(ctx, "usablep")
+		disconnectDone <- disconnectResult{mutation, err}
+	}()
+	probe.awaitWriteStarted(t)
+
+	type readResult struct {
+		view protocol.ProviderDetail
+		err  error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		view, err := r.getProvider(ctx, "usablep")
+		readDone <- readResult{view, err}
+	}()
+	awaitProviderQueryOwnerWait(t)
+	release()
+
+	disconnect := <-disconnectDone
+	if disconnect.err != nil {
+		t.Fatalf("disconnect: %v", disconnect.err)
+	}
+	read := <-readDone
+	if read.err != nil {
+		t.Fatal(read.err)
+	}
+	if read.view.Provider.KeySource == protocol.External {
+		t.Fatalf("read fabricated external ownership: source %v connected %v; the key was managed then absent, never external",
+			read.view.Provider.KeySource, read.view.Provider.Connected)
+	}
+	if read.view.Provider.KeySource != protocol.None || read.view.Provider.Connected {
+		t.Fatalf("overlapping read = source %v connected %v, want the published removed state",
+			read.view.Provider.KeySource, read.view.Provider.Connected)
+	}
+	if read.view.ConfigurationRevision.Generation != disconnect.mutation.ConfigurationRevision.Generation {
+		t.Fatalf("overlapping read revision = %s, want the disconnect's published %s",
+			read.view.ConfigurationRevision.Generation, disconnect.mutation.ConfigurationRevision.Generation)
+	}
+	after, err := r.getProvider(ctx, "usablep")
+	if err != nil || after.Provider.KeySource != protocol.None || after.Provider.Connected {
+		t.Fatalf("final provider = (%v, %+v), want the removed key", err, after.Provider)
+	}
+	assertEventStreamSecretFree(t, sub, "managed-secret")
+}
+
+// TestMutationResultStaysFrozenAfterNextPublication pins the F3 frozen-result
+// rule through the real writer and the real shared projector: the capture
+// returned by generation N still encodes N's revision and credential labels
+// after a real generation N+1 credential mutation publishes, while N+1's own
+// capture projects the removed pair.
+func TestMutationResultStaysFrozenAfterNextPublication(t *testing.T) {
+	reserveEnvKey(t, "LIGHTCODE_FROZEN_API_KEY")
+	h := newMetadataHarness(t)
+	writeServiceFile(t, h.configPath, metadataConfigDocument)
+	env := config.NewManagedEnvForTest(filepath.Join(h.dataDir, ".env"))
+	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc.attachWarnings(newWarningStore())
+	svc.attachEnv(env)
+	if _, err := svc.publish(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	ctx := context.Background()
+
+	// N: a real credential mutation persists a managed key.
+	key := "sk-frozen-credential"
+	window := 4096
+	baseURL := "https://frozen.test/v1"
+	captureN, err := svc.mutate(ctx, svc.editProviderCreate("frozen", protocol.ProviderEdit{BaseUrl: &baseURL},
+		map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	provN := captureN.snapshot.catalog.Providers["frozen"]
+	if provN == nil {
+		t.Fatal("created provider missing from the capture")
+	}
+	keyEnv := provN.Transport.APIKeyEnv
+	if observed := captureN.credentials[keyEnv]; !observed.Managed || observed.Value != key {
+		t.Fatalf("capture N credential = {defined:%v managed:%v valueMatch:%v}, want the managed supplied key",
+			observed.Defined, observed.Managed, observed.Value == key)
+	}
+	generationN := strconv.FormatUint(captureN.snapshot.generation, 10)
+
+	// N+1: another real credential mutation removes the key and publishes.
+	if _, err := svc.mutate(ctx, svc.editProviderDisconnect("frozen", &connectionEffects{})); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if current := svc.current(); current == nil || current.generation != captureN.snapshot.generation+1 {
+		t.Fatalf("N+1 publication = %+v, want the next generation", current)
+	}
+
+	// The actual shared projector, invoked with N's returned capture after
+	// N+1, still encodes N's revision and pre-change labels.
+	encoded, err := json.Marshal(protocol.ProviderMutation{
+		ConfigurationRevision: configurationRevision(captureN.snapshot),
+		Result:                projectProvider(captureN, provN),
+	})
+	if err != nil {
+		t.Fatalf("encode N's response: %v", err)
+	}
+	var decoded protocol.ProviderMutation
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decode N's response: %v", err)
+	}
+	if decoded.ConfigurationRevision.Generation != generationN {
+		t.Fatalf("N response revision = %s, want %s", decoded.ConfigurationRevision.Generation, generationN)
+	}
+	if decoded.Result.KeySource != protocol.Managed || !decoded.Result.Connected {
+		t.Fatalf("N response labels = source %v connected %v, want the pre-change managed pair",
+			decoded.Result.KeySource, decoded.Result.Connected)
+	}
+
+	// Nearest forbidden sibling: N+1's own capture projects the removed pair.
+	after, err := svc.capture(ctx)
+	if err != nil {
+		t.Fatalf("capture after N+1: %v", err)
+	}
+	afterProv := after.snapshot.catalog.Providers["frozen"]
+	if afterProv == nil {
+		t.Fatal("the disconnected provider left the catalog")
+	}
+	if view := projectProvider(after, afterProv); view.KeySource != protocol.None || view.Connected {
+		t.Fatalf("N+1 projection = %+v, want the removed key", view)
+	}
 }
 
 func TestDisconnectProviderRefusals(t *testing.T) {
@@ -2010,10 +2337,15 @@ func TestCreateProviderKeyFailureRestoresExactBytes(t *testing.T) {
 		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_RESTORE_KEY")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
+		envBefore, err := os.ReadFile(r.managedEnv.Path())
+		if err != nil {
+			t.Fatalf("read .env: %v", err)
+		}
 
-		// The NUL value fails the create's TrySet after the owning file was
-		// written: the exact prior bytes are restored and the joined
-		// failure claims no atomic success.
+		// The NUL value fails the create's native env-value preflight after
+		// the owning file was written: the exact prior bytes are restored,
+		// no .env line appears, and the joined failure claims no atomic
+		// success.
 		broken := "sk-\x00-broken"
 		window := 4096
 		baseURL := "https://new.test/v1"
@@ -2028,13 +2360,14 @@ func TestCreateProviderKeyFailureRestoresExactBytes(t *testing.T) {
 		if rerr != nil || string(after) != string(before) {
 			t.Fatalf("the failed create did not restore the exact prior bytes (%v)", rerr)
 		}
-		envData, rerr := os.ReadFile(r.managedEnv.Path())
-		if rerr != nil || !strings.Contains(string(envData), "CONNECTION_RESTORE_KEY=") {
-			t.Fatalf(".env after the partial failure = (%q, %v), want the honest written line kept", envData, rerr)
+		envAfter, rerr := os.ReadFile(r.managedEnv.Path())
+		if rerr != nil || string(envAfter) != string(envBefore) {
+			t.Fatalf(".env after the NUL refusal = (%q, %v), want the exact prior bytes", envAfter, rerr)
 		}
 		if os.Getenv("CONNECTION_RESTORE_KEY") != "" {
-			t.Fatal("the failed Setenv left the process env behind")
+			t.Fatal("the failed NUL write left the process env behind")
 		}
+		assertFollowUpEditProvesReleasedOwnership(t, r, "usablep")
 	})
 }
 
@@ -2366,8 +2699,8 @@ func TestCreateProviderNilManagedEnvTypedFailure(t *testing.T) {
 	}
 	assertNoEvent(t, sub)
 
-	// resolveConnectKey without a manager: the unmanaged path decides.
-	if _, _, err := resolveConnectKey("CONNECTION_NIL_MGR_KEY", nil, nil); err == nil {
+	// resolveConnectKey without a manager or key: the absent path decides.
+	if _, _, err := resolveConnectKey("CONNECTION_NIL_MGR_KEY", nil, config.EnvValue{}); err == nil {
 		t.Fatal("resolveConnectKey without a manager or key succeeded")
 	}
 

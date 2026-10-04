@@ -226,10 +226,10 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if candidate.generation != 2 || svc.current() != candidate {
-		t.Fatalf("create = generation %d, want 2 published", candidate.generation)
+	if candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
+		t.Fatalf("create = generation %d, want 2 published", candidate.snapshot.generation)
 	}
-	prov := candidate.catalog.Providers["new"]
+	prov := candidate.snapshot.catalog.Providers["new"]
 	if prov == nil || prov.Builtin {
 		t.Fatalf("created provider = %+v, want a non-builtin catalog member", prov)
 	}
@@ -269,8 +269,8 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		t.Fatalf("the create wrote secret bytes: %s", data)
 	}
 	mutationBytes, err := json.Marshal(protocol.ProviderMutation{
-		ConfigurationRevision: configurationRevision(candidate),
-		Result:                projectProvider(candidate, nil, candidate.catalog.Providers["new"]),
+		ConfigurationRevision: configurationRevision(candidate.snapshot),
+		Result:                projectProvider(candidate, candidate.snapshot.catalog.Providers["new"]),
 	})
 	if err != nil {
 		t.Fatalf("marshal mutation: %v", err)
@@ -383,8 +383,8 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 		t.Fatalf("read owning file: %v", err)
 	}
 	candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{}))
-	if err != nil || candidate.generation != 2 {
-		t.Fatalf("empty patch = (%v, generation %d), want a published edit at 2", err, candidate.generation)
+	if err != nil || candidate.snapshot.generation != 2 {
+		t.Fatalf("empty patch = (%v, generation %d), want a published edit at 2", err, candidate.snapshot.generation)
 	}
 	var beforeRoot, afterRoot map[string]json.RawMessage
 	if err := json.Unmarshal(unchanged, &beforeRoot); err != nil {
@@ -721,10 +721,10 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	}
 	drainMutationEventWithWarning(t, sub, "2", svc.warnings)
 	candidate, err := svc.mutate(context.Background(), svc.editProviderDelete("keyless"))
-	if err != nil || candidate.generation != 3 {
-		t.Fatalf("keyless delete = (%v, generation %d), want a publication at 3", err, candidate.generation)
+	if err != nil || candidate.snapshot.generation != 3 {
+		t.Fatalf("keyless delete = (%v, generation %d), want a publication at 3", err, candidate.snapshot.generation)
 	}
-	if candidate.catalog.Providers["keyless"] != nil {
+	if candidate.snapshot.catalog.Providers["keyless"] != nil {
 		t.Fatal("the deleted provider stayed in the candidate catalog")
 	}
 	drainMutationEventWithWarning(t, sub, "3", svc.warnings)
@@ -742,8 +742,8 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 
 	// The successful delete: only the owning definition leaves the raw file.
 	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("other"))
-	if err != nil || candidate.generation != 4 {
-		t.Fatalf("delete = (%v, generation %d), want a publication at 4", err, candidate.generation)
+	if err != nil || candidate.snapshot.generation != 4 {
+		t.Fatalf("delete = (%v, generation %d), want a publication at 4", err, candidate.snapshot.generation)
 	}
 	drainMutationEvent(t, sub, "4")
 	assertNoEvent(t, sub)
@@ -823,8 +823,8 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 		protocol.ResetProviderFieldParamsFieldMaxTokensField,
 	} {
 		candidate, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field))
-		if err != nil || candidate.generation != svc.current().generation {
-			t.Fatalf("reset %q = (%v, generation %d), want a publication", field, err, candidate.generation)
+		if err != nil || candidate.snapshot.generation != svc.current().generation {
+			t.Fatalf("reset %q = (%v, generation %d), want a publication", field, err, candidate.snapshot.generation)
 		}
 		generation++
 		drainMutationEvent(t, sub, strconv.Itoa(generation))
@@ -1189,8 +1189,8 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 		protocol.ResetProviderModelFieldParamsFieldInputModalities,
 	} {
 		candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", field))
-		if err != nil || candidate.generation != svc.current().generation {
-			t.Fatalf("reset %q = (%v, generation %d), want a publication", field, err, candidate.generation)
+		if err != nil || candidate.snapshot.generation != svc.current().generation {
+			t.Fatalf("reset %q = (%v, generation %d), want a publication", field, err, candidate.snapshot.generation)
 		}
 		generation++
 		drainMutationEvent(t, sub, strconv.Itoa(generation))
@@ -1338,8 +1338,8 @@ func TestMetadataEditDiscoveredModelSource(t *testing.T) {
 		t.Fatalf("discovered correctable patch: %v", err)
 	}
 	candidate, err := svc.mutate(context.Background(), svc.editModelFieldReset("disco", "disc-model", protocol.ResetProviderModelFieldParamsFieldMaxOutputTokens))
-	if err != nil || candidate.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens != 256 {
-		t.Fatalf("discovered reset = (%v, max output %d), want the discovered 256 restored", err, candidate.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens)
+	if err != nil || candidate.snapshot.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens != 256 {
+		t.Fatalf("discovered reset = (%v, max output %d), want the discovered 256 restored", err, candidate.snapshot.catalog.Providers["disco"].Models["disc-model"].MaxOutputTokens)
 	}
 }
 
@@ -1736,8 +1736,8 @@ func TestMetadataEditHiddenVisibility(t *testing.T) {
 	} {
 		for _, hidden := range []bool{true, false} {
 			candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate(row.providerID, protocol.ProviderEdit{Hidden: &hidden}))
-			if err != nil || candidate.catalog.Providers[row.providerID].Hidden != hidden {
-				t.Fatalf("%s hidden %v patch = (%v, hidden %v), want the written state", row.providerID, hidden, err, candidate.catalog.Providers[row.providerID].Hidden)
+			if err != nil || candidate.snapshot.catalog.Providers[row.providerID].Hidden != hidden {
+				t.Fatalf("%s hidden %v patch = (%v, hidden %v), want the written state", row.providerID, hidden, err, candidate.snapshot.catalog.Providers[row.providerID].Hidden)
 			}
 			generation++
 			drainMutationEvent(t, sub, strconv.Itoa(generation))
@@ -1758,8 +1758,8 @@ func TestMetadataEditHiddenVisibility(t *testing.T) {
 	} {
 		for _, hidden := range []bool{true, false} {
 			candidate, err := svc.mutate(context.Background(), svc.editModelSave(row.providerID, row.modelID, protocol.ModelEdit{Hidden: &hidden}))
-			if err != nil || candidate.catalog.Providers[row.providerID].Models[row.modelID] == nil ||
-				candidate.catalog.Providers[row.providerID].Models[row.modelID].Hidden != hidden {
+			if err != nil || candidate.snapshot.catalog.Providers[row.providerID].Models[row.modelID] == nil ||
+				candidate.snapshot.catalog.Providers[row.providerID].Models[row.modelID].Hidden != hidden {
 				t.Fatalf("%s/%s hidden %v patch = %v, want the written state", row.providerID, row.modelID, hidden, err)
 			}
 			generation++
@@ -2098,16 +2098,16 @@ func TestMetadataEditNormalizesValueFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("padded provider patch: %v", err)
 	}
-	if candidate.generation != 2 {
-		t.Fatalf("padded provider patch generation = %d, want 2", candidate.generation)
+	if candidate.snapshot.generation != 2 {
+		t.Fatalf("padded provider patch generation = %d, want 2", candidate.snapshot.generation)
 	}
-	if got := candidate.catalog.Providers["prov"].Transport.BaseURL; got != "https://x.test/v1" {
+	if got := candidate.snapshot.catalog.Providers["prov"].Transport.BaseURL; got != "https://x.test/v1" {
 		t.Fatalf("stored base_url = %q, want the trimmed URL", got)
 	}
-	if got := candidate.catalog.Providers["prov"].Name; got != "Padded Prov" {
+	if got := candidate.snapshot.catalog.Providers["prov"].Name; got != "Padded Prov" {
 		t.Fatalf("stored name = %q, want the trimmed value", got)
 	}
-	if got := candidate.catalog.Providers["prov"].MaxTokensField; got != "max_tokens" {
+	if got := candidate.snapshot.catalog.Providers["prov"].MaxTokensField; got != "max_tokens" {
 		t.Fatalf("stored max_tokens_field = %q, want the bundled default (no padded patch)", got)
 	}
 	drainMutationEvent(t, sub, "2")
@@ -2157,7 +2157,7 @@ func TestMetadataEditNormalizesValueFields(t *testing.T) {
 	}
 	drainMutationEvent(t, sub, "3")
 	assertNoEvent(t, sub)
-	if got := candidate.catalog.Providers["prov"].MaxTokensField; got != "max_completion_tokens" {
+	if got := candidate.snapshot.catalog.Providers["prov"].MaxTokensField; got != "max_completion_tokens" {
 		t.Fatalf("stored max_tokens_field = %q, want the trimmed value", got)
 	}
 	if got := metadataRawProvider(t, h.configPath, "prov")["max_tokens_field"]; string(got) != `"max_completion_tokens"` {
@@ -2172,13 +2172,13 @@ func TestMetadataEditNormalizesValueFields(t *testing.T) {
 	}
 	drainMutationEvent(t, sub, "4")
 	assertNoEvent(t, sub)
-	entry := candidate.catalog.Providers["prov"].Models["m"]
+	entry := candidate.snapshot.catalog.Providers["prov"].Models["m"]
 	if entry == nil || entry.Name != "Padded M" || entry.ContextWindow != 4096 || entry.UsageInStream {
 		t.Fatalf("model after name normalization = %+v, want the trimmed name with ctx and usage preserved", entry)
 	}
 	// The catalog identity stays valid under the normalized values: the
 	// provider keeps its ID and its two usable models.
-	normalized := candidate.catalog.Providers["prov"]
+	normalized := candidate.snapshot.catalog.Providers["prov"]
 	if normalized.ID != "prov" || usableModelCount(normalized) != 2 {
 		t.Fatalf("normalized provider = id %q usable %d, want the valid identity with both usable models", normalized.ID, usableModelCount(normalized))
 	}
