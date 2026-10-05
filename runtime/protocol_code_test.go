@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1341,6 +1342,104 @@ func TestRetainedCodeSnapshotsPartialTraversal(t *testing.T) {
 		}
 		if data, err := os.ReadFile(file); err != nil || string(data) != "p1" {
 			t.Fatalf("partial file = (%q, %v), want the completed later-turn restore", data, err)
+		}
+		assertCanariesUntouched(t, sessionDir)
+	})
+}
+
+// TestRetainedMountedRestoreConflict proves the retained restore interval
+// over the mounted generated client: one parked retained restore holds its
+// directory, a concurrent mounted retained restore answers the typed
+// conflict, and the parked restore completes with its FIFO preimage while
+// the legacy canaries stay untouched.
+func TestRetainedMountedRestoreConflict(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+		ctx := context.Background()
+
+		workspace := filepath.Join(e.home, "retained-mounted-ws")
+		if err := os.MkdirAll(workspace, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+		legacyID := "c0ffee12"
+		sessionDir := seedRetainedSession(t, r.config.loader.Home(), workspace, legacyID)
+		file := filepath.Join(workspace, "retained-mounted.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		// The turn-1 entry's saved original is a FIFO whose last-write hash
+		// matches the file's current content, so the retained restore
+		// reaches restoreFile's plain os.Open and parks on the FIFO.
+		fifo := seedFIFOCodeEntry(t, sessionDir, file, "v1")
+
+		// One result shape carries both mounted restore attempts — the
+		// parked first restore and the concurrent second restore.
+		type mountedRetainedResult struct {
+			response *protocol.RevertRetainedCodeResponse
+			err      error
+		}
+		request := func() mountedRetainedResult {
+			response, err := client.RevertRetainedCodeWithResponse(ctx, protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
+			return mountedRetainedResult{response: response, err: err}
+		}
+
+		// The mounted retained restore parks inside its traversal: its HTTP
+		// handler is mid-restore while the client waits.
+		parked := make(chan mountedRetainedResult, 1)
+		go func() { parked <- request() }()
+		// The shared FIFO park returns only once the mounted restore's
+		// reader is parked in restoreFile's os.Open.
+		park := parkFIFO(t, fifo)
+		defer park.flush()
+
+		// A concurrent mounted retained restore answers the typed conflict:
+		// the refusal happens before any traversal, so the bounded wait
+		// never competes with the parked FIFO.
+		secondCh := make(chan mountedRetainedResult, 1)
+		go func() { secondCh <- request() }()
+		var second mountedRetainedResult
+		select {
+		case second = <-secondCh:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the second mounted retained restore never answered, want the typed conflict")
+		}
+		if second.err != nil {
+			t.Fatalf("second mounted retained restore: %v, want the typed conflict 409", second.err)
+		}
+		if second.response == nil {
+			t.Fatal("second mounted retained restore = <nil response>, want the typed conflict 409")
+		}
+		if second.response.JSONDefault == nil || second.response.HTTPResponse.StatusCode != http.StatusConflict {
+			body, _ := json.Marshal(second.response)
+			t.Fatalf("second mounted retained restore = (%d, %s), want the typed conflict 409", second.response.HTTPResponse.StatusCode, body)
+		}
+		conflictError, err := second.response.JSONDefault.AsError()
+		if err != nil || conflictError.Code != protocol.Conflict {
+			t.Fatalf("second retained restore error = %+v (%v), want the typed conflict", second.response.JSONDefault, err)
+		}
+
+		// The parked mounted retained restore completes with its own result.
+		park.release("mounted-restored")
+		var out mountedRetainedResult
+		select {
+		case out = <-parked:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked mounted retained restore never returned after its FIFO completed")
+		}
+		if out.err != nil {
+			t.Fatalf("mounted retained restore: %v, want the restored result", out.err)
+		}
+		if out.response == nil || out.response.JSON200 == nil {
+			t.Fatalf("mounted retained restore = %+v, want the restored result", out.response)
+		}
+		if len(out.response.JSON200.Restored) != 1 || out.response.JSON200.Restored[0] != file || len(out.response.JSON200.Skipped) != 0 {
+			t.Fatalf("restored = %+v, want exactly the retained display path", out.response.JSON200)
+		}
+		if data, err := os.ReadFile(file); err != nil || string(data) != "mounted-restored" {
+			t.Fatalf("file = (%q, %v), want the FIFO content", data, err)
 		}
 		assertCanariesUntouched(t, sessionDir)
 	})

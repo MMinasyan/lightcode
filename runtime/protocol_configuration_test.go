@@ -139,7 +139,7 @@ func findProvider(views []protocol.Provider, id string) protocol.Provider {
 // name over captured occupancy, and the no-authorization header contract on
 // both header maps.
 func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value") // pre-exported shell key, never managed
 		e := newOwnerEnv(t)
@@ -325,7 +325,7 @@ func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *own
 // owned empty object as `{}` — absent sections omitted, and the Agent
 // roster's public fields.
 func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
@@ -516,7 +516,7 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 // hidden models and hidden providers, the full list includes them with their
 // flags, and disconnected providers appear in neither.
 func TestConfigurationModelPickerConnectedRules(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
@@ -613,7 +613,7 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 // an immutable serialized baseline: mutating every returned map, slice, and
 // pointer never reaches the captured configuration.
 func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
@@ -718,7 +718,7 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 // configuration generation nor the warning revision, and the global warning
 // groups stay the published candidate's.
 func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
@@ -759,7 +759,7 @@ func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
 // connected state clears them, a catalog warning appears and clears, and the
 // unfiltered read orders the actual stored groups lexically.
 func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "UNSET_SETUP_KEY")
 		e := newOwnerEnv(t)
 		disconnectedDoc := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"UNSET_SETUP_KEY"},"discovery":false,"models":{"m":{"context_window":4096}}}}}`
@@ -888,7 +888,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 // normalization producer, and no prompt, LSP, or other private definition
 // field is exposed.
 func TestConfigurationRosterRequiredArrays(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
@@ -969,7 +969,7 @@ func probeNames[T any](probes []T, name func(T) string) []string {
 // values (no conditional skips), at the same generation, and owned against
 // an independent serialized baseline.
 func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
@@ -1107,7 +1107,7 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 // merged transport — written with the existing cache helper, read once by
 // the reload build, never per read — is discovered.
 func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)

@@ -31,9 +31,8 @@ type contractComponent struct {
 }
 
 type contractRawFixture struct {
-	Schema   string   `json:"schema"`
-	JSON     string   `json:"json"`
-	Preserve []string `json:"preserve"`
+	Schema string `json:"schema"`
+	JSON   string `json:"json"`
 }
 
 type contractOperation struct {
@@ -473,11 +472,16 @@ func componentName(ref string) string {
 
 // TestContractCorpusRawFidelity pins the one place arbitrary JSON values must
 // survive generated Go decoding byte-exact: tool metadata and raw objects.
+// The exact-number decode compares the decoded original fixture with the
+// decoded re-encoded value, so every number lexeme must stay in its own
+// field and every null, boolean, list, string, and raw argument value must
+// survive the round-trip.
 func TestContractCorpusRawFidelity(t *testing.T) {
 	corpus := loadContractCorpus(t)
 	for _, entry := range corpus.RawFidelity {
 		schemaRef := componentSchema(t, entry.Schema)
-		if err := schemaRef.VisitJSON(decodeSchemaJSON(t, entry.JSON)); err != nil {
+		original := decodeSchemaJSON(t, entry.JSON)
+		if err := schemaRef.VisitJSON(original); err != nil {
 			t.Fatalf("%s raw fixture %s: schema rejected it: %v", entry.Schema, entry.JSON, err)
 		}
 		target, ok := contractGeneratedTypes[entry.Schema]
@@ -492,10 +496,8 @@ func TestContractCorpusRawFidelity(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s raw fixture: re-encode: %v", entry.Schema, err)
 		}
-		for _, want := range entry.Preserve {
-			if !strings.Contains(string(encoded), want) {
-				t.Fatalf("%s raw fixture re-encoded to %s, want %q preserved", entry.Schema, encoded, want)
-			}
+		if reencoded := decodeSchemaJSON(t, string(encoded)); !reflect.DeepEqual(original, reencoded) {
+			t.Fatalf("%s raw fixture re-encoded to %s, want the decoded original %s preserved exactly", entry.Schema, encoded, entry.JSON)
 		}
 	}
 }

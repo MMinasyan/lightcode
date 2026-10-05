@@ -599,11 +599,19 @@ func TestProductionAdmittedOperation(t *testing.T) {
 		if trace := e.server.traceAt(0); trace != "trace-1" {
 			t.Fatalf("wire X-Provider-Trace = %q, want the captured transport headers", trace)
 		}
-		body := e.server.bodyAt(0)
-		for _, fragment := range []string{`"provider_side":"provider-value"`, `"model_side":"model-value"`, "9007199254740993"} {
-			if !strings.Contains(body, fragment) {
-				t.Fatalf("wire body misses sidecar fragment %s: %s", fragment, body)
-			}
+		// The merged sidecar layers reach the wire body as decoded members,
+		// not whole-body substrings: the exact-number decode keeps the
+		// provider's number lexeme and both sidecar string values comparable.
+		decoder := json.NewDecoder(strings.NewReader(e.server.bodyAt(0)))
+		decoder.UseNumber()
+		var wire map[string]any
+		if err := decoder.Decode(&wire); err != nil {
+			t.Fatalf("decode wire body with exact numbers: %v", err)
+		}
+		if wire["provider_side"] != "provider-value" || wire["model_side"] != "model-value" ||
+			wire["provider_number"] != json.Number("9007199254740993") {
+			t.Fatalf("wire body sidecar members = (%v, %v, %v), want the merged provider and model sidecar layers with the exact number lexeme",
+				wire["provider_side"], wire["model_side"], wire["provider_number"])
 		}
 		if lastMessageRole(e.server.bodyAt(1)) != "tool" {
 			t.Fatalf("follow-up request = %s, want the tool result continuation", e.server.bodyAt(1))

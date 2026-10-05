@@ -26,6 +26,19 @@ import (
 // operator × field × source axis of the semantic matrix over real file
 // bytes, the captured catalog, generation, and event oracles.
 
+// bundledCatalogModel returns one bundled model ID of the named provider,
+// resolved from the runtime's published catalog.
+func bundledCatalogModel(t *testing.T, r *Runtime, providerID string) string {
+	t.Helper()
+	for id, m := range r.config.current().catalog.Providers[providerID].Models {
+		if m.Source == catalog.SourceBundled {
+			return id
+		}
+	}
+	t.Fatalf("no bundled model on provider %q in the published catalog", providerID)
+	return ""
+}
+
 // metadataBundledFS is the metadata suite's bundled catalog: one builtin
 // provider with bundled attribution headers and a bundled model (discovery
 // disabled — a captured build never attempts a network fetch), one
@@ -1543,7 +1556,7 @@ func TestMetadataEditDiscoveredModelSource(t *testing.T) {
 // a builtin removal, an unknown identity, a hidden reset, and a credential
 // header — fail before any write.
 func TestRuntimeProviderMetadataOperators(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -1644,23 +1657,14 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 // slash-containing model ID as an exact query value, and the typed unknown
 // failures.
 func TestRuntimeModelMetadataOperators(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
 
 		// The bundled model of the builtin, resolved dynamically from the
 		// published catalog.
-		var bundledModel string
-		for id, m := range r.config.current().catalog.Providers["openrouter"].Models {
-			if m.Source == catalog.SourceBundled {
-				bundledModel = id
-				break
-			}
-		}
-		if bundledModel == "" {
-			t.Fatal("no bundled openrouter model in the published catalog")
-		}
+		bundledModel := bundledCatalogModel(t, r, "openrouter")
 
 		// No source-specific lock applies: the rename lands as the bundled
 		// model's user override.
@@ -2015,7 +2019,7 @@ func metadataRawProvider(t *testing.T, configPath, providerID string) map[string
 // model leaves the visible list and rejoins it on hidden=false while the
 // full list keeps it, and the owned raw hidden member follows every write.
 func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -2109,7 +2113,7 @@ func modelListHas(list protocol.ModelList, providerID, modelID string) bool {
 func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 	for _, id := range []string{".", "..", "?", "#", "%"} {
 		t.Run(id, func(t *testing.T) {
-			eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 				r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 				defer closeProjectionRuntime(r)
 				ctx := context.Background()
@@ -2217,7 +2221,7 @@ func assertRuntimeMutationRefused(t *testing.T, r *Runtime, sub *Subscription, b
 // the baseline taken after the external bad write, and the latest file,
 // generation, warning revision, and event stream unchanged.
 func TestRuntimeMetadataCorruptRawTypesTypedFailure(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -2743,7 +2747,7 @@ func TestMetadataEditInvalidResetFields(t *testing.T) {
 // owned raw member, publish exactly one generation with its event, and
 // project the post state — with no credential value ever written.
 func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()

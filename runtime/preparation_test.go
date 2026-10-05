@@ -741,6 +741,14 @@ func eachPrepStore(t *testing.T, run func(t *testing.T, store harness.Storage)) 
 	})
 }
 
+// eachPrepStoreOnce runs one fixture against the memory store alone: the
+// scenarios that perform no Session admission, recovery, durable, or mounted
+// work have no store axis to multiply.
+func eachPrepStoreOnce(t *testing.T, run func(t *testing.T, store harness.Storage)) {
+	t.Helper()
+	run(t, storage.NewMemory())
+}
+
 // TestPreparationHappyPathThroughHarness drives one real admission end to end
 // on both stores: ordered hooks replace only the prompt, the committed
 // post-hook capture reaches the associated opener with the live execution

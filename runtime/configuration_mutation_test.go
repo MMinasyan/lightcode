@@ -1296,7 +1296,7 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 // whole-section document overwrites the first write and a fresh read
 // observes the winner.
 func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -1352,7 +1352,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 // with the empty pre-server instance identity, and the returned settings are
 // owned against a serialized baseline.
 func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -1473,7 +1473,7 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 // owning write has begun waits for the admitted call, the publication
 // completes, and Close joins only after it.
 func TestRuntimeOwnerCloseAfterWriteBeginsFinishesPublication(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		probe := installOwningSyncProbe(t, e.configPath)

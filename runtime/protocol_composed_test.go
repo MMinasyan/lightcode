@@ -81,6 +81,45 @@ func composedMemoryStorage(store harness.Storage) runtime.Plugin {
 	}
 }
 
+// composedCustomPluginID is the flow's selected custom plugin: an arbitrary
+// registered ID whose own settings document and Runtime-scoped warning the
+// mounted generated client must carry unchanged.
+const composedCustomPluginID = "custom"
+
+// composedCustomSettingsDocument is the custom plugin's own opaque document;
+// the exact integer lexeme must survive the whole mounted round-trip.
+const composedCustomSettingsDocument = `{"threshold":9007199254740993}`
+
+// composedCustomPlugin is the selected custom plugin of the flow: its absent
+// settings section uses the plugin's defaults, its own validator owns the
+// document's interpretation, and its Runtime-scoped factory reports one
+// neutral plugin warning the store attributes to this registration ID.
+func composedCustomPlugin() runtime.Plugin {
+	return runtime.Plugin{
+		ID:       composedCustomPluginID,
+		Scope:    runtime.ScopeRuntime,
+		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("custom.marker")},
+		ValidateConfig: func(raw json.RawMessage) error {
+			if len(raw) == 0 {
+				return nil // the absent section uses the plugin's defaults
+			}
+			var document struct {
+				Threshold *int64 `json:"threshold"`
+			}
+			if err := json.Unmarshal(raw, &document); err != nil || document.Threshold == nil || *document.Threshold < 1 {
+				return errors.New("custom plugin settings require a positive threshold")
+			}
+			return nil
+		},
+		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+			if info.ReportWarning != nil {
+				info.ReportWarning("notice", "custom plugin scope opened")
+			}
+			return runtime.Instance{Values: map[string]any{"custom.marker": composedCustomPluginID}}, nil
+		},
+	}
+}
+
 // composedFlowServer is the scripted model endpoint of the whole scenario:
 // the last user message's plain text selects the turn, a tool-role final
 // message always closes with a plain text turn, and the child's turn parks
@@ -313,6 +352,20 @@ func composedHydrate(t *testing.T, c *client.Client, sessionID string) *protocol
 		t.Fatalf("GetSessionHydration(%s) = status %d: %s", sessionID, resp.HTTPResponse.StatusCode, resp.Body)
 	}
 	return resp.JSON200
+}
+
+// composedAssertPluginWarning asserts the selected custom plugin's neutral
+// warning reached one read: the open source is the plugin's own registered
+// identity, not a fixed core enumeration.
+func composedAssertPluginWarning(t *testing.T, warnings []protocol.Warning) {
+	t.Helper()
+	for _, warning := range warnings {
+		if warning.Source == "plugin:"+composedCustomPluginID && warning.Kind == "notice" && warning.SessionId == nil {
+			return
+		}
+	}
+	body, _ := json.Marshal(warnings)
+	t.Fatalf("warnings = %s, want the custom plugin's global notice under its own source", body)
 }
 
 // composedAwaitOp polls the authoritative hydration until one Operation
@@ -771,6 +824,18 @@ func TestProtocolComposedFlow(t *testing.T) {
 				t.Fatalf("child operation %s = %q, want success", operation.OperationId, operation.Status)
 			}
 		}
+		// The child's GET/history matches its hydration: both mounted reads
+		// answer from the child's own one snapshot, with the same item
+		// identities and the same revision.
+		childHistory := composedHistory(t, c, childID, nil)
+		historyIDs := composedPageIDs(t, childHistory.Items)
+		hydrationIDs := composedPageIDs(t, childHydration.Conversation.Items)
+		if strings.Join(historyIDs, ",") != strings.Join(hydrationIDs, ",") {
+			t.Fatalf("child history items %v, want its hydration's conversation %v", historyIDs, hydrationIDs)
+		}
+		if childHistory.SessionRevision != childHydration.SessionRevision {
+			t.Fatalf("child history revision = %+v, want the hydration's %+v", childHistory.SessionRevision, childHydration.SessionRevision)
+		}
 
 		// 6. Older pages: fill past the 50-item boundary, then the anchored
 		// mechanics and the cross-Session cursor refusal.
@@ -795,7 +860,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		if len(older.Items) == 0 || older.OlderCursor != nil {
 			t.Fatalf("older page = %d items (cursor %v), want the remaining prefix", len(older.Items), older.OlderCursor)
 		}
-		olderIDs := composedPageIDs(t, older)
+		olderIDs := composedPageIDs(t, older.Items)
 		composedSubmit(t, c, main, "op-after-anchor", "after the anchor")
 		composedAwaitOp(t, c, main, "op-after-anchor", protocol.OperationStatusSuccess)
 		newest := composedHistory(t, c, main, nil)
@@ -803,7 +868,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 			t.Fatalf("newest page revision = %+v, want the advanced current revision", newest.SessionRevision)
 		}
 		olderAfter := composedHistory(t, c, main, first.OlderCursor)
-		if got := composedPageIDs(t, olderAfter); strings.Join(got, ",") != strings.Join(olderIDs, ",") {
+		if got := composedPageIDs(t, olderAfter.Items); strings.Join(got, ",") != strings.Join(olderIDs, ",") {
 			t.Fatalf("older page after the append = %v, want the anchored %v", got, olderIDs)
 		}
 		wsB := filepath.Join(home, "b-ws")
@@ -827,10 +892,15 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 		// 7. Settings: the stale whole-section save succeeds under
 		// last-writer-wins; each compiled plugin's own document string
-		// round-trips through the mounted generated client; the invalid
-		// candidate never publishes.
+		// round-trips through the mounted generated client — the shipped
+		// tools document and the selected custom plugin's own opaque
+		// document with its exact integer lexeme; the invalid candidate
+		// never publishes.
 		settingsADocument := `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}`
-		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Plugins: protocol.PluginsSettings{"tools": settingsADocument}}
+		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Plugins: protocol.PluginsSettings{
+			"tools":                settingsADocument,
+			composedCustomPluginID: composedCustomSettingsDocument,
+		}}
 		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Plugins: protocol.PluginsSettings{}}
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
@@ -842,8 +912,9 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 		firstPut := put(settingsA)
 		if firstPut.JSON200 == nil || !firstPut.JSON200.Result.Sessions.AutoArchive || firstPut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
-			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
-			t.Fatalf("settings write A = %+v, want the published A section with its exact tools document", firstPut.JSON200)
+			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
+			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
+			t.Fatalf("settings write A = %+v, want the published A section with every plugin's exact document", firstPut.JSON200)
 		}
 		secondPut := put(settingsB)
 		if secondPut.JSON200 == nil || secondPut.JSON200.Result.Sessions.AutoArchive || len(secondPut.JSON200.Result.Plugins) != 0 {
@@ -852,7 +923,8 @@ func TestProtocolComposedFlow(t *testing.T) {
 		stalePut := put(settingsA)
 		if stalePut.JSON200 == nil || !stalePut.JSON200.Result.Sessions.AutoArchive || stalePut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
 			stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays != 0 ||
-			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
+			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
+			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
 			t.Fatalf("stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		}
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
@@ -864,6 +936,16 @@ func TestProtocolComposedFlow(t *testing.T) {
 		if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.Configuration {
 			t.Fatalf("invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		}
+		// The selected custom plugin's own validator refuses its invalid
+		// document with the same configuration class.
+		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Plugins: protocol.PluginsSettings{composedCustomPluginID: `{"threshold":0}`}}
+		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: customInvalid})
+		if err != nil {
+			t.Fatalf("invalid custom settings write: %v", err)
+		}
+		if customRefused.JSONDefault == nil || customRefused.JSONDefault.Code != protocol.Configuration {
+			t.Fatalf("invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
+		}
 		view, err := c.GetConfigurationWithResponse(ctx)
 		if err != nil {
 			t.Fatalf("GetConfiguration: %v", err)
@@ -872,9 +954,24 @@ func TestProtocolComposedFlow(t *testing.T) {
 			t.Fatalf("GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
 		}
 		if view.JSON200.ConfigurationRevision.Generation != publishedGeneration || !view.JSON200.Settings.Sessions.AutoArchive || view.JSON200.Settings.Sessions.ArchiveAfterDays != 3 ||
-			compactComposed(t, []byte(view.JSON200.Settings.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) {
+			compactComposed(t, []byte(view.JSON200.Settings.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
+			compactComposed(t, []byte(view.JSON200.Settings.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
 			t.Fatalf("configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
 		}
+
+		// The custom plugin's neutral warning: the Runtime-scoped factory's
+		// report carries its own registered source through the mounted
+		// unfiltered read and every Session's hydration.
+		allWarnings, err := c.GetWarningsWithResponse(ctx)
+		if err != nil {
+			t.Fatalf("GetWarnings: %v", err)
+		}
+		if allWarnings.JSON200 == nil {
+			t.Fatalf("GetWarnings = status %d: %s", allWarnings.HTTPResponse.StatusCode, allWarnings.Body)
+		}
+		composedAssertPluginWarning(t, allWarnings.JSON200.Warnings)
+		hydratedWarnings := composedHydrate(t, c, main)
+		composedAssertPluginWarning(t, hydratedWarnings.Warnings)
 
 		// 8. Provider connection after startup: the managed key lands, the
 		// response carries no secret byte, and a following real command
@@ -906,6 +1003,60 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 		if strings.Contains(envOutput, composedFlowConnectKey) {
 			t.Fatalf("environment command output = %q, want the late-managed connect key scrubbed", envOutput)
+		}
+
+		// The disconnect refusal: the credential state the disconnect
+		// published governs the next admission. The selected model is
+		// configured while the provider is connected, the disconnect removes
+		// the managed key, and the following admission refuses with no
+		// published Operation.
+		selected, err := c.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "main"}, protocol.SetAgentTypeModelRequest{Model: "connprov/cm"})
+		if err != nil {
+			t.Fatalf("SetAgentTypeModel(connprov/cm): %v", err)
+		}
+		if selected.JSON200 == nil || selected.JSON200.Result.Model != "connprov/cm" {
+			t.Fatalf("selected model edit = %+v, want the main roster entry's connected-provider model", selected.JSON200)
+		}
+		disconnected, err := c.DisconnectProviderWithResponse(ctx, &protocol.DisconnectProviderParams{ProviderId: "connprov"})
+		if err != nil {
+			t.Fatalf("DisconnectProvider: %v", err)
+		}
+		if disconnected.JSON200 == nil || disconnected.JSON200.Result == nil || disconnected.JSON200.Result.Connected {
+			t.Fatalf("disconnect response = %+v, want the disconnected provider view", disconnected.JSON200)
+		}
+		var refusedPart protocol.ContentPart
+		if err := refusedPart.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: "refused turn"}); err != nil {
+			t.Fatalf("build refused part: %v", err)
+		}
+		refusedSubmit, err := c.SubmitSessionWithResponse(ctx, main, protocol.SubmitRequest{
+			OperationId: "op-refused",
+			Mode:        protocol.SubmitRequestModeRegular,
+			Content:     []protocol.ContentPart{refusedPart},
+		})
+		if err != nil {
+			t.Fatalf("refused submit: %v", err)
+		}
+		if refusedSubmit.JSONDefault == nil || refusedSubmit.JSONDefault.Code != protocol.Invalid ||
+			refusedSubmit.HTTPResponse.StatusCode != http.StatusBadRequest {
+			t.Fatalf("refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
+		}
+		afterRefusal := composedHydrate(t, c, main)
+		for _, operation := range afterRefusal.Operations {
+			if operation.OperationId == "op-refused" {
+				t.Fatalf("the refused admission published operation %+v, want no Operation", operation)
+			}
+		}
+		for _, item := range afterRefusal.Conversation.Items {
+			if composedItemKind(t, item) != "input" {
+				continue
+			}
+			input, err := item.AsInputItem()
+			if err != nil {
+				t.Fatalf("input item: %v", err)
+			}
+			if input.OperationId != nil && *input.OperationId == "op-refused" {
+				t.Fatalf("the refused admission published input %+v, want no published input", input)
+			}
 		}
 
 		// 9. Archive keeps history readable; reopen; delete removes every
@@ -996,10 +1147,11 @@ func TestProtocolComposedFlow(t *testing.T) {
 		run(t, []runtime.Plugin{
 			composedMemoryStorage(storage.NewMemory()),
 			tools.Plugin(), adaptation.Plugin(), lsp.Plugin(), jobs.Plugin(), tasks.Plugin(),
+			composedCustomPlugin(),
 		})
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		run(t, []runtime.Plugin{sqlite.Plugin(), tools.Plugin(), adaptation.Plugin(), lsp.Plugin(), jobs.Plugin(), tasks.Plugin()})
+		run(t, []runtime.Plugin{sqlite.Plugin(), tools.Plugin(), adaptation.Plugin(), lsp.Plugin(), jobs.Plugin(), tasks.Plugin(), composedCustomPlugin()})
 	})
 }
 
@@ -1015,10 +1167,10 @@ func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *s
 	return resp.JSON200
 }
 
-func composedPageIDs(t *testing.T, page *protocol.HistoryPage) []string {
+func composedPageIDs(t *testing.T, items []protocol.ConversationItem) []string {
 	t.Helper()
-	ids := make([]string, 0, len(page.Items))
-	for _, item := range page.Items {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
 		kind, err := item.Discriminator()
 		if err != nil {
 			t.Fatalf("item discriminator: %v", err)

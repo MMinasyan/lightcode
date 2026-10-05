@@ -2206,41 +2206,23 @@
  "raw_fidelity": [
   {
    "schema": "ToolMetadata",
-   "json": "9007199254740993",
-   "preserve": [
-    "9007199254740993"
-   ]
+   "json": "9007199254740993"
   },
   {
    "schema": "ToolMetadata",
-   "json": "1e1000",
-   "preserve": [
-    "1e1000"
-   ]
+   "json": "1e1000"
   },
   {
    "schema": "JSONObject",
-   "json": "{\"n\":9007199254740993,\"big\":1e1000}",
-   "preserve": [
-    "9007199254740993",
-    "1e1000"
-   ]
+   "json": "{\"n\":9007199254740993,\"big\":1e1000}"
   },
   {
    "schema": "ToolCallView",
-   "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}",
-   "preserve": [
-    "9007199254740993",
-    "1e1000"
-   ]
+   "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
   },
   {
    "schema": "AssistantItem",
-   "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}",
-   "preserve": [
-    "9007199254740993",
-    "1e1000"
-   ]
+   "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
   }
  ]
 }

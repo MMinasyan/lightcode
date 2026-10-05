@@ -21,7 +21,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
-	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -1238,16 +1237,7 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 
 	// A bundled openrouter model gains a user override, whose delete then
 	// reveals the bundled base as the required non-null post-state.
-	var bundledModel string
-	for id, m := range r.config.current().catalog.Providers["openrouter"].Models {
-		if m.Source == catalog.SourceBundled {
-			bundledModel = id
-			break
-		}
-	}
-	if bundledModel == "" {
-		t.Fatal("no bundled openrouter model in the published catalog")
-	}
+	bundledModel := bundledCatalogModel(t, r, "openrouter")
 	name := "Overridden"
 	saved, err := client.UpdateProviderModelWithResponse(ctx, &protocol.UpdateProviderModelParams{ProviderId: "openrouter", ModelId: bundledModel}, protocol.UpdateProviderModelRequest{
 		Model: protocol.ModelEdit{Name: &name},
