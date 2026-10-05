@@ -656,9 +656,12 @@ func TestObserveDurableAdvances(t *testing.T) {
 
 	t.Run("fork destination", func(t *testing.T) {
 		store := freshSessionStore(t)
-		stub := newPrepareStub(modelPrepared(quickModel()))
+		script := newModelScript(turn())
+		script.gate = make(chan struct{})
+		stub := newPrepareStub(modelPrepared(script.model))
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 		defer cancel()
+		defer script.releaseGate() // a parked destination execution always unblocks
 		if _, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 			t.Fatalf("disposition %q, want admitted", disposition)
 		}
@@ -690,7 +693,27 @@ func TestObserveDurableAdvances(t *testing.T) {
 		if destFacts < 2 {
 			t.Fatalf("fork destination facts = %d, want the durable creation and the local installation", destFacts)
 		}
+		// The destination's execution is held at the model gate, so the
+		// exact pair cannot race its settlement.
 		wantPairAt(t, h, dest, 2, 1)
+		// Release: the destination completes its fork turn, settles, drains
+		// and retires; the completed state proves the Operation ended in
+		// success with the durable advance past the held window.
+		script.releaseGate()
+		final := awaitHarnessQuiet(t, h, dest)
+		settled := false
+		for _, op := range final.Operations {
+			if op.Admission.OperationID == "fork-op-1" {
+				settled = op.State.Status == OperationSuccess && op.State.Terminal != nil
+			}
+		}
+		if !settled {
+			t.Fatalf("fork destination operations = %+v, want the fork Operation settled success", final.Operations)
+		}
+		if final.Session.Revision <= 2 || final.LocalRevision <= 1 {
+			t.Fatalf("completed destination pair = {%d %d}, want the settlement's durable advance and the drain's local publications over the held {2 1}",
+				final.Session.Revision, final.LocalRevision)
+		}
 	})
 }
 

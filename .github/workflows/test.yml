@@ -66,6 +66,9 @@ jobs:
       - name: Frontend tests
         run: cd frontend && npm run test
 
+      - name: Protocol freshness
+        run: make check-protocol
+
   integration:
     runs-on: ubuntu-24.04
     steps:

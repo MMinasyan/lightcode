@@ -1020,12 +1020,13 @@ func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
 // TestPluginInstallsReportWarningBeforeDetect proves the plugin captures the
 // Runtime's ReportWarning callback at Open, installs it on every lazy
 // workspace manager before its detection goroutine exists, and delivers the
-// real detection-time warning through the real manager: with an empty PATH
-// and no planted binary the clangd marker resolves no server, its nil
-// installer fails, and the manager's report reaches the Runtime closure. A
+// real detection-time warning through the real manager: with a cold HOME
+// and an empty PATH no server resolves anywhere, every marker's install
+// fails, and the manager's report reaches the Runtime closure. A
 // nil callback is the harmless no-report shape the rest of this suite runs
 // under.
 func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // cold LSP cache: nothing planted
 	t.Setenv("PATH", t.TempDir()) // no resolvable server anywhere
 	workspace := markerWorkspace(t)
 	if err := os.WriteFile(filepath.Join(workspace, "CMakeLists.txt"), []byte("cmake_minimum_required(VERSION 3.10)\n"), 0o600); err != nil {
@@ -1049,13 +1050,13 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 	symbol := instance.Values["workspace_symbol"].(runtime.Tool)
 
 	// The tool execution registers the workspace, installs the reporter, and
-	// starts detection: with no resolvable binary the detected servers fail
-	// their installations and the manager reports each through the
-	// installed callback — the retained empty result proves detection
-	// completed, so the reports are not racing a later goroutine.
+	// starts detection: with no resolvable binary anywhere the detected
+	// servers fail their installations and the manager reports each through
+	// the installed callback — the retained no-server response proves
+	// detection completed, so the reports are not racing a later goroutine.
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
-	if outcome := prepared.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess || !strings.Contains(outcome.Result.Content, "No symbols found") {
-		t.Fatalf("missing-server query = %+v, want the retained empty result after detection", outcome.Result)
+	if outcome := prepared.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No language servers available." {
+		t.Fatalf("missing-server query = %+v, want the cold no-server response after detection", outcome.Result)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
