@@ -650,6 +650,121 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 	}
 }
 
+// TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession pins the
+// warm corruption row of the mounted transport contract through the real
+// listener and the generated client: the durable source register is corrupted
+// while the mounted Runtime holds the warm source coordinator, so the real
+// fork transition over HTTP — POST /v1/sessions/{id}/fork — fails its
+// store-wide transaction on the corrupted register, sticks the sticky marker
+// on the warm source, and answers its typed corrupt response naming the
+// session; the mounted hydration over HTTP — GET /v1/sessions/{id}/hydration,
+// built on the same SnapshotSession capture — then refuses with the same typed
+// corrupt body and session identity while the valid sibling still hydrates
+// and stays listed. This complements the cold corrupt hydration answer inside
+// TestProtocolServerErrorClasses: the cold row seeds an undecodable register
+// before any materialization, while this row proves the marker a real
+// transition installs on an already-warm coordinator; both surface the one
+// error taxonomy with no production seam between them.
+func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+
+		source, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
+			Workspace: filepath.Join(e.home, "marked-src"), AgentType: "solo",
+		})
+		if err != nil || source.JSON201 == nil {
+			t.Fatalf("create source over HTTP: %v (typed %+v)", err, source.JSONDefault)
+		}
+		sourceID := source.JSON201.SessionId
+		sibling, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
+			Workspace: filepath.Join(e.home, "marked-sibling"), AgentType: "solo",
+		})
+		if err != nil || sibling.JSON201 == nil {
+			t.Fatalf("create sibling over HTTP: %v (typed %+v)", err, sibling.JSONDefault)
+		}
+		siblingID := sibling.JSON201.SessionId
+
+		if _, err := client.SubmitSessionWithResponse(ctx, sourceID, protocol.SubmitRequest{
+			OperationId: "op-src", Mode: "regular",
+			Content: []protocol.ContentPart{textContentPart(t, "boundary", nil)},
+		}); err != nil {
+			t.Fatalf("source submit over HTTP: %v", err)
+		}
+		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
+		awaitIdleSession(t, r, sourceID)
+
+		before, err := client.GetSessionHydrationWithResponse(ctx, sourceID)
+		if err != nil || before.JSON200 == nil {
+			t.Fatalf("hydration before the corruption: %v (typed %+v)", err, before.JSONDefault)
+		}
+		// The fork boundary is resolved from the mounted response itself: the
+		// committed user-origin input item the server projected.
+		boundaryItem := ""
+		for _, item := range before.JSON200.Conversation.Items {
+			input, asInput := item.AsInputItem()
+			if asInput != nil || input.Origin != protocol.InputOriginUser {
+				continue
+			}
+			boundaryItem = input.ItemId
+		}
+		if boundaryItem == "" {
+			t.Fatalf("the mounted hydration carries no user-origin input item: %+v", before.JSON200.Conversation.Items)
+		}
+
+		// The durable register is corrupted while the mounted Runtime holds
+		// the warm source coordinator, so the sticky marker the HTTP fork
+		// refusal reports is the real transition's, not a test injection.
+		corruptSessionRegister(t, store, sourceID)
+
+		refused, err := client.ForkSessionWithResponse(ctx, sourceID, protocol.ForkRequest{
+			BoundaryItemId: boundaryItem,
+			OperationId:    "op-fork-marked",
+			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
+		})
+		if err != nil || refused.JSONDefault == nil {
+			t.Fatalf("fork over HTTP = (%d, %+v, %v), want the typed corrupt refusal", refused.HTTPResponse.StatusCode, refused.JSONDefault, err)
+		}
+		if refused.JSONDefault.Code != protocol.Corrupt || refused.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("fork over HTTP = (%d, %+v), want the typed corrupt 422", refused.HTTPResponse.StatusCode, refused.JSONDefault)
+		}
+		if refused.JSONDefault.SessionId == nil || *refused.JSONDefault.SessionId != sourceID {
+			t.Fatalf("fork corrupt error session id = %v, want the marked source identity", refused.JSONDefault.SessionId)
+		}
+
+		after, err := client.GetSessionHydrationWithResponse(ctx, sourceID)
+		if err != nil || after.JSONDefault == nil || after.JSONDefault.Code != protocol.Corrupt ||
+			after.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("hydration of the marked warm source = (%d, %+v, %v), want the typed corrupt 422", after.HTTPResponse.StatusCode, after.JSONDefault, err)
+		}
+		if after.JSONDefault.SessionId == nil || *after.JSONDefault.SessionId != sourceID {
+			t.Fatalf("hydration corrupt error session id = %v, want the marked source identity", after.JSONDefault.SessionId)
+		}
+
+		siblingHydration, err := client.GetSessionHydrationWithResponse(ctx, siblingID)
+		if err != nil || siblingHydration.JSON200 == nil || siblingHydration.JSON200.Session.SessionId != siblingID {
+			t.Fatalf("sibling hydration = (%d, %+v, %v), want the valid sibling read", siblingHydration.HTTPResponse.StatusCode, siblingHydration.JSON200, err)
+		}
+		listed, err := client.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{
+			Workspace: filepath.Join(e.home, "marked-sibling"), Lifecycle: "open",
+		})
+		if err != nil || listed.JSON200 == nil || len(*listed.JSON200) != 1 || (*listed.JSON200)[0].SessionId != siblingID {
+			body, _ := json.Marshal(listed.JSON200)
+			t.Fatalf("sibling list = %s, want exactly the valid sibling", body)
+		}
+		sourceListed, err := client.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{
+			Workspace: filepath.Join(e.home, "marked-src"), Lifecycle: "open",
+		})
+		if err != nil || sourceListed.JSON200 == nil || len(*sourceListed.JSON200) != 0 {
+			body, _ := json.Marshal(sourceListed.JSON200)
+			t.Fatalf("marked source list = %s, want the corrupt source omitted", body)
+		}
+	})
+}
+
 // TestProtocolServerRevertPartialFailure pins the restore traversal contract:
 // a traversal I/O failure after earlier groups changed answers with the
 // accumulated result — restored and skipped members with the error member and

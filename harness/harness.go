@@ -312,8 +312,10 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 }
 
 // ReadOperation returns the materialized Operation record of one Operation of
-// one Session. A deletion that committed after materialization resolves to
-// ErrNotFound rather than a stale cached read.
+// one Session. The shared unavailable check runs inside the same
+// coordinator-mutex hold that copies the record, so a deletion or a corruption
+// marker that committed after materialization resolves to ErrNotFound or the
+// typed corruption error rather than a stale cached read.
 func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID string) (OperationRecord, error) {
 	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
@@ -324,8 +326,8 @@ func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID stri
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.gone {
-		return OperationRecord{}, notFoundSession(sessionID)
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return OperationRecord{}, err
 	}
 	rec, ok := c.graph.Operation(operationID)
 	if !ok {

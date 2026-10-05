@@ -81,10 +81,12 @@ type SessionSnapshot struct {
 // SnapshotSession materializes one Session's validated graph and returns its
 // complete owned snapshot under one coordinator-mutex hold. A cold Session
 // validates once and installs its coordinator; a warm valid Session reads its
-// cached graph with no history re-read. A deleted Session returns the
-// not-found class, a corrupt Session its typed corruption error, and a
-// storage or context failure passes through unmodified; no partial snapshot
-// is ever returned.
+// cached graph with no history re-read. The shared unavailable check runs
+// inside that hold, so a deletion or a corruption marker that committed after
+// the lookup refuses the capture rather than returning state of a Session
+// already decided unavailable. A deleted Session returns the not-found class,
+// a corrupt Session its typed corruption error, and a storage or context
+// failure passes through unmodified; no partial snapshot is ever returned.
 func (h *Harness) SnapshotSession(ctx context.Context, sessionID string) (SessionSnapshot, error) {
 	c, err := h.coordinatorFor(ctx, sessionID)
 	if err != nil {
@@ -92,8 +94,8 @@ func (h *Harness) SnapshotSession(ctx context.Context, sessionID string) (Sessio
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.gone {
-		return SessionSnapshot{}, notFoundSession(sessionID)
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return SessionSnapshot{}, err
 	}
 	snap := SessionSnapshot{
 		Session:       ownSessionRecord(c.graph.Session),
@@ -150,8 +152,8 @@ func (h *Harness) SnapshotSession(ctx context.Context, sessionID string) (Sessio
 // nil means available, a gone coordinator maps to the not-found class, and the
 // sticky corruption marker maps to its typed corruption error. The caller
 // holds c.mu; the marker is read through the registry mutex taken inside that
-// hold (the permitted c.mu→h.mu order). The passive publication read consumes
-// the same check.
+// hold (the permitted c.mu→h.mu order). The narrow reads, the observation
+// read, and the full snapshot and Operation captures consume the same check.
 func (h *Harness) unavailableLocked(c *coordinator, sessionID string) error {
 	if c.gone {
 		return notFoundSession(sessionID)
