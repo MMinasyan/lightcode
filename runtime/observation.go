@@ -139,38 +139,48 @@ func eventString(value string) *string {
 // group, and a committed deletion's batch warning removal own no narrower
 // attribution.
 func runtimeEventScope() protocol.Scope {
-	return protocol.Scope{Kind: protocol.ScopeKindRuntime}
+	var scope protocol.Scope
+	_ = scope.FromRuntimeScope(protocol.RuntimeScope{ // plain members; the marshal cannot fail
+		Kind: protocol.RuntimeScopeKindRuntime,
+	})
+	return scope
 }
 
 // sessionEventScope is one Session-granularity invalidation scope.
 func sessionEventScope(workspace, sessionID string) protocol.Scope {
-	return protocol.Scope{
-		Kind:      protocol.ScopeKindSession,
+	var scope protocol.Scope
+	_ = scope.FromSessionScope(protocol.SessionScope{ // plain members; the marshal cannot fail
+		Kind:      protocol.SessionScopeKindSession,
 		Workspace: eventString(workspace),
-		SessionId: eventString(sessionID),
-	}
+		SessionId: sessionID,
+	})
+	return scope
 }
 
 // jobEventScope is one job-member invalidation scope: the owning Session with
 // the Job identity.
 func jobEventScope(workspace, sessionID, jobID string) protocol.Scope {
-	return protocol.Scope{
-		Kind:      protocol.ScopeKindJob,
+	var scope protocol.Scope
+	_ = scope.FromJobScope(protocol.JobScope{ // plain members; the marshal cannot fail
+		Kind:      protocol.JobScopeKindJob,
 		Workspace: eventString(workspace),
-		SessionId: eventString(sessionID),
-		JobId:     eventString(jobID),
-	}
+		SessionId: sessionID,
+		JobId:     jobID,
+	})
+	return scope
 }
 
 // operationEventScope is one progress scope: the Operation running the model
 // stream or tool call, with its Session and Workspace ancestors.
 func operationEventScope(workspace, sessionID, operationID string) protocol.Scope {
-	return protocol.Scope{
-		Kind:        protocol.ScopeKindOperation,
+	var scope protocol.Scope
+	_ = scope.FromOperationScope(protocol.OperationScope{ // plain members; the marshal cannot fail
+		Kind:        protocol.OperationScopeKindOperation,
 		Workspace:   eventString(workspace),
-		SessionId:   eventString(sessionID),
-		OperationId: eventString(operationID),
-	}
+		SessionId:   sessionID,
+		OperationId: operationID,
+	})
+	return scope
 }
 
 // scopeEvent projects one scope identity into its passive event: the scope
@@ -179,15 +189,36 @@ func operationEventScope(workspace, sessionID, operationID string) protocol.Scop
 // Agent scopes carry the complete Workspace/Session/Operation identity. The
 // constructor-only DataDir and the passive warning callback never ride.
 func scopeEvent(kind protocol.ScopeEventKind, info ScopeInfo) Event {
+	var scope protocol.Scope
+	switch info.Kind {
+	case ScopeRuntime:
+		_ = scope.FromRuntimeScope(protocol.RuntimeScope{ // plain members; the marshal cannot fail
+			Kind: protocol.RuntimeScopeKindRuntime,
+		})
+	case ScopeWorkspace:
+		_ = scope.FromWorkspaceScope(protocol.WorkspaceScope{ // plain members; the marshal cannot fail
+			Kind:      protocol.WorkspaceScopeKindWorkspace,
+			Workspace: info.Workspace,
+		})
+	case ScopeOperation:
+		_ = scope.FromOperationScope(protocol.OperationScope{ // plain members; the marshal cannot fail
+			Kind:        protocol.OperationScopeKindOperation,
+			Workspace:   eventString(info.Workspace),
+			SessionId:   info.SessionID,
+			OperationId: info.OperationID,
+		})
+	case ScopeAgent:
+		_ = scope.FromAgentScope(protocol.AgentScope{ // plain members; the marshal cannot fail
+			Kind:        protocol.AgentScopeKindAgent,
+			Workspace:   eventString(info.Workspace),
+			SessionId:   info.SessionID,
+			OperationId: info.OperationID,
+		})
+	}
 	var event Event
 	_ = event.FromScopeEvent(protocol.ScopeEvent{ // plain string members; the marshal cannot fail
-		Kind: kind,
-		Scope: protocol.Scope{
-			Kind:        protocol.ScopeKind(info.Kind),
-			Workspace:   eventString(info.Workspace),
-			SessionId:   eventString(info.SessionID),
-			OperationId: eventString(info.OperationID),
-		},
+		Kind:  kind,
+		Scope: scope,
 	})
 	return event
 }

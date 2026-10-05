@@ -880,6 +880,31 @@ components:
           enum:
             - "1"
     Scope:
+      description: >
+        One SSE event's applicable scope, discriminated by kind. Every
+        non-global kind must address its subject: workspace carries workspace,
+        session carries session_id, operation and agent carry session_id and
+        operation_id, and job carries session_id and job_id. Each branch keeps
+        the same closed member vocabulary, so attribution members beyond the
+        required identities are allowed; every supplied member is nonempty and
+        session_id always matches its pattern.
+      oneOf:
+        - $ref: "#/components/schemas/RuntimeScope"
+        - $ref: "#/components/schemas/WorkspaceScope"
+        - $ref: "#/components/schemas/SessionScope"
+        - $ref: "#/components/schemas/OperationScope"
+        - $ref: "#/components/schemas/AgentScope"
+        - $ref: "#/components/schemas/JobScope"
+      discriminator:
+        propertyName: kind
+        mapping:
+          runtime: "#/components/schemas/RuntimeScope"
+          workspace: "#/components/schemas/WorkspaceScope"
+          session: "#/components/schemas/SessionScope"
+          operation: "#/components/schemas/OperationScope"
+          agent: "#/components/schemas/AgentScope"
+          job: "#/components/schemas/JobScope"
+    RuntimeScope:
       type: object
       additionalProperties: false
       required:
@@ -889,20 +914,136 @@ components:
           type: string
           enum:
             - runtime
-            - workspace
-            - session
-            - operation
-            - agent
-            - job
         workspace:
           type: string
+          minLength: 1
         session_id:
           type: string
           pattern: "^[0-9a-f]{32}$"
         operation_id:
           type: string
+          minLength: 1
         job_id:
           type: string
+          minLength: 1
+    WorkspaceScope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - workspace
+      properties:
+        kind:
+          type: string
+          enum:
+            - workspace
+        workspace:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+          minLength: 1
+        job_id:
+          type: string
+          minLength: 1
+    SessionScope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - session_id
+      properties:
+        kind:
+          type: string
+          enum:
+            - session
+        workspace:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+          minLength: 1
+        job_id:
+          type: string
+          minLength: 1
+    OperationScope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - session_id
+        - operation_id
+      properties:
+        kind:
+          type: string
+          enum:
+            - operation
+        workspace:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+          minLength: 1
+        job_id:
+          type: string
+          minLength: 1
+    AgentScope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - session_id
+        - operation_id
+      properties:
+        kind:
+          type: string
+          enum:
+            - agent
+        workspace:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+          minLength: 1
+        job_id:
+          type: string
+          minLength: 1
+    JobScope:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - session_id
+        - job_id
+      properties:
+        kind:
+          type: string
+          enum:
+            - job
+        workspace:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        operation_id:
+          type: string
+          minLength: 1
+        job_id:
+          type: string
+          minLength: 1
     ContentPart:
       oneOf:
         - $ref: "#/components/schemas/TextPart"

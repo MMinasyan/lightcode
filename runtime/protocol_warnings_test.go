@@ -100,15 +100,25 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 				if err != nil {
 					t.Fatalf("warning event body: %v", err)
 				}
-				if body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
-					promptHint = &body
+				if scopeKind(t, body.Scope) == "session" {
+					promptScope, err := body.Scope.AsSessionScope()
+					if err != nil {
+						t.Fatalf("session scope: %v", err)
+					}
+					if promptScope.SessionId == sessionID {
+						promptHint = &body
+					}
 				}
 			}
 		}
 		if progressBeforeHint {
 			t.Fatal("the Session's first warning hint arrived after the Operation's progress, want the preparation's own publication")
 		}
-		if promptHint.Scope.Workspace == nil || *promptHint.Scope.Workspace != e.workspace("prompt-ws") {
+		promptScope, err := promptHint.Scope.AsSessionScope()
+		if err != nil {
+			t.Fatalf("prompt warning hint scope: %v", err)
+		}
+		if promptScope.Workspace == nil || *promptScope.Workspace != e.workspace("prompt-ws") {
 			t.Fatalf("prompt warning hint scope = %+v, want the cached workspace identity", promptHint.Scope)
 		}
 		if revision, err := warnRevision(promptHint.WarningsRevision.Revision); err != nil || revision == 0 {
@@ -207,7 +217,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 				if err != nil {
 					t.Fatalf("warning event body: %v", err)
 				}
-				if body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
+				if hintSession, _ := scopeSessionIdentity(t, body.Scope); hintSession == sessionID {
 					continue
 				}
 				t.Fatalf("a failed preparation published a warning hint: %+v", body)
@@ -450,11 +460,21 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 			if err != nil {
 				t.Fatalf("warning event body: %v", err)
 			}
-			if body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == sessionID {
-				protocolHint = &body
+			if scopeKind(t, body.Scope) == "session" {
+				protocolScope, err := body.Scope.AsSessionScope()
+				if err != nil {
+					t.Fatalf("session scope: %v", err)
+				}
+				if protocolScope.SessionId == sessionID {
+					protocolHint = &body
+				}
 			}
 		}
-		if protocolHint.Scope.Workspace == nil || *protocolHint.Scope.Workspace != e.workspace("protocol-ws") {
+		protocolScope, err := protocolHint.Scope.AsSessionScope()
+		if err != nil {
+			t.Fatalf("protocol diagnostic hint scope: %v", err)
+		}
+		if protocolScope.Workspace == nil || *protocolScope.Workspace != e.workspace("protocol-ws") {
 			t.Fatalf("protocol diagnostic hint scope = %+v, want the cached workspace identity", protocolHint.Scope)
 		}
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
@@ -1092,7 +1112,7 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 			if err != nil {
 				t.Fatalf("warning event body: %v", err)
 			}
-			if body.Scope.Kind != protocol.ScopeKindRuntime {
+			if scopeKind(t, body.Scope) != "runtime" {
 				t.Fatalf("deletion warning hint scope = %+v, want the runtime scope", body.Scope)
 			}
 			hint = &body

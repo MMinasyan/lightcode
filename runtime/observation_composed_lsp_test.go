@@ -155,7 +155,7 @@ func TestComposedLSPWarningLandsInGlobalStoreAndEvents(t *testing.T) {
 			if err != nil {
 				t.Fatalf("warning event body: %v", err)
 			}
-			if body.Scope.Kind == protocol.ScopeKindRuntime {
+			if composedScopeKind(body.Scope) == "runtime" {
 				hint = &body
 			}
 		case <-deadline:

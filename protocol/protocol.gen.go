@@ -20,6 +20,21 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for AgentScopeKind.
+const (
+	AgentScopeKindAgent AgentScopeKind = "agent"
+)
+
+// Valid indicates whether the value is a known member of the AgentScopeKind enum.
+func (e AgentScopeKind) Valid() bool {
+	switch e {
+	case AgentScopeKindAgent:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AssistantItemKind.
 const (
 	Assistant AssistantItemKind = "assistant"
@@ -233,6 +248,21 @@ func (e InputOrigin) Valid() bool {
 	}
 }
 
+// Defines values for JobScopeKind.
+const (
+	JobScopeKindJob JobScopeKind = "job"
+)
+
+// Valid indicates whether the value is a known member of the JobScopeKind enum.
+func (e JobScopeKind) Valid() bool {
+	switch e {
+	case JobScopeKindJob:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ModelField.
 const (
 	ModelFieldContextWindow    ModelField = "context_window"
@@ -389,6 +419,21 @@ func (e OperationEndItemStatus) Valid() bool {
 	}
 }
 
+// Defines values for OperationScopeKind.
+const (
+	OperationScopeKindOperation OperationScopeKind = "operation"
+)
+
+// Valid indicates whether the value is a known member of the OperationScopeKind enum.
+func (e OperationScopeKind) Valid() bool {
+	switch e {
+	case OperationScopeKindOperation:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ProviderKeySource.
 const (
 	External ProviderKeySource = "external"
@@ -461,30 +506,15 @@ func (e ProviderField) Valid() bool {
 	}
 }
 
-// Defines values for ScopeKind.
+// Defines values for RuntimeScopeKind.
 const (
-	ScopeKindAgent     ScopeKind = "agent"
-	ScopeKindJob       ScopeKind = "job"
-	ScopeKindOperation ScopeKind = "operation"
-	ScopeKindRuntime   ScopeKind = "runtime"
-	ScopeKindSession   ScopeKind = "session"
-	ScopeKindWorkspace ScopeKind = "workspace"
+	RuntimeScopeKindRuntime RuntimeScopeKind = "runtime"
 )
 
-// Valid indicates whether the value is a known member of the ScopeKind enum.
-func (e ScopeKind) Valid() bool {
+// Valid indicates whether the value is a known member of the RuntimeScopeKind enum.
+func (e RuntimeScopeKind) Valid() bool {
 	switch e {
-	case ScopeKindAgent:
-		return true
-	case ScopeKindJob:
-		return true
-	case ScopeKindOperation:
-		return true
-	case ScopeKindRuntime:
-		return true
-	case ScopeKindSession:
-		return true
-	case ScopeKindWorkspace:
+	case RuntimeScopeKindRuntime:
 		return true
 	default:
 		return false
@@ -536,6 +566,21 @@ func (e SessionLifecycle) Valid() bool {
 	case Archived:
 		return true
 	case Open:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SessionScopeKind.
+const (
+	SessionScopeKindSession SessionScopeKind = "session"
+)
+
+// Valid indicates whether the value is a known member of the SessionScopeKind enum.
+func (e SessionScopeKind) Valid() bool {
+	switch e {
+	case SessionScopeKindSession:
 		return true
 	default:
 		return false
@@ -740,6 +785,21 @@ func (e WarningChangedEventKind) Valid() bool {
 	}
 }
 
+// Defines values for WorkspaceScopeKind.
+const (
+	WorkspaceScopeKindWorkspace WorkspaceScopeKind = "workspace"
+)
+
+// Valid indicates whether the value is a known member of the WorkspaceScopeKind enum.
+func (e WorkspaceScopeKind) Valid() bool {
+	switch e {
+	case WorkspaceScopeKindWorkspace:
+		return true
+	default:
+		return false
+	}
+}
+
 // Agent defines model for Agent.
 type Agent struct {
 	Capabilities []string `json:"capabilities"`
@@ -759,6 +819,18 @@ type AgentMutation struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
 	Result                Agent                 `json:"result"`
 }
+
+// AgentScope defines model for AgentScope.
+type AgentScope struct {
+	JobId       *string        `json:"job_id,omitempty"`
+	Kind        AgentScopeKind `json:"kind"`
+	OperationId string         `json:"operation_id"`
+	SessionId   string         `json:"session_id"`
+	Workspace   *string        `json:"workspace,omitempty"`
+}
+
+// AgentScopeKind defines model for AgentScope.Kind.
+type AgentScopeKind string
 
 // AssistantItem defines model for AssistantItem.
 type AssistantItem struct {
@@ -836,7 +908,9 @@ type CompactionItemKind string
 type ConfigurationChangedEvent struct {
 	ConfigurationRevision ConfigurationRevision         `json:"configuration_revision"`
 	Kind                  ConfigurationChangedEventKind `json:"kind"`
-	Scope                 Scope                         `json:"scope"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope Scope `json:"scope"`
 }
 
 // ConfigurationChangedEventKind defines model for ConfigurationChangedEvent.Kind.
@@ -1009,6 +1083,18 @@ type InputOrigin string
 // JSONObject One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
 type JSONObject = map[string]json.RawMessage
 
+// JobScope defines model for JobScope.
+type JobScope struct {
+	JobId       string       `json:"job_id"`
+	Kind        JobScopeKind `json:"kind"`
+	OperationId *string      `json:"operation_id,omitempty"`
+	SessionId   string       `json:"session_id"`
+	Workspace   *string      `json:"workspace,omitempty"`
+}
+
+// JobScopeKind defines model for JobScope.Kind.
+type JobScopeKind string
+
 // ModelEdit defines model for ModelEdit.
 type ModelEdit struct {
 	ContextWindow    *int                    `json:"context_window,omitempty"`
@@ -1137,6 +1223,18 @@ type OperationEndItemKind string
 
 // OperationEndItemStatus defines model for OperationEndItem.Status.
 type OperationEndItemStatus string
+
+// OperationScope defines model for OperationScope.
+type OperationScope struct {
+	JobId       *string            `json:"job_id,omitempty"`
+	Kind        OperationScopeKind `json:"kind"`
+	OperationId string             `json:"operation_id"`
+	SessionId   string             `json:"session_id"`
+	Workspace   *string            `json:"workspace,omitempty"`
+}
+
+// OperationScopeKind defines model for OperationScope.Kind.
+type OperationScopeKind string
 
 // PendingInput defines model for PendingInput.
 type PendingInput struct {
@@ -1275,22 +1373,29 @@ type RevisionResponse struct {
 	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
 }
 
-// Scope defines model for Scope.
-type Scope struct {
-	JobId       *string   `json:"job_id,omitempty"`
-	Kind        ScopeKind `json:"kind"`
-	OperationId *string   `json:"operation_id,omitempty"`
-	SessionId   *string   `json:"session_id,omitempty"`
-	Workspace   *string   `json:"workspace,omitempty"`
+// RuntimeScope defines model for RuntimeScope.
+type RuntimeScope struct {
+	JobId       *string          `json:"job_id,omitempty"`
+	Kind        RuntimeScopeKind `json:"kind"`
+	OperationId *string          `json:"operation_id,omitempty"`
+	SessionId   *string          `json:"session_id,omitempty"`
+	Workspace   *string          `json:"workspace,omitempty"`
 }
 
-// ScopeKind defines model for Scope.Kind.
-type ScopeKind string
+// RuntimeScopeKind defines model for RuntimeScope.Kind.
+type RuntimeScopeKind string
+
+// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+type Scope struct {
+	union json.RawMessage
+}
 
 // ScopeEvent defines model for ScopeEvent.
 type ScopeEvent struct {
-	Kind  ScopeEventKind `json:"kind"`
-	Scope Scope          `json:"scope"`
+	Kind ScopeEventKind `json:"kind"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope Scope `json:"scope"`
 }
 
 // ScopeEventKind defines model for ScopeEvent.Kind.
@@ -1313,9 +1418,11 @@ type Session struct {
 
 // SessionChangedEvent defines model for SessionChangedEvent.
 type SessionChangedEvent struct {
-	Kind            SessionChangedEventKind `json:"kind"`
-	Scope           Scope                   `json:"scope"`
-	SessionRevision SessionRevision         `json:"session_revision"`
+	Kind SessionChangedEventKind `json:"kind"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope           Scope           `json:"scope"`
+	SessionRevision SessionRevision `json:"session_revision"`
 }
 
 // SessionChangedEventKind defines model for SessionChangedEvent.Kind.
@@ -1330,6 +1437,18 @@ type SessionRevision struct {
 	InstanceId      string `json:"instance_id"`
 	LocalRevision   string `json:"local_revision"`
 }
+
+// SessionScope defines model for SessionScope.
+type SessionScope struct {
+	JobId       *string          `json:"job_id,omitempty"`
+	Kind        SessionScopeKind `json:"kind"`
+	OperationId *string          `json:"operation_id,omitempty"`
+	SessionId   string           `json:"session_id"`
+	Workspace   *string          `json:"workspace,omitempty"`
+}
+
+// SessionScopeKind defines model for SessionScope.Kind.
+type SessionScopeKind string
 
 // SessionsSettings defines model for SessionsSettings.
 type SessionsSettings struct {
@@ -1418,7 +1537,9 @@ type TextDeltaEvent struct {
 	Content  string             `json:"content"`
 	Kind     TextDeltaEventKind `json:"kind"`
 	Position int                `json:"position"`
-	Scope    Scope              `json:"scope"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope Scope `json:"scope"`
 }
 
 // TextDeltaEventKind defines model for TextDeltaEvent.Kind.
@@ -1460,8 +1581,10 @@ type ToolCallView struct {
 type ToolFinishedEvent struct {
 	CallId string                `json:"call_id"`
 	Kind   ToolFinishedEventKind `json:"kind"`
-	Scope  Scope                 `json:"scope"`
-	Status ToolCallStatus        `json:"status"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope  Scope          `json:"scope"`
+	Status ToolCallStatus `json:"status"`
 }
 
 // ToolFinishedEventKind defines model for ToolFinishedEvent.Kind.
@@ -1476,7 +1599,9 @@ type ToolStartedEvent struct {
 	Kind    ToolStartedEventKind `json:"kind"`
 	Name    string               `json:"name"`
 	Ordinal int                  `json:"ordinal"`
-	Scope   Scope                `json:"scope"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope Scope `json:"scope"`
 }
 
 // ToolStartedEventKind defines model for ToolStartedEvent.Kind.
@@ -1531,9 +1656,11 @@ type Warning struct {
 
 // WarningChangedEvent defines model for WarningChangedEvent.
 type WarningChangedEvent struct {
-	Kind             WarningChangedEventKind `json:"kind"`
-	Scope            Scope                   `json:"scope"`
-	WarningsRevision WarningsRevision        `json:"warnings_revision"`
+	Kind WarningChangedEventKind `json:"kind"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope            Scope            `json:"scope"`
+	WarningsRevision WarningsRevision `json:"warnings_revision"`
 }
 
 // WarningChangedEventKind defines model for WarningChangedEvent.Kind.
@@ -1556,6 +1683,18 @@ type Workspace struct {
 	DisplayName string `json:"display_name"`
 	Root        string `json:"root"`
 }
+
+// WorkspaceScope defines model for WorkspaceScope.
+type WorkspaceScope struct {
+	JobId       *string            `json:"job_id,omitempty"`
+	Kind        WorkspaceScopeKind `json:"kind"`
+	OperationId *string            `json:"operation_id,omitempty"`
+	SessionId   *string            `json:"session_id,omitempty"`
+	Workspace   string             `json:"workspace"`
+}
+
+// WorkspaceScopeKind defines model for WorkspaceScope.Kind.
+type WorkspaceScopeKind string
 
 // LifecycleQuery defines model for LifecycleQuery.
 type LifecycleQuery = SessionLifecycle
@@ -2333,6 +2472,251 @@ func (t Event) MarshalJSON() ([]byte, error) {
 }
 
 func (t *Event) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsRuntimeScope returns the union data inside the Scope as a RuntimeScope
+func (t Scope) AsRuntimeScope() (RuntimeScope, error) {
+	var body RuntimeScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRuntimeScope overwrites any union data inside the Scope as the provided RuntimeScope
+func (t *Scope) FromRuntimeScope(v RuntimeScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"runtime"}`))
+	t.union = b
+	return err
+}
+
+// MergeRuntimeScope performs a merge with any union data inside the Scope, using the provided RuntimeScope
+func (t *Scope) MergeRuntimeScope(v RuntimeScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"runtime"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsWorkspaceScope returns the union data inside the Scope as a WorkspaceScope
+func (t Scope) AsWorkspaceScope() (WorkspaceScope, error) {
+	var body WorkspaceScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromWorkspaceScope overwrites any union data inside the Scope as the provided WorkspaceScope
+func (t *Scope) FromWorkspaceScope(v WorkspaceScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"workspace"}`))
+	t.union = b
+	return err
+}
+
+// MergeWorkspaceScope performs a merge with any union data inside the Scope, using the provided WorkspaceScope
+func (t *Scope) MergeWorkspaceScope(v WorkspaceScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"workspace"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionScope returns the union data inside the Scope as a SessionScope
+func (t Scope) AsSessionScope() (SessionScope, error) {
+	var body SessionScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionScope overwrites any union data inside the Scope as the provided SessionScope
+func (t *Scope) FromSessionScope(v SessionScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"session"}`))
+	t.union = b
+	return err
+}
+
+// MergeSessionScope performs a merge with any union data inside the Scope, using the provided SessionScope
+func (t *Scope) MergeSessionScope(v SessionScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"session"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsOperationScope returns the union data inside the Scope as a OperationScope
+func (t Scope) AsOperationScope() (OperationScope, error) {
+	var body OperationScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromOperationScope overwrites any union data inside the Scope as the provided OperationScope
+func (t *Scope) FromOperationScope(v OperationScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"operation"}`))
+	t.union = b
+	return err
+}
+
+// MergeOperationScope performs a merge with any union data inside the Scope, using the provided OperationScope
+func (t *Scope) MergeOperationScope(v OperationScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"operation"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsAgentScope returns the union data inside the Scope as a AgentScope
+func (t Scope) AsAgentScope() (AgentScope, error) {
+	var body AgentScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromAgentScope overwrites any union data inside the Scope as the provided AgentScope
+func (t *Scope) FromAgentScope(v AgentScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"agent"}`))
+	t.union = b
+	return err
+}
+
+// MergeAgentScope performs a merge with any union data inside the Scope, using the provided AgentScope
+func (t *Scope) MergeAgentScope(v AgentScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"agent"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsJobScope returns the union data inside the Scope as a JobScope
+func (t Scope) AsJobScope() (JobScope, error) {
+	var body JobScope
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromJobScope overwrites any union data inside the Scope as the provided JobScope
+func (t *Scope) FromJobScope(v JobScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"job"}`))
+	t.union = b
+	return err
+}
+
+// MergeJobScope performs a merge with any union data inside the Scope, using the provided JobScope
+func (t *Scope) MergeJobScope(v JobScope) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"job"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t Scope) Discriminator() (string, error) {
+	var discriminator struct {
+		Discriminator string `json:"kind"`
+	}
+	err := json.Unmarshal(t.union, &discriminator)
+	return discriminator.Discriminator, err
+}
+
+func (t Scope) ValueByDiscriminator() (interface{}, error) {
+	discriminator, err := t.Discriminator()
+	if err != nil {
+		return nil, err
+	}
+	switch discriminator {
+	case "agent":
+		return t.AsAgentScope()
+	case "job":
+		return t.AsJobScope()
+	case "operation":
+		return t.AsOperationScope()
+	case "runtime":
+		return t.AsRuntimeScope()
+	case "session":
+		return t.AsSessionScope()
+	case "workspace":
+		return t.AsWorkspaceScope()
+	default:
+		return nil, errors.New("unknown discriminator value: " + discriminator)
+	}
+}
+
+func (t Scope) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *Scope) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
 	return err
 }

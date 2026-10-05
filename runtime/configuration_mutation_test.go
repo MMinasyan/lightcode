@@ -1698,8 +1698,8 @@ func requireRealWarningRevision(t *testing.T, event Event, store *warningStore) 
 	if err != nil {
 		t.Fatalf("warning event body: %v", err)
 	}
-	if body.Scope.Kind != protocol.ScopeKindRuntime {
-		t.Fatalf("warning event scope kind = %q, want the runtime scope", body.Scope.Kind)
+	if scopeKind(t, body.Scope) != "runtime" {
+		t.Fatalf("warning event scope kind = %q, want the runtime scope", scopeKind(t, body.Scope))
 	}
 	revision, err := strconv.ParseUint(body.WarningsRevision.Revision, 10, 64)
 	if err != nil || revision == 0 {

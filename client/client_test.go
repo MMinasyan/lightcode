@@ -115,13 +115,94 @@ func rawNotification(document string) string {
 // ptr returns a pointer to one value.
 func ptr[T any](value T) *T { return &value }
 
+// operationEventScope is the real producer shape of every progress hint: the
+// Operation's scope with its Session and Workspace ancestors.
+func operationEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromOperationScope(protocol.OperationScope{
+		Kind:        protocol.OperationScopeKindOperation,
+		Workspace:   ptr("/w"),
+		SessionId:   testInstance,
+		OperationId: "op-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// scopeOpenedEvent builds one valid scope lifecycle hint carrying the given
+// addressable scope.
+func scopeOpenedEvent(t *testing.T, scope protocol.Scope) protocol.Event {
+	t.Helper()
+	var event protocol.Event
+	if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
+		t.Fatalf("build scope_opened: %v", err)
+	}
+	return event
+}
+
+// sessionEventScope builds one Session-granularity scope, the producer shape
+// of the revisioned invalidation hints.
+func sessionEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromSessionScope(protocol.SessionScope{
+		Kind:      protocol.SessionScopeKindSession,
+		SessionId: testInstance,
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// workspaceEventScope builds one Workspace scope carrying the lexical root.
+func workspaceEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromWorkspaceScope(protocol.WorkspaceScope{
+		Kind:      protocol.WorkspaceScopeKindWorkspace,
+		Workspace: "/w",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// agentEventScope builds one Agent scope carrying its complete ancestor
+// identity, the producer shape of the agent lifecycle hints.
+func agentEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromAgentScope(protocol.AgentScope{
+		Kind:        protocol.AgentScopeKindAgent,
+		Workspace:   ptr("/w"),
+		SessionId:   testInstance,
+		OperationId: "op-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// jobEventScope builds one job-member scope, the producer shape of the
+// job-granularity invalidation hints.
+func jobEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromJobScope(protocol.JobScope{
+		Kind:      protocol.JobScopeKindJob,
+		Workspace: ptr("/w"),
+		SessionId: testInstance,
+		JobId:     "job-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
 // sessionChangedEvent builds one valid revisioned invalidation hint.
 func sessionChangedEvent(t *testing.T, instance, durable, local string) protocol.Event {
 	t.Helper()
 	var event protocol.Event
 	if err := event.FromSessionChangedEvent(protocol.SessionChangedEvent{
 		Kind:  protocol.SessionChanged,
-		Scope: protocol.Scope{Kind: protocol.ScopeKindSession, SessionId: ptr(testInstance)},
+		Scope: sessionEventScope(),
 		SessionRevision: protocol.SessionRevision{
 			InstanceId:      instance,
 			DurableRevision: durable,
@@ -386,19 +467,19 @@ func TestEventsFrames(t *testing.T) {
 	t.Run("valid transient progress", func(t *testing.T) {
 		var delta protocol.Event
 		if err := delta.FromTextDeltaEvent(protocol.TextDeltaEvent{
-			Kind: protocol.TextDelta, Scope: protocol.Scope{Kind: protocol.ScopeKindOperation}, Position: 7, Content: "chunk",
+			Kind: protocol.TextDelta, Scope: operationEventScope(), Position: 7, Content: "chunk",
 		}); err != nil {
 			t.Fatalf("build text_delta: %v", err)
 		}
 		var started protocol.Event
 		if err := started.FromToolStartedEvent(protocol.ToolStartedEvent{
-			Kind: protocol.ToolStarted, Scope: protocol.Scope{Kind: protocol.ScopeKindOperation}, CallId: "call-1", Ordinal: 0, Name: "read",
+			Kind: protocol.ToolStarted, Scope: operationEventScope(), CallId: "call-1", Ordinal: 0, Name: "read",
 		}); err != nil {
 			t.Fatalf("build tool_started: %v", err)
 		}
 		var finished protocol.Event
 		if err := finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{
-			Kind: protocol.ToolFinished, Scope: protocol.Scope{Kind: protocol.ScopeKindOperation}, CallId: "call-1", Status: protocol.ToolCallStatusSuccess,
+			Kind: protocol.ToolFinished, Scope: operationEventScope(), CallId: "call-1", Status: protocol.ToolCallStatusSuccess,
 		}); err != nil {
 			t.Fatalf("build tool_finished: %v", err)
 		}
@@ -420,6 +501,38 @@ func TestEventsFrames(t *testing.T) {
 		}
 	})
 
+	// Every non-global scope kind delivers through its real producer shape:
+	// the Workspace and Agent lifecycle hints and the job-member
+	// invalidation hint carry the identities that address their subject.
+	t.Run("addressable scope kinds", func(t *testing.T) {
+		var job protocol.Event
+		if err := job.FromSessionChangedEvent(protocol.SessionChangedEvent{
+			Kind:            protocol.SessionChanged,
+			Scope:           jobEventScope(),
+			SessionRevision: protocol.SessionRevision{InstanceId: testInstance, DurableRevision: "1", LocalRevision: "0"},
+		}); err != nil {
+			t.Fatalf("build session_changed: %v", err)
+		}
+		frames := notificationFrame(t, scopeOpenedEvent(t, workspaceEventScope())) +
+			notificationFrame(t, scopeOpenedEvent(t, agentEventScope())) +
+			notificationFrame(t, job)
+		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		events, errs := c.Events(context.Background())
+		delivered, err := drainEvents(events, errs)
+		if !errors.Is(err, client.ErrResyncRequired) {
+			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
+		}
+		if len(delivered) != 3 {
+			t.Fatalf("delivered %d events, want the workspace, agent, and job hints", len(delivered))
+		}
+		for i, want := range []string{"scope_opened", "scope_opened", "session_changed"} {
+			if kind, _ := delivered[i].Discriminator(); kind != want {
+				t.Fatalf("event %d kind = %q, want %q", i, kind, want)
+			}
+		}
+	})
+
 	malformed := []struct {
 		name  string
 		frame string
@@ -434,6 +547,14 @@ func TestEventsFrames(t *testing.T) {
 		{"unknown scope member", rawNotification(fmt.Sprintf(`{"kind":"session_changed","scope":{"kind":"session","bogus":true},"session_revision":{"instance_id":%q,"durable_revision":"1","local_revision":"0"}}`, testInstance))},
 		{"wrong-typed scope member", rawNotification(`{"kind":"scope_opened","scope":{"kind":5}}`)},
 		{"session_id is not hex32", rawNotification(fmt.Sprintf(`{"kind":"session_changed","scope":{"kind":"session","session_id":"nothex"},"session_revision":{"instance_id":%q,"durable_revision":"1","local_revision":"0"}}`, testInstance))},
+		{"workspace scope without its identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"workspace"}}`)},
+		{"session scope without its identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"session"}}`)},
+		{"operation scope without the session identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"operation","workspace":"/w","operation_id":"op-1"}}`)},
+		{"operation scope without the operation identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"operation","workspace":"/w","session_id":%q}}`, testInstance))},
+		{"agent scope without the operation identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"agent","session_id":%q}}`, testInstance))},
+		{"job scope without the session identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"job","job_id":"job-1"}}`)},
+		{"job scope without the job identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"job","session_id":%q}}`, testInstance))},
+		{"empty scope member", rawNotification(`{"kind":"scope_opened","scope":{"kind":"runtime","workspace":""}}`)},
 		{"negative text position", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":-1,"content":"x"}`)},
 		{"empty text content", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":0,"content":""}`)},
 		{"unknown tool status", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"pending"}`)},

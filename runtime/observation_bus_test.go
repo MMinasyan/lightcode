@@ -108,8 +108,12 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 			if body.SessionRevision != final {
 				t.Fatalf("delayed invalidation revision = %+v, want the current final pair %+v (never the stale intermediate pair)", body.SessionRevision, final)
 			}
-			if body.Scope.SessionId == nil || *body.Scope.SessionId != sessionID {
-				t.Fatalf("delayed invalidation session = %v, want the real session", body.Scope.SessionId)
+			invalidation, err := body.Scope.AsSessionScope()
+			if err != nil {
+				t.Fatalf("invalidation scope: %v", err)
+			}
+			if invalidation.SessionId != sessionID {
+				t.Fatalf("delayed invalidation session = %q, want the real session", invalidation.SessionId)
 			}
 		}
 		assertNoEvent(t, sub)
@@ -157,24 +161,36 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 					if err != nil {
 						t.Fatalf("session event body: %v", err)
 					}
-					switch {
-					case body.Scope.SessionId != nil && *body.Scope.SessionId == root:
+					invalidationSession, _ := scopeSessionIdentity(t, body.Scope)
+					switch invalidationSession {
+					case root:
 						rootInvalidations++
-					case body.Scope.SessionId != nil && *body.Scope.SessionId == child:
+					case child:
 						childInvalidations++
 					default:
 						t.Fatalf("invalidation for a foreign session %+v", body.Scope)
 					}
-					if body.Scope.Kind != protocol.ScopeKindSession || deref(body.Scope.Workspace) != workspace {
-						t.Fatalf("invalidation scope = %+v, want the session granularity with the shared workspace", body.Scope)
+					if scopeKind(t, body.Scope) != "session" {
+						t.Fatalf("invalidation scope = %+v, want the session granularity", body.Scope)
+					}
+					invalidation, err := body.Scope.AsSessionScope()
+					if err != nil {
+						t.Fatalf("invalidation scope: %v", err)
+					}
+					if deref(invalidation.Workspace) != workspace {
+						t.Fatalf("invalidation scope = %+v, want the shared workspace", body.Scope)
 					}
 				case "text_delta":
 					body, err := event.AsTextDeltaEvent()
 					if err != nil {
 						t.Fatalf("delta event body: %v", err)
 					}
-					if body.Scope.SessionId == nil || *body.Scope.SessionId == child {
-						if body.Scope.OperationId == nil || *body.Scope.OperationId != "child-op-1" {
+					progress, err := body.Scope.AsOperationScope()
+					if err != nil {
+						t.Fatalf("progress scope: %v", err)
+					}
+					if progress.SessionId == child {
+						if progress.OperationId != "child-op-1" {
 							t.Fatalf("child progress scope = %+v, want the child's real operation", body.Scope)
 						}
 						childProgress++
@@ -184,7 +200,7 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 					// delivery's own follow-up turn: its operation is real
 					// but caller-generated, so only the session identity is
 					// pinned here.
-					if body.Scope.SessionId == nil || *body.Scope.SessionId != root || body.Scope.OperationId == nil || *body.Scope.OperationId == "" {
+					if progress.SessionId != root || progress.OperationId == "" {
 						t.Fatalf("progress scope = %+v, want the root session's real operation", body.Scope)
 					}
 					rootProgress++
@@ -195,8 +211,9 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 					if err != nil {
 						t.Fatalf("scope event body: %v", err)
 					}
-					if body.Scope.Kind == protocol.ScopeKindOperation || body.Scope.Kind == protocol.ScopeKindAgent {
-						if body.Scope.SessionId == nil || (*body.Scope.SessionId != root && *body.Scope.SessionId != child) {
+					if kind := scopeKind(t, body.Scope); kind == "operation" || kind == "agent" {
+						shortSession, _ := scopeSessionIdentity(t, body.Scope)
+						if shortSession != root && shortSession != child {
 							t.Fatalf("short scope event for a foreign session: %+v", body.Scope)
 						}
 					}
@@ -375,7 +392,14 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("session event body: %v", err)
 		}
-		if creationBody.Scope.Kind != protocol.ScopeKindSession || creationBody.Scope.JobId != nil {
+		if scopeKind(t, creationBody.Scope) != "session" {
+			t.Fatalf("creation event scope = %+v, want the plain session granularity", creationBody.Scope)
+		}
+		creationScope, err := creationBody.Scope.AsSessionScope()
+		if err != nil {
+			t.Fatalf("creation event scope: %v", err)
+		}
+		if creationScope.JobId != nil {
 			t.Fatalf("creation event scope = %+v, want the plain session granularity", creationBody.Scope)
 		}
 
@@ -390,8 +414,15 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("session event body: %v", err)
 		}
-		if body.Scope.Kind != protocol.ScopeKindJob || body.Scope.JobId == nil || *body.Scope.JobId != "11111111" ||
-			body.Scope.SessionId == nil || *body.Scope.SessionId != session || deref(body.Scope.Workspace) != workspace {
+		if scopeKind(t, body.Scope) != "job" {
+			t.Fatalf("job admission scope = %+v, want the job scope with the owning session", body.Scope)
+		}
+		jobScope, err := body.Scope.AsJobScope()
+		if err != nil {
+			t.Fatalf("job admission scope: %v", err)
+		}
+		if jobScope.JobId != "11111111" ||
+			jobScope.SessionId != session || deref(jobScope.Workspace) != workspace {
 			t.Fatalf("job admission scope = %+v, want the job scope with the owning session", body.Scope)
 		}
 		if admitPair := snapshotPairOf(t, bg.r, session); body.SessionRevision != admitPair {
@@ -431,11 +462,17 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 			if err != nil {
 				t.Fatalf("session event body: %v", err)
 			}
-			if body.Scope.Kind == protocol.ScopeKindJob && body.Scope.JobId != nil && *body.Scope.JobId == "11111111" {
-				finishPair = body.SessionRevision
-				break
+			if scopeKind(t, body.Scope) == "job" {
+				finishHint, err := body.Scope.AsJobScope()
+				if err != nil {
+					t.Fatalf("job finish hint scope: %v", err)
+				}
+				if finishHint.JobId == "11111111" {
+					finishPair = body.SessionRevision
+					break
+				}
 			}
-			if body.Scope.Kind != protocol.ScopeKindSession {
+			if scopeKind(t, body.Scope) != "session" {
 				t.Fatalf("completion-delivery hint scope = %+v, want the session granularity", body.Scope)
 			}
 			if time.Now().After(deadline) {
@@ -519,8 +556,8 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 		if err != nil {
 			t.Fatalf("warning event body: %v", err)
 		}
-		if body.Scope.Kind != protocol.ScopeKindRuntime {
-			t.Fatalf("report event scope kind = %q, want the runtime scope", body.Scope.Kind)
+		if scopeKind(t, body.Scope) != "runtime" {
+			t.Fatalf("report event scope kind = %q, want the runtime scope", scopeKind(t, body.Scope))
 		}
 		if body.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
 			t.Fatalf("report event revision = %q, want the first advance", body.WarningsRevision.Revision)

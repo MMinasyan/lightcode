@@ -1459,7 +1459,7 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 			if err != nil {
 				t.Fatalf("warning event body: %v", err)
 			}
-			if body.Scope.Kind != protocol.ScopeKindRuntime {
+			if scopeKind(t, body.Scope) != "runtime" {
 				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
 			}
 			hint = &body

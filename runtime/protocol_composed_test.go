@@ -326,6 +326,12 @@ func composedDiscriminator(t *testing.T, event protocol.Event) string {
 	return kind
 }
 
+// composedScopeKind reads one delivered scope's union discriminator literal.
+func composedScopeKind(scope protocol.Scope) string {
+	kind, _ := scope.Discriminator()
+	return kind
+}
+
 func composedIsJobHintFor(t *testing.T, jobID string) func(protocol.Event) bool {
 	t.Helper()
 	return func(event protocol.Event) bool {
@@ -336,7 +342,11 @@ func composedIsJobHintFor(t *testing.T, jobID string) func(protocol.Event) bool 
 		if err != nil {
 			return false
 		}
-		return body.Scope.Kind == protocol.ScopeKindJob && body.Scope.JobId != nil && *body.Scope.JobId == jobID
+		if composedScopeKind(body.Scope) != "job" {
+			return false
+		}
+		job, err := body.Scope.AsJobScope()
+		return err == nil && job.JobId == jobID
 	}
 }
 
@@ -603,7 +613,11 @@ func TestProtocolComposedFlow(t *testing.T) {
 		if err != nil {
 			t.Fatalf("tool_started body: %v", err)
 		}
-		if startedBody.Scope.Kind != protocol.ScopeKindOperation || startedBody.Scope.SessionId == nil || *startedBody.Scope.SessionId != main {
+		if composedScopeKind(startedBody.Scope) != "operation" {
+			t.Fatalf("write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
+		}
+		startedScope, err := startedBody.Scope.AsOperationScope()
+		if err != nil || startedScope.SessionId != main {
 			t.Fatalf("write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
 		}
 		stream.wait(func(event protocol.Event) bool {
@@ -618,7 +632,11 @@ func TestProtocolComposedFlow(t *testing.T) {
 				return false
 			}
 			body, err := event.AsSessionChangedEvent()
-			return err == nil && body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == main
+			if err != nil || composedScopeKind(body.Scope) != "session" {
+				return false
+			}
+			session, err := body.Scope.AsSessionScope()
+			return err == nil && session.SessionId == main
 		}, "the settled operation's session invalidation")
 		sessionHint, err := invalidation.AsSessionChangedEvent()
 		if err != nil {
@@ -788,7 +806,11 @@ func TestProtocolComposedFlow(t *testing.T) {
 				return false
 			}
 			body, err := event.AsSessionChangedEvent()
-			return err == nil && body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == childID
+			if err != nil || composedScopeKind(body.Scope) != "session" {
+				return false
+			}
+			child, err := body.Scope.AsSessionScope()
+			return err == nil && child.SessionId == childID
 		}, "the child's own invalidation on the shared stream")
 		model.releaseChild()
 		// The parent receives the completion as one runtime-origin input

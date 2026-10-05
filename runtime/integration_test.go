@@ -431,7 +431,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if !ok {
 				t.Fatal("the healthy subscription closed before op-b1's Operation-close publication")
 			}
-			if body, closed := scopeClosedEvent(t, event); closed && body.Scope.Kind == protocol.ScopeKindOperation && deref(body.Scope.Workspace) == wsB {
+			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsB {
 				recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 				break
 			}
@@ -515,7 +515,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if !ok {
 				t.Fatal("the healthy subscription closed before the queued delivery settled")
 			}
-			if body, closed := scopeClosedEvent(t, event); closed && body.Scope.Kind == protocol.ScopeKindOperation && deref(body.Scope.Workspace) == wsA {
+			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
 				closedOps++
 			}
 			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
@@ -646,9 +646,9 @@ func recordCommittedEvent(t *testing.T, observed *[]Event, event Event, sessionI
 		if err != nil {
 			t.Fatalf("warning event body: %v", err)
 		}
-		if body.Scope.Kind == protocol.ScopeKindRuntime {
+		if scopeKind(t, body.Scope) == "runtime" {
 			// the global reload groups
-		} else if body.Scope.Kind == protocol.ScopeKindSession && scopeNamesRealSession(t, body.Scope, sessionIDs...) {
+		} else if scopeNamesRealSession(t, body.Scope, sessionIDs...) {
 			// the session's own prompt group
 		} else {
 			t.Fatalf("warning event scope = %+v, want the runtime scope or a real session", body.Scope)
@@ -662,12 +662,14 @@ func recordCommittedEvent(t *testing.T, observed *[]Event, event Event, sessionI
 			t.Fatalf("session event body: %v", err)
 		}
 		if !scopeNamesRealSession(t, body.Scope, sessionIDs...) {
-			t.Fatalf("passive invalidation for %v, want a real session", body.Scope.SessionId)
+			invalidation, _ := scopeSessionIdentity(t, body.Scope)
+			t.Fatalf("passive invalidation for %v, want a real session", invalidation)
 		}
 	case "text_delta", "tool_started", "tool_finished":
 		scope := progressEventScope(t, event)
 		if !scopeNamesRealSession(t, scope, sessionIDs...) {
-			t.Fatalf("passive progress for %v, want a real session", scope.SessionId)
+			progress, _ := scopeSessionIdentity(t, scope)
+			t.Fatalf("passive progress for %v, want a real session", progress)
 		}
 	default:
 		t.Fatalf("unexpected event kind %q", eventKind(t, event))
@@ -701,18 +703,33 @@ func committedTail(t *testing.T, sub *Subscription, sessionIDs ...string) []Even
 }
 
 // scopeNamesRealSession reports whether one event scope names one of the
-// given real Sessions.
+// given real Sessions through its Session-carrying union branches.
 func scopeNamesRealSession(t *testing.T, scope protocol.Scope, sessionIDs ...string) bool {
 	t.Helper()
-	if scope.SessionId == nil {
+	sessionID, ok := scopeSessionIdentity(t, scope)
+	if !ok {
 		return false
 	}
-	for _, sessionID := range sessionIDs {
-		if *scope.SessionId == sessionID {
+	for _, real := range sessionIDs {
+		if sessionID == real {
 			return true
 		}
 	}
 	return false
+}
+
+// operationScopeWorkspace reads the lexical Workspace of one Operation scope;
+// any other scope kind reads as the empty root.
+func operationScopeWorkspace(t *testing.T, scope protocol.Scope) string {
+	t.Helper()
+	if scopeKind(t, scope) != "operation" {
+		return ""
+	}
+	body, err := scope.AsOperationScope()
+	if err != nil {
+		t.Fatalf("operation scope: %v", err)
+	}
+	return deref(body.Workspace)
 }
 
 func deref(value *string) string {

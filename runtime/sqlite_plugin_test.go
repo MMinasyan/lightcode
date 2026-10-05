@@ -560,10 +560,12 @@ func composedEventJSON(event runtime.Event) string {
 // composedConfigurationEvent builds one configuration event through the
 // generated constructor for the composed order oracles.
 func composedConfigurationEvent(generation uint64) runtime.Event {
+	var scope protocol.Scope
+	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
 	var event protocol.Event
 	_ = event.FromConfigurationChangedEvent(protocol.ConfigurationChangedEvent{ // plain members; the marshal cannot fail
 		Kind:                  protocol.ConfigurationChanged,
-		Scope:                 protocol.Scope{Kind: protocol.ScopeKindRuntime},
+		Scope:                 scope,
 		ConfigurationRevision: protocol.ConfigurationRevision{Generation: strconv.FormatUint(generation, 10)},
 	})
 	return event
@@ -667,10 +669,12 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 // composedRuntimeScopeClosed builds the Runtime closure scope event for the
 // composed order oracles.
 func composedRuntimeScopeClosed() runtime.Event {
+	var scope protocol.Scope
+	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
 	var event protocol.Event
 	_ = event.FromScopeEvent(protocol.ScopeEvent{ // plain members; the marshal cannot fail
 		Kind:  protocol.ScopeClosed,
-		Scope: protocol.Scope{Kind: protocol.ScopeKindRuntime},
+		Scope: scope,
 	})
 	return event
 }

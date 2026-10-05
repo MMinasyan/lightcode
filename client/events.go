@@ -149,7 +149,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "configuration_revision"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if err := validateRevision(members["configuration_revision"], instance, "instance_id", "generation"); err != nil {
@@ -169,7 +169,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		var out protocol.Event
@@ -186,7 +186,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "session_revision"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if err := validateRevision(members["session_revision"], instance, "instance_id", "durable_revision", "local_revision"); err != nil {
@@ -206,7 +206,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "warnings_revision"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if err := validateRevision(members["warnings_revision"], instance, "instance_id", "revision"); err != nil {
@@ -226,7 +226,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "position", "content"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if event.Position < 0 || event.Content == "" {
@@ -246,7 +246,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "call_id", "ordinal", "name"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if event.Ordinal < 0 {
@@ -266,7 +266,7 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if err := requireMembers(members, "kind", "scope", "call_id", "status"); err != nil {
 			return protocol.Event{}, err
 		}
-		if err := validateScope(event.Scope, members["scope"]); err != nil {
+		if err := validateScope(members["scope"]); err != nil {
 			return protocol.Event{}, err
 		}
 		if !event.Status.Valid() {
@@ -329,12 +329,35 @@ func requireMembers(members map[string]json.RawMessage, names ...string) error {
 	return nil
 }
 
-// validateScope inspects the generated Scope the outer strict decode already
-// produced: the raw member map proves the required kind is present and no
-// member is null, then the decoded closed kind enum and the session_id pattern
-// are checked. The outer decoder already rejected nested unknown members and
-// wrong types, so no second typed decode runs here.
-func validateScope(scope protocol.Scope, raw json.RawMessage) error {
+// The closed scope member vocabulary shared by every union branch, and the
+// identities each kind must carry to address its subject; the runtime scope
+// alone names the whole Runtime with none.
+var (
+	scopeMembers = map[string]bool{
+		"kind":         true,
+		"workspace":    true,
+		"session_id":   true,
+		"operation_id": true,
+		"job_id":       true,
+	}
+	scopeRequiredIdentities = map[string][]string{
+		"runtime":   nil,
+		"workspace": {"workspace"},
+		"session":   {"session_id"},
+		"operation": {"session_id", "operation_id"},
+		"agent":     {"session_id", "operation_id"},
+		"job":       {"session_id", "job_id"},
+	}
+)
+
+// validateScope proves one delivered scope is inside the schema's union
+// domain: the raw member map proves the scope is a JSON object with no null
+// member, a present kind, and no member outside the closed vocabulary; every
+// supplied identifier is a nonempty string with session_id inside its 32-hex
+// pattern; and the kind selects one branch whose required identities are
+// present. The generated union's decode stores the raw value without
+// inspecting it, so this is the scope's one validation.
+func validateScope(raw json.RawMessage) error {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return fmt.Errorf("scope: %w", err)
@@ -348,11 +371,37 @@ func validateScope(scope protocol.Scope, raw json.RawMessage) error {
 	if err := requireMembers(members, "kind"); err != nil {
 		return fmt.Errorf("scope: %w", err)
 	}
-	if !scope.Kind.Valid() {
-		return fmt.Errorf("scope kind %q is outside the closed set", scope.Kind)
+	for name, value := range members {
+		if !scopeMembers[name] {
+			return fmt.Errorf("scope member %q is unknown", name)
+		}
+		if name == "kind" {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return fmt.Errorf("scope member %q: %w", name, err)
+		}
+		if name == "session_id" {
+			if !isLowerHex(text, 32) {
+				return fmt.Errorf("scope session_id %q is not 32 lowercase hex", text)
+			}
+			continue
+		}
+		if text == "" {
+			return fmt.Errorf("scope member %q is empty", name)
+		}
 	}
-	if scope.SessionId != nil && !isLowerHex(*scope.SessionId, 32) {
-		return fmt.Errorf("scope session_id %q is not 32 lowercase hex", *scope.SessionId)
+	var kind string
+	if err := json.Unmarshal(members["kind"], &kind); err != nil {
+		return fmt.Errorf("scope kind: %w", err)
+	}
+	required, known := scopeRequiredIdentities[kind]
+	if !known {
+		return fmt.Errorf("scope kind %q is outside the closed set", kind)
+	}
+	if err := requireMembers(members, required...); err != nil {
+		return fmt.Errorf("scope: %w", err)
 	}
 	return nil
 }

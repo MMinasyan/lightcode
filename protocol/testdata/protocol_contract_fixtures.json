@@ -467,7 +467,7 @@
     },
     {
      "name": "scope-closed",
-     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"job_id\":\"job-1\"}}"
+     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"job_id\":\"job-1\"}}"
     }
    ],
    "reject": [
@@ -1181,6 +1181,22 @@
     {
      "name": "full",
      "json": "{\"kind\":\"operation\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    },
+    {
+     "name": "workspace-identity",
+     "json": "{\"kind\":\"workspace\",\"workspace\":\"/workspace\"}"
+    },
+    {
+     "name": "session-identity",
+     "json": "{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "job-identity",
+     "json": "{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"job_id\":\"job-1\"}"
+    },
+    {
+     "name": "agent-identity",
+     "json": "{\"kind\":\"agent\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\"}"
     }
    ],
    "reject": [
@@ -1191,8 +1207,139 @@
     {
      "name": "unknown-member",
      "json": "{\"kind\":\"runtime\",\"extra\":true}"
+    },
+    {
+     "name": "workspace-without-workspace",
+     "json": "{\"kind\":\"workspace\"}"
+    },
+    {
+     "name": "session-without-session-id",
+     "json": "{\"kind\":\"session\"}"
+    },
+    {
+     "name": "operation-without-session-id",
+     "json": "{\"kind\":\"operation\",\"operation_id\":\"op-1\"}"
+    },
+    {
+     "name": "operation-without-operation-id",
+     "json": "{\"kind\":\"operation\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "agent-without-session-id",
+     "json": "{\"kind\":\"agent\",\"operation_id\":\"op-1\"}"
+    },
+    {
+     "name": "agent-without-operation-id",
+     "json": "{\"kind\":\"agent\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "job-without-session-id",
+     "json": "{\"kind\":\"job\",\"job_id\":\"job-1\"}"
+    },
+    {
+     "name": "job-without-job-id",
+     "json": "{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "empty-workspace",
+     "json": "{\"kind\":\"workspace\",\"workspace\":\"\"}",
+     "typescript": false
+    },
+    {
+     "name": "empty-operation-id",
+     "json": "{\"kind\":\"operation\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"\"}",
+     "typescript": false
+    },
+    {
+     "name": "empty-job-id",
+     "json": "{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"job_id\":\"\"}",
+     "typescript": false
     }
    ]
+  },
+  {
+   "schema": "RuntimeScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"runtime\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"runtime\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "WorkspaceScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"workspace\",\"workspace\":\"/workspace\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"workspace\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "SessionScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"session\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "OperationScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"operation\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"operation\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "AgentScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"agent\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"agent\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
+  },
+  {
+   "schema": "JobScope",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"job_id\":\"job-1\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"kind\":\"job\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+    }
+   ],
+   "reject": []
   },
   {
    "schema": "ScopeEvent",
@@ -1203,7 +1350,7 @@
     },
     {
      "name": "scope-closed-job",
-     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"job_id\":\"job-1\"}}"
+     "json": "{\"kind\":\"scope_closed\",\"scope\":{\"kind\":\"job\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"job_id\":\"job-1\"}}"
     }
    ],
    "reject": [

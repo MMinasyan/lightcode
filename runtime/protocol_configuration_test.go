@@ -808,7 +808,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("warning event body: %v", err)
 		}
-		if clearingBody.Scope.Kind != protocol.ScopeKindRuntime {
+		if scopeKind(t, clearingBody.Scope) != "runtime" {
 			t.Fatalf("clearing reload's warning scope = %+v, want the runtime scope", clearingBody.Scope)
 		}
 		clear, err := r.getWarnings(context.Background())

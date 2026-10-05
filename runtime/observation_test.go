@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,6 +40,104 @@ func eventKind(t *testing.T, event Event) string {
 		t.Fatalf("event discriminator: %v", err)
 	}
 	return kind
+}
+
+// scopeKind reads one delivered scope's union discriminator literal.
+func scopeKind(t *testing.T, scope protocol.Scope) string {
+	t.Helper()
+	kind, err := scope.Discriminator()
+	if err != nil {
+		t.Fatalf("scope discriminator: %v", err)
+	}
+	return kind
+}
+
+// scopeSessionIdentity reads the Session identity one scope names through its
+// Session-carrying union branches; the runtime and workspace scopes name none.
+func scopeSessionIdentity(t *testing.T, scope protocol.Scope) (string, bool) {
+	t.Helper()
+	var sessionID string
+	switch scopeKind(t, scope) {
+	case "session":
+		body, err := scope.AsSessionScope()
+		if err != nil {
+			t.Fatalf("session scope: %v", err)
+		}
+		sessionID = body.SessionId
+	case "operation":
+		body, err := scope.AsOperationScope()
+		if err != nil {
+			t.Fatalf("operation scope: %v", err)
+		}
+		sessionID = body.SessionId
+	case "agent":
+		body, err := scope.AsAgentScope()
+		if err != nil {
+			t.Fatalf("agent scope: %v", err)
+		}
+		sessionID = body.SessionId
+	case "job":
+		body, err := scope.AsJobScope()
+		if err != nil {
+			t.Fatalf("job scope: %v", err)
+		}
+		sessionID = body.SessionId
+	default:
+		return "", false
+	}
+	return sessionID, true
+}
+
+// scopeWorkspaceAttribution reads the optional Workspace attribution one
+// scope carries through its union branches; the Workspace scope carries it as
+// its required identity.
+func scopeWorkspaceAttribution(t *testing.T, scope protocol.Scope) (string, bool) {
+	t.Helper()
+	var workspace *string
+	switch scopeKind(t, scope) {
+	case "runtime":
+		body, err := scope.AsRuntimeScope()
+		if err != nil {
+			t.Fatalf("runtime scope: %v", err)
+		}
+		workspace = body.Workspace
+	case "workspace":
+		body, err := scope.AsWorkspaceScope()
+		if err != nil {
+			t.Fatalf("workspace scope: %v", err)
+		}
+		return body.Workspace, true
+	case "session":
+		body, err := scope.AsSessionScope()
+		if err != nil {
+			t.Fatalf("session scope: %v", err)
+		}
+		workspace = body.Workspace
+	case "operation":
+		body, err := scope.AsOperationScope()
+		if err != nil {
+			t.Fatalf("operation scope: %v", err)
+		}
+		workspace = body.Workspace
+	case "agent":
+		body, err := scope.AsAgentScope()
+		if err != nil {
+			t.Fatalf("agent scope: %v", err)
+		}
+		workspace = body.Workspace
+	case "job":
+		body, err := scope.AsJobScope()
+		if err != nil {
+			t.Fatalf("job scope: %v", err)
+		}
+		workspace = body.Workspace
+	default:
+		return "", false
+	}
+	if workspace == nil {
+		return "", false
+	}
+	return *workspace, true
 }
 
 // eventGeneration reads one configuration event's published generation.
@@ -388,7 +487,14 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 			if err != nil {
 				t.Fatalf("scope event body: %v", err)
 			}
-			if body.Scope.Kind != protocol.ScopeKindRuntime || body.Scope.Workspace != nil {
+			if scopeKind(t, body.Scope) != "runtime" {
+				t.Fatalf("unexpected closure event %s, only the Runtime scope closes here", eventJSON(t, event))
+			}
+			runtimeScope, err := body.Scope.AsRuntimeScope()
+			if err != nil {
+				t.Fatalf("runtime scope: %v", err)
+			}
+			if runtimeScope.Workspace != nil {
 				t.Fatalf("unexpected closure event %s, only the Runtime scope closes here", eventJSON(t, event))
 			}
 		default:
@@ -518,8 +624,12 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 				if err != nil {
 					t.Fatalf("session event body: %v", err)
 				}
-				if body.Scope.SessionId == nil || *body.Scope.SessionId != sessionID {
-					t.Fatalf("passive invalidation for %v, want the real session", body.Scope.SessionId)
+				invalidation, err := body.Scope.AsSessionScope()
+				if err != nil {
+					t.Fatalf("passive invalidation scope: %v", err)
+				}
+				if invalidation.SessionId != sessionID {
+					t.Fatalf("passive invalidation for %q, want the real session", invalidation.SessionId)
 				}
 			case "text_delta", "tool_started", "tool_finished":
 				if err := assertOperationScoped(t, event, sessionID, "op-observed"); err != nil {
@@ -568,7 +678,14 @@ func progressEventScope(t *testing.T, event Event) protocol.Scope {
 func assertOperationScoped(t *testing.T, event Event, sessionID, operationID string) error {
 	t.Helper()
 	scope := progressEventScope(t, event)
-	if scope.SessionId == nil || *scope.SessionId != sessionID || scope.OperationId == nil || *scope.OperationId != operationID {
+	if scopeKind(t, scope) != "operation" {
+		return fmt.Errorf("progress carries the %s scope, want the operation scope", scopeKind(t, scope))
+	}
+	body, err := scope.AsOperationScope()
+	if err != nil {
+		t.Fatalf("operation scope: %v", err)
+	}
+	if body.SessionId != sessionID || body.OperationId != operationID {
 		return errors.New("progress carries a foreign session or operation identity")
 	}
 	return nil

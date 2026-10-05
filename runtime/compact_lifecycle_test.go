@@ -19,7 +19,6 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/pkoukk/tiktoken-go"
 )
 
@@ -1058,11 +1057,12 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 					if err != nil {
 						t.Fatalf("session event body: %v", err)
 					}
-					if body.Scope.SessionId == nil || *body.Scope.SessionId != s {
-						t.Fatalf("compaction invalidation for session %v, want the real session", body.Scope.SessionId)
+					invalidationScope, err := body.Scope.AsSessionScope()
+					if err != nil {
+						t.Fatalf("compaction invalidation scope: %v", err)
 					}
-					if body.Scope.Kind != protocol.ScopeKindSession {
-						t.Fatalf("compaction invalidation scope kind = %q, want the session granularity", body.Scope.Kind)
+					if invalidationScope.SessionId != s || scopeKind(t, body.Scope) != "session" {
+						t.Fatalf("compaction invalidation scope = %+v, want the real session's session-granularity scope", body.Scope)
 					}
 					seenSessionInvalidations++
 				case "text_delta":
@@ -1070,8 +1070,12 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 					if err != nil {
 						t.Fatalf("delta event body: %v", err)
 					}
-					if body.Scope.SessionId == nil || *body.Scope.SessionId != s ||
-						body.Scope.OperationId == nil || (*body.Scope.OperationId != "op-2" && *body.Scope.OperationId != "op-3") {
+					deltaScope, err := body.Scope.AsOperationScope()
+					if err != nil {
+						t.Fatalf("compaction delta scope: %v", err)
+					}
+					if deltaScope.SessionId != s ||
+						(deltaScope.OperationId != "op-2" && deltaScope.OperationId != "op-3") {
 						t.Fatalf("compaction delta scope = %+v, want a real admitted operation", body.Scope)
 					}
 					if body.Content == "" {

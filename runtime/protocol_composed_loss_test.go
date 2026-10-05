@@ -144,15 +144,21 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 			if err != nil {
 				t.Fatalf("fresh stream frame scope: %v", err)
 			}
-			if scope.SessionId != nil && *scope.SessionId != fresh {
-				t.Fatalf("replayed frame for session %s reached the fresh stream: %s", *scope.SessionId, frame)
+			if stale, ok := scopeSessionIdentity(t, scope); ok && stale != fresh {
+				t.Fatalf("replayed frame for session %s reached the fresh stream: %s", stale, frame)
 			}
-			if scope.Workspace != nil && *scope.Workspace != freshWorkspace {
-				t.Fatalf("replayed frame for workspace %s reached the fresh stream: %s", *scope.Workspace, frame)
+			if stale, ok := scopeWorkspaceAttribution(t, scope); ok && stale != freshWorkspace {
+				t.Fatalf("replayed frame for workspace %s reached the fresh stream: %s", stale, frame)
 			}
 			if body, err := event.AsSessionChangedEvent(); err == nil &&
-				body.Scope.Kind == protocol.ScopeKindSession && body.Scope.SessionId != nil && *body.Scope.SessionId == fresh {
-				break // the fresh work's own invalidation is the witness
+				scopeKind(t, body.Scope) == "session" {
+				freshScope, err := body.Scope.AsSessionScope()
+				if err != nil {
+					t.Fatalf("fresh invalidation scope: %v", err)
+				}
+				if freshScope.SessionId == fresh {
+					break // the fresh work's own invalidation is the witness
+				}
 			}
 		}
 

@@ -177,7 +177,7 @@ func TestGeneratedCostRoundTripsDoublePrecision(t *testing.T) {
 func TestScopeEventSharedPayload(t *testing.T) {
 	event := componentSchema(t, "Event")
 	acceptJSON(t, event, `{"kind": "scope_opened", "scope": {"kind": "runtime"}}`)
-	acceptJSON(t, event, `{"kind": "scope_closed", "scope": {"kind": "job", "job_id": "j1"}}`)
+	acceptJSON(t, event, `{"kind": "scope_closed", "scope": {"kind": "job", "session_id": "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", "job_id": "j1"}}`)
 	rejectJSON(t, event, `{"kind": "scope_unknown", "scope": {"kind": "runtime"}}`)
 	rejectJSON(t, event, `{"kind": "scope_opened", "scope": {"kind": "runtime"}, "extra": 1}`)
 

@@ -49,12 +49,70 @@ export type Health = {
     protocol_version: '1';
 };
 
-export type Scope = {
-    kind: 'runtime' | 'workspace' | 'session' | 'operation' | 'agent' | 'job';
+/**
+ * One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+ *
+ */
+export type Scope = ({
+    kind: 'runtime';
+} & RuntimeScope) | ({
+    kind: 'workspace';
+} & WorkspaceScope) | ({
+    kind: 'session';
+} & SessionScope) | ({
+    kind: 'operation';
+} & OperationScope) | ({
+    kind: 'agent';
+} & AgentScope) | ({
+    kind: 'job';
+} & JobScope);
+
+export type RuntimeScope = {
+    kind: 'runtime';
     workspace?: string;
     session_id?: string;
     operation_id?: string;
     job_id?: string;
+};
+
+export type WorkspaceScope = {
+    kind: 'workspace';
+    workspace: string;
+    session_id?: string;
+    operation_id?: string;
+    job_id?: string;
+};
+
+export type SessionScope = {
+    kind: 'session';
+    workspace?: string;
+    session_id: string;
+    operation_id?: string;
+    job_id?: string;
+};
+
+export type OperationScope = {
+    kind: 'operation';
+    workspace?: string;
+    session_id: string;
+    operation_id: string;
+    job_id?: string;
+};
+
+export type AgentScope = {
+    kind: 'agent';
+    workspace?: string;
+    session_id: string;
+    operation_id: string;
+    job_id?: string;
+};
+
+export type JobScope = {
+    kind: 'job';
+    workspace?: string;
+    session_id: string;
+    operation_id?: string;
+    job_id: string;
 };
 
 export type ContentPart = ({
