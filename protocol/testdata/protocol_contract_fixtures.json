@@ -370,6 +370,10 @@
     {
      "name": "with-headers",
      "json": "{\"base_url\":\"https://discover.test/v1\",\"api_key_env\":\"DISCOVER_KEY\",\"headers\":{\"X-Discovery\":\"1\"}}"
+    },
+    {
+     "name": "with-supplied-key",
+     "json": "{\"base_url\":\"https://discover.test/v1\",\"api_key_env\":\"DISCOVER_KEY\",\"api_key\":\"sk-discovery-supplied-fixture\"}"
     }
    ],
    "reject": []

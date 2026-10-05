@@ -860,6 +860,128 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 	})
 }
 
+// TestProtocolServerDiscoverySuppliedKey drives the unpersisted discovery
+// read's credential input through the mounted server: the generated client
+// and the raw wire both carry the supplied key's exact value on the
+// transient fetch — never the externally owned reference's value — the
+// fallback row uses the reference's captured value, and no response byte,
+// notification frame, or persisted state carries a credential.
+func TestProtocolServerDiscoverySuppliedKey(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		const pasted = "sk-mounted-discovery-key"
+		const external = "sk-mounted-external-value"
+		t.Setenv("MOUNTED_DISCOVERY_KEY", external)
+		r, _ := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+		stream := openSSEStream(t, ps)
+		defer stream.close()
+		ctx := context.Background()
+
+		before, err := client.GetConfigurationWithResponse(ctx)
+		if err != nil || before.JSON200 == nil {
+			t.Fatalf("GetConfiguration: %v", err)
+		}
+
+		var mu sync.Mutex
+		var auths []string
+		discovery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			mu.Lock()
+			auths = append(auths, req.Header.Get("Authorization"))
+			mu.Unlock()
+			if req.Header.Get("Authorization") == "Bearer "+pasted {
+				_, _ = w.Write([]byte(`{"data":[{"id":"stub/m","name":"Stub","context_window":4096,"max_output_tokens":1024}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}))
+		defer discovery.Close()
+
+		// Pre-save pasted-key discovery through the generated client: the
+		// supplied value binds the transient fetch over the externally
+		// owned reference.
+		candidates, err := client.DiscoverProviderCandidatesWithResponse(ctx, protocol.DiscoveryRequest{
+			BaseUrl:   discovery.URL + "/v1",
+			ApiKeyEnv: "MOUNTED_DISCOVERY_KEY",
+			ApiKey:    ptrTo(pasted),
+		})
+		if err != nil || candidates.JSON200 == nil || len(*candidates.JSON200) != 1 || (*candidates.JSON200)[0].Id != "stub/m" {
+			body, _ := json.Marshal(candidates)
+			t.Fatalf("supplied-key discovery = %v %s, want the pasted key's candidate", err, body)
+		}
+
+		// The fallback row: with no supplied key the reference's captured
+		// value decides — the gate answers it with an empty list, the
+		// ordinary typed fetch outcome, whose body carries no credential.
+		fallback, err := client.DiscoverProviderCandidatesWithResponse(ctx, protocol.DiscoveryRequest{
+			BaseUrl:   discovery.URL + "/v1",
+			ApiKeyEnv: "MOUNTED_DISCOVERY_KEY",
+		})
+		if err != nil || fallback.JSON200 != nil || fallback.JSONDefault == nil {
+			body, _ := json.Marshal(fallback)
+			t.Fatalf("fallback discovery = %v %s, want the empty answer's typed refusal", err, body)
+		}
+		if refusal, merr := json.Marshal(fallback.JSONDefault); merr != nil || strings.Contains(string(refusal), pasted) || strings.Contains(string(refusal), external) {
+			t.Fatalf("the fallback refusal body carries a credential value: (%s, %v)", refusal, merr)
+		}
+
+		// The raw wire row: the strict body decode accepts the supplied
+		// key, the answer carries the candidate, and no response byte
+		// carries a credential value.
+		rawBody := `{"base_url":"` + discovery.URL + `/v1","api_key_env":"MOUNTED_DISCOVERY_KEY","api_key":"` + pasted + `"}`
+		raw := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers/discover"), ps.credential, rawBody)
+		rawBytes := readRawBody(t, raw)
+		if raw.StatusCode != http.StatusOK || !strings.Contains(rawBytes, `"stub/m"`) {
+			t.Fatalf("raw supplied-key discovery = %d: %s", raw.StatusCode, rawBytes)
+		}
+		if strings.Contains(rawBytes, pasted) || strings.Contains(rawBytes, external) {
+			t.Fatalf("the raw discovery response carries a credential value: %s", rawBytes)
+		}
+
+		// The exact wire credentials per row: the pasted key twice, with
+		// the captured external value between them.
+		wantAuths := []string{"Bearer " + pasted, "Bearer " + external, "Bearer " + pasted}
+		mu.Lock()
+		wireAuths := append([]string(nil), auths...)
+		mu.Unlock()
+		if !reflect.DeepEqual(wireAuths, wantAuths) {
+			t.Fatalf("discovery wire credentials = %v, want %v", wireAuths, wantAuths)
+		}
+
+		// The reads published nothing: the configuration revision is
+		// unchanged, no notification frame carries a credential value, no
+		// discovery cache was written, and the externally owned reference
+		// is untouched and unmanaged.
+		after, err := client.GetConfigurationWithResponse(ctx)
+		if err != nil || after.JSON200 == nil {
+			t.Fatalf("GetConfiguration after the reads: %v", err)
+		}
+		if after.JSON200.ConfigurationRevision != before.JSON200.ConfigurationRevision {
+			t.Fatalf("the discovery reads advanced the revision from %+v to %+v", before.JSON200.ConfigurationRevision, after.JSON200.ConfigurationRevision)
+		}
+		frames := make(chan string, 1)
+		go func() {
+			frame, ok, rerr := stream.readSSEFrame()
+			if rerr != nil || !ok {
+				return
+			}
+			frames <- string(frame)
+		}()
+		select {
+		case frame := <-frames:
+			t.Fatalf("the discovery reads published a notification frame: %s", frame)
+		case <-time.After(2 * time.Second):
+		}
+		if _, serr := os.Stat(filepath.Join(r.config.loader.Home(), ".lightcode", "cache", "discovery", "custom.json")); !os.IsNotExist(serr) {
+			t.Fatalf("the discovery reads wrote a cache file: %v", serr)
+		}
+		if os.Getenv("MOUNTED_DISCOVERY_KEY") != external || r.managedEnv.IsManaged("MOUNTED_DISCOVERY_KEY") {
+			t.Fatalf("external reference state = (%q, %v), want the exact value intact and unmanaged", os.Getenv("MOUNTED_DISCOVERY_KEY"), r.managedEnv.IsManaged("MOUNTED_DISCOVERY_KEY"))
+		}
+	})
+}
+
 // TestProtocolServerConfigurationFamily drives the configuration, model, and
 // provider operation families through the mounted server with the generated
 // client: reads carry their instance-qualified revision, the mutation

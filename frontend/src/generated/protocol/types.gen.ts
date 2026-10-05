@@ -637,6 +637,7 @@ export type ConnectRequest = {
 export type DiscoveryRequest = {
     base_url: string;
     api_key_env: string;
+    api_key?: string;
     headers?: {
         [key: string]: string;
     };

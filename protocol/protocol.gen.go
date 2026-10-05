@@ -985,6 +985,7 @@ type DiscoveredModelCandidate struct {
 
 // DiscoveryRequest defines model for DiscoveryRequest.
 type DiscoveryRequest struct {
+	ApiKey    *string            `json:"api_key,omitempty"`
 	ApiKeyEnv string             `json:"api_key_env"`
 	BaseUrl   string             `json:"base_url"`
 	Headers   *map[string]string `json:"headers,omitempty"`

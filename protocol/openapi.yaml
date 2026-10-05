@@ -2298,6 +2298,8 @@ components:
           type: string
         api_key_env:
           type: string
+        api_key:
+          type: string
         headers:
           type: object
           additionalProperties:

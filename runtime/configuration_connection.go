@@ -134,9 +134,13 @@ func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (pr
 // discoverProvider is the custom-provider discovery read: a pure network
 // read over the request's transport shape — no cache write, no attempt
 // marker, no env write, no configuration write — returning the sorted
-// candidates. The contract carries no key value: the referenced env name is
-// sampled once through the environment owner, and a defined-but-empty value
-// fails uniformly with the connect path's rule.
+// candidates. The credential is the one read rule: a supplied nonempty
+// api_key binds its exact value to this read's transient fetch and is
+// never substituted — even when the referenced env name is externally
+// owned — while an absent or empty supplied key uses the referenced
+// owner's captured value, where named-unset and named-defined-empty both
+// mean no credential and fetch unauthenticated, matching saved-provider
+// discovery. Nothing is persisted or published in any case.
 func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRequest) ([]protocol.DiscoveredModelCandidate, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
@@ -155,14 +159,10 @@ func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRe
 		headers = *req.Headers
 	}
 	key := ""
-	if envName := strings.TrimSpace(req.ApiKeyEnv); envName != "" {
-		observed := r.managedEnv.Capture([]string{envName})[envName]
-		if observed.Defined {
-			if observed.Value == "" {
-				return nil, configurationFailure(fmt.Errorf("provider env var %s is externally set but empty", envName))
-			}
-			key = observed.Value
-		}
+	if req.ApiKey != nil && *req.ApiKey != "" {
+		key = *req.ApiKey
+	} else if envName := strings.TrimSpace(req.ApiKeyEnv); envName != "" {
+		key = r.managedEnv.Capture([]string{envName})[envName].Value
 	}
 	discovered, err := connectFetchDiscovery(ctx, "custom", catalog.Transport{BaseURL: baseURL, Headers: headers}, key)
 	if err != nil {

@@ -2689,17 +2689,167 @@ func TestDiscoverCustomProviderPureRead(t *testing.T) {
 			t.Fatalf("the refused discovery fetched (%d -> %d)", fetches+1, got)
 		}
 
-		// A set-but-empty referenced env fails uniformly; an empty base URL
-		// is invalid input.
+		// A set-but-empty referenced env is no credential: the read fetches
+		// unauthenticated and answers the endpoint, matching saved-provider
+		// discovery. An empty base URL is invalid input and refuses before
+		// any fetch.
+		server.retarget(func(string) string { return connectionFullDiscovery })
 		t.Setenv("CONNECTION_EMPTY_REQ_KEY", "")
-		if _, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_EMPTY_REQ_KEY"}); err == nil || !errors.Is(err, ErrConfiguration) {
-			t.Fatalf("set-empty env discovery = %v, want the typed refusal", err)
+		emptyAuthCandidates, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_EMPTY_REQ_KEY"})
+		if err != nil || len(emptyAuthCandidates) != 1 || emptyAuthCandidates[0].Id != "fresh" {
+			t.Fatalf("set-empty env discovery = (%v, %+v), want the unauthenticated fetch's candidates", err, emptyAuthCandidates)
+		}
+		if auths := server.authorizations(); auths[len(auths)-1] != "" {
+			t.Fatalf("set-empty discovery authorization = %q, want the unauthenticated fetch", auths[len(auths)-1])
+		}
+		if got := server.requests(); got != fetches+2 {
+			t.Fatalf("the set-empty discovery fetched (%d -> %d)", fetches+1, got)
 		}
 		if _, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{}); err == nil || !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("empty base URL discovery = %v, want the invalid refusal", err)
 		}
-		if got := server.requests(); got != fetches+1 {
-			t.Fatalf("the refused discoveries fetched (%d -> %d)", fetches+1, got)
+		if got := server.requests(); got != fetches+2 {
+			t.Fatalf("the refused discovery fetched (%d -> %d)", fetches+2, got)
+		}
+	})
+}
+
+// TestDiscoverCustomProviderSuppliedKey pins the discovery read's one
+// credential input rule over a pre-save request: a supplied nonempty key
+// binds its exact value to the transient fetch — never the referenced
+// owner's captured value — an absent or empty supplied key falls back to
+// the referenced env's captured value, and no credential means an
+// unauthenticated fetch. Every row is a pure read: no key, env, config,
+// cache, or publication write, and no credential value in the returned
+// candidates.
+func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+		const pasted = "sk-pasted-discovery-key"
+		const external = "sk-external-reference-value"
+		// The gate answers one exact bearer per retarget, so each row's
+		// payload proves which credential reached the wire.
+		server := newGatedDiscoveryServer(t, func(auth string) string {
+			if auth == "Bearer "+pasted {
+				return connectionFullDiscovery
+			}
+			return connectionEmptyDiscovery
+		})
+		r, _ := openConnectionRuntime(t, store, server.URL)
+		defer closeProjectionRuntime(r)
+		ctx := context.Background()
+		sub, err := r.Subscribe(8)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		defer sub.Close()
+		before, generation, warnRev := runtimeMutationBaseline(t, r)
+		envBefore, err := os.ReadFile(r.managedEnv.Path())
+		if err != nil {
+			t.Fatalf("read .env: %v", err)
+		}
+		reserveEnvKey(t, "CONNECTION_SUPPLIED_EXT_KEY")
+		reserveEnvKey(t, "CONNECTION_SUPPLIED_UNSET_KEY")
+		t.Setenv("CONNECTION_SUPPLIED_EXT_KEY", external)
+		fetches := server.requests()
+		assertCandidates := func(candidates []protocol.DiscoveredModelCandidate, wantID string) {
+			t.Helper()
+			if len(candidates) != 1 || candidates[0].Id != wantID {
+				t.Fatalf("candidates = %+v, want exactly the fetched %q", candidates, wantID)
+			}
+		}
+
+		// Pre-save pasted-key discovery with no reference: the supplied
+		// value binds the transient fetch on its own.
+		pastedCandidates, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{
+			BaseUrl: server.URL + "/v1",
+			ApiKey:  ptrTo(pasted),
+		})
+		if err != nil {
+			t.Fatalf("keyless-reference supplied-key discovery: %v", err)
+		}
+		assertCandidates(pastedCandidates, "fresh")
+
+		// Pre-save pasted-key discovery over an externally owned reference:
+		// the supplied value binds the fetch; the referenced owner's value
+		// is never substituted for it.
+		pastedCandidates, err = r.discoverProvider(ctx, protocol.DiscoveryRequest{
+			BaseUrl:   server.URL + "/v1",
+			ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY",
+			ApiKey:    ptrTo(pasted),
+		})
+		if err != nil {
+			t.Fatalf("supplied-key discovery: %v", err)
+		}
+		assertCandidates(pastedCandidates, "fresh")
+
+		// Without a supplied key the referenced owner's captured value
+		// binds the same read; an empty supplied key is the same fallback.
+		server.retarget(func(auth string) string {
+			if auth == "Bearer "+external {
+				return connectionGhostDiscovery
+			}
+			return connectionEmptyDiscovery
+		})
+		fallbackCandidates, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY"})
+		if err != nil {
+			t.Fatalf("fallback discovery: %v", err)
+		}
+		assertCandidates(fallbackCandidates, "ghost")
+		emptySuppliedCandidates, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{
+			BaseUrl:   server.URL + "/v1",
+			ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY",
+			ApiKey:    ptrTo(""),
+		})
+		if err != nil {
+			t.Fatalf("empty-supplied-key discovery: %v", err)
+		}
+		assertCandidates(emptySuppliedCandidates, "ghost")
+
+		// A named-unset reference carries no credential: the read fetches
+		// unauthenticated and answers the endpoint.
+		server.retarget(func(auth string) string {
+			if auth == "" {
+				return connectionFullDiscovery
+			}
+			return connectionEmptyDiscovery
+		})
+		unsetCandidates, err := r.discoverProvider(ctx, protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_UNSET_KEY"})
+		if err != nil {
+			t.Fatalf("unset-reference discovery: %v", err)
+		}
+		assertCandidates(unsetCandidates, "fresh")
+
+		// The exact wire credentials per row: the pasted key twice, the
+		// captured external value twice, then the unauthenticated fetch.
+		wantAuths := []string{"Bearer " + pasted, "Bearer " + pasted, "Bearer " + external, "Bearer " + external, ""}
+		if got := server.authorizations(); !slices.Equal(got[fetches:], wantAuths) {
+			t.Fatalf("discovery authorizations = %v, want %v", got[fetches:], wantAuths)
+		}
+
+		// The pure read wrote nothing: the externally owned value is
+		// untouched and unmanaged, the .env and config bytes are unchanged,
+		// nothing published or was cached, and no candidate carries a
+		// credential value.
+		if os.Getenv("CONNECTION_SUPPLIED_EXT_KEY") != external || r.managedEnv.IsManaged("CONNECTION_SUPPLIED_EXT_KEY") {
+			t.Fatalf("external reference state = (%q, %v), want the exact value intact and unmanaged", os.Getenv("CONNECTION_SUPPLIED_EXT_KEY"), r.managedEnv.IsManaged("CONNECTION_SUPPLIED_EXT_KEY"))
+		}
+		assertDotenvUnchanged(t, r, envBefore, "the supplied-key discovery reads")
+		assertNoConnectionPublication(t, r, sub, generation, warnRev)
+		after, err := os.ReadFile(r.config.configPath)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("the supplied-key discovery reads changed the owning config (%v)", err)
+		}
+		if _, err := os.Stat(filepath.Join(r.config.loader.Home(), ".lightcode", "cache", "discovery", "custom.json")); !os.IsNotExist(err) {
+			t.Fatalf("the supplied-key discovery reads wrote a cache file: %v", err)
+		}
+		for _, row := range []struct {
+			what       string
+			candidates []protocol.DiscoveredModelCandidate
+		}{{"pasted", pastedCandidates}, {"fallback", fallbackCandidates}, {"empty-supplied", emptySuppliedCandidates}, {"unset", unsetCandidates}} {
+			raw, merr := json.Marshal(row.candidates)
+			if merr != nil || strings.Contains(string(raw), pasted) || strings.Contains(string(raw), external) {
+				t.Fatalf("the %s row's candidates carry a credential value: (%s, %v)", row.what, raw, merr)
+			}
 		}
 	})
 }
