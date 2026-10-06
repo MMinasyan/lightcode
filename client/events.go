@@ -237,6 +237,26 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 			return protocol.Event{}, err
 		}
 		return out, nil
+	case "refusal_delta":
+		var event protocol.RefusalDeltaEvent
+		members, err := decodeStrict(raw, &event)
+		if err != nil {
+			return protocol.Event{}, err
+		}
+		if err := requireMembers(members, "kind", "scope", "content"); err != nil {
+			return protocol.Event{}, err
+		}
+		if err := validateScope(members["scope"]); err != nil {
+			return protocol.Event{}, err
+		}
+		if event.Content == "" {
+			return protocol.Event{}, errors.New("refusal_delta carries empty content")
+		}
+		var out protocol.Event
+		if err := out.FromRefusalDeltaEvent(event); err != nil {
+			return protocol.Event{}, err
+		}
+		return out, nil
 	case "tool_started":
 		var event protocol.ToolStartedEvent
 		members, err := decodeStrict(raw, &event)

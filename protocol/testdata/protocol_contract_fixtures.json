@@ -457,10 +457,14 @@
      "name": "WarningChangedEvent",
      "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"}}"
     },
-    {
-     "name": "TextDeltaEvent",
-     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
-    },
+     {
+      "name": "TextDeltaEvent",
+      "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
+     },
+     {
+      "name": "RefusalDeltaEvent",
+      "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"runtime\"},\"content\":\"fixture\"}"
+     },
     {
      "name": "ToolStartedEvent",
      "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"ordinal\":0,\"name\":\"fixture\"}"
@@ -1109,6 +1113,30 @@
     {
      "name": "wrong-truncated-type",
      "json": "{\"content\":\"x\",\"canonical_path\":\"/x\",\"truncated\":1}"
+    }
+   ]
+  },
+  {
+   "schema": "RefusalDeltaEvent",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"runtime\"},\"content\":\"fixture\"}"
+    },
+    {
+     "name": "progress",
+     "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"content\":\"refused\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "duplicate-top-level-instance-id",
+     "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"content\":\"refused\",\"instance_id\":\"0123456789abcdef0123456789abcdef\"}"
+    },
+    {
+     "name": "empty-content",
+     "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"content\":\"\"}",
+     "typescript": false
     }
    ]
   },

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -26,7 +27,11 @@ import (
 // generated HTTP operations and SSE stream. HOME, the data root, and the
 // configuration path are all isolated under test temporary roots.
 
-const clientConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"CLIENT_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`
+// The shared fixture model declares a bounded output so the production output
+// reserve fits the context window: every turn is one completed model attempt
+// with no in-flight automatic compaction, whose compact request would
+// otherwise reach the same stateless fixture endpoint.
+const clientConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"CLIENT_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}}}`
 
 const clientAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"simple"}}`
 
@@ -378,6 +383,148 @@ func (m *parkedModel) wasCanceled() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.canceled
+}
+
+// refusalModelServer streams one mixed live turn over the OpenAI-compatible
+// wire: a content chunk, a chunk carrying content and refusal together, a
+// refusal-only chunk, and the stop completion.
+func refusalModelServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"working\"},\"finish_reason\":null}]}\n\n")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\" harder\",\"refusal\":\" but no\"},\"finish_reason\":null}]}\n\n")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"refusal\":\" can do.\"},\"finish_reason\":null}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestRealRuntimeRefusalStream drives one live refusal-bearing model stream
+// through the real owner and the generated client's SSE consumer: the refusal
+// fragments arrive as distinct refusal_delta events in exact order beside the
+// content text — content before refusal inside one chunk — every hint
+// addresses the real running Operation, and the settled history retains the
+// assembled refusal on the assistant item.
+func TestRealRuntimeRefusalStream(t *testing.T) {
+	model := refusalModelServer(t)
+	r, _ := newRealRuntime(t, model.URL)
+	_, record := openProtocol(t, r)
+	c := connectFixture(t, record)
+	session := createSession(t, c, filepath.Join(t.TempDir(), "refusal-ws"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, errs := c.Events(ctx)
+	submitOperation(t, c, session, "op-refusal", "hello")
+
+	type progress struct {
+		kind    string
+		content string
+	}
+	var got []progress
+	deadline := time.After(30 * time.Second)
+	for len(got) < 4 {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("the event stream closed early: %v", <-errs)
+			}
+			var entry progress
+			switch eventKind(t, event) {
+			case "text_delta":
+				body, err := event.AsTextDeltaEvent()
+				if err != nil {
+					t.Fatalf("text_delta body: %v", err)
+				}
+				entry = progress{kind: "text_delta", content: body.Content}
+			case "refusal_delta":
+				body, err := event.AsRefusalDeltaEvent()
+				if err != nil {
+					t.Fatalf("refusal_delta body: %v", err)
+				}
+				entry = progress{kind: "refusal_delta", content: body.Content}
+			default:
+				continue
+			}
+			scope, err := progressScope(t, event)
+			if err != nil {
+				t.Fatalf("progress scope: %v", err)
+			}
+			operation, err := scope.AsOperationScope()
+			if err != nil {
+				t.Fatalf("progress operation scope: %v", err)
+			}
+			if operation.SessionId != session || operation.OperationId != "op-refusal" {
+				t.Fatalf("progress scope = %+v, want the real running operation", scope)
+			}
+			got = append(got, entry)
+		case <-deadline:
+			t.Fatalf("the live progress stalled at %+v", got)
+		}
+	}
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+	}
+	want := []progress{
+		{kind: "text_delta", content: "working"},
+		{kind: "text_delta", content: " harder"},
+		{kind: "refusal_delta", content: " but no"},
+		{kind: "refusal_delta", content: " can do."},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("delivered progress = %+v, want the exact fragment order %+v", got, want)
+	}
+
+	// Final refusal retention through the real chain: the settled history's
+	// assistant item keeps the joined refusal beside the content text.
+	awaitOperation(t, c, session, "op-refusal", protocol.OperationStatusSuccess)
+	hydration := hydrateSession(t, c, session)
+	var assistant *protocol.AssistantItem
+	for _, item := range hydration.Conversation.Items {
+		kind, err := item.Discriminator()
+		if err != nil {
+			t.Fatalf("conversation item discriminator: %v", err)
+		}
+		if kind != "assistant" {
+			continue
+		}
+		value, err := item.AsAssistantItem()
+		if err != nil {
+			t.Fatalf("assistant item decode: %v", err)
+		}
+		assistant = &value
+	}
+	if assistant == nil {
+		t.Fatal("the settled history carries no assistant item")
+	}
+	if assistant.Refusal == nil || *assistant.Refusal != " but no can do." {
+		t.Fatalf("assistant refusal = %v, want the joined fragments", assistant.Refusal)
+	}
+	if len(assistant.Content) != 1 {
+		t.Fatalf("assistant content = %+v, want the single accumulated text part", assistant.Content)
+	}
+	part, err := assistant.Content[0].AsTextPart()
+	if err != nil || part.Text != "working harder" {
+		t.Fatalf("assistant text = (%q, %v), want the accumulated content", part.Text, err)
+	}
+}
+
+// progressScope extracts the scope one delivered progress event carries.
+func progressScope(t *testing.T, event protocol.Event) (protocol.Scope, error) {
+	t.Helper()
+	switch eventKind(t, event) {
+	case "text_delta":
+		body, err := event.AsTextDeltaEvent()
+		return body.Scope, err
+	case "refusal_delta":
+		body, err := event.AsRefusalDeltaEvent()
+		return body.Scope, err
+	}
+	return protocol.Scope{}, fmt.Errorf("event kind %q is not progress", eventKind(t, event))
 }
 
 // TestStreamCloseDoesNotCancelWork proves closing the client's event stream

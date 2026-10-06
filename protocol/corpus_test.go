@@ -539,7 +539,7 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 		}
 	}
 
-	for _, component := range []string{"TextDeltaEvent", "ToolStartedEvent", "ToolFinishedEvent"} {
+	for _, component := range []string{"TextDeltaEvent", "RefusalDeltaEvent", "ToolStartedEvent", "ToolFinishedEvent"} {
 		fixture := contractComponentFixture(t, corpus, component, "progress")
 		var members map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(fixture), &members); err != nil {
@@ -619,6 +619,7 @@ var contractGeneratedTypes = map[string]func() any{
 	"ProviderMutation":            func() any { return new(protocol.ProviderMutation) },
 	"ReadFileRequest":             func() any { return new(protocol.ReadFileRequest) },
 	"ReadFileResult":              func() any { return new(protocol.ReadFileResult) },
+	"RefusalDeltaEvent":           func() any { return new(protocol.RefusalDeltaEvent) },
 	"RetainedRevertRequest":       func() any { return new(protocol.RetainedRevertRequest) },
 	"RetainedTurn":                func() any { return new(protocol.RetainedTurn) },
 	"RetainedTurns":               func() any { return new(protocol.RetainedTurns) },

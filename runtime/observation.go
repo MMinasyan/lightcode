@@ -274,6 +274,18 @@ func textDeltaEvent(scope protocol.Scope, position int, content string) Event {
 	return event
 }
 
+// refusalDeltaEvent builds one transient model-stream refusal fragment hint;
+// refusal carries the content without a position.
+func refusalDeltaEvent(scope protocol.Scope, content string) Event {
+	var event Event
+	_ = event.FromRefusalDeltaEvent(protocol.RefusalDeltaEvent{ // plain members; the marshal cannot fail
+		Kind:    protocol.RefusalDelta,
+		Scope:   scope,
+		Content: content,
+	})
+	return event
+}
+
 // toolStartedEvent builds one dispatched tool-call hint.
 func toolStartedEvent(scope protocol.Scope, callID string, ordinal int64, name string) Event {
 	var event Event
@@ -347,6 +359,9 @@ func (a *observationAdapter) observe(fact harness.HarnessFact) {
 		case harness.FactTextDelta:
 			scope := operationEventScope(identity.Workspace, fact.SessionID, fact.OperationID)
 			return []Event{textDeltaEvent(scope, fact.Position, fact.Content)}
+		case harness.FactRefusalDelta:
+			scope := operationEventScope(identity.Workspace, fact.SessionID, fact.OperationID)
+			return []Event{refusalDeltaEvent(scope, fact.Content)}
 		case harness.FactToolStarted:
 			scope := operationEventScope(identity.Workspace, fact.SessionID, fact.OperationID)
 			return []Event{toolStartedEvent(scope, fact.CallID, fact.Ordinal, fact.Name)}

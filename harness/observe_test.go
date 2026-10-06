@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1061,14 +1062,15 @@ func (s *duplexStream) Close() error                     { return nil }
 // preservation, and close delegation.
 func TestObserveStreamFilter(t *testing.T) {
 	type emitted struct {
+		kind     HarnessFactKind
 		position int
 		content  string
 	}
 	collect := func(t *testing.T, inner model.Stream) (*observedStream, *[]emitted) {
 		t.Helper()
 		var got []emitted
-		wrapper := observedStream{inner: inner, emit: func(position int, content string) {
-			got = append(got, emitted{position: position, content: content})
+		wrapper := observedStream{inner: inner, emit: func(kind HarnessFactKind, position int, content string) {
+			got = append(got, emitted{kind: kind, position: position, content: content})
 		}}
 		return &wrapper, &got
 	}
@@ -1083,8 +1085,61 @@ func TestObserveStreamFilter(t *testing.T) {
 		if _, err := wrapper.Recv(); err != nil {
 			t.Fatalf("Recv: %v", err)
 		}
-		if len(*got) != 1 || (*got)[0] != (emitted{position: 0, content: "a"}) {
+		if len(*got) != 1 || (*got)[0] != (emitted{kind: FactTextDelta, position: 0, content: "a"}) {
 			t.Fatalf("emitted = %+v, want only the nonempty text fragment", *got)
+		}
+	})
+
+	t.Run("refusal only", func(t *testing.T) {
+		inner := streamOf(model.StreamDelta{HasChoice: true, Role: "assistant", RefusalFragment: "I cannot"})
+		wrapper, got := collect(t, inner)
+		if _, err := wrapper.Recv(); err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if len(*got) != 1 || (*got)[0] != (emitted{kind: FactRefusalDelta, position: 0, content: "I cannot"}) {
+			t.Fatalf("emitted = %+v, want only the nonempty refusal fragment without a position", *got)
+		}
+	})
+
+	t.Run("mixed delta emits content text before refusal", func(t *testing.T) {
+		inner := streamOf(model.StreamDelta{
+			HasChoice:       true,
+			Role:            "assistant",
+			RefusalFragment: "but no",
+			ContentFragments: []model.ContentFragment{
+				{Position: 0, Kind: model.PartText, Text: "working"},
+				{Position: 1, Kind: model.PartImageURL, URL: "u"},
+				{Position: 2, Kind: model.PartText, Text: "harder"},
+			},
+		})
+		wrapper, got := collect(t, inner)
+		if _, err := wrapper.Recv(); err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		want := []emitted{
+			{kind: FactTextDelta, position: 0, content: "working"},
+			{kind: FactTextDelta, position: 2, content: "harder"},
+			{kind: FactRefusalDelta, position: 0, content: "but no"},
+		}
+		if !slices.Equal(*got, want) {
+			t.Fatalf("emitted = %+v, want the content-text emissions before the refusal %+v", *got, want)
+		}
+	})
+
+	t.Run("empty refusal emits only the text", func(t *testing.T) {
+		inner := streamOf(model.StreamDelta{
+			HasChoice:       true,
+			RefusalFragment: "",
+			ContentFragments: []model.ContentFragment{
+				{Position: 0, Kind: model.PartText, Text: "kept"},
+			},
+		})
+		wrapper, got := collect(t, inner)
+		if _, err := wrapper.Recv(); err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if len(*got) != 1 || (*got)[0].kind != FactTextDelta {
+			t.Fatalf("emitted = %+v, want the text fragment and no refusal emission", *got)
 		}
 	})
 
@@ -1104,13 +1159,26 @@ func TestObserveStreamFilter(t *testing.T) {
 		}
 	})
 
+	t.Run("refusal with an error emits none", func(t *testing.T) {
+		inner := &duplexStream{delta: model.StreamDelta{HasChoice: true, RefusalFragment: "no"}, err: errors.New("read failed")}
+		wrapper, got := collect(t, inner)
+		if _, err := wrapper.Recv(); err == nil {
+			t.Fatal("Recv: want the original read failure")
+		}
+		if len(*got) != 0 {
+			t.Fatalf("a refusal delta returned with an error emitted %+v", *got)
+		}
+	})
+
 	t.Run("choiceless empty nontext and invalid emit none", func(t *testing.T) {
 		cases := []model.StreamDelta{
 			{ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "x"}}}, // no choice
-			{HasChoice: true}, // empty
-			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartImageURL, URL: "u"}}},        // non-text
-			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: -1, Kind: model.PartText, Text: "x"}}},          // invalid position
-			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "x", URL: "u"}}}, // cross-kind
+			{RefusalFragment: "no"}, // refusal without a choice
+			{HasChoice: true},       // empty
+			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartImageURL, URL: "u"}}},                      // non-text
+			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: -1, Kind: model.PartText, Text: "x"}}},                        // invalid position
+			{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "x", URL: "u"}}},               // cross-kind
+			{HasChoice: true, RefusalFragment: "no", ContentFragments: []model.ContentFragment{{Position: -1, Kind: model.PartText, Text: "x"}}}, // invalid with refusal
 		}
 		for i, delta := range cases {
 			wrapper, got := collect(t, streamOf(delta))
@@ -1185,6 +1253,63 @@ func TestObserveCompactAttribution(t *testing.T) {
 	}
 	if deltas != 1 {
 		t.Fatalf("compact text deltas = %d, want one", deltas)
+	}
+}
+
+// TestObserveRefusalFacts proves a real accepted refusal stream emits one
+// refusal fact per nonempty fragment in arrival order — attributed to the
+// enclosing Operation, carrying the content and no position — and that the
+// committed assistant entry retains the assembled refusal: the live facts
+// never replace the durable value.
+func TestObserveRefusalFacts(t *testing.T) {
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return streamOf(
+			model.StreamDelta{HasChoice: true, Role: "assistant", RefusalFragment: "I cannot"},
+			model.StreamDelta{HasChoice: true, RefusalFragment: " help with that."},
+			model.StreamDelta{HasChoice: true, FinishReason: "stop"},
+		), nil
+	}
+	h, _, c, sessionID := newEffectHarness(t, modelFn)
+	col := observeHarness(h)
+	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+	var refusals []HarnessFact
+	for _, fact := range col.snapshot() {
+		if fact.Kind != FactRefusalDelta {
+			continue
+		}
+		refusals = append(refusals, fact)
+	}
+	want := []string{"I cannot", " help with that."}
+	if len(refusals) != len(want) {
+		t.Fatalf("refusal facts = %+v, want one per fragment %v", refusals, want)
+	}
+	for i, fact := range refusals {
+		if fact.SessionID != sessionID || fact.OperationID != testOpID || fact.Content != want[i] ||
+			fact.Position != 0 || fact.JobID != "" || fact.CallID != "" || fact.Ordinal != 0 ||
+			fact.Name != "" || fact.Status != "" {
+			t.Fatalf("refusal fact %d = %+v, want the enclosed Operation attribution and no position", i, fact)
+		}
+	}
+	// Final refusal retention: the committed assistant entry keeps the
+	// fragments joined in arrival order.
+	snap, err := h.SnapshotSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("SnapshotSession: %v", err)
+	}
+	retained := false
+	for _, fact := range snap.Facts {
+		if fact.Assistant == nil {
+			continue
+		}
+		if fact.Assistant.Refusal != "I cannot help with that." {
+			t.Fatalf("committed assistant refusal = %q, want the joined fragments", fact.Assistant.Refusal)
+		}
+		retained = true
+	}
+	if !retained {
+		t.Fatalf("no committed assistant fact in %+v", snap.Facts)
 	}
 }
 

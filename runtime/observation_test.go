@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -656,6 +658,12 @@ func progressEventScope(t *testing.T, event Event) protocol.Scope {
 			t.Fatalf("delta event body: %v", err)
 		}
 		return body.Scope
+	case "refusal_delta":
+		body, err := event.AsRefusalDeltaEvent()
+		if err != nil {
+			t.Fatalf("refusal event body: %v", err)
+		}
+		return body.Scope
 	case "tool_started":
 		body, err := event.AsToolStartedEvent()
 		if err != nil {
@@ -697,6 +705,126 @@ func snapshotPairOf(t *testing.T, r *Runtime, sessionID string) protocol.Session
 	t.Helper()
 	snap := snapshotThroughRuntime(t, r, sessionID)
 	return wireRevision(snapshotRevision(snap))
+}
+
+// refusalProgressStream yields the scripted deltas then EOF: the live
+// refusal-bearing model-stream shape.
+type refusalProgressStream struct {
+	deltas []model.StreamDelta
+	i      int
+}
+
+func (s *refusalProgressStream) Recv() (model.StreamDelta, error) {
+	if s.i >= len(s.deltas) {
+		return model.StreamDelta{}, io.EOF
+	}
+	s.i++
+	return s.deltas[s.i-1], nil
+}
+
+func (s *refusalProgressStream) Close() error { return nil }
+
+// TestObservationRefusalDeltaProgress proves live refusal-bearing model
+// streams reach the passive bus as distinct refusal_delta events: a
+// refusal-only turn and a mixed content turn keep their exact fragment
+// order — content text before the refusal inside one delta — and every
+// hint addresses the real running Operation.
+func TestObservationRefusalDeltaProgress(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		defer func() {
+			if err := bg.r.Close(context.Background()); err != nil {
+				bg.t.Errorf("Close: %v", err)
+			}
+		}()
+		sub, err := bg.r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		session := bg.session("refusal")
+		bg.prep.setSessionScript(session, &lifecycleScript{model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
+			if attempt == 1 { // the refusal-only turn
+				return &refusalProgressStream{deltas: []model.StreamDelta{
+					{HasChoice: true, Role: "assistant", RefusalFragment: "I cannot"},
+					{HasChoice: true, RefusalFragment: " help with that."},
+					{HasChoice: true, FinishReason: "stop"},
+				}}, nil
+			}
+			// the mixed turn: one delta carries content text and the refusal
+			return &refusalProgressStream{deltas: []model.StreamDelta{
+				{HasChoice: true, Role: "assistant", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "working"}}},
+				{HasChoice: true, RefusalFragment: " but no", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "harder"}}},
+				{HasChoice: true, RefusalFragment: " can do."},
+				{HasChoice: true, FinishReason: "stop"},
+			}}, nil
+		}})
+		bg.submitMode(session, "op-refuse", "hello", harness.MessageModeRegular)
+		awaitOperation(t, bg.r, session, "op-refuse", harness.OperationSuccess)
+		bg.submitMode(session, "op-mixed", "hello", harness.MessageModeRegular)
+		awaitOperation(t, bg.r, session, "op-mixed", harness.OperationSuccess)
+
+		type progress struct {
+			kind    string
+			content string
+			op      string
+		}
+		var got []progress
+		for {
+			select {
+			case event, ok := <-sub.Events():
+				if !ok {
+					t.Fatal("the subscription closed before the drain finished")
+				}
+				var entry progress
+				switch eventKind(t, event) {
+				case "text_delta":
+					body, err := event.AsTextDeltaEvent()
+					if err != nil {
+						t.Fatalf("delta event body: %v", err)
+					}
+					scope, err := body.Scope.AsOperationScope()
+					if err != nil {
+						t.Fatalf("text progress scope: %v", err)
+					}
+					entry = progress{kind: "text_delta", content: body.Content, op: scope.OperationId}
+				case "refusal_delta":
+					body, err := event.AsRefusalDeltaEvent()
+					if err != nil {
+						t.Fatalf("refusal event body: %v", err)
+					}
+					scope, err := body.Scope.AsOperationScope()
+					if err != nil {
+						t.Fatalf("refusal progress scope: %v", err)
+					}
+					entry = progress{kind: "refusal_delta", content: body.Content, op: scope.OperationId}
+				default:
+					// committed and lifecycle publications interleave with progress
+					continue
+				}
+				if scope := progressEventScope(t, event); scopeKind(t, scope) != "operation" {
+					t.Fatalf("progress %s carries the %s scope, want the operation scope", eventJSON(t, event), scopeKind(t, scope))
+				}
+				if sessionID, _ := scopeSessionIdentity(t, progressEventScope(t, event)); sessionID != session {
+					t.Fatalf("progress %s names a foreign session", eventJSON(t, event))
+				}
+				got = append(got, entry)
+				continue
+			default:
+			}
+			break
+		}
+		want := []progress{
+			{kind: "refusal_delta", content: "I cannot", op: "op-refuse"},
+			{kind: "refusal_delta", content: " help with that.", op: "op-refuse"},
+			{kind: "text_delta", content: "working", op: "op-mixed"},
+			{kind: "text_delta", content: "harder", op: "op-mixed"},
+			{kind: "refusal_delta", content: " but no", op: "op-mixed"},
+			{kind: "refusal_delta", content: " can do.", op: "op-mixed"},
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("progress = %+v, want the exact fragment order and operation identity %+v", got, want)
+		}
+	})
 }
 
 // lessPair reports whether one wire revision pair is strictly older than

@@ -17,6 +17,11 @@ const (
 	// model stream. It carries no authority: the committed assistant entry is
 	// the authoritative value.
 	FactTextDelta HarnessFactKind = "text_delta"
+	// FactRefusalDelta reports one nonempty transient refusal fragment of an
+	// accepted model stream. It carries no position — refusal fragments
+	// concatenate in arrival order — and no authority: the committed
+	// assistant entry's refusal is the authoritative value.
+	FactRefusalDelta HarnessFactKind = "refusal_delta"
 	// FactToolStarted reports one dispatched tool call. It is emitted once at
 	// the live dispatcher entry, before any branch-specific validation, hook,
 	// permission decision, or execution.
@@ -40,13 +45,14 @@ type SessionRevision struct {
 // members are exactly the fields the fact's Kind requires. An invalidation
 // carries SessionID and the optional JobID of a job member admission or
 // finish; a text delta carries SessionID, OperationID, Position, and the
-// nonempty Content; a tool start carries SessionID, OperationID, CallID,
-// Ordinal, and Name; a tool finish carries SessionID, OperationID, CallID, and
-// the closed Status. Every field a kind does not require stays zero. A fact
-// grants no authority: it can never alter an admission, an effect, a
-// settlement, or a lifecycle transition. A fact carries no revision pair: no
-// producer sample can become notification authority; passive publishers read
-// the current pair at publication time.
+// nonempty Content; a refusal delta carries SessionID, OperationID, and the
+// nonempty Content and no Position; a tool start carries SessionID,
+// OperationID, CallID, Ordinal, and Name; a tool finish carries SessionID,
+// OperationID, CallID, and the closed Status. Every field a kind does not
+// require stays zero. A fact grants no authority: it can never alter an
+// admission, an effect, a settlement, or a lifecycle transition. A fact
+// carries no revision pair: no producer sample can become notification
+// authority; passive publishers read the current pair at publication time.
 type HarnessFact struct {
 	Kind        HarnessFactKind
 	SessionID   string
@@ -165,7 +171,7 @@ func (h *Harness) emitToolResultFacts(entries []graphEntry, sessionID, operation
 	}
 }
 
-// observeStream wraps one accepted model stream for passive text-delta
+// observeStream wraps one accepted model stream for passive progress
 // observation; without an observer the stream passes through untouched. The
 // wrapper is the single accepted→assemble handoff for both the conversation
 // and the compact model transport.
@@ -173,9 +179,9 @@ func (h *Harness) observeStream(sessionID, operationID string, stream model.Stre
 	if h.deps.Observe == nil {
 		return stream
 	}
-	return observedStream{inner: stream, emit: func(position int, content string) {
+	return observedStream{inner: stream, emit: func(kind HarnessFactKind, position int, content string) {
 		h.emitFact(HarnessFact{
-			Kind:        FactTextDelta,
+			Kind:        kind,
 			SessionID:   sessionID,
 			OperationID: operationID,
 			Position:    position,
@@ -186,14 +192,16 @@ func (h *Harness) observeStream(sessionID, operationID string, stream model.Stre
 
 // observedStream is the one accepted-stream wrapper: Recv delegates unchanged,
 // Close delegates exactly once, and only a successfully parsed choice-bearing
-// delta contributes one fact per nonempty text fragment. An empty, non-text,
-// or invalid delta emits nothing, and a delta returned together with an error
+// delta contributes one fact per nonempty fragment. An empty, non-text, or
+// invalid delta emits nothing, and a delta returned together with an error
 // (EOF included) emits nothing; the original delta and error are always
-// returned exactly as received. No reasoning, tool, refusal, or finish
-// fragment is interpreted, and no second assembler or accumulator exists.
+// returned exactly as received. A delta's positioned content-text fragments
+// are emitted before its refusal fragment, and refusal emits no position. No
+// reasoning, tool, or finish fragment is interpreted, and no second
+// assembler or accumulator exists.
 type observedStream struct {
 	inner model.Stream
-	emit  func(position int, content string)
+	emit  func(kind HarnessFactKind, position int, content string)
 }
 
 func (s observedStream) Recv() (model.StreamDelta, error) {
@@ -207,8 +215,11 @@ func (s observedStream) Recv() (model.StreamDelta, error) {
 	}
 	for _, fragment := range owned.ContentFragments {
 		if fragment.Kind == model.PartText && fragment.Text != "" {
-			s.emit(fragment.Position, fragment.Text)
+			s.emit(FactTextDelta, fragment.Position, fragment.Text)
 		}
+	}
+	if owned.RefusalFragment != "" {
+		s.emit(FactRefusalDelta, 0, owned.RefusalFragment)
 	}
 	return delta, err
 }

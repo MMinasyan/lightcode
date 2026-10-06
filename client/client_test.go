@@ -471,6 +471,12 @@ func TestEventsFrames(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("build text_delta: %v", err)
 		}
+		var refusal protocol.Event
+		if err := refusal.FromRefusalDeltaEvent(protocol.RefusalDeltaEvent{
+			Kind: protocol.RefusalDelta, Scope: operationEventScope(), Content: "refused",
+		}); err != nil {
+			t.Fatalf("build refusal_delta: %v", err)
+		}
 		var started protocol.Event
 		if err := started.FromToolStartedEvent(protocol.ToolStartedEvent{
 			Kind: protocol.ToolStarted, Scope: operationEventScope(), CallId: "call-1", Ordinal: 0, Name: "read",
@@ -483,7 +489,7 @@ func TestEventsFrames(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("build tool_finished: %v", err)
 		}
-		frames := notificationFrame(t, delta) + notificationFrame(t, started) + notificationFrame(t, finished)
+		frames := notificationFrame(t, delta) + notificationFrame(t, refusal) + notificationFrame(t, started) + notificationFrame(t, finished)
 		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
 		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
 		events, errs := c.Events(context.Background())
@@ -491,13 +497,17 @@ func TestEventsFrames(t *testing.T) {
 		if !errors.Is(err, client.ErrResyncRequired) {
 			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
 		}
-		if len(delivered) != 3 {
-			t.Fatalf("delivered %d transient events, want 3", len(delivered))
+		if len(delivered) != 4 {
+			t.Fatalf("delivered %d transient events, want 4", len(delivered))
 		}
-		for i, want := range []string{"text_delta", "tool_started", "tool_finished"} {
+		for i, want := range []string{"text_delta", "refusal_delta", "tool_started", "tool_finished"} {
 			if kind, _ := delivered[i].Discriminator(); kind != want {
 				t.Fatalf("event %d kind = %q, want %q", i, kind, want)
 			}
+		}
+		refusalBody, err := delivered[1].AsRefusalDeltaEvent()
+		if err != nil || refusalBody.Content != "refused" {
+			t.Fatalf("delivered refusal delta = (%+v, %v), want its distinct refusal content", refusalBody, err)
 		}
 	})
 
@@ -557,6 +567,9 @@ func TestEventsFrames(t *testing.T) {
 		{"empty scope member", rawNotification(`{"kind":"scope_opened","scope":{"kind":"runtime","workspace":""}}`)},
 		{"negative text position", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":-1,"content":"x"}`)},
 		{"empty text content", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":0,"content":""}`)},
+		{"empty refusal content", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"},"content":""}`)},
+		{"missing refusal content", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"}}`)},
+		{"position member on refusal_delta", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"},"content":"x","position":0}`)},
 		{"unknown tool status", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"pending"}`)},
 		{"negative tool ordinal", rawNotification(`{"kind":"tool_started","scope":{"kind":"runtime"},"call_id":"c","ordinal":-1,"name":"n"}`)},
 		{"wrong event name", "event: other\ndata: {}\n\n"},

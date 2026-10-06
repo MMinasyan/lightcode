@@ -506,6 +506,21 @@ func (e ProviderField) Valid() bool {
 	}
 }
 
+// Defines values for RefusalDeltaEventKind.
+const (
+	RefusalDelta RefusalDeltaEventKind = "refusal_delta"
+)
+
+// Valid indicates whether the value is a known member of the RefusalDeltaEventKind enum.
+func (e RefusalDeltaEventKind) Valid() bool {
+	switch e {
+	case RefusalDelta:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RuntimeScopeKind.
 const (
 	RuntimeScopeKindRuntime RuntimeScopeKind = "runtime"
@@ -1345,6 +1360,18 @@ type ReadFileResult struct {
 	Content       string `json:"content"`
 	Truncated     bool   `json:"truncated"`
 }
+
+// RefusalDeltaEvent defines model for RefusalDeltaEvent.
+type RefusalDeltaEvent struct {
+	Content string                `json:"content"`
+	Kind    RefusalDeltaEventKind `json:"kind"`
+
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	Scope Scope `json:"scope"`
+}
+
+// RefusalDeltaEventKind defines model for RefusalDeltaEvent.Kind.
+type RefusalDeltaEventKind string
 
 // RetainedRevertRequest defines model for RetainedRevertRequest.
 type RetainedRevertRequest struct {
@@ -2380,6 +2407,32 @@ func (t *Event) MergeTextDeltaEvent(v TextDeltaEvent) error {
 	return err
 }
 
+// AsRefusalDeltaEvent returns the union data inside the Event as a RefusalDeltaEvent
+func (t Event) AsRefusalDeltaEvent() (RefusalDeltaEvent, error) {
+	var body RefusalDeltaEvent
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRefusalDeltaEvent overwrites any union data inside the Event as the provided RefusalDeltaEvent
+func (t *Event) FromRefusalDeltaEvent(v RefusalDeltaEvent) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRefusalDeltaEvent performs a merge with any union data inside the Event, using the provided RefusalDeltaEvent
+func (t *Event) MergeRefusalDeltaEvent(v RefusalDeltaEvent) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsToolStartedEvent returns the union data inside the Event as a ToolStartedEvent
 func (t Event) AsToolStartedEvent() (ToolStartedEvent, error) {
 	var body ToolStartedEvent
@@ -2448,6 +2501,8 @@ func (t Event) ValueByDiscriminator() (interface{}, error) {
 	switch discriminator {
 	case "configuration_changed":
 		return t.AsConfigurationChangedEvent()
+	case "refusal_delta":
+		return t.AsRefusalDeltaEvent()
 	case "scope_closed":
 		return t.AsScopeEvent()
 	case "scope_opened":

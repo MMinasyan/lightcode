@@ -720,6 +720,12 @@ export type TextDeltaEvent = {
     content: string;
 };
 
+export type RefusalDeltaEvent = {
+    kind: 'refusal_delta';
+    scope: Scope;
+    content: string;
+};
+
 export type ToolStartedEvent = {
     kind: 'tool_started';
     scope: Scope;
@@ -746,6 +752,8 @@ export type Event = ({
 } & WarningChangedEvent) | ({
     kind: 'text_delta';
 } & TextDeltaEvent) | ({
+    kind: 'refusal_delta';
+} & RefusalDeltaEvent) | ({
     kind: 'tool_started';
 } & ToolStartedEvent) | ({
     kind: 'tool_finished';

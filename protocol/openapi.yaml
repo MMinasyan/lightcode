@@ -2501,6 +2501,23 @@ components:
         content:
           type: string
           minLength: 1
+    RefusalDeltaEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - scope
+        - content
+      properties:
+        kind:
+          type: string
+          enum:
+            - refusal_delta
+        scope:
+          $ref: "#/components/schemas/Scope"
+        content:
+          type: string
+          minLength: 1
     ToolStartedEvent:
       type: object
       additionalProperties: false
@@ -2550,6 +2567,7 @@ components:
         - $ref: "#/components/schemas/SessionChangedEvent"
         - $ref: "#/components/schemas/WarningChangedEvent"
         - $ref: "#/components/schemas/TextDeltaEvent"
+        - $ref: "#/components/schemas/RefusalDeltaEvent"
         - $ref: "#/components/schemas/ToolStartedEvent"
         - $ref: "#/components/schemas/ToolFinishedEvent"
       discriminator:
@@ -2561,5 +2579,6 @@ components:
           session_changed: "#/components/schemas/SessionChangedEvent"
           warning_changed: "#/components/schemas/WarningChangedEvent"
           text_delta: "#/components/schemas/TextDeltaEvent"
+          refusal_delta: "#/components/schemas/RefusalDeltaEvent"
           tool_started: "#/components/schemas/ToolStartedEvent"
           tool_finished: "#/components/schemas/ToolFinishedEvent"
