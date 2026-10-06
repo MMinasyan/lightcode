@@ -80,6 +80,55 @@ func (l *Loader) LoadCaptured(ctx context.Context, userRaw map[string]any) (Buil
 	return BuildResult{Catalog: catalog, Warnings: warnings}, nil
 }
 
+// Home returns the loader's home root.
+func (l *Loader) Home() string {
+	return l.home
+}
+
+// LoadCapturedConnection is the connection-candidate entry: over the same
+// captured bundled FS, discovery-cache read, and Build producer as
+// LoadCaptured, it performs no network fetch, no cache write, and no
+// refresh — a connection candidate is fully built and validated before its
+// caller's first persistence. A nonnil discovered overlays ONLY that
+// provider's in-memory discovery record: the fingerprint is computed here
+// over the caller's original configured transport, and the fetched models are
+// carried verbatim, their unexported metadata included — never round-tripped
+// through the cache. A nil discovered leaves the ordinary cached inputs.
+func (l *Loader) LoadCapturedConnection(ctx context.Context, userRaw map[string]any, providerID string, transport Transport, discovered *DiscoveredProvider) (BuildResult, error) {
+	catalog, warnings, err := l.loadCapturedConnection(userRaw, providerID, transport, discovered)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Catalog: catalog, Warnings: warnings}, nil
+}
+
+func (l *Loader) loadCapturedConnection(userRaw map[string]any, providerID string, transport Transport, discovered *DiscoveredProvider) (*Catalog, []Warning, error) {
+	home, err := l.resolvedHome()
+	if err != nil {
+		return nil, nil, err
+	}
+	bundled, err := readBundledProviders(l.bundled)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
+	}
+	records, warnings := ReadDiscoveryCache(home)
+	if discovered != nil {
+		fingerprint := transportFingerprint(transport)
+		if fingerprint == "" {
+			return nil, nil, fmt.Errorf("compute discovery transport fingerprint")
+		}
+		records[providerID] = DiscoveryRecord{
+			TransportFingerprint: fingerprint,
+			FetchedAt:            time.Now().UTC(),
+			AttemptedAt:          time.Now().UTC(),
+			Models:               discovered.Models,
+		}
+	}
+	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
+	warnings = append(warnings, result.Warnings...)
+	return result.Catalog, warnings, nil
+}
+
 func (l *Loader) loadReadInputs(try bool) (*Catalog, []Warning, error) {
 	home, err := l.resolvedHome()
 	if err != nil {
@@ -259,7 +308,7 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 	if !ok {
 		return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: "providers must be an object"}}
 	}
-	return cloneJSONValue(providers).(map[string]any), nil
+	return CloneJSONValue(providers).(map[string]any), nil
 }
 func writeEmptyCatalogConfig(configPath string) error {
 	if _, err := atomicfs.CreateExclusive(configPath, []byte(catalogEmptyConfigTemplate), 0o600); err != nil {

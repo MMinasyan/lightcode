@@ -13,7 +13,9 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // debugWireEnv is the retained wire-debug opt-in: when set to "1", raw
@@ -42,6 +44,65 @@ type selection struct {
 	agent      harness.AgentType
 	bindings   Bindings
 	invocation Invocation
+
+	// credentials is the preparation's one captured credential observation
+	// set, sampled with the same capture as the Invocation's snapshot: the
+	// concrete preparation resolves its transport secrets from it, and no
+	// value leaves the prepared opener or the durable capture.
+	credentials map[string]config.EnvValue
+
+	// warnings is the per-preparation private presentation collector: the
+	// concrete preparation assigns the assembled prompt warnings into it and
+	// the committed opener publishes them under the admitted Session identity
+	// only after the opener succeeded, so a failed fork or admission
+	// publishes nothing. It is never the Invocation or the durable capture.
+	warnings *preparationWarnings
+}
+
+// preparationWarnings collects one preparation's presentation values.
+type preparationWarnings struct {
+	publisher *observationAdapter
+	sessionID string
+	prompt    []prompt.Warning
+}
+
+// publish replaces the owning Session's prompt group with the collected
+// values through the passive publication adapter; a nil adapter drops the
+// presentation. The committed opener calls it exactly once per successful
+// execution.
+func (w *preparationWarnings) publish() {
+	if w == nil {
+		return
+	}
+	w.publisher.publishPrompt(w.sessionID, promptWarnings(w.sessionID, w.prompt))
+}
+
+// promptWarnings maps the assembled prompt diagnostics onto the store's
+// typed session group.
+func promptWarnings(sessionID string, warnings []prompt.Warning) []protocol.Warning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]protocol.Warning, 0, len(warnings))
+	for _, warning := range warnings {
+		id := sessionID
+		out = append(out, protocol.Warning{Source: promptSource, Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+	}
+	return out
+}
+
+// protocolWarnings maps one transport attempt's returned diagnostics onto the
+// store's typed session group.
+func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []protocol.Warning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]protocol.Warning, 0, len(warnings))
+	for _, warning := range warnings {
+		id := sessionID
+		out = append(out, protocol.Warning{Source: protocolSource, Kind: warning.Kind, Message: warning.Message, SessionId: &id})
+	}
+	return out
 }
 
 // PreparationHook is one pure preparation capability: it may replace the
@@ -89,23 +150,45 @@ type preparation struct {
 	workspaces  *workspaceScopes
 	home        string
 	background  BackgroundServices
+	passive     *observationAdapter
 	prepare     prepare
+
+	// artifacts is the Runtime's private per-Session artifact interval
+	// registry. Every committed opener acquires its Session's token here
+	// before any scope, plugin, model, tool or hook effect and releases it
+	// last, after the scoped cleanup; nil leaves an isolated preparation
+	// without artifact ownership.
+	artifacts *artifactIntervals
+
+	// subprocessEnv is the Runtime's live managed-environment producer,
+	// supplied only when the retained manager exists; nil leaves every
+	// prepared command without an environment producer and the cooperative
+	// command fails. It is invoked at each process start, never at
+	// preparation.
+	subprocessEnv func() []string
 }
 
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
 // once-resolved home, the background services bridge armed after harness.New
-// returns, and the controlled preparation function; nil selects the concrete
-// production preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, prepare prepare) *preparation {
+// returns, the Runtime's passive publication adapter (nil in isolated
+// preparation tests, dropping only passive presentation), the Runtime's
+// private artifact interval registry (nil without a Runtime), the Runtime's
+// live managed-environment producer (nil without a retained manager), and the
+// controlled preparation function; nil selects the concrete production
+// preparation.
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string, prepare prepare) *preparation {
 	return &preparation{
-		config:      config,
-		composition: c,
-		runtime:     runtime,
-		workspaces:  workspaces,
-		home:        home,
-		background:  background,
-		prepare:     prepare,
+		config:        config,
+		composition:   c,
+		runtime:       runtime,
+		workspaces:    workspaces,
+		home:          home,
+		background:    background,
+		passive:       passive,
+		artifacts:     artifacts,
+		subprocessEnv: subprocessEnv,
+		prepare:       prepare,
 	}
 }
 
@@ -116,7 +199,14 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 // admission with no partial consequence published.
 func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 	return func(ctx context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
-		snapshot := p.config.current()
+		// Configuration and the credentials its catalog references are one
+		// owner-coherent capture: the selected model, its transport secret,
+		// and the revision all belong to the same ready pair.
+		captured, err := p.config.capture(ctx)
+		if err != nil {
+			return harness.PreparedExecution{}, err
+		}
+		snapshot := captured.snapshot
 		if snapshot == nil {
 			return harness.PreparedExecution{}, fmt.Errorf("agent type %q has no published configuration: %w", req.Session.AgentType, harness.ErrInvalid)
 		}
@@ -133,7 +223,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			return harness.PreparedExecution{}, err
 		}
 		bindings := p.preparationBindings(workspaceScope, agent.Capabilities)
-		sel := selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}}
+		sel := selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
 		if err != nil {
@@ -144,6 +234,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		input := sel
 		input.agent.Tools = slices.Clone(agent.Tools)
 		input.agent.Capabilities = slices.Clone(agent.Capabilities)
+		// The per-preparation collector is allocated owned: only a successful
+		// preparation — validation, hooks and cancellation checks all passed —
+		// publishes its values under the admitted Session identity.
+		input.warnings = &preparationWarnings{publisher: p.passive, sessionID: req.Session.Identity.SessionID}
 		prepare := p.prepare
 		if prepare == nil {
 			prepare = p.concretePrepare
@@ -162,10 +256,14 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
+		// The collected presentation rides the prepared opener: only the
+		// committed admission's opener publishes it, so a failed fork or
+		// admission never creates warnings for an unpublished Session.
+		warnings := input.warnings
 		return harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, workspaceScope, agent, snapshot, opener)
+				return p.open(openCtx, admission, workspace, workspaceScope, agent, snapshot, warnings, opener)
 			},
 		}, nil
 	}
@@ -189,34 +287,48 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 	return Bindings{entries: entries}
 }
 
-// open turns the committed admission into the execution: it opens the
-// Operation then the Agent scope, enters the Agent-scope guard, creates the
-// execution selection from the same snapshot, and hands that new value with
-// the actual committed admission to this preparation's opener, so hooks'
-// final prompt and tools can never be replaced by stale pre-hook values. The
-// guard covers opening, every Harness-driven effect callback and terminal
-// settlement until the returned Close releases it and closes the Agent then
-// the Operation scope; opening failure releases the guard and unwinds owned
-// scopes first.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, opener openExecution) (harness.Execution, error) {
+// open turns the committed admission into the execution: it first acquires
+// the Session's whole artifact interval — before any scope, plugin, model,
+// tool or hook effect — then opens the Operation then the Agent scope, enters
+// the Agent-scope guard, creates the execution selection from the same
+// snapshot, and hands that new value with the actual committed admission to
+// this preparation's opener, so hooks' final prompt and tools can never be
+// replaced by stale pre-hook values. The guard covers opening, every
+// Harness-driven effect callback and terminal settlement until the returned
+// Close releases it and closes the Agent then the Operation scope; the
+// artifact token releases last, after that scoped cleanup, and an opening
+// failure releases it before returning. Only after the opener succeeds does
+// the collected prompt presentation publish, so a failed fork or admission
+// never creates warnings for an unpublished Session and a successful opener
+// publishes before any progress.
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openExecution) (harness.Execution, error) {
+	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(p.runtime.info.DataDir, admission.SessionID))
+	if err != nil {
+		return harness.Execution{}, err
+	}
 	base := ScopeInfo{DataDir: p.runtime.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
 	operation, err := p.composition.openScope(ctx, operationInfo, []*scope{p.runtime, workspaceScope})
 	if err != nil {
+		releaseArtifacts()
 		return harness.Execution{}, err
 	}
 	agentInfo := base
 	agentInfo.Kind = ScopeAgent
 	agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
 	if err != nil {
-		return harness.Execution{}, errors.Join(err, operation.close())
+		err = errors.Join(err, operation.close())
+		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
+		return harness.Execution{}, err
 	}
 	unwind := func(cause error, release func()) (harness.Execution, error) {
 		if release != nil {
 			release()
 		}
-		return harness.Execution{}, errors.Join(cause, agentScope.close(), operation.close())
+		err := errors.Join(cause, agentScope.close(), operation.close())
+		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
+		return harness.Execution{}, err
 	}
 	callCtx, release, err := agentScope.enter(ctx)
 	if err != nil {
@@ -241,6 +353,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	if err != nil {
 		return unwind(err, release)
 	}
+	// The committed opener owns the collected presentation: the successful
+	// execution publishes its Session's prompt group before any model or tool
+	// progress.
+	warnings.publish()
 	if execution.Close != nil {
 		// The concrete execution cleanup joins the Agent scope's closer stack last,
 		// so reverse disposal runs it before that scope's plugins.
@@ -256,7 +372,9 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		ToolHooks:     hooks,
 		Close: func() error {
 			release()
-			return errors.Join(agentScope.close(), operation.close())
+			err := errors.Join(agentScope.close(), operation.close())
+			releaseArtifacts() // the token releases last, after the scoped cleanup
+			return err
 		},
 	}, nil
 }
@@ -322,7 +440,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	}
 	apiKey := ""
 	if env := provider.Transport.APIKeyEnv; env != "" {
-		apiKey = os.Getenv(env)
+		apiKey = sel.credentials[env].Value
 		if apiKey == "" {
 			return harness.ExecutionCapture{}, nil, fmt.Errorf("%w: %s (for provider %q): %w", config.ErrMissingEnvVar, env, provider.ID, harness.ErrInvalid)
 		}
@@ -355,7 +473,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 			keyMissing := false
 			compactKey := ""
 			if env := compactProvider.Transport.APIKeyEnv; env != "" {
-				compactKey = os.Getenv(env)
+				compactKey = sel.credentials[env].Value
 				keyMissing = compactKey == ""
 			}
 			if !keyMissing {
@@ -392,6 +510,12 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	})
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
+	}
+	// The assembled prompt's diagnostics are this preparation's presentation
+	// contribution, collected privately and published by the binder only
+	// after every preparation step succeeded.
+	if sel.warnings != nil {
+		sel.warnings.prompt = result.Warnings
 	}
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
@@ -583,14 +707,20 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			Invocation:    sel.invocation,
 			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 			Background:    p.background,
+			SubprocessEnv: p.subprocessEnv,
 		}
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, _, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				stream, warnings, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				// The attempt's diagnostics are recorded under the admitted
+				// Session identity even when the physical request failed after
+				// encoding succeeded — a diagnostic is presentation only.
+				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, _, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				stream, warnings, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
 			// A nil Retry selects the standard classifier.

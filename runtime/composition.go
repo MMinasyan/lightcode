@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // Error identities reported by typed composition and scope lifetime.
@@ -56,7 +57,12 @@ func (k ScopeKind) rank() int {
 // same normalized owner root in every ScopeInfo. Workspace scopes carry only
 // lexical Workspace identity, never Session or Operation attribution; the
 // Runtime scope carries no narrower attribution at all; short scopes carry
-// the complete Workspace/Session/Operation identity.
+// the complete Workspace/Session/Operation identity. ReportWarning is the
+// Runtime's factory-bound passive warning-report callback: the composition
+// binds each Runtime-scoped plugin's copied ScopeInfo to its own registered
+// ID, a plugin that needs it captures it at Open, and it grants no authority
+// — reports are presentation only and are ignored after the warning store's
+// closure.
 type ScopeInfo struct {
 	Kind        ScopeKind
 	DataDir     string
@@ -64,10 +70,12 @@ type ScopeInfo struct {
 	SessionID   string
 	OperationID string
 
-	// ManagedEnvKeys names the env keys the Runtime injected from
-	// ~/.lightcode/.env; the Runtime scope carries them, narrower scopes
-	// carry none.
-	ManagedEnvKeys []string
+	// ReportWarning reports one typed warning from this Runtime-scoped plugin
+	// into the Runtime-owned warning store under this factory's registered
+	// plugin identity. The composition binds it per factory; a scope opened
+	// without a composition reporter carries nil. It performs no I/O or work
+	// under plugin state locks and cannot veto work.
+	ReportWarning func(kind, message string)
 }
 
 // CapabilitySpec pairs one capability lookup ID with its Go type. The ID is
@@ -239,6 +247,13 @@ type composition struct {
 	toolIDs       []string
 	coreExports   []typedExportDecl
 	jobStoppers   []typedExportDecl
+
+	// reportWarning is the owner's neutral plugin-warning sink: it receives
+	// one registered plugin's ID with the reported (kind,message) and performs
+	// the presentation publication. It is set by the owner before any scope
+	// opens; an isolated composition leaves it nil and every factory receives
+	// a nil ReportWarning.
+	reportWarning func(pluginID, kind, message string)
 
 	// modelAdaptation is the single export ID declared as exactly
 	// ModelAdaptation, or empty when the composition declares none. More than
@@ -445,6 +460,23 @@ func validateScopeInfo(info ScopeInfo) error {
 	return nil
 }
 
+// bindReportWarning returns one factory's passive warning callback. Only a
+// Runtime-scoped factory receives it, and only when the owner supplied a
+// neutral reporter: the callback fixes the attribution from the factory's own
+// registered ID, drops reports after this scope's cancellation, and delegates
+// the presentation publication. It cannot veto work, wait, or perform I/O.
+func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo, p Plugin) func(kind, message string) {
+	if info.Kind != ScopeRuntime || c.reportWarning == nil {
+		return nil
+	}
+	return func(kind, message string) {
+		if scopeCtx.Err() != nil {
+			return
+		}
+		c.reportWarning(p.ID, kind, message)
+	}
+}
+
 // openScope constructs the plugins planned for info.Kind in topological
 // order, seeding ordinary dependencies from the supplied ancestor scopes in
 // longer-to-shorter order. The failing factory owns its provisional
@@ -488,7 +520,13 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 			}
 			deps[req.id] = bindingEntry{declared: req.typ, value: source.value, from: source.from}
 		}
-		instance, err := p.Open(scopeCtx, info, Bindings{entries: deps})
+		// Every factory receives its own copied ScopeInfo. Only a
+		// Runtime-scoped factory receives the existing warning ingress, bound
+		// here to its registered ID and to this scope's cancellation; an
+		// isolated composition without a reporter supplies nil.
+		pluginInfo := info
+		pluginInfo.ReportWarning = c.bindReportWarning(scopeCtx, info, p)
+		instance, err := p.Open(scopeCtx, pluginInfo, Bindings{entries: deps})
 		if err != nil {
 			return fail(fmt.Errorf("plugin %q: open: %w", p.ID, err))
 		}
@@ -503,7 +541,10 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 	if sc.obs != nil && info.Kind != ScopeWorkspace {
 		// Construction completion is this scope's publication; a Workspace
 		// scope publishes later, at the registry commit in build.
-		sc.obs.publish(commit, scopeEvent(EventScopeOpened, info))
+		sc.obs.publish(func() []Event {
+			commit()
+			return []Event{scopeEvent(protocol.ScopeOpened, info)}
+		})
 	} else {
 		commit()
 	}
@@ -667,7 +708,10 @@ func (s *scope) close() error {
 		s.mu.Unlock()
 	}
 	if s.obs != nil {
-		s.obs.publish(commit, scopeEvent(EventScopeClosed, s.info))
+		s.obs.publish(func() []Event {
+			commit()
+			return []Event{scopeEvent(protocol.ScopeClosed, s.info)}
+		})
 	} else {
 		commit()
 	}
@@ -784,7 +828,7 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 		close(attempt.done)
 		return
 	}
-	w.obs.publish(func() {
+	w.obs.publish(func() []Event {
 		sc.obs = w.obs
 		w.mu.Lock()
 		delete(w.attempts, key)
@@ -792,7 +836,8 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 		w.mu.Unlock()
 		attempt.sc, attempt.err = sc, nil
 		close(attempt.done)
-	}, scopeEvent(EventScopeOpened, info))
+		return []Event{scopeEvent(protocol.ScopeOpened, info)}
+	})
 }
 
 // shutdown is called once by the Runtime owner. It closes registry admission,

@@ -360,6 +360,8 @@ func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing
 // ShutdownAll's snapshot missed it and the process survived the call.
 func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 	home := t.TempDir()
+	requestsLog := filepath.Join(t.TempDir(), "requests.log")
+	t.Setenv("FAKE_LSP_REQUESTS_LOG", requestsLog)
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -391,6 +393,14 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 		m.startServer(context.Background(), def)
 		close(started)
 	}()
+	t.Cleanup(func() {
+		m.ShutdownAll()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Error("server start did not finish after teardown")
+		}
+	})
 
 	// Wait for the provisional mapping: the admission handoff that puts the
 	// mid-start instance into the close snapshot.
@@ -410,11 +420,14 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 	if !mapped {
 		t.Fatal("startServer never mapped the instance")
 	}
-	// The process is running (the wrapper wrote the pidfile).
+	// The wrapper's pidfile can precede handle installation. Receiving
+	// initialize proves cmd/procDone are installed and the delayed call is
+	// underway, so teardown owns the process this row asserts was reaped.
 	var pid int
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(pidfile); err == nil {
+		requests, _ := os.ReadFile(requestsLog)
+		if data, err := os.ReadFile(pidfile); err == nil && strings.Contains(string(requests), "initialize\n") {
 			if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
 				pid = p
 				break
@@ -423,7 +436,7 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if pid == 0 {
-		t.Fatal("language server process never launched")
+		t.Fatal("language server never reached initialization")
 	}
 
 	start := time.Now()

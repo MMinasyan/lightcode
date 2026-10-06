@@ -144,7 +144,7 @@ func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID 
 	if err != nil {
 		t.Fatalf("coordinator: %v", err)
 	}
-	release, err := c.reserve(context.Background())
+	release, err := h.reserve(context.Background(), c)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -245,11 +245,11 @@ func TestCreateSessionWorkspaceIdentity(t *testing.T) {
 	if len(rec.State.Usage.ByModel) != 0 {
 		t.Fatalf("created session carries usage: %+v", rec.State.Usage)
 	}
-	read, err := h.ReadSession(context.Background(), rec.Identity.SessionID)
+	read, err := h.ReadSessionHeader(context.Background(), rec.Identity.SessionID)
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if read.Identity.Workspace != "/tmp/works" || read.Revision != 1 {
+	if read.Identity.Workspace != "/tmp/works" || read.Revision.DurableRevision != 1 {
 		t.Fatalf("read session = %+v", read)
 	}
 
@@ -270,10 +270,13 @@ func TestCreateSessionWorkspaceIdentity(t *testing.T) {
 func TestReadsMaterializeValidatedState(t *testing.T) {
 	store := emptyStore(t)
 	h := newTestHarness(t, store, nil)
-	if _, err := h.ReadSession(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
+	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent session = %v, want ErrNotFound", err)
 	}
-	if _, err := h.ReadSession(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
+	if _, _, err := h.ReadSessionHistory(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("absent history = %v, want ErrNotFound", err)
+	}
+	if _, err := h.ReadSessionHeader(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("malformed session id = %v, want ErrInvalid", err)
 	}
 	if _, err := h.ReadOperation(context.Background(), testSessionID, testOpID); !errors.Is(err, ErrNotFound) {
@@ -283,8 +286,8 @@ func TestReadsMaterializeValidatedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	read, err := h.ReadSession(context.Background(), created.Identity.SessionID)
-	if err != nil || read.Revision != 1 || read.Identity.SessionID != created.Identity.SessionID {
+	read, err := h.ReadSessionHeader(context.Background(), created.Identity.SessionID)
+	if err != nil || read.Revision.DurableRevision != 1 || read.Identity.SessionID != created.Identity.SessionID {
 		t.Fatalf("ReadSession = %+v, err %v", read, err)
 	}
 	if _, err := h.ReadOperation(context.Background(), created.Identity.SessionID, "op-1"); !errors.Is(err, ErrNotFound) {
@@ -306,11 +309,15 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 
 	wantCorruption(t, func() error {
-		_, err := h.ReadSession(context.Background(), testSessionID)
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		return err
 	}())
 	wantCorruption(t, func() error {
-		_, err := h.ReadSession(context.Background(), testSessionID)
+		_, _, err := h.ReadSessionHistory(context.Background(), testSessionID)
+		return err
+	}())
+	wantCorruption(t, func() error {
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		return err
 	}())
 	wantCorruption(t, func() error {
@@ -322,7 +329,7 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession on a store with a corrupt sibling: %v", err)
 	}
-	if _, err := h.ReadSession(context.Background(), sibling.Identity.SessionID); err != nil {
+	if _, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID); err != nil {
 		t.Fatalf("valid sibling session unreadable: %v", err)
 	}
 }
@@ -334,10 +341,11 @@ func TestChangeAgentType(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
 
-	before, err := h.ReadSession(context.Background(), testSessionID)
+	beforeSnap, err := h.SnapshotSession(context.Background(), testSessionID)
 	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
+		t.Fatalf("SnapshotSession: %v", err)
 	}
+	before := beforeSnap.Session
 	after, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
 	if err != nil {
 		t.Fatalf("ChangeAgentType: %v", err)
@@ -612,7 +620,7 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		readDone := make(chan struct{}, 1)
 		go func() {
-			if _, err := h.ReadSession(context.Background(), testSessionID); err != nil {
+			if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 				t.Errorf("ReadSession during preparation: %v", err)
 			}
 			readDone <- struct{}{}
@@ -718,8 +726,8 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		if rec.Admission.AgentType != "coder" {
 			t.Fatalf("admitted operation agent type = %q, want the capture-time value", rec.Admission.AgentType)
 		}
-		session, err := h.ReadSession(context.Background(), testSessionID)
-		if err != nil || session.State.CurrentAgentType != "reviewer" {
+		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
+		if err != nil || session.CurrentAgentType != "reviewer" {
 			t.Fatalf("session agent type = %+v err %v", session, err)
 		}
 	})
@@ -1060,7 +1068,7 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil { // materialize the open session
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize the open session
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
@@ -1079,12 +1087,12 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 2 {
 			t.Fatalf("refused admission left entries %v registers %v", entries, regs)
 		}
-		session, err := h.ReadSession(context.Background(), testSessionID)
+		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if session.State.Lifecycle != LifecycleArchived {
-			t.Fatalf("read session kept the stale view: %+v", session.State)
+		if session.Lifecycle != LifecycleArchived {
+			t.Fatalf("read session kept the stale view: %+v", session)
 		}
 	})
 
@@ -1092,7 +1100,7 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil { // materialize the idle open session
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize the idle open session
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
@@ -1111,12 +1119,12 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		if len(entries) != 1 || len(regs) != 2 {
 			t.Fatalf("refused admission left entries %v registers %v", entries, regs)
 		}
-		session, err := h.ReadSession(context.Background(), testSessionID)
+		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if session.State.CurrentOperationID != "foreign-op" {
-			t.Fatalf("read session kept the stale view: %+v", session.State)
+		if session.CurrentOperationID != "foreign-op" {
+			t.Fatalf("read session kept the stale view: %+v", session)
 		}
 	})
 }
@@ -1147,19 +1155,19 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 		if err := <-done; !errors.Is(err, ErrConflict) {
 			t.Fatalf("raced admission = %v, want ErrConflict", err)
 		}
-		session, err := h.ReadSession(context.Background(), testSessionID)
+		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if session.State.CurrentAgentType != "foreign" {
-			t.Fatalf("read session kept the stale view: %+v", session.State)
+		if session.CurrentAgentType != "foreign" {
+			t.Fatalf("read session kept the stale view: %+v", session)
 		}
 	})
 
 	t.Run("failed agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil { // materialize revision 1
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
@@ -1170,12 +1178,12 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 		if _, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer"); !errors.Is(err, ErrConflict) {
 			t.Fatalf("raced change = %v, want ErrConflict", err)
 		}
-		session, err := h.ReadSession(context.Background(), testSessionID)
+		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if session.State.CurrentAgentType != "foreign" {
-			t.Fatalf("read session kept the stale view: %+v", session.State)
+		if session.CurrentAgentType != "foreign" {
+			t.Fatalf("read session kept the stale view: %+v", session)
 		}
 	})
 }
@@ -1391,7 +1399,7 @@ func TestRefreshReturnsDiscoveredCorruption(t *testing.T) {
 	t.Run("admission", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil { // materialize revision 1
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) }); err != nil {
@@ -1402,7 +1410,7 @@ func TestRefreshReturnsDiscoveredCorruption(t *testing.T) {
 		if !errors.As(err, &corrupt) {
 			t.Fatalf("admission over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
 		}
-		if _, rerr := h.ReadSession(context.Background(), testSessionID); !errors.As(rerr, &corrupt) {
+		if _, rerr := h.ReadSessionHeader(context.Background(), testSessionID); !errors.As(rerr, &corrupt) {
 			t.Fatalf("subsequent read = %v, want the marked CorruptionError", rerr)
 		}
 	})
@@ -1410,7 +1418,7 @@ func TestRefreshReturnsDiscoveredCorruption(t *testing.T) {
 	t.Run("agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		if _, err := h.ReadSession(context.Background(), testSessionID); err != nil { // materialize revision 1
+		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
 			t.Fatalf("ReadSession: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) }); err != nil {
@@ -1565,17 +1573,17 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 
 	corruptErr := make(chan error, 1)
 	go func() {
-		_, err := h.ReadSession(context.Background(), testSessionID)
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		corruptErr <- err
 	}()
 	<-gate.entered // the parked materialization saw no installed coordinator
 
-	validDone := make(chan SessionRecord, 1)
+	validDone := make(chan SessionHeader, 1)
 	go func() {
-		rec, err := h.ReadSession(context.Background(), testSessionID)
+		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Errorf("valid materialization: %v", err)
-			validDone <- SessionRecord{}
+			validDone <- SessionHeader{}
 			return
 		}
 		validDone <- rec
@@ -1584,11 +1592,11 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	close(gate.release)
 
 	wantCorruption(t, <-corruptErr)
-	if validRec.Identity.SessionID != testSessionID || validRec.State.Lifecycle != LifecycleOpen {
+	if validRec.Identity.SessionID != testSessionID || validRec.Lifecycle != LifecycleOpen {
 		t.Fatalf("valid materialization = %+v", validRec)
 	}
 	wantCorruption(t, func() error {
-		_, err := h.ReadSession(context.Background(), testSessionID)
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		return err
 	}())
 	wantCorruption(t, func() error {
@@ -1600,7 +1608,7 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession with a corrupt sibling: %v", err)
 	}
-	if _, err := h.ReadSession(context.Background(), sibling.Identity.SessionID); err != nil {
+	if _, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID); err != nil {
 		t.Fatalf("valid sibling session unreadable: %v", err)
 	}
 }

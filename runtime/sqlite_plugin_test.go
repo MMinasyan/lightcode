@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -525,6 +527,50 @@ func nextComposedEvent(t *testing.T, sub *runtime.Subscription) (runtime.Event, 
 	}
 }
 
+// composedEventKind reads one composed event's discriminator.
+func composedEventKind(t *testing.T, event runtime.Event) string {
+	t.Helper()
+	kind, err := event.Discriminator()
+	if err != nil {
+		t.Fatalf("event discriminator: %v", err)
+	}
+	return kind
+}
+
+// composedEventGeneration reads one composed configuration event's
+// generation.
+func composedEventGeneration(t *testing.T, event runtime.Event) string {
+	t.Helper()
+	body, err := event.AsConfigurationChangedEvent()
+	if err != nil {
+		t.Fatalf("configuration event body: %v", err)
+	}
+	return body.ConfigurationRevision.Generation
+}
+
+// composedEventJSON renders one composed event for failure diagnostics.
+func composedEventJSON(event runtime.Event) string {
+	data, err := event.MarshalJSON()
+	if err != nil {
+		return "<unset>"
+	}
+	return string(data)
+}
+
+// composedConfigurationEvent builds one configuration event through the
+// generated constructor for the composed order oracles.
+func composedConfigurationEvent(generation uint64) runtime.Event {
+	var scope protocol.Scope
+	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
+	var event protocol.Event
+	_ = event.FromConfigurationChangedEvent(protocol.ConfigurationChangedEvent{ // plain members; the marshal cannot fail
+		Kind:                  protocol.ConfigurationChanged,
+		Scope:                 scope,
+		ConfigurationRevision: protocol.ConfigurationRevision{Generation: strconv.FormatUint(generation, 10)},
+	})
+	return event
+}
+
 // TestComposedSQLiteRuntimeObservationShutdownAndOwnership combines the
 // external composition surface over the real plugin: a saturated observer is
 // removed while a healthy one continues, shutdown converges and closes every
@@ -551,8 +597,8 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		}
 	}
 	first, ok := nextComposedEvent(t, sat)
-	if !ok || first.Kind != runtime.EventConfiguration || first.ConfigurationRevision != "2" {
-		t.Fatalf("saturated subscriber first event = %+v (ok=%v), want revision 2", first, ok)
+	if !ok || composedEventGeneration(t, first) != "2" {
+		t.Fatalf("saturated subscriber first event = %s (ok=%v), want revision 2", composedEventJSON(first), ok)
 	}
 	if _, ok := nextComposedEvent(t, sat); ok {
 		t.Fatal("saturated subscriber still open at the second publication, want it removed and closed")
@@ -561,8 +607,8 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 	var observed []runtime.Event
 	for _, want := range []string{"2", "3"} {
 		event, ok := nextComposedEvent(t, healthy)
-		if !ok || event.Kind != runtime.EventConfiguration || event.ConfigurationRevision != want {
-			t.Fatalf("healthy subscriber event = %+v (ok=%v), want configuration %s", event, ok, want)
+		if !ok || composedEventKind(t, event) != "configuration_changed" || composedEventGeneration(t, event) != want {
+			t.Fatalf("healthy subscriber event = %s (ok=%v), want configuration %s", composedEventJSON(event), ok, want)
 		}
 		observed = append(observed, event)
 	}
@@ -580,9 +626,9 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		observed = append(observed, event)
 	}
 	want := []runtime.Event{
-		{Kind: runtime.EventConfiguration, ConfigurationRevision: "2"},
-		{Kind: runtime.EventConfiguration, ConfigurationRevision: "3"},
-		{Kind: runtime.EventScopeClosed, Scope: runtime.ScopeInfo{Kind: runtime.ScopeRuntime}},
+		composedConfigurationEvent(2),
+		composedConfigurationEvent(3),
+		composedRuntimeScopeClosed(),
 	}
 	if !slices.EqualFunc(observed, want, runtime.EqualEventForTest) {
 		t.Fatalf("healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
@@ -618,4 +664,17 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 	if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
 		t.Fatalf("data root after shutdown = %v, want exactly the real SQLite plugin's files", got)
 	}
+}
+
+// composedRuntimeScopeClosed builds the Runtime closure scope event for the
+// composed order oracles.
+func composedRuntimeScopeClosed() runtime.Event {
+	var scope protocol.Scope
+	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
+	var event protocol.Event
+	_ = event.FromScopeEvent(protocol.ScopeEvent{ // plain members; the marshal cannot fail
+		Kind:  protocol.ScopeClosed,
+		Scope: scope,
+	})
+	return event
 }

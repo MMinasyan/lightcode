@@ -387,7 +387,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	}
 	h, err := harness.New(owner, harness.Dependencies{
 		Storage: store,
-		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, sh.home, nil, e.supply).bind(),
+		Prepare: newPreparation(e.svc, e.comp, e.runtime, e.ws, sh.home, nil, nil, nil, nil, e.supply).bind(),
 	})
 	if err != nil {
 		t.Fatalf("harness.New: %v", err)
@@ -739,6 +739,14 @@ func eachPrepStore(t *testing.T, run func(t *testing.T, store harness.Storage)) 
 		defer store.Close()
 		run(t, store)
 	})
+}
+
+// eachPrepStoreOnce runs one fixture against the memory store alone: the
+// scenarios that perform no Session admission, recovery, durable, or mounted
+// work have no store axis to multiply.
+func eachPrepStoreOnce(t *testing.T, run func(t *testing.T, store harness.Storage)) {
+	t.Helper()
+	run(t, storage.NewMemory())
 }
 
 // TestPreparationHappyPathThroughHarness drives one real admission end to end
@@ -1351,10 +1359,11 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 					if err != nil {
 						t.Fatalf("ReadEntries: %v", err)
 					}
-					sourceBefore, err := e.h.ReadSession(context.Background(), session)
+					sourceBeforeSnap, err := e.h.SnapshotSession(context.Background(), session)
 					if err != nil {
-						t.Fatalf("ReadSession: %v", err)
+						t.Fatalf("SnapshotSession: %v", err)
 					}
+					sourceBefore := sourceBeforeSnap.Session
 					tc.arm(e)
 					res, err := e.h.Fork(context.Background(), harness.ForkRequest{
 						SourceSessionID: session,
@@ -1379,10 +1388,11 @@ func TestPreparationSelectionMismatchOnDrainedAndForkDelivery(t *testing.T) {
 					if len(entriesAfter) != len(entriesBefore) {
 						t.Fatalf("source entries after the failed fork = %d, want unchanged %d", len(entriesAfter), len(entriesBefore))
 					}
-					sourceAfter, err := e.h.ReadSession(context.Background(), session)
+					sourceAfterSnap, err := e.h.SnapshotSession(context.Background(), session)
 					if err != nil {
-						t.Fatalf("ReadSession: %v", err)
+						t.Fatalf("SnapshotSession: %v", err)
 					}
+					sourceAfter := sourceAfterSnap.Session
 					if !reflect.DeepEqual(sourceAfter, sourceBefore) {
 						t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfter, sourceBefore)
 					}

@@ -50,8 +50,9 @@ func agentsWithCompact(overlay string) string {
 }
 
 // compactPrep wires one concrete preparation (nil controlled prepare) over
-// the compact fixture documents and publishes the configuration once.
-func compactPrep(t *testing.T, agentsDoc, endpoint string) (*configuration, *preparation) {
+// the compact fixture documents, publishes the configuration once, and
+// returns that publication's own snapshot+credential capture.
+func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture, *preparation) {
 	t.Helper()
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
@@ -64,10 +65,11 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (*configuration, *pre
 	obs := newObservation()
 	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
-	if _, err := svc.publish(context.Background()); err != nil {
+	captured, err := svc.publish(context.Background())
+	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	return svc.current(), newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil)
+	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil, nil)
 }
 
 func compactToolsPlugin() Plugin {
@@ -91,13 +93,13 @@ func compactPrepRequest() harness.PreparationRequest {
 	}
 }
 
-func compactPrepSelection(t *testing.T, snapshot *configuration, agentName string) selection {
+func compactPrepSelection(t *testing.T, captured configurationCapture, agentName string) selection {
 	t.Helper()
-	agent, err := harness.ResolveAgentType(agentName, snapshot.agentTypes())
+	agent, err := harness.ResolveAgentType(agentName, captured.snapshot.agentTypes())
 	if err != nil {
 		t.Fatalf("ResolveAgentType(%q): %v", agentName, err)
 	}
-	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: snapshot}}
+	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
 }
 
 // compactBaseCapture is the valid capture baseline of the hook-protection
@@ -214,8 +216,8 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			snapshot, prep := compactPrep(t, tc.agentsDoc, "https://prov.test/v1")
-			sel := compactPrepSelection(t, snapshot, tc.agent)
+			captured, prep := compactPrep(t, tc.agentsDoc, "https://prov.test/v1")
+			sel := compactPrepSelection(t, captured, tc.agent)
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			if err != nil {
 				t.Fatalf("concretePrepare: %v", err)
@@ -290,8 +292,8 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			server := newCompactRecordingServer(t)
-			snapshot, prep := compactPrep(t, tc.agentsDoc, server.URL)
-			sel := compactPrepSelection(t, snapshot, "solo")
+			captured, prep := compactPrep(t, tc.agentsDoc, server.URL)
+			sel := compactPrepSelection(t, captured, "solo")
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			if err != nil {
 				t.Fatalf("concretePrepare: %v", err)

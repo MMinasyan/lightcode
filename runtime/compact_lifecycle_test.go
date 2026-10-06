@@ -473,12 +473,15 @@ func (f *compactLifecycle) readSession(sessionID string) harness.SessionRecord {
 	f.t.Helper()
 	var rec harness.SessionRecord
 	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		rec, err = h.ReadSession(ctx, sessionID)
-		return err
+		snap, err := h.SnapshotSession(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		rec = snap.Session
+		return nil
 	})
 	if err != nil {
-		f.t.Fatalf("ReadSession(%s): %v", sessionID, err)
+		f.t.Fatalf("SnapshotSession(%s): %v", sessionID, err)
 	}
 	return rec
 }
@@ -880,9 +883,11 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 				return compactSummaryTurn("summary one", model.Usage{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), nil
 			})
 
-			// No passive event may fire across the compaction: the protocol
-			// and client surface are untouched by compaction.
-			sub, err := f.r.Subscribe(16)
+			// The subscription observes the real committed truth across the
+			// compaction: the fixed configuration and scope events plus the
+			// passive facts of the actual operations, with no synthetic
+			// admission.
+			sub, err := f.r.Subscribe(256)
 			if err != nil {
 				t.Fatalf("Subscribe: %v", err)
 			}
@@ -1025,21 +1030,67 @@ func TestCompactLifecycleTriggerRows(t *testing.T) {
 			}
 			assertCompactShapes(t, compactShapesOf(sent.at(1).Messages), want)
 
-			// The subscription saw only the fixed configuration and scope
-			// event kinds across the compaction: no new protocol or client
-			// surface fired.
+			// Every invalidation names the real Session at session
+			// granularity and every delta the real running Operation: no
+			// event names a Session or Operation outside the committed
+			// admissions — compaction invents no synthetic admission.
+			seenSessionInvalidations := 0
+			seenDeltas := 0
+			var drained []Event
 			for {
 				select {
-				case event := <-sub.Events():
-					switch event.Kind {
-					case EventConfiguration, EventScopeOpened, EventScopeClosed:
-					default:
-						t.Fatalf("observation fired kind %q during compaction, want only the fixed configuration and scope set", event.Kind)
+				case event, ok := <-sub.Events():
+					if !ok {
+						t.Fatal("the subscription closed early, want it open through the drain")
 					}
+					drained = append(drained, event)
 					continue
 				default:
 				}
 				break
+			}
+			for _, event := range drained {
+				switch eventKind(t, event) {
+				case "configuration_changed", "scope_opened", "scope_closed":
+				case "session_changed":
+					body, err := event.AsSessionChangedEvent()
+					if err != nil {
+						t.Fatalf("session event body: %v", err)
+					}
+					invalidationScope, err := body.Scope.AsSessionScope()
+					if err != nil {
+						t.Fatalf("compaction invalidation scope: %v", err)
+					}
+					if invalidationScope.SessionId != s || scopeKind(t, body.Scope) != "session" {
+						t.Fatalf("compaction invalidation scope = %+v, want the real session's session-granularity scope", body.Scope)
+					}
+					seenSessionInvalidations++
+				case "text_delta":
+					body, err := event.AsTextDeltaEvent()
+					if err != nil {
+						t.Fatalf("delta event body: %v", err)
+					}
+					deltaScope, err := body.Scope.AsOperationScope()
+					if err != nil {
+						t.Fatalf("compaction delta scope: %v", err)
+					}
+					if deltaScope.SessionId != s ||
+						(deltaScope.OperationId != "op-2" && deltaScope.OperationId != "op-3") {
+						t.Fatalf("compaction delta scope = %+v, want a real admitted operation", body.Scope)
+					}
+					if body.Content == "" {
+						t.Fatal("compaction delta carries empty content")
+					}
+					seenDeltas++
+				default:
+					t.Fatalf("observation fired kind %q during compaction, outside the closed event set", eventKind(t, event))
+				}
+			}
+			if seenSessionInvalidations == 0 {
+				t.Fatal("the compaction committed no session invalidation, want the real committed hints")
+			}
+			if seenDeltas == 0 {
+				t.Fatal("the compaction model stream produced no text delta, want the real progress truth")
 			}
 
 			if err := f.r.Close(ctx); err != nil {
@@ -2502,12 +2553,12 @@ func TestCompactLifecycleCorruptCompactionEntry(t *testing.T) {
 
 		f := openCompactLifecycle(t, store)
 		err := f.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.ReadSession(ctx, corrupt)
+			_, err := h.ReadSessionHeader(ctx, corrupt)
 			return err
 		})
 		var corruptErr *harness.CorruptionError
 		if !errors.As(err, &corruptErr) || !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("ReadSession(corrupt) = %v, want a corruption error", err)
+			t.Fatalf("ReadSessionHeader(corrupt) = %v, want a corruption error", err)
 		}
 		if got := f.readSession(sibling).Identity.SessionID; got != sibling {
 			t.Fatalf("sibling session read = %q, want %q usable", got, sibling)
@@ -2876,61 +2927,63 @@ func productionAgentsWithFreedHook() string {
 // --- the protocol and client surface pin ---
 
 // TestCompactLifecycleRuntimeSurfaceUnchanged pins the runtime package's
-// exported declaration set against the fixed pre-compaction set — top-level
+// exported declaration set against the fixed current set — top-level
 // exported declarations under their bare names and exported methods on
 // exported receiver types under receiver-qualified names, with pointer and
 // value receivers distinguished in the key the same way the exported check
 // distinguishes them — so an added (*Runtime) method cannot hide behind the
 // top-level-only scan and same-named methods on different receivers cannot
-// collide: the compaction lifecycle added no runtime-level protocol or
-// client surface, and a source scan of the package's production files must
-// find exactly the pinned names and no others.
+// collide: the mounted server transport exposes only the Runtime's
+// OpenProtocol and the ProtocolServer's endpoint and discovery publication,
+// while the generated handler methods live on the private transport receiver
+// and are not public surface. A source scan of the package's production
+// files must find exactly the pinned names and no others.
 func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 	want := map[string]bool{
-		"(*Runtime).Close":        true,
-		"(*Runtime).Reload":       true,
-		"(*Runtime).Subscribe":    true,
-		"(*Subscription).Close":   true,
-		"(*Subscription).Events":  true,
-		"(Invocation).AgentTypes": true,
-		"(Invocation).Config":     true,
-		"(Invocation).Revision":   true,
-		"Adaptation":              true,
-		"BackgroundServices":      true,
-		"Bind":                    true,
-		"Bindings":                true,
-		"CapabilitySpec":          true,
-		"ErrClosed":               true,
-		"ErrComposition":          true,
-		"ErrConfiguration":        true,
-		"ErrOwned":                true,
-		"Event":                   true,
-		"EventConfiguration":      true,
-		"EventKind":               true,
-		"EventScopeClosed":        true,
-		"EventScopeOpened":        true,
-		"Instance":                true,
-		"Invocation":              true,
-		"ModelAdaptation":         true,
-		"Open":                    true,
-		"Options":                 true,
-		"Plugin":                  true,
-		"PreparationHook":         true,
-		"Runtime":                 true,
-		"ScopeAgent":              true,
-		"ScopeInfo":               true,
-		"ScopeKind":               true,
-		"ScopeOperation":          true,
-		"ScopeRuntime":            true,
-		"ScopeWorkspace":          true,
-		"Spec":                    true,
-		"Subscription":            true,
-		"Tool":                    true,
-		"ToolArgumentsHook":       true,
-		"ToolConstraints":         true,
-		"ToolContext":             true,
-		"ToolDescription":         true,
-		"ToolSpec":                true,
+		"(*ProtocolServer).Endpoint":         true,
+		"(*ProtocolServer).PublishDiscovery": true,
+		"(*Runtime).Close":                   true,
+		"(*Runtime).OpenProtocol":            true,
+		"(*Runtime).Reload":                  true,
+		"(*Runtime).Subscribe":               true,
+		"(*Subscription).Close":              true,
+		"(*Subscription).Events":             true,
+		"(Invocation).AgentTypes":            true,
+		"(Invocation).Config":                true,
+		"(Invocation).Revision":              true,
+		"Adaptation":                         true,
+		"BackgroundServices":                 true,
+		"Bind":                               true,
+		"Bindings":                           true,
+		"CapabilitySpec":                     true,
+		"ErrClosed":                          true,
+		"ErrComposition":                     true,
+		"ErrConfiguration":                   true,
+		"ErrOwned":                           true,
+		"Event":                              true,
+		"Instance":                           true,
+		"Invocation":                         true,
+		"ModelAdaptation":                    true,
+		"Open":                               true,
+		"Options":                            true,
+		"Plugin":                             true,
+		"PreparationHook":                    true,
+		"ProtocolServer":                     true,
+		"Runtime":                            true,
+		"ScopeAgent":                         true,
+		"ScopeInfo":                          true,
+		"ScopeKind":                          true,
+		"ScopeOperation":                     true,
+		"ScopeRuntime":                       true,
+		"ScopeWorkspace":                     true,
+		"Spec":                               true,
+		"Subscription":                       true,
+		"Tool":                               true,
+		"ToolArgumentsHook":                  true,
+		"ToolConstraints":                    true,
+		"ToolContext":                        true,
+		"ToolDescription":                    true,
+		"ToolSpec":                           true,
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")

@@ -162,7 +162,7 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			}
 			stream, attemptErr := attempt(ctx, req)
 			if attemptErr == nil && stream != nil {
-				output, attemptErr = assemble(intent.expected, stream) // exactly one assembly after acceptance
+				output, attemptErr = assemble(intent.expected, h.observeStream(intent.sessionID, operationID, stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
 				if attemptErr != nil {
 					return settle(attemptErr)
 				}
@@ -609,5 +609,6 @@ func (h *Harness) commitCompaction(c *coordinator, operationID string, capture E
 	c.graph.replaceOperation(operationID, committedOp)
 	c.graph.Session = committedSess
 	c.mu.Unlock()
+	h.observeInvalidation(c) // every compaction commit replaces the Session register
 	return nil
 }

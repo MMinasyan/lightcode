@@ -165,7 +165,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("restarted Harness: %v", err)
 		}
-		if _, err := restarted.ReadSession(ctx, session); err != nil {
+		if _, err := restarted.ReadSessionHeader(ctx, session); err != nil {
 			t.Fatalf("restarted ReadSession: %v", err)
 		}
 		rec, err = restarted.ReadOperation(ctx, session, "op-1")

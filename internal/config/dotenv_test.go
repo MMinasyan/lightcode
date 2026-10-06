@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,6 +236,35 @@ func TestManagedEnvSetRefusesExternalKey(t *testing.T) {
 	// Not in managed set.
 	if m.IsManaged(key) {
 		t.Fatalf("refused key must not be in managed set")
+	}
+}
+
+func TestManagedEnvRejectsNULValueWithoutFileEffect(t *testing.T) {
+	key := envKeyForTest(t, "NUL_VALUE")
+	broken := "sk-\x00-broken"
+	for _, tc := range []struct {
+		name    string
+		attempt func(*ManagedEnv) error
+	}{
+		{"Set", func(m *ManagedEnv) error { return m.Set(key, broken) }},
+		{"TrySet", func(m *ManagedEnv) error { return m.TrySet(key, broken) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".env")
+			m := NewManagedEnvForTest(path)
+			if err := tc.attempt(m); err == nil {
+				t.Fatal("a NUL value was accepted")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("a NUL value wrote the env file (%v)", err)
+			}
+			if _, defined := os.LookupEnv(key); defined {
+				t.Fatal("a NUL value reached the process environment")
+			}
+			if m.IsManaged(key) {
+				t.Fatal("a NUL value marked the key managed")
+			}
+		})
 	}
 }
 
@@ -1023,5 +1053,150 @@ func TestLoadDotEnvScannerErrorReturnsPartialManagedSet(t *testing.T) {
 	}
 	if keys := m.ManagedKeys(); !slices.Contains(keys, key) {
 		t.Fatalf("ManagedKeys = %v, want to contain %s", keys, key)
+	}
+}
+
+func TestManagedEnvSubprocessEnvFiltersCurrentManagedSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManagedEnvForTest(path)
+	external := envKeyForTest(t, "SUBPROC_EXTERNAL")
+	managed := envKeyForTest(t, "SUBPROC_MANAGED")
+	t.Setenv(external, "sibling-value")
+
+	// Before any managed write: everything passes through.
+	env := m.SubprocessEnv()
+	if env == nil {
+		t.Fatal("SubprocessEnv = nil, want a non-nil slice")
+	}
+	if !slices.Contains(env, external+"=sibling-value") {
+		t.Fatalf("SubprocessEnv = %v, want the external sibling present", env)
+	}
+	if slices.Contains(env, managed+"=") {
+		t.Fatalf("SubprocessEnv = %v, want the unset managed name absent", env)
+	}
+
+	if err := m.TrySet(managed, "managed-secret"); err != nil {
+		t.Fatalf("TrySet: %v", err)
+	}
+	env = m.SubprocessEnv()
+	if slices.Contains(env, managed+"=managed-secret") {
+		t.Fatalf("SubprocessEnv = %v, want the managed key scrubbed", env)
+	}
+	if !slices.Contains(env, external+"=sibling-value") {
+		t.Fatalf("SubprocessEnv = %v, want the external sibling still present", env)
+	}
+
+	// The snapshot is one owned copy: mutating it never reaches the manager
+	// or the process env.
+	if len(env) > 0 {
+		env[0] = "MUTED=1"
+	}
+	if !slices.Contains(m.SubprocessEnv(), external+"=sibling-value") {
+		t.Fatal("a mutated snapshot changed the manager's view")
+	}
+
+	if err := m.TryRemove(managed); err != nil {
+		t.Fatalf("TryRemove: %v", err)
+	}
+	if slices.Contains(m.SubprocessEnv(), managed+"=managed-secret") {
+		t.Fatal("the removed key is back in the snapshot")
+	}
+}
+
+func TestManagedEnvSubprocessEnvNilReceiver(t *testing.T) {
+	var m *ManagedEnv
+	env := m.SubprocessEnv()
+	if env == nil {
+		t.Fatal("nil receiver returned nil, want a non-nil empty slice")
+	}
+	if len(env) != 0 {
+		t.Fatalf("nil receiver returned %d entries, want an empty slice", len(env))
+	}
+}
+
+func TestSubprocessEnvConcurrentWithManagedWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManagedEnvForTest(path)
+	key := envKeyForTest(t, "SUBPROC_RACE")
+	t.Setenv(key, "")
+	_ = os.Unsetenv(key)
+
+	// One synchronous managed write proves the writer path works before the
+	// consumer loop, so a failed or unscheduled writer cannot pass vacuously.
+	if err := m.TrySet(key, "managed-secret"); err != nil {
+		t.Fatalf("initial TrySet: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopWriter := func() {
+		stopOnce.Do(func() { close(stop) })
+	}
+	// A failing assertion stops and joins the writer before unwinding, so no
+	// leaked goroutine keeps mutating the process env or the temp .env.
+	defer func() {
+		stopWriter()
+		wg.Wait()
+	}()
+	writerErrs := make(chan error, 1)
+	wg.Add(1)
+	go func() { // concurrent managed writes share SubprocessEnv's critical section
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var err error
+			if i%2 == 0 {
+				err = m.TrySet(key, "managed-secret")
+			} else {
+				err = m.TryRemove(key)
+			}
+			if err != nil {
+				select {
+				case writerErrs <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		env := m.SubprocessEnv()
+		// The managed key is filtered while owned and unset while unmanaged:
+		// no key= prefix may ever appear in the snapshot, not even the exact
+		// managed secret.
+		for _, entry := range env {
+			if strings.HasPrefix(entry, key+"=") {
+				t.Fatalf("snapshot leaked a managed key entry %q", entry)
+			}
+		}
+	}
+	stopWriter()
+	wg.Wait()
+	select {
+	case err := <-writerErrs:
+		t.Fatalf("concurrent managed writer: %v", err)
+	default:
+	}
+	// After the final state settles, the snapshot reflects it exactly.
+	if err := m.TrySet(key, "managed-secret"); err != nil {
+		t.Fatalf("TrySet: %v", err)
+	}
+	for _, entry := range m.SubprocessEnv() {
+		if strings.HasPrefix(entry, key+"=") {
+			t.Fatalf("the connected key leaked into the snapshot: %q", entry)
+		}
 	}
 }

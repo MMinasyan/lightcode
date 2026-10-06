@@ -15,12 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // ownerSweepDocument builds one owner configuration document with the fixed
@@ -256,12 +258,12 @@ func (c *deadlineContext) Err() error {
 
 func (c *deadlineContext) expire() { close(c.done) }
 
-func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.SessionRecord, error) {
+func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.SessionHeader, error) {
 	t.Helper()
-	var rec harness.SessionRecord
+	var rec harness.SessionHeader
 	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		rec, err = h.ReadSession(ctx, sessionID)
+		rec, err = h.ReadSessionHeader(ctx, sessionID)
 		return err
 	})
 	return rec, err
@@ -365,8 +367,8 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if rec.State.Lifecycle != harness.LifecycleArchived || rec.State.ArchivedAt == nil {
-			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec.State)
+		if rec.Lifecycle != harness.LifecycleArchived || rec.ArchivedAt == nil {
+			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec)
 		}
 		if calls, opens := e.prep.counts(); calls != 0 || opens != 0 {
 			t.Fatalf("preparation/opener calls during startup = %d/%d, want the sweep to admit no model work", calls, opens)
@@ -421,11 +423,11 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadSession after the archive ticks: %v", err)
 		}
-		if archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != created.Revision+1 {
-			t.Fatalf("Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d", archived.State, archived.Revision, created.Revision+1)
+		if archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != created.Revision+1 {
+			t.Fatalf("Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d", archived, archived.Revision.DurableRevision, created.Revision+1)
 		}
-		if archived.State.ArchivedAt == nil || !archived.State.ArchivedAt.Equal(archivedAt) {
-			t.Fatalf("sweep stamped %v, want the archive tick's explicit time %v", archived.State.ArchivedAt, archivedAt)
+		if archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(archivedAt) {
+			t.Fatalf("sweep stamped %v, want the archive tick's explicit time %v", archived.ArchivedAt, archivedAt)
 		}
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour))                 // exact delete boundary
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour+time.Nanosecond)) // one nanosecond past: delete
@@ -482,7 +484,7 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				sendTick(t, ticks, tick) // this pass lists, fails, and reports
 				sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
 				waitWritten(t, wrapped)  // the later tick committed the archive
-				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 					t.Fatalf("Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
 				}
 				if err := r.Close(context.Background()); err != nil {
@@ -739,7 +741,7 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
 			t.Fatalf("the sweep changed the running Session's register (%d -> %d), want it left unchanged", before.Revision, after.Revision)
 		}
-		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("idle sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
 		if calls, opens := e.prep.counts(); calls != 1 || opens != 1 {
@@ -787,7 +789,7 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		tick := valid.State.LastActivity.Add(100 * time.Hour)
 		sendTick(t, ticks, tick)
 		sendTick(t, ticks, tick)
-		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("valid sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
 		// Shutdown still converges — Close returns, joining the latched
@@ -1013,7 +1015,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
 		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.ReadSession(ctx, archivedID)
+			_, err := h.ReadSessionHeader(ctx, archivedID)
 			return err
 		}); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("read after delete = err %v, want ErrNotFound", err)
@@ -1375,6 +1377,205 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		}
 		mustNotExist(t, firstCode, "the committed deletion's artifacts after the joined pass")
 		if err := r.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion proves the
+// batch warning cleanup over the broad sweep loop: with the third stale
+// archived Session's deletion rolled back, both committed deletions — and only
+// those — have their Session warning groups removed before the pass error
+// returns, in one observation section with exactly one runtime-scoped
+// warning_changed hint, while an unrelated Session's group survives.
+func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		var ids []string
+		for _, name := range []string{"a", "b", "c"} {
+			ids = append(ids, seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, name), 100*time.Hour))
+		}
+		slices.Sort(ids)
+		first, second, third := ids[0], ids[1], ids[2]
+
+		wrapped := newSweepStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(wrapped))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() {
+			if err := r.Close(context.Background()); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+
+		keeper, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "keeper"), "solo")
+		if err != nil {
+			t.Fatalf("createSession(keeper): %v", err)
+		}
+		keeperID := keeper.Identity.SessionID
+		seed := func(sessionID, kind string) {
+			id := sessionID
+			r.warnings.setSessionPrompt(sessionID, []protocol.Warning{{Source: "runtime:prompt", Kind: kind, Message: kind, SessionId: &id}})
+		}
+		seed(first, "first")
+		seed(second, "second")
+		seed(third, "third")
+		seed(keeperID, "keeper")
+
+		sub, err := r.Subscribe(64)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		baseRevision, _ := r.warnings.snapshot()
+
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		if _, err := r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		wrapped.armDeleteTarget(third)
+		stderr := captureSweepStderr(t)
+		now := time.Now().Add(200 * time.Hour)
+		sendTick(t, ticks, now) // the pass commits first and second, then rolls third back
+
+		// The batch hint is the failed pass's warning-cleanup completion
+		// barrier: it publishes after every returned committed identity was
+		// cleaned.
+		var hint *protocol.WarningChangedEvent
+		for hint == nil {
+			event, ok := nextEvent(t, sub)
+			if !ok {
+				t.Fatal("the subscription closed before the sweep's warning hint")
+			}
+			if eventKind(t, event) != "warning_changed" {
+				continue
+			}
+			body, err := event.AsWarningChangedEvent()
+			if err != nil {
+				t.Fatalf("warning event body: %v", err)
+			}
+			if scopeKind(t, body.Scope) != "runtime" {
+				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
+			}
+			hint = &body
+		}
+		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
+			t.Fatalf("sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
+		}
+		assertNoEvent(t, sub)
+
+		for _, id := range []string{first, second} {
+			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("committed deletion of %s = err %v, want the register gone", id, err)
+			}
+			if _, warnings := r.warnings.snapshot(); sessionWarningPresent(warnings, id) {
+				t.Fatalf("committed deletion of %s kept its warning group: %+v", id, warnings)
+			}
+		}
+		readSweepRegister(t, wrapped, third)
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, third) {
+			t.Fatalf("the rolled-back deletion dropped its warning group")
+		}
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, keeperID) {
+			t.Fatalf("the unrelated Session's warning group was removed")
+		}
+
+		// The pass error's one retained diagnostic may land just after the
+		// hint; poll it under a bounded budget.
+		deadline := time.Now().Add(5 * time.Second)
+		for strings.Count(stderr(), "lightcode: sweep:") == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
+		}
+	})
+}
+
+// TestSweepSkipsHeldArtifactInterval proves the pass's ownership row: a
+// header-enumerated candidate whose artifact interval is held by a parked
+// restore is skipped for that pass without blocking the sibling's transition
+// and cleanup; the held Session keeps its artifacts and register until a later
+// pass owns the interval and completes the deletion.
+func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		ctx := context.Background()
+		r, err := e.open(ctx, e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		heldWorkspace := filepath.Join(e.dataDir, "held-ws")
+		if err := os.MkdirAll(heldWorkspace, 0o700); err != nil {
+			t.Fatalf("mkdir held workspace: %v", err)
+		}
+		held := projectionSession(t, r, heldWorkspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, held, "op-1", "held")
+		file := filepath.Join(heldWorkspace, "held.txt")
+		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
+			t.Fatalf("write v1: %v", err)
+		}
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, held, op.Admission.AdmittedEntry.EntryID), file, "v1")
+		if _, err := r.archiveSession(ctx, held); err != nil {
+			t.Fatalf("archive the held session: %v", err)
+		}
+		heldCode := filepath.Join(e.dataDir, "code", held)
+
+		sibling := projectionSession(t, r, filepath.Join(e.dataDir, "swept-ws"), "solo").Identity.SessionID
+		if _, err := r.archiveSession(ctx, sibling); err != nil {
+			t.Fatalf("archive the sibling session: %v", err)
+		}
+		siblingCode := plantSessionCode(t, e.dataDir, sibling)
+
+		park, outcomes := parkRestore(t, r, held, "op-1", fifo)
+
+		defer park.flush()
+
+		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
+
+		if _, err := os.Stat(siblingCode); !os.IsNotExist(err) {
+			t.Fatalf("sibling artifacts = %v, want them swept by the pass", err)
+		}
+		if err := headerErrorThroughRuntime(ctx, r, sibling); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("sibling after the pass = %v, want the committed deletion", err)
+		}
+		if _, err := os.Stat(heldCode); err != nil {
+			t.Fatalf("held artifacts after the pass = %v, want them intact", err)
+		}
+		if header := headerThroughRuntime(t, r, held); header.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("held candidate lifecycle = %v, want it left archived", header.Lifecycle)
+		}
+
+		park.release("restored")
+		var parked restoreOutcome
+		select {
+		case parked = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parked restore never returned after its FIFO completed")
+		}
+		if parked.err != nil {
+			t.Fatalf("parked restore = %v", parked.err)
+		}
+		if len(parked.result.Restored) != 1 || parked.result.Restored[0] != file {
+			t.Fatalf("restored = %v, want the parked group's restore", parked.result.Restored)
+		}
+
+		// A later pass owns the interval and completes the deletion.
+		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
+		if _, err := os.Stat(heldCode); !os.IsNotExist(err) {
+			t.Fatalf("held artifacts after the later pass = %v, want them removed", err)
+		}
+		if err := headerErrorThroughRuntime(ctx, r, held); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("held candidate after the later pass = %v, want the committed deletion", err)
+		}
+		if err := r.Close(ctx); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
 	})

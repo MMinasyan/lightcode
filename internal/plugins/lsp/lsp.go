@@ -76,13 +76,15 @@ type workspaceEntry struct {
 }
 
 // instance is one Open's constructed state: the runtime lifetime context,
-// the resolved home directory, and the owner data root. Workspaces register
+// the resolved home directory, the owner data root, and the Runtime's
+// passive warning-report callback captured at Open. Workspaces register
 // lazily — detection starts only in an authorized tool execution; Open and
 // every preparation start nothing.
 type instance struct {
-	ctx     context.Context
-	home    string
-	dataDir string
+	ctx           context.Context
+	home          string
+	dataDir       string
+	reportWarning func(kind, message string)
 
 	mu     sync.Mutex
 	closed bool
@@ -102,11 +104,14 @@ type instance struct {
 	workspaces map[string]*workspaceEntry
 }
 
-// workspace returns the canonical root's entry, creating it and launching one
-// detection goroutine on first use. The lock covers only the map check, the
-// creation and the insertion; detection runs outside it on the plugin's
-// runtime lifetime context, so a caller's cancellation never cancels shared
-// detection.
+// workspace returns the canonical root's entry, creating it, installing the
+// Runtime's warning reporter, and launching one detection goroutine on first
+// use. The lock covers only the map check, the creation and the insertion;
+// detection runs outside it on the plugin's runtime lifetime context, so a
+// caller's cancellation never cancels shared detection. The reporter is
+// installed before the detection goroutine exists, so every warning —
+// including one emitted during detection — reaches the Runtime's store; a
+// nil reporter is the harmless no-report shape.
 func (in *instance) workspace(canonicalRoot string) *workspaceEntry {
 	in.mu.Lock()
 	if in.closed {
@@ -116,6 +121,7 @@ func (in *instance) workspace(canonicalRoot string) *workspaceEntry {
 	entry := in.workspaces[canonicalRoot]
 	if entry == nil {
 		manager := newManager(canonicalRoot, in.home)
+		manager.SetWarningHandler(in.reportWarning)
 		entry = &workspaceEntry{manager: manager, done: make(chan struct{})}
 		in.workspaces[canonicalRoot] = entry
 		lifetime := in.ctx
@@ -442,8 +448,9 @@ func Plugin() runtime.Plugin {
 }
 
 // open checks the scope context, resolves home once, and captures the runtime
-// lifetime context and the owner data root. No manager, workspace or server
-// exists at construction.
+// lifetime context, the owner data root, and the Runtime's passive
+// warning-report callback. No manager, workspace or server exists at
+// construction; a nil callback is the no-report shape.
 func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
@@ -453,10 +460,11 @@ func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runt
 		return runtime.Instance{}, fmt.Errorf("lsp: resolve home directory: %w", err)
 	}
 	inst := &instance{
-		ctx:        ctx,
-		home:       home,
-		dataDir:    info.DataDir,
-		workspaces: make(map[string]*workspaceEntry),
+		ctx:           ctx,
+		home:          home,
+		dataDir:       info.DataDir,
+		reportWarning: info.ReportWarning,
+		workspaces:    make(map[string]*workspaceEntry),
 	}
 	return runtime.Instance{
 		Values: map[string]any{

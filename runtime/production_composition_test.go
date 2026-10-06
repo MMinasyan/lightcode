@@ -1226,7 +1226,7 @@ func TestProductionOpenInitialSweepCleansArtifacts(t *testing.T) {
 
 		// The stale-but-not-yet-deletable session survives with its tree.
 		rec, err := readSweptSession(t, r, young)
-		if err != nil || rec.State.Lifecycle != harness.LifecycleArchived {
+		if err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("young session after the initial sweep = %+v err %v, want it archived and intact", rec, err)
 		}
 		mustExist(t, youngCode, "the surviving session's artifact tree")

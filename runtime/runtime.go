@@ -51,10 +51,9 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 // discovery cache keep their home-based paths: neither option relocates them
 // nor changes owner identity. prepare is the controlled preparation function
 // supplied by tests; a nil prepare selects the concrete production
-// preparation.
-// sweepTicks optionally replaces the automatic sweep scheduler's owned
-// hourly ticker with a controlled tick stream whose sends carry each pass's
-// explicit time; the zero value keeps the production time.Ticker.
+// preparation. sweepTicks optionally replaces the automatic sweep scheduler's
+// owned hourly ticker with a controlled tick stream whose sends carry each
+// pass's explicit time; the zero value keeps the production time.Ticker.
 type options struct {
 	DataDir, ConfigPath string
 	Plugins             []Plugin
@@ -73,10 +72,17 @@ type Runtime struct {
 	cancelWork   context.CancelFunc
 	config       *configurationService
 	obs          *observation
+	warnings     *warningStore
+	passive      *observationAdapter
+	managedEnv   *config.ManagedEnv
 	runtimeScope *scope
 	workspaces   *workspaceScopes
 	harness      *harness.Harness
+	artifacts    *artifactIntervals
 	dataDir      string
+	// protocol is the one attached isolated protocol server, set under mu by
+	// OpenProtocol and frozen once closure begins; nil when none is attached.
+	protocol *ProtocolServer
 
 	// mu guards only the admission transition below; it is never held across
 	// any call, wait, or I/O.
@@ -161,7 +167,19 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 
 	obs := newObservation()
-	configService := newConfigurationService(work, c, catalog.NewLoader(home, nil), configPath, obs)
+	// The warning store and the passive publication adapter initialize
+	// before any plugin scope opens: the Runtime installs the adapter's
+	// neutral plugin-warning sink on the composition, which binds each
+	// Runtime-scoped factory's copied ScopeInfo to its own registered ID, and
+	// scopes and preparations report into the store from the moment they
+	// exist.
+	warnings := newWarningStore()
+	adapter := newObservationAdapter(obs, warnings)
+	c.reportWarning = adapter.reportPluginWarning
+	loader := catalog.NewLoader(home, nil)
+	configService := newConfigurationService(work, c, loader, configPath, obs)
+	configService.attachWarnings(warnings)
+	configService.attachEnv(managedEnv)
 	if _, err := configService.publish(work); err != nil {
 		// Initial publication supplies the owned context as both caller and
 		// owner, so its caller-first checkpoints report a canceled
@@ -171,7 +189,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir, ManagedEnvKeys: managedEnv.ManagedKeys()}, nil)
+	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
 	if err != nil {
 		return unlock(err)
 	}
@@ -198,18 +216,32 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 
 	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	background := &backgroundBridge{}
+	// The private per-Session artifact interval registry initializes before
+	// the Harness: every committed opener, restore, committed deletion and
+	// sweep candidate coordinates on it, and no caller can observe an
+	// unarmed registry because the owner is unpublished.
+	artifacts := newArtifactIntervals()
+	// The call-time subprocess environment producer exists only when the
+	// retained manager exists; without it no manager is constructed on
+	// demand and every cooperative command fails.
+	var subprocessEnv func() []string
+	if managedEnv != nil {
+		subprocessEnv = managedEnv.SubprocessEnv
+	}
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv, options.prepare).bind(),
+		Observe: adapter.observe,
 	})
 	if err != nil {
 		return unwind(err)
 	}
 	// Armed before publication: harness.New performed no I/O and the first
 	// Prepare requires the admission gate, so no caller can observe the
-	// unarmed bridge.
+	// unarmed bridge or the adapter's unbound Harness.
 	background.h = h
+	adapter.h = h
 
 	r := &Runtime{
 		lock:         lock,
@@ -217,9 +249,13 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		cancelWork:   cancelWork,
 		config:       configService,
 		obs:          obs,
+		warnings:     warnings,
+		passive:      adapter,
+		managedEnv:   managedEnv,
 		runtimeScope: runtimeScope,
 		workspaces:   workspaces,
 		harness:      h,
+		artifacts:    artifacts,
 		dataDir:      dataDir,
 		shutdownDone: make(chan struct{}),
 	}
@@ -353,20 +389,13 @@ func (r *Runtime) withHarness(ctx context.Context, fn func(context.Context, *har
 	return fn(ctx, r.harness)
 }
 
-// createSession is the private root Session creation: it normalizes the
-// Workspace with filepath.Abs alone and uses the same admitted-call gate.
+// createSession is the private root Session creation: it runs the one
+// normalized creation core inside the shared admitted-call gate.
 func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
-	if workspace == "" {
-		return harness.SessionRecord{}, errors.New("runtime: workspace must be non-empty")
-	}
-	normalized, err := filepath.Abs(workspace)
-	if err != nil {
-		return harness.SessionRecord{}, fmt.Errorf("normalize workspace: %w", err)
-	}
 	var record harness.SessionRecord
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		record, err = h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentType: agentType})
+		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
 		return err
 	}); err != nil {
 		return harness.SessionRecord{}, err
@@ -374,19 +403,45 @@ func (r *Runtime) createSession(ctx context.Context, workspace, agentType string
 	return record, nil
 }
 
+// createSessionRecord is the one root creation core: the existing empty
+// workspace check wraps the shared harness.ErrInvalid sentinel, the Workspace
+// is normalized with filepath.Abs alone, and the Harness retains its
+// nonempty-only Agent-type selection. It executes inside the caller's
+// admission.
+func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, workspace, agentType string) (harness.SessionRecord, error) {
+	if workspace == "" {
+		return harness.SessionRecord{}, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
+	}
+	normalized, err := filepath.Abs(workspace)
+	if err != nil {
+		return harness.SessionRecord{}, fmt.Errorf("normalize workspace: %w", err)
+	}
+	return h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentType: agentType})
+}
+
 // deleteSession is the private canonical Session deletion: the whole body
 // runs inside one admitted call, so shutdown joins the deletion and its
-// cleanup together. After Harness.DeleteSession commits — or reports the
-// Session already absent for a valid identity, the same idempotent result —
-// the Session's artifact tree is removed once. Any other Harness error
-// (invalid input, corruption, revision races, a closed admission) returns
-// as-is and authorizes no cleanup.
+// cleanup together. The deletion takes the Session's artifact interval
+// nonblockingly around its Harness transition and retains it through the
+// warning and artifact cleanup, so a held interval refuses the deletion
+// before any transition; after Harness.DeleteSession commits — or reports
+// the Session already absent for a valid identity, the same idempotent result
+// — the Session's warning groups are removed in one observation section with
+// one runtime-scoped hint, then its artifact tree is removed once. Any other
+// Harness error (invalid input, corruption, revision races, a closed
+// admission) returns as-is and authorizes no cleanup.
 func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		err := h.DeleteSession(ctx, sessionID)
+		releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
+		if err != nil {
+			return err
+		}
+		defer releaseArtifacts()
+		err = h.DeleteSession(ctx, sessionID)
 		if err != nil && !errors.Is(err, harness.ErrNotFound) {
 			return err
 		}
+		r.passive.removeSessionWarnings([]string{sessionID})
 		return r.removeSessionCode(sessionID)
 	})
 }
@@ -413,7 +468,7 @@ func (r *Runtime) Reload(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strconv.FormatUint(snapshot.generation, 10), nil
+	return strconv.FormatUint(snapshot.snapshot.generation, 10), nil
 }
 
 // Close starts (or joins) the one shared managed shutdown and waits for it.
@@ -430,15 +485,32 @@ func (r *Runtime) Close(ctx context.Context) error {
 }
 
 // beginShutdown first closes admission and cancels the owned work context,
-// then starts the one shared cleanup asynchronously. Repeat callers only join.
+// then closes the attached protocol server's listener and every active
+// connection outside the mutex — before any admitted call is joined — and
+// only then starts the one shared cleanup asynchronously. Repeat callers
+// only join.
 func (r *Runtime) beginShutdown() {
 	r.shutdownOnce.Do(func() {
 		r.mu.Lock()
 		r.closed = true
+		server := r.protocol
 		r.mu.Unlock()
+		// The warning store's admission closes with the Runtime: later
+		// reports are ignored presentation. Short in-memory coordination
+		// only — no network or plugin work runs here.
+		r.warnings.close()
 		r.cancelWork()
+		// The attached server's listener and every active stream close
+		// before admitted calls converge: an events stream never holds the
+		// call wait open, and a served request observes its own work
+		// context end instead of a live server. Once attached, the serving
+		// goroutine always started, so this close always joins it.
+		var closeErr error
+		if server != nil {
+			closeErr = server.closeNetwork()
+		}
 		go func() {
-			r.shutdownErr = r.joinShutdown()
+			r.shutdownErr = errors.Join(closeErr, r.joinShutdown())
 			close(r.shutdownDone)
 		}()
 	})
@@ -451,7 +523,8 @@ func (r *Runtime) beginShutdown() {
 // execution, and required terminal commit, then closes every
 // live Workspace scope in sorted path order and the Runtime scope in reverse
 // dependency order, closes every passive subscription once those cleanup
-// events have been published, and releases the lock as the final ownership
+// events have been published, withdraws the attached protocol server's
+// remembered discovery record, and releases the lock as the final ownership
 // action. Every required close is attempted and all errors are joined; no
 // state-owning mutex is held across any of it.
 func (r *Runtime) joinShutdown() error {
@@ -470,6 +543,18 @@ func (r *Runtime) joinShutdown() error {
 		errs = append(errs, err)
 	}
 	r.obs.closeAll()
+	// The remembered discovery record is withdrawn after the Harness and
+	// every scope have converged and before the owner lock is released, so
+	// no successor observes a record this owner cannot answer. After closure
+	// began, the attached server is frozen, so this read is stable.
+	r.mu.Lock()
+	server := r.protocol
+	r.mu.Unlock()
+	if server != nil {
+		if err := server.withdrawDiscovery(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := r.lock.Release(); err != nil {
 		errs = append(errs, err)
 	}

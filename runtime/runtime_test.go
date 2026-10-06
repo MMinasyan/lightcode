@@ -198,6 +198,11 @@ type controlledPrep struct {
 	modelArrived chan struct{}
 	cleanups     chan struct{}
 	cleanupSeen  int
+	// closeGate when non-nil blocks every supplied execution's Close after it
+	// signals the cleanups channel: a deterministic cleanup-phase barrier.
+	closeGate chan struct{}
+	// openErr when non-nil fails every supplied execution's opener.
+	openErr error
 }
 
 func newControlledPrep() *controlledPrep {
@@ -228,8 +233,12 @@ func (p *controlledPrep) prepare(_ context.Context, req harness.PreparationReque
 func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
 	p.mu.Lock()
 	p.openCalls++
+	openErr := p.openErr
 	gate := p.modelGate
 	p.mu.Unlock()
+	if openErr != nil {
+		return harness.Execution{}, openErr
+	}
 	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
 		select {
 		case p.modelArrived <- struct{}{}:
@@ -255,6 +264,12 @@ func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission,
 			select {
 			case p.cleanups <- struct{}{}:
 			default:
+			}
+			p.mu.Lock()
+			gate := p.closeGate
+			p.mu.Unlock()
+			if gate != nil {
+				<-gate
 			}
 			return nil
 		},
@@ -1577,42 +1592,4 @@ func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 	})
-}
-
-// A Runtime-scoped plugin's Open observes the names of the env keys the
-// Runtime injected from its .env file in its ScopeInfo.
-func TestRuntimeScopeInfoCarriesManagedEnvKeys(t *testing.T) {
-	e := newOwnerEnv(t)
-	key := "LIGHTCODE_TEST_RUNTIME_MANAGED_KEYS"
-	t.Setenv(key, "")
-	if err := os.Unsetenv(key); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(e.home, ".lightcode")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(key+"=injected\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	observer := Plugin{
-		ID:       "scope_env_observer",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[any]("scope_env_observer.cap")},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			got = info.ManagedEnvKeys
-			return Instance{Values: map[string]any{"scope_env_observer.cap": "observer"}}, nil
-		},
-	}
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()), observer)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if !slices.Contains(got, key) {
-		t.Fatalf("ScopeInfo.ManagedEnvKeys = %v, want to contain %s", got, key)
-	}
 }

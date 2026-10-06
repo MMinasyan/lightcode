@@ -502,7 +502,7 @@ func TestDeliverBackgroundCompletionReserveFailureTakesClosedPath(t *testing.T) 
 		t.Fatalf("admission: %v", err)
 	}
 
-	release, err := c.reserve(context.Background()) // the test holds the admission reservation
+	release, err := h.reserve(context.Background(), c) // the test holds the admission reservation
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}

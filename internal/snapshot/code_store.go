@@ -321,36 +321,54 @@ func (c *CodeStore) ListTurns() ([]TurnEntry, error) {
 	return entries, nil
 }
 
+// RevertCodeGroups restores every file snapshotted in turns > afterTurn
+// across the supplied directories, latest-first, under ONE traversal
+// ownership: the skip and reported-skip ledgers span every group and every
+// descending turn, so an identity skipped in a newer directory is never
+// restored by an older one. Turn numbering, the after-turn floor and turn-dir
+// removal stay per directory. A failure returns the result accumulated so far
+// with the error; the restore work that already succeeded stays honest.
+func RevertCodeGroups(directories []string, afterTurn int) (RevertResult, error) {
+	if afterTurn < 0 {
+		afterTurn = 0
+	}
+	var result RevertResult
+	skippedEntries := make(map[string]struct{})
+	reportedSkippedEntries := make(map[string]struct{})
+	for _, directory := range directories {
+		snapshotsDir := filepath.Join(directory, "snapshots")
+		turns := readIntDirs(snapshotsDir)
+		for i := len(turns) - 1; i >= 0; i-- {
+			turn := turns[i]
+			if turn <= afterTurn {
+				break
+			}
+			turnDir := filepath.Join(snapshotsDir, strconv.Itoa(turn))
+			turnResult, err := revertOneTurn(turnDir, skippedEntries, reportedSkippedEntries)
+			result.Restored = append(result.Restored, turnResult.Restored...)
+			result.Skipped = append(result.Skipped, turnResult.Skipped...)
+			if err != nil {
+				return result, fmt.Errorf("snapshot: revert %s turn %d: %w", directory, turn, err)
+			}
+			if err := os.Remove(turnDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
+				return result, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
+			}
+		}
+	}
+	return result, nil
+}
+
 // RevertCode restores every file snapshotted in turns > toTurn to its
 // pre-turn state and deletes those snapshot turn dirs. Message history
 // and turn dirs are NOT touched — conversation stays intact. Turn-number
 // allocation remains the legacy Store's concern: the high-water mark is
-// recorded there before this rewind is delegated.
+// recorded there before this rewind is delegated. The traversal is the shared
+// whole-invocation one under this store's instance ownership.
 func (c *CodeStore) RevertCode(toTurn int) (RevertResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if toTurn < 0 {
-		toTurn = 0
+	if c.snapshotsDir == "" { // detached store: no snapshot root, nothing to revert
+		return RevertResult{}, nil
 	}
-	turns := readIntDirs(c.snapshotsDir)
-	var result RevertResult
-	skippedEntries := make(map[string]struct{})
-	reportedSkippedEntries := make(map[string]struct{})
-	for i := len(turns) - 1; i >= 0; i-- {
-		turn := turns[i]
-		if turn <= toTurn {
-			break
-		}
-		turnDir := filepath.Join(c.snapshotsDir, strconv.Itoa(turn))
-		turnResult, err := revertOneTurn(turnDir, skippedEntries, reportedSkippedEntries)
-		result.Restored = append(result.Restored, turnResult.Restored...)
-		result.Skipped = append(result.Skipped, turnResult.Skipped...)
-		if err != nil {
-			return result, fmt.Errorf("snapshot: revert turn %d: %w", turn, err)
-		}
-		if err := os.Remove(turnDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
-			return result, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
-		}
-	}
-	return result, nil
+	return RevertCodeGroups([]string{filepath.Dir(c.snapshotsDir)}, toTurn)
 }

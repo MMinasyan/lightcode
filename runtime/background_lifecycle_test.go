@@ -1951,17 +1951,52 @@ func TestBackgroundLifecycleStopBehaviors(t *testing.T) {
 			stopper := newLifecycleStopper(store)
 			bg := openBackgroundLifecycle(t, store, stopper)
 			stopper.arm(bg.r.harness)
+			// Every exit releases the model gate before the Runtime cleanup:
+			// the cleanups run LIFO, so the parked launch turn below unblocks
+			// and the close joins it even on a failed assertion.
+			t.Cleanup(func() { _ = bg.r.Close(context.Background()) })
 			root := bg.session("corrupt-root")
+
+			// The child's launch turn parks so the live job joins its group
+			// before the completion obligation can classify: released only
+			// after startJob, the deferred obligation is structural, not a
+			// race with the run's retirement.
+			childArrived := make(chan struct{}, 1)
+			childRelease := make(chan struct{})
+			releaseChild := sync.OnceFunc(func() { close(childRelease) })
+			t.Cleanup(releaseChild)
+			bg.prep.setAgentScript("worker", &lifecycleScript{
+				model: func(_ context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
+					childArrived <- struct{}{}
+					<-childRelease
+					return lifecycleTextTurn("child done"), nil
+				},
+			})
+
 			childOp := newLifecycleID(t)
 			child := bg.launchChild(root, "child task", childOp, 5)
-			awaitOperation(t, bg.r, child, childOp, harness.OperationSuccess)
+			<-childArrived
 
+			// The live job joins the child's group while its launch turn is
+			// parked, and the armed delivery rides the job-stop seam.
 			jobCompletion := bg.startJob(child, "cd000014")
 			stopper.addDelivery(child, jobCompletion, "job report")
+			releaseChild()
+			awaitOperation(t, bg.r, child, childOp, harness.OperationSuccess)
 			corruptSessionRegister(t, store, child)
 
 			if err := bg.stop(root); err != nil {
 				t.Fatalf("Stop: %v, want convergence despite the corrupt child", err)
+			}
+			// The first-writer claim converged the group: the stop captured
+			// the child member, stopped its job exactly once through the
+			// seam, and the job member's delivery call returned against the
+			// corrupt register.
+			if got := stopper.stopJobCount(); got != 1 {
+				t.Fatalf("StopJob calls = %d, want the one converged member job", got)
+			}
+			if !stopper.completedMember(jobCompletion) {
+				t.Fatal("the corrupt child's job delivery call never returned")
 			}
 			// No completion was recorded anywhere: the corruption prevented
 			// the natural delivery and no compensating write followed.
@@ -2646,14 +2681,14 @@ func TestBackgroundLifecycleSharedPreparation(t *testing.T) {
 			}
 			var childIdentity harness.SessionIdentity
 			if err := bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				rec, err := h.ReadSession(ctx, child)
+				rec, err := h.ReadSessionHeader(ctx, child)
 				if err != nil {
 					return err
 				}
 				childIdentity = rec.Identity
 				return nil
 			}); err != nil {
-				t.Fatalf("ReadSession(child): %v", err)
+				t.Fatalf("ReadSessionHeader(child): %v", err)
 			}
 			if !req.Session.Identity.CreatedAt.Equal(childIdentity.CreatedAt) {
 				t.Fatalf("prepared CreatedAt = %v, want the durable child identity's %v", req.Session.Identity.CreatedAt, childIdentity.CreatedAt)

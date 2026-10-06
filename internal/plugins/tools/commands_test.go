@@ -11,7 +11,7 @@ import (
 )
 
 func TestRunCommandNormalization(t *testing.T) {
-	byID := directTools(t.TempDir(), nil)
+	byID := directTools(t.TempDir())
 	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
 	runCommand := byID["run_command"]
 

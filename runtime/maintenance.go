@@ -1,8 +1,10 @@
 package runtime
 
 // This file owns the retained automatic lifecycle-sweep scheduling: the
-// Runtime never reimplements Session transitions. Every pass consumes the
-// existing Harness.Sweep transition through the admitted-call gate.
+// Runtime never reimplements Session transitions. Every pass enumerates the
+// Harness's owned Session headers and consumes the per-Session sweep
+// transition through the admitted-call gate, coordinating each candidate's
+// artifact interval without waiting on busy siblings.
 
 import (
 	"context"
@@ -48,20 +50,27 @@ func (r *Runtime) startMaintenance(ticks <-chan time.Time, stopTicker func()) {
 // current session policy, retains auto_archive=false as disabling the whole
 // sweep, converts each positive day count into its checked 24-hour
 // threshold and leaves a nonpositive count at zero so the Harness disables
-// only that transition, and calls Harness.Sweep with the explicit time on
-// the Runtime-owned context through the ordinary admitted-call gate. Every
-// committed deleted identity's artifact tree is removed inside the same
-// admission — including successes collected before a pass failure — and
-// cleanup failures join the pass result, so one diagnostic reports
-// everything. The diagnostic decision is sampled once after the pass
-// returns: a failure while the owned context is live is reported through the
-// retained stderr diagnostic unless the admission gate returned ErrClosed,
-// and once shutdown is observed the pass stays quiet, accepting that an
-// unrelated failure concurrent with shutdown may go unlogged. A
-// context-valued source error against a live owner is an ordinary failure
-// too. Later cancellation never retracts a report the check already
-// admitted. No special event, startup failure, or immediate retry follows a
-// failed pass, and a failed cleanup never re-runs the committed deletion.
+// only that transition, and enumerates the Harness's owned Session headers
+// inside one admitted call. Each candidate's Session artifact interval is
+// taken nonblockingly: a held interval skips that candidate for the pass, so
+// one busy Session never makes the pass wait on unrelated execution. Under
+// the token the pass calls the per-Session Sweep transition; a gone or
+// corrupt candidate is omitted, and any other error stops the pass. Every
+// committed deletion's artifact tree is then removed inside the same
+// admission under its own lease — including successes collected before a
+// stopping error — and all of their Session warning groups are removed
+// together in one observation section with one runtime-scoped hint; only
+// then does every lease release, on every exit. Cleanup failures join the
+// pass result, so one diagnostic reports everything. The diagnostic decision
+// is sampled once after the pass returns: a failure while the owned context
+// is live is reported through the retained stderr diagnostic unless the
+// admission gate returned ErrClosed, and once shutdown is observed the pass
+// stays quiet, accepting that an unrelated failure concurrent with shutdown
+// may go unlogged. A context-valued source error against a live owner is an
+// ordinary failure too. Later cancellation never retracts a report the check
+// already admitted. No special event, startup failure, or immediate retry
+// follows a failed pass, and a failed cleanup never re-runs the committed
+// deletion.
 func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 	sessions := r.config.current().sessions
 	if !sessions.AutoArchive {
@@ -72,12 +81,53 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 		DeleteAfterArchive: sweepThreshold(sessions.DeleteAfterArchiveDays),
 	}
 	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		ids, passErr := h.Sweep(ctx, policy, now)
-		var cleanErrs []error
-		for _, id := range ids {
-			if err := r.removeSessionCode(id); err != nil {
+		headers, err := h.ListSessions(ctx)
+		if err != nil {
+			return err
+		}
+		var (
+			deleted   []string
+			leases    []func() // committed-deletion leases, retained through their cleanups and the batch's warning cleanup
+			cleanErrs []error
+			passErr   error
+		)
+		for _, header := range headers {
+			sessionID := header.Identity.SessionID
+			releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
+			if err != nil {
+				continue // a held interval skips this candidate for the pass
+			}
+			commit, err := h.SweepSession(ctx, sessionID, policy, now)
+			if err != nil {
+				releaseArtifacts()
+				var corrupt *harness.CorruptionError
+				if errors.As(err, &corrupt) || errors.Is(err, harness.ErrNotFound) {
+					continue // a gone or corrupt candidate is omitted
+				}
+				passErr = err // stop the pass; the accumulated committed deletions are cleaned below
+				break
+			}
+			if commit {
+				deleted = append(deleted, sessionID)
+				leases = append(leases, releaseArtifacts) // retained through the cleanups and the batch's warning cleanup
+				continue
+			}
+			releaseArtifacts()
+		}
+		// Every committed deleted identity's artifact tree is removed inside
+		// the same admission under its own lease — including successes
+		// collected before a pass failure.
+		for _, sessionID := range deleted {
+			if err := r.removeSessionCode(sessionID); err != nil {
 				cleanErrs = append(cleanErrs, err)
 			}
+		}
+		// The committed batch's warning cleanup is one section and one hint,
+		// and it runs for every committed identity before the pass error is
+		// returned; only then do the retained leases release.
+		r.passive.removeSessionWarnings(deleted)
+		for _, releaseArtifacts := range leases {
+			releaseArtifacts()
 		}
 		return errors.Join(append([]error{passErr}, cleanErrs...)...)
 	})

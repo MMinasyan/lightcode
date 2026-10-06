@@ -249,6 +249,12 @@ type publicFixture struct {
 }
 
 func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
+	return newPublicFixtureWithJobs(t, store, nil, script, modelFn)
+}
+
+// newPublicFixtureWithJobs is the fixture's core builder: the same scripted
+// preparation over a Harness whose optional Jobs seam is installed.
+func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harness.JobStopper, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
 	t.Helper()
 	if modelFn == nil {
 		modelFn = script.effect
@@ -280,7 +286,7 @@ func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, 
 			return hook(call, req)
 		}
 		return prepared, nil
-	}})
+	}, Jobs: stopper})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -419,12 +425,12 @@ func TestPublicTurnLifecycle(t *testing.T) {
 		if len(first.State.Usage.ByModel) != 1 || first.State.Usage.ByModel[0] != want.ByModel[0] {
 			t.Fatalf("operation usage = %+v, want the reported counts", first.State.Usage)
 		}
-		sessionRec, err := f.h.ReadSession(context.Background(), session)
-		if err != nil || sessionRec.State.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v", sessionRec, err)
+		sessionSnap, err := f.h.SnapshotSession(context.Background(), session)
+		if err != nil || sessionSnap.Session.State.CurrentOperationID != "" {
+			t.Fatalf("session after convergence = %+v err %v", sessionSnap, err)
 		}
-		if len(sessionRec.State.Usage.ByModel) != 1 || sessionRec.State.Usage.ByModel[0] != want.ByModel[0] {
-			t.Fatalf("session usage = %+v, want the same totals", sessionRec.State.Usage)
+		if len(sessionSnap.Session.State.Usage.ByModel) != 1 || sessionSnap.Session.State.Usage.ByModel[0] != want.ByModel[0] {
+			t.Fatalf("session usage = %+v, want the same totals", sessionSnap.Session.State.Usage)
 		}
 		second, err := f.h.ReadOperation(context.Background(), session, "op-2")
 		if err != nil || second.State.Status != harness.OperationFailure ||
@@ -696,8 +702,8 @@ func TestPublicSubmitRoutesAfterReservationWinner(t *testing.T) {
 		if _, err := f.h.ReadOperation(context.Background(), session, "op-3"); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("buffered queued operation read = err %v, want ErrNotFound while buffered", err)
 		}
-		rec, err := f.h.ReadSession(context.Background(), session)
-		if err != nil || rec.State.CurrentOperationID != "op-1" {
+		rec, err := f.h.ReadSessionHeader(context.Background(), session)
+		if err != nil || rec.CurrentOperationID != "op-1" {
 			t.Fatalf("session while both items wait buffered = %+v err %v, want the winner as the one active Operation", rec, err)
 		}
 
@@ -705,8 +711,8 @@ func TestPublicSubmitRoutesAfterReservationWinner(t *testing.T) {
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
-		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
-			rec.State.CurrentOperationID != "" {
+		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
+			rec.CurrentOperationID != "" {
 			t.Fatalf("session after convergence = %+v err %v, want no operation left running", rec, err)
 		}
 	})
@@ -756,8 +762,8 @@ func TestPublicSubmitSameIDResolvesExistingUnderReservation(t *testing.T) {
 			rec.State.Status != harness.OperationRunning {
 			t.Fatalf("same-ID operation = %+v err %v, want the one running Operation", rec, err)
 		}
-		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
-			rec.State.CurrentOperationID != "op-1" {
+		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
+			rec.CurrentOperationID != "op-1" {
 			t.Fatalf("session = %+v err %v, want the same ID still current", rec, err)
 		}
 
@@ -768,8 +774,8 @@ func TestPublicSubmitSameIDResolvesExistingUnderReservation(t *testing.T) {
 		if calls := f.preparationCalls(); len(calls) != 1 {
 			t.Fatalf("preparation calls after convergence = %d, want the same ID never independently executed", len(calls))
 		}
-		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
-			rec.State.CurrentOperationID != "" {
+		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
+			rec.CurrentOperationID != "" {
 			t.Fatalf("session after convergence = %+v err %v, want no buffered duplicate delivered", rec, err)
 		}
 	})
@@ -809,8 +815,8 @@ func TestPublicSubmitCanceledWaiterPublishesNothing(t *testing.T) {
 		if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("canceled operation read = err %v, want ErrNotFound: nothing published", err)
 		}
-		if rec, err := f.h.ReadSession(context.Background(), session); err != nil ||
-			rec.State.CurrentOperationID != "" {
+		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
+			rec.CurrentOperationID != "" {
 			t.Fatalf("session after the canceled waiter = %+v err %v, want nothing published", rec, err)
 		}
 
@@ -2042,20 +2048,20 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			f := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f.close()
 			session := createSession(t, f.h)
-			first, err := f.h.ReadSession(ctx, session)
-			if err != nil || first.State.Lifecycle != harness.LifecycleOpen || first.Revision != 1 {
+			first, err := f.h.ReadSessionHeader(ctx, session)
+			if err != nil || first.Lifecycle != harness.LifecycleOpen || first.Revision.DurableRevision != 1 {
 				t.Fatalf("created session = %+v err %v, want open at revision 1", first, err)
 			}
-			originalActivity := first.State.LastActivity
+			originalActivity := first.LastActivity
 
 			reopened, err := f.h.ReopenSession(ctx, session)
 			if err != nil || reopened.State.Lifecycle != harness.LifecycleOpen || reopened.State.ArchivedAt != nil ||
-				reopened.Revision != first.Revision || !reopened.State.LastActivity.Equal(originalActivity) {
+				reopened.Revision != first.Revision.DurableRevision || !reopened.State.LastActivity.Equal(originalActivity) {
 				t.Fatalf("reopen of open = %+v err %v, want the no-write success", reopened, err)
 			}
 
 			archived, err := f.h.ArchiveSession(ctx, session)
-			if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != first.Revision+1 {
+			if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != first.Revision.DurableRevision+1 {
 				t.Fatalf("archive of open = %+v err %v, want archived at the next revision", archived, err)
 			}
 			if reg := sessionRegister(t, store, session); reg.Revision != archived.Revision {
@@ -2167,7 +2173,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			}
 
 			// holders of the materialized coordinator and later materialization both get ErrNotFound
-			if _, err := f.h.ReadSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
+			if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
 				t.Fatalf("read after delete = err %v, want ErrNotFound, not a stale record", err)
 			}
 			if _, err := f.h.ReadOperation(ctx, session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
@@ -2228,19 +2234,19 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		defer f.close()
 		ctx := context.Background()
 		session := createSession(t, f.h)
-		first, err := f.h.ReadSession(ctx, session)
+		first, err := f.h.ReadSessionHeader(ctx, session)
 		if err != nil {
 			t.Fatalf("read created session: %v", err)
 		}
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 
-		boundary := first.State.LastActivity.Add(policy.ArchiveAfter)
+		boundary := first.LastActivity.Add(policy.ArchiveAfter)
 		before := sessionRegister(t, store, session)
 		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the boundary: %v", err)
 		}
-		still, err := f.h.ReadSession(ctx, session)
-		if err != nil || still.State.Lifecycle != harness.LifecycleOpen || still.Revision != first.Revision {
+		still, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.Revision != first.Revision {
 			t.Fatalf("boundary sweep = %+v err %v, want the open Session unchanged", still, err)
 		}
 		after := sessionRegister(t, store, session)
@@ -2252,18 +2258,18 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		if _, err := f.h.Sweep(ctx, policy, past); err != nil {
 			t.Fatalf("sweep past the boundary: %v", err)
 		}
-		archived, err := f.h.ReadSession(ctx, session)
-		if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != first.Revision+1 {
+		archived, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != first.Revision.DurableRevision+1 {
 			t.Fatalf("past-boundary sweep = %+v err %v, want archived at the next revision", archived, err)
 		}
-		if reg := sessionRegister(t, store, session); reg.Revision != archived.Revision {
-			t.Fatalf("durable register revision %d disagrees with the swept record's %d", reg.Revision, archived.Revision)
+		if reg := sessionRegister(t, store, session); reg.Revision != archived.Revision.DurableRevision {
+			t.Fatalf("durable register revision %d disagrees with the swept record's %d", reg.Revision, archived.Revision.DurableRevision)
 		}
-		if archived.State.ArchivedAt == nil || !archived.State.ArchivedAt.Equal(past) {
-			t.Fatalf("sweep archive stamped %v, want the explicit sweep time %v", archived.State.ArchivedAt, past)
+		if archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(past) {
+			t.Fatalf("sweep archive stamped %v, want the explicit sweep time %v", archived.ArchivedAt, past)
 		}
-		if !archived.State.LastActivity.Equal(first.State.LastActivity) {
-			t.Fatalf("sweep archive moved last activity to %v, want it unchanged", archived.State.LastActivity)
+		if !archived.LastActivity.Equal(first.LastActivity) {
+			t.Fatalf("sweep archive moved last activity to %v, want it unchanged", archived.LastActivity)
 		}
 	})
 }
@@ -2290,7 +2296,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 		if _, err := f.h.Sweep(ctx, policy, boundary); err != nil {
 			t.Fatalf("sweep at the delete boundary: %v", err)
 		}
-		if _, err := f.h.ReadSession(ctx, session); err != nil {
+		if _, err := f.h.ReadSessionHeader(ctx, session); err != nil {
 			t.Fatalf("delete-boundary sweep removed the session: %v", err)
 		}
 		after := sessionRegister(t, store, session)
@@ -2314,7 +2320,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 				t.Fatalf("sweep-deleted session still listed")
 			}
 		}
-		if _, err := f.h.ReadSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
+		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("read after sweep delete = err %v, want ErrNotFound, not a stale record", err)
 		}
 	})
@@ -2336,23 +2342,23 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
 				t.Fatalf("archive: %v", err)
 			}
-			beforeOpen, err := f.h.ReadSession(ctx, open)
+			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
 			if err != nil {
 				t.Fatalf("read open: %v", err)
 			}
-			beforeArchived, err := f.h.ReadSession(ctx, archivedID)
+			beforeArchived, err := f.h.ReadSessionHeader(ctx, archivedID)
 			if err != nil {
 				t.Fatalf("read archived: %v", err)
 			}
-			if _, err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity)); err != nil {
 				t.Fatalf("sweep with disabled thresholds: %v", err)
 			}
-			afterOpen, err := f.h.ReadSession(ctx, open)
-			if err != nil || afterOpen.Revision != beforeOpen.Revision || afterOpen.State.Lifecycle != harness.LifecycleOpen {
+			afterOpen, err := f.h.ReadSessionHeader(ctx, open)
+			if err != nil || afterOpen.Revision != beforeOpen.Revision || afterOpen.Lifecycle != harness.LifecycleOpen {
 				t.Fatalf("disabled sweep touched the open session: %+v err %v", afterOpen, err)
 			}
-			afterArchived, err := f.h.ReadSession(ctx, archivedID)
-			if err != nil || afterArchived.Revision != beforeArchived.Revision || afterArchived.State.Lifecycle != harness.LifecycleArchived {
+			afterArchived, err := f.h.ReadSessionHeader(ctx, archivedID)
+			if err != nil || afterArchived.Revision != beforeArchived.Revision || afterArchived.Lifecycle != harness.LifecycleArchived {
 				t.Fatalf("disabled sweep touched the archived session: %+v err %v", afterArchived, err)
 			}
 		})
@@ -2365,22 +2371,22 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
 				t.Fatalf("archive: %v", err)
 			}
-			beforeOpen, err := f.h.ReadSession(ctx, open)
+			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
 			if err != nil {
 				t.Fatalf("read open: %v", err)
 			}
 			policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour}
-			if _, err := f.h.Sweep(ctx, policy, farPast(beforeOpen.State.LastActivity)); err != nil {
+			if _, err := f.h.Sweep(ctx, policy, farPast(beforeOpen.LastActivity)); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
-			sweptOpen, err := f.h.ReadSession(ctx, open)
-			if err != nil || sweptOpen.State.Lifecycle != harness.LifecycleArchived {
+			sweptOpen, err := f.h.ReadSessionHeader(ctx, open)
+			if err != nil || sweptOpen.Lifecycle != harness.LifecycleArchived {
 				t.Fatalf("enabled archive transition = %+v err %v, want archived", sweptOpen, err)
 			}
 			if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: archivedID, Kind: harness.RegisterSession}); err != nil {
 				t.Fatalf("disabled delete removed the archived session: %v", err)
 			}
-			if _, err := f.h.ReadSession(ctx, archivedID); err != nil {
+			if _, err := f.h.ReadSessionHeader(ctx, archivedID); err != nil {
 				t.Fatalf("archived sibling after sweep = err %v, want it still present", err)
 			}
 		})
@@ -2393,17 +2399,17 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
 				t.Fatalf("archive: %v", err)
 			}
-			beforeOpen, err := f.h.ReadSession(ctx, open)
+			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
 			if err != nil {
 				t.Fatalf("read open: %v", err)
 			}
 			policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
-			now := beforeOpen.State.LastActivity.Add(100 * time.Hour)
+			now := beforeOpen.LastActivity.Add(100 * time.Hour)
 			if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 				t.Fatalf("sweep: %v", err)
 			}
-			stillOpen, err := f.h.ReadSession(ctx, open)
-			if err != nil || stillOpen.State.Lifecycle != harness.LifecycleOpen {
+			stillOpen, err := f.h.ReadSessionHeader(ctx, open)
+			if err != nil || stillOpen.Lifecycle != harness.LifecycleOpen {
 				t.Fatalf("disabled archive transition = %+v err %v, want the session still open", stillOpen, err)
 			}
 			key := harness.RegisterKey{SessionID: archivedID, Kind: harness.RegisterSession}
@@ -2426,7 +2432,7 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 		defer f.close()
 		ctx := context.Background()
 		session := createSession(t, f.h)
-		first, err := f.h.ReadSession(ctx, session)
+		first, err := f.h.ReadSessionHeader(ctx, session)
 		if err != nil {
 			t.Fatalf("read created session: %v", err)
 		}
@@ -2439,18 +2445,18 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 		if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
 			t.Fatalf("queued submit: %v", err)
 		}
-		active, err := f.h.ReadSession(ctx, session) // the admission's own write is the sweep's baseline
+		active, err := f.h.ReadSessionHeader(ctx, session) // the admission's own write is the sweep's baseline
 		if err != nil {
 			t.Fatalf("read active session: %v", err)
 		}
 		before := sessionRegister(t, store, session)
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep of a running session: %v", err)
 		}
-		still, err := f.h.ReadSession(ctx, session)
-		if err != nil || still.State.Lifecycle != harness.LifecycleOpen || still.Revision != active.Revision {
+		still, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.Revision != active.Revision {
 			t.Fatalf("sweep touched the running session: %+v err %v, want it unchanged", still, err)
 		}
 		after := sessionRegister(t, store, session)
@@ -2513,12 +2519,12 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 			t.Fatalf("corrupt the register: %v", err)
 		}
 
-		validBefore, err := f.h.ReadSession(ctx, valid)
+		validBefore, err := f.h.ReadSessionHeader(ctx, valid)
 		if err != nil {
 			t.Fatalf("read valid sibling: %v", err)
 		}
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if _, err := f.h.Sweep(ctx, policy, validBefore.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, validBefore.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a corrupt sibling = %v, want the corruption left in place and the pass completed", err)
 		}
 
@@ -2526,11 +2532,11 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 		if !bytes.Equal(untouched.Payload, bad) || untouched.Revision != reg.Revision+1 {
 			t.Fatalf("sweep changed the corrupt register (revision %d -> %d)", reg.Revision+1, untouched.Revision)
 		}
-		swept, err := f.h.ReadSession(ctx, valid)
-		if err != nil || swept.State.Lifecycle != harness.LifecycleArchived {
+		swept, err := f.h.ReadSessionHeader(ctx, valid)
+		if err != nil || swept.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("valid sibling after sweep = %+v err %v, want it archived", swept, err)
 		}
-		if _, err := f.h.ReadSession(ctx, corrupt); !errors.Is(err, harness.ErrCorrupt) {
+		if _, err := f.h.ReadSessionHeader(ctx, corrupt); !errors.Is(err, harness.ErrCorrupt) {
 			t.Fatalf("corrupt session after sweep = err %v, want the corruption error", err)
 		}
 	})
@@ -2667,22 +2673,22 @@ func TestPublicSweepListFailureReturnsNoIdentities(t *testing.T) {
 	})
 }
 
-// TestPublicSweepWaitsForBlockedPreparation proves the sweep's transition
-// serialization through public operations: a Sweep that reaches a Session with
-// an in-flight preparation (reservation held) waits for it to resolve instead
-// of transitioning the Session under it — the admission commits, the running
-// Session is left unchanged, and the sweep returns nil.
-func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
+// TestPublicSweepSkipsBlockedPreparation proves the sweep's nonwaiting busy
+// rule: a Sweep that reaches a Session with an in-flight preparation
+// (reservation held) applies the same no-transition outcome as running or
+// buffered work and returns without waiting — the Session stays unchanged
+// while the preparation is still parked, and the released admission commits
+// and settles normally.
+func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
-		counting := &listCountingStore{Storage: store, listed: make(chan struct{}, 1)}
 		script := newScriptModel()
 		gate := make(chan struct{})
 		script.gate = gate
-		f := newPublicFixture(t, counting, script, nil)
+		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
 		ctx := context.Background()
-		session := createSession(t, f.h) // the only Session: after enumeration the sweep is parked on it
-		first, err := f.h.ReadSession(ctx, session)
+		session := createSession(t, f.h) // the only Session: the sweep reaches the reserved candidate
+		first, err := f.h.ReadSessionHeader(ctx, session)
 		if err != nil {
 			t.Fatalf("read created session: %v", err)
 		}
@@ -2691,7 +2697,7 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 		releasePrep := make(chan struct{})
 		prepared := scriptPrepared(script)
 		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
-			if call == 0 { // the first admission's preparation is blocked while the sweep waits
+			if call == 0 { // the first admission's preparation is blocked while the sweep passes
 				select {
 				case prepStarted <- struct{}{}:
 				default:
@@ -2721,25 +2727,35 @@ func TestPublicSweepWaitsForBlockedPreparation(t *testing.T) {
 		sweepDone := make(chan error, 1)
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 		go func() {
-			_, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour))
+			_, err := f.h.Sweep(ctx, policy, first.LastActivity.Add(100*time.Hour))
 			sweepDone <- err
 		}()
-		<-counting.listed // the sweep enumerated and is waiting for the idle reservation
+		select {
+		case err := <-sweepDone:
+			if err != nil {
+				t.Fatalf("sweep over a blocked preparation = %v, want the no-transition skip", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the sweep waited for the blocked preparation: busy candidates skip without waiting")
+		}
+		// The skip happened before the preparation released: nothing
+		// transitioned while the reservation was still held.
+		still, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.CurrentOperationID != "" {
+			t.Fatalf("sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
+		}
 
 		close(releasePrep) // the preparation completes: the admission commits and the Session becomes running
 		out := <-submitDone
 		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted {
 			t.Fatalf("first submit = %+v err %v, want admitted", out.res, out.err)
 		}
-		if err := <-sweepDone; err != nil {
-			t.Fatalf("sweep over a blocked preparation = %v, want it to wait and then skip the running Session", err)
-		}
-		still, err := f.h.ReadSession(ctx, session)
-		if err != nil || still.State.Lifecycle != harness.LifecycleOpen || still.State.CurrentOperationID != "op-1" {
-			t.Fatalf("sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
+		settled, err := f.h.ReadSessionHeader(ctx, session)
+		if err != nil || settled.Lifecycle != harness.LifecycleOpen || settled.CurrentOperationID != "op-1" {
+			t.Fatalf("post-commit header = %+v err %v, want the running Session unchanged", settled, err)
 		}
 		if _, err := f.h.ReadOperation(ctx, session, "op-1"); err != nil {
-			t.Fatalf("blocked-preparation admission = err %v, want it admitted after the sweep waited", err)
+			t.Fatalf("blocked-preparation admission = err %v, want it admitted after the sweep skipped", err)
 		}
 
 		script.releaseGate()
@@ -2766,8 +2782,8 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		ctx := context.Background()
 
 		readDone := make(chan error, 1)
-		go func() { _, err := f.h.ReadSession(ctx, session); readDone <- err }() // the first materialization
-		<-gated.started                                                          // parked after capturing its valid pre-deletion state
+		go func() { _, err := f.h.ReadSessionHeader(ctx, session); readDone <- err }() // the first materialization
+		<-gated.started                                                                // parked after capturing its valid pre-deletion state
 
 		if err := f.h.DeleteSession(ctx, session); err != nil { // materializes and deletes the same Session
 			t.Fatalf("delete of the seeded session: %v", err)
@@ -2777,7 +2793,7 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		if err := <-readDone; !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("materialization across a deletion = err %v, want ErrNotFound", err)
 		}
-		if _, err := f.h.ReadSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
+		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("later materialization installed a stale coordinator: err %v, want ErrNotFound", err)
 		}
 	})
@@ -2848,24 +2864,24 @@ func (t *rollbackProbeTransaction) InsertRegister(draft harness.RegisterDraft) (
 // assertRollback verifies that a failed lifecycle transaction left the durable
 // register byte-identical at the same revision and the coordinator's cached
 // view still returns the pre-attempt record.
-func assertRollback(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.Register, want harness.SessionRecord) {
+func assertRollback(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.Register, want harness.SessionHeader) {
 	t.Helper()
 	after := sessionRegister(t, store, session)
 	if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
 		t.Fatalf("failed transition changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 	}
-	got, err := h.ReadSession(context.Background(), session)
+	got, err := h.ReadSessionHeader(context.Background(), session)
 	if err != nil {
 		t.Fatalf("read after failed transition: %v", err)
 	}
-	if got.Revision != want.Revision || got.State.Lifecycle != want.State.Lifecycle ||
-		!got.State.LastActivity.Equal(want.State.LastActivity) ||
-		got.State.CurrentAgentType != want.State.CurrentAgentType {
+	if got.Revision != want.Revision || got.Lifecycle != want.Lifecycle ||
+		!got.LastActivity.Equal(want.LastActivity) ||
+		got.CurrentAgentType != want.CurrentAgentType {
 		t.Fatalf("cached view after failed transition = %+v, want the pre-attempt record", got)
 	}
-	if (got.State.ArchivedAt == nil) != (want.State.ArchivedAt == nil) ||
-		(got.State.ArchivedAt != nil && !got.State.ArchivedAt.Equal(*want.State.ArchivedAt)) {
-		t.Fatalf("cached view archived_at after failed transition = %v, want %v", got.State.ArchivedAt, want.State.ArchivedAt)
+	if (got.ArchivedAt == nil) != (want.ArchivedAt == nil) ||
+		(got.ArchivedAt != nil && !got.ArchivedAt.Equal(*want.ArchivedAt)) {
+		t.Fatalf("cached view archived_at after failed transition = %v, want %v", got.ArchivedAt, want.ArchivedAt)
 	}
 }
 
@@ -2919,9 +2935,12 @@ func rollbackReopenCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	archived, err := f.h.ArchiveSession(ctx, session)
-	if err != nil {
+	if _, err := f.h.ArchiveSession(ctx, session); err != nil {
 		t.Fatalf("seed archive: %v", err)
+	}
+	archived, err := f.h.ReadSessionHeader(ctx, session)
+	if err != nil {
+		t.Fatalf("read seed archive: %v", err)
 	}
 	before := sessionRegister(t, store, session)
 
@@ -2945,7 +2964,7 @@ func rollbackArchiveCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	first, err := f.h.ReadSession(ctx, session)
+	first, err := f.h.ReadSessionHeader(ctx, session)
 	if err != nil {
 		t.Fatalf("read created session: %v", err)
 	}
@@ -2971,9 +2990,12 @@ func rollbackDeleteCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	archived, err := f.h.ArchiveSession(ctx, session)
-	if err != nil {
+	if _, err := f.h.ArchiveSession(ctx, session); err != nil {
 		t.Fatalf("seed archive: %v", err)
+	}
+	archived, err := f.h.ReadSessionHeader(ctx, session)
+	if err != nil {
+		t.Fatalf("read seed archive: %v", err)
 	}
 	before := sessionRegister(t, store, session)
 
@@ -3013,14 +3035,14 @@ func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	first, err := f.h.ReadSession(ctx, session)
+	first, err := f.h.ReadSessionHeader(ctx, session)
 	if err != nil {
 		t.Fatalf("read created session: %v", err)
 	}
 	before := sessionRegister(t, store, session)
 
 	policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-	now := first.State.LastActivity.Add(100 * time.Hour)
+	now := first.LastActivity.Add(100 * time.Hour)
 	probe.failReplace = true
 	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
@@ -3030,9 +3052,9 @@ func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
 	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
 	}
-	archived, err := f.h.ReadSession(ctx, session)
-	if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != before.Revision+1 ||
-		archived.State.ArchivedAt == nil || !archived.State.ArchivedAt.Equal(now) {
+	archived, err := f.h.ReadSessionHeader(ctx, session)
+	if err != nil || archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != before.Revision+1 ||
+		archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(now) {
 		t.Fatalf("sweep after rollback = %+v err %v, want archived at the sweep time", archived, err)
 	}
 }
@@ -3053,11 +3075,15 @@ func rollbackSweepDeleteCase(t *testing.T, store harness.Storage) {
 
 	policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 	now := archived.State.ArchivedAt.Add(100 * time.Hour)
+	archivedHeader, err := f.h.ReadSessionHeader(ctx, session)
+	if err != nil {
+		t.Fatalf("read seed archive: %v", err)
+	}
 	probe.failDelete = true
 	if _, err := f.h.Sweep(ctx, policy, now); !errors.Is(err, errInjectedRollback) {
 		t.Fatalf("sweep with injected post-mutation failure = err %v, want the pass to stop and return it", err)
 	}
-	assertRollback(t, store, f.h, session, before, archived)
+	assertRollback(t, store, f.h, session, before, archivedHeader)
 
 	if _, err := f.h.Sweep(ctx, policy, now); err != nil {
 		t.Fatalf("sweep after rollback: %v", err)
@@ -3088,18 +3114,18 @@ func TestPublicSweepMalformedRowSibling(t *testing.T) {
 		f := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f.close()
 		valid := createSession(t, f.h)
-		first, err := f.h.ReadSession(ctx, valid)
+		first, err := f.h.ReadSessionHeader(ctx, valid)
 		if err != nil {
 			t.Fatalf("read the valid sibling: %v", err)
 		}
 
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-		if _, err := f.h.Sweep(ctx, policy, first.State.LastActivity.Add(100*time.Hour)); err != nil {
+		if _, err := f.h.Sweep(ctx, policy, first.LastActivity.Add(100*time.Hour)); err != nil {
 			t.Fatalf("sweep with a malformed row = %v, want the row left unchanged and the pass completed", err)
 		}
 
-		swept, err := f.h.ReadSession(ctx, valid)
-		if err != nil || swept.State.Lifecycle != harness.LifecycleArchived {
+		swept, err := f.h.ReadSessionHeader(ctx, valid)
+		if err != nil || swept.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("valid sibling after sweep = %+v err %v, want it archived", swept, err)
 		}
 		key := harness.RegisterKey{SessionID: malformed, Kind: harness.RegisterSession}
@@ -3284,7 +3310,7 @@ func TestPublicSweepCorruptRowsContributeNoIdentities(t *testing.T) {
 
 		// a row whose cached view turns corrupt under the sweep transaction
 		cached := createSession(t, f.h)
-		if _, err := f.h.ReadSession(ctx, cached); err != nil {
+		if _, err := f.h.ReadSessionHeader(ctx, cached); err != nil {
 			t.Fatalf("materialize the cached row: %v", err)
 		}
 		key := harness.RegisterKey{SessionID: cached, Kind: harness.RegisterSession}
@@ -3373,7 +3399,7 @@ func TestPublicWaitConvergesWithCorruptingTransition(t *testing.T) {
 		if err := <-waited; err != nil {
 			t.Fatalf("Wait converging with the corrupting transition = %v, want nil", err)
 		}
-		if _, err := f.h.ReadSession(ctx, session); !errors.Is(err, harness.ErrCorrupt) {
+		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrCorrupt) {
 			t.Fatalf("corrupt session after convergence = err %v, want the sticky corruption error", err)
 		}
 	})
@@ -3836,8 +3862,8 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 				assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 				h := harnessOver(t, store) // one Harness after recovery: materialization verification only
-				sess, err := h.ReadSession(ctx, sessionID)
-				if err != nil || sess.State.CurrentOperationID != "" {
+				sess, err := h.ReadSessionHeader(ctx, sessionID)
+				if err != nil || sess.CurrentOperationID != "" {
 					t.Fatalf("repaired session = %+v err %v, want open with the current Operation cleared", sess, err)
 				}
 				rec, err := h.ReadOperation(ctx, sessionID, "op-1")
@@ -5141,7 +5167,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				// The unmutated graph materializes on a separate fresh store.
 				baseline := storage.NewMemory()
 				baselineID := row.seed(t, baseline)
-				if _, err := harnessOver(t, baseline).ReadSession(ctx, baselineID); err != nil {
+				if _, err := harnessOver(t, baseline).ReadSessionHeader(ctx, baselineID); err != nil {
 					t.Fatalf("unmutated graph does not materialize: %v", err)
 				}
 
@@ -5160,7 +5186,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				assertRecoveredOperation(t, store, siblingID, "op-sib", pre, "", nil)
 
 				h := harnessOver(t, wrapped) // constructed only after recovery: materialization verification
-				if _, err := h.ReadSession(ctx, targetID); !errors.Is(err, harness.ErrCorrupt) {
+				if _, err := h.ReadSessionHeader(ctx, targetID); !errors.Is(err, harness.ErrCorrupt) {
 					t.Fatalf("corrupt session after recovery = err %v, want the corruption error", err)
 				}
 				rec, err := h.ReadOperation(ctx, siblingID, "op-sib")
@@ -5538,9 +5564,9 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 
 		// the fork's own turn settled through its model-originated terminal
-		sess, err := f2.h.ReadSession(ctx, dest)
-		if err != nil || sess.State.CurrentOperationID != "" || len(sess.State.Usage.ByModel) != 0 {
-			t.Fatalf("fork session after convergence = %+v err %v, want it settled with zero usage", sess, err)
+		snapshot, err := f2.h.SnapshotSession(ctx, dest)
+		if err != nil || snapshot.Session.State.CurrentOperationID != "" || len(snapshot.Session.State.Usage.ByModel) != 0 {
+			t.Fatalf("fork session after convergence = %+v err %v, want it settled with zero usage", snapshot, err)
 		}
 		rec, err := f2.h.ReadOperation(ctx, dest, "fork-1")
 		if err != nil || rec.State.Status != harness.OperationFailure ||
@@ -5586,8 +5612,8 @@ func TestPublicForkArchivedSource(t *testing.T) {
 		if res.Session.State.Lifecycle != harness.LifecycleOpen {
 			t.Fatalf("fork lifecycle = %s, want open", res.Session.State.Lifecycle)
 		}
-		src, err := f2.h.ReadSession(ctx, source)
-		if err != nil || src.State.Lifecycle != harness.LifecycleArchived {
+		src, err := f2.h.ReadSessionHeader(ctx, source)
+		if err != nil || src.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("source after fork = %+v err %v, want it archived without reopening", src, err)
 		}
 		if err := converge(t, f2); err != nil {
@@ -5824,7 +5850,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			defer f8.close()
 			// the affected destination is already materialized in the retry
 			// Harness before the corruption is reported
-			if _, err := f8.h.ReadSession(ctx, res.Session.Identity.SessionID); err != nil {
+			if _, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID); err != nil {
 				t.Fatalf("read the destination before corruption: %v", err)
 			}
 			if err := store.Transact(ctx, func(tx harness.Transaction) error {
@@ -5842,10 +5868,10 @@ func TestPublicForkExistingLookup(t *testing.T) {
 				t.Fatalf("retry over a corrupt located owner = err %v, want the corruption error", err)
 			}
 			// the affected cached Session is sticky-corrupt while valid siblings remain usable
-			if _, err := f8.h.ReadSession(ctx, res.Session.Identity.SessionID); !errors.Is(err, harness.ErrCorrupt) {
+			if _, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID); !errors.Is(err, harness.ErrCorrupt) {
 				t.Fatalf("cached read of the corrupt located owner = err %v, want the sticky corruption error", err)
 			}
-			if _, err := f8.h.ReadSession(ctx, other); err != nil {
+			if _, err := f8.h.ReadSessionHeader(ctx, other); err != nil {
 				t.Fatalf("valid sibling after the corrupt located owner = err %v, want it usable", err)
 			}
 		})
@@ -5857,7 +5883,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			defer f9.close()
 			// the affected sibling is already materialized in this Harness
 			// before the corruption is reported
-			if _, err := f9.h.ReadSession(ctx, forkSiblingID); err != nil {
+			if _, err := f9.h.ReadSessionHeader(ctx, forkSiblingID); err != nil {
 				t.Fatalf("read the sibling before corruption: %v", err)
 			}
 			res, err := f9.h.Fork(ctx, forkReq)
@@ -5868,10 +5894,10 @@ func TestPublicForkExistingLookup(t *testing.T) {
 				t.Fatalf("retry = %+v, want the existing destination", res)
 			}
 			// the skipped corruption sticks to the cached Session while valid siblings remain usable
-			if _, err := f9.h.ReadSession(ctx, forkSiblingID); !errors.Is(err, harness.ErrCorrupt) {
+			if _, err := f9.h.ReadSessionHeader(ctx, forkSiblingID); !errors.Is(err, harness.ErrCorrupt) {
 				t.Fatalf("cached read of the corrupt sibling = err %v, want the sticky corruption error", err)
 			}
-			if _, err := f9.h.ReadSession(ctx, other); err != nil {
+			if _, err := f9.h.ReadSessionHeader(ctx, other); err != nil {
 				t.Fatalf("valid sibling after the corrupt sibling = err %v, want it usable", err)
 			}
 		})
@@ -6092,7 +6118,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 		if err := f3.h.DeleteSession(ctx, source); err != nil {
 			t.Fatalf("delete source: %v", err)
 		}
-		if _, err := f3.h.ReadSession(ctx, dest); err != nil {
+		if _, err := f3.h.ReadSessionHeader(ctx, dest); err != nil {
 			t.Fatalf("fork read after source deletion: %v", err)
 		}
 		if _, err := f3.h.ReadOperation(ctx, dest, "fork-1"); err != nil {

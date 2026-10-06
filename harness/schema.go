@@ -100,8 +100,8 @@ type EntryRef struct {
 	EntryID   string `json:"entry_id"`
 }
 
-// operationRef addresses one Operation of one Session. It is a private codec
-// value, not public API.
+// operationRef addresses one Operation of one Session. It is a codec value
+// exposed to callers through the OperationRef alias.
 type operationRef struct {
 	SessionID   string `json:"session_id"`
 	OperationID string `json:"operation_id"`
@@ -266,10 +266,12 @@ type OperationRecord struct {
 	State     OperationCurrentState
 }
 
-// The entry-payload structs below are private codec values, not public
-// API. Every payload repeats the envelope Session and entry identity; normal
+// The entry-payload structs below are the codec's validated payload values.
+// Every payload repeats the envelope Session and entry identity; normal
 // entries repeat their owning Operation identity, while independently copied
-// fork-prefix entries omit it.
+// fork-prefix entries omit it. The exported aliases below make the exact
+// struct shapes reachable as the HistoryFact payload members; no duplicate
+// field schema exists.
 
 // inputEntry is one admitted user, runtime, or plugin input.
 type inputEntry struct {
@@ -398,3 +400,18 @@ type compactionEntry struct {
 	ConfigurationRevision string         `json:"configuration_revision"`
 	Usage                 *UsageCount    `json:"usage,omitempty"`
 }
+
+// Exported aliases of the validated entry payloads: the HistoryFact union
+// exposes these exact structs, their JSON tags, and their nested members. A
+// hook_result payload stays execution evidence and has no exported alias.
+type (
+	InputEntry               = inputEntry
+	AssistantEntry           = assistantEntry
+	ToolResultEntry          = toolResultEntry
+	SignalEntry              = signalEntry
+	OperationSettlementEntry = operationSettlementEntry
+	CompactionEntry          = compactionEntry
+	ToolCallRecord           = toolCallRecord
+	RelatedMember            = relatedMember
+	OperationRef             = operationRef
+)

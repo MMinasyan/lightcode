@@ -44,6 +44,18 @@ type discoveryModelMetadata struct {
 	SupportedParameters          []string        `json:"supported_parameters,omitempty"`
 }
 
+// Model-source labels: the provenance class of one effective catalog model.
+// Custom providers have no bundled layer, so every model under one is
+// user-added; a bundled provider's model is bundled when its ID ships in the
+// embedded catalog, discovered when the accepted transport-bound discovery
+// record supplied it, and user otherwise. The label rides the effective
+// Model entry, not a parallel map.
+const (
+	SourceUser       = "user"
+	SourceBundled    = "bundled"
+	SourceDiscovered = "discovered"
+)
+
 // BuildResult contains the effective catalog and non-fatal warnings.
 type BuildResult struct {
 	Catalog  *Catalog
@@ -95,6 +107,7 @@ func Build(inputs BuildInputs) BuildResult {
 			continue
 		}
 		result.Catalog.Providers[providerID] = provider
+		labelModelSources(provider, bundled[providerID], record)
 		for _, ref := range (&Catalog{Providers: map[string]*Provider{providerID: provider}}).IncompleteModels() {
 			result.Warnings = append(result.Warnings, Warning{
 				Kind:     "incomplete_model",
@@ -112,6 +125,33 @@ func Build(inputs BuildInputs) BuildResult {
 		}
 	}
 	return result
+}
+
+// labelModelSources stamps each accepted provider's effective models with
+// their provenance, using the same accepted bundled layer and transport-bound
+// discovery record that produced the provider in this same Build loop. No
+// second file read: bundled model IDs come from the already-decoded layer.
+func labelModelSources(provider *Provider, bundledRaw map[string]any, record DiscoveryRecord) {
+	var bundledModels map[string]struct{}
+	if models, ok := bundledRaw["models"].(map[string]any); ok {
+		bundledModels = make(map[string]struct{}, len(models))
+		for modelID := range models {
+			bundledModels[modelID] = struct{}{}
+		}
+	}
+	for _, model := range provider.Models {
+		if !provider.Builtin {
+			model.Source = SourceUser
+			continue
+		}
+		if _, ok := bundledModels[model.ID]; ok {
+			model.Source = SourceBundled
+		} else if _, ok := record.Models[model.ID]; ok {
+			model.Source = SourceDiscovered
+		} else {
+			model.Source = SourceUser
+		}
+	}
 }
 
 func decodeBundledProviders(raw map[string]json.RawMessage, result *BuildResult) map[string]map[string]any {
@@ -147,7 +187,7 @@ func decodeUserProviders(raw map[string]any, result *BuildResult) map[string]map
 			result.Warnings = append(result.Warnings, Warning{Kind: "user_config_skip", Provider: providerID, Message: "provider must be an object"})
 			continue
 		}
-		providers[providerID] = cloneJSONValue(providerRaw).(map[string]any)
+		providers[providerID] = CloneJSONValue(providerRaw).(map[string]any)
 	}
 	return providers
 }
@@ -423,7 +463,7 @@ func intValue(v any, fallback int) int {
 
 func anyMapValue(v any) map[string]any {
 	if m, ok := v.(map[string]any); ok {
-		return cloneJSONValue(m).(map[string]any)
+		return CloneJSONValue(m).(map[string]any)
 	}
 	return map[string]any{}
 }

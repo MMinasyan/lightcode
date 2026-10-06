@@ -159,23 +159,22 @@ func signalProjectedText(content string) string {
 	return "<system-signal>" + strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(content) + "</system-signal>"
 }
 
-// drainSteering delivers the waiting steering FIFO at one model boundary: in
-// FIFO order, each item receives its one scheduled delivery attempt through
-// the active-Operation input transition. A failed attempt is final for the
-// item and the drain proceeds to the next buffered message. Harness-context
-// loss discards both buffers without delivery attempts. A canceled boundary
-// context stops the drain before popping another item: an already-popped item
-// still commits on the Harness context despite the execution interruption,
-// and unpopped items remain for the post-terminal drain.
+// drainSteering delivers each waiting head once at a model boundary, retaining
+// it until commit or final failure. Harness loss discards both buffers; a
+// canceled boundary leaves unselected items for the post-terminal drain.
+// Selected steering commits on the Harness context despite interruption.
 func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID string) {
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			c.steering, c.queued = nil, nil
+			discarded := c.discardBuffers()
 			c.mu.Unlock()
+			if discarded {
+				h.observeInvalidation(c)
+			}
 			return
 		}
-		if ctx.Err() != nil { // a canceled boundary context leaves unpopped items for the post-terminal drain
+		if ctx.Err() != nil { // a canceled boundary context leaves unselected items for the post-terminal drain
 			c.mu.Unlock()
 			return
 		}
@@ -183,11 +182,10 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 			c.mu.Unlock()
 			return
 		}
-		item := c.steering[0]
-		c.steering = c.steering[1:]
+		item := c.steering[0] // peek: the head stays pending while its delivery is unresolved
 		c.mu.Unlock()
-		if err := h.commitSteeringInput(h.ctx, c, operationID, item.origin, item.content); err != nil {
-			_ = err // one failed delivery attempt is final for the item; the next proceeds
+		if err := h.commitSteeringInput(h.ctx, c, operationID, item); err != nil {
+			_ = err // one failed delivery attempt is final; the selected head left the buffer under the commit's hold
 		}
 	}
 }
@@ -199,8 +197,9 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 // Operation. The marker is consumed at execute's entry when it matches that
 // operation — a marker for a running operation is inert — and canceling a
 // retiring predecessor is a harmless no-op. Buffers are never discarded by an
-// interrupt: already-popped steering commits on the Harness context and
-// unpopped items drain after the interrupted Operation's terminal.
+// interrupt: an in-flight selected steering item commits on the Harness
+// context and unselected items drain after the interrupted Operation's
+// terminal.
 func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	c, err := h.coordinatorFor(ctx, sessionID)
 	if err != nil {
@@ -221,41 +220,48 @@ func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// commitSteeringInput is the steering-input helper: it commits one waiting
-// steering message as an Operation-owned input entry with its own submission
-// origin immediately before the next model request, advancing last activity
-// to the entry's commit time in the same transaction.
-func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, origin InputOrigin, content []model.ContentPart) error {
-	owned := make([]model.ContentPart, 0, len(content))
-	for i, part := range content {
+// commitSteeringInput commits one selected head as an Operation-owned input.
+// Removal shares the commit/adoption hold; a failed attempt instead publishes
+// a final local drop. A concurrent discard never makes a replacement removable.
+func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, item *pendingMessage) error {
+	c.mu.Lock()
+	fail := func(err error) error { // the attempt's final outcome under this hold
+		dropped := c.dropBufferedLocked(item)
+		if dropped {
+			c.bumpLocalRevision()
+		}
+		c.mu.Unlock()
+		if dropped {
+			h.observeInvalidation(c)
+		}
+		return err
+	}
+	owned := make([]model.ContentPart, 0, len(item.content))
+	for i, part := range item.content {
 		validated, err := model.NewContentPart(part)
 		if err != nil {
-			return invalidInput("content[%d]: %v", i, err)
+			return fail(invalidInput("content[%d]: %v", i, err))
 		}
 		owned = append(owned, validated)
 	}
-	c.mu.Lock()
 	view := c.graph.Session
 	if _, ok := c.graph.Operation(operationID); !ok {
-		c.mu.Unlock()
-		return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, view.Identity.SessionID)
+		return fail(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, view.Identity.SessionID))
 	}
 	entryID, err := newHexID()
 	if err != nil {
-		c.mu.Unlock()
-		return fmt.Errorf("%w: %v", ErrStorage, err)
+		return fail(fmt.Errorf("%w: %v", ErrStorage, err))
 	}
 	input := inputEntry{
 		SessionID:   view.Identity.SessionID,
 		EntryID:     entryID,
 		OperationID: operationID,
-		Origin:      origin,
+		Origin:      item.origin,
 		Content:     owned,
 	}
 	payload, err := encodeInputEntry(input)
 	if err != nil {
-		c.mu.Unlock()
-		return err
+		return fail(err)
 	}
 	var (
 		committedSession SessionRecord
@@ -308,7 +314,7 @@ func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, opera
 	})
 	if err != nil {
 		h.markCorrupt(view.Identity.SessionID, err)
-		c.mu.Unlock()
+		err = fail(err)
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, view.Identity.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 				return rerr
@@ -318,6 +324,8 @@ func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, opera
 	}
 	c.graph.Entries = append(c.graph.Entries, graphEntry{Envelope: inserted, Input: &input})
 	c.graph.Session = committedSession
+	c.dropBufferedLocked(item) // the adopted input's own advance is the one publication the removal rides
 	c.mu.Unlock()
+	h.observeInvalidation(c) // the durable steering-input advance
 	return nil
 }

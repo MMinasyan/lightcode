@@ -39,6 +39,60 @@ const dotEnvTemplate = `#OPENAI_API_KEY=
 // export) and is not in the managed set. Lightcode refuses to shadow it.
 var ErrExternalKey = fmt.Errorf("env var is set externally; Lightcode will not override it")
 
+// EnvValue is one owner-coherent observation of an environment variable: its
+// current value, whether it is defined in the process environment at all, and
+// whether Lightcode's managed set owns it. Infrastructure data only — it is
+// never a protocol DTO, log value, or durable capture.
+type EnvValue struct {
+	Value   string
+	Defined bool
+	Managed bool
+}
+
+// Capture returns one owned observation of each requested name from a single
+// os.Environ sample plus, for a non-nil manager, the managed membership under
+// the same mutex every managed write holds — so a concurrent Set/TrySet/
+// Remove/TryRemove is either fully before or fully after every returned
+// value. A nil manager samples the environment with no managed ownership.
+// The returned map never aliases the owner's state.
+func (m *ManagedEnv) Capture(names []string) map[string]EnvValue {
+	out := make(map[string]EnvValue, len(names))
+	if m == nil {
+		environment := parseEnviron(os.Environ())
+		for _, name := range names {
+			value, defined := environment[name]
+			out[name] = EnvValue{Value: value, Defined: defined}
+		}
+		return out
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// The environment sample happens under the same mutex a managed write
+	// holds, so the value and the managed membership come from one owner
+	// state: a parked write is either fully before or fully after this.
+	environment := parseEnviron(os.Environ())
+	for _, name := range names {
+		value, defined := environment[name]
+		_, managed := m.managed[name]
+		out[name] = EnvValue{Value: value, Defined: defined, Managed: managed}
+	}
+	return out
+}
+
+// parseEnviron splits one os.Environ snapshot into its name → value map. A
+// defined-but-empty variable keeps its empty value with Defined true.
+func parseEnviron(environ []string) map[string]string {
+	out := make(map[string]string, len(environ))
+	for _, entry := range environ {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		out[name] = value
+	}
+	return out
+}
+
 // ManagedEnv tracks the set of env vars Lightcode owns — those loaded from
 // ~/.lightcode/.env at startup plus any written during this session. It is
 // safe for concurrent use. The managed set is the source of truth for
@@ -103,6 +157,9 @@ func (m *ManagedEnv) Set(key, value string) error {
 	if !isValidEnvKey(key) {
 		return fmt.Errorf("invalid env key %q", key)
 	}
+	if err := validateEnvValue(value); err != nil {
+		return err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -131,6 +188,9 @@ func (m *ManagedEnv) TrySet(key, value string) error {
 	}
 	if !isValidEnvKey(key) {
 		return fmt.Errorf("invalid env key %q", key)
+	}
+	if err := validateEnvValue(value); err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -320,6 +380,25 @@ func LoadDotEnv() (*ManagedEnv, error) {
 	return m, nil
 }
 
+// SubprocessEnv returns one owned, non-nil snapshot of the process
+// environment with every key currently in the managed set removed. It holds
+// the same mutex as Set/TrySet/Remove/TryRemove, so a concurrent managed
+// write is either fully applied before the snapshot or fully absent from it.
+// Shell-exported keys that Lightcode does not own pass through. A nil
+// receiver returns a non-nil empty slice — never the ambient environment.
+func (m *ManagedEnv) SubprocessEnv() []string {
+	if m == nil {
+		return []string{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.managed))
+	for key := range m.managed {
+		keys = append(keys, key)
+	}
+	return EnvWithoutKeys(os.Environ(), keys)
+}
+
 // EnvWithoutKeys returns env with every entry whose name is in keys removed.
 // Order otherwise preserved; nil keys returns env unchanged.
 func EnvWithoutKeys(env []string, keys []string) []string {
@@ -403,6 +482,16 @@ func ReadDotEnvKeys(path string) (map[string]bool, []string, error) {
 // specific file without going through LoadDotEnv.
 func NewManagedEnvForTest(path string) *ManagedEnv {
 	return &ManagedEnv{path: path, managed: map[string]struct{}{}}
+}
+
+// validateEnvValue rejects native environment values the OS refuses before
+// any owning env-file write, so an ordinary Setenv input refusal cannot follow
+// persistence. NUL is the one invalid byte in an environment value.
+func validateEnvValue(value string) error {
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("invalid env value: contains NUL")
+	}
+	return nil
 }
 
 // isValidEnvKey reports whether key is a plausible env var name: non-empty,

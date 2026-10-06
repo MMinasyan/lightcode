@@ -17,15 +17,17 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // configuration is the immutable snapshot of one effective input set: the
-// assembled catalog with its build warnings, the complete resolved agent
-// definitions (retaining their private fields) with the definition warnings,
-// the session policy, the per-plugin configuration values, and the captured
-// global and Workspace permission inputs. Input documents and unconsumed
-// sections are discarded once the snapshot is built; later consumers add
-// their own fields when they land.
+// assembled catalog with its build warnings and each model's source label,
+// the complete resolved agent definitions (retaining their private fields)
+// with the definition warnings, the session policy, every compiled plugin's
+// owned raw configuration section, the owned decoded provider user layer this
+// same build consumed, and the captured global and Workspace permission
+// inputs. Input documents are discarded once the snapshot is built; later
+// consumers add their own fields when they land.
 type configuration struct {
 	generation           uint64
 	catalog              *catalog.Catalog
@@ -34,6 +36,7 @@ type configuration struct {
 	agentWarnings        []agents.Warning
 	sessions             config.SessionConfig
 	plugins              map[string]json.RawMessage
+	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
 }
@@ -99,9 +102,32 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 		agentWarnings:        definitions.Warnings(),
 		sessions:             sessions,
 		plugins:              doc.Plugins,
+		userProviders:        doc.Providers,
 		permissions:          doc.Permissions,
 		workspacePermissions: workspacePermissions,
 	}, nil
+}
+
+// projectSettings projects one captured revision's settings view: the parsed
+// session policy beside every owned raw plugin section as its opaque JSON
+// document string. This is a lossless transport projection, not an
+// interpreted settings authority — each document is returned as captured and
+// the selected declaration's validator owns interpretation. An owned empty
+// object is an empty document, absent sections are absent map members, and
+// unowned numbers survive as their exact lexemes inside the strings.
+func projectSettings(sessions config.SessionConfig, plugins map[string]json.RawMessage) protocol.Settings {
+	out := protocol.Settings{
+		Sessions: protocol.SessionsSettings{
+			AutoArchive:            sessions.AutoArchive,
+			ArchiveAfterDays:       sessions.ArchiveAfterDays,
+			DeleteAfterArchiveDays: sessions.DeleteAfterArchiveDays,
+		},
+		Plugins: make(protocol.PluginsSettings, len(plugins)),
+	}
+	for id, raw := range plugins {
+		out.Plugins[id] = string(raw)
+	}
+	return out
 }
 
 // permissionPolicy resolves this revision's automatic policy for one
@@ -118,15 +144,22 @@ func (c *configuration) permissionPolicy(workspace string) harness.PermissionPol
 	return harness.ResolvePermissionPolicy(c.permissions, workspaceRaw)
 }
 
-// agentTypes projects the snapshot's resolved definitions onto the Harness:
-// public model identity, owned slices, the permission capability constraints
-// with WriteDir trimmed once (preserving the legacy whitespace-as-unset
-// behavior: no environment expansion, no new path syntax), the subagent
-// eligibility and roster description, and the complete roster with no
-// internal package type reaching the view.
+// agentTypes projects the snapshot's resolved definitions onto the Harness
+// view.
 func (c *configuration) agentTypes() []harness.AgentType {
-	out := make([]harness.AgentType, 0, len(c.definitions))
-	for _, def := range c.definitions {
+	return projectAgentTypes(c.definitions)
+}
+
+// projectAgentTypes projects resolved definitions onto the Harness view: the
+// shared producer admission and the Agent-model edit's known-type check both
+// resolve through — public model identity, owned slices, the permission
+// capability constraints with WriteDir trimmed once (preserving the legacy
+// whitespace-as-unset behavior: no environment expansion, no new path
+// syntax), the subagent eligibility and roster description, and the complete
+// roster with no internal package type reaching the view.
+func projectAgentTypes(defs []agents.Resolved) []harness.AgentType {
+	out := make([]harness.AgentType, 0, len(defs))
+	for _, def := range defs {
 		at := harness.AgentType{
 			Name:         def.Name,
 			SystemPrompt: def.SystemPrompt,

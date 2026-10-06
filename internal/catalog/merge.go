@@ -4,7 +4,7 @@ package catalog
 func DeepMergeCatalog(bundled, user map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range bundled {
-		out[k] = cloneJSONValue(v)
+		out[k] = CloneJSONValue(v)
 	}
 	for k, userValue := range user {
 		bundledMap, bundledOK := out[k].(map[string]any)
@@ -13,7 +13,7 @@ func DeepMergeCatalog(bundled, user map[string]any) map[string]any {
 			out[k] = DeepMergeCatalog(bundledMap, userMap)
 			continue
 		}
-		out[k] = cloneJSONValue(userValue)
+		out[k] = CloneJSONValue(userValue)
 	}
 	return out
 }
@@ -23,24 +23,26 @@ func ShallowMergeBody(layers ...map[string]any) map[string]any {
 	out := map[string]any{}
 	for _, layer := range layers {
 		for k, v := range layer {
-			out[k] = cloneJSONValue(v)
+			out[k] = CloneJSONValue(v)
 		}
 	}
 	return out
 }
 
-func cloneJSONValue(v any) any {
+// CloneJSONValue deep-copies one decoded JSON value tree: objects, slices,
+// and the immutable leaf kinds string, bool, nil, float64 and json.Number.
+func CloneJSONValue(v any) any {
 	switch typed := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(typed))
 		for k, value := range typed {
-			out[k] = cloneJSONValue(value)
+			out[k] = CloneJSONValue(value)
 		}
 		return out
 	case []any:
 		out := make([]any, len(typed))
 		for i, value := range typed {
-			out[i] = cloneJSONValue(value)
+			out[i] = CloneJSONValue(value)
 		}
 		return out
 	default:

@@ -90,6 +90,7 @@ func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id stri
 	}
 	m := &backgroundMember{kind: kind, id: id, completionID: completionID, done: make(chan struct{})}
 	c.group.members[completionID] = m
+	c.bumpLocalRevision() // the member admission is a coordinator-local publication
 	return m, nil
 }
 
@@ -117,13 +118,23 @@ func (h *Harness) claimBackgroundMember(c *coordinator, completionID string) (*b
 // pending completion.
 func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 	c.mu.Lock()
+	removed := false
 	if c.group != nil {
 		if _, ok := c.group.members[m.completionID]; ok {
 			delete(c.group.members, m.completionID)
 			close(m.done)
+			c.bumpLocalRevision() // the member finish is a coordinator-local publication
+			removed = true
 		}
 	}
 	c.mu.Unlock()
+	if removed {
+		if m.kind == memberJob { // only a job member's transition names its Job
+			h.observeMemberInvalidation(c, m.id)
+		} else {
+			h.observeInvalidation(c)
+		}
+	}
 	h.childCompletionSettled(c, "")
 }
 
@@ -147,6 +158,7 @@ func backgroundDeliveryPriority(h *Harness, c *coordinator, item *pendingMessage
 	}
 	if c.graph.Session.State.CurrentOperationID != "" || c.run != nil {
 		c.steering = append(c.steering, item)
+		c.bumpLocalRevision() // the completion enqueue is a coordinator-local publication
 		return bgDeliverSteering
 	}
 	return bgDeliverIdle
@@ -210,6 +222,9 @@ func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinato
 	validated.mu.Lock()
 	mode := backgroundDeliveryPriority(h, validated, item)
 	validated.mu.Unlock()
+	if mode == bgDeliverSteering { // the completion enqueue is a coordinator-local publication
+		h.observeInvalidation(validated)
+	}
 
 	switch mode {
 	case bgDeliverSteering:
@@ -230,7 +245,7 @@ func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinato
 // the closed path; an admission failure is final: no retry and no fallback
 // signal write.
 func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember, parts []model.ContentPart, content string) error {
-	release, err := c.reserve(h.ctx)
+	release, err := h.reserve(h.ctx, c)
 	if err != nil { // the reservation failed under harness loss: re-evaluated receivability is the closed path
 		return h.deliverClosedCompletion(c, member, content)
 	}
@@ -239,6 +254,9 @@ func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember
 	sessionID := c.graph.Session.Identity.SessionID
 	mode := backgroundDeliveryPriority(h, c, &pendingMessage{operationID: member.completionID, origin: InputOriginRuntime, content: parts})
 	c.mu.Unlock()
+	if mode == bgDeliverSteering { // the completion enqueue is a coordinator-local publication
+		h.observeInvalidation(c)
+	}
 	switch mode {
 	case bgDeliverClosed:
 		return h.deliverClosedCompletion(c, member, content)
@@ -344,6 +362,7 @@ func (h *Harness) deliverClosedCompletion(c *coordinator, member *backgroundMemb
 	c.graph.Entries = append(c.graph.Entries, adopted)
 	c.graph.Session = committedSession
 	c.mu.Unlock()
+	h.observeInvalidation(c) // the durable operationless completion advance
 	return nil
 }
 
@@ -560,7 +579,12 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 		run         *activeExecution
 		members     []*backgroundMember
 	)
+	published := false
 	if isChild { // the lineage closure is permanent: the buffers go, the pending completion stays
+		if c.bgState != bgClosed || len(c.steering) > 0 || len(c.queued) > 0 {
+			c.bumpLocalRevision() // one publication: the permanent closure and its buffer discard
+			published = true
+		}
 		c.bgState = bgClosed
 		c.steering, c.queued = nil, nil
 		reservation = c.reserved
@@ -571,6 +595,8 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 			return nil
 		}
 		c.bgState = bgStopping
+		c.bumpLocalRevision() // the root's stopping publication
+		published = true
 	}
 	if c.group != nil {
 		for _, m := range c.group.members {
@@ -579,6 +605,9 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	}
 	c.stop = interval
 	c.mu.Unlock()
+	if published {
+		h.observeInvalidation(c)
+	}
 
 	var (
 		runs       []*activeExecution
@@ -657,13 +686,19 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	}
 
 	c.mu.Lock()
+	reopened := false
 	if !isChild && c.bgState == bgStopping {
-		c.bgState = bgOpen // a root's closure lasts only the stop; a child's stays
+		c.bgState = bgOpen    // a root's closure lasts only the stop; a child's stays
+		c.bumpLocalRevision() // the root's reopen publication
+		reopened = true
 	}
 	interval.err = errors.Join(errs...)
 	close(interval.done)
 	c.stop = nil
 	c.mu.Unlock()
+	if reopened {
+		h.observeInvalidation(c)
+	}
 	return interval.err
 }
 
@@ -715,6 +750,7 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 	if err != nil {
 		return err
 	}
+	h.observeMemberInvalidation(c, jobID) // the job member admission
 	if err := h.backgroundHandoffFailure(c, member); err != nil {
 		h.claimFinishBackgroundMember(c, member.completionID)
 		return err
@@ -809,6 +845,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
+	h.observeInvalidation(c) // the child member admission carries no Job identity
 
 	child := SessionRecord{
 		Identity: childIdentity,
@@ -847,6 +884,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	childCoordinator.mu.Lock()
 	childCoordinator.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: req.OutputLimit}
 	childCoordinator.mu.Unlock()
+	h.observeInvalidation(childCoordinator) // the durable child creation
 	h.startExecution(childCoordinator, req.OperationID, prepared)
 	return LaunchChildResult{ChildSessionID: childID}, nil
 }

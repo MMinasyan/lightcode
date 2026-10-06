@@ -532,12 +532,12 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 		if !errors.Is(err, ErrConflict) {
 			t.Fatalf("drifted launch = %v, want the conflict class", err)
 		}
-		rec, err := h.ReadSession(context.Background(), testSessionID)
+		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if rec.Revision != 2 || rec.State.CurrentAgentType != "other" {
-			t.Fatalf("subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision, rec.State.CurrentAgentType)
+		if rec.Revision.DurableRevision != 2 || rec.CurrentAgentType != "other" {
+			t.Fatalf("subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision.DurableRevision, rec.CurrentAgentType)
 		}
 		if n := durableRegisterCount(store); n != 1 {
 			t.Fatalf("the drifted launch published %d registers, want only the parent", n)
@@ -550,12 +550,12 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 		if !errors.Is(err, ErrConflict) {
 			t.Fatalf("drifted launch = %v, want the conflict class", err)
 		}
-		rec, err := h.ReadSession(context.Background(), testSessionID)
+		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		if err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if rec.Revision != 2 {
-			t.Fatalf("subsequent read revision = %d, want the rematerialized 2", rec.Revision)
+		if rec.Revision.DurableRevision != 2 {
+			t.Fatalf("subsequent read revision = %d, want the rematerialized 2", rec.Revision.DurableRevision)
 		}
 		c.mu.Lock()
 		empty := c.group == nil || len(c.group.members) == 0
@@ -639,12 +639,12 @@ func TestLaunchChildSessionSettlesRejectedHandoff(t *testing.T) {
 	if rec.State.Status != OperationInterruption {
 		t.Fatalf("child operation settled %q, want interruption", rec.State.Status)
 	}
-	childRec, err := h.ReadSession(context.Background(), childID)
+	childRec, err := h.ReadSessionHeader(context.Background(), childID)
 	if err != nil {
-		t.Fatalf("ReadSession(child): %v", err)
+		t.Fatalf("ReadSessionHeader(child): %v", err)
 	}
-	if childRec.State.CurrentOperationID != "" {
-		t.Fatalf("settled child still runs operation %q", childRec.State.CurrentOperationID)
+	if childRec.CurrentOperationID != "" {
+		t.Fatalf("settled child still runs operation %q", childRec.CurrentOperationID)
 	}
 	if n := storedEntryCount(store, childID); n != 3 { // input, interruption signal, settlement
 		t.Fatalf("child entries = %d, want input, interruption signal and settlement", n)
@@ -813,17 +813,17 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 		t.Fatalf("prepared agent type = %q, want child-agent", call.req.Session.AgentType)
 	}
 
-	childRec, err := h.ReadSession(context.Background(), res.ChildSessionID)
+	childRec, err := h.ReadSessionHeader(context.Background(), res.ChildSessionID)
 	if err != nil {
-		t.Fatalf("ReadSession(child): %v", err)
+		t.Fatalf("ReadSessionHeader(child): %v", err)
 	}
 	if childRec.Identity.ParentSessionID != testSessionID || childRec.Identity.Workspace != "/tmp/works" ||
 		!childRec.Identity.CreatedAt.Equal(ident.CreatedAt) || childRec.Identity.SourceSessionID != "" {
 		t.Fatalf("durable child identity = %+v, want the prepared identity", childRec.Identity)
 	}
-	if childRec.State.Lifecycle != LifecycleOpen || childRec.State.CurrentAgentType != "child-agent" ||
-		childRec.State.CurrentOperationID != "child-op-1" || childRec.State.ArchivedAt != nil {
-		t.Fatalf("durable child state = %+v, want the initial launch state", childRec.State)
+	if childRec.Lifecycle != LifecycleOpen || childRec.CurrentAgentType != "child-agent" ||
+		childRec.CurrentOperationID != "child-op-1" || childRec.ArchivedAt != nil {
+		t.Fatalf("durable child state = %+v, want the initial launch state", childRec)
 	}
 	op := settledOperation(t, store, res.ChildSessionID, "child-op-1")
 	if op.State.Status != OperationRunning || op.Admission.RequestKind != RequestKindMessage ||

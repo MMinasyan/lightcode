@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/plugins/tools"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -160,16 +161,15 @@ func fakeJobsPlugin(j *fakeJobs) runtime.Plugin {
 // the runtime constructs the jobs binding in-package — with one optional
 // extra plugin composed in the same scope (the zero Plugin composes none),
 // and returns its tool exports plus every bound capability value.
-func openToolsComposed(t *testing.T, dataDir string, managedKeys []string, jobsPlugin, extra runtime.Plugin) (map[string]runtime.Tool, map[string]any) {
+func openToolsComposed(t *testing.T, dataDir string, jobsPlugin, extra runtime.Plugin) (map[string]runtime.Tool, map[string]any) {
 	t.Helper()
 	plugins := []runtime.Plugin{jobsPlugin, tools.Plugin()}
 	if extra.ID != "" {
 		plugins = append(plugins, extra)
 	}
 	values, closeScope, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{
-		Kind:           runtime.ScopeRuntime,
-		DataDir:        dataDir,
-		ManagedEnvKeys: managedKeys,
+		Kind:    runtime.ScopeRuntime,
+		DataDir: dataDir,
 	}, plugins)
 	if err != nil {
 		t.Fatalf("compose tools plugin: %v", err)
@@ -192,13 +192,7 @@ func openToolsComposed(t *testing.T, dataDir string, managedKeys []string, jobsP
 
 func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
 	t.Helper()
-	byID, _ := openToolsComposed(t, dataDir, nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
-	return byID
-}
-
-func openToolsWithKeys(t *testing.T, dataDir string, managedKeys []string) map[string]runtime.Tool {
-	t.Helper()
-	byID, _ := openToolsComposed(t, dataDir, managedKeys, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, dataDir, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	return byID
 }
 
@@ -218,7 +212,7 @@ func TestComposedToolsPluginContract(t *testing.T) {
 	if _, _, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, []runtime.Plugin{tools.Plugin()}); err == nil || !strings.Contains(err.Error(), `"jobs"`) {
 		t.Fatalf("open without a jobs provider = %v, want the unresolved jobs dependency error", err)
 	}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
 	if len(byID) != 7 {
 		t.Fatalf("composed open returned %d tools, want all seven", len(byID))
 	}
@@ -234,6 +228,24 @@ func callToolContext(workspace string, constraints runtime.ToolConstraints) runt
 		Invocation:    runtime.Invocation{},
 		Constraints:   constraints,
 	}
+}
+
+// stubManagedEnv returns one real manager bound to a throwaway .env whose
+// managed set the test controls; its SubprocessEnv method is the fixture's
+// call-time environment producer.
+func stubManagedEnv(t *testing.T) *config.ManagedEnv {
+	t.Helper()
+	return config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+}
+
+// envCallContext is a callToolContext whose call-time environment producer
+// is one empty real manager: the ambient environment passes through
+// unfiltered.
+func envCallContext(t *testing.T, workspace string, constraints runtime.ToolConstraints) runtime.ToolContext {
+	t.Helper()
+	tc := callToolContext(workspace, constraints)
+	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+	return tc
 }
 
 func makeCall(t *testing.T, name, args string) model.ToolCall {
@@ -389,14 +401,15 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 
 // toolsHarnessOpts varies one composed tools Harness: the jobs provider, the
 // advertised tool set, the resolved permission policy, the background bridge,
-// the captured invocation, and the scope's managed env keys.
+// the captured invocation, and the call-time subprocess environment
+// producer.
 type toolsHarnessOpts struct {
-	jobsPlugin  runtime.Plugin
-	advertise   []string
-	permissions harness.PermissionPolicy
-	background  runtime.BackgroundServices
-	invocation  runtime.Invocation
-	managedKeys []string
+	jobsPlugin    runtime.Plugin
+	advertise     []string
+	permissions   harness.PermissionPolicy
+	background    runtime.BackgroundServices
+	invocation    runtime.Invocation
+	subprocessEnv func() []string
 	// store, when non-nil, is the durable store behind the fixture's
 	// Harness; the zero value opens a temporary SQLite store.
 	store harness.Storage
@@ -447,7 +460,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 	if jobsPlugin.ID == "" {
 		jobsPlugin = fakeJobsPlugin(&fakeJobs{})
 	}
-	byID, values := openToolsComposed(t, dataDir, opts.managedKeys, jobsPlugin, opts.extraPlugin)
+	byID, values := openToolsComposed(t, dataDir, jobsPlugin, opts.extraPlugin)
 	if opts.extraToolID != "" {
 		value, ok := values[opts.extraToolID]
 		if !ok {
@@ -481,6 +494,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						Invocation:    opts.invocation,
 						Constraints:   runtime.ToolConstraints{Readonly: admission.Execution.Readonly, WriteDir: admission.Execution.WriteDir},
 						Background:    opts.background,
+						SubprocessEnv: opts.subprocessEnv,
 					}
 					return harness.Execution{
 						Model:        modelFn,
@@ -784,7 +798,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	ws := t.TempDir()
 
 	t.Run("conclusive simple commands declare one target per segment", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{}), "run_command", `{"command":"echo one; echo two && echo three"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":"echo one; echo two && echo three"}`)
 		if plan.Immediate != nil || plan.Execute == nil {
 			t.Fatalf("plan = %+v, want an executor plan", plan)
 		}
@@ -810,7 +824,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 			// byte — the heredoc body and the trailing newline — preserved.
 			{"{\"command\":\"  \\ncat <<EOF\\nbody\\nEOF\\n\"}", "cat <<EOF\nbody\nEOF\n"},
 		} {
-			plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{}), "run_command", tc.args)
+			plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", tc.args)
 			if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "command.run" {
 				t.Fatalf("%s: pairs = %+v, want the single complete-command target", tc.args, plan.Permissions)
 			}
@@ -821,7 +835,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("all-blank text takes the whole-command fallback with the original input", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{}), "run_command", `{"command":"   "}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":"   "}`)
 		if len(plan.Permissions) != 1 || plan.Permissions[0].Target != "   " {
 			t.Fatalf("pairs = %+v, want the unchanged original blank input as the one target", plan.Permissions)
 		}
@@ -832,7 +846,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("empty command text is an immediate argument error", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{}), "run_command", `{"command":""}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":""}`)
 		if plan.Execute != nil || plan.Immediate == nil {
 			t.Fatalf("plan = %+v, want one immediate outcome", plan)
 		}
@@ -842,7 +856,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("readonly declares the rewritten command and executes it", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"git status --short"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"git status --short"}`)
 		if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "command.run" {
 			t.Fatalf("pairs = %+v, want one command.run pair", plan.Permissions)
 		}
@@ -857,7 +871,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("readonly plain command runs in the workspace", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"pwd"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"pwd"}`)
 		if len(plan.Permissions) != 1 || plan.Permissions[0].Target != "pwd" {
 			t.Fatalf("pairs = %+v, want the unchanged pwd target", plan.Permissions)
 		}
@@ -868,7 +882,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("readonly rejection is an immediate error with the fixed text", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"curl example.com"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"curl example.com"}`)
 		if plan.Execute != nil || plan.Immediate == nil {
 			t.Fatalf("plan = %+v, want one immediate outcome", plan)
 		}
@@ -879,7 +893,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 
 	t.Run("readonly blank and empty commands settle the fixed rejection", func(t *testing.T) {
 		for _, args := range []string{`{"command":""}`, `{"command":"   "}`, "{\"command\":\" \\n\\t \"}"} {
-			plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{Readonly: true}), "run_command", args)
+			plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", args)
 			if plan.Execute != nil || plan.Immediate == nil {
 				t.Fatalf("%s: plan = %+v, want one immediate outcome", args, plan)
 			}
@@ -906,7 +920,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 			}
 		}()
 		start := time.Now()
-		plan := prepare(t, byID["run_command"], callToolContext(ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"cat pipe","timeout":1}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"cat pipe","timeout":1}`)
 		outcome := plan.Execute(context.Background())
 		if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "done" {
 			t.Fatalf("result = %+v, want the default timeout to let the command finish", outcome.Result)
@@ -922,6 +936,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 	byID := openTools(t, dataDir)
 	ws := t.TempDir()
 	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 
 	t.Run("success carries the captured output", func(t *testing.T) {
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf ok"}`)
@@ -998,11 +1013,24 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("the managed key is scrubbed while an unlisted key and the workspace cwd remain", func(t *testing.T) {
+	t.Run("the managed key connected after Open is scrubbed while an unlisted sibling and the workspace cwd remain", func(t *testing.T) {
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_TEST", "env-value")
-		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret")
-		runCommand := openToolsWithKeys(t, dataDir, []string{"LIGHTCODE_TOOLS_PLUGIN_MANAGED"})["run_command"]
-		plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\" \"$LIGHTCODE_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
+		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret") // cleanup reservation only
+		if err := os.Unsetenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED"); err != nil {
+			t.Fatal(err)
+		}
+		byID, _ := openToolsComposed(t, dataDir, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+		runCommand := byID["run_command"]
+		// The key connects AFTER the tools plugin opened: the call-time
+		// subprocess-environment producer, not any Open-captured copy, must
+		// scrub it from the child.
+		managed := config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+		if err := managed.TrySet("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret"); err != nil {
+			t.Fatalf("managed TrySet: %v", err)
+		}
+		callTC := tc
+		callTC.SubprocessEnv = managed.SubprocessEnv
+		plan := prepare(t, runCommand, callTC, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\" \"$LIGHTCODE_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
 		outcome := plan.Execute(context.Background())
 		if outcome.Result.Status != model.ResultSuccess {
 			t.Fatalf("result = %+v, want success", outcome.Result)
@@ -1157,7 +1185,7 @@ func TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers(t *testin
 	} {
 		t.Run(command, func(t *testing.T) {
 			_ = os.Remove(marker)
-			plan := prepare(t, byID["run_command"], callToolContext(repo, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"`+command+`"}`)
+			plan := prepare(t, byID["run_command"], envCallContext(t, repo, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"`+command+`"}`)
 			if len(plan.Permissions) != 1 || plan.Permissions[0].Permission != "command.run" {
 				t.Fatalf("pairs = %+v, want one command.run pair", plan.Permissions)
 			}
@@ -1696,8 +1724,9 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("handoff rejection renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
+		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{startErr: errors.New("background group is closed or stopping")}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		if plan.Immediate != nil || plan.Execute == nil {
@@ -1720,8 +1749,9 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("spawn failure renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{startErr: errors.New("spawn boom")}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
+		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		outcome := plan.Execute(context.Background())
@@ -1738,8 +1768,9 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("reserve failure renders through the wrapper without an abort", func(t *testing.T) {
 		fake := &fakeJobs{reserveErr: errors.New("process: manager is closed")}
-		byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
 		tc := callToolContext(ws, runtime.ToolConstraints{})
+		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		outcome := plan.Execute(context.Background())
@@ -1761,9 +1792,10 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 // sub-one becomes 0, and the immediate result is the retained template.
 func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	fake := &fakeJobs{live: []string{"b0b0b0b0", "11111111"}}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
 	ws := t.TempDir()
 	tc := callToolContext(ws, runtime.ToolConstraints{Readonly: true})
+	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 	tc.Background = &scriptBackground{}
 
 	wantCommand, err := tool.ReadOnlyCommand("git status")
@@ -1801,21 +1833,161 @@ func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	}
 }
 
-// TestBackgroundJobEnvironmentScrubsManagedKey proves the background job's
-// environment carries the unlisted user key and never the managed key.
-func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
-	t.Setenv("LIGHTCODE_BG_UNLISTED", "visible-value")
-	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret")
-	dataDir := t.TempDir()
-	byID, values := openToolsComposed(t, dataDir, []string{"LIGHTCODE_BG_MANAGED"}, jobs.Plugin(), runtime.Plugin{})
+// TestRunCommandConcurrentManagedWritesSpawnChildren drives real foreground
+// and background children while a writer loops TrySet/TryRemove on the one
+// manager. The single-manager critical section means an owned value is never
+// observable at a process start: every child sees the external sibling and no
+// managed value at all — never a partial or leaked line. Bounded counts and a
+// joined writer keep the failure cleanup honest.
+func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
+	const (
+		externalKey = "LIGHTCODE_CONCURRENT_EXTERNAL"
+		managedKey  = "LIGHTCODE_CONCURRENT_MANAGED"
+	)
+	t.Setenv(externalKey, "sibling-value")
+	t.Setenv(managedKey, "") // cleanup reservation only
+	if err := os.Unsetenv(managedKey); err != nil {
+		t.Fatal(err)
+	}
+	managed := stubManagedEnv(t)
+	byID, values := openToolsComposed(t, t.TempDir(), jobs.Plugin(), runtime.Plugin{})
 	jobsInst, ok := values["jobs"].(jobs.Jobs)
 	if !ok {
 		t.Fatalf("values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
 	}
 	ws := t.TempDir()
 	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.SubprocessEnv = managed.SubprocessEnv
+	tc.Background = &scriptBackground{}
+
+	// One synchronous managed write proves the writer path works before any
+	// child spawns, so a failed or unscheduled writer cannot pass vacuously.
+	if err := managed.TrySet(managedKey, "managed-secret"); err != nil {
+		t.Fatalf("initial managed TrySet: %v", err)
+	}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopWriter := func() { stopOnce.Do(func() { close(stop) }) }
+	defer func() { stopWriter(); wg.Wait() }()
+	writerErrs := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var err error
+			if i%2 == 0 {
+				err = managed.TrySet(managedKey, "managed-secret")
+			} else {
+				err = managed.TryRemove(managedKey)
+			}
+			if err != nil {
+				select {
+				case writerErrs <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	checkOutput := func(kind, output string) {
+		t.Helper()
+		output = strings.TrimSpace(output)
+		if !strings.HasPrefix(output, "sibling-value|") {
+			t.Fatalf("%s child lost the external sibling: %q", kind, output)
+		}
+		if rest := strings.TrimPrefix(output, "sibling-value|"); rest != "" {
+			t.Fatalf("%s child saw a managed value %q, want none", kind, rest)
+		}
+	}
+	command := `printf '%s|%s' "$LIGHTCODE_CONCURRENT_EXTERNAL" "$LIGHTCODE_CONCURRENT_MANAGED"`
+	fgArgs, err := json.Marshal(map[string]any{"command": command})
+	if err != nil {
+		t.Fatalf("marshal foreground args: %v", err)
+	}
+	bgArgs, err := json.Marshal(map[string]any{"command": command + "; sleep 30", "background": true})
+	if err != nil {
+		t.Fatalf("marshal background args: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		plan := prepare(t, byID["run_command"], tc, "run_command", string(fgArgs))
+		outcome := plan.Execute(context.Background())
+		if outcome.Result.Status != model.ResultSuccess {
+			t.Fatalf("foreground child %d = %+v, want success", i, outcome.Result)
+		}
+		checkOutput("foreground", outcome.Result.Content)
+	}
+	for i := 0; i < 5; i++ {
+		plan := prepare(t, byID["run_command"], tc, "run_command", string(bgArgs))
+		outcome := plan.Execute(context.Background())
+		if outcome.Result.Status != model.ResultSuccess {
+			t.Fatalf("background child %d = %+v, want the immediate success", i, outcome.Result)
+		}
+		jobID := assertBackgroundImmediate(t, outcome.Result.Content)
+		deadline := time.Now().Add(15 * time.Second)
+		output := ""
+		for time.Now().Before(deadline) {
+			got, rerr := jobsInst.Read(testSessionID, jobID)
+			if rerr == nil && strings.Contains(got, "sibling-value|") {
+				output = got
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if output == "" {
+			t.Fatalf("the background child %d never produced its output", i)
+		}
+		checkOutput("background", output)
+		if rerr := jobsInst.Kill(testSessionID, jobID); rerr != nil {
+			t.Fatalf("kill background child %d: %v", i, rerr)
+		}
+	}
+	stopWriter()
+	wg.Wait()
+	select {
+	case err := <-writerErrs:
+		t.Fatalf("concurrent managed writer: %v", err)
+	default:
+	}
+}
+
+// TestBackgroundJobEnvironmentScrubsManagedKey proves the background job's
+// environment carries the unlisted user key and never the managed key —
+// connected through a real manager AFTER the call was prepared and before the
+// actual child start, so the call-time producer, not any Prepare-time copy,
+// does the scrubbing.
+func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
+	t.Setenv("LIGHTCODE_BG_UNLISTED", "early-value")
+	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret") // cleanup reservation only
+	if err := os.Unsetenv("LIGHTCODE_BG_MANAGED"); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	byID, values := openToolsComposed(t, dataDir, jobs.Plugin(), runtime.Plugin{})
+	jobsInst, ok := values["jobs"].(jobs.Jobs)
+	if !ok {
+		t.Fatalf("values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
+	}
+	managed := stubManagedEnv(t)
+	ws := t.TempDir()
+	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.SubprocessEnv = managed.SubprocessEnv
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_BG_UNLISTED\" \"$LIGHTCODE_BG_MANAGED\"; sleep 30","background":true}`)
+	// Both clocks move after Prepare and before the child starts: the
+	// external sibling changes and the key connects. The job must see the
+	// later sibling and no managed key.
+	t.Setenv("LIGHTCODE_BG_UNLISTED", "visible-value")
+	if err := managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"); err != nil {
+		t.Fatalf("managed TrySet: %v", err)
+	}
 	outcome := plan.Execute(context.Background())
 	if outcome.Result.Status != model.ResultSuccess {
 		t.Fatalf("result = %+v, want the background start to succeed", outcome.Result)
@@ -1895,10 +2067,11 @@ func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testin
 		}
 	}
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		jobsPlugin: jobs.Plugin(),
-		advertise:  []string{"run_command"},
-		background: bg,
-		invocation: invocation,
+		jobsPlugin:    jobs.Plugin(),
+		advertise:     []string{"run_command"},
+		background:    bg,
+		invocation:    invocation,
+		subprocessEnv: stubManagedEnv(t).SubprocessEnv,
 	})
 	session := th.createSession()
 	th.submit(session, "op-1", "run the background command")
@@ -1976,7 +2149,7 @@ func reserveAndStart(t *testing.T, jobsInst jobs.Jobs, workspace, command string
 // owner-scoped canonical targets and the capability's unknown-ID text for
 // well-shaped unknown and foreign identities.
 func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
-	byID, values := openToolsComposed(t, t.TempDir(), nil, jobs.Plugin(), runtime.Plugin{})
+	byID, values := openToolsComposed(t, t.TempDir(), jobs.Plugin(), runtime.Plugin{})
 	jobsInst, ok := values["jobs"].(jobs.Jobs)
 	if !ok {
 		t.Fatalf("values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
@@ -2090,7 +2263,7 @@ func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
 // no capability call — never permission-denied status.
 func TestProcessToolValidationIsImmediateError(t *testing.T) {
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), nil, fakeJobsPlugin(fake), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
 	process := byID["process"]
 	ws := t.TempDir()
 	cases := []struct {
@@ -2182,5 +2355,111 @@ func TestComposedPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 	}
 	if fake.reserves != 0 || len(fake.started) != 0 || fake.lists != 0 {
 		t.Fatalf("capability calls = reserves %d started %d lists %d, want none behind the denials", fake.reserves, len(fake.started), fake.lists)
+	}
+}
+
+// TestRunCommandNilSubprocessEnvNoStart proves the foreground command
+// refuses when the call-time environment producer is missing or reports no
+// environment: the ordinary error outcome, and no process started.
+func TestRunCommandNilSubprocessEnvNoStart(t *testing.T) {
+	byID := openTools(t, t.TempDir())
+	ws := t.TempDir()
+	for _, testCase := range []struct {
+		name     string
+		producer func() []string
+		want     string
+	}{
+		{name: "nil callback", producer: nil, want: "no subprocess environment producer"},
+		{name: "nil snapshot", producer: func() []string { return nil }, want: "returned no environment"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			marker := filepath.Join(ws, strings.ReplaceAll(testCase.name, " ", "-")+"-marker")
+			tc := callToolContext(ws, runtime.ToolConstraints{})
+			tc.SubprocessEnv = testCase.producer
+			plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"touch `+marker+`"}`)
+			outcome := plan.Execute(context.Background())
+			if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, testCase.want) {
+				t.Fatalf("result = %+v, want the %q refusal", outcome.Result, testCase.want)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("the command started without an environment producer (%v)", err)
+			}
+		})
+	}
+}
+
+// TestBackgroundNilSubprocessEnvNoReservation proves the background start
+// refuses before the Jobs reservation when the producer is missing: no
+// reservation, no member, no start.
+func TestBackgroundNilSubprocessEnvNoReservation(t *testing.T) {
+	ws := t.TempDir()
+	fake := &fakeJobs{}
+	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
+	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.Background = &scriptBackground{}
+	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
+	outcome := plan.Execute(context.Background())
+	if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, "no subprocess environment producer") {
+		t.Fatalf("result = %+v, want the missing-producer error", outcome.Result)
+	}
+	if fake.reserves != 0 || len(fake.started) != 0 {
+		t.Fatalf("reserves = %d, started = %d, want no reservation and no start", fake.reserves, len(fake.started))
+	}
+}
+
+// TestRunCommandEnvResolvedAtStartNotPrepare proves the environment resolves
+// at the process start, never at Prepare: a key connected between the two
+// moments is still scrubbed from the child.
+func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
+	managed := stubManagedEnv(t)
+	key := "LIGHTCODE_SCRUB_LATE"
+	external := "LIGHTCODE_TIMING_EXTERNAL"
+	t.Setenv(key, "late-secret") // cleanup reservation only
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(external, "early-value")
+	runCommand := openTools(t, t.TempDir())["run_command"]
+	ws := t.TempDir()
+	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.SubprocessEnv = managed.SubprocessEnv
+	plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TIMING_EXTERNAL\" \"$LIGHTCODE_SCRUB_LATE\""}`)
+	// Both clocks move after Prepare: the external sibling changes and the
+	// key connects. A Prepare-time capture would freeze the early sibling and
+	// miss the late managed key; the start-time resolution sees the later
+	// sibling and scrubs the key.
+	t.Setenv(external, "later-value")
+	if err := managed.TrySet(key, "late-secret"); err != nil {
+		t.Fatalf("managed TrySet: %v", err)
+	}
+	outcome := plan.Execute(context.Background())
+	if outcome.Result.Status != model.ResultSuccess {
+		t.Fatalf("result = %+v, want success", outcome.Result)
+	}
+	if strings.TrimSpace(outcome.Result.Content) != "later-value|" {
+		t.Fatalf("result = %q, want the post-Prepare sibling and the scrubbed key", outcome.Result.Content)
+	}
+}
+
+// TestBackgroundNilEnvSnapshotAbortsBeforeStart proves the forbidden-sibling
+// row of the background handoff: a producer reporting no environment fails
+// the start with no process and no leaked reservation or member.
+func TestBackgroundNilEnvSnapshotAbortsBeforeStart(t *testing.T) {
+	ws := t.TempDir()
+	fake := &fakeJobs{}
+	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
+	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc.SubprocessEnv = func() []string { return nil } // a nil snapshot is never an ambient fallback
+	tc.Background = &scriptBackground{}
+	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
+	outcome := plan.Execute(context.Background())
+	if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, "returned no environment") {
+		t.Fatalf("result = %+v, want the nil-snapshot refusal", outcome.Result)
+	}
+	if len(fake.started) != 0 {
+		t.Fatalf("started = %d, want no process start", len(fake.started))
+	}
+	if len(fake.aborted) != 1 {
+		t.Fatalf("aborted = %v, want the reservation aborted once", fake.aborted)
 	}
 }

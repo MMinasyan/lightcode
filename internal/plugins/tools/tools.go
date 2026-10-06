@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -102,17 +101,17 @@ func (s settings) toolsConfig() config.ToolsConfig {
 	}
 }
 
-// instance is one Open's constructed state: the owner data root, the managed
-// env key names captured from the scope identity, and the jobs capability
-// the background command and process paths call. It keeps no
+// instance is one Open's constructed state: the owner data root and the jobs
+// capability the background command and process paths call. It keeps no
 // Session-indexed state, no handle tags, no cached read records and no
 // reset or eviction hooks: every mutating call opens its code group fresh
 // from the calling Operation's admitted-input identity and drops it
-// afterward.
+// afterward. No environment key set is captured at Open — the command paths
+// resolve the live subprocess environment through the ToolContext's
+// call-time producer, so keys connected after this Open are still scrubbed.
 type instance struct {
-	dataDir     string
-	managedKeys []string
-	jobs        jobs.Jobs
+	dataDir string
+	jobs    jobs.Jobs
 }
 
 func (in *instance) settings(inv runtime.Invocation) (settings, error) {
@@ -580,17 +579,54 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 			if background {
 				return t.backgroundOutcome(ctx, call.ID, command, backgroundTimeoutSec, tc)
 			}
-			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir, t.inst.managedKeys)
+			// The environment resolves immediately at this process start,
+			// never at Prepare: a key connected after the call was prepared
+			// is still scrubbed, and a shell sibling stays visible.
+			env, envErr := commandEnvironment(tc)
+			if envErr != nil {
+				return commandEnvironmentFailure(call.ID, envErr)
+			}
+			return commandOutcome(ctx, call.ID, command, tc.Workspace, timeoutSec, s, spillDir, env)
 		},
 	}
 }
 
+// errNoSubprocessEnv is the one missing-producer diagnostic shared by the
+// foreground resolution and the background pre-reservation check.
+var errNoSubprocessEnv = errors.New("run_command: no subprocess environment producer")
+
+// commandEnvironment resolves one cooperative command's environment through
+// the ToolContext's call-time producer. A missing callback — or a producer
+// reporting no environment — is an ordinary error the caller renders with no
+// process start; there is no ambient-environment fallback.
+func commandEnvironment(tc runtime.ToolContext) ([]string, error) {
+	if tc.SubprocessEnv == nil {
+		return nil, errNoSubprocessEnv
+	}
+	env := tc.SubprocessEnv()
+	if env == nil {
+		return nil, errors.New("run_command: subprocess environment producer returned no environment")
+	}
+	return env, nil
+}
+
+// commandEnvironmentFailure renders one environment-resolution failure as the
+// ordinary model-visible error outcome.
+func commandEnvironmentFailure(callID string, cause error) harness.ToolOutcome {
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: boundedDiagnostic(cause)}}
+}
+
 // backgroundOutcome starts one background job for the prepared call: it
-// reserves the identity, hands the spawn to the background bridge, aborts
-// the reservation when the bridge rejects the start, and returns the
-// retained immediate template on success. Every start failure — reserve,
-// handoff, or spawn — renders through the one legacy wrapper.
+// refuses a missing subprocess-environment producer before any reservation,
+// reserves the identity, hands the spawn to the background bridge, resolves
+// the job's exact environment at the admitted Jobs start handoff, aborts the
+// reservation when the bridge or the start rejects, and returns the retained
+// immediate template on success. Every start failure — reserve, handoff, or
+// spawn — renders through the one legacy wrapper.
 func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command string, timeoutSec int, tc runtime.ToolContext) harness.ToolOutcome {
+	if tc.SubprocessEnv == nil {
+		return commandEnvironmentFailure(callID, errNoSubprocessEnv)
+	}
 	jobsInst := t.inst.jobs
 	sessionID := tc.AdmittedEntry.SessionID
 	jobID, err := jobsInst.Reserve()
@@ -598,13 +634,20 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 		return backgroundStartOutcome(callID, err)
 	}
 	err = tc.Background.StartJob(ctx, sessionID, jobID, func(_ context.Context, completionID string) error {
+		// The environment resolves at the admitted start handoff — never at
+		// Prepare — and the exact slice is the job process's environment; a
+		// nil snapshot fails the start instead of inheriting ambient secrets.
+		env, envErr := commandEnvironment(tc)
+		if envErr != nil {
+			return envErr
+		}
 		return jobsInst.Start(jobs.StartRequest{
 			JobID:      jobID,
 			SessionID:  sessionID,
 			Workspace:  tc.Workspace,
 			Command:    command,
 			TimeoutSec: timeoutSec,
-			Env:        config.EnvWithoutKeys(os.Environ(), t.inst.managedKeys),
+			Env:        env,
 			Config:     tc.Invocation.Config("jobs"),
 			OnExit: func(er jobs.ExitResult) {
 				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
@@ -671,8 +714,8 @@ func truncateCompletionText(text string, limit int) string {
 }
 
 // commandOutcome runs one prepared foreground command through the shared
-// runner over the environment scrubbed of the instance's managed keys and
-// maps the retained outcomes onto the model-visible result: a
+// runner over the resolved subprocess environment and maps the retained
+// outcomes onto the model-visible result: a
 // completed run settles as success or — for a nonzero exit — the same
 // ExitError output the legacy engine reports as an error; a configured
 // timeout settles as an error result with the retained timeout text; the
@@ -680,8 +723,8 @@ func truncateCompletionText(text string, limit int) string {
 // with the retained cancellation text. The classification reads the cause
 // the runner flagged on the error, never the context after the runner has
 // settled the real result.
-func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string, managedKeys []string) harness.ToolOutcome {
-	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir, config.EnvWithoutKeys(os.Environ(), managedKeys))
+func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string, env []string) harness.ToolOutcome {
+	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir, env)
 	var exitErr *tool.ExitError
 	if errors.As(err, &exitErr) {
 		status := model.ResultError
@@ -866,8 +909,7 @@ func mutationDescription(name, description, parameters string, defaultHidden boo
 // degraded mode without it. ValidateConfig validates the owned
 // plugins.tools section; Open captures the owner data root the mutating
 // calls derive their code groups from and the command spills their output
-// directory from, the managed env key names the command path scrubs from
-// its environment, and the bound jobs capability the background and process
+// directory from, and the bound jobs capability the background and process
 // paths call.
 func Plugin() runtime.Plugin {
 	return runtime.Plugin{
@@ -894,9 +936,11 @@ func Plugin() runtime.Plugin {
 }
 
 // open checks the scope context, binds the declared jobs capability
-// strictly, and captures the scope identity's owner data root and managed
-// env key names. Six of the seven tool values share that one instance
-// (sleep needs no instance state); no per-Session state is created here.
+// strictly, and captures the scope identity's owner data root. Six of the
+// seven tool values share that one instance (sleep needs no instance state);
+// no per-Session state is created here and no environment key set is
+// captured — the command paths resolve the live subprocess environment
+// through the ToolContext's call-time producer.
 func open(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
@@ -905,7 +949,7 @@ func open(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings
 	if err != nil {
 		return runtime.Instance{}, err
 	}
-	inst := &instance{dataDir: info.DataDir, managedKeys: info.ManagedEnvKeys, jobs: jobsInst}
+	inst := &instance{dataDir: info.DataDir, jobs: jobsInst}
 	return runtime.Instance{Values: map[string]any{
 		"read_file":   readTool{inst},
 		"write_file":  writeTool{inst},

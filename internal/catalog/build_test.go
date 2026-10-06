@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"testing"
 )
 
@@ -205,6 +206,92 @@ func TestBuildRejectsTrailingBundledProviderData(t *testing.T) {
 	if len(result.Warnings) != 1 || result.Warnings[0].Kind != "bundled_config_skip" {
 		t.Fatalf("warnings = %#v, want one bundled_config_skip", result.Warnings)
 	}
+}
+
+// TestBuildLabelsModelSourcesFromSameAcceptedInputs pins the source labels
+// stamped on the effective Model entries: they come from the same bundled
+// layer, user layer, and accepted transport-bound discovery record that
+// produced each provider in the same Build loop — custom providers are
+// always user, a bundled provider's shipped model IDs are bundled, a bound
+// record's models are discovered, and every remaining effective model is
+// user. Models outside the effective catalog (a rejected provider, an
+// unadopted record model) carry no entry at all rather than a label.
+func TestBuildLabelsModelSourcesFromSameAcceptedInputs(t *testing.T) {
+	bundledTransport := Transport{BaseURL: "http://bundled.test/v1"}
+	result := Build(BuildInputs{
+		Bundled: map[string]json.RawMessage{
+			"bundled": rawProviderJSON(`{
+				"id": "bundled",
+				"transport": {"base_url": "http://bundled.test/v1", "api_key_env": ""},
+				"discovery": true,
+				"models": {"ship": {"context_window": 4096}, "overridden": {"context_window": 4096}}
+			}`),
+		},
+		UserRaw: map[string]any{
+			"bundled": map[string]any{
+				"transport": map[string]any{"base_url": "http://bundled.test/v1", "api_key_env": ""},
+				"models": map[string]any{
+					"overridden": map[string]any{"context_window": 8192},
+					"user_added": map[string]any{"context_window": 4096},
+				},
+			},
+			"custom": map[string]any{
+				"transport": map[string]any{"base_url": "http://custom.test/v1", "api_key_env": ""},
+				"discovery": true,
+				"models":    map[string]any{"mine": map[string]any{"context_window": 4096}},
+			},
+		},
+		Records: map[string]DiscoveryRecord{
+			"bundled": {TransportFingerprint: transportFingerprint(bundledTransport), Models: map[string]DiscoveredModel{
+				"found":      {ContextWindow: 4096},
+				"overridden": {ContextWindow: 1},
+			}},
+			"custom": {TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://custom.test/v1"}), Models: map[string]DiscoveredModel{
+				"unadopted": {ContextWindow: 4096},
+			}},
+			"absent": {TransportFingerprint: transportFingerprint(Transport{BaseURL: "http://nowhere.test/v1"}), Models: map[string]DiscoveredModel{
+				"unbound": {ContextWindow: 4096},
+			}},
+		},
+	})
+	want := map[string]map[string]string{
+		"bundled": {"ship": SourceBundled, "overridden": SourceBundled, "found": SourceDiscovered, "user_added": SourceUser},
+		"custom":  {"mine": SourceUser},
+	}
+	if len(result.Catalog.Providers) != len(want) {
+		t.Fatalf("accepted providers = %v, want exactly %v", providerIDs(result.Catalog), want)
+	}
+	for providerID, models := range want {
+		provider := result.Catalog.Providers[providerID]
+		if provider == nil || len(provider.Models) != len(models) {
+			t.Fatalf("provider %q effective models = %d, want %d", providerID, len(provider.Models), len(models))
+		}
+		for modelID, source := range models {
+			if got := provider.Models[modelID].Source; got != source {
+				t.Fatalf("source of %s/%s = %q, want %q", providerID, modelID, got, source)
+			}
+		}
+	}
+	if _, ok := result.Catalog.Providers["bundled"].Models["unadopted"]; ok {
+		t.Fatal("custom-provider discovery model was adopted into the bundled-provider catalog")
+	}
+	for _, absent := range []struct{ provider, model string }{
+		{"custom", "unadopted"},
+		{"bundled", "unbound"},
+	} {
+		if _, present := result.Catalog.Providers[absent.provider].Models[absent.model]; present {
+			t.Fatalf("model %s/%s carries an effective entry outside the accepted layers", absent.provider, absent.model)
+		}
+	}
+}
+
+func providerIDs(catalog *Catalog) []string {
+	out := make([]string, 0, len(catalog.Providers))
+	for id := range catalog.Providers {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestBuildIgnoresForeignDiscoveryRecord(t *testing.T) {

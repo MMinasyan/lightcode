@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/plugins/jobs"
@@ -158,8 +161,14 @@ func TestBackgroundLifecycleJobsAcrossSessions(t *testing.T) {
 // external key is present.
 func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	t.Setenv("LIGHTCODE_BG_EXTERNAL", "external-value")
-	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret")
+	if err := os.Unsetenv("LIGHTCODE_BG_MANAGED"); err != nil {
+		t.Fatal(err)
+	}
 	background := &harnessBackground{}
+	// The managed key connects through a real manager AFTER the tools
+	// plugin opened: the call-time subprocess-environment producer, not any
+	// Open-captured copy, must scrub it from the spawned job.
+	managed := config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
 	// The read loop's bounded rendezvous: every retry gets a fresh call ID,
 	// and the final assertion reads this last one — valid only after the
 	// loop observed the real output.
@@ -214,13 +223,18 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 		t.Fatalf("ConfiguredInvocationForTest: %v", err)
 	}
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		jobsPlugin:  jobs.Plugin(),
-		advertise:   []string{"run_command", "process"},
-		background:  background,
-		invocation:  invocation,
-		managedKeys: []string{"LIGHTCODE_BG_MANAGED"},
-		store:       store,
+		jobsPlugin:    jobs.Plugin(),
+		advertise:     []string{"run_command", "process"},
+		background:    background,
+		invocation:    invocation,
+		subprocessEnv: managed.SubprocessEnv,
+		store:         store,
 	})
+	// The connect happens after the plugin scope opened, before any command
+	// starts.
+	if err := managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"); err != nil {
+		t.Fatalf("managed TrySet: %v", err)
+	}
 	sessionA := th.createSession()
 	sessionB := th.createSession()
 
