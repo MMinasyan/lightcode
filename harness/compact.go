@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
@@ -106,10 +105,6 @@ func compactionPieceBudget(capture CompactCapture, previous string) int {
 // — while pre-assembly failures and cancellations return no output.
 func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture, accumulated *usageAccumulator) agent.ModelEffect {
 	attempt := exec.CompactModel
-	retry := exec.Retry
-	if retry == nil {
-		retry = standardRetryPolicy
-	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -152,50 +147,31 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			}
 			return agent.ModelSettlement{}, cause
 		}
-		// The one attempt loop lives inside the committed intent, identical
-		// to the conversation model effect's but running through the compact
-		// transport.
+		// The one shared attempt loop lives inside the committed intent,
+		// identical to the conversation model effect's but running through the
+		// compact transport.
 		var output model.Output
-		for failed := 1; ; failed++ {
-			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+		switch res := runModelAttempts(ctx, req, attempt, exec.Retry); res.kind {
+		case attemptAccepted:
+			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
+			if attemptErr != nil {
+				return settle(attemptErr)
 			}
-			stream, attemptErr := attempt(ctx, req)
-			if attemptErr == nil && stream != nil {
-				output, attemptErr = assemble(intent.expected, h.observeStream(intent.sessionID, operationID, stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
-				if attemptErr != nil {
-					return settle(attemptErr)
-				}
-				break
+			output = out
+		case attemptInterrupted:
+			return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+		case attemptInvalid:
+			return settle(res.err)
+		case attemptFailed:
+			committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: res.err.Error()}
+			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
+				terminal: OperationFailure,
+				detail:   res.err.Error(),
+				usage:    accumulated.total,
+			}); err != nil {
+				return agent.ModelSettlement{}, err
 			}
-			if attemptErr == nil || stream != nil { // exactly one stream or one error must be returned; a supplied stream closes before the boundary failure
-				if stream != nil {
-					_ = stream.Close()
-				}
-				return settle(&agent.ProtocolError{Boundary: "model", Detail: "physical model request returned neither exactly one stream nor one error"})
-			}
-			// An attempt failure observed under a done execution context
-			// settles the interruption outcome before any classification.
-			if ctx.Err() != nil {
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
-			}
-			delay, again := retry(attemptErr, failed)
-			if !again || delay < 0 {
-				committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: attemptErr.Error()}
-				if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
-					terminal: OperationFailure,
-					detail:   attemptErr.Error(),
-					usage:    accumulated.total,
-				}); err != nil {
-					return agent.ModelSettlement{}, err
-				}
-				return committed, nil
-			}
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
-			}
+			return committed, nil
 		}
 		// The piece's reported usage joins the accumulator before its
 		// settlement; a piece reporting no usage contributes nothing.
