@@ -1533,6 +1533,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// second Operation is blocked: selected_model follows the reloaded
 		// catalog under the response's captured configuration revision, while
 		// the active Operation keeps its captured model and window.
+		awaitRestorableSession(t, r, active) // terminal publication can precede run-slot retirement
 		secondGate := make(chan struct{})
 		e.prep.modelGate = secondGate
 		releaseSecond := sync.OnceFunc(func() { close(secondGate) })
