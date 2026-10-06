@@ -70,25 +70,30 @@ func validateContentFragment(f ContentFragment) error {
 	return nil
 }
 
-// NewStreamDelta validates in (nonnegative fragment positions including nil-checked pointer tool positions; closed content-fragment kinds and field exclusivity with empty transient pieces allowed; well-formed extra JSON at every scope) and returns an independent owned copy: content/tool extras are deep-copied at the accepting boundary. Role strings and finish reasons pass through as raw wire data; usage pointers are copied by value so caller mutations cannot reach retained deltas.
-func NewStreamDelta(in StreamDelta) (StreamDelta, error) {
+// ValidateStreamDelta applies exactly the NewStreamDelta accepting rules — nonnegative fragment positions including nil-checked pointer tool positions; closed content-fragment kinds and field exclusivity with empty transient pieces allowed; well-formed extra JSON at every scope — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original delta.
+func ValidateStreamDelta(in StreamDelta) error {
 	for _, frag := range in.ContentFragments {
 		if frag.Position < 0 {
-			return StreamDelta{}, fmt.Errorf("%w: content fragment position %d", ErrInvalidPosition, frag.Position)
+			return fmt.Errorf("%w: content fragment position %d", ErrInvalidPosition, frag.Position)
 		}
 		if err := validateContentFragment(frag); err != nil {
-			return StreamDelta{}, fmt.Errorf("content fragment at position %d: %w", frag.Position, err)
+			return fmt.Errorf("content fragment at position %d: %w", frag.Position, err)
 		}
 	}
 	for i, frag := range in.ToolFragments {
 		if frag.Position != nil && *frag.Position < 0 {
-			return StreamDelta{}, fmt.Errorf("%w: tool call fragment position %d", ErrInvalidPosition, *frag.Position)
+			return fmt.Errorf("%w: tool call fragment position %d", ErrInvalidPosition, *frag.Position)
 		}
 		if err := validateExtraValues(frag.Extra); err != nil {
-			return StreamDelta{}, fmt.Errorf("tool call fragment[%d]: %w", i, err)
+			return fmt.Errorf("tool call fragment[%d]: %w", i, err)
 		}
 	}
-	if err := validateExtraValues(in.MessageExtra); err != nil {
+	return validateExtraValues(in.MessageExtra)
+}
+
+// NewStreamDelta validates in (nonnegative fragment positions including nil-checked pointer tool positions; closed content-fragment kinds and field exclusivity with empty transient pieces allowed; well-formed extra JSON at every scope) and returns an independent owned copy: content/tool extras are deep-copied at the accepting boundary. Role strings and finish reasons pass through as raw wire data; usage pointers are copied by value so caller mutations cannot reach retained deltas.
+func NewStreamDelta(in StreamDelta) (StreamDelta, error) {
+	if err := ValidateStreamDelta(in); err != nil {
 		return StreamDelta{}, err
 	}
 

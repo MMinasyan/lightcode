@@ -77,41 +77,49 @@ func finalizedPartNonEmpty(p ContentPart) bool {
 	return p.Text != "" || p.URL != "" || p.OpaqueWireType != "" || len(p.Extra.Finalize()) > 0
 }
 
-// NewOutput validates in and returns an independent owned copy. Rules enforced — closed status set; complete nonzero output source; present messages are re-validated at this trust boundary (closed role, per-role field combinations) and must be assistant-role carrying exactly the output's own source identity; completed requires one message with an eligible payload plus empty detail; errored/interrupted require non-empty detail and a tool-call-free optional partial message. Usage pointers are copied by value so caller mutations never reach retained outputs.
-func NewOutput(in Output) (Output, error) {
+// ValidateOutput applies exactly the NewOutput accepting rules — closed status set; complete nonzero output source; present messages re-validated at this trust boundary (closed role, per-role field combinations) and assistant-role carrying exactly the output's own source identity; completed requires one message with an eligible payload plus empty detail; errored/interrupted require non-empty detail and a tool-call-free optional partial message — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original value.
+func ValidateOutput(in Output) error {
 	if !validOutputStatus(in.Status) {
-		return Output{}, fmt.Errorf("%w: %q", ErrInvalidStatus, in.Status)
+		return fmt.Errorf("%w: %q", ErrInvalidStatus, in.Status)
 	}
 	if !in.Source.complete() {
-		return Output{}, fmt.Errorf("%w: output requires a complete source model identity, got zero or partial ref", ErrMissingSource)
+		return fmt.Errorf("%w: output requires a complete source model identity, got zero or partial ref", ErrMissingSource)
 	}
 
 	switch in.Status {
 	case OutputCompleted:
 		if in.Message == nil {
-			return Output{}, fmt.Errorf("%w: completed output requires one assistant message", ErrMissingField)
+			return fmt.Errorf("%w: completed output requires one assistant message", ErrMissingField)
 		}
 		if err := validateOutputMessage(*in.Message, in.Source); err != nil {
-			return Output{}, err
+			return err
 		}
 		if !hasAssistantPayload(in.Message) {
-			return Output{}, errors.New("completed output requires an assistant payload (content parts, refusal, tool calls, or finalized extras)")
+			return errors.New("completed output requires an assistant payload (content parts, refusal, tool calls, or finalized extras)")
 		}
 		if in.Detail != "" {
-			return Output{}, fmt.Errorf("%w: completed output must carry empty detail", ErrForbiddenField)
+			return fmt.Errorf("%w: completed output must carry empty detail", ErrForbiddenField)
 		}
 	default: // errored/interrupted may omit the message entirely.
 		if in.Message != nil {
 			if err := validateOutputMessage(*in.Message, in.Source); err != nil {
-				return Output{}, err
+				return err
 			}
 			if len(in.Message.ToolCalls) > 0 {
-				return Output{}, errors.New("errored or interrupted output message must not carry tool calls")
+				return errors.New("errored or interrupted output message must not carry tool calls")
 			}
 		}
 		if in.Detail == "" {
-			return Output{}, fmt.Errorf("%w: %s output requires non-empty detail", ErrMissingField, string(in.Status))
+			return fmt.Errorf("%w: %s output requires non-empty detail", ErrMissingField, string(in.Status))
 		}
+	}
+	return nil
+}
+
+// NewOutput validates in and returns an independent owned copy. Rules enforced — closed status set; complete nonzero output source; present messages are re-validated at this trust boundary (closed role, per-role field combinations) and must be assistant-role carrying exactly the output's own source identity; completed requires one message with an eligible payload plus empty detail; errored/interrupted require non-empty detail and a tool-call-free optional partial message. Usage pointers are copied by value so caller mutations never reach retained outputs.
+func NewOutput(in Output) (Output, error) {
+	if err := ValidateOutput(in); err != nil {
+		return Output{}, err
 	}
 
 	out := in

@@ -51,9 +51,14 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 			}
 			return TerminalResult{}, err // any other non-nil source error is infrastructure and wins over concurrent cancellation: returned with no terminal result.
 		}
-		req, err := model.NewRequest(model.Request{Messages: msgs, Tools: advertised.Tools}) // role-specific message invariants re-validate at this trust boundary; the request owns deep copies while the advertised list stays the entry-owned immutable one.
+		req, err := model.NewRequest(model.Request{Messages: msgs}) // fresh context messages validate and own at this trust boundary; the advertised tools were entry-validated once and attach below without repeating schema validation.
 		if err != nil {
 			return TerminalResult{}, fmt.Errorf("%w: %v", newBoundaryViolation("agent", "context snapshot is invalid"), err)
+		}
+		req.Tools = make([]model.ToolDefinition, len(advertised.Tools)) // one fresh deep copy of the entry-validated tool list per request: model-effect callbacks never gain an alias to the immutable advertised baseline, so their mutations cannot reach later requests or the invocation input.
+		for i, def := range advertised.Tools {
+			def.Parameters = model.CloneRaw(def.Parameters)
+			req.Tools[i] = def
 		}
 
 		if ctx.Err() != nil {
@@ -71,7 +76,7 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 		if err := cb.settlementFailure(set.Output); err != nil { // the callback discipline behind the settlement gates it before anything else: an ignored protocol or invalid-call failure cannot settle.
 			return TerminalResult{}, err
 		}
-		if _, err := ValidateModelSettlement(inv.ExpectedModel, set); err != nil { // the exported validator; Run discards the owned copy and keeps its original settlement and output pointer.
+		if _, err := validateSettlement(set, inv.ExpectedModel, false); err != nil { // the read-only settlement path: the same closed table and expected-identity rules without an ownership copy, so Run keeps its original settlement and output pointer.
 			return TerminalResult{}, err
 		}
 

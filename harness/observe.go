@@ -195,10 +195,11 @@ func (h *Harness) observeStream(sessionID, operationID string, stream model.Stre
 // delta contributes one fact per nonempty fragment. An empty, non-text, or
 // invalid delta emits nothing, and a delta returned together with an error
 // (EOF included) emits nothing; the original delta and error are always
-// returned exactly as received. A delta's positioned content-text fragments
-// are emitted before its refusal fragment, and refusal emits no position. No
-// reasoning, tool, or finish fragment is interpreted, and no second
-// assembler or accumulator exists.
+// returned exactly as received — the validation gate reads the same contract
+// the constructor enforces without building an owned copy. A delta's
+// positioned content-text fragments are emitted before its refusal fragment,
+// and refusal emits no position. No reasoning, tool, or finish fragment is
+// interpreted, and no second assembler or accumulator exists.
 type observedStream struct {
 	inner model.Stream
 	emit  func(kind HarnessFactKind, position int, content string)
@@ -209,17 +210,16 @@ func (s observedStream) Recv() (model.StreamDelta, error) {
 	if err != nil || !delta.HasChoice {
 		return delta, err
 	}
-	owned, verr := model.NewStreamDelta(delta) // validation gate only; the original delta is returned unchanged
-	if verr != nil {
+	if verr := model.ValidateStreamDelta(delta); verr != nil { // validation gate only; the original delta is returned unchanged
 		return delta, err
 	}
-	for _, fragment := range owned.ContentFragments {
+	for _, fragment := range delta.ContentFragments {
 		if fragment.Kind == model.PartText && fragment.Text != "" {
 			s.emit(FactTextDelta, fragment.Position, fragment.Text)
 		}
 	}
-	if owned.RefusalFragment != "" {
-		s.emit(FactRefusalDelta, 0, owned.RefusalFragment)
+	if delta.RefusalFragment != "" {
+		s.emit(FactRefusalDelta, 0, delta.RefusalFragment)
 	}
 	return delta, err
 }

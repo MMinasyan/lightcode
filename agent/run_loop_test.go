@@ -48,6 +48,57 @@ func TestRunContinuationUsesFreshSnapshotPerEffect(t *testing.T) {
 	}
 }
 
+// TestRunRequestToolsAreFreshCopiesPerEffect pins the per-request tool ownership rule: every model effect receives its own deep copy of the entry-validated advertised list — slice and Parameters bytes — so a model-effect callback mutating the handed request's tool slice and bytes in place cannot reach the immutable advertised baseline, any later request, or the invocation input.
+func TestRunRequestToolsAreFreshCopiesPerEffect(t *testing.T) {
+	f := &runFakes{}
+	advertised := advTools()
+	inv := f.invocation()
+	inv.Tools = advertised
+	var handed []model.ToolDefinition // what each request carried before the callback corrupted it
+	f.modelSet = func(call int, req model.Request, cb AssemblyCallback) (ModelSettlement, error) {
+		handed = append(handed, model.ToolDefinition{Name: req.Tools[0].Name, Parameters: append([]byte(nil), req.Tools[0].Parameters...)})
+		if len(req.Tools) > 0 { // corrupt the handed request's tool entry in place: element fields and Parameters bytes.
+			req.Tools[0].Name = "mutated"
+			if len(req.Tools[0].Parameters) > 0 {
+				req.Tools[0].Parameters[0] = 'X'
+			}
+		}
+		return setScript(
+			ModelSettlement{Disposition: DispoContinue, Output: mkOutput(model.OutputErrored, "boom", nil)},
+			ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)},
+		)(call, req, cb)
+	}
+
+	res, err := Run(context.Background(), inv)
+	if err != nil || res.Status != TerminalSuccess {
+		t.Fatalf("run = %#v, %v; want success", res, err)
+	}
+	if f.modelCalls != 2 {
+		t.Fatalf("model calls = %d, want 2", f.modelCalls)
+	}
+	// Every request started from the pristine advertised values.
+	for i, got := range handed {
+		if got.Name != "t" || string(got.Parameters) != `{"type":"object"}` {
+			t.Fatalf("request %d carried a mutated tool: %#v", i+1, got)
+		}
+	}
+	// The mutation actually landed in the recorded requests — the check above is not vacuous.
+	if f.reqs[0].Tools[0].Name != "mutated" || f.reqs[1].Tools[0].Name != "mutated" {
+		t.Fatalf("recorded requests show %q/%q, want the callback's in-place mutations", f.reqs[0].Tools[0].Name, f.reqs[1].Tools[0].Name)
+	}
+	// The invocation input keeps exactly its own entry values.
+	if advertised[0].Name != "t" || string(advertised[0].Parameters) != `{"type":"object"}` {
+		t.Fatalf("advertised baseline mutated through a request alias: %#v", advertised[0])
+	}
+	// Each request owns independent storage: no request aliases the advertised bytes, and successive requests share nothing.
+	if &f.reqs[0].Tools[0].Parameters[0] == &advertised[0].Parameters[0] {
+		t.Fatal("a request gained an alias to the advertised baseline bytes")
+	}
+	if &f.reqs[0].Tools[0].Parameters[0] == &f.reqs[1].Tools[0].Parameters[0] {
+		t.Fatal("successive requests share tool Parameters backing")
+	}
+}
+
 // TestRunToolBatchSettlesInOrderThenContinues pins sequential in-order dispatch with a settled complete non-interrupted batch feeding the next fresh-context effect, which then ends the run.
 func TestRunToolBatchSettlesInOrderThenContinues(t *testing.T) {
 	f := &runFakes{}
