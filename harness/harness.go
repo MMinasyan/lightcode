@@ -205,7 +205,8 @@ type Harness struct {
 
 // pendingMessage is one buffered Submit: a process-local FIFO item that is
 // neither a durable Operation nor a Session entry while it waits, carries no
-// idempotency, and is discarded on Harness-context loss.
+// idempotency, and is discarded on Harness-context loss. A delivery's
+// selected head stays buffered until its one attempt resolves.
 type pendingMessage struct {
 	operationID string
 	origin      InputOrigin
@@ -991,6 +992,26 @@ func (c *coordinator) discardBuffers() bool {
 	return changed
 }
 
+// dropBufferedLocked removes one delivery's previously selected pending item
+// from the head of whichever buffer still holds it, reporting whether it
+// removed anything. The caller holds the coordinator mutex. Only the exact
+// selected item matches: a concurrently discarded buffer's new head is never
+// removed.
+func (c *coordinator) dropBufferedLocked(item *pendingMessage) bool {
+	if item == nil {
+		return false
+	}
+	if len(c.steering) > 0 && c.steering[0] == item {
+		c.steering = c.steering[1:]
+		return true
+	}
+	if len(c.queued) > 0 && c.queued[0] == item {
+		c.queued = c.queued[1:]
+		return true
+	}
+	return false
+}
+
 // invalidate marks one coordinator absent under the caller-held coordinator
 // mutex: it clears the process-local buffers and sets the gone flag in the
 // same critical section as the deletion commit's adoption, so no holder can
@@ -1172,6 +1193,9 @@ type admissionRequest struct {
 	Kind        RequestKind
 	Origin      InputOrigin
 	Content     []model.ContentPart
+	// buffered identifies a drain's head for removal during adoption; nil
+	// leaves the FIFOs unchanged for ordinary admissions.
+	buffered *pendingMessage
 }
 
 // errAdmissionExisting aborts the admission transaction once the conflicting
@@ -1474,6 +1498,8 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 	}
 	c.graph.Operations = append(c.graph.Operations, published)
 	c.graph.Session = newSession
+	// The durable advance also publishes removal of the selected FIFO head.
+	c.dropBufferedLocked(req.buffered)
 	c.mu.Unlock()
 	h.observeInvalidation(c) // the durable admission advance
 	return published, false, nil
@@ -1657,15 +1683,11 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	}()
 }
 
-// drainBuffers runs the post-terminal buffer drain after the terminal commit:
-// undelivered steering first, then queued input, each in FIFO order through
-// ordinary admission. Every item receives one scheduled delivery attempt; a
-// failed attempt is final for the item and the drain advances to the next
-// buffered message. A successful admission starts the next execution, whose
-// own terminal re-drains. Harness-context loss discards both buffers without
-// delivery attempts. An empty FIFO scan retires this run's slot in the same
-// critical section — never a replacement run's — so no window remains where
-// the Session looks active without a pending drain.
+// drainBuffers delivers steering before queued input after terminal commit.
+// A selected head stays pending until admission or final failure/duplicate.
+// Successful admission starts the successor; failure advances to the next
+// head. Harness loss discards both FIFOs. An empty scan retires only this run
+// under the same hold, never a successor's slot.
 func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
@@ -1692,9 +1714,9 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 		var item *pendingMessage
 		switch {
 		case len(c.steering) > 0:
-			item, c.steering = c.steering[0], c.steering[1:]
+			item = c.steering[0] // peek: the head stays pending while its delivery is unresolved
 		case len(c.queued) > 0:
-			item, c.queued = c.queued[0], c.queued[1:]
+			item = c.queued[0]
 		default: // the FIFO scan is empty: retire this run's slot in the same critical section
 			retired := false
 			if c.run == run { // never clear a replacement run
@@ -1708,18 +1730,28 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 			}
 			return
 		}
-		c.bumpLocalRevision() // the pop is a coordinator-local publication; the delivery attempt happens outside this hold
 		c.mu.Unlock()
-		h.observeInvalidation(c)
 		rec, prepared, disposition, err := h.admitReserved(h.ctx, c, admissionRequest{
 			SessionID:   sessionID,
 			OperationID: item.operationID,
 			Kind:        RequestKindMessage,
 			Origin:      item.origin,
 			Content:     item.content,
+			buffered:    item,
 		})
 		if err != nil || disposition != DispositionAdmitted || prepared == nil {
-			continue // one failed delivery attempt is final for the item; the next proceeds
+			// one failed delivery attempt is final for the item: the selected
+			// head leaves its buffer as the attempt's final outcome
+			c.mu.Lock()
+			dropped := c.dropBufferedLocked(item)
+			if dropped {
+				c.bumpLocalRevision()
+			}
+			c.mu.Unlock()
+			if dropped {
+				h.observeInvalidation(c)
+			}
+			continue // the next buffered message proceeds
 		}
 		h.startExecution(c, rec.Admission.OperationID, *prepared)
 		return

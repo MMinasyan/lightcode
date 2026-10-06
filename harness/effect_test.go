@@ -750,10 +750,10 @@ func TestSteeringInputHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); err != nil {
+	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); err != nil {
 		t.Fatalf("commitSteeringInput: %v", err)
 	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginRuntime, admissionContent("steered-by-runtime")); err != nil {
+	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginRuntime, content: admissionContent("steered-by-runtime")}); err != nil {
 		t.Fatalf("commitSteeringInput with a non-user origin: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -878,7 +878,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 	t.Run("steering transaction", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrConflict) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrConflict) {
 			t.Fatalf("steering over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
@@ -943,7 +943,7 @@ func TestSteeringInputPreconditions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("graph before steering: %v", err)
 		}
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering after terminal settlement = %v, want ErrInvalid", err)
 		}
 		after, err := validateFixture(t, store, sessionID)
@@ -963,7 +963,7 @@ func TestSteeringInputPreconditions(t *testing.T) {
 			t.Fatalf("terminal effect: %v", err)
 		}
 		archiveSettledSession(t, c, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering on an archived session = %v, want ErrInvalid", err)
 		}
 		after, err := validateFixture(t, store, sessionID)
@@ -1055,7 +1055,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 	t.Run("steering over a foreign archive", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		foreignArchive(t, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steering")); !errors.Is(err, ErrInvalid) {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("steering over a foreign archive = %v, want ErrInvalid", err)
 		}
 	})

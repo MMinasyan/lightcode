@@ -269,8 +269,10 @@ func TestPublicSnapshotSessionReadsAndOwns(t *testing.T) {
 
 // TestPublicSnapshotSessionPendingPublications proves the pending FIFO and
 // ExecutionBusy rows over both stores: each Submit's reservation, buffer
-// enqueue, and release advance the local revision; a popped item leaves the
-// buffer before its durable delivery; Harness loss discards the buffers.
+// enqueue, and release advance the local revision; a delivery's selected head
+// stays pending until its attempt resolves — a parked queued admission is
+// still listed while it prepares, and the adoption removes it in the same
+// critical section; Harness loss discards the buffers.
 func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -279,12 +281,17 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
 		// preparation call 0 is op-1's admission; the post-terminal drain's
-		// admission parks on its gate so the popped-but-uncommitted state
-		// stays stable. The steering item is not on this path: a waiting
+		// admission parks on its gate so the selected-but-unresolved delivery
+		// state stays stable. The steering item is not on this path: a waiting
 		// steering item continues the completed turn, and its boundary
 		// delivers the input under the running Operation's identity.
 		prepGate := make(chan struct{})
 		drainGate := make(chan struct{})
+		releasePrep := sync.OnceFunc(func() { close(prepGate) })
+		releaseDrain := sync.OnceFunc(func() { close(drainGate) })
+		defer releasePrep()
+		defer releaseDrain()
+		defer script.releaseGate()
 		f.prepareHook = func(call int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 			switch call {
 			case 0:
@@ -324,7 +331,7 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if reserved.LocalRevision != baseline.LocalRevision+1 {
 			t.Fatalf("reservation revision = %d, want %d", reserved.LocalRevision, baseline.LocalRevision+1)
 		}
-		close(prepGate) // op-1's preparation proceeds
+		releasePrep() // op-1's preparation proceeds
 		<-submitDone
 		<-script.arrived // the run is parked at its boundary
 		installed, err := f.h.SnapshotSession(ctx, session)
@@ -366,26 +373,31 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		}
 
 		// Releasing the boundary lets op-1's completed turn continue for the
-		// waiting steering item: that boundary pops op-3 and commits its
-		// content as an op-1-owned input, op-1 settles, and the post-terminal
-		// drain pops op-2 and parks in its admission preparation.
+		// waiting steering item: that boundary commits op-3's content as an
+		// op-1-owned input — the selected head leaves the buffer in the
+		// adoption section — op-1 settles, and the post-terminal drain selects
+		// op-2 and parks in its admission preparation with the queued head
+		// still pending.
 		script.releaseGate()
 		<-script.arrived // the continuation turn for the waiting steering item
 		<-f.prepare      // the drain admission of op-2 is preparing
-		popped, err := f.h.SnapshotSession(ctx, session)
+		parked, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after the pops: %v", err)
+			t.Fatalf("snapshot during the parked delivery: %v", err)
 		}
-		if len(popped.Steering) != 0 || len(popped.Queued) != 0 {
-			t.Fatalf("buffers after the pops = %+v / %+v", popped.Steering, popped.Queued)
+		if len(parked.Steering) != 0 {
+			t.Fatalf("steering buffer during the parked delivery = %+v, want the adopted input's head gone", parked.Steering)
 		}
-		for _, op := range popped.Operations {
+		if len(parked.Queued) != 1 || parked.Queued[0].OperationID != "op-2" {
+			t.Fatalf("queued buffer during the parked delivery = %+v, want the selected head still pending", parked.Queued)
+		}
+		for _, op := range parked.Operations {
 			if op.Admission.OperationID == "op-2" || op.Admission.OperationID == "op-3" {
-				t.Fatalf("the popped item %s committed before its delivery completed", op.Admission.OperationID)
+				t.Fatalf("the pending item %s committed before its delivery completed", op.Admission.OperationID)
 			}
 		}
 		steered := false
-		for _, fact := range popped.Facts {
+		for _, fact := range parked.Facts {
 			if fact.Input != nil && fact.Input.OperationID == "op-1" && fact.Input.Content[0].Text == "steer-1" {
 				steered = true // the steering delivery adopted at its durable commit
 			}
@@ -393,11 +405,13 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if !steered {
 			t.Fatalf("the delivered steering input is missing from the committed facts")
 		}
-		// the boundary's steering pop plus the drain's reservation and pop
-		if popped.LocalRevision != buffered.LocalRevision+3 {
-			t.Fatalf("popped revision = %d, want %d", popped.LocalRevision, buffered.LocalRevision+3)
+		// the drain's reservation is the only local publication between the
+		// buffering and the parked admission: the steering delivery's removal
+		// rode its durable adoption
+		if parked.LocalRevision != buffered.LocalRevision+1 {
+			t.Fatalf("parked revision = %d, want %d", parked.LocalRevision, buffered.LocalRevision+1)
 		}
-		close(drainGate) // op-2 admits, runs, and settles
+		releaseDrain()   // op-2 admits, runs, and settles
 		<-script.arrived // the admitted Operation's execution started
 		awaitTerminal(t, f.h, session, "op-2")
 		if err := converge(t, f); err != nil {

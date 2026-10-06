@@ -301,10 +301,12 @@ func TestObserveRunLifecycle(t *testing.T) {
 }
 
 // TestObserveBufferClocks proves the buffer clocks: the active enqueue, the
-// steering pop with its durable delivery, the drain pop, and the Harness-loss
-// discard each emit exactly when the counter advances.
+// steering delivery's durable commit, the drain's admission, and the
+// Harness-loss discard each emit exactly when the counter advances. A
+// delivery's head selection publishes nothing: the removal rides the durable
+// adoption, or is the failed attempt's final outcome under its own hold.
 func TestObserveBufferClocks(t *testing.T) {
-	t.Run("active enqueue and steering pop", func(t *testing.T) {
+	t.Run("active enqueue and steering delivery", func(t *testing.T) {
 		h, _, c, sessionID := newEffectHarness(t, nil)
 		col := observeHarness(h)
 		base := snapshotPair(t, h, sessionID)
@@ -325,13 +327,13 @@ func TestObserveBufferClocks(t *testing.T) {
 		col.reset()
 		h.drainSteering(context.Background(), c, testOpID)
 		facts = col.invalidations()
-		if len(facts) != 2 {
-			t.Fatalf("steering delivery facts = %d, want the pop and the durable input commit", len(facts))
+		if len(facts) != 1 {
+			t.Fatalf("steering delivery facts = %d, want exactly the durable input commit (the selection publishes nothing)", len(facts))
 		}
-		wantPairAt(t, h, sessionID, base.DurableRevision+1, base.LocalRevision+4) // pop then durable steering input
+		wantPairAt(t, h, sessionID, base.DurableRevision+1, base.LocalRevision+3) // the durable steering input; the removal rode its adoption
 	})
 
-	t.Run("drain pop and admission", func(t *testing.T) {
+	t.Run("drain selection and admission", func(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(parkedPrepared())
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
@@ -360,10 +362,10 @@ func TestObserveBufferClocks(t *testing.T) {
 
 		h.drainBuffers(c, run)
 		facts := col.invalidations()
-		if len(facts) != 5 {
-			t.Fatalf("drain facts = %d, want reservation, pop, admission, installation and release", len(facts))
+		if len(facts) != 4 {
+			t.Fatalf("drain facts = %d, want reservation, admission, installation and release (the selection publishes nothing)", len(facts))
 		}
-		wantPairAt(t, h, testSessionID, base.DurableRevision+1, base.LocalRevision+4) // one durable admission, four local publications
+		wantPairAt(t, h, testSessionID, base.DurableRevision+1, base.LocalRevision+3) // one durable admission — the removal rode it — and three local publications
 	})
 
 	t.Run("harness-loss discard", func(t *testing.T) {
@@ -642,7 +644,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 
 		col.reset()
 		steeringBase := snapshotPair(t, h, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steer")); err != nil {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steer")}); err != nil {
 			t.Fatalf("commitSteeringInput: %v", err)
 		}
 		facts = col.invalidations()
@@ -950,7 +952,7 @@ func TestObserveConcurrentCommits(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, InputOriginUser, admissionContent("steer")); err != nil {
+		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steer")}); err != nil {
 			t.Errorf("second commit: %v", err)
 		}
 	}()
