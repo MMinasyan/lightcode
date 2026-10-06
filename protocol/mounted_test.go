@@ -156,7 +156,9 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	// and joined before the owner and temporary roots are torn down.
 	nodeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(nodeCtx, vitest, "run", "protocol-mounted.test.js")
+	// This composed run uses the Go-owned deadline, not Vitest's unit-test
+	// timeout across its entire sequence of real backend calls.
+	cmd := exec.CommandContext(nodeCtx, vitest, "run", "protocol-mounted.test.js", "--testTimeout", "0")
 	cmd.Dir = frontendDir
 	cmd.Env = append(os.Environ(), mountedDiscoveryEnv+"="+record)
 	cmd.WaitDelay = 15 * time.Second
