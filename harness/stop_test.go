@@ -1069,12 +1069,12 @@ func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 		!strings.Contains(err.Error(), "session has live background work; stop it first") {
 		t.Fatalf("ArchiveSession = %v, want the live-background rejection", err)
 	}
-	deleted, err := h.Sweep(context.Background(), SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
+	deleted, err := h.SweepSession(context.Background(), testSessionID, SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
 	if err != nil {
-		t.Fatalf("Sweep: %v", err)
+		t.Fatalf("SweepSession: %v", err)
 	}
-	if len(deleted) != 0 {
-		t.Fatalf("Sweep deleted %v, want the live member to skip the Session", deleted)
+	if deleted {
+		t.Fatalf("SweepSession deleted the Session, want the live member to skip it")
 	}
 	rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 	if err != nil {

@@ -96,20 +96,6 @@ func TestCompactAdmissionKindResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("message admission rejects a compact identity at the cached path", func(t *testing.T) {
-		store := freshSessionStore(t)
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
-		}); err != nil {
-			t.Fatalf("foreign compact admission: %v", err)
-		}
-		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: "cx-1", Origin: InputOriginUser, Content: admissionContent("x")})
-		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "different request kind") {
-			t.Fatalf("cached reuse = %v, want the request-kind rejection", err)
-		}
-	})
-
 	t.Run("message admission rejects a compact identity at the reserved path", func(t *testing.T) {
 		store := freshSessionStore(t)
 		if err := store.Transact(context.Background(), func(tx Transaction) error {

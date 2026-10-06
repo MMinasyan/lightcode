@@ -1,11 +1,11 @@
 package runtime
 
 // Automatic lifecycle-sweep scheduling tests: the retained startup/hourly
-// cadence drives the existing Harness.Sweep transition under the sampled
-// session policy, with controlled tick streams, one owned loop, ordinary
-// admitted-call join, and the retained stderr diagnostic. Each case runs on
-// the real owner over memory and temporary SQLite through the existing
-// fixtures; HOME and bundled credentials are isolated.
+// cadence drives the existing Harness.SweepSession transition under the
+// sampled session policy, with controlled tick streams, one owned loop,
+// ordinary admitted-call join, and the retained stderr diagnostic. Each case
+// runs on the real owner over memory and temporary SQLite through the
+// existing fixtures; HOME and bundled credentials are isolated.
 
 import (
 	"bytes"
@@ -759,9 +759,11 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 }
 
 // TestMaintenancePassSweepsValidSiblingsAroundCorruption proves the
-// corruption axis through the retained scheduler using the Harness
-// semantics: a corrupt Session's durable state is left exactly in place, the
-// eligible sibling is archived, and the pass reports no failure.
+// corruption and omitted-row axis through the retained scheduler using the
+// Harness semantics: a corrupt Session's durable state is left exactly in
+// place, a malformed listed identity and a register corrupt before its first
+// materialization are both omitted, the eligible sibling is archived, and the
+// pass reports no failure.
 func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
@@ -785,6 +787,25 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		bad := rewriteSessionRegister(t, wrapped, corrupted.Identity.SessionID, func(state map[string]json.RawMessage) {
 			state["lifecycle"] = json.RawMessage(`"bogus"`)
 		})
+
+		// Two more rows the same pass must omit: a listed identity that
+		// violates the durable shape is skipped before any materialization,
+		// and a valid identity whose register is corrupt before its first
+		// materialization is omitted when the enumeration discovers the
+		// corruption. Neither is acted on and neither is reported.
+		const malformed = "corrupt-id"                        // non-empty, not the durable 32-hex shape
+		const preCorrupt = "fedcba9876543210fedcba9876543210" // valid hex, corrupt register
+		for _, row := range []string{malformed, preCorrupt} {
+			if err := wrapped.Transact(context.Background(), func(tx harness.Transaction) error {
+				_, err := tx.InsertRegister(harness.RegisterDraft{
+					Key:     harness.RegisterKey{SessionID: row, Kind: harness.RegisterSession},
+					Payload: json.RawMessage(`{}`),
+				})
+				return err
+			}); err != nil {
+				t.Fatalf("plant row %q: %v", row, err)
+			}
+		}
 		stderr := captureSweepStderr(t)
 		tick := valid.State.LastActivity.Add(100 * time.Hour)
 		sendTick(t, ticks, tick)
@@ -808,6 +829,11 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		}
 		if after := readSweepRegister(t, wrapped, corrupted.Identity.SessionID); after.Revision != bad.Revision || !bytes.Equal(after.Payload, bad.Payload) {
 			t.Fatalf("the sweep changed the corrupt register (%d -> %d), want it left in place", bad.Revision, after.Revision)
+		}
+		for _, id := range []string{malformed, preCorrupt} {
+			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); err != nil {
+				t.Fatalf("omitted row %s after the pass = err %v, want it left in place", id, err)
+			}
 		}
 		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
 			t.Fatalf("the corrupt sibling was reported as a pass failure: %q", out)
@@ -1383,7 +1409,7 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 }
 
 // TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion proves the
-// batch warning cleanup over the broad sweep loop: with the third stale
+// batch warning cleanup over the sweep pass: with the third stale
 // archived Session's deletion rolled back, both committed deletions — and only
 // those — have their Session warning groups removed before the pass error
 // returns, in one observation section with exactly one runtime-scoped

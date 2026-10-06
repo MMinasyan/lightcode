@@ -240,8 +240,9 @@ func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinato
 // the Session's admission reservation, re-evaluates the same priority under
 // it — a run installed while the reservation waited re-routes to steering,
 // lost receivability to the closed path — and admits through the held
-// reservation, installing the execution before releasing it. admit is not
-// used because it would reserve recursively. A reserve failure resolves to
+// reservation, installing the execution before releasing it. The reserved
+// body runs directly because the reservation is already held: a wrapper that
+// takes its own reservation would deadlock against itself. A reserve failure resolves to
 // the closed path; an admission failure is final: no retry and no fallback
 // signal write.
 func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember, parts []model.ContentPart, content string) error {

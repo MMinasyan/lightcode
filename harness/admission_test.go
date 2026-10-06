@@ -169,19 +169,24 @@ func admissionContent(text string) []model.ContentPart {
 	return []model.ContentPart{{Kind: model.PartText, Text: text}}
 }
 
+// mustAdmit submits one regular message through public Submit and returns
+// the public result's operation record and disposition.
 func mustAdmit(t *testing.T, h *Harness, sessionID, operationID string, content []model.ContentPart) (OperationRecord, SubmitDisposition) {
 	t.Helper()
-	rec, disposition, err := h.admit(context.Background(), admissionRequest{
+	res, err := h.Submit(context.Background(), SubmitRequest{
 		SessionID:   sessionID,
 		OperationID: operationID,
-		Kind:        RequestKindMessage,
 		Origin:      InputOriginUser,
 		Content:     content,
+		Mode:        MessageModeRegular,
 	})
 	if err != nil {
-		t.Fatalf("admit: %v", err)
+		t.Fatalf("Submit: %v", err)
 	}
-	return rec, disposition
+	if res.Operation == nil {
+		t.Fatalf("Submit disposition %q carried no operation record", res.Disposition)
+	}
+	return *res.Operation, res.Disposition
 }
 
 // storedSessionState reads back the store's session fixtures for one Session.
@@ -321,7 +326,7 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 		return err
 	}())
 	wantCorruption(t, func() error {
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: "op-9", Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: "op-9", Origin: InputOriginUser, Mode: MessageModeRegular})
 		return err
 	}())
 
@@ -376,7 +381,7 @@ func TestChangeAgentType(t *testing.T) {
 func TestAdmissionSessionPreconditions(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-	if _, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: otherSession(), OperationID: testOpID, Origin: InputOriginUser}); !errors.Is(err, ErrNotFound) {
+	if _, err := h.Submit(context.Background(), SubmitRequest{SessionID: otherSession(), OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent session admission = %v, want ErrNotFound", err)
 	}
 	archived := &testGraph{session: validSessionRecord()}
@@ -384,7 +389,7 @@ func TestAdmissionSessionPreconditions(t *testing.T) {
 	archived.session.State.Lifecycle = LifecycleArchived
 	archived.session.State.ArchivedAt = &stamped
 	archivedHarness := newTestHarness(t, archived.storage(t), newPrepareStub(validPrepared()).prepare)
-	if _, _, err := archivedHarness.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser}); !errors.Is(err, ErrInvalid) {
+	if _, err := archivedHarness.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("archived session admission = %v, want ErrInvalid", err)
 	}
 }
@@ -405,7 +410,7 @@ func TestAdmissionInputValidation(t *testing.T) {
 		{"invalid content part", testOpID, InputOriginUser, []model.ContentPart{{Kind: model.PartKind("bogus")}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: tc.operationID, Origin: tc.origin, Content: tc.content})
+			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: tc.operationID, Origin: tc.origin, Content: tc.content, Mode: MessageModeRegular})
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatalf("invalid input = %v, want ErrInvalid", err)
 			}
@@ -522,7 +527,7 @@ func TestAdmissionPreparationContract(t *testing.T) {
 				mutate(&prepared)
 				store := freshSessionStore(t)
 				h := newTestHarness(t, store, newPrepareStub(prepared).prepare)
-				_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x")})
+				_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x"), Mode: MessageModeRegular})
 				if !errors.Is(err, ErrInvalid) {
 					t.Fatalf("invalid prepared execution = %v, want ErrInvalid", err)
 				}
@@ -540,7 +545,7 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		stub.err = prepErr
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, stub.prepare)
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		if err != prepErr {
 			t.Fatalf("preparation error = %v, want the exact callback error", err)
 		}
@@ -559,7 +564,7 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := h.admit(ctx, admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+			_, err := h.Submit(ctx, SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 			done <- err
 		}()
 		<-stub.arrived // the callback is parked
@@ -611,7 +616,7 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		first := make(chan struct{}, 1)
 		go func() {
-			if _, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("first")}); err != nil {
+			if _, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("first"), Mode: MessageModeRegular}); err != nil {
 				t.Errorf("first admission: %v", err)
 			}
 			first <- struct{}{}
@@ -633,14 +638,14 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		second := make(chan struct{}, 1)
 		go func() {
-			rec, disposition, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("second")})
+			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("second"), Mode: MessageModeRegular})
 			if err != nil {
 				t.Errorf("second admission: %v", err)
 			}
-			if disposition != DispositionExisting {
-				t.Errorf("second admission disposition = %q, want existing", disposition)
+			if res.Disposition != DispositionExisting || res.Operation == nil {
+				t.Errorf("second admission disposition = %q, want existing", res.Disposition)
 			}
-			if rec.Admission.AdmittedAt != firstAdmittedAt(t, h, testSessionID, testOpID) {
+			if res.Operation != nil && res.Operation.Admission.AdmittedAt != firstAdmittedAt(t, h, testSessionID, testOpID) {
 				t.Errorf("second admission returned a different operation")
 			}
 			second <- struct{}{}
@@ -663,7 +668,7 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 			done <- err
 		}()
 		<-stub.arrived
@@ -693,12 +698,12 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		admitted := make(chan struct{}, 1)
 		go func() {
-			rec, disposition, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 			if err != nil {
 				t.Errorf("admission: %v", err)
 			}
-			if disposition != DispositionAdmitted || rec.Admission.AgentType != "coder" {
-				t.Errorf("admitted operation = %+v disposition %q", rec, disposition)
+			if res.Disposition != DispositionAdmitted || res.Operation == nil || res.Operation.Admission.AgentType != "coder" {
+				t.Errorf("admitted operation = %+v disposition %q", res.Operation, res.Disposition)
 			}
 			admitted <- struct{}{}
 		}()
@@ -778,7 +783,7 @@ func TestAdmissionPartialFailurePublishesNothing(t *testing.T) {
 				return nil
 			}
 			h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-			_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x")})
+			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x"), Mode: MessageModeRegular})
 			if err != injected {
 				t.Fatalf("admission error = %v, want the injected failure", err)
 			}
@@ -838,11 +843,11 @@ func TestAdmissionIdempotency(t *testing.T) {
 
 		dispCh := make(chan SubmitDisposition, 1)
 		go func() {
-			_, disposition, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("raced")})
+			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("raced"), Mode: MessageModeRegular})
 			if err != nil {
 				t.Errorf("raced admission: %v", err)
 			}
-			dispCh <- disposition
+			dispCh <- res.Disposition
 		}()
 		<-stub.arrived
 
@@ -882,7 +887,7 @@ func TestAdmissionIdempotency(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		_, _, err = h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: created.Identity.SessionID, OperationID: "shared-op", Origin: InputOriginUser, Content: admissionContent("y")})
+		_, err = h.Submit(context.Background(), SubmitRequest{SessionID: created.Identity.SessionID, OperationID: "shared-op", Origin: InputOriginUser, Content: admissionContent("y"), Mode: MessageModeRegular})
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("cross-session reuse = %v, want ErrInvalid", err)
 		}
@@ -892,19 +897,6 @@ func TestAdmissionIdempotency(t *testing.T) {
 		}
 	})
 
-	t.Run("second active operation is invalid", func(t *testing.T) {
-		store := freshSessionStore(t)
-		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: "op-2", Origin: InputOriginUser, Content: admissionContent("y")})
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("second active operation = %v, want ErrInvalid", err)
-		}
-		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 1 || len(regs) != 2 {
-			t.Fatalf("rejected admission published entries %v registers %v", entries, regs)
-		}
-	})
 }
 
 // insertForeignAdmission publishes one complete admission of the given
@@ -1024,46 +1016,11 @@ func foreignArchiveChange(tx Transaction, sessionID string) error {
 }
 
 // TestAdmissionRechecksPreconditionsAfterReservation proves the open and idle
-// preconditions are re-checked against the coordinator state the reservation
-// resolved on, before preparation runs.
+// preconditions are re-checked against the durable state at the admission
+// commit: preparation may run against the stale view the reservation resolved
+// on, and a foreign archive or a committed foreign Operation refuses the
+// publication and refreshes the coordinator view.
 func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
-	t.Run("loser of a different-operation race returns invalid without preparing", func(t *testing.T) {
-		gate := make(chan struct{})
-		stub := newPrepareStub(validPrepared())
-		stub.gate = gate
-		store := freshSessionStore(t)
-		h := newTestHarness(t, store, stub.prepare)
-
-		first := make(chan struct{}, 1)
-		go func() {
-			if _, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("first")}); err != nil {
-				t.Errorf("first admission: %v", err)
-			}
-			first <- struct{}{}
-		}()
-		<-stub.arrived // the first admission is parked in preparation
-
-		lostErr := make(chan error, 1)
-		go func() {
-			_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: "op-2", Origin: InputOriginUser, Content: admissionContent("second")})
-			lostErr <- err
-		}()
-
-		close(gate)
-		<-first
-		err := <-lostErr
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("raced second admission = %v, want ErrInvalid", err)
-		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one: the loser must not prepare", got)
-		}
-		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 1 || len(regs) != 2 {
-			t.Fatalf("loser published entries %v registers %v", entries, regs)
-		}
-	})
-
 	t.Run("foreign archive between materialization and admission resolves at commit", func(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
@@ -1076,7 +1033,7 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("foreign archive: %v", err)
 		}
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("admission over a foreign archive = %v, want ErrInvalid", err)
 		}
@@ -1108,7 +1065,7 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("foreign admission: %v", err)
 		}
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("admission over a foreign running operation = %v, want ErrInvalid", err)
 		}
@@ -1142,7 +1099,7 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 			done <- err
 		}()
 		<-stub.arrived
@@ -1215,7 +1172,7 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		done <- err
 	}()
 	<-stub.arrived
@@ -1334,12 +1291,12 @@ func TestAdmitExistingBeforeLifecycle(t *testing.T) {
 	c.graph.Session.State.ArchivedAt = &stamped
 	c.mu.Unlock()
 
-	_, disposition, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("retry")})
+	res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("retry"), Mode: MessageModeRegular})
 	if err != nil {
 		t.Fatalf("retry on an archived session = %v, want the existing Operation", err)
 	}
-	if disposition != DispositionExisting {
-		t.Fatalf("retry disposition = %q, want existing", disposition)
+	if res.Disposition != DispositionExisting || res.Operation == nil {
+		t.Fatalf("retry disposition = %q, want existing", res.Disposition)
 	}
 }
 
@@ -1354,7 +1311,7 @@ func TestAdmitDeadContextSkipsPreparation(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	cancelHarness() // the harness context dies after construction, before admission
-	_, _, admitErr := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+	_, admitErr := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 	if !errors.Is(admitErr, context.Canceled) {
 		t.Fatalf("admission over a dead harness context = %v, want a context error", admitErr)
 	}
@@ -1405,7 +1362,7 @@ func TestRefreshReturnsDiscoveredCorruption(t *testing.T) {
 		if err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) }); err != nil {
 			t.Fatalf("foreign corrupt revision: %v", err)
 		}
-		_, _, err := h.admit(context.Background(), admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser})
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		var corrupt *CorruptionError
 		if !errors.As(err, &corrupt) {
 			t.Fatalf("admission over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
