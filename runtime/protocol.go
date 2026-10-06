@@ -233,10 +233,12 @@ type projectedItem struct {
 // they are already materialized, validated, and owned, so no storage payload
 // is re-decoded and no model-context projection is consulted. Tool results
 // never become separate items — every terminal result is absorbed into the
-// assistant item that published its call, matched by the full assistant-entry
-// reference, the reserved result entry identity, and the call ID — while an
-// unresolved call keeps its assistant item without terminal members and gains
-// them on a later read under the same item ID.
+// assistant item that published its call, addressed by its reserved result
+// entry identity alone: the validated facts guarantee that identity is
+// Session-unique and bound to its publishing assistant entry and call, so
+// repeating the binding here would add nothing — while an unresolved call
+// keeps its assistant item without terminal members and gains them on a
+// later read under the same item ID.
 func projectConversation(sessionID string, facts []harness.HistoryFact) ([]projectedItem, error) {
 	results := indexToolResults(facts)
 	items := make([]projectedItem, 0, len(facts))
@@ -252,32 +254,18 @@ func projectConversation(sessionID string, facts []harness.HistoryFact) ([]proje
 	return items, nil
 }
 
-// toolResultKey addresses one terminal tool result by the full
-// assistant-entry reference (including the Session), its reserved result
-// entry identity, and the call ID — the exact validated binding.
-type toolResultKey struct {
-	session   string
-	assistant string
-	result    string
-	call      string
-}
-
 // indexToolResults maps the snapshot's terminal tool results by their
-// validated assistant/call binding. Unmatched results cannot exist in
+// reserved result entry identities — Session-unique under the validated
+// facts' own reservation rule. Unmatched identities cannot exist in
 // validated facts and simply never match.
-func indexToolResults(facts []harness.HistoryFact) map[toolResultKey]harness.ToolResultEntry {
-	index := make(map[toolResultKey]harness.ToolResultEntry)
+func indexToolResults(facts []harness.HistoryFact) map[string]harness.ToolResultEntry {
+	index := make(map[string]harness.ToolResultEntry)
 	for _, fact := range facts {
 		if fact.Kind != harness.EntryToolResult {
 			continue
 		}
 		result := *fact.ToolResult
-		index[toolResultKey{
-			session:   result.AssistantEntry.SessionID,
-			assistant: result.AssistantEntry.EntryID,
-			result:    result.EntryID,
-			call:      result.ToolCallID,
-		}] = result
+		index[result.EntryID] = result
 	}
 	return index
 }
@@ -285,7 +273,7 @@ func indexToolResults(facts []harness.HistoryFact) map[toolResultKey]harness.Too
 // projectConversationItem maps one validated fact to its generated client
 // item and source-known stable identity. Tool-result facts are absorbed into
 // their publishing assistant and produce no item of their own.
-func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[toolResultKey]harness.ToolResultEntry) (*projectedItem, error) {
+func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (*projectedItem, error) {
 	var item protocol.ConversationItem
 	var err error
 	switch fact.Kind {
@@ -346,7 +334,7 @@ func operationAttribution(operationID string) *string {
 // projectAssistantItem maps one validated assistant entry to its generated
 // item: the published calls in their validated order, each carrying its
 // terminal tool result's outcome when that result has committed.
-func projectAssistantItem(sessionID string, fact harness.HistoryFact, results map[toolResultKey]harness.ToolResultEntry) (protocol.AssistantItem, error) {
+func projectAssistantItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (protocol.AssistantItem, error) {
 	entry := fact.Assistant
 	content, err := projectContentParts(entry.Content)
 	if err != nil {
@@ -354,7 +342,7 @@ func projectAssistantItem(sessionID string, fact harness.HistoryFact, results ma
 	}
 	calls := make([]protocol.ToolCallView, 0, len(entry.ToolCalls))
 	for _, call := range entry.ToolCalls {
-		view, err := projectToolCall(sessionID, fact.EntryID, call, results)
+		view, err := projectToolCall(call, results)
 		if err != nil {
 			return protocol.AssistantItem{}, fmt.Errorf("project assistant entry %q: %w", fact.EntryID, err)
 		}
@@ -381,11 +369,11 @@ func projectAssistantItem(sessionID string, fact harness.HistoryFact, results ma
 // The wire arguments are the decoded raw argument text: the canonical base64
 // never leaves the facts, and the raw bytes need no JSON validity gate —
 // the native JSON string encoding supplies the UTF-8 replacement. A terminal
-// result matched by the reserved result identity and call ID contributes its
+// result matched by the call's reserved result identity contributes its
 // status, its model-visible content (an empty success content stays present),
 // and its preserved tool-owned metadata for every terminal status alike; a
 // pending call omits all three and never gains a fabricated outcome.
-func projectToolCall(sessionID, assistantID string, call harness.ToolCallRecord, results map[toolResultKey]harness.ToolResultEntry) (protocol.ToolCallView, error) {
+func projectToolCall(call harness.ToolCallRecord, results map[string]harness.ToolResultEntry) (protocol.ToolCallView, error) {
 	arguments, err := base64.StdEncoding.Strict().DecodeString(call.ArgumentsBase64)
 	if err != nil {
 		return protocol.ToolCallView{}, fmt.Errorf("tool call %q arguments: %v", call.ID, err)
@@ -403,7 +391,7 @@ func projectToolCall(sessionID, assistantID string, call harness.ToolCallRecord,
 		}
 		view.NormalizedArguments = &normalized
 	}
-	result, ok := results[toolResultKey{session: sessionID, assistant: assistantID, result: call.ResultEntryID, call: call.ID}]
+	result, ok := results[call.ResultEntryID]
 	if !ok {
 		return view, nil
 	}
@@ -484,13 +472,11 @@ func wireRevision(revision harness.SessionRevision) protocol.SessionRevision {
 // historyPageSize is the exact page size in indivisible items.
 const historyPageSize = 50
 
-// historyCursor is the private opaque cursor payload: exactly these four
+// historyCursor is the private opaque cursor payload: exactly these two
 // members on the wire, base64url-encoded.
 type historyCursor struct {
-	Version      int    `json:"version"`
 	SessionID    string `json:"session_id"`
 	AnchorItemID string `json:"anchor_item_id"`
-	Direction    string `json:"direction"`
 }
 
 // encodeHistoryCursor encodes one cursor as its base64url JSON form; the
@@ -501,11 +487,11 @@ func encodeHistoryCursor(c historyCursor) string {
 }
 
 // decodeHistoryCursor decodes one opaque cursor strictly: base64url, one
-// JSON document with exactly the cursor members, then the exact version,
-// Session identity, and direction. Every failure wraps the shared
-// harness.ErrInvalid sentinel; no other error class exists. The anchor's
-// emptiness needs no decoder rule — no valid item identity is empty — the
-// resolver rejects it uniformly with every other non-member.
+// JSON document with exactly the cursor members, then the Session identity.
+// Every failure wraps the shared harness.ErrInvalid sentinel; no other error
+// class exists. The anchor's emptiness needs no decoder rule — no valid item
+// identity is empty — the resolver rejects it uniformly with every other
+// non-member.
 func decodeHistoryCursor(raw, sessionID string) (historyCursor, error) {
 	invalid := func(format string, args ...any) (historyCursor, error) {
 		return historyCursor{}, fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), harness.ErrInvalid)
@@ -524,13 +510,8 @@ func decodeHistoryCursor(raw, sessionID string) (historyCursor, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return invalid("malformed history cursor: trailing content")
 	}
-	switch {
-	case c.Version != 1:
-		return invalid("history cursor version %d is not 1", c.Version)
-	case c.SessionID != sessionID:
+	if c.SessionID != sessionID {
 		return invalid("history cursor names session %q, not %q", c.SessionID, sessionID)
-	case c.Direction != "older":
-		return invalid("history cursor direction %q is not %q", c.Direction, "older")
 	}
 	return c, nil
 }
@@ -575,7 +556,7 @@ func projectHistoryPage(sessionID string, facts []harness.HistoryFact, revision 
 		page.Items[i] = item.item
 	}
 	if start > 0 {
-		encoded := encodeHistoryCursor(historyCursor{Version: 1, SessionID: sessionID, AnchorItemID: items[start].id, Direction: "older"})
+		encoded := encodeHistoryCursor(historyCursor{SessionID: sessionID, AnchorItemID: items[start].id})
 		page.OlderCursor = &encoded
 	}
 	return page, nil

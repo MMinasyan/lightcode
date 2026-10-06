@@ -133,9 +133,8 @@ func TestHistoryPagePureThreePages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode older cursor: %v", err)
 	}
-	if cursor1.Version != 1 || cursor1.SessionID != convSessionID || cursor1.Direction != "older" ||
-		cursor1.AnchorItemID != wantPageItemID(70) {
-		t.Fatalf("older cursor = %+v, want version 1, this session, older, anchored at item 70", cursor1)
+	if cursor1.SessionID != convSessionID || cursor1.AnchorItemID != wantPageItemID(70) {
+		t.Fatalf("older cursor = %+v, want this session anchored at item 70", cursor1)
 	}
 
 	page2, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page1.OlderCursor)
@@ -266,18 +265,18 @@ func cursorBody(t *testing.T, body string) *string {
 	return &raw
 }
 
-func cursorJSON(sessionID, anchor, direction string) string {
-	return fmt.Sprintf(`{"version":1,"session_id":%s,"anchor_item_id":%s,"direction":%s}`,
-		quoteJSON(sessionID), quoteJSON(anchor), quoteJSON(direction))
+func cursorJSON(sessionID, anchor string) string {
+	return fmt.Sprintf(`{"session_id":%s,"anchor_item_id":%s}`,
+		quoteJSON(sessionID), quoteJSON(anchor))
 }
 
 // TestHistoryCursorStrictValidation proves the cursor decode's closed rule:
-// only the exact four-member version-1 older document for this Session with
-// a resolvable anchor passes, and every malformed sibling fails uniformly
-// with harness.ErrInvalid.
+// only the exact two-member document for this Session with a resolvable
+// anchor passes, and every malformed sibling fails uniformly with
+// harness.ErrInvalid.
 func TestHistoryCursorStrictValidation(t *testing.T) {
 	snap := pageSnapshot(3)
-	valid := cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1), "older"))
+	valid := cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1)))
 	if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), valid); err != nil {
 		t.Fatalf("valid cursor rejected: %v", err)
 	}
@@ -285,16 +284,16 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 	rejections := map[string]*string{
 		"empty cursor":      strPtr(""),
 		"not base64":        strPtr("not a cursor!"),
-		"unknown member":    cursorBody(t, `{"version":1,"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"direction":"older","extra":1}`),
-		"trailing document": cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1), "older")+`{"again":1}`),
-		// The version, direction, and Session rows each keep an otherwise
-		// valid anchor of the addressed Session: removing that one guard
-		// would produce a page, so every row isolates its own rule.
-		"wrong version":      cursorBody(t, `{"version":2,"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"direction":"older"}`),
-		"wrong direction":    cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1), "newer")),
-		"empty anchor":       cursorBody(t, cursorJSON(convSessionID, "", "older")),
-		"foreign session":    cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", wantPageItemID(1), "older")),
-		"nonexistent anchor": cursorBody(t, cursorJSON(convSessionID, "missing", "older")),
+		"unknown member":    cursorBody(t, `{"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"extra":1}`),
+		"trailing document": cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1))+`{"again":1}`),
+		// The retired version and direction members are ordinary unknown
+		// members now: each row keeps an otherwise valid anchor of the
+		// addressed Session, so every row isolates the closed member set.
+		"retired version member":   cursorBody(t, `{"version":1,"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`}`),
+		"retired direction member": cursorBody(t, `{"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"direction":"older"}`),
+		"empty anchor":             cursorBody(t, cursorJSON(convSessionID, "")),
+		"foreign session":          cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", wantPageItemID(1))),
+		"nonexistent anchor":       cursorBody(t, cursorJSON(convSessionID, "missing")),
 	}
 	for name, cursor := range rejections {
 		if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursor); !errors.Is(err, harness.ErrInvalid) {
@@ -304,7 +303,7 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 
 	// The one uniform slicing rule for a resolvable anchor with nothing
 	// older: a present empty page with no next cursor.
-	page, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0), "older")))
+	page, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0))))
 	if err != nil {
 		t.Fatalf("oldest-anchor page: %v", err)
 	}
@@ -830,8 +829,8 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 }
 
 // TestHistoryCursorRejectionsThroughRuntime proves the read body propagates
-// the cursor's uniform invalid rule against the live owner; the version,
-// direction, and Session rows each carry an otherwise valid anchor of the
+// the cursor's uniform invalid rule against the live owner; the retired-
+// member and Session rows each carry an otherwise valid anchor of the
 // addressed Session, so every rejection isolates its own guard.
 func TestHistoryCursorRejectionsThroughRuntime(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
@@ -844,15 +843,188 @@ func TestHistoryCursorRejectionsThroughRuntime(t *testing.T) {
 		rejected := []*string{
 			strPtr(""),
 			strPtr("!!!!"),
-			cursorBody(t, `{"version":2,"session_id":`+quoteJSON(session)+`,"anchor_item_id":`+quoteJSON(anchor)+`,"direction":"older"}`),
-			cursorBody(t, cursorJSON(session, anchor, "newer")),
-			cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", anchor, "older")),
-			cursorBody(t, cursorJSON(session, "missing", "older")),
+			cursorBody(t, `{"version":1,"session_id":`+quoteJSON(session)+`,"anchor_item_id":`+quoteJSON(anchor)+`,"direction":"older"}`),
+			cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", anchor)),
+			cursorBody(t, cursorJSON(session, "missing")),
 		}
 		for i, cursor := range rejected {
 			if _, err := r.getHistory(context.Background(), session, cursor); !errors.Is(err, harness.ErrInvalid) {
 				t.Fatalf("cursor rejection %d = %v, want harness.ErrInvalid", i, err)
 			}
+		}
+	})
+}
+
+// TestHistoryGeneratedClientCompactionRetainsOldCursor proves, over both
+// stores and the mounted generated client, the full combination: a history of
+// more than one page, an older cursor issued before a real manual compaction
+// stays valid with its page unchanged, and the complete original history plus
+// the compaction item stays pageable — every post-compaction page carrying
+// the current revision, and the compaction item carrying the real scripted
+// model's summary.
+func TestHistoryGeneratedClientCompactionRetainsOldCursor(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		session := newLifecycleID(t)
+		usageSeedSession(t, store, session, "", "", "solo", emptyUsageWireTotals())
+		for i := 1; i <= 18; i++ { // 18 settled turns × 3 items = 54 items
+			compactRawSuccessOperation(t, store, session, fmt.Sprintf("op-%d", i), fmt.Sprintf("question op-%d", i), fmt.Sprintf("answer op-%d", i))
+		}
+		r, _ := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+		ctx := context.Background()
+
+		// The pre-compaction paging: the newest 50 and the older 4, with the
+		// older cursor anchored at the fourth item.
+		page1, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{})
+		if err != nil || page1.JSON200 == nil {
+			t.Fatalf("initial history: %v", err)
+		}
+		if len(page1.JSON200.Items) != 50 || page1.JSON200.OlderCursor == nil {
+			body, _ := json.Marshal(page1.JSON200)
+			t.Fatalf("initial history = %s, want exactly 50 items with an older cursor", body)
+		}
+		assertQualifiedInstance(t, "initial history", page1.JSON200.SessionRevision, ps.instance)
+		page2, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{Cursor: page1.JSON200.OlderCursor})
+		if err != nil || page2.JSON200 == nil {
+			t.Fatalf("older history: %v", err)
+		}
+		if len(page2.JSON200.Items) != 4 || page2.JSON200.OlderCursor != nil {
+			body, _ := json.Marshal(page2.JSON200)
+			t.Fatalf("older history = %s, want the remaining 4 items with no cursor", body)
+		}
+		preItems := append(append([]protocol.ConversationItem{}, page1.JSON200.Items...), page2.JSON200.Items...)
+		if len(preItems) != 54 {
+			t.Fatalf("pre-compaction walk = %d items, want all 54", len(preItems))
+		}
+		preRevision := page1.JSON200.SessionRevision.DurableRevision
+		oldCursor := *page1.JSON200.OlderCursor
+
+		// The real manual compaction through the mounted command.
+		compacted, err := client.CompactSessionWithResponse(ctx, session, protocol.CompactRequest{OperationId: "compact-1"})
+		if err != nil {
+			t.Fatalf("CompactSession: %v", err)
+		}
+		if compacted.JSON200 == nil || compacted.JSON200.OperationId != "compact-1" {
+			body, _ := json.Marshal(compacted.JSON200)
+			t.Fatalf("compact = %s, want the admitted compact Operation", body)
+		}
+		awaitIdleSession(t, r, session)
+
+		// The old cursor stays valid: the same four items, no compaction
+		// item, nothing older, and the current revision.
+		page2After, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{Cursor: &oldCursor})
+		if err != nil || page2After.JSON200 == nil {
+			t.Fatalf("older history after compaction: %v", err)
+		}
+		if got := strings.Join(pageItemIDs(t, *page2After.JSON200), ","); got != strings.Join(pageItemIDs(t, *page2.JSON200), ",") {
+			t.Fatalf("old-cursor page after compaction = %s, want the unchanged %s", got, strings.Join(pageItemIDs(t, *page2.JSON200), ","))
+		}
+		if page2After.JSON200.OlderCursor != nil {
+			t.Fatalf("old-cursor page after compaction produced an older cursor %v with nothing older", page2After.JSON200.OlderCursor)
+		}
+		if page2After.JSON200.SessionRevision.DurableRevision == preRevision {
+			t.Fatalf("old-cursor page revision = %s, want the advanced current revision", page2After.JSON200.SessionRevision.DurableRevision)
+		}
+		assertQualifiedInstance(t, "old-cursor page", page2After.JSON200.SessionRevision, ps.instance)
+
+		// The complete history plus the compaction item stays pageable: walk
+		// every page and collect the items.
+		type walkPage struct {
+			page   *protocol.HistoryPage
+			cursor *string
+		}
+		walk := func(cursor *string) (*protocol.HistoryPage, *string, error) {
+			resp, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{Cursor: cursor})
+			if err != nil || resp.JSON200 == nil {
+				return nil, nil, fmt.Errorf("history page: %v", err)
+			}
+			return resp.JSON200, resp.JSON200.OlderCursor, nil
+		}
+		var walked []protocol.ConversationItem
+		var currentRevision string
+		firstPageLen := 0
+		for cursor := (*string)(nil); ; {
+			page, next, err := walk(cursor)
+			if err != nil {
+				t.Fatalf("%v", err)
+			}
+			if cursor == nil {
+				firstPageLen = len(page.Items)
+			}
+			walked = append(walked, page.Items...)
+			currentRevision = page.SessionRevision.DurableRevision
+			if currentRevision == preRevision {
+				t.Fatalf("walk page revision = %s, want the advanced current revision", currentRevision)
+			}
+			if next == nil {
+				break
+			}
+			cursor = next
+		}
+		if len(walked) != 56 {
+			t.Fatalf("post-compaction walk = %d items, want all 54 original items plus the compaction and settlement items", len(walked))
+		}
+		// Exactly one compaction item, carrying the real scripted model's
+		// summary, and the compact Operation's settlement beside it — the
+		// first page's two newest items.
+		var compactions []*protocol.CompactionItem
+		compactionAt := -1
+		for i, item := range walked {
+			if itemKind(t, item) != "compaction" {
+				continue
+			}
+			if compactionAt >= 0 {
+				t.Fatalf("second compaction item at walk position %d", i)
+			}
+			value, err := item.AsCompactionItem()
+			if err != nil {
+				t.Fatalf("compaction item %d: %v", i, err)
+			}
+			compactions = append(compactions, &value)
+			compactionAt = i
+		}
+		if compactionAt != firstPageLen-2 {
+			t.Fatalf("compaction item at walk position %d, want the first page's second-newest item", compactionAt)
+		}
+		if len(compactions) != 1 || compactions[0].Summary != "done" || compactions[0].Model != "prov/m" {
+			body, _ := json.Marshal(compactions)
+			t.Fatalf("compaction items = %s, want exactly the real model summary", body)
+		}
+		end, err := walked[firstPageLen-1].AsOperationEndItem()
+		if err != nil || end.Status != protocol.OperationEndItemStatusSuccess ||
+			end.OperationId == nil || *end.OperationId != "compact-1" {
+			t.Fatalf("compact settlement item = %+v err %v, want compact-1's settled success", end, err)
+		}
+		// Removing the compaction and settlement items leaves exactly the
+		// original items: every pre-compaction identity appears once with
+		// byte-identical wire content.
+		without := append(append([]protocol.ConversationItem{}, walked[:compactionAt]...), walked[compactionAt+2:]...)
+		if len(without) != len(preItems) {
+			t.Fatalf("post-compaction original items = %d, want %d", len(without), len(preItems))
+		}
+		preByItem := make(map[string]string, len(preItems))
+		for _, item := range preItems {
+			data, err := json.Marshal(item)
+			if err != nil {
+				t.Fatalf("marshal original item: %v", err)
+			}
+			preByItem[wireItemID(t, item)] = string(data)
+		}
+		for _, item := range without {
+			id := wireItemID(t, item)
+			data, err := json.Marshal(item)
+			if err != nil {
+				t.Fatalf("marshal post-compaction item: %v", err)
+			}
+			if preByItem[id] != string(data) {
+				t.Fatalf("item %q = %s, want the original %s", id, data, preByItem[id])
+			}
+			delete(preByItem, id)
+		}
+		if len(preByItem) != 0 {
+			t.Fatalf("post-compaction history lost %d original items", len(preByItem))
 		}
 	})
 }

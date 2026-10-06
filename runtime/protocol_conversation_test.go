@@ -359,9 +359,10 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 // binding when two Operations of one Session publish the same call ID: call
 // identities are unique per Operation, while the reserved result entry
 // identities are Session-unique — each assistant item keeps its own result's
-// content and metadata under its own assistant-entry reference, at its own
-// independent item identity. No result-ID-only or call-ID-only shortcut is
-// valid: only the full validated binding attaches.
+// content and metadata, at its own independent item identity. The fixture's
+// distinct result identities discriminate a call-ID-only shortcut; the
+// result-identity lookup itself is owned by the validated facts' reservation
+// rule, whose uniqueness and binding the Harness graph validation proves.
 func TestConversationProjectionSameCallIDAcrossOperations(t *testing.T) {
 	assistantA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
 	resultA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
