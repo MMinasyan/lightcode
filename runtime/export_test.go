@@ -105,6 +105,22 @@ func SetAgentTypeModelForTest(r *Runtime, agentType, modelRef string) (protocol.
 	return r.setAgentTypeModel(context.Background(), agentType, modelRef)
 }
 
+// createSession is the test-build root Session creation bridge: it enters
+// Runtime's existing admitted-call gate and runs the one normalized creation
+// core, so tests needing the full Core record observe the real gate. It is
+// absent from production builds.
+func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
+	var record harness.SessionRecord
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
+		return err
+	}); err != nil {
+		return harness.SessionRecord{}, err
+	}
+	return record, nil
+}
+
 // CreateSessionForTest bridges the private root Session creation for the
 // external composition tests. It is absent from production builds.
 func CreateSessionForTest(ctx context.Context, r *Runtime, workspace, agentType string) (harness.SessionRecord, error) {

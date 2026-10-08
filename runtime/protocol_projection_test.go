@@ -504,6 +504,12 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
+		// The empty navigation result is the non-nil [] shape before any
+		// Session exists.
+		initial, err := r.listWorkspaces(context.Background())
+		if err != nil || initial == nil || len(initial) != 0 {
+			t.Fatalf("initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
+		}
 		wsA := filepath.Join(e.home, "alpha")
 		wsB := filepath.Join(e.home, "beta")
 		root := projectionSession(t, r, wsA, "solo").Identity.SessionID

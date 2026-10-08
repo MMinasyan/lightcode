@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1584,7 +1585,7 @@ func TestProtocolServerRetainedFamily(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RevertRetainedCode: %v", err)
 		}
-		if revert.JSON200 == nil || !containsString(revert.JSON200.Restored, file) || revert.JSON200.Error != nil {
+		if revert.JSON200 == nil || !slices.Contains(revert.JSON200.Restored, file) || revert.JSON200.Error != nil {
 			body, _ := json.Marshal(revert.JSON200)
 			t.Fatalf("retained revert = %s (status %d), want the completed restore", body, revert.HTTPResponse.StatusCode)
 		}

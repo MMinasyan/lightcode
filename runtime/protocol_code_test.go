@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -158,6 +159,15 @@ func TestCodeSnapshotsTargetGroups(t *testing.T) {
 		}
 		if len(groups[1].Files) != 1 || groups[1].Files[0] != (protocol.SnapshotFile{Path: created, Existed: false}) {
 			t.Fatalf("second group files = %+v, want the created display path with an absent preimage", groups[1].Files)
+		}
+
+		// A returned group list is a caller copy: mutation cannot affect
+		// the next read.
+		groups[0].OperationId = "mutated"
+		groups[0].Files[0].Path = "mutated"
+		reread, err := r.listSessionCodeSnapshots(context.Background(), session)
+		if err != nil || len(reread) != 2 || reread[0].OperationId != "op-z" || reread[0].Files[0] != (protocol.SnapshotFile{Path: edited, Existed: true}) {
+			t.Fatalf("re-read groups = (%+v, %v), want the immutable first projection", reread, err)
 		}
 	})
 }
@@ -382,7 +392,7 @@ func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 		if err != nil {
 			t.Fatalf("revert boundary op-m: %v", err)
 		}
-		if len(result.Restored) != 2 || !containsString(result.Restored, edited) || !containsString(result.Restored, created) {
+		if len(result.Restored) != 2 || !slices.Contains(result.Restored, edited) || !slices.Contains(result.Restored, created) {
 			t.Fatalf("restored = %v, want the later group's edited and created files", result.Restored)
 		}
 		if data, err := os.ReadFile(edited); err != nil || string(data) != "v1" {
@@ -427,15 +437,6 @@ func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 			t.Fatalf("chain after refused boundaries = (%q, %v), want no mutation", data, err)
 		}
 	})
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 // TestCodeSnapshotsSkipOnIdentityChange proves the retained CodeStore proof

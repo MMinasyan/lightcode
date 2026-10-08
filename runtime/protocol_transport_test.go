@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -825,7 +826,7 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	if result.Error == nil || result.Error.Code != protocol.Internal {
 		t.Fatalf("partial restore error member = %+v, want the accumulated internal error", result.Error)
 	}
-	if !containsString(result.Restored, newestTarget) {
+	if !slices.Contains(result.Restored, newestTarget) {
 		t.Fatalf("partial restore restored = %v, want the newest group's file before the failure", result.Restored)
 	}
 	if restored, err := os.ReadFile(newestTarget); err != nil || string(restored) != "v0" {

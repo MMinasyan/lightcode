@@ -387,20 +387,6 @@ func (r *Runtime) withHarness(ctx context.Context, fn func(context.Context, *har
 	return fn(ctx, r.harness)
 }
 
-// createSession is the private root Session creation: it runs the one
-// normalized creation core inside the shared admitted-call gate.
-func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
-	var record harness.SessionRecord
-	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
-		return err
-	}); err != nil {
-		return harness.SessionRecord{}, err
-	}
-	return record, nil
-}
-
 // createSessionRecord is the one root creation core: the existing empty
 // workspace check wraps the shared harness.ErrInvalid sentinel, the Workspace
 // is normalized with filepath.Abs alone, and the Harness retains its
