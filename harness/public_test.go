@@ -6230,7 +6230,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		if _, err := submit(t, f.h, source, "op-2", harness.MessageModeRegular, "later question"); err != nil {
 			t.Fatalf("second submit: %v", err)
 		}
-		awaitTerminal(t, f.h, source, "op-2")
+		awaitSettled(t, f.h, source, "op-2") // submit may buffer during the compact run's retirement; admission is the rendezvous
 
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
 		before := snapshotSession(t, store, source)
