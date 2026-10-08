@@ -253,30 +253,11 @@ func derivedSettlement(out model.Output) agent.ModelSettlement {
 	case model.OutputInterrupted:
 		return agent.ModelSettlement{Disposition: agent.DispoInterruption, Output: &out, Detail: out.Detail}
 	default:
-		if outputCarriesPayload(out) {
+		if model.HasAssistantContent(out.Message) { // the content-only query: an errored output carries no tool calls, so content is its whole retained-payload question.
 			return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: &out}
 		}
 		return agent.ModelSettlement{Disposition: agent.DispoFailure, Output: &out, Detail: out.Detail}
 	}
-}
-
-// outputCarriesPayload reports whether one finalized output retains a
-// model-visible payload, mirroring the model package's finalized payload
-// predicate: a non-empty refusal, tool calls, one non-empty finalized content
-// part, or one finalized non-null message extra.
-func outputCarriesPayload(out model.Output) bool {
-	if out.Message == nil {
-		return false
-	}
-	if out.Message.Refusal != "" || len(out.Message.ToolCalls) > 0 {
-		return true
-	}
-	for _, part := range out.Message.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
-			return true
-		}
-	}
-	return len(out.Message.Extra.Finalize()) > 0
 }
 
 // standardRetryPolicy is the nil-Retry classifier: HTTP 429 and 5xx failures,

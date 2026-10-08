@@ -51,16 +51,13 @@ func (st *assemblyState) assembleMessage(includeCalls bool) model.Message {
 	return msg
 }
 
-func msgHasEligiblePartialContent(m model.Message) bool {
-	if m.Refusal != "" {
-		return true
-	}
-
-	for _, part := range m.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
-			return true
+// completeCallCount counts exactly the tool slots buildCalls would emit — entries with non-empty id and name — without sorting, argument conversion or extra finalization, so finish-state classification never allocates merely to count completed calls.
+func (st *assemblyState) completeCallCount() int {
+	n := 0
+	for _, entry := range st.toolDeltas {
+		if entry.id != "" && entry.name != "" {
+			n++
 		}
 	}
-
-	return len(m.Extra.Finalize()) > 0
+	return n
 }

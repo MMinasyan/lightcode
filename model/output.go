@@ -59,22 +59,30 @@ type Output struct {
 	Detail  string       // empty for completed; mandatory diagnostic text for errored/interrupted.
 }
 
-// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view: at least one finalized non-empty content part, a non-empty refusal, at least one tool call, or at least one finalized non-null message extra. Finalized parts drop empty pieces and null extras; role, source, name, finish reason, and usage never count as payload here (they are not fields of this value).
-func hasAssistantPayload(m *Message) bool {
-	if m.Refusal != "" || len(m.ToolCalls) > 0 {
+// ContentPartHasPayload is the finalization view of one content part: non-empty when it has non-empty text, a non-empty URL, a non-empty opaque wire type, or at least one extra that survives null removal. Finalization omits empty parts; this predicate decides what counts toward an assistant payload before they are dropped. It validates, retains or mutates nothing.
+func ContentPartHasPayload(p ContentPart) bool {
+	return p.Text != "" || p.URL != "" || p.OpaqueWireType != "" || p.Extra.HasValues()
+}
+
+// HasAssistantContent reports whether an assistant message carries model-visible content under the finalization view: at least one finalized non-empty content part, a non-empty refusal, or at least one surviving message extra. Role, source, name, finish reason and usage never count as content here (they are not fields of this value). A nil message reports false. The query validates, retains or mutates nothing.
+func HasAssistantContent(m *Message) bool {
+	if m == nil {
+		return false
+	}
+	if m.Refusal != "" {
 		return true
 	}
 	for _, part := range m.Content {
-		if finalizedPartNonEmpty(part) {
+		if ContentPartHasPayload(part) {
 			return true
 		}
 	}
-	return len(m.Extra.Finalize()) > 0
+	return m.Extra.HasValues()
 }
 
-// finalizedPartNonEmpty is the finalization view of one content part: non-empty when it has non-empty text, a non-empty URL, a non-empty opaque wire type, or at least one extra that survives null removal. Finalization omits empty parts; this predicate decides what counts toward an assistant payload before they are dropped.
-func finalizedPartNonEmpty(p ContentPart) bool {
-	return p.Text != "" || p.URL != "" || p.OpaqueWireType != "" || len(p.Extra.Finalize()) > 0
+// HasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view: the content of HasAssistantContent plus at least one tool call. A nil message reports false. The query validates, retains or mutates nothing.
+func HasAssistantPayload(m *Message) bool {
+	return HasAssistantContent(m) || m != nil && len(m.ToolCalls) > 0
 }
 
 // ValidateOutput applies exactly the NewOutput accepting rules — closed status set; complete nonzero output source; present messages re-validated at this trust boundary (closed role, per-role field combinations) and assistant-role carrying exactly the output's own source identity; completed requires one message with an eligible payload plus empty detail; errored/interrupted require non-empty detail and a tool-call-free optional partial message — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original value.
@@ -94,7 +102,7 @@ func ValidateOutput(in Output) error {
 		if err := validateOutputMessage(*in.Message, in.Source); err != nil {
 			return err
 		}
-		if !hasAssistantPayload(in.Message) {
+		if !HasAssistantPayload(in.Message) {
 			return errors.New("completed output requires an assistant payload (content parts, refusal, tool calls, or finalized extras)")
 		}
 		if in.Detail != "" {

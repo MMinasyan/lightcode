@@ -240,3 +240,54 @@ func TestExtraAccumulatorAddDeepCopiesInput(t *testing.T) {
 	}
 	_ = out
 }
+
+// TestExtraHasValuesMatchesFinalizedRetention compares the scalar query with the finalization view it stands for: HasValues must equal "Finalize retains at least one value" over null, non-null, empty and malformed raw values, for the plain map and the accumulator alike.
+func TestExtraHasValuesMatchesFinalizedRetention(t *testing.T) {
+	extras := []Extra{
+		nil,
+		{},
+		{"only": json.RawMessage(`null`)},
+		{"padded": json.RawMessage(`  null  `)},
+		{"mixed": json.RawMessage(`null`), "keep": json.RawMessage(`1`)},
+		{"empty": json.RawMessage(``)},
+		{"malformed": json.RawMessage(`{`)},
+		{"zero": json.RawMessage(`0`)},
+		{"false": json.RawMessage(`false`)},
+		{"emptystr": json.RawMessage(`""`)},
+		{"array": json.RawMessage(`[]`)},
+		{"object": json.RawMessage(`{}`)},
+	}
+	for _, e := range extras {
+		if got, want := e.HasValues(), len(e.Finalize()) > 0; got != want {
+			t.Fatalf("Extra %#v: HasValues = %v, want %v", map[string]json.RawMessage(e), got, want)
+		}
+	}
+
+	var nilAcc *ExtraAccumulator
+	if nilAcc.HasValues() {
+		t.Fatal("nil accumulator reports values")
+	}
+
+	type add struct {
+		key   string
+		value json.RawMessage
+	}
+	scripts := [][]add{
+		{},
+		{{"k", json.RawMessage(`null`)}},
+		{{"k", json.RawMessage(`null`)}, {"k", json.RawMessage(`5`)}}, // kind change keeps the latest value.
+		{{"k", json.RawMessage(`5`)}, {"k", json.RawMessage(`null`)}},
+		{{"k", json.RawMessage(`"a"`)}, {"k", json.RawMessage(`"b"`)}},
+		{{"", json.RawMessage(`1`)}, {"k", json.RawMessage(``)}}, // ignored key and value leave nothing retained.
+		{{"a", json.RawMessage(`null`)}, {"b", json.RawMessage(`false`)}},
+	}
+	for _, script := range scripts {
+		acc := NewExtraAccumulator()
+		for _, step := range script {
+			_ = acc.Add(step.key, step.value) // accumulation errors keep the latest value; the query sees the same retained state either way.
+		}
+		if got, want := acc.HasValues(), len(acc.Finalize()) > 0; got != want {
+			t.Fatalf("accumulator %#v: HasValues = %v, want %v", script, got, want)
+		}
+	}
+}

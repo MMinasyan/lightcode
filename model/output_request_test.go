@@ -206,6 +206,50 @@ func TestNewOutputAssistantPayloadDefinition(t *testing.T) {
 	}
 }
 
+// TestAssistantContentAndPayloadQueries pins the two shared scalar queries against their finalization view: content is parts, refusal and surviving extras; payload adds tool calls; a nil message answers false to both; extras are read without validation.
+func TestAssistantContentAndPayloadQueries(t *testing.T) {
+	call, _ := NewToolCall(ToolCall{ID: "c1", Name: "f"})
+	cases := []struct {
+		name    string
+		msg     *Message
+		content bool
+		payload bool
+	}{
+		{name: "nil message", msg: nil, content: false, payload: false},
+		{name: "empty assistant", msg: &Message{Role: RoleAssistant, Source: fullRef}, content: false, payload: false},
+		{name: "text part", msg: &Message{Content: []ContentPart{{Kind: PartText, Text: "x"}}}, content: true, payload: true},
+		{name: "url part", msg: &Message{Content: []ContentPart{{Kind: PartImageURL, URL: "https://a/b"}}}, content: true, payload: true},
+		{name: "opaque part", msg: &Message{Content: []ContentPart{{Kind: PartOpaque, OpaqueWireType: "thinking"}}}, content: true, payload: true},
+		{name: "part extra only", msg: &Message{Content: []ContentPart{{Kind: PartText, Extra: Extra{"k": json.RawMessage(`1`)}}}}, content: true, payload: true},
+		{name: "null-only part extras", msg: &Message{Content: []ContentPart{{Kind: PartText, Extra: Extra{"k": json.RawMessage(`null`)}}}}, content: false, payload: false},
+		{name: "empty part", msg: &Message{Content: []ContentPart{{Kind: PartText}}}, content: false, payload: false},
+		{name: "refusal only", msg: &Message{Refusal: "no"}, content: true, payload: true},
+		{name: "message extra only", msg: &Message{Extra: Extra{"k": json.RawMessage(`"v"`)}}, content: true, payload: true},
+		{name: "null-only message extras", msg: &Message{Extra: Extra{"k": json.RawMessage(`null`)}}, content: false, payload: false},
+		{name: "malformed extra counts as finalization retains it", msg: &Message{Extra: Extra{"k": json.RawMessage(`{`)}}, content: true, payload: true},
+		{name: "tool calls only", msg: &Message{ToolCalls: []ToolCall{call}}, content: false, payload: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasAssistantContent(tc.msg); got != tc.content {
+				t.Fatalf("HasAssistantContent = %v, want %v", got, tc.content)
+			}
+			if got := HasAssistantPayload(tc.msg); got != tc.payload {
+				t.Fatalf("HasAssistantPayload = %v, want %v", got, tc.payload)
+			}
+		})
+	}
+
+	p := ContentPart{Kind: PartText, Extra: Extra{"k": json.RawMessage(`null`), "m": json.RawMessage(`0`)}}
+	if !ContentPartHasPayload(p) {
+		t.Fatal("part with one surviving extra reported empty")
+	}
+	empty := ContentPart{Kind: PartText, Extra: Extra{"k": json.RawMessage(`null`)}}
+	if ContentPartHasPayload(empty) {
+		t.Fatal("part with null-only extras reported payload")
+	}
+}
+
 // TestNewRequest pins the logical request contract: owned messages + tools only.
 func TestNewRequestValidAndOwnership(t *testing.T) {
 	msgs := []Message{mustMessage(t, Message{Role: RoleUser, Content: []ContentPart{{Kind: PartText, Text: "hi"}}})}

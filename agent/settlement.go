@@ -19,7 +19,7 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef, own bool) 
 		}
 		switch set.Output.Status {
 		case model.OutputErrored:
-			if !hasAssistantPayload(set.Output.Message) {
+			if !model.HasAssistantContent(set.Output.Message) {
 				return ModelSettlement{}, newBoundaryViolation("model", "continue disposition requires an errored output retaining an assistant payload (content part, refusal, or finalized extra)")
 			}
 		case model.OutputCompleted:
@@ -83,22 +83,6 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef, own bool) 
 	owned := set // disposition and detail are plain value copies.
 	owned.Output = &ownedOutput
 	return owned, nil // well-formed.
-}
-
-// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view — a non-empty finalized content part, a non-empty refusal, or at least one finalized non-null extra — written against exported fields only as the agent-side mirror of model's private predicate (tool calls are impossible on errored outputs and are governed by their own row rule).
-func hasAssistantPayload(m *model.Message) bool {
-	if m == nil {
-		return false
-	}
-	if m.Refusal != "" {
-		return true
-	}
-	for _, part := range m.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
-			return true
-		}
-	}
-	return len(m.Extra.Finalize()) > 0
 }
 
 // ValidateModelSettlement validates one model settlement against the closed disposition table and the expected identity exactly like the run's internal validator, rejecting an incomplete expected identity before any settlement row is consulted. On success it returns the shared validator's independent owned copy: a present output is the validated deep copy from the public model constructor, while disposition and detail are plain value copies.
