@@ -248,8 +248,6 @@ func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	}
 }
 
-func strPtr(s string) *string { return &s }
-
 func quoteJSON(s string) string {
 	data, err := json.Marshal(s)
 	if err != nil {
@@ -282,8 +280,8 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 	}
 
 	rejections := map[string]*string{
-		"empty cursor":      strPtr(""),
-		"not base64":        strPtr("not a cursor!"),
+		"empty cursor":      ptrTo(""),
+		"not base64":        ptrTo("not a cursor!"),
 		"unknown member":    cursorBody(t, `{"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"extra":1}`),
 		"trailing document": cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1))+`{"again":1}`),
 		// The retired version and direction members are ordinary unknown
@@ -841,8 +839,8 @@ func TestHistoryCursorRejectionsThroughRuntime(t *testing.T) {
 		awaitIdleSession(t, r, session)
 		anchor := projectItemID(session, inputEntryID(t, r, session, "op-1"))
 		rejected := []*string{
-			strPtr(""),
-			strPtr("!!!!"),
+			ptrTo(""),
+			ptrTo("!!!!"),
 			cursorBody(t, `{"version":1,"session_id":`+quoteJSON(session)+`,"anchor_item_id":`+quoteJSON(anchor)+`,"direction":"older"}`),
 			cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", anchor)),
 			cursorBody(t, cursorJSON(session, "missing")),

@@ -408,38 +408,10 @@ func TestConnectHealthClassification(t *testing.T) {
 // out-of-order hints are preserved, every malformed or unauthenticated frame
 // is one ErrResyncRequired, and intentional cancellation is ctx.Err.
 func TestEventsFrames(t *testing.T) {
-	t.Run("keepalives and declared notifications", func(t *testing.T) {
+	t.Run("duplicate and out-of-order hints are preserved", func(t *testing.T) {
 		frames := ": keepalive\n\n" +
 			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
 			": keepalive\n\n" +
-			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0"))
-		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
-		events, errs := c.Events(context.Background())
-		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
-		}
-		if len(delivered) != 2 {
-			t.Fatalf("delivered %d events, want the duplicate pair", len(delivered))
-		}
-		for i, event := range delivered {
-			kind, err := event.Discriminator()
-			if err != nil || kind != "session_changed" {
-				t.Fatalf("event %d kind = %q (%v), want session_changed", i, kind, err)
-			}
-			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("event %d decode: %v", i, err)
-			}
-			if body.SessionRevision.InstanceId != testInstance || body.SessionRevision.DurableRevision != "3" {
-				t.Fatalf("event %d revision = %+v", i, body.SessionRevision)
-			}
-		}
-	})
-
-	t.Run("duplicate and out-of-order hints are preserved", func(t *testing.T) {
-		frames := notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
 			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
 			notificationFrame(t, sessionChangedEvent(t, testInstance, "2", "0"))
 		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
@@ -454,12 +426,18 @@ func TestEventsFrames(t *testing.T) {
 			t.Fatalf("delivered %d hints, want %d", len(delivered), len(want))
 		}
 		for i, event := range delivered {
+			if kind, err := event.Discriminator(); err != nil || kind != "session_changed" {
+				t.Fatalf("hint %d kind = %q (%v), want session_changed", i, kind, err)
+			}
 			body, err := event.AsSessionChangedEvent()
 			if err != nil {
 				t.Fatalf("hint %d decode: %v", i, err)
 			}
 			if body.SessionRevision.DurableRevision != want[i] {
 				t.Fatalf("hint %d durable revision = %q, want %q", i, body.SessionRevision.DurableRevision, want[i])
+			}
+			if body.SessionRevision.InstanceId != c.InstanceID() {
+				t.Fatalf("hint %d instance = %q, want the connection instance %q", i, body.SessionRevision.InstanceId, c.InstanceID())
 			}
 		}
 	})

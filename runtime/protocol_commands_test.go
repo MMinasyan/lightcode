@@ -39,23 +39,13 @@ func drainCommandModelArrivals(e *ownerEnv) {
 	}
 }
 
-// commandTextPart builds one generated text union part.
-func commandTextPart(t *testing.T, text string) protocol.ContentPart {
-	t.Helper()
-	var wire protocol.ContentPart
-	if err := wire.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: text}); err != nil {
-		t.Fatalf("build text part: %v", err)
-	}
-	return wire
-}
-
 // commandSubmitRequest builds one regular-mode submit body with one text part.
 func commandSubmitRequest(t *testing.T, operationID, text string) protocol.SubmitRequest {
 	t.Helper()
 	return protocol.SubmitRequest{
 		OperationId: operationID,
 		Mode:        protocol.SubmitRequestModeRegular,
-		Content:     []protocol.ContentPart{commandTextPart(t, text)},
+		Content:     []protocol.ContentPart{textContentPart(t, text, nil)},
 	}
 }
 
@@ -240,7 +230,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		queuedIdle, err := r.submitSession(ctx, sessionID, protocol.SubmitRequest{
 			OperationId: "op-q-idle",
 			Mode:        protocol.SubmitRequestModeQueued,
-			Content:     []protocol.ContentPart{commandTextPart(t, "queued while idle")},
+			Content:     []protocol.ContentPart{textContentPart(t, "queued while idle", nil)},
 		})
 		if err != nil {
 			t.Fatalf("idle queued submit: %v", err)
@@ -273,7 +263,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		queued, err := r.submitSession(ctx, sessionID, protocol.SubmitRequest{
 			OperationId: "op-queued",
 			Mode:        protocol.SubmitRequestModeQueued,
-			Content:     []protocol.ContentPart{commandTextPart(t, "queued")},
+			Content:     []protocol.ContentPart{textContentPart(t, "queued", nil)},
 		})
 		if err != nil {
 			t.Fatalf("active queued submit: %v", err)
@@ -436,13 +426,13 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 		if _, err := r.submitSession(ctx, sessionID, protocol.SubmitRequest{
 			OperationId: "op-bad-mode",
 			Mode:        protocol.SubmitRequestMode("weird"),
-			Content:     []protocol.ContentPart{commandTextPart(t, "x")},
+			Content:     []protocol.ContentPart{textContentPart(t, "x", nil)},
 		}); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("invalid mode = %v, want the Harness mode validator", err)
 		}
 		if _, err := r.submitSession(ctx, sessionID, protocol.SubmitRequest{
 			Mode:    protocol.SubmitRequestModeRegular,
-			Content: []protocol.ContentPart{commandTextPart(t, "x")},
+			Content: []protocol.ContentPart{textContentPart(t, "x", nil)},
 		}); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("empty operation id = %v, want harness.ErrInvalid", err)
 		}
@@ -547,8 +537,8 @@ func TestSessionCommandFork(t *testing.T) {
 		// A valid source resolves its own boundary: neither invalid row may
 		// enumerate destinations as a fallback.
 		for name, req := range map[string]protocol.ForkRequest{
-			"nonexistent item": {BoundaryItemId: "no-such-item", OperationId: "op-bad-a", Content: []protocol.ContentPart{commandTextPart(t, "fork")}},
-			"non-user item":    {BoundaryItemId: projectItemID(sourceID, assistantEntry), OperationId: "op-bad-b", Content: []protocol.ContentPart{commandTextPart(t, "fork")}},
+			"nonexistent item": {BoundaryItemId: "no-such-item", OperationId: "op-bad-a", Content: []protocol.ContentPart{textContentPart(t, "fork", nil)}},
+			"non-user item":    {BoundaryItemId: projectItemID(sourceID, assistantEntry), OperationId: "op-bad-b", Content: []protocol.ContentPart{textContentPart(t, "fork", nil)}},
 		} {
 			before := counting.listCount()
 			if _, err := r.forkSession(ctx, sourceID, req); !errors.Is(err, harness.ErrInvalid) {
@@ -571,7 +561,7 @@ func TestSessionCommandFork(t *testing.T) {
 		req := protocol.ForkRequest{
 			BoundaryItemId: boundaryItem,
 			OperationId:    "op-fork",
-			Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}
 		before := counting.listCount()
 		result, err := r.forkSession(ctx, sourceID, req)
@@ -622,14 +612,14 @@ func TestSessionCommandFork(t *testing.T) {
 		if _, err := r.forkSession(ctx, sourceID, protocol.ForkRequest{
 			BoundaryItemId: projectItemID(sourceID, assistantEntry),
 			OperationId:    "op-fork",
-			Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("mismatched boundary after source deletion = %v, want typed source unavailability", err)
 		}
 		if _, err := r.forkSession(ctx, sourceID, protocol.ForkRequest{
 			BoundaryItemId: boundaryItem,
 			OperationId:    "op-other",
-			Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("unknown operation after source deletion = %v, want typed source unavailability", err)
 		}
@@ -677,7 +667,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 		req := protocol.ForkRequest{
 			BoundaryItemId: boundaryItem,
 			OperationId:    "op-fork",
-			Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}
 		result, err := first.forkSession(ctx, sourceID, req)
 		if err != nil {
@@ -1000,7 +990,7 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 			if res, err := bg.r.submitSession(ctx, root, protocol.SubmitRequest{
 				OperationId: "op-wait",
 				Mode:        protocol.SubmitRequestModeQueued,
-				Content:     []protocol.ContentPart{commandTextPart(t, "queued")},
+				Content:     []protocol.ContentPart{textContentPart(t, "queued", nil)},
 			}); err != nil || res.Disposition != protocol.SubmitResultDispositionQueued {
 				t.Fatalf("queued submit = (%+v, %v), want queued", res, err)
 			}

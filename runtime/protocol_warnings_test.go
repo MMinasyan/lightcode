@@ -943,7 +943,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			_, err := r.forkSession(ctx, sourceID, protocol.ForkRequest{
 				BoundaryItemId: boundaryItem,
 				OperationId:    "op-orphan-fork",
-				Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+				Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 			})
 			forkDone <- err
 		}()
