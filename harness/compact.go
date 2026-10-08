@@ -366,42 +366,49 @@ func compactionFailureSettlement(c *coordinator, operationID string, err error) 
 	return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
 }
 
+// findCompactionCutoff resolves the named compaction's payload and cutoff
+// over one validated Session graph — the single lookup behind both the
+// context projection and the compaction boundary. An empty named ID is the
+// uncompacted history: no payload and no cutoff. A nonempty named ID's
+// references are guaranteed by graph validation — the register names an
+// in-session compaction entry and that entry's boundary names an in-session
+// entry strictly before it — so the lookup returns that payload and the
+// boundary target's sequence; a missing persisted reference is corruption
+// rejected before this lookup runs.
+func findCompactionCutoff(entries []graphEntry, namedID string) (*compactionEntry, int64) {
+	if namedID == "" {
+		return nil, -1
+	}
+	for i := range entries {
+		if entries[i].Envelope.ID != namedID || entries[i].Compaction == nil {
+			continue
+		}
+		for j := range entries {
+			if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
+				return entries[i].Compaction, entries[j].Envelope.Sequence
+			}
+		}
+	}
+	return nil, -1
+}
+
 // compactionBoundary names the last entry one frozen compaction snapshot
 // covered: the need-th projectable entry strictly after the prior
 // compaction's own boundary target, where need is the snapshot length minus
 // the prior summary message the snapshot carries as its first covered message.
 // Without a named prior compaction the count runs from the graph's start; a
 // summary-only re-compaction (the snapshot is the prior summary alone) names
-// the prior compaction entry itself, a valid compaction-kind boundary. Both
-// lookups cannot miss on a validating graph — the register names an
-// in-session compaction entry and every compaction boundary names an
-// in-session entry strictly before it — so a miss degrades to the same count
-// over the named entry's own sequence, or over the graph's start when the
-// named entry itself is absent. A count shortfall returns the empty boundary:
-// unreachable when the snapshot derives from the same graph's projectable
-// entries, and the payload's hex rule rejects it inside the commit
-// transaction as the ordinary failure.
+// the prior compaction entry itself, a valid compaction-kind boundary. The
+// named cutoff comes from findCompactionCutoff over the same validated graph.
+// A count shortfall returns the empty boundary: unreachable when the snapshot
+// derives from the same graph's projectable entries, and the payload's hex
+// rule rejects it inside the commit transaction as the ordinary failure.
 func compactionBoundary(entries []graphEntry, namedCompactionID string, snapshotLen int) string {
-	cutoff := int64(-1)
-	summaryCount := 0
-	if namedCompactionID != "" {
-		for i := range entries {
-			if entries[i].Envelope.ID != namedCompactionID || entries[i].Compaction == nil {
-				continue
-			}
-			boundarySequence := entries[i].Envelope.Sequence
-			for j := range entries {
-				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
-					boundarySequence = entries[j].Envelope.Sequence
-					break
-				}
-			}
-			cutoff = boundarySequence
-			summaryCount = 1
-			break
-		}
+	payload, cutoff := findCompactionCutoff(entries, namedCompactionID)
+	need := snapshotLen
+	if payload != nil {
+		need-- // the prior summary the snapshot carries as its first covered message
 	}
-	need := snapshotLen - summaryCount
 	if need == 0 {
 		return namedCompactionID
 	}

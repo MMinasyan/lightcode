@@ -55,38 +55,21 @@ func (h *Harness) projectContext(c *coordinator, operationID string) ([]model.Me
 		}
 		messages = append(messages, msg)
 	}
-	// boundarySequence at or before which no entry projects; -1 means no
-	// compaction boundary and the full history projects.
-	boundarySequence := int64(-1)
-	if compactionID != "" {
-		// the graph validator requires a non-empty CompactionEntryID to name
-		// an in-session compaction entry, so the lookup cannot miss
-		for i := range entries {
-			if entries[i].Envelope.ID != compactionID {
-				continue
-			}
-			boundarySequence = entries[i].Envelope.Sequence
-			msg, err := model.NewMessage(model.Message{
-				Role:    model.RoleAssistant,
-				Source:  entries[i].Compaction.Model,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + entries[i].Compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
-			})
-			if err != nil {
-				return nil, err
-			}
-			messages = append(messages, msg)
-			// the cutoff is the boundary the payload records — one further
-			// lookup in the same entries slice; the validator guarantees the
-			// target is in-session, and a miss keeps the named entry's own
-			// sequence
-			for j := range entries {
-				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
-					boundarySequence = entries[j].Envelope.Sequence
-					break
-				}
-			}
-			break
+	// The named compaction's payload supplies the one summary message and
+	// its boundary target's sequence is boundarySequence, at or before which
+	// no entry projects; -1 means no compaction boundary and the full
+	// history projects.
+	compaction, boundarySequence := findCompactionCutoff(entries, compactionID)
+	if compaction != nil {
+		msg, err := model.NewMessage(model.Message{
+			Role:    model.RoleAssistant,
+			Source:  compaction.Model,
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
+		})
+		if err != nil {
+			return nil, err
 		}
+		messages = append(messages, msg)
 	}
 	for _, entry := range entries {
 		if entry.Envelope.Sequence <= boundarySequence {
