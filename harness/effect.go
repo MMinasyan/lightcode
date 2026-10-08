@@ -75,10 +75,6 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 	attempt := exec.Model
 	normalize := exec.NormalizeTool
 	advertised := advertisedToolNames(capture)
-	retry := exec.Retry
-	if retry == nil {
-		retry = standardRetryPolicy
-	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		// The compaction trigger sits before every model boundary, before any
 		// intent commits: a request whose messages plus the output reserve
@@ -152,53 +148,31 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			}
 			return agent.ModelSettlement{}, cause
 		}
-		// The one attempt loop lives inside the committed intent: every
+		// The one shared attempt loop lives inside the committed intent: every
 		// failed attempt is classified by the retry policy, waits run behind
 		// the cancellation checks, and an accepted stream never re-enters
 		// retry — assembly owns it, including closure.
 		var output model.Output
-		for failed := 1; ; failed++ {
-			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
-				return h.interruptModelEffect(c, operationID, intent, nil)
+		switch res := runModelAttempts(ctx, req, attempt, exec.Retry); res.kind {
+		case attemptAccepted:
+			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance
+			if attemptErr != nil {
+				return settle(attemptErr)
 			}
-			stream, attemptErr := attempt(ctx, req)
-			if attemptErr == nil && stream != nil {
-				output, attemptErr = assemble(intent.expected, h.observeStream(intent.sessionID, operationID, stream)) // exactly one assembly after acceptance
-				if attemptErr != nil {
-					return settle(attemptErr)
-				}
-				break
+			output = out
+		case attemptInterrupted:
+			return h.interruptModelEffect(c, operationID, intent, nil)
+		case attemptInvalid:
+			return settle(res.err)
+		case attemptFailed:
+			committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: res.err.Error()}
+			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
+				terminal: OperationFailure,
+				detail:   res.err.Error(),
+			}); err != nil {
+				return agent.ModelSettlement{}, err
 			}
-			if attemptErr == nil || stream != nil { // exactly one stream or one error must be returned; a supplied stream closes before the boundary failure
-				if stream != nil {
-					_ = stream.Close()
-				}
-				return settle(&agent.ProtocolError{Boundary: "model", Detail: "physical model request returned neither exactly one stream nor one error"})
-			}
-			// An attempt failure observed under a done execution context
-			// settles the interruption outcome before any classification:
-			// regardless of the attempt error's shape or the retry policy's
-			// answer, pre-acceptance cancellation is an interruption with no
-			// output and no assembly call.
-			if ctx.Err() != nil {
-				return h.interruptModelEffect(c, operationID, intent, nil)
-			}
-			delay, again := retry(attemptErr, failed)
-			if !again || delay < 0 {
-				committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: attemptErr.Error()}
-				if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
-					terminal: OperationFailure,
-					detail:   attemptErr.Error(),
-				}); err != nil {
-					return agent.ModelSettlement{}, err
-				}
-				return committed, nil
-			}
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
-				return h.interruptModelEffect(c, operationID, intent, nil)
-			}
+			return committed, nil
 		}
 		set := derivedSettlement(output)
 		owned, err := agent.ValidateModelSettlement(intent.expected, set)
@@ -279,30 +253,11 @@ func derivedSettlement(out model.Output) agent.ModelSettlement {
 	case model.OutputInterrupted:
 		return agent.ModelSettlement{Disposition: agent.DispoInterruption, Output: &out, Detail: out.Detail}
 	default:
-		if outputCarriesPayload(out) {
+		if model.HasAssistantContent(out.Message) { // the content-only query: an errored output carries no tool calls, so content is its whole retained-payload question.
 			return agent.ModelSettlement{Disposition: agent.DispoContinue, Output: &out}
 		}
 		return agent.ModelSettlement{Disposition: agent.DispoFailure, Output: &out, Detail: out.Detail}
 	}
-}
-
-// outputCarriesPayload reports whether one finalized output retains a
-// model-visible payload, mirroring the model package's finalized payload
-// predicate: a non-empty refusal, tool calls, one non-empty finalized content
-// part, or one finalized non-null message extra.
-func outputCarriesPayload(out model.Output) bool {
-	if out.Message == nil {
-		return false
-	}
-	if out.Message.Refusal != "" || len(out.Message.ToolCalls) > 0 {
-		return true
-	}
-	for _, part := range out.Message.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
-			return true
-		}
-	}
-	return len(out.Message.Extra.Finalize()) > 0
 }
 
 // standardRetryPolicy is the nil-Retry classifier: HTTP 429 and 5xx failures,

@@ -1379,26 +1379,13 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 // PUT's effect boundary over the real admission path: two Sessions selecting
 // the edited type both prepare their next Operations with the new model at
 // the new generation, while the durably running Operation keeps its original
-// capture — no re-preparation and no capture change.
+// committed capture — no re-preparation and no capture change.
 func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096},"wide":{"name":"W","context_window":8192}}}}}`)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"`+e.server.URL+`","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},"wide":{"name":"W","context_window":262144,"max_output_tokens":4096}}}}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
-		var mu sync.Mutex
-		var admitted []string
-		prep := e.prep
-		r, err := open(context.Background(), options{
-			DataDir:    e.dataDir,
-			ConfigPath: e.configPath,
-			Plugins:    []Plugin{e.storagePlugin(store)},
-			prepare: func(ctx context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openExecution, error) {
-				mu.Lock()
-				admitted = append(admitted, req.Session.AgentType+"="+sel.agent.Model.String()+"@"+sel.invocation.Revision())
-				mu.Unlock()
-				return prep.prepare(ctx, req, sel)
-			},
-		})
+		r, err := e.open(context.Background(), e.storagePlugin(store))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1411,7 +1398,7 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 		// One durably running Operation on session A holds the original
 		// capture while the mutation lands.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, a.Identity.SessionID, "op-active", "running")
 		awaitModelArrival(t, e)
 
@@ -1423,29 +1410,26 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 			t.Fatalf("mutation = %+v, want the new model projected from the returned candidate at generation 2", mutation)
 		}
 
-		// Session B is idle: its next admission prepares the new model at the
-		// new generation, and the active Operation has not re-prepared. The
-		// controlled model gate parks every execution, so B's Operation runs
-		// up to its model effect and both settle once the gate opens.
+		// Session B is idle: its next admission commits the new model at the
+		// new generation, and the active Operation has not re-captured. The
+		// held HTTP request parks every execution, so B's Operation runs up
+		// to its model request and both settle once the gate opens.
 		submitThroughRuntime(t, r, b.Identity.SessionID, "op-b1", "b turn")
-		mu.Lock()
-		got := append([]string(nil), admitted...)
-		mu.Unlock()
-		if len(got) != 2 || got[0] != "worker=prov/m@1" || got[1] != "worker=prov/wide@2" {
-			t.Fatalf("admissions = %q, want the original capture then B's new selection at generation 2", got)
+		if got := committedAdmission(t, r, b.Identity.SessionID, "op-b1"); got != "worker=prov/wide@2" {
+			t.Fatalf("B's committed capture = %q, want the new selection at generation 2", got)
+		}
+		if got := committedAdmission(t, r, a.Identity.SessionID, "op-active"); got != "worker=prov/m@1" {
+			t.Fatalf("A's committed capture = %q, want the original capture kept by the running Operation", got)
 		}
 
 		// The active captures settle with their original selections; A's
-		// next admission then prepares the new model too.
+		// next admission then commits the new model too.
 		close(gate)
 		awaitIdleSession(t, r, a.Identity.SessionID)
 		awaitIdleSession(t, r, b.Identity.SessionID)
 		submitConvergedThroughRuntime(t, r, a.Identity.SessionID, "op-a2", "a turn", harness.OperationSuccess)
-		mu.Lock()
-		got = append([]string(nil), admitted...)
-		mu.Unlock()
-		if len(got) != 3 || got[2] != "worker=prov/wide@2" {
-			t.Fatalf("admissions = %q, want A's next selection under the mutated publication", got)
+		if got := committedAdmission(t, r, a.Identity.SessionID, "op-a2"); got != "worker=prov/wide@2" {
+			t.Fatalf("A's next committed capture = %q, want the selection under the mutated publication", got)
 		}
 
 		// The forbidden siblings: an unknown type and a malformed ref fail

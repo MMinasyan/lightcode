@@ -88,7 +88,7 @@ func (st *assemblyState) partAt(pos int) *partAcc {
 }
 
 func (p *partAcc) nonEmpty() bool {
-	return p.text != "" || p.url != "" || p.opaque != "" || len(p.extra.Finalize()) > 0
+	return p.text != "" || p.url != "" || p.opaque != "" || p.extra.HasValues()
 }
 
 func (st *assemblyState) buildParts() []model.ContentPart {
@@ -124,5 +124,5 @@ func (st *assemblyState) hasPayload() bool {
 		}
 	}
 
-	return len(st.msgExtra.Finalize()) > 0
+	return st.msgExtra.HasValues()
 }

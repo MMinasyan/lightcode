@@ -1171,7 +1171,13 @@
      "json": "{\"turn\":1,\"files\":[]}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "zero-turn",
+     "json": "{\"turn\":0,\"files\":[]}",
+     "typescript": false
+    }
+   ]
   },
   {
    "schema": "RetainedTurns",
@@ -2394,6 +2400,14 @@
   {
    "schema": "JSONObject",
    "json": "{\"n\":9007199254740993,\"big\":1e1000}"
+  },
+  {
+   "schema": "Cost",
+   "json": "{\"input\":0.123456789,\"output\":0.987654321,\"cache_read\":0.123456789,\"cache_write\":0.123456789}"
+  },
+  {
+   "schema": "Cost",
+   "json": "{}"
   },
   {
    "schema": "ToolCallView",

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -395,7 +397,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		// The one gate channel releases through one OnceFunc, so the normal
 		// and deferred releases are idempotent.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release()
 		submit := func(operationID, mode, text string) protocol.SubmitSessionResponse {
@@ -450,8 +452,8 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		if hydration.JSON200.SelectedModel == nil || *hydration.JSON200.SelectedModel != "prov/m" {
 			t.Fatalf("hydration selected model = %v, want the configured prov/m", hydration.JSON200.SelectedModel)
 		}
-		if hydration.JSON200.Usage.Context.ContextWindow != 4096 {
-			t.Fatalf("hydration context window = %d, want the captured 4096", hydration.JSON200.Usage.Context.ContextWindow)
+		if hydration.JSON200.Usage.Context.ContextWindow != 262144 {
+			t.Fatalf("hydration context window = %d, want the running Operation's captured catalog window", hydration.JSON200.Usage.Context.ContextWindow)
 		}
 		assertQualifiedInstance(t, "hydration", hydration.JSON200.SessionRevision, ps.instance)
 		if hydration.JSON200.Session.SessionId != session || hydration.JSON200.Session.SessionRevision.InstanceId != ps.instance {
@@ -672,7 +674,7 @@ func TestProtocolServerHistoryRoundTripsOpaqueNumbers(t *testing.T) {
 			body, _ := json.Marshal(submitted.JSON200)
 			t.Fatalf("submit = %s (status %d)", body, submitted.HTTPResponse.StatusCode)
 		}
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 
 		history, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{})
 		if err != nil || history.JSON200 == nil {
@@ -737,7 +739,7 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		const nulSecret = "sk-raw\x00-refused"
 		stderr := captureSweepStderr(t)
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 		// One malformed line makes the startup LoadDotEnv diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")
@@ -1584,7 +1586,7 @@ func TestProtocolServerRetainedFamily(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RevertRetainedCode: %v", err)
 		}
-		if revert.JSON200 == nil || !containsString(revert.JSON200.Restored, file) || revert.JSON200.Error != nil {
+		if revert.JSON200 == nil || !slices.Contains(revert.JSON200.Restored, file) || revert.JSON200.Error != nil {
 			body, _ := json.Marshal(revert.JSON200)
 			t.Fatalf("retained revert = %s (status %d), want the completed restore", body, revert.HTTPResponse.StatusCode)
 		}
@@ -1729,5 +1731,130 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 	if empty.JSONDefault == nil || empty.JSONDefault.Code != protocol.Invalid {
 		body, _ := json.Marshal(empty.JSONDefault)
 		t.Fatalf("empty identity = %s (status %d), want the typed invalid refusal", body, empty.HTTPResponse.StatusCode)
+	}
+}
+
+// refusedAnswer extracts one generated response's typed default error body
+// and HTTP status through the generated accessors; a transport failure or an
+// answer without its typed body fails the calling row.
+func refusedAnswer(t *testing.T, resp interface {
+	GetJSONDefault() *protocol.Error
+	StatusCode() int
+}, err error) (int, protocol.Error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("generated client call: %v", err)
+	}
+	if typed := resp.GetJSONDefault(); typed != nil {
+		return resp.StatusCode(), *typed
+	}
+	t.Fatalf("response %d carries no typed error body", resp.StatusCode())
+	return 0, protocol.Error{}
+}
+
+// TestProtocolServerMissingMetadata pins the missing-metadata identity
+// answers of the mounted generated client: the model DELETE/reset and
+// provider detail/delete/reset routes answer the typed not-found 404 for an
+// absent provider or model identity and the typed invalid 400 for a
+// malformed empty one, while an existing identity still edits normally on
+// the same routes. Every refused edit leaves the latest owning bytes, the
+// published generation, the warning revision and the event stream
+// untouched.
+func TestProtocolServerMissingMetadata(t *testing.T) {
+	r, _ := openProjectionRuntime(t, storage.NewMemory())
+	defer closeProjectionRuntime(r)
+	ps := openProtocolServer(t, r)
+	client := protocolClient(t, ps)
+	ctx := context.Background()
+
+	// The existing identities edit normally on the same routes the
+	// absent-identity rows below refuse.
+	window := 4096
+	spare, err := client.UpdateProviderModelWithResponse(ctx, &protocol.UpdateProviderModelParams{ProviderId: "prov", ModelId: "spare"}, protocol.UpdateProviderModelRequest{
+		Model: protocol.ModelEdit{Name: ptrTo("Spare"), ContextWindow: &window},
+	})
+	if err != nil || spare.JSON200 == nil || spare.JSON200.Result == nil || spare.JSON200.Result.Id != "spare" {
+		body, _ := json.Marshal(spare.JSON200)
+		t.Fatalf("existing model edit = %s (status %d, %v), want the upserted model", body, spare.HTTPResponse.StatusCode, err)
+	}
+	spareReset, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelFieldContextWindow, &protocol.ResetProviderModelFieldParams{ProviderId: "prov", ModelId: "spare"})
+	if err != nil || spareReset.JSON200 == nil {
+		body, _ := json.Marshal(spareReset.JSON200)
+		t.Fatalf("existing model reset = %s (status %d, %v), want the published reset", body, spareReset.HTTPResponse.StatusCode, err)
+	}
+	detail, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "prov"})
+	if err != nil || detail.JSON200 == nil || detail.JSON200.Provider.Id != "prov" {
+		t.Fatalf("existing provider read = (%v, %+v), want the provider view", err, detail.JSON200)
+	}
+	provReset, err := client.ResetProviderFieldWithResponse(ctx, protocol.ProviderFieldName, &protocol.ResetProviderFieldParams{ProviderId: "prov"})
+	if err != nil || provReset.JSON200 == nil {
+		body, _ := json.Marshal(provReset.JSON200)
+		t.Fatalf("existing provider reset = %s (status %d, %v), want the published reset", body, provReset.HTTPResponse.StatusCode, err)
+	}
+	removed, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "prov", ModelId: "spare"})
+	if err != nil || removed.JSON200 == nil || removed.JSON200.Result != nil {
+		body, _ := json.Marshal(removed.JSON200)
+		t.Fatalf("existing model deletion = %s (status %d, %v), want the null post-state", body, removed.HTTPResponse.StatusCode, err)
+	}
+
+	// The refused identities: the loop checks each live answer's class and
+	// status at the shared writer, and the shared refusal oracle checks the
+	// latest owning bytes, the published generation, the warning revision
+	// and the event stream through its wrapped expected class.
+	subscription, err := r.Subscribe(64)
+	if err != nil {
+		t.Fatalf("subscribe for the refusal baseline: %v", err)
+	}
+	defer subscription.Close()
+	refused := []struct {
+		name   string
+		want   error
+		code   protocol.ErrorCode
+		status int
+		call   func(t *testing.T) (int, protocol.Error)
+	}{
+		{"model delete missing", catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "prov", ModelId: "ghost"})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"model reset missing", catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelFieldName, &protocol.ResetProviderModelFieldParams{ProviderId: "prov", ModelId: "ghost"})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"provider detail missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "ghost"})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"provider delete missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.DeleteProviderDetailWithResponse(ctx, &protocol.DeleteProviderDetailParams{ProviderId: "ghost"})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"provider reset missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.ResetProviderFieldWithResponse(ctx, protocol.ProviderFieldName, &protocol.ResetProviderFieldParams{ProviderId: "ghost"})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"model delete empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "prov", ModelId: ""})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"model reset empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelFieldName, &protocol.ResetProviderModelFieldParams{ProviderId: "prov", ModelId: ""})
+			return refusedAnswer(t, resp, err)
+		}},
+		{"provider delete empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+			resp, err := client.DeleteProviderDetailWithResponse(ctx, &protocol.DeleteProviderDetailParams{ProviderId: ""})
+			return refusedAnswer(t, resp, err)
+		}},
+	}
+	for _, row := range refused {
+		t.Run(row.name, func(t *testing.T) {
+			before, generation, warnRev := runtimeMutationBaseline(t, r)
+			status, typed := row.call(t)
+			if typed.Code != row.code || status != row.status {
+				t.Fatalf("%s = (%d, %+v), want the typed (%d, %s)", row.name, status, typed, row.status, row.code)
+			}
+			assertRuntimeMutationRefused(t, r, subscription, before, generation, warnRev,
+				fmt.Errorf("%s: %w", row.name, row.want), row.want)
+		})
 	}
 }

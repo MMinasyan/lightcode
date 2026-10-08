@@ -609,7 +609,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, r.obs)
 		adapter := newObservationAdapter(r.obs, r.warnings)
 		adapter.h = r.harness
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, adapter, nil, nil, nil)
+		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, adapter, nil, nil)
 
 		request := compactPrepRequest()
 		request.Session.Identity.SessionID = sessionID
@@ -943,7 +943,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			_, err := r.forkSession(ctx, sourceID, protocol.ForkRequest{
 				BoundaryItemId: boundaryItem,
 				OperationId:    "op-orphan-fork",
-				Content:        []protocol.ContentPart{commandTextPart(t, "forked")},
+				Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 			})
 			forkDone <- err
 		}()

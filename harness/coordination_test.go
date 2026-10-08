@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -212,6 +213,34 @@ func settledOperation(t *testing.T, store *graphStorage, sessionID, operationID 
 		t.Fatalf("decode operation register %q: %v", operationID, err)
 	}
 	return rec
+}
+
+// awaitOperationTerminal polls one operation register until it settles
+// terminally with the wanted status, tolerating the not-yet-admitted window.
+func awaitOperationTerminal(t *testing.T, store *graphStorage, sessionID, operationID string, want OperationState) OperationRecord {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID})
+		if err == nil {
+			rec, derr := decodeOperationRegister(reg)
+			if derr != nil {
+				t.Fatalf("decode operation register %q: %v", operationID, derr)
+			}
+			if rec.State.Terminal != nil {
+				if rec.State.Status != want {
+					t.Fatalf("operation %q status = %s, want %s", operationID, rec.State.Status, want)
+				}
+				return rec
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("read operation register %q: %v", operationID, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %q never settled as %s", operationID, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // TestSubmitRoutesIdleAndActive proves the routing row: idle regular and idle

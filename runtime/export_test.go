@@ -12,15 +12,14 @@ import (
 
 // OpenForTest is the test-build composition bridge used by the external
 // runtime_test integration tests to assemble the actual plugin set without a
-// runtime-to-plugin import cycle. It runs the private open path with the
-// existing controlled preparation fixture; it is absent from production
-// builds, and no production constructor or concrete-plugin import backs it.
+// runtime-to-plugin import cycle. It forwards to the public Open with the
+// supplied plugins: the same concrete preparation path, with no alternate
+// producer. It is absent from production builds.
 func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []Plugin) (*Runtime, error) {
-	return open(ctx, options{
+	return Open(ctx, Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,
 		Plugins:    plugins,
-		prepare:    newControlledPrep().prepare,
 	})
 }
 
@@ -104,6 +103,22 @@ func UpdateSettingsForTest(r *Runtime, settings protocol.Settings) (protocol.Set
 // absent from production builds.
 func SetAgentTypeModelForTest(r *Runtime, agentType, modelRef string) (protocol.AgentMutation, error) {
 	return r.setAgentTypeModel(context.Background(), agentType, modelRef)
+}
+
+// createSession is the test-build root Session creation bridge: it enters
+// Runtime's existing admitted-call gate and runs the one normalized creation
+// core, so tests needing the full Core record observe the real gate. It is
+// absent from production builds.
+func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
+	var record harness.SessionRecord
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
+		return err
+	}); err != nil {
+		return harness.SessionRecord{}, err
+	}
+	return record, nil
 }
 
 // CreateSessionForTest bridges the private root Session creation for the

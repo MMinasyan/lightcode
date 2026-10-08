@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -188,7 +189,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		}
 		session := created.JSON201.SessionId
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		defer close(gate)
 		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
 			OperationId: "op-1", Mode: "regular",
@@ -609,7 +610,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		// class from the one idle gate.
 		session := projectionSession(t, r, filepath.Join(e.home, "busy"), "solo").Identity.SessionID
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		defer close(gate)
 		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
 			OperationId: "op-1", Mode: "regular",
@@ -648,6 +649,86 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 			t.Fatalf("classify(%v) = (%s, %d), want (%s, %d)", row.err, code, status, row.code, row.status)
 		}
 	}
+}
+
+// TestClassifyProtocolMissingMetadata pins the missing-metadata identity
+// classification at the one shared mapper: every real metadata producer's
+// typed absent-provider or absent-model refusal maps to the not-found class
+// after one wrapping level, a malformed identity and an invalid field keep
+// the invalid class ahead of any missing identity, and a complete-candidate
+// refusal keeps its configuration class even though its message names a
+// model. Every row is a real Runtime operator's refusal.
+func TestClassifyProtocolMissingMetadata(t *testing.T) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
+		defer closeProjectionRuntime(r)
+		ctx := context.Background()
+		reserved := map[string]any{"stream": true}
+
+		rows := []struct {
+			name   string
+			run    func() error
+			want   error // the producer's typed identity
+			code   protocol.ErrorCode
+			status int
+		}{
+			{"provider read missing", func() error {
+				_, err := r.getProvider(ctx, "ghost")
+				return err
+			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			{"provider delete missing", func() error {
+				_, err := r.deleteProvider(ctx, "ghost")
+				return err
+			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			{"provider field reset missing", func() error {
+				_, err := r.resetProviderField(ctx, "ghost", protocol.ProviderFieldName)
+				return err
+			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			{"model delete missing", func() error {
+				_, err := r.deleteModel(ctx, "prov", "ghost")
+				return err
+			}, catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound},
+			{"model field reset missing", func() error {
+				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelFieldName)
+				return err
+			}, catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound},
+			{"model delete under missing provider", func() error {
+				_, err := r.deleteModel(ctx, "ghost", "m")
+				return err
+			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			{"empty provider identity", func() error {
+				_, err := r.deleteProvider(ctx, "")
+				return err
+			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			{"empty model identity", func() error {
+				_, err := r.deleteModel(ctx, "prov", "")
+				return err
+			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			{"invalid model field on a missing model", func() error {
+				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelField("bogus"))
+				return err
+			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			{"complete candidate refusal", func() error {
+				_, err := r.saveModel(ctx, "prov", "m", protocol.ModelEdit{ExtraBody: &reserved})
+				return err
+			}, ErrConfiguration, protocol.Configuration, http.StatusUnprocessableEntity},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				err := row.run()
+				if err == nil {
+					t.Fatal("the producer refused nothing, want a typed refusal")
+				}
+				if !errors.Is(err, row.want) {
+					t.Fatalf("producer refusal = %v, want class %v", err, row.want)
+				}
+				code, status := classifyProtocolError(fmt.Errorf("wrapped: %w", err))
+				if code != row.code || status != row.status {
+					t.Fatalf("classify(%v) = (%s, %d), want (%s, %d)", err, code, status, row.code, row.status)
+				}
+			})
+		}
+	})
 }
 
 // TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession pins the
@@ -825,7 +906,7 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	if result.Error == nil || result.Error.Code != protocol.Internal {
 		t.Fatalf("partial restore error member = %+v, want the accumulated internal error", result.Error)
 	}
-	if !containsString(result.Restored, newestTarget) {
+	if !slices.Contains(result.Restored, newestTarget) {
 		t.Fatalf("partial restore restored = %v, want the newest group's file before the failure", result.Restored)
 	}
 	if restored, err := os.ReadFile(newestTarget); err != nil || string(restored) != "v0" {

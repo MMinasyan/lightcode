@@ -6,12 +6,14 @@ package harness_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/pkoukk/tiktoken-go"
 )
 
 // publicFactSink is the external suite's synchronous passive observer.
@@ -123,6 +125,239 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// TestPublicLaunchChildSessionAutomaticCompaction retains the launched-child
+// trigger oracle on both stores. Completion delivery, terminal publication,
+// scoped Close and run retirement are separate observations.
+func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx, cancel := context.WithCancel(context.Background())
+		sink := &publicFactSink{}
+		enc, err := tiktoken.GetEncoding("cl100k_base")
+		if err != nil {
+			t.Fatal(err)
+		}
+		estimate := func(messages []model.Message) int {
+			total := 0
+			for _, message := range messages {
+				total += len(enc.Encode(message.TextContent(), nil, nil)) + 4
+				for _, call := range message.ToolCalls {
+					total += len(enc.Encode(call.Name, nil, nil))
+					total += len(enc.Encode(string(call.Arguments), nil, nil))
+				}
+			}
+			return total
+		}
+		first := strings.Repeat("seed ", 80)
+		huge := strings.Repeat("word ", 4000)
+		capture := compactManualCapture()
+		capture.ContextWindow, capture.OutputReserve = 262144, 64
+		capture.Compact.ContextWindow, capture.Compact.OutputReserve = 65536, 4096
+		var mu sync.Mutex
+		var prepares []harness.PreparationRequest
+		type requestObservation struct {
+			session, operation string
+			request            model.Request
+		}
+		var requests []requestObservation
+		var compactRequests []model.Request
+		parentRequest := make(chan string, 1)
+		parentClose := make(chan string, 1)
+		root := ""
+		h, err := harness.New(ctx, harness.Dependencies{
+			Storage: store,
+			Observe: sink.observe,
+			Prepare: func(_ context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+				mu.Lock()
+				prepares = append(prepares, req)
+				ownedCapture := capture
+				mu.Unlock()
+				return harness.PreparedExecution{
+					Capture: ownedCapture,
+					Open: func(_ context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+						return harness.Execution{
+							Model: func(_ context.Context, req model.Request) (model.Stream, error) {
+								mu.Lock()
+								requests = append(requests, requestObservation{admission.SessionID, admission.OperationID, req})
+								mu.Unlock()
+								if admission.SessionID == root {
+									parentRequest <- admission.OperationID
+									return summaryTurnStream("parent complete", model.Usage{}), nil
+								}
+								return summaryTurnStream("child answer", model.Usage{}), nil
+							},
+							CompactModel: func(_ context.Context, req model.Request) (model.Stream, error) {
+								mu.Lock()
+								compactRequests = append(compactRequests, req)
+								mu.Unlock()
+								return summaryTurnStream("child summary", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
+							},
+							Tool:          publicImmediateTool,
+							NormalizeTool: publicNormalize,
+							Close: func() error {
+								if admission.SessionID == root {
+									parentClose <- admission.OperationID
+								}
+								return nil
+							},
+						}, nil
+					},
+				}, nil
+			},
+		})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		defer func() {
+			cancel()
+			if err := h.Wait(context.Background()); err != nil {
+				t.Errorf("Wait: %v", err)
+			}
+		}()
+		root = createSession(t, h)
+		launch := publicChildLaunch(root)
+		launch.Content = []model.ContentPart{{Kind: model.PartText, Text: first}}
+		res, err := h.LaunchChildSession(context.Background(), launch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := res.ChildSessionID
+		if rec := awaitTerminal(t, h, child, "child-op-1"); rec.State.Status != harness.OperationSuccess {
+			t.Fatalf("first child operation: %+v", rec.State)
+		}
+		// A terminal child register does not prove that its completion reached
+		// the parent. Join the actual parent execution and its lifetime.
+		var completionID string
+		select {
+		case completionID = <-parentRequest:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first child completion never reached the parent model boundary")
+		}
+		if completionID == "" || completionID == launch.OperationID {
+			t.Fatalf("parent completion identity = %q", completionID)
+		}
+		if rec := awaitTerminal(t, h, root, completionID); rec.State.Status != harness.OperationSuccess || rec.Admission.RequestKind != harness.RequestKindMessage {
+			t.Fatalf("parent completion operation: %+v", rec)
+		}
+		select {
+		case closed := <-parentClose:
+			if closed != completionID {
+				t.Fatalf("closed parent operation %q, want %q", closed, completionID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("parent completion execution never closed")
+		}
+		parentQuiet := awaitPublicQuiet(t, h, root, sink)
+		if len(parentQuiet.Background) != 0 {
+			t.Fatalf("first child membership not retired: %+v", parentQuiet.Background)
+		}
+		awaitPublicQuiet(t, h, child, sink)
+		parentBefore := snapshotSession(t, store, root)
+
+		mu.Lock()
+		var firstRequest model.Request
+		var foundFirst, foundParent bool
+		for _, observed := range requests {
+			if observed.session == child && observed.operation == "child-op-1" {
+				firstRequest, foundFirst = observed.request, true
+			}
+			if observed.session == root && observed.operation == completionID {
+				got := texts(observed.request)
+				foundParent = len(got) == 2 && got[1] == "child answer"
+			}
+		}
+		if len(compactRequests) != 0 {
+			t.Errorf("ordinary first child turn compacted")
+		}
+		mu.Unlock()
+		if !foundFirst || !foundParent {
+			t.Fatalf("missing first child or actual parent completion request: child=%v parent=%v", foundFirst, foundParent)
+		}
+		if got := texts(firstRequest); len(got) != 2 || got[1] != first {
+			t.Fatalf("first child projection = %q", got)
+		}
+		assembled := append(append([]model.Message(nil), firstRequest.Messages...),
+			model.Message{Role: model.RoleAssistant, Source: publicModelRef, Content: []model.ContentPart{{Kind: model.PartText, Text: "child answer"}}},
+			model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: huge}}})
+		mu.Lock()
+		capture.ContextWindow = estimate(assembled) + capture.OutputReserve - 1
+		window, reserve, compactRef := capture.ContextWindow, capture.OutputReserve, capture.Compact.Model
+		mu.Unlock()
+		if fits := estimate([]model.Message{
+			firstRequest.Messages[0],
+			{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]"}}},
+		}) + reserve; fits > window {
+			t.Fatalf("summary request %d does not fit overflowing window %d", fits, window)
+		}
+		if result, err := submit(t, h, child, "child-op-2", harness.MessageModeRegular, huge); err != nil || result.Disposition != harness.DispositionAdmitted {
+			t.Fatalf("second child submit = %+v, %v", result, err)
+		}
+		secondOperation := awaitTerminal(t, h, child, "child-op-2")
+		if rec := secondOperation; rec.State.Status != harness.OperationSuccess || rec.Admission.Execution.ContextWindow != window {
+			t.Fatalf("second child capture/terminal: %+v", rec)
+		}
+		childQuiet := awaitPublicQuiet(t, h, child, sink)
+		mu.Lock()
+		observedPieces := append([]model.Request(nil), compactRequests...)
+		observedRequests := append([]requestObservation(nil), requests...)
+		observedPrepares := append([]harness.PreparationRequest(nil), prepares...)
+		mu.Unlock()
+		if len(observedRequests) != 3 {
+			t.Fatalf("conversation requests = %d, want child, parent completion, rebuilt child", len(observedRequests))
+		}
+		if len(observedPieces) != 1 {
+			t.Fatalf("child compact calls = %d, want one complete piece", len(observedPieces))
+		}
+		var rebuilt model.Request
+		rebuiltCalls := 0
+		for _, observed := range observedRequests {
+			if observed.session == child && observed.operation == "child-op-2" {
+				rebuilt, rebuiltCalls = observed.request, rebuiltCalls+1
+			}
+		}
+		got := texts(rebuilt)
+		if rebuiltCalls != 1 || len(got) != 2 || got[1] != "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]" || rebuilt.Messages[1].Source != compactRef {
+			t.Fatalf("child rebuilt calls/projection = %d/%q", rebuiltCalls, got)
+		}
+		compactions := 0
+		for _, fact := range childQuiet.Facts {
+			if fact.Kind == harness.EntryCompaction {
+				comp := fact.Compaction
+				if comp == nil {
+					t.Fatal("compaction fact has no payload")
+				}
+				compactions++
+				if comp.OperationID != "child-op-2" || comp.Summary != "child summary" || comp.Usage == nil || *comp.Usage != (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) || childQuiet.Session.State.CompactionEntryID != comp.EntryID {
+					t.Fatalf("child compaction/projection = %+v", comp)
+				}
+			}
+		}
+		if compactions != 1 {
+			t.Fatalf("child committed compactions = %d, want one", compactions)
+		}
+		pieceCount := func(totals harness.UsageTotals) bool {
+			for _, usage := range totals.ByModel {
+				if usage.Model == compactRef {
+					return usage.Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1})
+				}
+			}
+			return false
+		}
+		if !pieceCount(secondOperation.State.Usage) || !pieceCount(childQuiet.Session.State.Usage) {
+			t.Fatalf("child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.Session.State.Usage)
+		}
+		if len(observedPrepares) != 3 || observedPrepares[0].Session.Identity.SessionID != child || observedPrepares[1].Session.Identity.SessionID != root || observedPrepares[2].Session.Identity.SessionID != child {
+			t.Fatalf("shared preparation lineage = %+v", observedPrepares)
+		}
+		for _, preparation := range observedPrepares {
+			if preparation.RequestKind != harness.RequestKindMessage {
+				t.Fatalf("preparation kind = %q, want message", preparation.RequestKind)
+			}
+		}
+		assertForkSourceUnchanged(t, store, root, parentBefore)
+	})
 }
 
 // TestObservePublicBothStores proves the public observer over memory and

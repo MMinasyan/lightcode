@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/model"
@@ -106,10 +105,6 @@ func compactionPieceBudget(capture CompactCapture, previous string) int {
 // — while pre-assembly failures and cancellations return no output.
 func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture, accumulated *usageAccumulator) agent.ModelEffect {
 	attempt := exec.CompactModel
-	retry := exec.Retry
-	if retry == nil {
-		retry = standardRetryPolicy
-	}
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -152,50 +147,31 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			}
 			return agent.ModelSettlement{}, cause
 		}
-		// The one attempt loop lives inside the committed intent, identical
-		// to the conversation model effect's but running through the compact
-		// transport.
+		// The one shared attempt loop lives inside the committed intent,
+		// identical to the conversation model effect's but running through the
+		// compact transport.
 		var output model.Output
-		for failed := 1; ; failed++ {
-			if err := ctx.Err(); err != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+		switch res := runModelAttempts(ctx, req, attempt, exec.Retry); res.kind {
+		case attemptAccepted:
+			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
+			if attemptErr != nil {
+				return settle(attemptErr)
 			}
-			stream, attemptErr := attempt(ctx, req)
-			if attemptErr == nil && stream != nil {
-				output, attemptErr = assemble(intent.expected, h.observeStream(intent.sessionID, operationID, stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
-				if attemptErr != nil {
-					return settle(attemptErr)
-				}
-				break
+			output = out
+		case attemptInterrupted:
+			return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+		case attemptInvalid:
+			return settle(res.err)
+		case attemptFailed:
+			committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: res.err.Error()}
+			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
+				terminal: OperationFailure,
+				detail:   res.err.Error(),
+				usage:    accumulated.total,
+			}); err != nil {
+				return agent.ModelSettlement{}, err
 			}
-			if attemptErr == nil || stream != nil { // exactly one stream or one error must be returned; a supplied stream closes before the boundary failure
-				if stream != nil {
-					_ = stream.Close()
-				}
-				return settle(&agent.ProtocolError{Boundary: "model", Detail: "physical model request returned neither exactly one stream nor one error"})
-			}
-			// An attempt failure observed under a done execution context
-			// settles the interruption outcome before any classification.
-			if ctx.Err() != nil {
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
-			}
-			delay, again := retry(attemptErr, failed)
-			if !again || delay < 0 {
-				committed := agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: attemptErr.Error()}
-				if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
-					terminal: OperationFailure,
-					detail:   attemptErr.Error(),
-					usage:    accumulated.total,
-				}); err != nil {
-					return agent.ModelSettlement{}, err
-				}
-				return committed, nil
-			}
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done(): // cancellation during backoff interrupts; no attempt starts
-				return h.interruptModelEffect(c, operationID, intent, accumulated.total)
-			}
+			return committed, nil
 		}
 		// The piece's reported usage joins the accumulator before its
 		// settlement; a piece reporting no usage contributes nothing.
@@ -390,42 +366,49 @@ func compactionFailureSettlement(c *coordinator, operationID string, err error) 
 	return agent.ModelSettlement{Disposition: agent.DispoFailure, Detail: err.Error()}, nil
 }
 
+// findCompactionCutoff resolves the named compaction's payload and cutoff
+// over one validated Session graph — the single lookup behind both the
+// context projection and the compaction boundary. An empty named ID is the
+// uncompacted history: no payload and no cutoff. A nonempty named ID's
+// references are guaranteed by graph validation — the register names an
+// in-session compaction entry and that entry's boundary names an in-session
+// entry strictly before it — so the lookup returns that payload and the
+// boundary target's sequence; a missing persisted reference is corruption
+// rejected before this lookup runs.
+func findCompactionCutoff(entries []graphEntry, namedID string) (*compactionEntry, int64) {
+	if namedID == "" {
+		return nil, -1
+	}
+	for i := range entries {
+		if entries[i].Envelope.ID != namedID || entries[i].Compaction == nil {
+			continue
+		}
+		for j := range entries {
+			if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
+				return entries[i].Compaction, entries[j].Envelope.Sequence
+			}
+		}
+	}
+	return nil, -1
+}
+
 // compactionBoundary names the last entry one frozen compaction snapshot
 // covered: the need-th projectable entry strictly after the prior
 // compaction's own boundary target, where need is the snapshot length minus
 // the prior summary message the snapshot carries as its first covered message.
 // Without a named prior compaction the count runs from the graph's start; a
 // summary-only re-compaction (the snapshot is the prior summary alone) names
-// the prior compaction entry itself, a valid compaction-kind boundary. Both
-// lookups cannot miss on a validating graph — the register names an
-// in-session compaction entry and every compaction boundary names an
-// in-session entry strictly before it — so a miss degrades to the same count
-// over the named entry's own sequence, or over the graph's start when the
-// named entry itself is absent. A count shortfall returns the empty boundary:
-// unreachable when the snapshot derives from the same graph's projectable
-// entries, and the payload's hex rule rejects it inside the commit
-// transaction as the ordinary failure.
+// the prior compaction entry itself, a valid compaction-kind boundary. The
+// named cutoff comes from findCompactionCutoff over the same validated graph.
+// A count shortfall returns the empty boundary: unreachable when the snapshot
+// derives from the same graph's projectable entries, and the payload's hex
+// rule rejects it inside the commit transaction as the ordinary failure.
 func compactionBoundary(entries []graphEntry, namedCompactionID string, snapshotLen int) string {
-	cutoff := int64(-1)
-	summaryCount := 0
-	if namedCompactionID != "" {
-		for i := range entries {
-			if entries[i].Envelope.ID != namedCompactionID || entries[i].Compaction == nil {
-				continue
-			}
-			boundarySequence := entries[i].Envelope.Sequence
-			for j := range entries {
-				if entries[j].Envelope.ID == entries[i].Compaction.BoundaryEntryID {
-					boundarySequence = entries[j].Envelope.Sequence
-					break
-				}
-			}
-			cutoff = boundarySequence
-			summaryCount = 1
-			break
-		}
+	payload, cutoff := findCompactionCutoff(entries, namedCompactionID)
+	need := snapshotLen
+	if payload != nil {
+		need-- // the prior summary the snapshot carries as its first covered message
 	}
-	need := snapshotLen - summaryCount
 	if need == 0 {
 		return namedCompactionID
 	}

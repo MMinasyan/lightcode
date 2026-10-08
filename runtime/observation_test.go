@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,7 +14,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -565,12 +563,13 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 			t.Fatalf("createSession: %v", err)
 		}
 		sessionID := session.Identity.SessionID
-		e.prep.modelGate = make(chan struct{})
+		gate := make(chan struct{})
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, sessionID, "op-observed", "hello")
 		select {
-		case <-e.prep.modelArrived:
+		case <-e.server.arrived:
 		case <-time.After(10 * time.Second):
-			t.Fatal("the gated execution never reached its model effect")
+			t.Fatal("the gated execution never reached its model request")
 		}
 		full, err := r.Subscribe(1)
 		if err != nil {
@@ -585,9 +584,8 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 				t.Fatalf("Reload during execution = (%q, %v), want %s", revision, err, want)
 			}
 		}
-		close(e.prep.modelGate)
-		e.prep.awaitCleanups(1)
-		if rec := readOperation(t, r, sessionID, "op-observed"); rec.State.Status != harness.OperationSuccess {
+		close(gate)
+		if rec := awaitOperation(t, r, sessionID, "op-observed", harness.OperationSuccess); rec.State.Status != harness.OperationSuccess {
 			t.Fatalf("Operation state = %+v, want success: subscriber saturation changed no execution outcome", rec.State)
 		}
 		if err := r.Close(context.Background()); err != nil {
@@ -707,23 +705,6 @@ func snapshotPairOf(t *testing.T, r *Runtime, sessionID string) protocol.Session
 	return wireRevision(snapshotRevision(snap))
 }
 
-// refusalProgressStream yields the scripted deltas then EOF: the live
-// refusal-bearing model-stream shape.
-type refusalProgressStream struct {
-	deltas []model.StreamDelta
-	i      int
-}
-
-func (s *refusalProgressStream) Recv() (model.StreamDelta, error) {
-	if s.i >= len(s.deltas) {
-		return model.StreamDelta{}, io.EOF
-	}
-	s.i++
-	return s.deltas[s.i-1], nil
-}
-
-func (s *refusalProgressStream) Close() error { return nil }
-
 // TestObservationRefusalDeltaProgress proves live refusal-bearing model
 // streams reach the passive bus as distinct refusal_delta events: a
 // refusal-only turn and a mixed content turn keep their exact fragment
@@ -731,7 +712,7 @@ func (s *refusalProgressStream) Close() error { return nil }
 // hint addresses the real running Operation.
 func TestObservationRefusalDeltaProgress(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() {
 			if err := bg.r.Close(context.Background()); err != nil {
 				bg.t.Errorf("Close: %v", err)
@@ -742,22 +723,24 @@ func TestObservationRefusalDeltaProgress(t *testing.T) {
 			t.Fatalf("Subscribe: %v", err)
 		}
 		session := bg.session("refusal")
-		bg.prep.setSessionScript(session, &lifecycleScript{model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-			if attempt == 1 { // the refusal-only turn
-				return &refusalProgressStream{deltas: []model.StreamDelta{
-					{HasChoice: true, Role: "assistant", RefusalFragment: "I cannot"},
-					{HasChoice: true, RefusalFragment: " help with that."},
-					{HasChoice: true, FinishReason: "stop"},
-				}}, nil
+		// The wire dispatch: the request whose history carries no refusal
+		// receives the refusal-only turn; the later one — whose history
+		// retains the refused assistant — receives the mixed turn.
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if !strings.Contains(body, `"refusal"`) {
+				return []string{
+					`{"choices":[{"delta":{"role":"assistant","refusal":"I cannot"}}]}`,
+					`{"choices":[{"delta":{"refusal":" help with that."}}]}`,
+					`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				}
 			}
-			// the mixed turn: one delta carries content text and the refusal
-			return &refusalProgressStream{deltas: []model.StreamDelta{
-				{HasChoice: true, Role: "assistant", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "working"}}},
-				{HasChoice: true, RefusalFragment: " but no", ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "harder"}}},
-				{HasChoice: true, RefusalFragment: " can do."},
-				{HasChoice: true, FinishReason: "stop"},
-			}}, nil
-		}})
+			return []string{
+				`{"choices":[{"delta":{"role":"assistant","content":"working"}}]}`,
+				`{"choices":[{"delta":{"content":"harder","refusal":" but no"}}]}`,
+				`{"choices":[{"delta":{"refusal":" can do."}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			}
+		})
 		bg.submitMode(session, "op-refuse", "hello", harness.MessageModeRegular)
 		awaitOperation(t, bg.r, session, "op-refuse", harness.OperationSuccess)
 		bg.submitMode(session, "op-mixed", "hello", harness.MessageModeRegular)

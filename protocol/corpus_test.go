@@ -470,8 +470,9 @@ func componentName(ref string) string {
 	return ref
 }
 
-// TestContractCorpusRawFidelity pins the one place arbitrary JSON values must
-// survive generated Go decoding byte-exact: tool metadata and raw objects.
+// TestContractCorpusRawFidelity pins where values must survive generated Go
+// decoding byte-exact: tool metadata and raw objects, and the typed numeric
+// scalars whose optional fields and double-precision values must not change.
 // The exact-number decode compares the decoded original fixture with the
 // decoded re-encoded value, so every number lexeme must stay in its own
 // field and every null, boolean, list, string, and raw argument value must
@@ -503,9 +504,10 @@ func TestContractCorpusRawFidelity(t *testing.T) {
 }
 
 // TestContractCorpusSSEIdentity pins the stream identity rule: a revisioned
-// event embeds its owner inside the revision object, transient progress
-// inherits the authenticated connection and carries no identity, and no
-// event accepts a duplicate top-level instance id.
+// event embeds its owner inside the revision object, and transient progress
+// inherits the authenticated connection and carries no identity. The named
+// duplicate-top-level-instance-id rejections stay exercised by the generic
+// rejection pass over the same corpus fixtures.
 func TestContractCorpusSSEIdentity(t *testing.T) {
 	corpus := loadContractCorpus(t)
 
@@ -534,9 +536,6 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 				t.Fatalf("%s fixture %q: revision %q has no instance_id", component, fixture.name, revisionMember)
 			}
 		}
-		if err := componentSchema(t, component).VisitJSON(decodeSchemaJSON(t, contractComponentFixture(t, corpus, component, "duplicate-top-level-instance-id"))); err == nil {
-			t.Fatalf("%s accepted a duplicate top-level instance_id", component)
-		}
 	}
 
 	for _, component := range []string{"TextDeltaEvent", "RefusalDeltaEvent", "ToolStartedEvent", "ToolFinishedEvent"} {
@@ -547,9 +546,6 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 		}
 		if _, ok := members["instance_id"]; ok {
 			t.Fatalf("%s progress fixture carries an instance identity", component)
-		}
-		if err := componentSchema(t, component).VisitJSON(decodeSchemaJSON(t, contractComponentFixture(t, corpus, component, "duplicate-top-level-instance-id"))); err == nil {
-			t.Fatalf("%s accepted a duplicate top-level instance_id", component)
 		}
 	}
 }

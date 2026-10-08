@@ -1193,6 +1193,77 @@ func TestObserveStreamFilter(t *testing.T) {
 		}
 	})
 
+	t.Run("valid delta pairs with choice-less and usage-only twins", func(t *testing.T) {
+		textDelta := model.StreamDelta{
+			HasChoice:       true,
+			RefusalFragment: "but no",
+			ContentFragments: []model.ContentFragment{
+				{Position: 3, Kind: model.PartText, Text: "working"},
+			},
+		}
+		choiceless := textDelta
+		choiceless.HasChoice = false // the same fragments and refusal without a choice.
+		usageOnly := model.StreamDelta{Usage: &model.Usage{InputTokens: 1, OutputTokens: 2}}
+		rows := []struct {
+			name      string
+			delta     model.StreamDelta
+			want      []emitted
+			checkOrig func(t *testing.T, returned model.StreamDelta)
+		}{
+			{
+				name:  "choice-bearing emits text then refusal",
+				delta: textDelta,
+				want:  []emitted{{kind: FactTextDelta, position: 3, content: "working"}, {kind: FactRefusalDelta, position: 0, content: "but no"}},
+				checkOrig: func(t *testing.T, returned model.StreamDelta) {
+					if &returned.ContentFragments[0] != &textDelta.ContentFragments[0] {
+						t.Fatal("the original delta was not returned unchanged")
+					}
+				},
+			},
+			{
+				name:  "same delta choice-less emits none",
+				delta: choiceless,
+				checkOrig: func(t *testing.T, returned model.StreamDelta) {
+					if &returned.ContentFragments[0] != &choiceless.ContentFragments[0] {
+						t.Fatal("the original choice-less delta was not returned unchanged")
+					}
+				},
+			},
+			{
+				name:  "usage-only choice-less emits none and still passes through",
+				delta: usageOnly,
+				checkOrig: func(t *testing.T, returned model.StreamDelta) {
+					if returned.Usage != usageOnly.Usage {
+						t.Fatal("the original usage pointer was not returned unchanged")
+					}
+				},
+			},
+			{
+				name:  "invalid tool position suppresses valid-looking text",
+				delta: model.StreamDelta{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "x"}}, ToolFragments: []model.ToolCallFragment{{ID: "c", Name: "f", Position: &[]int{-2}[0]}}},
+			},
+			{
+				name:  "malformed tool extra suppresses valid-looking text",
+				delta: model.StreamDelta{HasChoice: true, ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "x"}}, ToolFragments: []model.ToolCallFragment{{ID: "c", Name: "f", Extra: model.Extra{"k": json.RawMessage(`{oops`)}}}},
+			},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				wrapper, got := collect(t, streamOf(row.delta))
+				returned, err := wrapper.Recv()
+				if err != nil {
+					t.Fatalf("Recv: %v", err)
+				}
+				if !slices.Equal(*got, row.want) {
+					t.Fatalf("emitted = %+v, want %+v", *got, row.want)
+				}
+				if row.checkOrig != nil {
+					row.checkOrig(t, returned)
+				}
+			})
+		}
+	})
+
 	t.Run("close delegates once", func(t *testing.T) {
 		inner := streamOf()
 		wrapper, _ := collect(t, inner)

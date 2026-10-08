@@ -29,8 +29,9 @@ func TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent(t *testing.T) 
 
 	dir := t.TempDir() // isolated per-test filesystem root so file assertions can enumerate exhaustively without shared-state interference between rows... (TempDir cleanup is automatic and keeps no artifacts behind on failure either).
 	rt := testResolved()
-	rt.BaseURL = server.URL // pinned pre-construction per suite convention — resolved input is immutable after NewTransport deep-copies it.
-	rt.WireDebugDir = dir   // THE switch under test: everything below about artifact existence/contents flows from this one field being nonempty.
+	rt.BaseURL = server.URL                    // pinned pre-construction per suite convention — resolved input is immutable after NewTransport deep-copies it.
+	rt.WireDebugDir = dir                      // THE switch under test: everything below about artifact existence/contents flows from this one field being nonempty.
+	rt.APIKey = "diagnostics-secret-key-value" // the credential exists ONLY in the Authorization header on this transport; no diagnostic artifact may ever carry it.
 
 	tr := mustTransport(t, rt)
 	stream, _, err := tr.Stream(context.Background(), baseRequest(), nil) // acceptance must succeed with diagnostics enabled — any failure here would make every file assertion vacuous... (establishing the happy path first keeps triage linear if it ever breaks).
@@ -79,11 +80,15 @@ func TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent(t *testing.T) 
 		t.Fatalf("read request dump: %v", rerr) // filesystem read failure here means the earlier WriteFile lied about success — stopping with its own distinct message keeps that hypothetical class triage-able separately from content-mismatch failures below.
 	} else if !bytesEqual(reqBytes, receivedBody) {
 		t.Fatalf("request dump bytes (%d) differ from wire body (%d): %q vs %q", len(reqBytes), len(receivedBody), reqBytes, receivedBody) // lengths first (cheapest distinguishing signal under large-body regressions) then full content rendering so the exact diverging region is visible without diffing two files externally...
+	} else if strings.Contains(string(reqBytes), "diagnostics-secret-key-value") {
+		t.Fatalf("resolved API key leaked into the request dump; the key belongs to headers only and the dump carries the encoded body alone") // secrets-absent oracle part one: no credential material may reach the wire-debug request artifact.
 	}
 
 	chunkBytes, cerr := os.ReadFile(chunksFile) // chunks artifact: one JSONL line per successfully decoded event in delivery order — read whole file for structural assertion before any per-line checks below.
 	if cerr != nil {
 		t.Fatalf("read chunks dump: %v", cerr) // same distinct-failure-class rationale as the request-dump read above applied to its sibling artifact... (keeping each filesystem operation's failure independently named preserves triage linearity across this test's two parallel verification threads).
+	} else if strings.Contains(string(chunkBytes), "diagnostics-secret-key-value") {
+		t.Fatalf("resolved API key leaked into the chunks artifact; no streamed event may ever carry credential material") // secrets-absent oracle part two: the append path must stay credential-free as well.
 	} else if lines := splitJSONL(chunkBytes); len(lines) != 2 { // exactly our TWO decoded events — [DONE] never appends itself and no phantom third entry may exist from any code path... (count pinned before content so an off-by-one framing bug fails loudly here with its full line list rendered for immediate inspection).
 		t.Fatalf("chunks artifact holds %d lines; want one per successfully-decoded event: %#v", len(lines), lines) // each raw payload string included verbatim in output so malformed-vs-missing-vs-extra failure modes are distinguishable by looking at actual retained bytes rather than guessing from counts alone.
 	} else if !json.Valid([]byte(lines[0])) || !strings.Contains(lines[0], "one") { // line zero must be our FIRST event's exact payload — both structural validity (it IS JSON) and content attribution (that specific literal marker value appears within it)... double-checking because a reordered or concatenated write would pass pure-validity checks while still violating delivery-order retention.

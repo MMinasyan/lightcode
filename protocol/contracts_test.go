@@ -76,7 +76,6 @@ func decodeSchemaJSON(t *testing.T, value string) any {
 
 const (
 	revisionJSON = `{"instance_id": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", "generation": "3"}`
-	usageJSON    = `{"input_tokens": "12", "cached_input_tokens": "0", "output_tokens": "34"}`
 )
 
 // TestPluginsSettingsDocumentsStayNamedOpaqueStrings keeps the settings
@@ -94,80 +93,6 @@ func TestPluginsSettingsDocumentsStayNamedOpaqueStrings(t *testing.T) {
 	document := componentSchema(t, "PluginConfigDocument")
 	if document.Type == nil || !document.Type.Is("string") {
 		t.Fatalf("PluginConfigDocument type = %v, want string", document.Type)
-	}
-	acceptJSON(t, document, `"{\"kept\":1,\"exact\":9007199254740993}"`)
-	rejectJSON(t, document, `{"kept":1}`)
-}
-
-func TestModelUsageCarriesOneSharedModelReference(t *testing.T) {
-	s := componentSchema(t, "ModelUsage")
-	acceptJSON(t, s, `{"model": "openrouter/team/model", "usage": `+usageJSON+`}`)
-	rejectJSON(t, s, `{"provider": "openrouter", "model": "openrouter/team/model", "usage": `+usageJSON+`}`)
-}
-
-func TestGeneratedModelUsageSerializesSingleModelReference(t *testing.T) {
-	usage := protocol.ModelUsage{
-		Model: "openrouter/team/model",
-		Usage: protocol.UsageCount{
-			InputTokens:       "12",
-			CachedInputTokens: "0",
-			OutputTokens:      "34",
-		},
-	}
-	data, err := json.Marshal(usage)
-	if err != nil {
-		t.Fatalf("marshaling generated ModelUsage: %v", err)
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("decoding generated ModelUsage JSON: %v", err)
-	}
-	if len(decoded) != 2 || decoded["model"] != "openrouter/team/model" {
-		t.Fatalf("generated ModelUsage JSON = %s, want one shared model reference and usage", data)
-	}
-}
-
-func TestRetainedSnapshotDomain(t *testing.T) {
-	turn := componentSchema(t, "RetainedTurn")
-	acceptJSON(t, turn, `{"turn": 1, "files": []}`)
-	rejectJSON(t, turn, `{"turn": 0, "files": []}`)
-
-	revert := componentSchema(t, "RetainedRevertRequest")
-	acceptJSON(t, revert, `{"workspace": "/w", "session_id": "0f0f0f0f", "after_turn": -1}`)
-	acceptJSON(t, revert, `{"workspace": "/w", "session_id": "0f0f0f0f", "after_turn": 0}`)
-}
-
-// TestGeneratedCostRoundTripsDoublePrecision proves the generated Cost
-// scalar keeps ordinary price values exact across a JSON roundtrip; float32
-// generation collapses 0.123456789 to 0.12345679.
-func TestGeneratedCostRoundTripsDoublePrecision(t *testing.T) {
-	var cost protocol.Cost
-	if err := json.Unmarshal([]byte(`{"input":0.123456789,"output":0.987654321,"cache_read":0.123456789,"cache_write":0.123456789}`), &cost); err != nil {
-		t.Fatalf("decoding generated Cost: %v", err)
-	}
-	data, err := json.Marshal(cost)
-	if err != nil {
-		t.Fatalf("marshaling generated Cost: %v", err)
-	}
-	var decoded map[string]float64
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("decoding generated Cost JSON: %v", err)
-	}
-	for _, field := range []string{"input", "output", "cache_read", "cache_write"} {
-		if got := decoded[field]; got != 0.123456789 && got != 0.987654321 {
-			t.Fatalf("generated Cost field %q roundtripped to %v (JSON: %s)", field, got, data)
-		}
-	}
-	if decoded["output"] != 0.987654321 {
-		t.Fatalf("generated Cost output roundtripped to %v (JSON: %s)", decoded["output"], data)
-	}
-
-	empty, err := json.Marshal(protocol.Cost{})
-	if err != nil {
-		t.Fatalf("marshaling empty Cost: %v", err)
-	}
-	if string(empty) != "{}" {
-		t.Fatalf("empty generated Cost JSON = %s, want every optional field omitted", empty)
 	}
 }
 
@@ -345,21 +270,6 @@ func TestGeneratedSystemRoleSharedAcrossEditsAndViews(t *testing.T) {
 	}
 }
 
-// TestToolMetadataAcceptsEveryNonNullJSONValue pins the tool-owned metadata
-// contract: one bounded non-null JSON value of any kind — no type constraint.
-// The top-level null literal is not a value and stays rejected.
-func TestToolMetadataAcceptsEveryNonNullJSONValue(t *testing.T) {
-	s := componentSchema(t, "ToolMetadata")
-	acceptJSON(t, s, `{"n": 9007199254740993}`)
-	acceptJSON(t, s, `[1, "two", false]`)
-	acceptJSON(t, s, `"line count"`)
-	acceptJSON(t, s, `true`)
-	acceptJSON(t, s, `0`)
-	acceptJSON(t, s, `{"rows": [null, {"depth": 1e1000}]}`)
-	acceptJSON(t, s, `1e1000`)
-	rejectJSON(t, s, `null`)
-}
-
 // TestConversationRawObjectFieldsShareOneComponent keeps the conversation
 // extra/normalized-argument fields on the one shared raw-valued object
 // component and the tool metadata on its own component — and nothing else in
@@ -392,52 +302,18 @@ func TestConversationRawObjectFieldsShareOneComponent(t *testing.T) {
 	}
 }
 
-// TestGeneratedToolMetadataRoundTripsRawValues proves the generated
-// tool-metadata and normalized-argument members keep every JSON value
-// byte-exact across a decode and re-encode: large integers and extreme
-// exponents never pass through a float64, and every non-null kind is
-// accepted. The probe decodes through the generated type and re-inspects the
-// re-encoded bytes through raw members, so the check exercises exactly the
-// generated contract's value fidelity.
-func TestGeneratedToolMetadataRoundTripsRawValues(t *testing.T) {
-	const wire = `{"id":"call-1","name":"read","arguments":"e30=","metadata":{"n":9007199254740993,"big":1e1000,"list":[null,false,0],"text":"x"}}`
-	var view protocol.ToolCallView
-	if err := json.Unmarshal([]byte(wire), &view); err != nil {
-		t.Fatalf("decoding generated ToolCallView: %v", err)
-	}
-	data, err := json.Marshal(view)
-	if err != nil {
-		t.Fatalf("marshaling generated ToolCallView: %v", err)
-	}
-	for _, want := range []string{"9007199254740993", "1e1000", `[null,false,0]`} {
-		if !strings.Contains(string(data), want) {
-			t.Fatalf("re-encoded ToolCallView JSON = %s, want %q preserved", data, want)
-		}
-	}
-
-	// The same fidelity for the raw-valued normalized-argument object.
-	const normalized = `{"id":"call-2","name":"grep","arguments":"e30=","normalized_arguments":{"n":9007199254740993,"big":1e1000}}`
-	var normalizedView protocol.ToolCallView
-	if err := json.Unmarshal([]byte(normalized), &normalizedView); err != nil {
-		t.Fatalf("decoding generated normalized arguments: %v", err)
-	}
-	reEncoded, err := json.Marshal(normalizedView)
-	if err != nil {
-		t.Fatalf("marshaling generated normalized arguments: %v", err)
-	}
-	for _, want := range []string{"9007199254740993", "1e1000"} {
-		if !strings.Contains(string(reEncoded), want) {
-			t.Fatalf("re-encoded normalized arguments = %s, want %q preserved", reEncoded, want)
-		}
-	}
-}
-
 // TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors proves the
 // generated raw-valued object keeps opaque numbers exact through the
 // union constructors a producer uses and the As accessors a consumer uses.
+// Every opaque value comes from the corpus's JSONObject fixture.
 func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.T) {
-	normalized := protocol.JSONObject{"n": json.RawMessage(`9007199254740993`), "big": json.RawMessage(`1e1000`)}
-	metadata := protocol.ToolMetadata(json.RawMessage(`{"n":9007199254740993,"big":1e1000}`))
+	raw := contractComponentFixture(t, loadContractCorpus(t), "JSONObject", "raw-numbers")
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
+		t.Fatalf("decoding the raw JSONObject fixture: %v", err)
+	}
+	normalized := protocol.JSONObject(members)
+	metadata := protocol.ToolMetadata(raw)
 	item := protocol.AssistantItem{
 		ItemId:      "assistant-1",
 		CommittedAt: time.Time{}.UTC(),
@@ -462,7 +338,7 @@ func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.
 	if err != nil {
 		t.Fatalf("marshaling generated ConversationItem: %v", err)
 	}
-	for _, want := range []string{"9007199254740993", "1e1000"} {
+	for _, want := range []string{string(members["n"]), string(members["big"])} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("wire JSON = %s, want %q preserved", data, want)
 		}
@@ -471,12 +347,13 @@ func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.
 	if err != nil {
 		t.Fatalf("AsAssistantItem: %v", err)
 	}
-	if decoded.ToolCalls[0].NormalizedArguments == nil || string((*decoded.ToolCalls[0].NormalizedArguments)["n"]) != `9007199254740993` {
+	if decoded.ToolCalls[0].NormalizedArguments == nil || string((*decoded.ToolCalls[0].NormalizedArguments)["n"]) != string(members["n"]) {
 		t.Fatalf("decoded normalized arguments = %v, want the raw number preserved", decoded.ToolCalls[0].NormalizedArguments)
 	}
 	// A raw-valued object re-encodes canonically (sorted members) while every
-	// value stays byte-exact: the two opaque numbers survive untouched.
-	if decoded.ToolCalls[0].Metadata == nil || string(*decoded.ToolCalls[0].Metadata) != `{"big":1e1000,"n":9007199254740993}` {
+	// value stays byte-exact: the fixture's opaque numbers survive untouched.
+	want := "{\"big\":" + string(members["big"]) + ",\"n\":" + string(members["n"]) + "}"
+	if decoded.ToolCalls[0].Metadata == nil || string(*decoded.ToolCalls[0].Metadata) != want {
 		t.Fatalf("decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
 	}
 }

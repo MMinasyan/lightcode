@@ -248,8 +248,6 @@ func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	}
 }
 
-func strPtr(s string) *string { return &s }
-
 func quoteJSON(s string) string {
 	data, err := json.Marshal(s)
 	if err != nil {
@@ -282,8 +280,8 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 	}
 
 	rejections := map[string]*string{
-		"empty cursor":      strPtr(""),
-		"not base64":        strPtr("not a cursor!"),
+		"empty cursor":      ptrTo(""),
+		"not base64":        ptrTo("not a cursor!"),
 		"unknown member":    cursorBody(t, `{"session_id":`+quoteJSON(convSessionID)+`,"anchor_item_id":`+quoteJSON(wantPageItemID(1))+`,"extra":1}`),
 		"trailing document": cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1))+`{"again":1}`),
 		// The retired version and direction members are ordinary unknown
@@ -841,8 +839,8 @@ func TestHistoryCursorRejectionsThroughRuntime(t *testing.T) {
 		awaitIdleSession(t, r, session)
 		anchor := projectItemID(session, inputEntryID(t, r, session, "op-1"))
 		rejected := []*string{
-			strPtr(""),
-			strPtr("!!!!"),
+			ptrTo(""),
+			ptrTo("!!!!"),
 			cursorBody(t, `{"version":1,"session_id":`+quoteJSON(session)+`,"anchor_item_id":`+quoteJSON(anchor)+`,"direction":"older"}`),
 			cursorBody(t, cursorJSON("ffffffffffffffffffffffffffffffff", anchor)),
 			cursorBody(t, cursorJSON(session, "missing")),
@@ -1089,7 +1087,7 @@ func TestHydrationPendingFIFOsAndActiveOperation(t *testing.T) {
 		session := projectionSession(t, r, "/tmp/paging-pending", "solo").Identity.SessionID
 
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release() // LIFO: the gate releases before the owner close joins
 
@@ -1174,8 +1172,8 @@ func pendingText(t *testing.T, member protocol.PendingInput) string {
 // input is committed non-user history: it never resolves as a fork boundary.
 func TestHydrationRootChildCoherence(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		stopper.arm(bg.r.harness)
 
@@ -1184,21 +1182,20 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		park := make(chan struct{})
 		parkOnce := sync.OnceFunc(func() { close(park) })
 		defer parkOnce() // LIFO: the gate releases before the owner close joins
-		bg.prep.setAgentScript("worker", &lifecycleScript{
-			model: func(mctx context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				if attempt == 1 {
-					select {
-					case arrived <- struct{}{}:
-					default:
-					}
-					select {
-					case <-park:
-					case <-mctx.Done():
-						return nil, mctx.Err()
-					}
-				}
-				return lifecycleTextTurn("child finished"), nil
-			},
+		bg.e.server.setScript(func(sctx context.Context, body string) []string {
+			if lastUserText(body) != "child work" {
+				return nil
+			}
+			select { // the child's first model request parks on the test gate
+			case arrived <- struct{}{}:
+			default:
+			}
+			select {
+			case <-park:
+				return textTurnEvents("child finished")
+			case <-sctx.Done():
+				return nil
+			}
 		})
 		child := bg.launchChild(root, "child work", "child-op-1", 1)
 		select {
@@ -1304,7 +1301,16 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 // the active Operation's captured window surviving the reload.
 func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
+		// The row's own intentional initial catalog: the real 4096 idle window,
+		// distinct from the fixtures' shared generous default. The row admits
+		// no work, so the placeholder endpoint is never contacted.
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), usageWindowAgents)
+		r, err := e.open(context.Background(), e.storagePlugin(store))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
 
@@ -1436,7 +1442,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}}}}`)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"`+e.server.URL+`","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":1024},"m2":{"name":"M2","context_window":8192,"max_output_tokens":1024}}}}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"alternate":{"model":"prov/m2","system_prompt":"simple"},"modelless":{"system_prompt":"simple"},"gone":{"model":"prov/gone","system_prompt":"simple"}}`)
 		r, err := e.open(context.Background(), e.storagePlugin(store))
 		if err != nil {
@@ -1487,7 +1493,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// model and window stay the captured pair under one configuration
 		// revision.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release()
 		active := projectionSession(t, r, "/tmp/selection-active", "solo").Identity.SessionID
@@ -1535,7 +1541,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// the active Operation keeps its captured model and window.
 		awaitRestorableSession(t, r, active) // terminal publication can precede run-slot retirement
 		secondGate := make(chan struct{})
-		e.prep.modelGate = secondGate
+		e.server.setHold(secondGate)
 		releaseSecond := sync.OnceFunc(func() { close(secondGate) })
 		defer releaseSecond()
 		submitThroughRuntime(t, r, active, "op-2", "running again")
@@ -1549,8 +1555,8 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 			t.Fatalf("buildHydration(reloaded): %v", err)
 		}
 		if reloaded.ActiveOperation == nil || reloaded.ActiveOperation.Model != "prov/m2" ||
-			reloaded.Usage.Context.ContextWindow != 4096 {
-			t.Fatalf("reloaded active capture = active %+v window %d, want the captured prov/m2 under the controlled 4096",
+			reloaded.Usage.Context.ContextWindow != 8192 {
+			t.Fatalf("reloaded active capture = active %+v window %d, want the captured prov/m2 under its captured 8192",
 				reloaded.ActiveOperation, reloaded.Usage.Context.ContextWindow)
 		}
 		if reloaded.SelectedModel == nil || *reloaded.SelectedModel != "prov/m" {
@@ -1624,11 +1630,10 @@ func TestProjectionReadsClosedAndCanceledCallers(t *testing.T) {
 // caller mutation cannot reach the owner, and the next read is unchanged.
 func TestHydrationAndPageReturnedValueOwnership(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
+		r, _ := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
 		session := projectionSession(t, r, "/tmp/paging-owned", "solo").Identity.SessionID
 		submitConvergedThroughRuntime(t, r, session, "op-1", "work", harness.OperationSuccess)
-		e.prep.awaitCleanups(1)
 		// The run slot retires after the terminal is durably visible, and its
 		// retirement is a coordinator-local publication: the immutable
 		// baseline must be taken only after the busy state has cleared.

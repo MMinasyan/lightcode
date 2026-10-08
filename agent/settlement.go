@@ -6,8 +6,8 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// validateSettlement is the shared settlement validator: it checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity and returns its first owned validated settlement. Ready is exactly its completed callback output with empty detail; continue is its errored output that retains an assistant payload or its completed output carrying no tool calls, with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. The owned copy's output is the validated deep copy from the public model constructor built exactly once here; disposition and detail are plain value copies. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
-func validateSettlement(set ModelSettlement, expected model.ModelRef) (ModelSettlement, error) {
+// validateSettlement is the shared settlement validator: it checks one settlement returned by a model effect against the closed disposition table and the invocation's expected identity. Ready is exactly its completed callback output with empty detail; continue is its errored output that retains an assistant payload or its completed output carrying no tool calls, with empty detail (the caller has already settled any continuation facts); failure non-empty detail plus no accepted stream or that same errored output — a completed output never settles as failure; interruption non-empty detail plus one of three states, nothing before acceptance, the interrupted callback output while generation was in flight over it, or a retained completed output when cancellation followed successful completion. A present output must itself satisfy every ordinary model-output invariant and carry exactly the expected source identity field-for-field (String() rendering is lossy on first-slash splits, so both fields are compared separately) and its completed tool calls must carry pairwise-unique IDs. The own flag selects the two existing uses: own=true (the exported ValidateModelSettlement) returns the validated settlement whose output is the deep copy from the public model constructor built exactly once here, while own=false (the run's read-only check) applies the identical checks through the read-only model validator, retains nothing and returns the original settlement untouched — the caller keeps its original settlement and output pointer. Disposition and detail are plain value copies. Every violation returns one typed boundary-protocol error naming the "model" boundary; nothing here coerces a malformed settlement into another shape.
+func validateSettlement(set ModelSettlement, expected model.ModelRef, own bool) (ModelSettlement, error) {
 	switch set.Disposition {
 	case DispoReady: // completed callback output only; empty detail checked below.
 		if err := requireDispositionOutput("ready", set.Output, model.OutputCompleted); err != nil {
@@ -19,7 +19,7 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef) (ModelSett
 		}
 		switch set.Output.Status {
 		case model.OutputErrored:
-			if !hasAssistantPayload(set.Output.Message) {
+			if !model.HasAssistantContent(set.Output.Message) {
 				return ModelSettlement{}, newBoundaryViolation("model", "continue disposition requires an errored output retaining an assistant payload (content part, refusal, or finalized extra)")
 			}
 		case model.OutputCompleted:
@@ -62,34 +62,27 @@ func validateSettlement(set ModelSettlement, expected model.ModelRef) (ModelSett
 		return ModelSettlement{}, newBoundaryViolation("model", fmt.Sprintf("settlement output source %q does not equal invocation expected model identity %q", out.Source.String(), expected.String()))
 	}
 
-	ownedOutput, err := model.NewOutput(out) // the one ownership copy every validation builds and returns.
-	if err != nil {
-		return ModelSettlement{}, fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), err)
+	var ownedOutput model.Output // the one ownership copy the owning path builds and returns.
+	var outErr error
+	if own {
+		ownedOutput, outErr = model.NewOutput(out)
+	} else { // read-only: the same invariants through the validation-only model path, retaining nothing.
+		outErr = model.ValidateOutput(out)
+	}
+	if outErr != nil {
+		return ModelSettlement{}, fmt.Errorf("%w: %v", newBoundaryViolation("model", "settlement output violates model-output invariants"), outErr)
 	}
 	if out.Message != nil {
 		if err := requireUniqueCallIDs("model", out.Message.ToolCalls); err != nil {
 			return ModelSettlement{}, err
 		}
 	}
+	if !own { // the run keeps its original settlement and output pointer; nothing owned is built for the check.
+		return set, nil
+	}
 	owned := set // disposition and detail are plain value copies.
 	owned.Output = &ownedOutput
 	return owned, nil // well-formed.
-}
-
-// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view — a non-empty finalized content part, a non-empty refusal, or at least one finalized non-null extra — written against exported fields only as the agent-side mirror of model's private predicate (tool calls are impossible on errored outputs and are governed by their own row rule).
-func hasAssistantPayload(m *model.Message) bool {
-	if m == nil {
-		return false
-	}
-	if m.Refusal != "" {
-		return true
-	}
-	for _, part := range m.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
-			return true
-		}
-	}
-	return len(m.Extra.Finalize()) > 0
 }
 
 // ValidateModelSettlement validates one model settlement against the closed disposition table and the expected identity exactly like the run's internal validator, rejecting an incomplete expected identity before any settlement row is consulted. On success it returns the shared validator's independent owned copy: a present output is the validated deep copy from the public model constructor, while disposition and detail are plain value copies.
@@ -97,7 +90,7 @@ func ValidateModelSettlement(expected model.ModelRef, set ModelSettlement) (Mode
 	if !nonzeroSource(expected) {
 		return ModelSettlement{}, newBoundaryViolation("model", "settlement validation requires a nonzero expected model identity")
 	}
-	return validateSettlement(set, expected)
+	return validateSettlement(set, expected, true)
 }
 
 // requireUniqueCallIDs enforces the completed-call identity invariant shared by settlements and terminal results: at most one call may carry any given ID, so a repeated ID never reaches dispatch, unstarted-call matching stays unambiguous, and a validated caller cannot drive the loop's internal terminal invariant route.
@@ -134,15 +127,13 @@ func validateToolResult(res model.ToolResult, callID string) error {
 	return nil // well-formed settlement answering exactly its own call.
 }
 
-// validateTerminalResult checks one Agent terminal result against the closed status table: success is a valid completed last output with no tool calls, no unstarted calls and empty detail; failure is non-empty detail, no unstarted calls, and an optional valid completed or errored output; interruption is non-empty detail, an optional valid completed or interrupted output, and unstarted calls that must each identify a distinct call of that completed output in increasing original-call order. Every other shape or status is one typed boundary-protocol error naming the "agent" boundary; present outputs and unstarted calls are re-validated through the landed public model constructors first, and a present completed output must carry pairwise-unique call IDs.
+// validateTerminalResult checks one Agent terminal result against the closed status table: success is a valid completed last output with no tool calls, no unstarted calls and empty detail; failure is non-empty detail, no unstarted calls, and an optional valid completed or errored output; interruption is non-empty detail, an optional valid completed or interrupted output, and unstarted calls that must each identify a distinct call of that completed output in increasing original-call order. Every other shape or status is one typed boundary-protocol error naming the "agent" boundary; present outputs and unstarted calls are re-validated first — the output through the read-only model validator, the calls through the read-only tool-call validator — and a present completed output must carry pairwise-unique call IDs.
 func validateTerminalResult(res TerminalResult) error {
 	out := res.LastOutput
 	if out != nil {
-		validated, err := model.NewOutput(*out) // a present last output must satisfy the ordinary model-output invariants before its status participates in any row check.
-		if err != nil {
+		if err := model.ValidateOutput(*out); err != nil { // a present last output must satisfy the ordinary model-output invariants before its status participates in any row check; the original value stays untouched.
 			return fmt.Errorf("%w: %v", newBoundaryViolation("agent", "terminal last output violates model-output invariants"), err)
 		}
-		out = &validated
 		if out.Message != nil {
 			if err := requireUniqueCallIDs("agent", out.Message.ToolCalls); err != nil {
 				return err
@@ -191,7 +182,7 @@ func validateTerminalResult(res TerminalResult) error {
 	return nil
 }
 
-// validateUnstartedCalls enforces the interruption row's correlation rule: unstarted calls exist only against a completed last output, and each must be a valid tool call identifying one distinct call of that output through the public constructor and ID matching, in strictly increasing original-call order.
+// validateUnstartedCalls enforces the interruption row's correlation rule: unstarted calls exist only against a completed last output, and each must be a valid tool call identifying one distinct call of that output through the read-only tool-call validator and exact ID matching against the original calls, in strictly increasing original-call order. No argument or extra bytes are cloned merely to check identity.
 func validateUnstartedCalls(calls []model.ToolCall, out *model.Output) error {
 	if len(calls) == 0 { // nothing to correlate.
 		return nil
@@ -202,19 +193,18 @@ func validateUnstartedCalls(calls []model.ToolCall, out *model.Output) error {
 
 	prev := -1
 	for _, call := range calls {
-		checked, err := model.NewToolCall(call) // identity and shape come back from the public constructor first.
-		if err != nil {
+		if err := model.ValidateToolCall(call); err != nil { // identity and shape come from the read-only validator first.
 			return fmt.Errorf("%w: %v", newBoundaryViolation("agent", "unstarted call violates the tool-call contract"), err)
 		}
 		idx := -1
 		for i, produced := range out.Message.ToolCalls { // identification is exact call-ID equality against the output's own ordered calls.
-			if produced.ID == checked.ID {
+			if produced.ID == call.ID {
 				idx = i
 				break
 			}
 		}
 		if idx < 0 || idx <= prev { // not from this output, already consumed by an earlier unstarted call, or out of the output's original order.
-			return newBoundaryViolation("agent", fmt.Sprintf("unstarted call %q does not identify a later call of the completed last output", checked.ID))
+			return newBoundaryViolation("agent", fmt.Sprintf("unstarted call %q does not identify a later call of the completed last output", call.ID))
 		}
 		prev = idx
 	}

@@ -36,7 +36,7 @@ func (c *Client) Events(ctx context.Context) (<-chan protocol.Event, <-chan erro
 	errs := make(chan error, 1)
 	response, err := c.GetEvents(ctx)
 	if err != nil {
-		errs <- c.streamError(ctx, fmt.Errorf("open event stream: %v", err))
+		errs <- streamError(ctx, fmt.Errorf("open event stream: %v", err))
 		close(events)
 		close(errs)
 		return events, errs
@@ -50,7 +50,7 @@ func (c *Client) Events(ctx context.Context) (<-chan protocol.Event, <-chan erro
 	}
 	go func() {
 		defer response.Body.Close()
-		errs <- c.streamError(ctx, c.consumeEvents(response.Body, events))
+		errs <- streamError(ctx, c.consumeEvents(response.Body, events))
 		close(events)
 		close(errs)
 	}()
@@ -60,7 +60,7 @@ func (c *Client) Events(ctx context.Context) (<-chan protocol.Event, <-chan erro
 // streamError classifies one terminal stream failure: a deliberately canceled
 // caller context is preserved as ctx.Err(), and every continuity failure is
 // ErrResyncRequired.
-func (c *Client) streamError(ctx context.Context, err error) error {
+func streamError(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}

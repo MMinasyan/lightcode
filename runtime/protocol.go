@@ -271,9 +271,16 @@ func indexToolResults(facts []harness.HistoryFact) map[string]harness.ToolResult
 }
 
 // projectConversationItem maps one validated fact to its generated client
-// item and source-known stable identity. Tool-result facts are absorbed into
-// their publishing assistant and produce no item of their own.
+// item and source-known stable identity: one item identity is derived per
+// produced item, before its generated variant is constructed, and shared by
+// the variant, the assistant/signal projectors and the returned pair.
+// Tool-result facts are absorbed into their publishing assistant and produce
+// no item of their own.
 func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (*projectedItem, error) {
+	if fact.Kind == harness.EntryToolResult {
+		return nil, nil
+	}
+	id := projectItemID(sessionID, fact.EntryID)
 	var item protocol.ConversationItem
 	var err error
 	switch fact.Kind {
@@ -283,23 +290,23 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 			return nil, fmt.Errorf("project input entry %q: %w", fact.EntryID, contentErr)
 		}
 		err = item.FromInputItem(protocol.InputItem{
-			ItemId:      projectItemID(sessionID, fact.EntryID),
+			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
 			OperationId: operationAttribution(fact.OperationID),
 			Origin:      protocol.InputOrigin(fact.Input.Origin),
 			Content:     content,
 		})
 	case harness.EntryAssistant:
-		assistant, assistantErr := projectAssistantItem(sessionID, fact, results)
+		assistant, assistantErr := projectAssistantItem(id, fact, results)
 		if assistantErr != nil {
 			return nil, assistantErr
 		}
 		err = item.FromAssistantItem(assistant)
 	case harness.EntrySignal:
-		err = item.FromSignalItem(projectSignalItem(sessionID, fact))
+		err = item.FromSignalItem(projectSignalItem(id, fact))
 	case harness.EntryCompaction:
 		err = item.FromCompactionItem(protocol.CompactionItem{
-			ItemId:      projectItemID(sessionID, fact.EntryID),
+			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
 			OperationId: operationAttribution(fact.OperationID),
 			Summary:     fact.Compaction.Summary,
@@ -307,19 +314,19 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 		})
 	case harness.EntryOperationSettlement:
 		err = item.FromOperationEndItem(protocol.OperationEndItem{
-			ItemId:      projectItemID(sessionID, fact.EntryID),
+			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
 			OperationId: operationAttribution(fact.OperationID),
 			Status:      protocol.OperationEndItemStatus(fact.Settlement.Status),
 			Detail:      fact.Settlement.Detail,
 		})
-	default: // a tool result: absorbed into its publishing assistant
+	default: // absorbed into no item
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("project %s entry %q: %w", fact.Kind, fact.EntryID, err)
 	}
-	return &projectedItem{id: projectItemID(sessionID, fact.EntryID), item: item}, nil
+	return &projectedItem{id: id, item: item}, nil
 }
 
 // operationAttribution points at a fact's owning Operation when it has one;
@@ -332,9 +339,10 @@ func operationAttribution(operationID string) *string {
 }
 
 // projectAssistantItem maps one validated assistant entry to its generated
-// item: the published calls in their validated order, each carrying its
-// terminal tool result's outcome when that result has committed.
-func projectAssistantItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (protocol.AssistantItem, error) {
+// item under its already-derived stable identity: the published calls in
+// their validated order, each carrying its terminal tool result's outcome
+// when that result has committed.
+func projectAssistantItem(id string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (protocol.AssistantItem, error) {
 	entry := fact.Assistant
 	content, err := projectContentParts(entry.Content)
 	if err != nil {
@@ -349,7 +357,7 @@ func projectAssistantItem(sessionID string, fact harness.HistoryFact, results ma
 		calls = append(calls, view)
 	}
 	item := protocol.AssistantItem{
-		ItemId:      projectItemID(sessionID, fact.EntryID),
+		ItemId:      id,
 		CommittedAt: fact.CommittedAt.UTC(),
 		OperationId: operationAttribution(fact.OperationID),
 		Status:      protocol.AssistantItemStatus(entry.Status),
@@ -406,11 +414,12 @@ func projectToolCall(call harness.ToolCallRecord, results map[string]harness.Too
 	return view, nil
 }
 
-// projectSignalItem maps one validated signal entry to its generated item.
-// The subtype comes from the typed payload kind, never from content matching.
-func projectSignalItem(sessionID string, fact harness.HistoryFact) protocol.SignalItem {
+// projectSignalItem maps one validated signal entry to its generated item
+// under its already-derived stable identity. The subtype comes from the typed
+// payload kind, never from content matching.
+func projectSignalItem(id string, fact harness.HistoryFact) protocol.SignalItem {
 	item := protocol.SignalItem{
-		ItemId:      projectItemID(sessionID, fact.EntryID),
+		ItemId:      id,
 		CommittedAt: fact.CommittedAt.UTC(),
 		OperationId: operationAttribution(fact.OperationID),
 		Subtype:     protocol.SignalItemSubtype(fact.Signal.Signal),

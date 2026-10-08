@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"path/filepath"
 	"strings"
@@ -25,6 +24,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/shellparse"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
+	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/plugins/jobs"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -153,26 +153,6 @@ func (s codeGroupStore) Snapshot(turn int, absPath string) error {
 	return err
 }
 
-// decodeCallArguments strictly decodes one call's JSON arguments into an
-// owned map: UseNumber keeps every numeric lexeme exact, the decode clones
-// the call data at the accepting boundary, and malformed, non-object, null
-// or trailing data are argument-validation errors.
-func decodeCallArguments(raw json.RawMessage) (map[string]any, error) {
-	var args map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&args); err != nil {
-		return nil, fmt.Errorf("arguments must be a JSON object: %w", err)
-	}
-	if args == nil {
-		return nil, errors.New("arguments must be a JSON object")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return nil, errors.New("arguments must be one JSON object")
-	}
-	return args, nil
-}
-
 // immediateError is the normalization-class immediate outcome: status error
 // carrying the bounded validation diagnostic, per the tool-boundary
 // validation contract.
@@ -284,7 +264,7 @@ func patchOutcome(ctx context.Context, callID string, call *tool.PreparedPatchCa
 // the strict decode of the call arguments, the tool's single argument
 // normalization, and the marshaled normalized object.
 func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) (map[string]any, error)) (json.RawMessage, error) {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +307,7 @@ func (t readTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 	}
 	// Preparation accepts only the committed normalized arguments: one
 	// strict decode-and-pass, never a second normalization.
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -363,7 +343,7 @@ type mutationPrepared struct {
 // The per-tool callback runs the shared preparation and wraps the outcome;
 // its error is a failed canonical preparation.
 func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -513,7 +493,7 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 	}
 	// Preparation accepts only the committed normalized arguments: one
 	// strict decode-and-pass, never a second normalization.
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -760,7 +740,7 @@ func (sleepTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.Raw
 }
 
 func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -808,7 +788,7 @@ func (processTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.R
 }
 
 func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}

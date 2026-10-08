@@ -101,7 +101,7 @@ func (st *assemblyState) pinIncompleteToolCall() {
 
 // finishStateVerdict applies the one shared finish/payload consistency matrix over a single observed semantic snapshot, reporting whether completion holds for it and — when not — exactly the wording an errored output carries on that same shape: cleanTermination and final-state revalidation both consume this helper so those two paths cannot drift apart from each other.
 func (st *assemblyState) finishStateVerdict() (bool, string) {
-	calls := len(st.buildCalls())
+	calls := st.completeCallCount()
 
 	switch st.finishReason { // the closed reason vocabulary decides which half of the matrix applies to this snapshot before any payload check runs below it in wire order respectively left-to-right as they appear here now.
 	case "": // an absent explicit reason completes whenever any eligible payload or valid calls exist at all — the truly empty response is its only errored shape on this branch above these lines verbatim (the fallback row of the same shared matrix rather than a separate special case anywhere downstream along this trajectory forward now).
@@ -167,7 +167,7 @@ func (st *assemblyState) interruptedOutput(ctx context.Context) model.Output {
 func (st *assemblyState) nonCompletedOutput(status model.OutputStatus, detail string) model.Output {
 	msg := st.assembleMessage(false)
 	var msgPtr *model.Message
-	if msgHasEligiblePartialContent(msg) {
+	if model.HasAssistantContent(&msg) {
 		m := msg
 		msgPtr = &m
 	}

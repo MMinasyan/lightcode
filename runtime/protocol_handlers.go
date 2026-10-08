@@ -20,15 +20,6 @@ type protocolHandlers struct {
 
 var _ protocol.ServerInterface = (*protocolHandlers)(nil)
 
-// emptyIfNil is the response-side collection rule: a present collection
-// serializes as [], never null.
-func emptyIfNil[T any](slice []T) []T {
-	if slice == nil {
-		return make([]T, 0)
-	}
-	return slice
-}
-
 // GetHealth serves the authenticated, versioned readiness read of the live
 // owner: one admitted call answers with the attached server's minted
 // instance identity and the one wire protocol version.
@@ -184,7 +175,6 @@ func (rt *protocolHandlers) DiscoverProviderCandidates(w http.ResponseWriter, r 
 		writeProtocolError(w, err)
 		return
 	}
-	candidates = emptyIfNil(candidates)
 	rt.writeQualifiedJSON(w, http.StatusOK, &candidates)
 }
 
@@ -257,7 +247,6 @@ func (rt *protocolHandlers) DiscoverProviderModelCandidates(w http.ResponseWrite
 		writeProtocolError(w, err)
 		return
 	}
-	candidates = emptyIfNil(candidates)
 	rt.writeQualifiedJSON(w, http.StatusOK, &candidates)
 }
 
@@ -300,7 +289,6 @@ func (rt *protocolHandlers) ListSessions(w http.ResponseWriter, r *http.Request,
 		writeProtocolError(w, err)
 		return
 	}
-	sessions = emptyIfNil(sessions)
 	rt.writeQualifiedJSON(w, http.StatusOK, &sessions)
 }
 
@@ -463,7 +451,6 @@ func (rt *protocolHandlers) GetSessionCodeSnapshots(w http.ResponseWriter, r *ht
 		writeProtocolError(w, err)
 		return
 	}
-	groups = emptyIfNil(groups)
 	rt.writeQualifiedJSON(w, http.StatusOK, &groups)
 }
 
@@ -518,7 +505,6 @@ func (rt *protocolHandlers) ListWorkspaces(w http.ResponseWriter, r *http.Reques
 		writeProtocolError(w, err)
 		return
 	}
-	workspaces = emptyIfNil(workspaces)
 	rt.writeQualifiedJSON(w, http.StatusOK, &workspaces)
 }
 

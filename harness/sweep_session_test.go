@@ -1,6 +1,5 @@
 // Public per-Session sweep transition coverage: the exported one-Session
-// transition the broad sweep and the owner's artifact-coordinated passes
-// delegate to.
+// lifecycle transition the owner's artifact-coordinated passes consume.
 package harness_test
 
 import (
@@ -13,8 +12,8 @@ import (
 )
 
 // TestPublicSweepSessionSkipsBusyCandidate proves the one per-Session sweep
-// transition: a running candidate returns the same no-transition outcome the
-// broad sweep applies, without waiting on the Session's work; an unknown
+// transition: a running candidate takes the no-transition outcome without
+// waiting on the Session's work; an unknown
 // identity reports the not-found class; a zero time is invalid input; and an
 // eligible archived candidate transitions inside the call.
 func TestPublicSweepSessionSkipsBusyCandidate(t *testing.T) {
@@ -62,7 +61,7 @@ func TestPublicSweepSessionSkipsBusyCandidate(t *testing.T) {
 // TestPublicSweepSessionDeletesEligibleCandidate proves the positive
 // transition through the exported per-Session entry point: an archived
 // candidate past its delete threshold commits its deletion inside the call
-// and reports it, like the broad sweep's row.
+// and reports it through the exported per-Session entry point.
 func TestPublicSweepSessionDeletesEligibleCandidate(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel()

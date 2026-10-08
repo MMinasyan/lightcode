@@ -235,7 +235,7 @@ func classifyProtocolError(err error) (protocol.ErrorCode, int) {
 		return protocol.Unauthorized, http.StatusUnauthorized
 	case errors.Is(err, harness.ErrInvalid):
 		return protocol.Invalid, http.StatusBadRequest
-	case errors.Is(err, harness.ErrNotFound), errors.Is(err, catalog.ErrUnknownProvider):
+	case errors.Is(err, harness.ErrNotFound), errors.Is(err, catalog.ErrUnknownProvider), errors.Is(err, catalog.ErrUnknownModel):
 		return protocol.NotFound, http.StatusNotFound
 	case errors.Is(err, harness.ErrConflict):
 		return protocol.Conflict, http.StatusConflict

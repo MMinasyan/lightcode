@@ -49,12 +49,17 @@ type ToolCall struct {
 	Extra     Extra           // raw extras; deep-copied at every accepting boundary.
 }
 
+// ValidateToolCall applies exactly the NewToolCall accepting rules — non-empty id and name checked before well-formed Extra values; Arguments stay byte-for-byte uninterpreted input, including empty, malformed, null and non-object JSON — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original call.
+func ValidateToolCall(in ToolCall) error {
+	if in.ID == "" || in.Name == "" {
+		return fmt.Errorf("%w: tool call requires a non-empty id and name", ErrMissingField)
+	}
+	return validateExtraValues(in.Extra) // arguments stay raw; only extras are JSON-checked.
+}
+
 // NewToolCall validates in (non-empty id and name) and returns an independent copy: arguments are copied byte-for-byte without any JSON validation — the stated exception to complete-JSON requirements — and extras are cloned.
 func NewToolCall(in ToolCall) (ToolCall, error) {
-	if in.ID == "" || in.Name == "" {
-		return ToolCall{}, fmt.Errorf("%w: tool call requires a non-empty id and name", ErrMissingField)
-	}
-	if err := validateExtraValues(in.Extra); err != nil { // arguments stay raw; only extras are JSON-checked.
+	if err := ValidateToolCall(in); err != nil {
 		return ToolCall{}, err
 	}
 	out := in

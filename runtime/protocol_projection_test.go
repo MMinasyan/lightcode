@@ -22,12 +22,17 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
+// projectionAgentsDocument is the shared plain solo/worker pair for the
+// storage-only projection fixtures: no tools or capabilities are selected,
+// so it declares coherently under every one of their plugin compositions.
+const projectionAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`
+
 // openProjectionRuntime opens one composed Runtime over the given store with
-// the controlled preparation and both agent types.
+// the plain solo/worker agent pair.
 func openProjectionRuntime(t *testing.T, store harness.Storage) (*Runtime, *ownerEnv) {
 	t.Helper()
 	e := newOwnerEnv(t)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 	r, err := e.open(context.Background(), e.storagePlugin(store))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -220,11 +225,12 @@ func inputEntryID(t *testing.T, r *Runtime, sessionID, operationID string) strin
 	return ""
 }
 
-// awaitModelArrival waits for the parked execution to reach its model effect.
+// awaitModelArrival waits for the parked execution to reach its model
+// request on the configured endpoint.
 func awaitModelArrival(t *testing.T, e *ownerEnv) {
 	t.Helper()
 	select {
-	case <-e.prep.modelArrived:
+	case <-e.server.arrived:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the execution never reached its model effect")
 	}
@@ -281,13 +287,13 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		// One settled admission gives the fork its committed input boundary;
 		// its terminal cleanup proves the settled idle source Fork requires.
 		submitThroughRuntime(t, r, root.Identity.SessionID, "op-1", "hello")
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, root.Identity.SessionID, "op-1", harness.OperationSuccess)
 		boundary := inputEntryID(t, r, root.Identity.SessionID, "op-1")
 
 		// Park both later models on the one gate: each lineage header is
 		// asserted while its own Operation is the running current one.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release() // LIFO: the gate releases before the owner close joins
 
@@ -316,7 +322,8 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		}
 
 		release()
-		e.prep.awaitCleanups(3)
+		awaitOperation(t, r, forked, "fork-op-1", harness.OperationSuccess)
+		awaitOperation(t, r, child, "child-op-1", harness.OperationSuccess)
 	})
 }
 
@@ -330,7 +337,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		session := projectionSession(t, r, filepath.Join(e.home, "ops"), "solo").Identity.SessionID
 
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, session, "op-1", "work")
 		awaitModelArrival(t, e)
 
@@ -342,8 +349,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		}
 
 		close(gate)
-		e.prep.awaitCleanups(1)
-		record := readOperation(t, r, session, "op-1")
+		record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 		settled := projectOperation(record)
 		if settled.Status != protocol.OperationStatusSuccess || settled.SettledAt == nil || settled.Detail != nil {
 			t.Fatalf("settled projection = %+v, want success with a settlement time and no detail", settled)
@@ -358,7 +364,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		// just-settled Session.
 		interruptedSession := projectionSession(t, r, filepath.Join(e.home, "ops"), "solo").Identity.SessionID
 		gate = make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, interruptedSession, "op-2", "again")
 		awaitModelArrival(t, e)
 		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
@@ -367,8 +373,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Interrupt: %v", err)
 		}
-		e.prep.awaitCleanups(2)
-		interrupted := projectOperation(readOperation(t, r, interruptedSession, "op-2"))
+		interrupted := projectOperation(awaitOperation(t, r, interruptedSession, "op-2", harness.OperationInterruption))
 		if interrupted.Status != protocol.OperationStatusInterruption || interrupted.SettledAt == nil ||
 			interrupted.Detail == nil || *interrupted.Detail == "" {
 			t.Fatalf("interrupted projection = %+v, want interruption with a required detail", interrupted)
@@ -499,6 +504,12 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
+		// The empty navigation result is the non-nil [] shape before any
+		// Session exists.
+		initial, err := r.listWorkspaces(context.Background())
+		if err != nil || initial == nil || len(initial) != 0 {
+			t.Fatalf("initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
+		}
 		wsA := filepath.Join(e.home, "alpha")
 		wsB := filepath.Join(e.home, "beta")
 		root := projectionSession(t, r, wsA, "solo").Identity.SessionID
@@ -647,7 +658,7 @@ func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
 		session := projectionSession(t, r, filepath.Join(e.home, "queued"), "solo").Identity.SessionID
 
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, session, "op-1", "running")
 		awaitModelArrival(t, e)
 		before := projectSession(headerThroughRuntime(t, r, session))
@@ -671,7 +682,7 @@ func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
 		}
 
 		close(gate)
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
 	})
 }
 
@@ -731,7 +742,7 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 		ws := filepath.Join(e.home, "wire")
 		session := projectionSession(t, r, ws, "solo").Identity.SessionID
 		submitThroughRuntime(t, r, session, "op-1", "work")
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 
 		header := projectSession(headerThroughRuntime(t, r, session))
 		assertExactJSONKeys(t, header, []string{

@@ -17,31 +17,8 @@ import (
 // ErrAuthFailed is joined with the HTTP status error on 401/403 responses so callers can classify authentication failures without parsing status codes. Retry classification of any kind belongs to later Harness work, not this value or its errors.
 var ErrAuthFailed = errors.New("authentication failed")
 
-// ErrInvalidInput wraps invalid resolved or request values at the transport's two owning boundaries with one typed identity: NewTransport classifies malformed resolved extra-body values, and Stream classifies every logical-request validation failure through NewRequest — including malformed message/content/tool extras — preserving any underlying specific validation sentinel in the same unwrap chain, with the offending field and detail in the text. Reserved-key failures keep their own dedicated shape (ReservedKeyError), and per-call runtime-extra failures keep no classification at all.
+// ErrInvalidInput wraps invalid resolved or request values at the transport's two owning boundaries with one typed identity: NewTransport classifies incomplete target identities and out-of-set wire system roles, and Stream classifies every logical-request validation failure through NewRequest — including malformed message/content/tool extras — each preserving the underlying specific validation sentinel in the same unwrap chain, with the offending field and detail in the text. Reserved-key failures keep their own dedicated shape (ReservedKeyError), and per-call runtime-extra failures keep no classification at all.
 var ErrInvalidInput = errors.New("invalid resolved or request input")
-
-// invalidRequestValueIdentities is the closed set of validation sentinels classifyEncodeError matches inside Encode's error path: every logical-request identity NewRequest can return (messages scope, tools scope) plus the two resolved-value re-validations Encode performs on each call. With Stream pre-validating its request and NewTransport pre-validating the resolved layers, Encode's path can only fail this way if a validation rule stops being idempotent — the set keeps those defensive failures classified identically. Deliberately excluded are ErrReservedKeys and all extra-body value failures — their own shapes stay unclassified on Encode's path.
-var invalidRequestValueIdentities = []error{ // order is diagnostic only; matching short-circuits on first hit because every listed identity maps to the same wrapping shape.
-	ErrInvalidRole,
-	ErrMissingSource,
-	ErrUnexpectedSource,
-	ErrForbiddenField,
-	ErrMissingField,
-	ErrDuplicateToolName,
-	ErrInvalidParameters,
-	ErrInvalidModelRef,       // NewTransport gates this on Stream's path; listed so Encode's defensive per-call re-validation classifies identically if ever reached.
-	ErrInvalidWireSystemRole, // same reasoning as above for the wire system role closed set.
-}
-
-// classifyEncodeError wraps one Encode failure under ErrInvalidInput exactly when its unwrap chain carries a logical-request or resolved-value validation sentinel: double %w keeps both sentinels reachable through errors.Is on the single returned value while retaining NewRequest's field-position prefix and every validator detail in the text. Every other shape — reserved keys, extra-body values, runtime extras, marshal boundaries — passes through unchanged so each keeps exactly its own classification surface.
-func classifyEncodeError(err error) error {
-	for _, identity := range invalidRequestValueIdentities {
-		if errors.Is(err, identity) {
-			return fmt.Errorf("%w: %w", ErrInvalidInput, err) // umbrella first in the rendered text (class before detail), original second so its sentinel and positional context survive intact.
-		}
-	}
-	return err
-}
 
 // Transport is one fixed OpenAI-compatible streaming chat transport over a single standard-library HTTP client and an immutable deep copy of the resolved input it was built from. It owns no retry policy: one physical attempt per Stream invocation, never more (standard redirect handling inside that one call is retained but is not a retry), and no alternate client or RoundTripper seam exists — tests use the resolved base URL with httptest.
 type Transport struct {
@@ -54,11 +31,13 @@ func NewTransport(in ResolvedTransport) (*Transport, error) {
 	resolved := cloneResolvedInput(in) // own every resolved value before retaining it.
 
 	if !resolved.Model.complete() { // a transport without a complete target identity cannot encode any request body.
-		return nil, classifyEncodeError(fmt.Errorf("%w: resolved transport field Model is %s; a complete provider/model pair is required", ErrInvalidModelRef, describeRef(resolved.Model)))
+		return nil, fmt.Errorf("%w: %w", ErrInvalidInput, fmt.Errorf("%w: resolved transport field Model is %s; a complete provider/model pair is required", ErrInvalidModelRef, describeRef(resolved.Model)))
 	}
-	if _, err := resolveWireSystemRole(resolved.WireSystemRole); err != nil { // same closed set the encoder enforces per call.
-		return nil, classifyEncodeError(fmt.Errorf("resolved transport field WireSystemRole: %w", err))
+	systemRole, err := resolveWireSystemRole(resolved.WireSystemRole) // same closed set the encoder enforces per call.
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidInput, fmt.Errorf("resolved transport field WireSystemRole: %w", err))
 	}
+	resolved.WireSystemRole = systemRole // the normalized wire role is stored once in the resolved value; the encoding path reads it without re-resolving.
 
 	var reserved []string // reserved-key pass over both resolved layers runs before any value parsing so a malformed value can never hide a reservation.
 	for _, layer := range []Extra{resolved.ProviderExtraBody, resolved.ModelExtraBody} {
@@ -87,9 +66,20 @@ func (t *Transport) Stream(ctx context.Context, req Request, runtimeExtras map[s
 		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidInput, err)
 	}
 
-	body, warnings, err := Encode(t.resolved, request, runtimeExtras) // reserved keys rejected inside before any value parsing; runtime extras stay unclassified and the validated request passes through its re-validation unchanged.
+	runtimeLayer := Extra(runtimeExtras).Clone() // own the per-call runtime layer before validating and merging it; construction already excluded reserved and malformed values from the resolved layers, so this call's layer is the only remaining input to check.
+
+	var reserved []string // reserved-key pass over the runtime layer, same shape and precedence as the resolved-layer pass at construction.
+	reserved = collectReservedKeys(reserved, runtimeLayer)
+	if len(reserved) > 0 {
+		return nil, nil, &ReservedKeyError{Keys: reserved}
+	}
+	if err := validateExtraValues(runtimeLayer); err != nil {
+		return nil, nil, fmt.Errorf("runtime extra body: %w", err) // per-call runtime extras keep no classification of their own: the layer context plus field detail is the entire shape.
+	}
+
+	body, warnings, err := encodeOwned(t.resolved, request, runtimeLayer) // the retained resolved values and the validated request pass through without revalidation or re-cloning.
 	if err != nil {
-		return nil, nil, classifyEncodeError(err) // defensive for sentinel-carrying shapes only; reserved/runtime/marshal pass through unchanged.
+		return nil, nil, err // marshal-boundary failures only; they wrap their standard-library cause unchanged.
 	}
 
 	endpoint := ChatEndpoint(t.resolved)

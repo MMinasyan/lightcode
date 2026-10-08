@@ -49,15 +49,13 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 // is the sole data root: runtime.lock and the storage backend's own files
 // derive from it, while agents.json stays beside ConfigPath. Dotenv and the
 // discovery cache keep their home-based paths: neither option relocates them
-// nor changes owner identity. prepare is the controlled preparation function
-// supplied by tests; a nil prepare selects the concrete production
-// preparation. sweepTicks optionally replaces the automatic sweep scheduler's
-// owned hourly ticker with a controlled tick stream whose sends carry each
-// pass's explicit time; the zero value keeps the production time.Ticker.
+// nor changes owner identity. sweepTicks optionally replaces the automatic
+// sweep scheduler's owned hourly ticker with a controlled tick stream whose
+// sends carry each pass's explicit time; the zero value keeps the production
+// time.Ticker.
 type options struct {
 	DataDir, ConfigPath string
 	Plugins             []Plugin
-	prepare             prepare
 	sweepTicks          <-chan time.Time
 }
 
@@ -231,7 +229,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
 		Jobs:    jobs,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv, options.prepare).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {
@@ -387,20 +385,6 @@ func (r *Runtime) withHarness(ctx context.Context, fn func(context.Context, *har
 	}
 	defer release()
 	return fn(ctx, r.harness)
-}
-
-// createSession is the private root Session creation: it runs the one
-// normalized creation core inside the shared admitted-call gate.
-func (r *Runtime) createSession(ctx context.Context, workspace, agentType string) (harness.SessionRecord, error) {
-	var record harness.SessionRecord
-	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
-		return err
-	}); err != nil {
-		return harness.SessionRecord{}, err
-	}
-	return record, nil
 }
 
 // createSessionRecord is the one root creation core: the existing empty

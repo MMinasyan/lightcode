@@ -2926,6 +2926,32 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 			t.Fatal("the attempt marker changed on the failed model discovery read")
 		}
 		assertDotenvUnchanged(t, r, envBefore, "the failed model discovery read")
+
+		// A returned candidate list is a caller copy: mutation cannot affect
+		// the next read.
+		server.retarget(func(auth string) string {
+			return `{"data":[{"id":"m","name":"Included","context_window":4096},{"id":"a","name":"A","context_window":0},{"id":"b","name":"B","context_window":8192,"cost":{"input":0.5}}]}`
+		})
+		copied, err := r.discoverProviderModels(ctx, "usablep")
+		if err != nil || len(copied) != 2 {
+			t.Fatalf("copied candidates = (%+v, %v), want the sorted filtered pair", copied, err)
+		}
+		copied[0].Id = "mutated"
+		copied[0].Name = "mutated"
+		reread, err := r.discoverProviderModels(ctx, "usablep")
+		if err != nil || len(reread) != 2 || reread[0].Id != "a" || reread[0].Name != "A" || reread[1].Id != "b" {
+			t.Fatalf("re-read candidates = (%+v, %v), want the immutable fetched pair", reread, err)
+		}
+
+		// The skip-all empty result is the non-nil [] shape: every fetched
+		// model is already included and usable.
+		server.retarget(func(auth string) string {
+			return `{"data":[{"id":"m","name":"Included","context_window":4096}]}`
+		})
+		empty, err := r.discoverProviderModels(ctx, "usablep")
+		if err != nil || empty == nil || len(empty) != 0 {
+			t.Fatalf("skip-all candidates = (%+v, %v), want the non-nil empty list", empty, err)
+		}
 	})
 }
 

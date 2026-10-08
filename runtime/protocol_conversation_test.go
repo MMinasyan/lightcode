@@ -5,7 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -559,20 +560,18 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newPrepEnv(t, store)
 		t.Cleanup(func() { e.converge() })
-		turn := []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)}}
-		e.model = func(selection) func(context.Context, model.Request) (model.Stream, error) {
-			return func(context.Context, model.Request) (model.Stream, error) {
-				next := turn
-				turn = nil
-				if len(next) > 0 {
-					return &prepStream{calls: next}, nil
-				}
-				return &prepStream{}, nil
+		e.echo.mu.Lock()
+		e.echo.fail = true // this row's one deliberate error outcome, after the hook chain
+		e.echo.mu.Unlock()
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the default completed text turn
 			}
-		}
+			return toolCallTurnEvents("call-1", "echo", ` {"x": 1} `)
+		})
 		session := e.session("hooky")
 		e.admit(session, "op-1", "one")
-		e.awaitCleanups(1)
+		e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 
 		runtimeSeen, _ := e.argHooks[0].received()
 		if len(runtimeSeen) != 1 {
@@ -592,7 +591,7 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 			t.Fatalf("hook evidence entries = %d, want the four committed hook_result entries", hookEntries)
 		}
 
-		snap, err := e.h.SnapshotSession(context.Background(), session)
+		snap, err := e.snapshotSession(context.Background(), session)
 		if err != nil {
 			t.Fatalf("SnapshotSession: %v", err)
 		}
@@ -634,77 +633,70 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 // stay ordered and together.
 func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r) // failure-safe: runs after the release below
 		session := bg.session("lifecycle")
 		releaseTool := make(chan struct{})
 		releaseToolOnce := sync.OnceFunc(func() { close(releaseTool) })
 		defer releaseToolOnce()
 		toolStarted := make(chan struct{}, 1)
-		arrivals := make(chan int, 8)
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			advertise: []string{"read", "grep"},
-			model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				select {
-				case arrivals <- attempt:
-				default:
+		// The wire dispatch: each request's tool results name the turn the
+		// provider serves next.
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			switch {
+			case strings.Contains(body, `"call-4 ran"`):
+				return textTurnEvents("done")
+			case strings.Contains(body, `"second"`):
+				return []string{
+					`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-3","type":"function","function":{"name":"read","arguments":"{\"third\":1}"}},{"index":1,"id":"call-4","type":"function","function":{"name":"read","arguments":"{\"fourth\":2}"}}]},"finish_reason":null}]}`,
+					`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 				}
-				switch attempt {
-				case 1:
-					return lifecycleCallTurn("call-1", "read", `{"n":9007199254740993}`), nil
-				case 2:
-					return lifecycleCallTurn("call-2", "grep", `{"q":"late"}`), nil
-				case 3:
-					position := 0
-					return &lifecycleTurn{delta: model.StreamDelta{
-						HasChoice: true, Role: "assistant",
-						ToolFragments: []model.ToolCallFragment{
-							{Position: &position, ID: "call-3", Name: "read", ArgumentFragment: `{"third":1}`},
-							{Position: &position, ID: "call-4", Name: "read", ArgumentFragment: `{"fourth":2}`},
-						},
-						FinishReason: "tool_calls",
-					}}, nil
-				default:
-					return lifecycleTextTurn("done"), nil
+			case strings.Contains(body, `"first"`):
+				return toolCallTurnEvents("call-2", "grep", `{"q":"late"}`)
+			default:
+				return toolCallTurnEvents("call-1", "read", `{}`)
+			}
+		})
+		// The declared tools' prepared outcomes: the first result carries its
+		// big-number metadata, the second parks until released, the rest
+		// settle immediately.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			permissions := []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}
+			switch call.ID {
+			case "call-1":
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Immediate: &harness.ToolOutcome{
+						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+						Metadata: json.RawMessage(`{"n":9007199254740993}`),
+					},
 				}
-			},
-			tool: func(_ context.Context, _ string, call model.ToolCall) harness.PreparedTool {
-				switch call.ID {
-				case "call-1":
-					return harness.PreparedTool{
-						Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-						Immediate: &harness.ToolOutcome{
-							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
-							Metadata: json.RawMessage(`{"n":9007199254740993}`),
-						},
-					}
-				case "call-2": // parks: its result lands after the pending read
-					return harness.PreparedTool{
-						Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-						Execute: func(context.Context) harness.ToolOutcome {
-							select {
-							case toolStarted <- struct{}{}:
-							default:
-							}
-							<-releaseTool
-							return harness.ToolOutcome{
-								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
-								Metadata: json.RawMessage(`{"late":true}`),
-							}
-						},
-					}
-				default:
-					return harness.PreparedTool{
-						Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-						Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
-					}
+			case "call-2": // parks: its result lands after the pending read
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Execute: func(context.Context) harness.ToolOutcome {
+						select {
+						case toolStarted <- struct{}{}:
+						default:
+						}
+						<-releaseTool
+						return harness.ToolOutcome{
+							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
+							Metadata: json.RawMessage(`{"late":true}`),
+						}
+					},
 				}
-			},
+			default:
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+				}
+			}
 		})
 
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
-		awaitArrival(t, arrivals, 2, "attempt 2")
+		bg.e.server.awaitRequests(2) // the parked second call's turn arrived
 		<-toolStarted
 		pending := projectSessionItems(t, bg.r, session)
 		if len(pending) != 3 { // input, publishing assistant, pending assistant
@@ -724,7 +716,7 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 		pendingIDs := itemIDs(t, pending)
 
 		releaseToolOnce()
-		awaitArrival(t, arrivals, 4, "attempt 4")
+		bg.e.server.awaitRequests(4)
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
 
 		attached := projectSessionItems(t, bg.r, session)
@@ -860,23 +852,22 @@ func itemKind(t *testing.T, item protocol.ConversationItem) string {
 // outcome projects as the call's terminal state with no invented metadata.
 func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		session := bg.session("synthetic")
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			advertise: []string{"read"},
-			model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				if attempt == 1 {
-					return lifecycleCallTurn("call-1", "read", `{}`), nil
-				}
-				return lifecycleTextTurn("done"), nil
-			},
-			tool: func(_ context.Context, _ string, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{
-					Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
-				}
-			},
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the default completed text turn
+			}
+			return toolCallTurnEvents("call-1", "read", `{}`)
+		})
+		// The declared read tool fails its prepared call immediately: the
+		// synthetic error outcome settles the published call.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{
+				Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
+			}
 		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
@@ -906,47 +897,48 @@ func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 // outcome wins the cancellation race.
 func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		session := bg.session("interrupted-synthetic")
 		releaseTool := make(chan struct{})
 		releaseToolOnce := sync.OnceFunc(func() { close(releaseTool) })
 		defer releaseToolOnce()
 		toolStarted := make(chan struct{}, 1)
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			advertise: []string{"read"},
-			model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				if attempt == 1 {
-					position := 0
-					return &lifecycleTurn{delta: model.StreamDelta{
-						HasChoice: true, Role: "assistant",
-						ToolFragments: []model.ToolCallFragment{
-							{Position: &position, ID: "call-1", Name: "read", ArgumentFragment: `{}`},
-							{Position: &position, ID: "call-2", Name: "read", ArgumentFragment: `{}`},
-						},
-						FinishReason: "tool_calls",
-					}}, nil
-				}
-				return lifecycleTextTurn("never reached"), nil
-			},
-			tool: func(ctx context.Context, _ string, call model.ToolCall) harness.PreparedTool {
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return textTurnEvents("never reached")
+			}
+			return []string{
+				`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			}
+		})
+		// The started call parks its execution until the run's cancellation
+		// releases it and returns its real outcome; the unstarted call never
+		// begins.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			if call.ID != "call-1" {
 				return harness.PreparedTool{
 					Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-					Execute: func(execCtx context.Context) harness.ToolOutcome {
-						select {
-						case toolStarted <- struct{}{}:
-						default:
-						}
-						select {
-						case <-releaseTool: // never released on the main path
-						case <-execCtx.Done(): // the interrupt releases the started call
-						}
-						// A returned real outcome wins the cancellation race.
-						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
-					},
+					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
 				}
-			},
+			}
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Execute: func(execCtx context.Context) harness.ToolOutcome {
+					select {
+					case toolStarted <- struct{}{}:
+					default:
+					}
+					select {
+					case <-releaseTool: // never released on the main path
+					case <-execCtx.Done(): // the interrupt releases the started call
+					}
+					// A returned real outcome wins the cancellation race.
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+				},
+			}
 		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		select {
@@ -998,27 +990,27 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 // order — distinct from both the interruption and the no-assistant failure.
 func TestConversationProjectionErroredPartialAssistant(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		session := bg.session("errored")
-		arrivals := make(chan int, 8)
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				select {
-				case arrivals <- attempt:
-				default:
-				}
-				if attempt == 1 { // yields the partial answer, then fails
-					return &compactPartialStream{fail: errors.New("chunk parse failed")}, nil
-				}
-				return nil, errors.New("model down") // nonretryable: settles failure
-			},
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if strings.Contains(body, "The previous model response failed after partial output.") {
+				// The continuation request fails nonretryably: the operation
+				// settles failure carrying the provider's diagnostic.
+				return []string{"HTTP 400", `{"error":{"message":"model down"}}`}
+			}
+			// The first turn: the partial answer streams, then the malformed
+			// event fails the response after its accepted fragment.
+			return []string{
+				`{"choices":[{"delta":{"role":"assistant","content":"partial answer"},"finish_reason":null}]}`,
+				`{"choices":[{"delta":`,
+			}
 		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
-		// Attempt 2's arrival is the rendezvous proving attempt 1's errored
-		// partial assistant and continuation signal committed.
-		awaitArrival(t, arrivals, 2, "attempt 2")
+		// Request 2's arrival is the rendezvous proving the errored partial
+		// assistant and its continuation signal committed.
+		bg.e.server.awaitRequests(2)
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationFailure)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -1052,24 +1044,65 @@ func TestConversationProjectionErroredPartialAssistant(t *testing.T) {
 // visible beside its typed signal and terminal end.
 func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
+		// One row-local streaming endpoint: it writes and flushes the single
+		// incomplete "partial answer" delta, then holds the response open until
+		// the run's cancellation ends the request context — the fragment is
+		// real wire output, and no completion event or terminator follows it.
+		stream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + `{"choices":[{"delta":{"role":"assistant","content":"partial answer"},"finish_reason":null}]}` + "\n\n"))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}))
+		t.Cleanup(stream.Close)
+		// The real provider serves this row through the owning configuration:
+		// the endpoint change publishes before any admission runs.
+		writeServiceFile(t, bg.e.configPath, backgroundLifecycleConfigDocument(stream.URL))
+		if _, err := bg.r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		sub, err := bg.r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		defer sub.Close()
 		session := bg.session("interrupted")
-		fragmentSent := make(chan struct{}, 1)
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			model: func(ctx context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				if attempt > 1 {
-					return lifecycleTextTurn("done"), nil
-				}
-				return &interruptPartialStream{ctx: ctx, sent: fragmentSent}, nil
-			},
-		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
-		select {
-		case <-fragmentSent:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the partial fragment never streamed")
+		// The rendezvous is the published progress itself: the real text_delta
+		// carrying the flushed fragment for this session and operation, not a
+		// fixture-side signal.
+		sawFragment := false
+		deadline := time.After(10 * time.Second)
+		for !sawFragment {
+			select {
+			case event, ok := <-sub.Events():
+				if !ok {
+					t.Fatal("the subscription closed before the fragment's progress arrived")
+				}
+				if eventKind(t, event) != "text_delta" {
+					continue
+				}
+				delta, err := event.AsTextDeltaEvent()
+				if err != nil {
+					t.Fatalf("delta event body: %v", err)
+				}
+				scope, err := delta.Scope.AsOperationScope()
+				if err != nil {
+					t.Fatalf("progress scope: %v", err)
+				}
+				if scope.SessionId != session || scope.OperationId != "op-1" {
+					t.Fatalf("progress scope = %+v, want this session's operation", delta.Scope)
+				}
+				if delta.Content != "partial answer" {
+					t.Fatalf("progress content = %q, want the flushed fragment", delta.Content)
+				}
+				sawFragment = true
+			case <-deadline:
+				t.Fatal("the partial fragment never became published progress")
+			}
 		}
 		if err := bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 			return h.Interrupt(ctx, session)
@@ -1124,59 +1157,34 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 	})
 }
 
-// interruptPartialStream yields one text fragment and then fails when the run
-// context is canceled: the assembler finalizes an interrupted partial output.
-type interruptPartialStream struct {
-	ctx  context.Context
-	sent chan struct{}
-	done bool
-}
-
-func (s *interruptPartialStream) Recv() (model.StreamDelta, error) {
-	if !s.done {
-		s.done = true
-		select {
-		case s.sent <- struct{}{}:
-		default:
-		}
-		return model.StreamDelta{
-			HasChoice:        true,
-			Role:             "assistant",
-			ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "partial answer"}},
-		}, nil
-	}
-	<-s.ctx.Done()
-	return model.StreamDelta{}, s.ctx.Err()
-}
-
-func (s *interruptPartialStream) Close() error { return nil }
-
 // TestConversationProjectionForkPrefixIsIndependent proves a copied fork
 // prefix projects with new identities, no Operation ownership, and no source
 // identity — while the source keeps its own items unchanged.
 func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		root := bg.session("fork-root")
-		bg.prep.setSessionScript(root, &lifecycleScript{
-			advertise: []string{"read"},
-			model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				if attempt == 1 {
-					return lifecycleCallTurn("call-1", "read", `{"n":9007199254740993}`), nil
-				}
-				return lifecycleTextTurn("done"), nil
-			},
-			tool: func(_ context.Context, _ string, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{
-					Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-					Immediate: &harness.ToolOutcome{
-						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
-						Metadata: json.RawMessage(`{"n":9007199254740993}`),
-					},
-				}
-			},
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the closing turn: the default completed text turn
+			}
+			if lastUserText(body) == "hello fork" {
+				return toolCallTurnEvents("call-1", "read", `{"n":9007199254740993}`)
+			}
+			return nil // later user turns close with the default turn
+		})
+		// The declared read tool settles its call with the big-number
+		// metadata the projection keeps.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Immediate: &harness.ToolOutcome{
+					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+					Metadata: json.RawMessage(`{"n":9007199254740993}`),
+				},
+			}
 		})
 		submitThroughRuntime(t, bg.r, root, "op-1", "hello fork")
 		awaitOperation(t, bg.r, root, "op-1", harness.OperationSuccess)
@@ -1282,15 +1290,16 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 // background_completion signal naming its member.
 func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		stopper.arm(bg.r.harness)
 		root := bg.session("completion-root")
-		bg.prep.setAgentScript("worker", &lifecycleScript{
-			model: func(_ context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
-				return lifecycleTextTurn("child finished"), nil
-			},
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastUserText(body) == "child work" {
+				return textTurnEvents("child finished") // the child's final answer
+			}
+			return nil
 		})
 		child := launchChildThroughRuntime(t, bg.r, root, "child-op-1")
 		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
@@ -1382,7 +1391,7 @@ func itemKinds(t *testing.T, items []protocol.ConversationItem) string {
 // stays pageable: no model-summary truncation of the client history.
 func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		f := openCompactLifecycle(t, store)
+		f := openCodeRuntime(t, store)
 		defer closeProjectionRuntime(f.r)
 		s := f.session("twice")
 		f.submit(s, "op-1", "hello first")
@@ -1471,15 +1480,25 @@ func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) 
 // that repeats a signal's fixed text stays an input item.
 func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		stopper := newLifecycleStopper(store)
-		bg := openBackgroundLifecycle(t, store, stopper)
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
 		defer closeProjectionRuntime(bg.r)
 		session := bg.session("failure")
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			model: func(_ context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
-				return lifecycleTextTurn("done"), nil
-			},
+		bg.e.server.setScript(func(sctx context.Context, body string) []string {
+			switch lastUserText(body) {
+			case "again":
+				// The failing turn: the provider's nonretryable diagnostic.
+				return []string{"HTTP 400", `{"error":{"message":"model down"}}`}
+			case "hold":
+				// The no-output interruption: the request parks and releases
+				// with no content under the run's cancellation.
+				<-sctx.Done()
+				return nil
+			default:
+				return nil // the literal-text turn: the default completed turn
+			}
 		})
+
 		// The literal text that exactly matches a fixed signal's content.
 		submitThroughRuntime(t, bg.r, session, "op-1", "Operation interrupted.")
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
@@ -1498,12 +1517,6 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 			t.Fatalf("first item = %+v, want the literal input", literal)
 		}
 
-		// The failing turn: pre-acceptance failure, no assistant at all.
-		bg.prep.setSessionScript(session, &lifecycleScript{
-			model: func(_ context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
-				return nil, errors.New("model down")
-			},
-		})
 		submitConvergedThroughRuntime(t, bg.r, session, "op-2", "again", harness.OperationFailure)
 
 		items = projectSessionItems(t, bg.r, session)
@@ -1529,26 +1542,10 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 		// no assistant is fabricated — the input, the typed interruption
 		// signal, and the end are the whole conversation.
 		interrupted := bg.session("no-output-interruption")
-		interruptions := make(chan int, 8)
-		park := make(chan struct{})
-		parkOnce := sync.OnceFunc(func() { close(park) })
-		defer parkOnce() // LIFO: releases before the owner close joins
-		bg.prep.setSessionScript(interrupted, &lifecycleScript{
-			model: func(mctx context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-				select {
-				case interruptions <- attempt:
-				default:
-				}
-				select {
-				case <-park:
-				case <-mctx.Done(): // the interrupt releases the parked effect
-				}
-				return nil, mctx.Err()
-			},
-		})
 		submitThroughRuntime(t, bg.r, interrupted, "op-int", "hold")
+		drainCommandModelArrivals(bg.e)
 		select {
-		case <-interruptions:
+		case <-bg.e.server.arrived:
 		case <-time.After(10 * time.Second):
 			t.Fatal("the model effect never arrived")
 		}

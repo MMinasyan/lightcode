@@ -14,7 +14,7 @@ func mkSettlementOutput(status model.OutputStatus, detail string) *model.Output 
 
 	out := model.Output{Status: status, Source: testRef, Detail: detail}
 	switch {
-	case status == model.OutputCompleted: // the one mandatory-payload row — a single non-empty text part satisfies it minimally respectively left-to-right as they appear within hasAssistantPayload's own check sequence further up above all of these lines verbatim.
+	case status == model.OutputCompleted: // the one mandatory-payload row: a single non-empty text part minimally satisfies the completed-output payload rule.
 		msg.Content = []model.ContentPart{{Kind: model.PartText, Text: "x"}}
 
 	case status == model.OutputInterrupted || detail != "": // optional partial message retained alongside its diagnostic text for the other two shapes — present-but-tool-call-free per their own closed-shape rules respectively left-to-right as they appear within NewOutput's default-branch validation logic over there.
@@ -91,7 +91,7 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { // spawn one isolated subtest per settlement shape so a single bad behavior doesn't mask sibling rows' own independent pass/fail outcomes anywhere downstream of this nested closure's opening brace below it further ahead now.
-			_, err := validateSettlement(tc.set, testRef)
+			_, err := validateSettlement(tc.set, testRef, true)
 			if tc.wantErr { // only the negative rows in THIS specific table expect a typed boundary-protocol violation below it further ahead now (the positive rows' nil-return contract is asserted through its own dedicated branch immediately after this if-block ends here respectively left-to-right as they appear within that else-statement's body over there).
 				requireBoundaryViolation(t, err, "model")
 			} else if err != nil { // positive rows must return NIL — any non-nil value here indicates either broken validation logic somewhere upstream inside validateSettlement itself OR an invalid fixture shape constructed by the helpers above these lines now rather than legitimately arising from anything within THIS specific row's own settlement data alone anywhere downstream along this trajectory forward.
@@ -214,7 +214,7 @@ func TestValidateModelSettlement(t *testing.T) {
 	t.Run("one-copy-per-validation", func(t *testing.T) {
 		set := ModelSettlement{Disposition: DispoReady, Output: mkNestedSettlementOutput()}
 		two := testing.AllocsPerRun(200, func() { // the removed two-copy shape: validate (one internal copy, discarded) plus a second full copy
-			_, _ = validateSettlement(set, testRef)
+			_, _ = validateSettlement(set, testRef, true)
 			_, _ = model.NewOutput(*set.Output)
 		})
 		one := testing.AllocsPerRun(200, func() {
@@ -317,7 +317,7 @@ func TestValidateTerminalResult(t *testing.T) {
 		return out
 	}
 
-	// badLastOutput is a completed-shaped output that fails re-validation through the public model constructor: its message carries a foreign source identity.
+	// badLastOutput is a completed-shaped output that fails re-validation through the read-only model validator: its message carries a foreign source identity.
 	badLastOutput := &model.Output{
 		Status: model.OutputCompleted,
 		Source: testRef,
@@ -346,7 +346,7 @@ func TestValidateTerminalResult(t *testing.T) {
 		{"invalid-success-nonempty-detail", TerminalResult{Status: TerminalSuccess, LastOutput: completed, Detail: "x"}, true},
 		{"invalid-success-unstarted-calls", TerminalResult{Status: TerminalSuccess, LastOutput: completed, UnstartedCalls: []model.ToolCall{{ID: "x", Name: "n"}}}, true},
 		{"invalid-success-output-with-tool-calls", TerminalResult{Status: TerminalSuccess, LastOutput: callsOut}, true},
-		{"invalid-success-model-invalid-output", TerminalResult{Status: TerminalSuccess, LastOutput: badLastOutput}, true}, // present outputs are re-validated through the public model constructor.
+		{"invalid-success-model-invalid-output", TerminalResult{Status: TerminalSuccess, LastOutput: badLastOutput}, true}, // present outputs are re-validated through the read-only model validator.
 		{"invalid-failure-empty-detail", TerminalResult{Status: TerminalFailure}, true},
 		{"invalid-failure-interrupted-output", TerminalResult{Status: TerminalFailure, LastOutput: interrupted, Detail: "d"}, true},
 		{"invalid-failure-unstarted-calls", TerminalResult{Status: TerminalFailure, LastOutput: errored, UnstartedCalls: []model.ToolCall{{ID: "x", Name: "n"}}, Detail: "d"}, true},
@@ -357,7 +357,7 @@ func TestValidateTerminalResult(t *testing.T) {
 		{"invalid-interruption-unstarted-not-from-output", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: []model.ToolCall{{ID: "zz", Name: "n"}}, Detail: "d"}, true},
 		{"invalid-interruption-unstarted-reversed-order", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(2, 1), Detail: "d"}, true},
 		{"invalid-interruption-unstarted-duplicate-id", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: unstarted(1, 1), Detail: "d"}, true},
-		{"invalid-interruption-unstarted-invalid-call", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: []model.ToolCall{{ID: "a"}}, Detail: "d"}, true}, // present calls are re-validated through the public model constructor.
+		{"invalid-interruption-unstarted-invalid-call", TerminalResult{Status: TerminalInterruption, LastOutput: callsOut, UnstartedCalls: []model.ToolCall{{ID: "a"}}, Detail: "d"}, true}, // present calls are re-validated through the read-only tool-call validator.
 	}
 
 	for _, tc := range cases {
@@ -377,7 +377,7 @@ func mkForeignSettlementOutput(status model.OutputStatus, detail string, src mod
 
 	out := model.Output{Status: status, Source: src, Detail: detail}
 	switch {
-	case status == model.OutputCompleted: // the one mandatory-payload row — a single non-empty text part satisfies it minimally respectively left-to-right as they appear within hasAssistantPayload's own check sequence further up above all of these lines verbatim.
+	case status == model.OutputCompleted: // the one mandatory-payload row: a single non-empty text part minimally satisfies the completed-output payload rule.
 		msg.Content = []model.ContentPart{{Kind: model.PartText, Text: "x"}}
 
 	case status == model.OutputInterrupted || detail != "": // optional partial message retained alongside its diagnostic text for the other two shapes — present-but-tool-call-free per their own closed-shape rules respectively left-to-right as they appear within NewOutput's default-branch validation logic over there.

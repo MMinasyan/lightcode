@@ -168,7 +168,7 @@ type CompactRequest struct {
 	OperationID string
 }
 
-// SweepPolicy is the explicit-time lifecycle thresholds of one Sweep call: an
+// SweepPolicy is the explicit-time lifecycle thresholds of one sweep call: an
 // open Session is archived when now-last_activity exceeds ArchiveAfter, and an
 // archived Session is deleted when now-archived_at exceeds DeleteAfterArchive.
 // A nonpositive threshold disables only its corresponding transition.
@@ -512,7 +512,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 // Compact compacts one idle Session manually under a dedicated Operation: the
 // caller-generated stable Operation ID supplies normal admission and
 // idempotency without any applicable input entry or synthetic user message.
-// The method follows the admit shape, never Submit's: an existing same-Session
+// The method follows the reserved admission shape, never Submit's: an existing same-Session
 // Operation of the compact kind resolves before the idle check, without
 // running preparation or compaction again; otherwise the Session must be
 // truly idle — no current Operation, no installed run, and both the steering
@@ -801,49 +801,8 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 }
 
-// Sweep runs one explicit-time lifecycle pass: it rejects a zero time before
-// any storage read, enumerates the sorted Session IDs, and delegates each
-// candidate to SweepSession, collecting the committed deleted identities.
-// Corrupt rows (including listed identities that violate the durable shape)
-// and concurrently deleted candidates are omitted; any other error stops and
-// returns from the call with the identities deleted so far. Sweep deletion
-// uses the same post-commit coordinator invalidation as DeleteSession. It
-// publishes no per-Session status, starts no ticker, reads no configuration,
-// and emits no event.
-//
-// Sweep returns every committed deleted Session identity, including successes
-// collected before a stopping error, in unspecified order; corrupt and
-// malformed rows contribute none. A rejected zero time or a listing failure
-// returns no identities.
-func (h *Harness) Sweep(ctx context.Context, policy SweepPolicy, now time.Time) ([]string, error) {
-	if now.IsZero() {
-		return nil, invalidInput("sweep time must not be zero")
-	}
-	ids, err := h.deps.Storage.ListSessionIDs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var deletedIDs []string
-	for _, sessionID := range ids {
-		if err := validateHexID(sessionID, "session id"); err != nil { // a listed identity violating the durable shape is a corrupt row: left unchanged, the pass continues
-			continue
-		}
-		deleted, err := h.SweepSession(ctx, sessionID, policy, now)
-		if err != nil {
-			if !isCorruption(err) && !errors.Is(err, ErrNotFound) { // a corrupt or concurrently deleted Session is omitted; every other error stops the sweep
-				return deletedIDs, err
-			}
-			continue
-		}
-		if deleted {
-			deletedIDs = append(deletedIDs, sessionID)
-		}
-	}
-	return deletedIDs, nil
-}
-
-// SweepSession handles one Sweep Session through the coordinator: the
-// per-Session transition broad Sweep delegates to. It never waits: a reserved
+// SweepSession is the explicit-time per-Session lifecycle transition. It
+// never waits: a reserved
 // candidate takes the same no-transition outcome as running, buffered, or
 // live-background work, so one busy Session never makes a caller wait on
 // unrelated execution. Under the coordinator mutex held across its own
@@ -1199,7 +1158,7 @@ type admissionRequest struct {
 }
 
 // errAdmissionExisting aborts the admission transaction once the conflicting
-// same-Session Operation has been read; it never escapes admit.
+// same-Session Operation has been read; it never escapes the reserved admission body.
 var errAdmissionExisting = errors.New("harness: operation already admitted in this session")
 
 // errRevisionRace marks the revision-guard conflict of an admission,
@@ -1227,59 +1186,6 @@ func validateSubmitInput(operationID string, origin InputOrigin, content []model
 		owned = append(owned, validated)
 	}
 	return owned, nil
-}
-
-// admit is the one normal admission path: validate the input, materialize the
-// Session, return an existing same-Session Operation without preparing again,
-// reserve admission, then run the reserved admission body. The reservation is
-// the configuration-capture linearization point; preparation failure
-// publishes nothing.
-func (h *Harness) admit(ctx context.Context, req admissionRequest) (OperationRecord, SubmitDisposition, error) {
-	content, err := validateSubmitInput(req.OperationID, req.Origin, req.Content)
-	if err != nil {
-		return OperationRecord{}, "", err
-	}
-	req.Content = content
-	c, err := h.coordinatorFor(ctx, req.SessionID)
-	if err != nil {
-		return OperationRecord{}, "", err
-	}
-	c.mu.Lock()
-	if c.gone { // a deletion committed while this call waited or relocked
-		c.mu.Unlock()
-		return OperationRecord{}, "", notFoundSession(req.SessionID)
-	}
-	if rec, ok := c.graph.Operation(req.OperationID); ok {
-		c.mu.Unlock()
-		if rec.Admission.RequestKind != req.Kind { // a different request kind's use of the identity is invalid
-			return OperationRecord{}, "", invalidInput("operation %q already exists in session %q with a different request kind", req.OperationID, req.SessionID)
-		}
-		return ownOperationRecord(rec), DispositionExisting, nil
-	}
-	if c.graph.Session.State.Lifecycle != LifecycleOpen {
-		c.mu.Unlock()
-		return OperationRecord{}, "", invalidInput("session %q is archived; admission requires an open Session", req.SessionID)
-	}
-	if c.graph.Session.State.CurrentOperationID != "" {
-		running := c.graph.Session.State.CurrentOperationID
-		c.mu.Unlock()
-		return OperationRecord{}, "", invalidInput("session %q already runs operation %q; admission requires an idle Session", req.SessionID, running)
-	}
-	c.mu.Unlock()
-
-	release, err := h.reserve(ctx, c)
-	if err != nil {
-		return OperationRecord{}, "", err
-	}
-	defer release()
-	rec, prepared, disposition, err := h.admitReserved(ctx, c, req)
-	if err != nil {
-		return OperationRecord{}, "", err
-	}
-	if prepared != nil { // install process-local execution and start Agent only after commit
-		h.startExecution(c, rec.Admission.OperationID, *prepared)
-	}
-	return rec, disposition, nil
 }
 
 // admitReserved is the reserved admission body: the re-checked existing,

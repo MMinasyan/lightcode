@@ -48,6 +48,7 @@ func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.Raw
 	if err != nil {
 		return nil, nil, err
 	}
+	rt.WireSystemRole = systemRole // the normalized role rides in the resolved value itself; the shared encoding body reads it from there.
 
 	runtimeLayer := Extra(runtimeExtras).Clone() // the per-call layer enters validation and merge as an owned copy.
 
@@ -65,16 +66,21 @@ func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.Raw
 		}
 	}
 
-	request, err := NewRequest(req) // re-validate and own the logical request at this trust boundary.
+	request, err := NewRequest(req) // validate and own the logical request at this trust boundary.
 	if err != nil {
 		return nil, nil, err
 	}
 
+	return encodeOwned(rt, request, runtimeLayer)
+}
+
+// encodeOwned is the single wire-encoding implementation shared by both owning boundaries (public Encode and Transport.Stream): it serializes messages and tools, applies replay filtering, merges the three sidecar layers over the base body, and returns owned JSON bytes plus ordered warnings. It receives already-owned, already-validated values — the resolved input with its wire system role normalized into WireSystemRole, a request that passed NewRequest, and a runtime layer that passed reserved-key and value validation — and performs no revalidation, no NewRequest call, and no cloning of the retained resolved input beyond the per-value copies the wire shape itself requires.
+func encodeOwned(rt ResolvedTransport, request Request, runtimeLayer Extra) (json.RawMessage, []ProtocolWarning, error) {
 	bodyMessages := make([]map[string]any, 0, len(request.Messages))
 	var warnings []ProtocolWarning
 	for i, msg := range request.Messages {
 		policy := replayPolicyFor(rt.Model, rt.SourceFamilies, rt.ProtocolFamily, rt.Drop, msg.Source)
-		obj := serializeMessage(msg, systemRole, policy) // canonical keys are written after the extras so they can never be forged by an extra.
+		obj := serializeMessage(msg, rt.WireSystemRole, policy) // canonical keys are written after the extras so they can never be forged by an extra.
 		bodyMessages = append(bodyMessages, obj)
 
 		if !policy.keep || msg.Role != RoleAssistant || len(msg.ToolCalls) == 0 {

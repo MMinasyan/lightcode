@@ -14,10 +14,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -107,7 +107,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 	}
 	// Preparation accepts only the committed normalized arguments: one
 	// strict decode-and-pass, never a second normalization.
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
@@ -211,31 +211,11 @@ func normalizeTaskArgs(args map[string]any) (map[string]any, error) {
 	return clean, nil
 }
 
-// decodeCallArguments strictly decodes one call's JSON arguments into an
-// owned map: UseNumber keeps every numeric lexeme exact, the decode clones
-// the call data at the accepting boundary, and malformed, non-object, null
-// or trailing data are argument-validation errors.
-func decodeCallArguments(raw json.RawMessage) (map[string]any, error) {
-	var args map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&args); err != nil {
-		return nil, fmt.Errorf("arguments must be a JSON object: %w", err)
-	}
-	if args == nil {
-		return nil, errors.New("arguments must be a JSON object")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return nil, errors.New("arguments must be one JSON object")
-	}
-	return args, nil
-}
-
 // normalizeCallArguments is the one shared Normalize body: the strict decode
 // of the call arguments, the tool's single argument normalization, and the
 // marshaled normalized object.
 func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) (map[string]any, error)) (json.RawMessage, error) {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return nil, err
 	}

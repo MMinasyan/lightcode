@@ -40,6 +40,16 @@ func (e Extra) Finalize() Extra {
 	return out
 }
 
+// HasValues reports whether any value survives the null-only finalization rule, i.e. exactly the values Finalize would retain, without allocating a finalized map. It validates nothing: malformed or empty raw values are retained by finalization and count here the same way.
+func (e Extra) HasValues() bool {
+	for _, value := range e {
+		if !isJSONNull(value) {
+			return true
+		}
+	}
+	return false
+}
+
 // CloneRaw returns a copy of one raw JSON value, or an empty value for nil.
 func CloneRaw(raw json.RawMessage) json.RawMessage {
 	return cloneRaw(raw)
@@ -114,6 +124,14 @@ func (a *ExtraAccumulator) Finalize() Extra {
 		return nil
 	}
 	return a.values.Finalize()
+}
+
+// HasValues reports whether any accumulated value survives the null-only finalization rule. A nil accumulator reports false.
+func (a *ExtraAccumulator) HasValues() bool {
+	if a == nil {
+		return false
+	}
+	return a.values.HasValues()
 }
 
 type extraKind string

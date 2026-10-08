@@ -538,11 +538,11 @@ func assistantPayloadEligible(v assistantEntry) bool {
 		return true
 	}
 	for _, part := range v.Content {
-		if part.Text != "" || part.URL != "" || part.OpaqueWireType != "" || len(part.Extra.Finalize()) > 0 {
+		if model.ContentPartHasPayload(part) {
 			return true
 		}
 	}
-	if len(v.Extra.Finalize()) > 0 {
+	if v.Extra.HasValues() {
 		return true
 	}
 	return v.Status == model.OutputCompleted && len(v.ToolCalls) > 0

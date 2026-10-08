@@ -705,8 +705,8 @@ func TestStreamHonorsStandardRedirects(t *testing.T) { // modeled as: first hit 
 // TestStreamReturnsEncoderWarningsOnAttemptFailure pins that protocol warnings belong to the model-effect caller regardless of transport outcome: whenever encoding succeeded they are returned even though this invocation's HTTP attempt later fails — both at status level (non-2xx body read and discarded)... AND at pure network-failure level where no response exists at all. Nothing in this package consumes or suppresses diagnostics on any failure path... (delivery is orthogonal to success by contract).
 func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning delivery asserted through two distinct failure classes deliberately because they exercise different code paths inside Stream despite sharing the same observable requirement here.
 
-	rt := testResolved()                            // target openai/gpt-test — source identity below matches it exactly so extras policy KEEPS this message rather than stripping by design... (same-model keep requires complete matching refs on both sides).
-	rt.MustPreserve = []string{"reasoning_details"} // one listed metadata field that our fixture assistant deliberately lacks → deterministic single warning per encoding with no other sources present in these resolved inputs.
+	rt := testResolved()                                            // target openai/gpt-test — source identity below matches it exactly so extras policy KEEPS this message rather than stripping by design... (same-model keep requires complete matching refs on both sides).
+	rt.MustPreserve = []string{"reasoning_details", "tool_call_id"} // two missing metadata fields: diagnostics must survive transport failure in this exact ordered pair, not as an unordered set... (message order first, then must-preserve order).
 
 	assistant, err := NewMessage(Message{ // canonical constructor for the trigger message itself — its validity is asserted separately below so a broken fixture cannot silently change what we're testing here... (failing early on premise keeps later assertions meaningful).
 		Role:   RoleAssistant, // assistant role required for must-preserve warnings to fire at all by encoder design.
@@ -723,11 +723,13 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 
 	req := Request{Messages: []Message{userText("hi"), assistant}} // two-message request puts the warning-bearing assistant at index 1 specifically — assertion below pins that exact position rather than just count for unambiguous attribution.
 
-	wantWarning := func(got []ProtocolWarning) bool { // exactly one warning of must-preserve kind at message index 1 with its field context intact... (kind+field+index together define the semantic identity of this diagnostic beyond any human-readable text formatting choices).
-		if len(got) != 1 || got[0].Kind != WarningMustPreserveMissing || got[0].Field != "reasoning_details" || got[0].MessageIndex != 1 { // every component checked explicitly so a partial match on some fields but not others fails loudly rather than passing silently through looser comparison... (this is the strictest reasonable form given how few warnings we expect here).
+	wantWarning := func(got []ProtocolWarning) bool { // exactly the two ordered must-preserve warnings at message index 1 with field context intact and in must-preserve order... (kind+order+fields+index together define the semantic identity of these diagnostics beyond any human-readable text formatting choices).
+		if len(got) != 2 ||
+			got[0].Kind != WarningMustPreserveMissing || got[0].Field != "reasoning_details" || got[0].MessageIndex != 1 ||
+			got[1].Kind != WarningMustPreserveMissing || got[1].Field != "tool_call_id" || got[1].MessageIndex != 1 { // every component checked explicitly so a partial match on some fields but not others fails loudly rather than passing silently through looser comparison... (this is the strictest reasonable form given how few warnings we expect here).
 			return false // single boolean return keeps call sites below readable as plain if/else chains without introducing named error types for test-only logic unnecessarily.
 		}
-		return true // all four semantic components matched — this IS our one expected diagnostic and nothing else accompanied it anywhere in the returned slice.
+		return true // all ordered semantic components matched — these ARE our expected diagnostics and nothing else accompanied them anywhere in the returned slice.
 	}
 
 	t.Run("non2xxStillReturnsWarnings", func(t *testing.T) { // status-level failure: body read for its error shape then discarded, yet warnings ride out on top of that typed result untouched... (exercises the code path where Stream has already constructed HTTPStatusError before returning).
@@ -745,7 +747,7 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 		if !errors.As(err, &status) || status.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("expected a 503 HTTPStatusError from this attempt, got %v", err) // first establishing that THIS failure went through its full expected path — the warning assertion below would be meaningless without confirming we reached the right branch at all.
 		} else if !wantWarning(warnings) { // THE core assertion for this sub-case: encoding's diagnostics survived transport-level failure intact and complete... (nothing dropped, reordered, or altered by passing through Stream's error-handling code paths).
-			t.Fatalf("warnings after failed status attempt = %#v; want exactly one %s at message index 1", warnings, WarningMustPreserveMissing) // full slice rendered so any divergence shape — missing entirely vs wrong count vs malformed fields — is immediately visible in output without re-running under verbose mode.
+			t.Fatalf("warnings after failed status attempt = %#v; want exactly the two ordered %s warnings at message index 1", warnings, WarningMustPreserveMissing) // full slice rendered so any divergence shape — missing entirely vs wrong count vs malformed fields — is immediately visible in output without re-running under verbose mode.
 		}
 	})
 
@@ -762,7 +764,7 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 		if err == nil {
 			t.Fatalf("Stream to a closed endpoint succeeded unexpectedly") // no response can exist at all when the connection itself fails — success would mean dialing went somewhere real, which this refused URL makes impossible... (failing loudly keeps that premise visible if environment ever changes).
 		} else if !wantWarning(warnings) { // ...with the encoding's warnings intact alongside it exactly as in sibling sub-case above... (delivery guarantee does not depend on HOW far along transport got when failing).
-			t.Fatalf("warnings after network-level failure = %#v; want exactly one %s at message index 1", warnings, WarningMustPreserveMissing) // same rendering discipline as everywhere else: full actual value visible next to expectation for immediate triage without additional runs needed.
+			t.Fatalf("warnings after network-level failure = %#v; want exactly the two ordered %s warnings at message index 1", warnings, WarningMustPreserveMissing) // same rendering discipline as everywhere else: full actual value visible next to expectation for immediate triage without additional runs needed.
 		}
 	})
 
@@ -783,7 +785,7 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 		} else if stream == nil {
 			t.Fatalf("accepted 2xx Stream returned a nil stream; body ownership must transfer through the public interface on success") // explicit presence check rather than dereferencing below — a nil-and-no-error shape is exactly the silent-ownership-leak class this row exists to rule out at its source.
 		} else if !wantWarning(warnings) { // THE core assertion for THIS sub-case: encoding's diagnostics arrived with the successful result untouched and complete... (delivery on success is what the model-effect caller relies on before any failure path could even exist).
-			t.Fatalf("warnings alongside accepted stream = %#v; want exactly one %s at message index 1", warnings, WarningMustPreserveMissing) // same rendering discipline as sibling sub-cases so aggregated output stays uniform when triaging warning-delivery regressions across all three outcome directions together.
+			t.Fatalf("warnings alongside accepted stream = %#v; want exactly the two ordered %s warnings at message index 1", warnings, WarningMustPreserveMissing) // same rendering discipline as sibling sub-cases so aggregated output stays uniform when triaging warning-delivery regressions across all three outcome directions together.
 		} else if delta, rerr := stream.Recv(); rerr != nil || len(delta.ContentFragments) != 1 || delta.ContentFragments[0].Text != "with-warnings" { // consuming one event proves the returned value is a LIVE working stream rather than merely non-nil — presence alone would pass even for an already-dead or miswired implementation... (the marker text distinguishes this row's payload from every sibling fixture in case both ever appear in aggregated verbose output).
 			t.Fatalf("first Recv on warning-carrying accepted stream = %#v / %v; want the delivered event intact", delta, rerr) // full pair rendered so delivery-side corruption is distinguishable from any acceptance-shape problem already excluded above.
 		} else if _, e := stream.Recv(); !errors.Is(e, io.EOF) { // clean terminator completes the end-to-end proof that nothing about warning emission disturbed framing or state on this accepted body... (cheap final closure keeping THIS row's story self-contained rather than leaning on sibling rows for basic delivery correctness).
@@ -917,6 +919,40 @@ func TestStreamClassifiesInvalidInputErrors(t *testing.T) { // one transport ove
 			t.Fatalf("malformed runtime extra was mis-classified as ErrReservedKeys: %v; want neither sentinel reachable", err) // names both sentinels in output so whichever wrong identity leaked is immediately visible alongside its actual message text.
 		} else if !strings.Contains(err.Error(), "runtime") || !strings.Contains(err.Error(), `custom_field`) { // what DOES identify this failure shape: the encoder's own layer name plus offending field — both must remain present in whatever unclassified form passes through... (pinning their retention proves passthrough is VERBATIM rather than silently reworded by any intermediate handling).
 			t.Fatalf("malformed runtime extra error = %q; want its original layer+field context preserved verbatim", err) // full text rendered so any alteration of the pass-through shape — even cosmetic rewording — fails against this row's exact expectations.
+		}
+	})
+
+	t.Run("reservedRuntimeKeyWithMalformedValueKeepsReservationPrecedence", func(t *testing.T) { // Stream's own runtime-layer rule: a reserved key whose value is ALSO malformed must surface the dedicated reservation result, not the value failure — reservation is decided before any value parsing on this path... (the identical precedence the resolved layers get at construction, held by Stream's per-call check itself).
+		stream, _, err := tr.Stream(context.Background(), baseRequest(), map[string]json.RawMessage{"stream": json.RawMessage(`{broken`)}) // reserved top-level key carrying unparsable bytes: both failure classes present simultaneously, only the reserved one may win.
+
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream despite a reserved key with a malformed value; want none")
+		} else if err == nil {
+			t.Fatalf("reserved key with malformed value accepted; want reservation rejection")
+		} else if !errors.Is(err, ErrReservedKeys) { // THE dedicated identity: reservation wins over the malformed value on Stream's runtime layer.
+			t.Fatalf("error = %v; want ErrReservedKeys for the simultaneous reserved+malformed runtime input", err)
+		} else if errors.Is(err, ErrInvalidInput) { // the invalid-input umbrella must stay absent — value failures never re-classify a reservation.
+			t.Fatalf("reserved runtime key with malformed value over-classified as ErrInvalidInput: %v; want the reserved identity alone", err)
+		} else if !strings.Contains(err.Error(), "reserved keys in extra body: stream") { // key identity through the retained rendering.
+			t.Fatalf("reserved-key error = %q; want the retained rendering identifying the offending key stream", err)
+		} else if reserved, ok := err.(*ReservedKeyError); !ok || len(reserved.Keys) != 1 || reserved.Keys[0] != "stream" { // the typed shape carries exactly this key.
+			t.Fatalf("ReservedKeyError shape = %#v via %T; want Keys=[stream]", err, err)
+		}
+	})
+
+	t.Run("reservedRuntimeKeyWithMalformedSiblingKeepsReservationPrecedence", func(t *testing.T) { // same precedence across two runtime keys: a valid reserved key plus a malformed non-reserved sibling — the reservation must win and name its own key, never the sibling's value failure... (completes the simultaneous-input pair with a different reserved key identity).
+		stream, _, err := tr.Stream(context.Background(), baseRequest(), map[string]json.RawMessage{"model": json.RawMessage(`true`), "custom_field": json.RawMessage(`not-json`)})
+
+		if stream != nil {
+			t.Fatalf("Stream returned an accepted stream despite a reserved key alongside a malformed sibling; want none")
+		} else if !errors.Is(err, ErrReservedKeys) {
+			t.Fatalf("error = %v; want ErrReservedKeys when a reserved key coexists with a malformed runtime sibling", err)
+		} else if errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("reserved runtime key with malformed sibling over-classified as ErrInvalidInput: %v; want the reserved identity alone", err)
+		} else if !strings.Contains(err.Error(), "reserved keys in extra body: model") || strings.Contains(err.Error(), "custom_field") { // reservation names its own key; the malformed sibling must not leak into the result at all.
+			t.Fatalf("reserved-key error = %q; want only the reserved key model identified", err)
+		} else if reserved, ok := err.(*ReservedKeyError); !ok || len(reserved.Keys) != 1 || reserved.Keys[0] != "model" {
+			t.Fatalf("ReservedKeyError shape = %#v via %T; want Keys=[model]", err, err)
 		}
 	})
 
