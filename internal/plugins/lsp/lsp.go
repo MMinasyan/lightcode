@@ -7,12 +7,10 @@
 package lsp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +21,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/lsp"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -172,26 +171,6 @@ func (in *instance) close() error {
 	return nil
 }
 
-// decodeCallArguments strictly decodes one call's JSON arguments into an
-// owned map: UseNumber keeps every numeric lexeme exact, the decode clones
-// the call data at the accepting boundary, and malformed, non-object, null
-// or trailing data are argument-validation errors.
-func decodeCallArguments(raw json.RawMessage) (map[string]any, error) {
-	var args map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&args); err != nil {
-		return nil, fmt.Errorf("arguments must be a JSON object: %w", err)
-	}
-	if args == nil {
-		return nil, errors.New("arguments must be a JSON object")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return nil, errors.New("arguments must be one JSON object")
-	}
-	return args, nil
-}
-
 // immediateError is the normalization-class immediate outcome: status error
 // carrying the bounded validation diagnostic, per the tool-boundary
 // validation contract.
@@ -224,7 +203,7 @@ func boundedDiagnostic(cause error) string {
 // the tool's consumed-field validation, and the marshaled normalized object.
 // Unrelated accepted members are retained.
 func normalizeCallArguments(call model.ToolCall, validate func(map[string]any) error) (json.RawMessage, error) {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +394,7 @@ func (workspaceSymbolTool) Normalize(_ runtime.ToolContext, call model.ToolCall)
 }
 
 func (t workspaceSymbolTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := decodeCallArguments(call.Arguments)
+	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
