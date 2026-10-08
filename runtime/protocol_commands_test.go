@@ -32,7 +32,7 @@ func releaseCommandGate(gate chan struct{}) {
 func drainCommandModelArrivals(e *ownerEnv) {
 	for {
 		select {
-		case <-e.prep.modelArrived:
+		case <-e.server.arrived:
 		default:
 			return
 		}
@@ -254,7 +254,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		drainCommandModelArrivals(e)
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		active, err := r.submitSession(ctx, sessionID, commandSubmitRequest(t, "op-active", "active run"))
 		if err != nil {
 			t.Fatalf("active regular submit: %v", err)
@@ -262,7 +262,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		if active.Disposition != protocol.SubmitResultDispositionAdmitted || active.Operation == nil {
 			t.Fatalf("active admission = %+v, want admitted", active)
 		}
-		<-e.prep.modelArrived // the active model call is parked before the buffers are filled
+		<-e.server.arrived // the active model call is parked before the buffers are filled
 		steering, err := r.submitSession(ctx, sessionID, commandSubmitRequest(t, "op-steer", "steer"))
 		if err != nil {
 			t.Fatalf("active steering submit: %v", err)
@@ -493,7 +493,7 @@ func TestSessionCommandCompact(t *testing.T) {
 
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		if _, err := r.submitSession(ctx, sessionID, commandSubmitRequest(t, "op-run", "run")); err != nil {
 			t.Fatalf("active submit: %v", err)
 		}
@@ -566,7 +566,7 @@ func TestSessionCommandFork(t *testing.T) {
 		drainCommandModelArrivals(e)
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 
 		req := protocol.ForkRequest{
 			BoundaryItemId: boundaryItem,
@@ -588,7 +588,7 @@ func TestSessionCommandFork(t *testing.T) {
 		if result.Operation.OperationId != "op-fork" || result.Operation.Status != protocol.OperationStatusRunning {
 			t.Fatalf("fork operation = %+v, want running op-fork", result.Operation)
 		}
-		<-e.prep.modelArrived // rendezvous: the destination's first model effect is parked
+		<-e.server.arrived // rendezvous: the destination's first model effect is parked
 		if status, err := operationStatusOf(store, destID, "op-fork"); err != nil || status != harness.OperationRunning {
 			t.Fatalf("fork header rendezvous = (%q, %v), want the destination still running", status, err)
 		}
@@ -737,11 +737,11 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		drainCommandModelArrivals(e)
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		if _, err := r.submitSession(ctx, sessionID, commandSubmitRequest(t, "op-1", "run")); err != nil {
 			t.Fatalf("active submit: %v", err)
 		}
-		<-e.prep.modelArrived // the active model call is parked before the steering enqueue
+		<-e.server.arrived // the active model call is parked before the steering enqueue
 		if _, err := r.submitSession(ctx, sessionID, commandSubmitRequest(t, "op-steer", "steer")); err != nil {
 			t.Fatalf("steering submit: %v", err)
 		}
@@ -787,7 +787,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		}
 		runningGate := make(chan struct{})
 		defer releaseCommandGate(runningGate)
-		e.prep.modelGate = runningGate
+		e.server.setHold(runningGate)
 		if _, err := r.submitSession(ctx, running.Identity.SessionID, commandSubmitRequest(t, "op-running", "run")); err != nil {
 			t.Fatalf("running submit: %v", err)
 		}
@@ -846,7 +846,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 func TestSessionCommandArchiveLiveBackground(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() {
 			if err := bg.r.Close(ctx); err != nil {
 				t.Errorf("Close: %v", err)
@@ -855,15 +855,16 @@ func TestSessionCommandArchiveLiveBackground(t *testing.T) {
 
 		root := bg.session("archive-bg")
 		childStarted := make(chan struct{}, 1)
-		bg.prep.setAgentScript("worker", &lifecycleScript{
-			model: func(ctx context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
-				select {
-				case childStarted <- struct{}{}:
-				default:
-				}
-				<-ctx.Done()
-				return nil, ctx.Err()
-			},
+		bg.e.server.setScript(func(ctx context.Context, body string) []string {
+			if lastUserText(body) != "child work" {
+				return nil // every other turn: the default completed turn
+			}
+			select {
+			case childStarted <- struct{}{}:
+			default:
+			}
+			<-ctx.Done() // the child's model request parks until its run cancels
+			return nil
 		})
 		child := bg.launchChild(root, "child work", "op-child", 5)
 
@@ -896,21 +897,26 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 		ctx := context.Background()
 
 		t.Run("interrupt returns before the terminal settlement", func(t *testing.T) {
-			bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+			bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 			defer func() { _ = bg.r.Close(ctx) }()
 			root := bg.session("interrupt-root")
 			started := make(chan struct{}, 1)
 			release := make(chan struct{})
 			defer releaseCommandGate(release)
-			bg.prep.setSessionScript(root, &lifecycleScript{
-				model: func(ctx context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-					if attempt == 1 {
-						started <- struct{}{}
-						<-release
-						return nil, ctx.Err()
-					}
-					return lifecycleTextTurn("done"), nil
-				},
+			bg.e.server.setScript(func(sctx context.Context, body string) []string {
+				if lastUserText(body) != "run" {
+					return nil
+				}
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				select { // the model request parks until the gate or the run's cancellation
+				case <-release:
+					return textTurnEvents("done")
+				case <-sctx.Done():
+					return nil
+				}
 			})
 			if _, err := bg.r.submitSession(ctx, root, commandSubmitRequest(t, "op-int", "run")); err != nil {
 				t.Fatalf("submit: %v", err)
@@ -930,19 +936,20 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 		})
 
 		t.Run("child stop converges and permanently closes admission", func(t *testing.T) {
-			bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+			bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 			defer func() { _ = bg.r.Close(ctx) }()
 			root := bg.session("child-stop-root")
 			childStarted := make(chan struct{}, 1)
-			bg.prep.setAgentScript("worker", &lifecycleScript{
-				model: func(ctx context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
-					select {
-					case childStarted <- struct{}{}:
-					default:
-					}
-					<-ctx.Done()
-					return nil, ctx.Err()
-				},
+			bg.e.server.setScript(func(sctx context.Context, body string) []string {
+				if lastUserText(body) != "child work" {
+					return nil
+				}
+				select {
+				case childStarted <- struct{}{}:
+				default:
+				}
+				<-sctx.Done() // the child's model request parks until its run cancels
+				return nil
 			})
 			child := bg.launchChild(root, "child work", "op-child", 5)
 			<-childStarted // the child's execution is open before the stop races it
@@ -956,32 +963,35 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 		})
 
 		t.Run("root stop converges members and leaves the root untouched", func(t *testing.T) {
-			bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+			bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 			defer func() { _ = bg.r.Close(ctx) }()
 			root := bg.session("member-stop-root")
 			started := make(chan struct{}, 1)
 			release := make(chan struct{})
 			defer releaseCommandGate(release)
-			bg.prep.setSessionScript(root, &lifecycleScript{
-				model: func(_ context.Context, _ string, attempt int, _ model.Request) (model.Stream, error) {
-					if attempt == 1 {
-						started <- struct{}{}
-						<-release
-						return lifecycleTextTurn("done"), nil
-					}
-					return lifecycleTextTurn("done"), nil
-				},
-			})
 			childStarted := make(chan struct{}, 1)
-			bg.prep.setAgentScript("worker", &lifecycleScript{
-				model: func(ctx context.Context, _ string, _ int, _ model.Request) (model.Stream, error) {
+			bg.e.server.setScript(func(sctx context.Context, body string) []string {
+				switch lastUserText(body) {
+				case "run": // the root's own model request parks on the gate
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					select {
+					case <-release:
+						return textTurnEvents("done")
+					case <-sctx.Done():
+						return nil
+					}
+				case "child work": // the child's request parks until its run cancels
 					select {
 					case childStarted <- struct{}{}:
 					default:
 					}
-					<-ctx.Done()
-					return nil, ctx.Err()
-				},
+					<-sctx.Done()
+					return nil
+				}
+				return nil
 			})
 			if _, err := bg.r.submitSession(ctx, root, commandSubmitRequest(t, "op-root", "run")); err != nil {
 				t.Fatalf("root submit: %v", err)
@@ -1022,12 +1032,12 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 func TestSessionCommandPreparationError(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() { _ = bg.r.Close(ctx) }()
 
 		root := bg.session("prep-fail")
 		failure := errors.New("controlled preparation failure")
-		bg.prep.setSessionScript(root, &lifecycleScript{fail: failure})
+		bg.hook.failNext(failure)
 
 		res, err := bg.r.submitSession(ctx, root, commandSubmitRequest(t, "op-fail", "run"))
 		if !errors.Is(err, failure) {
@@ -1041,7 +1051,6 @@ func TestSessionCommandPreparationError(t *testing.T) {
 			t.Fatalf("failing preparation committed state: %+v", snap)
 		}
 
-		bg.prep.setSessionScript(root, &lifecycleScript{})
 		ok, err := bg.r.submitSession(ctx, root, commandSubmitRequest(t, "op-ok", "run"))
 		if err != nil {
 			t.Fatalf("submit after failure: %v", err)
@@ -1115,7 +1124,7 @@ func TestSessionCommandCommitJoinsClose(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		gated := newGatedStore(store)
-		bg := openBackgroundLifecycle(t, gated, newLifecycleStopper(gated))
+		bg := openBackgroundRuntime(t, gated, newLifecycleStopper())
 		defer func() { _ = bg.r.Close(ctx) }()
 
 		root := bg.session("join-close")

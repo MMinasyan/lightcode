@@ -241,7 +241,7 @@ func newDiscoveryChildEnv(t *testing.T, home, dataDir string) *ownerEnv {
 		t: t, home: home, dataDir: dataDir,
 		configPath: filepath.Join(dataDir, "config.json"),
 		events:     &traceLog{},
-		prep:       newControlledPrep(),
+		server:     newProductionModelServer(t, "", ""),
 	}
 	e.scopeDataDir.Store("")
 	e.scopeWorkspace.Store("")

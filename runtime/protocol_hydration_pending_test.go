@@ -98,7 +98,7 @@ func TestProtocolHydrationPendingDuringParkedQueuedDelivery(t *testing.T) {
 		client := protocolClient(t, ps)
 
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release() // LIFO: the gate releases before the owner close joins
 

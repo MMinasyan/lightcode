@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,30 +162,127 @@ func TestCodeSnapshotsTargetGroups(t *testing.T) {
 	})
 }
 
+// codeRuntime is the code suite's native owner: the solo agent over the
+// local model endpoint, the job-stop seam, and a never-ticked sweep stream
+// that keeps the automatic lifecycle sweep structurally out of every row.
+type codeRuntime struct {
+	t     *testing.T
+	store harness.Storage
+	r     *Runtime
+	e     *ownerEnv
+}
+
+func openCodeRuntime(t *testing.T, store harness.Storage) *codeRuntime {
+	t.Helper()
+	// The fixture declares the shared plain solo/worker pair: this
+	// composition provides no hooks or tools, and the rows need only ordinary
+	// text turns and manual compaction.
+	e := newOwnerEnv(t)
+	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+	ticks := make(chan time.Time)
+	opts := e.options(e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, newLifecycleStopper()))
+	opts.sweepTicks = ticks
+	r, err := open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return &codeRuntime{t: t, store: store, r: r, e: e}
+}
+
+func (f *codeRuntime) session(name string) string {
+	f.t.Helper()
+	rec, err := f.r.createSession(context.Background(), "/tmp/compact-"+name, "solo")
+	if err != nil {
+		f.t.Fatalf("createSession(%s): %v", name, err)
+	}
+	return rec.Identity.SessionID
+}
+
+// submit submits one regular user message, tolerating the buffered
+// dispositions of the terminal-to-retirement window: the durable admission
+// is the rendezvous, not the terminal state.
+func (f *codeRuntime) submit(sessionID, operationID, text string) {
+	f.t.Helper()
+	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		_, err := h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   sessionID,
+			OperationID: operationID,
+			Origin:      harness.InputOriginUser,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
+			Mode:        harness.MessageModeRegular,
+		})
+		return err
+	})
+	if err != nil {
+		f.t.Fatalf("Submit(%s): %v", operationID, err)
+	}
+}
+
+// compactIdle admits one manual compaction on an idle Session: the
+// terminal-to-retirement window clears asynchronously, and the admission
+// itself is the rendezvous on the retired run — a rejection committed
+// nothing, so the retry is safe.
+func (f *codeRuntime) compactIdle(sessionID, operationID string) harness.OperationRecord {
+	f.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var rec harness.OperationRecord
+		err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			var err error
+			rec, err = h.Compact(ctx, harness.CompactRequest{SessionID: sessionID, OperationID: operationID})
+			return err
+		})
+		if err == nil {
+			return rec
+		}
+		if !errors.Is(err, harness.ErrInvalid) || !strings.Contains(err.Error(), "is not idle") || time.Now().After(deadline) {
+			f.t.Fatalf("Compact(%s): %v", operationID, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// submitMode submits one message in the given mode and returns the
+// disposition.
+func (f *codeRuntime) submitMode(sessionID, operationID, text string, mode harness.MessageMode) harness.SubmitDisposition {
+	f.t.Helper()
+	var disposition harness.SubmitDisposition
+	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		res, err := h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   sessionID,
+			OperationID: operationID,
+			Origin:      harness.InputOriginUser,
+			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
+			Mode:        mode,
+		})
+		if err == nil {
+			disposition = res.Disposition
+		}
+		return err
+	})
+	if err != nil {
+		f.t.Fatalf("Submit(%s): %v", operationID, err)
+	}
+	return disposition
+}
+
 // TestCodeSnapshotsSteeringSharesAdmittedGroup proves a real drained steering
 // input that shares its owning Operation does not create or displace the
 // group: the group key is the Operation's own admitted entry, never the later
 // steering entry, over the multi-boundary compact-lifecycle fixture.
 func TestCodeSnapshotsSteeringSharesAdmittedGroup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		f := openCompactLifecycle(t, store)
+		f := openCodeRuntime(t, store)
 		defer func() { _ = f.r.Close(context.Background()) }()
 		session := f.session("steering-group")
 
-		parked := make(chan struct{}, 1)
+		// The first request — the one carrying "start work" — parks on the
+		// server hold while its turn is served after release; the steering
+		// submit buffers behind it.
 		gate := make(chan struct{})
-		f.setConvScript(session, func(_ context.Context, req model.Request) (model.Stream, error) {
-			if strings.Contains(requestText(req), "start work") {
-				select {
-				case parked <- struct{}{}:
-				default:
-				}
-				<-gate
-			}
-			return lifecycleTextTurn("resumed"), nil
-		})
+		f.e.server.setHold(gate)
 		f.submit(session, "op-1", "start work")
-		<-parked
+		awaitModelArrival(t, f.e)
 		if got := f.submitMode(session, "op-steer", "steering text", harness.MessageModeRegular); got != harness.DispositionSteering {
 			t.Fatalf("steering submit = %q, want steering", got)
 		}
@@ -246,7 +344,7 @@ func TestCodeSnapshotsSteeringSharesAdmittedGroup(t *testing.T) {
 // implementation cannot pass the same-file preimage chain.
 func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		f := openCompactLifecycle(t, store)
+		f := openCodeRuntime(t, store)
 		defer func() { _ = f.r.Close(context.Background()) }()
 		session := f.session("revert-order")
 		workspace := filepath.Join(f.r.dataDir, "revert-order-ws")
@@ -427,9 +525,9 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 		}
 		captureCodeMutation(t, codeGroupRoot(r, root, rootEntry), rootFile, rootFile, []byte("r1"))
 
-		e.prep.awaitCleanups(1) // the settled root execution retires before Fork requires its idle source
+		awaitOperation(t, r, root, "op-root", harness.OperationSuccess) // the settled root execution retires before Fork requires its idle source
 		forked := forkThroughRuntime(t, r, root, rootEntry, "op-fork")
-		e.prep.awaitCleanups(2)
+		awaitOperation(t, r, forked, "op-fork", harness.OperationSuccess)
 		forkOp := readOperation(t, r, forked, "op-fork")
 		forkEntry := forkOp.Admission.AdmittedEntry.EntryID
 		forkFile := filepath.Join(workspace, "fork.txt")
@@ -439,7 +537,7 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 		captureCodeMutation(t, codeGroupRoot(r, forked, forkEntry), forkFile, forkFile, []byte("f1"))
 
 		child := launchChildThroughRuntime(t, r, root, "op-child")
-		e.prep.awaitCleanups(3)
+		awaitOperation(t, r, child, "op-child", harness.OperationSuccess)
 		childOp := readOperation(t, r, child, "op-child")
 		childEntry := childOp.Admission.AdmittedEntry.EntryID
 		childFile := filepath.Join(workspace, "child.txt")
@@ -536,7 +634,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, session, "op-1", "running")
 		awaitModelArrival(t, e)
 		runningEntry := readOperation(t, r, session, "op-1").Admission.AdmittedEntry.EntryID
@@ -553,7 +651,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 			t.Fatalf("running refusal mutated the file: (%q, %v)", data, err)
 		}
 		close(gate)
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, r, session)
 		result, err := r.revertSessionCode(context.Background(), session, "op-1")
 		if err != nil || len(result.Restored) != 1 {
@@ -570,10 +668,10 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 			t.Fatalf("write parent preimage: %v", err)
 		}
 		captureCodeMutation(t, codeGroupRoot(r, parent, parentEntry), parentFile, parentFile, []byte("p1"))
-		e.prep.awaitCleanups(2) // the parent's own execution retires before the child launch
+		awaitOperation(t, r, parent, "op-parent", harness.OperationSuccess) // the parent's own execution retires before the child launch
 		childGate := make(chan struct{})
-		e.prep.modelGate = childGate
-		_ = launchChildThroughRuntime(t, r, parent, "op-live-child")
+		e.server.setHold(childGate)
+		child := launchChildThroughRuntime(t, r, parent, "op-live-child")
 		awaitModelArrival(t, e)
 		if children := snapshotThroughRuntime(t, r, parent).Background; len(children) == 0 {
 			t.Fatal("parent background membership is empty after a live child launch")
@@ -585,7 +683,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 			t.Fatalf("live-child refusal mutated the file: (%q, %v)", data, err)
 		}
 		close(childGate)
-		e.prep.awaitCleanups(3)
+		awaitOperation(t, r, child, "op-live-child", harness.OperationSuccess)
 	})
 }
 
@@ -1726,7 +1824,7 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 		var gateOnce sync.Once
 		releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
 		defer releaseGate()
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 
 		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 			res, err := h.Submit(ctx, harness.SubmitRequest{
@@ -1766,9 +1864,9 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 		}
 
 		awaitOpenerRegistered(t, r, session)
-		select { // neither execution's model effect began inside the interval
-		case <-e.prep.modelArrived:
-			t.Fatal("a model effect began inside the restore interval")
+		select { // neither execution's model request began inside the interval
+		case <-e.server.arrived:
+			t.Fatal("a model request began inside the restore interval")
 		default:
 		}
 
@@ -1800,7 +1898,7 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 		stopper := &stubStopper{events: e.events}
 		r, err := e.open(context.Background(), e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
 		if err != nil {
@@ -1828,7 +1926,7 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 		var gateOnce sync.Once
 		releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
 		defer releaseGate()
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 
 		var completionID string
 		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
@@ -1847,8 +1945,8 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 
 		awaitOpenerRegistered(t, r, session) // the wake's opener is the registered waiter
 		select {
-		case <-e.prep.modelArrived:
-			t.Fatal("the wake's model effect began inside the restore interval")
+		case <-e.server.arrived:
+			t.Fatal("the wake's model request began inside the restore interval")
 		default:
 		}
 
@@ -1873,9 +1971,31 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 // TestExecutionOpenerFailureReleasesInterval proves the opening-failure row:
 // a failed opener releases the Session's artifact token before returning, so
 // the registry is reclaimed and the next execution runs normally.
+// failingAgentFactoryPlugin is one Agent-scoped plugin whose factory fails
+// while armed: the concrete opening-failure row.
+func failingAgentFactoryPlugin(fail *atomic.Bool) Plugin {
+	return Plugin{
+		ID:       "failing-agent",
+		Scope:    ScopeAgent,
+		Provides: []CapabilitySpec{Spec[any]("failing.agent.cap")},
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			if fail.Load() {
+				return Instance{}, errors.New("boom")
+			}
+			return Instance{Values: map[string]any{"failing.agent.cap": "ok"}}, nil
+		},
+	}
+}
+
 func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
+		e := newOwnerEnv(t)
+		var fail atomic.Bool
+		fail.Store(true)
+		r, err := e.open(context.Background(), e.storagePlugin(store), failingAgentFactoryPlugin(&fail))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
 		defer closeProjectionRuntime(r)
 		workspace := filepath.Join(e.home, "openerr-ws")
 		if err := os.MkdirAll(workspace, 0o700); err != nil {
@@ -1883,7 +2003,6 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 		}
 		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 
-		e.prep.openErr = errors.New("boom")
 		if err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 			_, err := h.Submit(ctx, harness.SubmitRequest{
 				SessionID:   session,
@@ -1896,10 +2015,13 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
+		if rec := awaitOperation(t, r, session, "op-fail", harness.OperationFailure); rec.State.Status != harness.OperationFailure {
+			t.Fatalf("failed opening settled as %+v, want failure", rec.State)
+		}
 		awaitNoRegistryEntries(t, r, "the failed opening") // the unwind released the token
 		awaitRestorableSession(t, r, session)              // the failed execution's slot retired
 
-		e.prep.openErr = nil
+		fail.Store(false)
 		submitCodeOperation(t, r, session, "op-next", "next") // the next execution runs normally
 		awaitNoRegistryEntries(t, r, "the settled successor")
 	})
@@ -1910,9 +2032,36 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 // still held — a restore conflicts — and only after the cleanup and the
 // scoped closes complete is the registry reclaimed and the same restore
 // admitted.
+// parkingAgentClosePlugin is one Agent-scoped plugin whose Instance.Close
+// signals its start and then parks on the release gate: the held
+// execution-cleanup row.
+func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) Plugin {
+	return Plugin{
+		ID:       "parking-agent",
+		Scope:    ScopeAgent,
+		Provides: []CapabilitySpec{Spec[any]("parking.agent.cap")},
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"parking.agent.cap": "ok"}, Close: func() error {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				<-gate
+				return nil
+			}}, nil
+		},
+	}
+}
+
 func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
+		e := newOwnerEnv(t)
+		closeGate := make(chan struct{})
+		closeStarted := make(chan struct{}, 1)
+		r, err := e.open(context.Background(), e.storagePlugin(store), parkingAgentClosePlugin(closeStarted, closeGate))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
 		defer closeProjectionRuntime(r)
 		workspace := filepath.Join(e.home, "cleanup-ws")
 		if err := os.MkdirAll(workspace, 0o700); err != nil {
@@ -1920,13 +2069,15 @@ func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 		}
 		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 
-		closeGate := make(chan struct{})
 		var gateOnce sync.Once
 		releaseCleanup := func() { gateOnce.Do(func() { close(closeGate) }) }
 		defer releaseCleanup() // a failing assertion must not leak a held execution Close
-		e.prep.closeGate = closeGate
 		submitThroughRuntime(t, r, session, "op-1", "run")
-		e.prep.awaitCleanups(1) // the concrete execution's Close started and blocked
+		select { // the execution's scoped cleanup started and blocked
+		case <-closeStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the execution cleanup never started")
+		}
 
 		// The token is still held through the blocked cleanup and the not-yet-
 		// closed scopes: a restore conflicts before any directory work.

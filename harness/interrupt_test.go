@@ -49,17 +49,29 @@ func TestInterruptBlockedModelAttemptSettlesContractInterruption(t *testing.T) {
 // TestInterruptBlockedForegroundToolSettlesRealResult proves the blocked-tool
 // row: interrupting a channel-blocked foreground tool cancels it, commits the
 // tool's own interrupted result, stops the batch so the later unstarted call
-// never begins, and settles the Operation as terminal interruption.
+// never begins, and settles the Operation as terminal interruption; the
+// steering submitted while the tool was blocked later enters its own admission
+// and its own model request.
 func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 	store := emptyStore(t)
-	modelFn := func(context.Context, model.Request) (model.Stream, error) {
-		return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
-	}
 	var (
 		mu       sync.Mutex
 		call2Ran bool
+		calls    int
+		requests []model.Request
 		started  = make(chan struct{})
 	)
+	modelFn := func(ctx context.Context, req model.Request) (model.Stream, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		requests = append(requests, req)
+		mu.Unlock()
+		if n == 1 { // the blocked Operation's tool-call turn
+			return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
+		}
+		return completedTurnStream(), nil // the steering admission's own turn
+	}
 	toolFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		if call.ID == "call-1" {
 			return PreparedTool{Permissions: fixturePermission, Execute: func(ctx context.Context) ToolOutcome {
@@ -85,6 +97,9 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 		t.Fatalf("first submit: %v", err)
 	}
 	<-started // the foreground tool is parked in its executor
+	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
+		t.Fatalf("steering submit while the tool is blocked: %v", err)
+	}
 	if err := h.Interrupt(context.Background(), session); err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
@@ -111,6 +126,26 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 	}
 	if call1 == nil || call1.Status != model.ResultInterrupted || call1.Content != "tool canceled" {
 		t.Fatalf("call-1 result = %+v, want the tool's real interrupted result", call1)
+	}
+
+	// The steering buffered while the tool was blocked drains after the
+	// interrupted Operation's terminal into its own admission, whose own
+	// model request carries it: exactly two model effects in total.
+	watch.next()
+	if rec := settledOperation(t, store, session, "op-2"); rec.State.Status != OperationSuccess {
+		t.Fatalf("op-2 status = %s, want the buffered steering admitted and successful", rec.State.Status)
+	}
+	mu.Lock()
+	calls, reqs := calls, append([]model.Request(nil), requests...)
+	mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("model effects = %d, want the blocked Operation's turn plus the steering admission's own request", calls)
+	}
+	if got := strings.Join(textsOf(reqs[1]), "|"); !strings.Contains(got, "steer") {
+		t.Fatalf("the steering admission's request = %q, want the steering text at its own model boundary", got)
+	}
+	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,steer" {
+		t.Fatalf("committed inputs = %q, want the interrupted turn's input and the steering admission's own input", got)
 	}
 	requireSessionCleared(t, h, session)
 }

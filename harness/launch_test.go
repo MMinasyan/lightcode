@@ -398,15 +398,19 @@ func durableRegisterCount(store *graphStorage) int {
 }
 
 // TestLaunchChildSessionCapRejection proves the child concurrency cap: at the
-// requested cap the launch is rejected before any member or child exists.
+// requested cap the launch is rejected before any member or child exists, and
+// once the live member completes a later launch succeeds with a freshly
+// generated child identity.
 func TestLaunchChildSessionCapRejection(t *testing.T) {
 	stub := newPrepareStub(validPrepared())
-	h := newTestHarness(t, freshSessionStore(t), stub.prepare)
+	h, cancel := newCancelableHarness(t, freshSessionStore(t), PreparedExecution{}, stub.prepare)
+	defer cancel()
 	c, err := h.coordinatorFor(context.Background(), testSessionID)
 	if err != nil {
 		t.Fatalf("coordinatorFor: %v", err)
 	}
-	if _, err := admitLocked(h, c, memberChild, "existing-child", 0); err != nil {
+	member, err := admitLocked(h, c, memberChild, "existing-child", 0)
+	if err != nil {
 		t.Fatalf("pre-admission: %v", err)
 	}
 	req := launchRequest()
@@ -424,6 +428,20 @@ func TestLaunchChildSessionCapRejection(t *testing.T) {
 	}
 	if n := durableRegisterCount(fixtureStore(t, h)); n != 1 {
 		t.Fatalf("the rejected launch published %d registers, want only the parent", n)
+	}
+
+	// Completing the live member frees the cap: the next public launch
+	// succeeds and publishes a fresh child identity.
+	h.finishBackgroundMember(c, member)
+	res, err := h.LaunchChildSession(context.Background(), req)
+	if err != nil {
+		t.Fatalf("post-completion launch: %v", err)
+	}
+	if !completionIDShape.MatchString(res.ChildSessionID) || res.ChildSessionID == testSessionID {
+		t.Fatalf("launched child session id %q, want a fresh generated identity", res.ChildSessionID)
+	}
+	if _, err := fixtureStore(t, h).ReadRegister(context.Background(), RegisterKey{SessionID: res.ChildSessionID, Kind: RegisterSession}); err != nil {
+		t.Fatalf("launched child session register: %v", err)
 	}
 }
 

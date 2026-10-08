@@ -395,7 +395,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		// The one gate channel releases through one OnceFunc, so the normal
 		// and deferred releases are idempotent.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release()
 		submit := func(operationID, mode, text string) protocol.SubmitSessionResponse {
@@ -450,8 +450,8 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		if hydration.JSON200.SelectedModel == nil || *hydration.JSON200.SelectedModel != "prov/m" {
 			t.Fatalf("hydration selected model = %v, want the configured prov/m", hydration.JSON200.SelectedModel)
 		}
-		if hydration.JSON200.Usage.Context.ContextWindow != 4096 {
-			t.Fatalf("hydration context window = %d, want the captured 4096", hydration.JSON200.Usage.Context.ContextWindow)
+		if hydration.JSON200.Usage.Context.ContextWindow != 262144 {
+			t.Fatalf("hydration context window = %d, want the running Operation's captured catalog window", hydration.JSON200.Usage.Context.ContextWindow)
 		}
 		assertQualifiedInstance(t, "hydration", hydration.JSON200.SessionRevision, ps.instance)
 		if hydration.JSON200.Session.SessionId != session || hydration.JSON200.Session.SessionRevision.InstanceId != ps.instance {
@@ -672,7 +672,7 @@ func TestProtocolServerHistoryRoundTripsOpaqueNumbers(t *testing.T) {
 			body, _ := json.Marshal(submitted.JSON200)
 			t.Fatalf("submit = %s (status %d)", body, submitted.HTTPResponse.StatusCode)
 		}
-		e.prep.awaitCleanups(1)
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 
 		history, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{})
 		if err != nil || history.JSON200 == nil {
@@ -737,7 +737,7 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		const nulSecret = "sk-raw\x00-refused"
 		stderr := captureSweepStderr(t)
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 		// One malformed line makes the startup LoadDotEnv diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")

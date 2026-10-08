@@ -10,6 +10,7 @@ package harness_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -191,11 +192,76 @@ func compactWhenIdle(t *testing.T, h *harness.Harness, session, operation string
 // settles success; the projection then carries the summary, a retry resolves
 // the first compact Operation without new work, and cross-kind identity
 // reuse is rejected on both sides.
+// compactCommitGateStore parks the return of every transaction that inserted
+// a compaction entry: the frozen post-commit instant where the manual settle
+// transaction has committed and its caller has not yet returned.
+type compactCommitGateStore struct {
+	harness.Storage
+	started chan struct{}
+	release chan struct{}
+}
+
+// compactCommitGateTx watches one transaction for a compaction insertion.
+type compactCommitGateTx struct {
+	harness.Transaction
+	inserted bool
+}
+
+func (tx *compactCommitGateTx) InsertEntry(draft harness.EntryDraft) (harness.Entry, error) {
+	if draft.Kind == harness.EntryCompaction {
+		tx.inserted = true
+	}
+	return tx.Transaction.InsertEntry(draft)
+}
+
+func (s *compactCommitGateStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
+	var gate compactCommitGateTx
+	err := s.Storage.Transact(ctx, func(inner harness.Transaction) error {
+		gate = compactCommitGateTx{Transaction: inner}
+		return fn(&gate)
+	})
+	if err == nil && gate.inserted {
+		select {
+		case s.started <- struct{}{}:
+		default:
+		}
+		<-s.release
+	}
+	return err
+}
+
+// parkedUsageCount reports whether one raw register usage section carries
+// exactly the piece counts keyed by the compact model.
+func parkedUsageCount(t *testing.T, raw json.RawMessage, wantRef model.ModelRef) bool {
+	t.Helper()
+	// The register's usage section encodes its model identity in the wire
+	// object form, not the ModelRef string form.
+	var totals struct {
+		ByModel []struct {
+			Model struct {
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+			} `json:"model"`
+			Usage harness.UsageCount `json:"usage"`
+		} `json:"by_model"`
+	}
+	if err := json.Unmarshal(raw, &totals); err != nil {
+		t.Fatalf("decode usage section: %v", err)
+	}
+	for _, mu := range totals.ByModel {
+		if mu.Model.Provider == wantRef.Provider && mu.Model.Model == wantRef.Model {
+			return mu.Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5})
+		}
+	}
+	return false
+}
+
 func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		gated := &compactCommitGateStore{Storage: store, started: make(chan struct{}, 1), release: make(chan struct{})}
+		f := newCompactManualFixture(t, gated, conversation, compact)
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -205,6 +271,82 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		if res.Admission.RequestKind != harness.RequestKindCompact || res.Admission.AdmittedEntry != (harness.EntryRef{}) {
 			t.Fatalf("admission = %+v, want the compact kind with no admitted entry", res.Admission)
 		}
+		// The frozen instant: the manual settle transaction committed the
+		// compaction entry and the already-terminal register state together,
+		// and its caller has not returned — a split implementation would show
+		// the entry without the terminal registers.
+		select {
+		case <-gated.started:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the manual compact never committed its settle transaction")
+		}
+		parkedEntries, err := store.ReadEntries(context.Background(), session, 0)
+		if err != nil {
+			t.Fatalf("frozen entries read: %v", err)
+		}
+		var parkedCompaction *harness.Entry
+		for i := range parkedEntries {
+			if parkedEntries[i].Kind == harness.EntryCompaction {
+				parkedCompaction = &parkedEntries[i]
+			}
+		}
+		if parkedCompaction == nil || parkedCompaction.OperationID != "c-1" {
+			t.Fatalf("parked compaction entry = %+v, want the c-1-owned commit", parkedCompaction)
+		}
+		var parkedWire struct {
+			Summary string              `json:"summary"`
+			Usage   *harness.UsageCount `json:"usage"`
+		}
+		if err := json.Unmarshal(parkedCompaction.Payload, &parkedWire); err != nil {
+			t.Fatalf("decode parked compaction entry: %v", err)
+		}
+		if parkedWire.Summary != "S1" || parkedWire.Usage == nil || *parkedWire.Usage != (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}) {
+			t.Fatalf("parked compaction entry = %+v, want the committed summary and piece usage", parkedWire)
+		}
+		parkedSessionReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
+		if err != nil {
+			t.Fatalf("frozen session register read: %v", err)
+		}
+		var parkedSession struct {
+			State struct {
+				CompactionEntryID string          `json:"compaction_entry_id"`
+				Usage             json.RawMessage `json:"usage"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(parkedSessionReg.Payload, &parkedSession); err != nil {
+			t.Fatalf("decode frozen session register: %v", err)
+		}
+		if parkedSession.State.CompactionEntryID != parkedCompaction.ID {
+			t.Fatalf("parked compaction_entry_id = %q, want the committed entry %q", parkedSession.State.CompactionEntryID, parkedCompaction.ID)
+		}
+		if !parkedUsageCount(t, parkedSession.State.Usage, compactModelRef) {
+			t.Fatalf("parked session usage = %s, want the piece counts keyed by the compact model", parkedSessionReg.Payload)
+		}
+		parkedOpReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "c-1"})
+		if err != nil {
+			t.Fatalf("frozen operation register read: %v", err)
+		}
+		var parkedOperation struct {
+			State struct {
+				Status   harness.OperationState `json:"status"`
+				Terminal *struct {
+					SettlementEntry struct {
+						EntryID string `json:"entry_id"`
+					} `json:"settlement_entry"`
+				} `json:"terminal"`
+				Usage json.RawMessage `json:"usage"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(parkedOpReg.Payload, &parkedOperation); err != nil {
+			t.Fatalf("decode frozen operation register: %v", err)
+		}
+		if parkedOperation.State.Status != harness.OperationSuccess || parkedOperation.State.Terminal == nil {
+			t.Fatalf("parked operation state = %s, want the register already terminal at the frozen instant", parkedOpReg.Payload)
+		}
+		if !parkedUsageCount(t, parkedOperation.State.Usage, compactModelRef) {
+			t.Fatalf("parked operation usage = %s, want the piece counts keyed by the compact model", parkedOpReg.Payload)
+		}
+		close(gated.release)
 		rec := awaitTerminal(t, f.h, session, "c-1")
 		if rec.State.Status != harness.OperationSuccess || rec.State.Terminal == nil {
 			t.Fatalf("compact operation state = %+v, want the success terminal", rec.State)
@@ -537,6 +679,108 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 		texts := texts(reqs[1])
 		if len(texts) != 3 || !strings.Contains(texts[1], "S1") || texts[2] != "second turn" {
 			t.Fatalf("drained request = %q, want the summary projection with the buffered message", texts)
+		}
+	})
+}
+
+// TestPublicManualCompactInterruptKeepsPriorProjection proves the interrupt
+// row: a live interrupt of a manual compact Operation parked at its piece
+// settles the interruption with no new compaction entry, the previous
+// projection stays current, and the Session's current Operation clears.
+func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("S1"))
+		f := newCompactManualFixture(t, store, conversation, compact)
+		defer f.close()
+		session := createSession(t, f.h)
+		idleHistory(t, f, session)
+
+		compactWhenIdle(t, f.h, session, "c-1")
+		if rec := awaitTerminal(t, f.h, session, "c-1"); rec.State.Status != harness.OperationSuccess {
+			t.Fatalf("first compact = %+v, want success", rec.State)
+		}
+		prior := compactionEntryIDs(t, store, session)
+		if len(prior) != 1 {
+			t.Fatalf("prior compaction entries = %v, want exactly one", prior)
+		}
+		priorID := prior[0]
+
+		// The second compact's piece parks until its own effect context
+		// ends: the interrupt releases it and settles the interruption.
+		pieceStarted := make(chan struct{}, 1)
+		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+			if req.RequestKind == harness.RequestKindCompact && call >= 2 {
+				return harness.PreparedExecution{
+					Capture: compactManualCapture(),
+					Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+						return harness.Execution{
+							Model: conversation.effect,
+							CompactModel: func(ctx context.Context, _ model.Request) (model.Stream, error) {
+								select {
+								case pieceStarted <- struct{}{}:
+								default:
+								}
+								<-ctx.Done() // the interrupt ends the parked piece
+								return nil, ctx.Err()
+							},
+							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+							},
+							NormalizeTool: publicNormalize,
+						}, nil
+					},
+				}, nil
+			}
+			return f.defaultPrep, nil
+		}
+		compactWhenIdle(t, f.h, session, "c-2")
+		select {
+		case <-pieceStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the second compact piece never started")
+		}
+		if err := f.h.Interrupt(ctx, session); err != nil {
+			t.Fatalf("Interrupt: %v", err)
+		}
+		rec := awaitTerminal(t, f.h, session, "c-2")
+		if rec.State.Status != harness.OperationInterruption {
+			t.Fatalf("interrupted compact = %+v, want the interruption terminal", rec.State)
+		}
+		// No new compaction entry: the prior projection stays current.
+		if ids := compactionEntryIDs(t, store, session); len(ids) != 1 || ids[0] != priorID {
+			t.Fatalf("compaction entries after the interrupt = %v, want only the prior %q", ids, priorID)
+		}
+		reg, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
+		if err != nil {
+			t.Fatalf("session register: %v", err)
+		}
+		var wire struct {
+			State struct {
+				CurrentOperationID string `json:"current_operation_id"`
+				CompactionEntryID  string `json:"compaction_entry_id"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(reg.Payload, &wire); err != nil {
+			t.Fatalf("decode session register: %v", err)
+		}
+		if wire.State.CompactionEntryID != priorID {
+			t.Fatalf("compaction_entry_id = %q, want the prior projection %q", wire.State.CompactionEntryID, priorID)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for wire.State.CurrentOperationID != "" {
+			if time.Now().After(deadline) {
+				t.Fatalf("current Operation %q never cleared after the interruption", wire.State.CurrentOperationID)
+			}
+			time.Sleep(time.Millisecond)
+			reg, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
+			if err != nil {
+				t.Fatalf("session register reread: %v", err)
+			}
+			if err := json.Unmarshal(reg.Payload, &wire); err != nil {
+				t.Fatalf("decode session register reread: %v", err)
+			}
 		}
 	})
 }

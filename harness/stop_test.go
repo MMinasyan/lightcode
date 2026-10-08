@@ -742,7 +742,9 @@ func insertMalformedChildSession(t *testing.T, store *graphStorage, sessionID st
 // TestStopConcurrentCallersJoinSameError proves the join row: concurrent
 // stops share one interval and every caller receives the same stored error —
 // here the corruption-class child failure that Stop claim-finishes without
-// delivery.
+// delivery. The stopper stops the job member exactly once, the corrupt child
+// register stays byte-identical, and the root admits and completes ordinary
+// work after convergence.
 func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	store := freshSessionStore(t)
 	childID := hexID(9)
@@ -756,6 +758,11 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	member, err := admitLocked(h, c, memberChild, childID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
+	}
+	corruptKey := RegisterKey{SessionID: childID, Kind: RegisterSession}
+	corruptBefore, err := store.ReadRegister(context.Background(), corruptKey)
+	if err != nil {
+		t.Fatalf("read the corrupt child register: %v", err)
 	}
 	gate := make(chan struct{})
 	completions := map[string]string{}
@@ -814,6 +821,25 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	if !reopened {
 		t.Fatalf("root bgState after Stop = %q, want reopened", c.bgState)
 	}
+	if stopped := stopper.stopped; len(stopped) != 1 || stopped[0] != testSessionID+"/"+jobFixtureID {
+		t.Fatalf("StopJob calls = %q, want exactly the one job member's stop", stopped)
+	}
+	corruptAfter, err := store.ReadRegister(context.Background(), corruptKey)
+	if err != nil {
+		t.Fatalf("reread the corrupt child register: %v", err)
+	}
+	if !reflect.DeepEqual(corruptBefore, corruptAfter) {
+		t.Fatalf("the corrupt child register changed: before %+v after %+v", corruptBefore, corruptAfter)
+	}
+
+	// The root lifecycle is usable after convergence: once the delivered
+	// job completion's own Operation retires, the next ordinary input
+	// admits and completes.
+	waitQuiet(t, c)
+	if _, err := submitText(t, h, testSessionID, "op-root", MessageModeRegular, "after stop"); err != nil {
+		t.Fatalf("post-stop submit: %v", err)
+	}
+	awaitOperationTerminal(t, store, testSessionID, "op-root", OperationSuccess)
 }
 
 // TestStopReportsChildErrorAndWaitsForNaturalDelivery proves the error

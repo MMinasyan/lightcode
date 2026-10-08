@@ -22,13 +22,6 @@ import (
 // request bodies and SSE chunks dump under the home-based private directory.
 const debugWireEnv = "LIGHTCODE_DEBUG_WIRE"
 
-// prepare is the controlled preparation function the Runtime calls inside one
-// Workspace-scope guard: it returns the durable capture values plus the opener
-// for the committed admission, never short-lived resources. Concrete
-// production preparation supplies it in its owning phase; controlled callers
-// supply it now.
-type prepare func(context.Context, harness.PreparationRequest, selection) (harness.ExecutionCapture, openExecution, error)
-
 // openExecution turns one committed admission and the opened execution scope
 // view into the execution the Harness runs. The opener is the preparation's
 // only associated continuation: there is no intermediate execution-plan type
@@ -61,20 +54,19 @@ type selection struct {
 
 // preparationWarnings collects one preparation's presentation values.
 type preparationWarnings struct {
-	publisher *observationAdapter
-	sessionID string
-	prompt    []prompt.Warning
+	prompt []prompt.Warning
 }
 
 // publish replaces the owning Session's prompt group with the collected
 // values through the passive publication adapter; a nil adapter drops the
 // presentation. The committed opener calls it exactly once per successful
-// execution.
-func (w *preparationWarnings) publish() {
+// execution, passing the publisher and the admitted Session identity at
+// publication instead of storing a second pair.
+func (w *preparationWarnings) publish(publisher *observationAdapter, sessionID string) {
 	if w == nil {
 		return
 	}
-	w.publisher.publishPrompt(w.sessionID, promptWarnings(w.sessionID, w.prompt))
+	publisher.publishPrompt(sessionID, promptWarnings(sessionID, w.prompt))
 }
 
 // promptWarnings maps the assembled prompt diagnostics onto the store's
@@ -151,7 +143,6 @@ type preparation struct {
 	home        string
 	background  BackgroundServices
 	passive     *observationAdapter
-	prepare     prepare
 
 	// artifacts is the Runtime's private per-Session artifact interval
 	// registry. Every committed opener acquires its Session's token here
@@ -173,11 +164,10 @@ type preparation struct {
 // once-resolved home, the background services bridge armed after harness.New
 // returns, the Runtime's passive publication adapter (nil in isolated
 // preparation tests, dropping only passive presentation), the Runtime's
-// private artifact interval registry (nil without a Runtime), the Runtime's
-// live managed-environment producer (nil without a retained manager), and the
-// controlled preparation function; nil selects the concrete production
-// preparation.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string, prepare prepare) *preparation {
+// private artifact interval registry (nil without a Runtime), and the
+// Runtime's live managed-environment producer (nil without a retained
+// manager). One concrete preparation path serves every admission.
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
 	return &preparation{
 		config:        config,
 		composition:   c,
@@ -188,7 +178,6 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 		passive:       passive,
 		artifacts:     artifacts,
 		subprocessEnv: subprocessEnv,
-		prepare:       prepare,
 	}
 }
 
@@ -229,27 +218,14 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
-		defer release() // the one preparation guard covers the controlled call and every pure hook
+		defer release() // the one preparation guard covers the concrete preparation and every pure hook
 
-		input := sel
-		input.agent.Tools = slices.Clone(agent.Tools)
-		input.agent.Capabilities = slices.Clone(agent.Capabilities)
 		// The per-preparation collector is allocated owned: only a successful
 		// preparation — validation, hooks and cancellation checks all passed —
 		// publishes its values under the admitted Session identity.
-		input.warnings = &preparationWarnings{publisher: p.passive, sessionID: req.Session.Identity.SessionID}
-		prepare := p.prepare
-		if prepare == nil {
-			prepare = p.concretePrepare
-		}
-		capture, opener, err := prepare(callCtx, req, input)
+		sel.warnings = &preparationWarnings{}
+		capture, opener, err := p.concretePrepare(callCtx, req, sel)
 		if err != nil {
-			return harness.PreparedExecution{}, err
-		}
-		if opener == nil {
-			return harness.PreparedExecution{}, fmt.Errorf("preparation of agent %q returned no opener: %w", agent.Name, harness.ErrInvalid)
-		}
-		if err := validateCaptureSelection(capture, sel); err != nil {
 			return harness.PreparedExecution{}, err
 		}
 		capture, err = runPreparationHooks(callCtx, sel, capture)
@@ -259,7 +235,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		// The collected presentation rides the prepared opener: only the
 		// committed admission's opener publishes it, so a failed fork or
 		// admission never creates warnings for an unpublished Session.
-		warnings := input.warnings
+		warnings := sel.warnings
 		return harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
@@ -334,14 +310,9 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	if err != nil {
 		return unwind(err, nil)
 	}
-	// The concrete preparation's opener also binds the Agent's declared tool
-	// exports — separately from the explicitly selected non-tool capability
-	// IDs; controlled openers bind only what they select.
-	selected := agent.Capabilities
-	if p.prepare == nil {
-		selected = slices.Concat(agent.Capabilities, agent.Tools)
-	}
-	bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, selected)
+	// The opener binds the Agent's declared tool exports — separately from
+	// the explicitly selected non-tool capability IDs.
+	bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, slices.Concat(agent.Capabilities, agent.Tools))
 	if err != nil {
 		return unwind(err, release)
 	}
@@ -356,16 +327,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	// The committed opener owns the collected presentation: the successful
 	// execution publishes its Session's prompt group before any model or tool
 	// progress.
-	warnings.publish()
-	if execution.Close != nil {
-		// The concrete execution cleanup joins the Agent scope's closer stack last,
-		// so reverse disposal runs it before that scope's plugins.
-		agentScope.closers = append(agentScope.closers, execution.Close)
-	}
+	warnings.publish(p.passive, admission.SessionID)
 	return harness.Execution{
 		Model:         execution.Model,
 		CompactModel:  execution.CompactModel,
-		Retry:         execution.Retry,
 		Tool:          execution.Tool,
 		Permissions:   execution.Permissions,
 		NormalizeTool: execution.NormalizeTool,
@@ -408,8 +373,8 @@ func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invo
 // captured catalog with a positive context window, and rejects a wholly
 // empty selection with the retained "no model configured" diagnostic. A
 // partial identity keeps the catalog path: it is not resolvable there either.
-// Credentials and provider connection are not required for controlled
-// effects; production readiness belongs to concrete preparation.
+// Credentials and provider connection are resolved by the concrete
+// preparation that follows this availability check.
 func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 	if ref.IsZero() {
 		return fmt.Errorf("no model configured: %w", harness.ErrInvalid)
@@ -424,8 +389,7 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 	return nil
 }
 
-// concretePrepare is the production preparation selected when no controlled
-// prepare is supplied. It consumes only the captured snapshot's inputs — the
+// concretePrepare is the one production preparation. It consumes only the captured snapshot's inputs — the
 // catalog entry, the once-resolved credential, the effective permission
 // policy, and the composed prompt/tool surface — and returns the durable
 // capture plus the opener carrying the one constructed transport, the policy,
@@ -735,48 +699,31 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 	}
 }
 
-// validateCaptureSelection checks the prepared capture's model and revision
-// against the selected view, its capability names against the Agent's full
-// selected names in the same order, and its permission capability members
-// against the one Harness-selected Agent definition before any hook runs; nil
-// and empty selections compare equal. Harness remains the final capture and
-// admission validator.
-func validateCaptureSelection(capture harness.ExecutionCapture, sel selection) error {
-	if capture.Model != sel.agent.Model {
-		return fmt.Errorf("capture model %s is not the selected model %s: %w", capture.Model.String(), sel.agent.Model.String(), harness.ErrInvalid)
-	}
-	if capture.ConfigurationRevision != sel.invocation.Revision() {
-		return fmt.Errorf("capture revision %q is not the captured revision %q: %w", capture.ConfigurationRevision, sel.invocation.Revision(), harness.ErrInvalid)
-	}
-	if !slices.Equal(capture.Capabilities, sel.agent.Capabilities) {
-		return fmt.Errorf("capture capabilities %q are not the selected capabilities %q: %w", capture.Capabilities, sel.agent.Capabilities, harness.ErrInvalid)
-	}
-	if capture.Readonly != sel.agent.Readonly {
-		return fmt.Errorf("capture readonly %v is not the selected definition's %v: %w", capture.Readonly, sel.agent.Readonly, harness.ErrInvalid)
-	}
-	if capture.WriteDir != sel.agent.WriteDir {
-		return fmt.Errorf("capture write dir %q is not the selected definition's %q: %w", capture.WriteDir, sel.agent.WriteDir, harness.ErrInvalid)
-	}
-	return nil
-}
-
 // runPreparationHooks binds and directly invokes, in selected order inside
 // the same preparation guard, every available long-lived selected binding
 // whose declared type satisfies PreparationHook, passing the captured
-// Invocation unchanged and a fresh owned capture copy to each hook. An
-// invalid result, error or observed cancellation aborts admission before the
-// next hook runs, so no partial hook consequence is published; the retained
-// chain owns its values and never aliases a hook's slice.
+// Invocation unchanged and a fresh owned capture copy to each hook. The owned
+// baseline is allocated only when the first applicable hook is reached: a
+// selection with no bound preparation hook keeps the concrete producer's
+// already-owned capture. An invalid result, error or observed cancellation
+// aborts admission before the next hook runs, so no partial hook consequence
+// is published; the retained chain owns its values and never aliases a hook's
+// slice.
 func runPreparationHooks(ctx context.Context, sel selection, prepared harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	baseline, err := ownExecutionCapture(prepared)
-	if err != nil {
-		return harness.ExecutionCapture{}, err
-	}
-	capture := baseline
+	capture := prepared
+	var baseline harness.ExecutionCapture
+	bound := false
 	for _, id := range sel.agent.Capabilities {
 		entry, ok := sel.bindings.entries[id]
 		if !ok || !entry.declared.Implements(preparationHookType) {
 			continue
+		}
+		if !bound { // baseline ownership belongs to the first applicable hook, never a hookless selection
+			owned, err := ownExecutionCapture(prepared)
+			if err != nil {
+				return harness.ExecutionCapture{}, err
+			}
+			baseline, capture, bound = owned, owned, true
 		}
 		hook, err := Bind[PreparationHook](sel.bindings, id)
 		if err != nil {

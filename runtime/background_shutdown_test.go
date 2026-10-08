@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -59,13 +60,12 @@ func startJobThrough(r *Runtime, sessionID, jobID string, spawn func(context.Con
 }
 
 // startLiveJobRuntime opens one Runtime with a delivering job-stop seam and
-// starts one live job on a fresh Session, arming the seam to deliver the
-// given terminal report when shutdown stops the job.
-func startLiveJobRuntime(t *testing.T, content string) (*ownerEnv, *Runtime, harness.Storage, *stubStopper, string) {
+// starts one live job on a fresh Session over the given store, arming the
+// seam to deliver the given terminal report when shutdown stops the job.
+func startLiveJobRuntime(t *testing.T, store harness.Storage, content string) (*ownerEnv, *Runtime, harness.Storage, *stubStopper, string) {
 	t.Helper()
 	ctx := context.Background()
 	e := newOwnerEnv(t)
-	store := storage.NewMemory()
 	stopper := &stubStopper{events: e.events, content: content}
 	r, err := e.open(ctx, e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
 	if err != nil {
@@ -218,7 +218,7 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 // recorded before the Harness wait has converged and shutdown returns.
 func TestRuntimeShutdownDeliversLiveJobCompletion(t *testing.T) {
 	ctx := context.Background()
-	_, r, store, stopper, sessionID := startLiveJobRuntime(t, "job stopped")
+	_, r, store, stopper, sessionID := startLiveJobRuntime(t, storage.NewMemory(), "job stopped")
 
 	if err := r.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -264,21 +264,89 @@ func TestRuntimeShutdownDeliversLiveJobCompletion(t *testing.T) {
 }
 
 // TestRuntimeJobStopperDisposesBeforeStorage pins the disposal order of one
-// managed shutdown: the stop runs while both the job-stop capability and its
-// storage are still open (the delivery succeeded), and the capability's scope
-// Close runs before the storage Close.
+// managed shutdown. The unparked sibling proves the stop runs while both the
+// job-stop capability and its storage are still open (the delivery succeeded)
+// and the capability's scope Close runs before the storage Close. The parked
+// row holds the stopped job's required terminal completion transaction at its
+// real commit-return boundary over both stores: the durable completion is
+// observable while Close stays joined behind it and no plugin scope Close has
+// run; only after the release do the disposals record
+// stopjob → close:jobs → close:core.
 func TestRuntimeJobStopperDisposesBeforeStorage(t *testing.T) {
 	ctx := context.Background()
-	e, r, _, stopper, _ := startLiveJobRuntime(t, "job stopped")
 
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if stopper.deliverErr != nil {
-		t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
-	}
-	events := e.events.all()
-	if !orderedSubset(events, "stopjob", "close:jobs", "close:core") {
-		t.Fatalf("shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
-	}
+	t.Run("the stop runs while the scopes are open", func(t *testing.T) {
+		e, r, _, stopper, _ := startLiveJobRuntime(t, storage.NewMemory(), "job stopped")
+
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if stopper.deliverErr != nil {
+			t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
+		}
+		events := e.events.all()
+		if !orderedSubset(events, "stopjob", "close:jobs", "close:core") {
+			t.Fatalf("shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
+		}
+	})
+
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		t.Run("no scope closes before the held terminal commit", func(t *testing.T) {
+			gated := newGatedStore(store)
+			e, r, _, stopper, sessionID := startLiveJobRuntime(t, gated, "job stopped")
+			gated.armPostCommit(1)
+			closeDone := make(chan error, 1)
+			t.Cleanup(func() { // a failed row must never leave the joined Close parked
+				gated.releaseAll()
+				bound, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = r.Close(bound) // repeat callers join the shared shutdown
+			})
+			go func() { closeDone <- r.Close(ctx) }()
+
+			select {
+			case <-gated.parked:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the stopped job's terminal completion transaction never committed")
+			}
+
+			// The committed completion is durable at the frozen return
+			// boundary, while shutdown is still joined behind it.
+			completions := completionsOf(gated, sessionID)
+			if len(completions) != 1 || completions[0].memberKind != "job" ||
+				completions[0].memberID != "0a1b2c3d" || completions[0].content != "job stopped" {
+				t.Fatalf("committed completion while held = %+v, want the job 0a1b2c3d with its report", completions)
+			}
+			select {
+			case err := <-closeDone:
+				t.Fatalf("Close returned while the terminal completion transaction was still held (%v)", err)
+			default:
+			}
+			// The stop already ran, and no plugin scope Close has started
+			// before the held terminal commit returns.
+			if n := eventsNamed(e.events.all(), "stopjob"); n != 1 {
+				t.Fatalf("stopjob events while held = %d, want exactly the one stop", n)
+			}
+			if closes := eventsNamedList(e.events.all(), "close"); len(closes) != 0 {
+				t.Fatalf("scope closes before the held terminal commit = %v, want none", closes)
+			}
+
+			gated.releaseGate()
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Close never converged after the terminal commit was released")
+			}
+			if stopper.deliverErr != nil {
+				t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
+			}
+			events := e.events.all()
+			if !orderedSubset(events, "stopjob", "close:jobs", "close:core") {
+				t.Fatalf("shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
+			}
+		})
+	})
 }

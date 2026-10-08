@@ -125,7 +125,7 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 // progress event names the real running Operation.
 func TestObservationRootChildScopeTagging(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() {
 			if err := bg.r.Close(context.Background()); err != nil {
 				bg.t.Errorf("Close: %v", err)
@@ -241,7 +241,7 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 func TestObservationTwoHealthyOrderOneSaturatedNoReplay(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() {
 			if err := bg.r.Close(context.Background()); err != nil {
 				bg.t.Errorf("Close: %v", err)
@@ -323,7 +323,7 @@ func TestObservationTwoHealthyOrderOneSaturatedNoReplay(t *testing.T) {
 func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		bg := openBackgroundLifecycle(t, store, newLifecycleStopper(store))
+		bg := openBackgroundRuntime(t, store, newLifecycleStopper())
 		defer func() {
 			if err := bg.r.Close(context.Background()); err != nil {
 				bg.t.Errorf("Close: %v", err)

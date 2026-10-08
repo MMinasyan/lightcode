@@ -23,14 +23,22 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// Owner-lifecycle fixtures: one controlled prepare/opener pair and traceable
-// plugins drive the real owner over memory and temporary SQLite. Each test
-// isolates HOME and every bundled provider credential, so construction reaches
-// no network and mutates no real user state.
+// Owner-lifecycle fixtures: one native model server, traceable plugins and the
+// concrete preparation drive the real owner over memory and temporary SQLite.
+// Each test isolates HOME and every bundled provider credential, so
+// construction reaches no real provider and mutates no real user state; the
+// configured provider is the test server's keyless local endpoint.
 
-const ownerConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`
+// ownerConfigDocument points the configured provider at the test model
+// server's keyless local endpoint with discovery disabled and a generous
+// window so ordinary rows never accidentally test compaction.
+func ownerConfigDocument(endpoint string) string {
+	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}}}`
+}
 
-const ownerGatedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"gate":{}}}`
+func ownerGatedConfigDocument(endpoint string) string {
+	return strings.TrimSuffix(ownerConfigDocument(endpoint), "}") + `,"plugins":{"gate":{}}}`
+}
 
 const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"}}`
 
@@ -40,7 +48,7 @@ type ownerEnv struct {
 	dataDir        string
 	configPath     string
 	events         *traceLog
-	prep           *controlledPrep
+	server         *productionModelServer
 	scopeDataDir   atomic.Value
 	scopeWorkspace atomic.Value
 }
@@ -58,11 +66,11 @@ func newOwnerEnvIn(t *testing.T, home, dataDir string) *ownerEnv {
 		t: t, home: home, dataDir: dataDir,
 		configPath: filepath.Join(dataDir, "config.json"),
 		events:     &traceLog{},
-		prep:       newControlledPrep(),
+		server:     newProductionModelServer(t, "", ""),
 	}
 	e.scopeDataDir.Store("")
 	e.scopeWorkspace.Store("")
-	writeServiceFile(t, e.configPath, ownerConfigDocument)
+	writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 	writeServiceFile(t, agents.PathForConfig(e.configPath), ownerAgentsDocument)
 	return e
 }
@@ -99,7 +107,7 @@ func isolateBundledCredentials(t *testing.T) {
 }
 
 func (e *ownerEnv) options(plugins ...Plugin) options {
-	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, prepare: e.prep.prepare}
+	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins}
 }
 
 func (e *ownerEnv) open(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
@@ -185,112 +193,6 @@ func (e *ownerEnv) sqliteDerivationPlugin() Plugin {
 			}, nil
 		},
 	}
-}
-
-// controlledPrep is the options.prepare fixture: every admission captures the
-// selected Agent unchanged and runs one immediately successful turn unless a
-// test parks the model effect.
-type controlledPrep struct {
-	mu           sync.Mutex
-	calls        int
-	openCalls    int
-	modelGate    chan struct{}
-	modelArrived chan struct{}
-	cleanups     chan struct{}
-	cleanupSeen  int
-	// closeGate when non-nil blocks every supplied execution's Close after it
-	// signals the cleanups channel: a deterministic cleanup-phase barrier.
-	closeGate chan struct{}
-	// openErr when non-nil fails every supplied execution's opener.
-	openErr error
-}
-
-func newControlledPrep() *controlledPrep {
-	return &controlledPrep{modelArrived: make(chan struct{}, 16), cleanups: make(chan struct{}, 16)}
-}
-
-func (p *controlledPrep) prepare(_ context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openExecution, error) {
-	p.mu.Lock()
-	p.calls++
-	p.mu.Unlock()
-	capture := harness.ExecutionCapture{
-		ConfigurationRevision: sel.invocation.Revision(),
-		Model:                 sel.agent.Model,
-		ContextWindow:         4096,
-		OutputReserve:         2048,
-		SystemPrompt:          "prompt-" + req.Session.AgentType,
-		Tools:                 captureTools(sel.agent.Tools),
-		Compact: harness.CompactCapture{
-			Model:         sel.agent.Model,
-			ContextWindow: 2048,
-			OutputReserve: 1024,
-			SystemPrompt:  "summarize",
-		},
-	}
-	return capture, p.open, nil
-}
-
-func (p *controlledPrep) open(_ context.Context, adm harness.OperationAdmission, sel selection) (harness.Execution, error) {
-	p.mu.Lock()
-	p.openCalls++
-	openErr := p.openErr
-	gate := p.modelGate
-	p.mu.Unlock()
-	if openErr != nil {
-		return harness.Execution{}, openErr
-	}
-	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
-		select {
-		case p.modelArrived <- struct{}{}:
-		default:
-		}
-		if gate != nil {
-			select {
-			case <-gate:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		return &prepStream{}, nil
-	}
-	return harness.Execution{
-		NormalizeTool: runtimeNormalize,
-		Model:         modelFn,
-		CompactModel:  modelFn,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
-		},
-		Close: func() error {
-			select {
-			case p.cleanups <- struct{}{}:
-			default:
-			}
-			p.mu.Lock()
-			gate := p.closeGate
-			p.mu.Unlock()
-			if gate != nil {
-				<-gate
-			}
-			return nil
-		},
-	}, nil
-}
-
-func (p *controlledPrep) awaitCleanups(n int) {
-	for p.cleanupSeen < n {
-		select {
-		case <-p.cleanups:
-			p.cleanupSeen++
-		case <-time.After(10 * time.Second):
-			panic(fmt.Sprintf("execution cleanup %d never ran", p.cleanupSeen+1))
-		}
-	}
-}
-
-func (p *controlledPrep) counts() (int, int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.calls, p.openCalls
 }
 
 // gatedValidator is one plugin settings validator a test can arm to park a
@@ -476,6 +378,14 @@ func readOperation(t *testing.T, r *Runtime, sessionID, operationID string) harn
 	return rec
 }
 
+// committedAdmission renders one committed Operation's admission as the
+// agentType=model@revision triple its durable capture carries.
+func committedAdmission(t *testing.T, r *Runtime, sessionID, operationID string) string {
+	t.Helper()
+	rec := readOperation(t, r, sessionID, operationID)
+	return rec.Admission.AgentType + "=" + rec.Admission.Execution.Model.String() + "@" + rec.Admission.Execution.ConfigurationRevision
+}
+
 // seedRunningOperation commits one running Operation through a standalone
 // Harness whose model effect never completes: abandoning that owner is the
 // durable state restart recovery consumes. The effect is released during
@@ -542,8 +452,8 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 			name string
 			opts options
 		}{
-			{"empty data directory", options{ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
-			{"empty config path", options{DataDir: e.dataDir, Plugins: []Plugin{e.storagePlugin(nil)}, prepare: e.prep.prepare}},
+			{"empty data directory", options{ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}}},
+			{"empty config path", options{DataDir: e.dataDir, Plugins: []Plugin{e.storagePlugin(nil)}}},
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)
@@ -579,7 +489,6 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 			DataDir:    relData,
 			ConfigPath: filepath.Join(relData, "config.json"),
 			Plugins:    []Plugin{e.sqliteDerivationPlugin()},
-			prepare:    e.prep.prepare,
 		})
 		if err != nil {
 			t.Fatalf("open(relative): %v", err)
@@ -605,7 +514,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		e := newOwnerEnv(t)
 		configDir := t.TempDir()
 		configPath := filepath.Join(configDir, "config.json")
-		writeServiceFile(t, configPath, ownerConfigDocument)
+		writeServiceFile(t, configPath, ownerConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(configPath), ownerAgentsDocument)
 		e.configPath = configPath
 		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
@@ -784,7 +693,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		if events := e.events.all(); len(events) != 0 {
 			t.Fatalf("factory events = %v, want the configuration rejection to precede any factory", events)
 		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument)
+		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
 
@@ -873,7 +782,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 
 	t.Run("cancellation during the initial publication reports the constructor context error", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerGatedConfigDocument)
+		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 		validator := &gatedValidator{}
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 		gate.ValidateConfig = validator.ValidateConfig
@@ -907,26 +816,26 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		if events := e.events.all(); len(events) != 0 {
 			t.Fatalf("factory events = %v, want the publication rejection to precede any factory", events)
 		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument)
+		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
 
 	t.Run("an ErrClosed source identity survives without cancellation", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerGatedConfigDocument)
+		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 		gate.ValidateConfig = func(json.RawMessage) error { return ErrClosed }
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), gate}, ErrClosed)
 		if events := e.events.all(); len(events) != 0 {
 			t.Fatalf("factory events = %v, want the validator rejection preserved before any factory", events)
 		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument)
+		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
 
 	t.Run("a wrapped ErrClosed source survives cancellation at the publication boundary", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerGatedConfigDocument)
+		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 		errValidator := fmt.Errorf("test validator unavailable: %w", ErrClosed)
 		validator := &gatedValidator{fail: errValidator}
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
@@ -961,7 +870,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		if errors.Is(got.err, context.Canceled) {
 			t.Fatalf("open error = %v, want the source identity rather than the constructor context error", got.err)
 		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument)
+		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
 }
@@ -1105,7 +1014,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 
 		t.Run("caller cancellation before publication consumes no revision", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			writeServiceFile(t, e.configPath, ownerGatedConfigDocument)
+			writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
@@ -1139,7 +1048,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 
 		t.Run("shutdown joins the admitted build before releasing the lock", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			writeServiceFile(t, e.configPath, ownerGatedConfigDocument)
+			writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
@@ -1451,7 +1360,8 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 				t.Fatalf("createSession(right): %v", err)
 			}
 			submitThroughRuntime(t, r, right.Identity.SessionID, "op-right", "first")
-			e.prep.awaitCleanups(2)
+			awaitOperation(t, r, left.Identity.SessionID, "op-left", harness.OperationSuccess)
+			awaitOperation(t, r, right.Identity.SessionID, "op-right", harness.OperationSuccess)
 			if n := <-opens; n != 1 {
 				t.Fatalf("Workspace scope constructions = %d, want one shared scope for the same normalized identity", n)
 			}
@@ -1493,7 +1403,7 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 			if e.scopeWorkspace.Load().(string) != shared {
 				t.Fatalf("Workspace scope identity = %q, want the normalized %q", e.scopeWorkspace.Load().(string), shared)
 			}
-			e.prep.awaitCleanups(3)
+			awaitOperation(t, r, forked.Identity.SessionID, "op-fork", harness.OperationSuccess)
 			if n := eventsNamed(e.events.all(), "open:ws"); n != 1 {
 				t.Fatalf("Workspace scope constructions = %d, want exactly one across both Sessions and the Fork", n)
 			}
@@ -1561,21 +1471,76 @@ func TestRuntimeCoreStorageBindingContract(t *testing.T) {
 
 // --- restart recovery before execution ---
 
+// shortScopeProbe is one Operation- or Agent-scoped plugin recording every
+// construction, so a recovery row can prove no execution scope opens before
+// an explicit admission.
+func shortScopeProbe(id string, scope ScopeKind, opens *atomic.Int64) Plugin {
+	return Plugin{
+		ID:       id,
+		Scope:    scope,
+		Provides: []CapabilitySpec{Spec[any](id + ".cap")},
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			opens.Add(1)
+			return Instance{Values: map[string]any{id + ".cap": id}}, nil
+		},
+	}
+}
+
+// readSessionFacts reads one Session's header and whole fact list through
+// the live owner. The header comes from the Harness; the facts are the
+// projected durable entries.
+func readSessionFacts(t *testing.T, r *Runtime, sessionID string) (harness.SessionHeader, []harness.HistoryFact) {
+	t.Helper()
+	var header harness.SessionHeader
+	var facts []harness.HistoryFact
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		rec, err := h.ReadSessionHeader(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		header = rec
+		snap, err := h.SnapshotSession(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		facts = snap.Facts
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read session %q facts: %v", sessionID, err)
+	}
+	return header, facts
+}
+
 func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		sessionID, operationID := seedRunningOperation(t, store, filepath.Join(e.home, "seeded"))
-		r, err := e.open(context.Background(), e.storagePlugin(&countingStore{Storage: store}))
+		var opOpens, agOpens atomic.Int64
+		r, err := e.open(context.Background(),
+			e.storagePlugin(&countingStore{Storage: store}),
+			shortScopeProbe("probe", ScopeOperation, &opOpens),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
-		if calls, opens := e.prep.counts(); calls != 0 || opens != 0 {
-			t.Fatalf("preparation/opener calls during startup = %d/%d, want recovery to invoke no execution callback", calls, opens)
+		if got := e.server.requests(); got != 0 {
+			t.Fatalf("HTTP requests during startup = %d, want recovery to reach no model request", got)
+		}
+		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
+			t.Fatalf("short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
 		}
 		rec := readOperation(t, r, sessionID, operationID)
 		if rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
 			rec.State.Terminal.Detail != "Operation interrupted by Runtime loss." {
 			t.Fatalf("recovered Operation state = %+v, want the terminal interruption settlement", rec.State)
+		}
+		header, facts := readSessionFacts(t, r, sessionID)
+		if header.CurrentOperationID != "" {
+			t.Fatalf("recovered Session current Operation = %q, want it cleared", header.CurrentOperationID)
+		}
+		if len(facts) == 0 || facts[0].Kind != harness.EntryInput {
+			t.Fatalf("recovered Session facts = %d, want the retained seeded input", len(facts))
 		}
 		// Repair precedes execution: a later admission enters ordinary
 		// admission on the repaired durable state.
@@ -1584,12 +1549,138 @@ func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 			t.Fatalf("createSession after recovery: %v", err)
 		}
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-after-repair", "continue")
-		e.prep.awaitCleanups(1)
-		if post := readOperation(t, r, next.Identity.SessionID, "op-after-repair"); post.State.Status != harness.OperationSuccess {
+		if post := awaitOperation(t, r, next.Identity.SessionID, "op-after-repair", harness.OperationSuccess); post.State.Status != harness.OperationSuccess {
 			t.Fatalf("post-repair Operation = %+v, want success", post.State)
+		}
+		if got := e.server.requests(); got != 1 {
+			t.Fatalf("HTTP requests after the explicit submit = %d, want exactly the one admitted request", got)
 		}
 		if err := r.Close(context.Background()); err != nil {
 			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion extends
+// the restart-recovery composition over the durable state a process loss
+// leaves behind: one idle open root Session with one valid running child,
+// seeded directly through the storage contract. The successor owner's
+// recovery settles the child's Operation as the runtime-loss interruption
+// with its committed prefix retained while the parent records no completion
+// and reconstructs no background member; recovery invokes no model request,
+// opens no execution scope, and stops no job through the actual seam export;
+// the parent then admits explicit work normally and its lifecycle stays
+// unblocked, and a repeated owner's recovery over the same state changes
+// nothing.
+func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		e := newOwnerEnv(t)
+		parent := newLifecycleID(t)
+		child := newLifecycleID(t)
+		childOp := newLifecycleID(t)
+		seedLifecycleRoot(t, store, parent)
+		seedLifecycleChild(t, store, parent, child, childOp)
+
+		var opOpens, agOpens atomic.Int64
+		stopper := &stubStopper{events: e.events}
+		r, err := e.open(ctx,
+			e.storagePlugin(store),
+			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
+			shortScopeProbe("probe", ScopeOperation, &opOpens),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		// Recovery invoked no model transport, opened no execution scope, and
+		// stopped no job.
+		if got := e.server.requests(); got != 0 {
+			t.Fatalf("HTTP requests during startup = %d, want recovery to reach no model request", got)
+		}
+		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
+			t.Fatalf("short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
+		}
+		if n := eventsNamed(e.events.all(), "stopjob"); n != 0 {
+			t.Fatalf("job-stop invocations during startup = %d, want recovery to stop no job", n)
+		}
+
+		// The child's running Operation settled as the runtime-loss
+		// interruption with its committed input prefix retained.
+		rec := readOperation(t, r, child, childOp)
+		if rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
+			rec.State.Terminal.Detail != "Operation interrupted by Runtime loss." {
+			t.Fatalf("recovered child operation state = %+v, want the terminal interruption settlement", rec.State)
+		}
+		childHeader, childFacts := readSessionFacts(t, r, child)
+		if childHeader.CurrentOperationID != "" {
+			t.Fatalf("recovered child current Operation = %q, want it cleared", childHeader.CurrentOperationID)
+		}
+		if len(childFacts) == 0 || childFacts[0].Kind != harness.EntryInput {
+			t.Fatalf("recovered child facts = %d, want the retained seeded input prefix", len(childFacts))
+		}
+
+		// The loss stays parent-independent: the parent keeps no current
+		// Operation and records no fabricated completion entry.
+		parentHeader, parentFacts := readSessionFacts(t, r, parent)
+		if parentHeader.CurrentOperationID != "" {
+			t.Fatalf("recovered parent current Operation = %q, want none", parentHeader.CurrentOperationID)
+		}
+		if len(parentFacts) != 0 {
+			t.Fatalf("recovered parent facts = %+v, want no fabricated completion entry", parentFacts)
+		}
+
+		// Only the subsequent explicit Submit may produce a request; the
+		// parent admits normally and its lifecycle stays unblocked with no
+		// reconstructed member.
+		submitThroughRuntime(t, r, parent, "op-after-loss", "continue")
+		if post := awaitOperation(t, r, parent, "op-after-loss", harness.OperationSuccess); post.State.Status != harness.OperationSuccess {
+			t.Fatalf("post-recovery parent Operation = %+v, want success", post.State)
+		}
+		if got := e.server.requests(); got != 1 {
+			t.Fatalf("HTTP requests after the explicit submit = %d, want exactly the one admitted request", got)
+		}
+		err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, parent)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("ArchiveSession on the recovered parent = %v, want no reconstructed member blocking the lifecycle", err)
+		}
+		_, settledChildFacts := readSessionFacts(t, r, child)
+		_, settledParentFacts := readSessionFacts(t, r, parent)
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		// A repeated recovery over the same durable state changes nothing.
+		requestsBefore := e.server.requests()
+		again, err := e.open(ctx,
+			e.storagePlugin(store),
+			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
+		if err != nil {
+			t.Fatalf("reopen for the repeated recovery: %v", err)
+		}
+		if got := e.server.requests(); got != requestsBefore {
+			t.Fatalf("HTTP requests during the repeated recovery = %d, want none beyond the %d before it", got, requestsBefore)
+		}
+		if n := eventsNamed(e.events.all(), "stopjob"); n != 0 {
+			t.Fatalf("job-stop invocations across both recoveries = %d, want none", n)
+		}
+		if got := readOperation(t, again, child, childOp); got.State.Status != rec.State.Status ||
+			got.State.Terminal == nil || got.State.Terminal.Detail != rec.State.Terminal.Detail {
+			t.Fatalf("repeated recovery changed the child settlement: %+v, want the unchanged %+v", got.State, rec.State)
+		}
+		if _, facts := readSessionFacts(t, again, child); len(facts) != len(settledChildFacts) {
+			t.Fatalf("repeated recovery changed the child facts %d -> %d", len(settledChildFacts), len(facts))
+		}
+		if header, facts := readSessionFacts(t, again, parent); header.Lifecycle != harness.LifecycleArchived ||
+			len(facts) != len(settledParentFacts) {
+			t.Fatalf("repeated recovery changed the parent: lifecycle %q facts %d -> %d, want the archived %d",
+				header.Lifecycle, len(settledParentFacts), len(facts), len(settledParentFacts))
+		}
+		if err := again.Close(ctx); err != nil {
+			t.Fatalf("second Close: %v", err)
 		}
 	})
 }

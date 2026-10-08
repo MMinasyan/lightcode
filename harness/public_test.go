@@ -6200,3 +6200,353 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 		})
 	})
 }
+
+// TestPublicForkAcrossCompaction proves the complete fork-across-compaction
+// copy oracle over public operations on both stores: a Session whose prefix
+// carries a committed compaction entry forks with fresh copied identities, an
+// in-prefix boundary rewritten to the mapped copy, no inherited Operation
+// ownership or usage on the copied compaction entry, the source's
+// configuration revision retained, the copied prefix in the source's order
+// excluding settlements, zero inherited usage on the destination, the
+// destination's projection recreated at the copied summary, and the source
+// unchanged.
+func TestPublicForkAcrossCompaction(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		conversation := newScriptModel(publicTurn(), publicTurn(), publicTurn()) // op-1, op-2, fork-1
+		compact := newScriptModel(summaryAttempt("summary one"))
+		f := newCompactManualFixture(t, store, conversation, compact)
+		defer f.close()
+		source := createSession(t, f.h)
+
+		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "first question"); err != nil {
+			t.Fatalf("first submit: %v", err)
+		}
+		awaitTerminal(t, f.h, source, "op-1")
+		compactWhenIdle(t, f.h, source, "c-1")
+		if rec := awaitTerminal(t, f.h, source, "c-1"); rec.State.Status != harness.OperationSuccess {
+			t.Fatalf("manual compact = %+v, want success", rec.State)
+		}
+		if _, err := submit(t, f.h, source, "op-2", harness.MessageModeRegular, "later question"); err != nil {
+			t.Fatalf("second submit: %v", err)
+		}
+		awaitTerminal(t, f.h, source, "op-2")
+
+		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
+		before := snapshotSession(t, store, source)
+		// The source's committed compaction entry: the values the fork must
+		// copy with fresh identities and no ownership.
+		var sourceComp *harness.Entry
+		for i := range before.entries {
+			if before.entries[i].Kind == harness.EntryCompaction {
+				sourceComp = &before.entries[i]
+			}
+		}
+		if sourceComp == nil {
+			t.Fatalf("no compaction entry in the source prefix")
+		}
+		// The wire compaction entry carries its model as the string
+		// "provider/model" form; the copy observes the identity members only.
+		type compactionWire struct {
+			OperationID           string              `json:"operation_id"`
+			Summary               string              `json:"summary"`
+			BoundaryEntryID       string              `json:"boundary_entry_id"`
+			ConfigurationRevision string              `json:"configuration_revision"`
+			Usage                 *harness.UsageCount `json:"usage"`
+		}
+		var sourceWire compactionWire
+		if err := json.Unmarshal(sourceComp.Payload, &sourceWire); err != nil {
+			t.Fatalf("decode source compaction entry: %v", err)
+		}
+		if sourceWire.OperationID != "c-1" || sourceWire.Summary != "summary one" || sourceWire.Usage == nil {
+			t.Fatalf("source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
+		}
+
+		res, err := f.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: source,
+			BoundaryEntryID: boundary,
+			OperationID:     "fork-1",
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+		})
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		dest := res.Session.Identity.SessionID
+		if dest == source {
+			t.Fatalf("fork session identity = %q, want one fresh identity", dest)
+		}
+		if len(res.Session.State.Usage.ByModel) != 0 {
+			t.Fatalf("fork session usage = %+v, want zero inherited usage", res.Session.State.Usage)
+		}
+		awaitTerminal(t, f.h, dest, "fork-1")
+
+		destEntries := recoverEntries(t, store, dest)
+		// The copied prefix maps one-to-one onto the source's strict-before-
+		// boundary prefix, excluding the kinds the copy drops (Operation
+		// settlements), and the fork's own input follows.
+		var expectedCopied []harness.Entry
+		for _, entry := range before.entries {
+			if entry.ID == boundary {
+				break
+			}
+			switch entry.Kind {
+			case harness.EntryInput, harness.EntryAssistant, harness.EntryToolResult, harness.EntrySignal, harness.EntryCompaction:
+				expectedCopied = append(expectedCopied, entry)
+			}
+		}
+		if len(destEntries) <= len(expectedCopied) || destEntries[len(expectedCopied)].Kind != harness.EntryInput {
+			t.Fatalf("destination entries = %+v, want the copied prefix followed by the fork's own input", kindsOf(destEntries))
+		}
+		idMap := map[string]string{}
+		for i, entry := range expectedCopied {
+			if destEntries[i].Kind != entry.Kind {
+				t.Fatalf("copied prefix %d = %s, want the source %s's %s", i, destEntries[i].Kind, entry.ID, entry.Kind)
+			}
+			idMap[entry.ID] = destEntries[i].ID
+		}
+		// The one copied compaction entry: fresh identity, no operation
+		// ownership, no inherited usage, the boundary rewritten to the mapped
+		// copy, the revision retained, the summary verbatim.
+		var copied *harness.Entry
+		for i := range destEntries {
+			if destEntries[i].Kind == harness.EntryCompaction {
+				if copied != nil {
+					t.Fatalf("destination compaction entries: more than one copied")
+				}
+				copied = &destEntries[i]
+			}
+		}
+		if copied == nil {
+			t.Fatalf("no compaction entry copied into the destination")
+		}
+		if copied.ID == sourceComp.ID || copied.OperationID != "" {
+			t.Fatalf("copied compaction entry = %q/%q, want a fresh identity with no operation ownership", copied.ID, copied.OperationID)
+		}
+		var copiedWire compactionWire
+		if err := json.Unmarshal(copied.Payload, &copiedWire); err != nil {
+			t.Fatalf("decode copied compaction entry: %v", err)
+		}
+		if copiedWire.OperationID != "" {
+			t.Fatalf("copied compaction entry operation = %q, want no operation ownership", copiedWire.OperationID)
+		}
+		if copiedWire.Usage != nil {
+			t.Fatalf("copied compaction entry usage = %+v, want none", copiedWire.Usage)
+		}
+		if copiedWire.Summary != "summary one" {
+			t.Fatalf("copied summary = %q, want the source summary", copiedWire.Summary)
+		}
+		expectedBoundary, ok := idMap[sourceWire.BoundaryEntryID]
+		if !ok {
+			t.Fatalf("the source boundary %q is not inside the copied prefix", sourceWire.BoundaryEntryID)
+		}
+		if copiedWire.BoundaryEntryID != expectedBoundary {
+			t.Fatalf("copied boundary %q != the mapped copy of the source boundary %q", copiedWire.BoundaryEntryID, expectedBoundary)
+		}
+		if copiedWire.ConfigurationRevision != sourceWire.ConfigurationRevision {
+			t.Fatalf("copied revision = %q, want the kept source revision %q", copiedWire.ConfigurationRevision, sourceWire.ConfigurationRevision)
+		}
+		// The destination projection is recreated at the copied summary and
+		// inherits none of the source's usage: the source's compact-model
+		// piece counts never reach the destination, whose only totals are its
+		// own fork turn's conversation counts.
+		snap, err := f.h.SnapshotSession(ctx, dest)
+		if err != nil {
+			t.Fatalf("SnapshotSession(dest): %v", err)
+		}
+		if snap.Session.State.CompactionEntryID != copied.ID {
+			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", snap.Session.State.CompactionEntryID, copied.ID)
+		}
+		for _, mu := range snap.Session.State.Usage.ByModel {
+			if mu.Model == compactModelRef {
+				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", snap.Session.State.Usage)
+			}
+		}
+		// The fork's own turn projected at the copied summary.
+		reqs := conversation.seen()
+		if len(reqs) == 0 {
+			t.Fatalf("the fork execution never reached its model boundary")
+		}
+		last := texts(reqs[len(reqs)-1])
+		if len(last) != 3 || !strings.Contains(last[1], "[Previous conversation summary]") || !strings.Contains(last[1], "summary one") || last[2] != "fork input" {
+			t.Fatalf("fork projection = %q, want the system prompt, the copied summary, and the fork input", last)
+		}
+		// The source is unchanged.
+		assertForkSourceUnchanged(t, store, source, before)
+	})
+}
+
+// kindsOf renders one entry list's kinds, for failure messages.
+func kindsOf(entries []harness.Entry) []harness.EntryKind {
+	out := make([]harness.EntryKind, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Kind)
+	}
+	return out
+}
+
+// rawSessionRegisterWithCompaction builds one open root Session register
+// payload that also carries the current compaction projection.
+func rawSessionRegisterWithCompaction(sessionID, currentOp, compactionEntryID string) string {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return fmt.Sprintf(
+		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
+			`"state":{"lifecycle":"open","current_agent_type":"coder","current_operation_id":%q,`+
+			`"compaction_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+		sessionID, now, currentOp, compactionEntryID, now)
+}
+
+// rawCompactAdmission builds one compact-kind admission payload: the compact
+// request shape carries no admitted input entry.
+func rawCompactAdmission(sessionID, operationID string) string {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return fmt.Sprintf(
+		`{"session_id":%q,"operation_id":%q,"request_kind":"compact",`+
+			`"agent_type":"coder",`+
+			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
+			`"context_window":4096,"output_reserve":2048,`+
+			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
+		sessionID, operationID, rawToolDefinition, now)
+}
+
+// rawCompactionEntryPayload builds one committed compaction entry payload.
+func rawCompactionEntryPayload(sessionID, entryID, operationID, summary, boundaryID string) string {
+	return fmt.Sprintf(
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
+			`"model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1"}`,
+		sessionID, entryID, operationID, summary, boundaryID)
+}
+
+// rawSettledSuccessOperation seeds one settled success message Operation —
+// its input and assistant entries plus the settlement entry in order, and the
+// register with the matching terminal section — returning the assistant
+// entry's identity, with both entries carrying the given texts.
+func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, operationID, inputText, assistantText string) string {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	inputID, assistantID, settlementID := newRawSessionID(t), newRawSessionID(t), newRawSessionID(t)
+	insertRawEntry(t, store, sessionID, inputID, operationID, harness.EntryInput,
+		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"user","content":[{"kind":"text","text":%q}]}`,
+			sessionID, inputID, operationID, inputText))
+	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
+		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
+			sessionID, assistantID, operationID, assistantText))
+	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
+		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`, sessionID, settlementID, operationID))
+	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
+		fmt.Sprintf(`{"admission":%s,"state":{"status":"success","started_at":%q,"settled_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]},"terminal":{"settlement_entry":{"session_id":%q,"entry_id":%q}}}}`,
+			rawAdmission(sessionID, operationID, inputID), now, now, sessionID, settlementID))
+	return assistantID
+}
+
+// TestPublicRecoverRunningCompactOperation proves the compact recovery row:
+// a running compact Operation holding a live model-effect intent, over a
+// prior committed compaction and settled post-compaction turns, settles as
+// the runtime-loss interruption through the quiescent recovery — the previous
+// projection stays current, no effect replays, the seeded entries stay
+// byte-identical with only the signal and settlement committed, the re-run
+// writes nothing, and the next admission over the repaired state projects the
+// prior summary and post-boundary entries.
+func TestPublicRecoverRunningCompactOperation(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		sessionID := newRawSessionID(t)
+		compactionID := newRawSessionID(t)
+
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession},
+			rawSessionRegisterWithCompaction(sessionID, "compact-op", compactionID))
+		assistant1 := rawSettledSuccessOperation(t, store, sessionID, "op-1", "hello", "done")
+		insertRawEntry(t, store, sessionID, compactionID, "op-1", harness.EntryCompaction,
+			rawCompactionEntryPayload(sessionID, compactionID, "op-1", "seeded summary", assistant1))
+		rawSettledSuccessOperation(t, store, sessionID, "op-2", "after the summary", "later answer")
+		reserved := newRawSessionID(t)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "compact-op"},
+			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
+				`"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				rawCompactAdmission(sessionID, "compact-op"), now, reserved))
+
+		// The seeded shape: a running compact request with a live model intent.
+		state := recoverOpStateAt(t, store, sessionID, "compact-op")
+		if state.Status != "running" || state.ActiveEffect == nil || state.ActiveEffect.Kind != "model" ||
+			state.ActiveEffect.ResultEntryID != reserved {
+			t.Fatalf("seeded compact operation = %+v, want the running live model intent", state)
+		}
+
+		pre := recoverEntries(t, store, sessionID)
+		if err := harness.Recover(ctx, store); err != nil { // quiescent: before any live Harness
+			t.Fatalf("recover: %v", err)
+		}
+		// The compact Operation settles as the runtime-loss interruption with
+		// no effect replay: the settlement consumes the reserved identity and
+		// the committed tail is exactly the signal and the settlement.
+		assertRecoveredOperation(t, store, sessionID, "compact-op", pre, reserved, nil)
+		assertRecoverIdempotent(t, store, sessionID, "compact-op")
+
+		// The previous projection stays current: the seeded compaction entry
+		// is the only one, the session's compaction_entry_id still names it,
+		// and the current Operation cleared.
+		entries := recoverEntries(t, store, sessionID)
+		compactions := 0
+		for _, entry := range entries {
+			if entry.Kind == harness.EntryCompaction {
+				compactions++
+				if entry.ID != compactionID {
+					t.Fatalf("recovery committed a new compaction entry %q, want no effect replay", entry.ID)
+				}
+			}
+		}
+		if compactions != 1 {
+			t.Fatalf("compaction entries = %d, want only the seeded one", compactions)
+		}
+		sessReg, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
+		if err != nil {
+			t.Fatalf("session register: %v", err)
+		}
+		var sessWire struct {
+			State struct {
+				CurrentOperationID string `json:"current_operation_id"`
+				CompactionEntryID  string `json:"compaction_entry_id"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(sessReg.Payload, &sessWire); err != nil {
+			t.Fatalf("decode session register: %v", err)
+		}
+		if sessWire.State.CurrentOperationID != "" || sessWire.State.CompactionEntryID != compactionID {
+			t.Fatalf("recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
+		}
+
+		// The next admission over the repaired state projects the prior
+		// summary, the post-boundary entries, and the interruption signal —
+		// through the real public path, with no replayed effect.
+		script := newScriptModel(publicTurn())
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		if _, err := submit(t, f.h, sessionID, "op-next", harness.MessageModeRegular, "next question"); err != nil {
+			t.Fatalf("submit after recovery: %v", err)
+		}
+		awaitTerminal(t, f.h, sessionID, "op-next")
+		reqs := script.seen()
+		if len(reqs) != 1 {
+			t.Fatalf("conversation transport calls = %d, want exactly the next admission's one request", len(reqs))
+		}
+		got := texts(reqs[0])
+		want := []string{
+			"system",
+			"[Previous conversation summary]\n\nseeded summary\n\n[End of summary. Continue from here.]",
+			"after the summary",
+			"later answer",
+			"<system-signal>Operation interrupted.</system-signal>",
+			"next question",
+		}
+		if len(got) != len(want) {
+			t.Fatalf("next admission projection = %q, want %q", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("next admission projection[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+}

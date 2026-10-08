@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -1738,26 +1737,14 @@ func TestRuntimeModelMetadataOperators(t *testing.T) {
 // TestRuntimeModelMetadataMutationAffectsNextAdmissions proves the metadata
 // edit's effect boundary over the real admission path: a durably running
 // Operation keeps its captured configuration while the next admission of
-// another Session prepares under the new generation.
+// another Session prepares under the new generation. The committed captures
+// carry the observation.
 func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`)
+		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"worker":{"model":"prov/m","system_prompt":"simple"}}`)
-		var mu sync.Mutex
-		var admitted []string
-		prep := e.prep
-		r, err := open(context.Background(), options{
-			DataDir:    e.dataDir,
-			ConfigPath: e.configPath,
-			Plugins:    []Plugin{e.storagePlugin(store)},
-			prepare: func(ctx context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openExecution, error) {
-				mu.Lock()
-				admitted = append(admitted, req.Session.AgentType+"="+sel.agent.Model.String()+"@"+sel.invocation.Revision())
-				mu.Unlock()
-				return prep.prepare(ctx, req, sel)
-			},
-		})
+		r, err := e.open(context.Background(), e.storagePlugin(store))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -1770,24 +1757,26 @@ func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 		// One durably running Operation on session A holds the original
 		// capture while the metadata mutation lands.
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, a.Identity.SessionID, "op-active", "running")
 		awaitModelArrival(t, e)
 
-		window := 1024
+		// The mutated window keeps ordinary rows fitting: the edit's effect
+		// boundary is under test, not a compaction trigger.
+		window := 131072
 		mutation, err := r.saveModel(ctx, "prov", "m", protocol.ModelEdit{ContextWindow: &window})
 		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
 			t.Fatalf("saveModel = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		}
 
-		// Session B's next admission prepares under the new generation while
-		// the active Operation has not re-prepared.
+		// Session B's next admission commits its capture under the new
+		// generation while the active Operation has not re-captured.
 		submitThroughRuntime(t, r, b.Identity.SessionID, "op-b1", "b turn")
-		mu.Lock()
-		got := append([]string(nil), admitted...)
-		mu.Unlock()
-		if len(got) != 2 || got[0] != "worker=prov/m@1" || got[1] != "worker=prov/m@2" {
-			t.Fatalf("admissions = %q, want the original capture then B's admission at generation 2", got)
+		if got := committedAdmission(t, r, b.Identity.SessionID, "op-b1"); got != "worker=prov/m@2" {
+			t.Fatalf("B's committed capture = %q, want the admission under generation 2", got)
+		}
+		if got := committedAdmission(t, r, a.Identity.SessionID, "op-active"); got != "worker=prov/m@1" {
+			t.Fatalf("A's committed capture = %q, want the original capture kept by the running Operation", got)
 		}
 
 		// Both captures settle; A's next admission uses the new publication.
@@ -1795,11 +1784,8 @@ func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 		awaitIdleSession(t, r, a.Identity.SessionID)
 		awaitIdleSession(t, r, b.Identity.SessionID)
 		submitConvergedThroughRuntime(t, r, a.Identity.SessionID, "op-a2", "a turn", harness.OperationSuccess)
-		mu.Lock()
-		got = append([]string(nil), admitted...)
-		mu.Unlock()
-		if len(got) != 3 || got[2] != "worker=prov/m@2" {
-			t.Fatalf("admissions = %q, want A's next admission under the mutated publication", got)
+		if got := committedAdmission(t, r, a.Identity.SessionID, "op-a2"); got != "worker=prov/m@2" {
+			t.Fatalf("A's next committed capture = %q, want the admission under the mutated publication", got)
 		}
 	})
 }

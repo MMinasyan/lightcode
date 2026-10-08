@@ -117,7 +117,7 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 
 	// Hold one gated operation so committed work exists across the flood.
 	parked := make(chan struct{})
-	e.prep.modelGate = parked
+	e.server.setHold(parked)
 	gate := sync.OnceFunc(func() { close(parked) })
 	defer gate()
 	if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
@@ -194,8 +194,7 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	// The gated operation is untouched by the loss: releasing the gate lets
 	// it settle success.
 	gate()
-	e.prep.awaitCleanups(1)
-	record := readOperation(t, r, session, "op-1")
+	record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 	if record.State.Status != harness.OperationSuccess {
 		t.Fatalf("the gated operation settled as %q, want success after the stream loss", record.State.Status)
 	}
@@ -695,7 +694,7 @@ func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
 // the live job member in hydration and never invokes the job stopper; the
 // existing stop path then completes the job through the seam.
 func TestProtocolServerStreamDisconnectPreservesLiveJob(t *testing.T) {
-	e, r, _, _, session := startLiveJobRuntime(t, "stopped job")
+	e, r, _, _, session := startLiveJobRuntime(t, storage.NewMemory(), "stopped job")
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)

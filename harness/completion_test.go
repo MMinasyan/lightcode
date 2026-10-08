@@ -353,7 +353,9 @@ func TestDeliverBackgroundCompletionEmptyContentRejected(t *testing.T) {
 }
 
 // TestDeliverBackgroundCompletionSecondDeliveryIsNoOp proves the first-writer
-// claim: a second delivery of the same completion changes nothing.
+// claim: after the first delivery's own Operation completes stably, a second
+// delivery of the same completion changes no durable state, causes no second
+// model call, and commits no parent signal.
 func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 	store := emptyStore(t)
 	script := newModelScript()
@@ -371,10 +373,27 @@ func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 		t.Fatalf("first delivery: %v", err)
 	}
 	waitMemberDone(t, member)
+	watch.next() // the delivered completion's own Operation settles
+	awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
+	if calls := len(script.seen()); calls != 1 {
+		t.Fatalf("first-delivery model requests = %d, want exactly one", calls)
+	}
+	beforeEntries, beforeRegs := storedSessionState(store, session)
+
 	if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "second"); err != nil {
 		t.Fatalf("second delivery = %v, want a no-op success", err)
 	}
-	watch.next()
+
+	afterEntries, afterRegs := storedSessionState(store, session)
+	if !reflect.DeepEqual(beforeEntries, afterEntries) || !reflect.DeepEqual(beforeRegs, afterRegs) {
+		t.Fatalf("the duplicate delivery changed the durable registers or entries")
+	}
+	if calls := len(script.seen()); calls != 1 {
+		t.Fatalf("model requests after the duplicate = %d, want no second model call", calls)
+	}
+	if signals := storedSignals(t, store, session); len(signals) != 0 {
+		t.Fatalf("the duplicate committed signal entries %+v, want no parent signal", signals)
+	}
 
 	if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"first"}) {
 		t.Fatalf("committed inputs = %q, want exactly the first delivery", got)
@@ -479,6 +498,24 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 
 	script.releaseGate()
 	<-script.arrived // the boundary drained the steering into the running operation
+	// The rerouted completion actually reached the model boundary: whether
+	// the steering committed before the winning Operation started or during
+	// its first boundary, the last request the Operation sent carries it.
+	deadline := time.After(2 * time.Second)
+	for {
+		reqs := script.seen()
+		if len(reqs) > 0 && strings.Contains(strings.Join(script.lastTexts(), "|"), "raced") {
+			break
+		}
+		select {
+		case <-script.arrived:
+		case <-deadline:
+			t.Fatalf("the rerouted completion never reached a model boundary (requests %d)", len(reqs))
+		}
+	}
+	if reqs := script.seen(); len(reqs) > 2 {
+		t.Fatalf("model requests = %d, want the boundary plus at most the drained continuation", len(reqs))
+	}
 	watch.next()
 	if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"hello", "raced"}) {
 		t.Fatalf("committed inputs = %q, want the rerouted completion as steering", got)

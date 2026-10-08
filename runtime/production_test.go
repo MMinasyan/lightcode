@@ -354,14 +354,20 @@ func (e *productionEnv) workspace(name string) string {
 	return filepath.Join(e.home, name)
 }
 
-// productionModelServer is the shared configured-provider endpoint of the
-// production and assembled scenarios. Dispatch is body-driven: every first
-// turn answers with a tool call ("please run" runs the command row's
-// run_command, everything else the constructor's tool), every tool follow-up
-// with a final text turn, and "parked" first turns hold until the gate
-// releases or the client disconnects (signal observed by the assembled
-// shutdown scenario); every request's body and interesting headers are
-// recorded.
+// productionModelServer is the one shared configured-provider endpoint of the
+// production, assembled and native owner fixtures. Every request's raw body,
+// auth and trace headers are recorded in arrival order, and one arrival
+// signal is sent after recording, before any wait. An armed hold parks each
+// request until the channel closes or the client disconnects, ahead of
+// dispatch. An installed script answers for the request's body (a nil return
+// falls through, and a two-element result prefixed "HTTP " writes one
+// scripted non-2xx response); otherwise dispatch is body-driven: without a
+// configured default tool the plain done text turn answers every body, and
+// with one every tool follow-up answers a final text turn ("done"), a
+// "parked" first turn holds until the gate releases or the client disconnects
+// (signal observed by the assembled shutdown scenario), and other first turns
+// answer a tool call ("please run" runs the command row's run_command,
+// everything else the constructor's tool).
 type productionModelServer struct {
 	*httptest.Server
 
@@ -373,11 +379,14 @@ type productionModelServer struct {
 	trace    []string
 	gate     chan struct{}
 	gone     chan struct{}
+	hold     chan struct{}
+	script   func(ctx context.Context, body string) []string
+	arrived  chan struct{}
 }
 
 func newProductionModelServer(t *testing.T, toolName, toolArgs string) *productionModelServer {
 	t.Helper()
-	s := &productionModelServer{toolName: toolName, toolArgs: toolArgs, gone: make(chan struct{}, 16)}
+	s := &productionModelServer{toolName: toolName, toolArgs: toolArgs, gone: make(chan struct{}, 16), arrived: make(chan struct{}, 64)}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.Close)
 	return s
@@ -390,8 +399,43 @@ func (s *productionModelServer) serve(w http.ResponseWriter, r *http.Request) {
 	s.auth = append(s.auth, r.Header.Get("Authorization"))
 	s.trace = append(s.trace, r.Header.Get("X-Provider-Trace"))
 	gate := s.gate
+	hold := s.hold
+	script := s.script
+	toolName, toolArgs := s.toolName, s.toolArgs
 	s.mu.Unlock()
 
+	select {
+	case s.arrived <- struct{}{}:
+	default:
+	}
+	if hold != nil { // the before-dispatch owner wait: release or client disconnect
+		select {
+		case <-hold:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	if script != nil {
+		if events := script(r.Context(), string(body)); events != nil {
+			if len(events) == 2 && strings.HasPrefix(events[0], "HTTP ") {
+				// One scripted non-2xx provider response: its status and body
+				// are the transport's own facts.
+				code, err := strconv.Atoi(strings.TrimPrefix(events[0], "HTTP "))
+				if err != nil {
+					panic("production model server: bad scripted status " + events[0])
+				}
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(events[1]))
+				return
+			}
+			writeSSE(w, events...)
+			return
+		}
+	}
+	if toolName == "" { // no default tool: the plain owner fixture's done fallback
+		writeTextTurn(w, "done")
+		return
+	}
 	switch role := lastMessageRole(string(body)); {
 	case role == "tool":
 		writeTextTurn(w, "done")
@@ -403,7 +447,6 @@ func (s *productionModelServer) serve(w http.ResponseWriter, r *http.Request) {
 			s.signalGone()
 		}
 	default:
-		toolName, toolArgs := s.toolName, s.toolArgs
 		if lastUserText(string(body)) == "please run" {
 			toolName, toolArgs = "run_command", `{"command":"production-command-row"}`
 		}
@@ -417,6 +460,24 @@ func (s *productionModelServer) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeToolCallTurn(w, toolName, toolArgs)
 	}
+}
+
+// setScript installs one wire-dispatched turn script; a nil return leaves the
+// request to the body-driven dispatch. The script receives the HTTP request
+// context, so a scripted turn parks on the client's own cancellation.
+func (s *productionModelServer) setScript(script func(ctx context.Context, body string) []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.script = script
+}
+
+// setHold parks every request arriving while the channel is armed until the
+// channel closes; the parking request still records and signals its arrival
+// first.
+func (s *productionModelServer) setHold(hold chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hold = hold
 }
 
 func (s *productionModelServer) signalGone() {
@@ -1243,7 +1304,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil, nil)
+	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	if err != nil {

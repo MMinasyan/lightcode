@@ -18,17 +18,51 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // ownerSweepDocument builds one owner configuration document with the fixed
-// prov/m catalog and an explicit sessions section.
+// prov/m catalog and an explicit sessions section. The unroutable endpoint
+// stays: the sweep rows that admit no model work never reach it, and the two
+// startup-probe rows below build their own local-endpoint document.
 func ownerSweepDocument(sessions string) string {
 	return `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"sessions":` + sessions + `}`
+}
+
+// ownerSweepProbedDocument builds the sweep fixture's local-endpoint document
+// with a generous window and the hooks plugin section, so an accidental sweep
+// admission reaches the selected preparation hook and the local model server
+// instead of failing for absent metadata.
+func ownerSweepProbedDocument(endpoint, sessions string) string {
+	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
+}
+
+// ownerSweepAgentsDocument selects the local model and the preparation hook
+// for both agent types the sweep fixtures create.
+const ownerSweepAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple","capabilities":["hook.first"]},"seeded":{"model":"prov/m","system_prompt":"simple","capabilities":["hook.first"]}}`
+
+// assertNoOperationRegisters proves one Session carries no Operation
+// register: no admission created durable Operation state.
+func assertNoOperationRegisters(t *testing.T, store harness.Storage, sessionID string) {
+	t.Helper()
+	regs, err := store.ReadRegisters(context.Background(), sessionID)
+	if err != nil {
+		if errors.Is(err, harness.ErrNotFound) {
+			return // a deleted Session carries no registers: no admission exists
+		}
+		t.Fatalf("ReadRegisters(%s): %v", sessionID, err)
+	}
+	for _, reg := range regs {
+		if reg.Key.Kind == harness.RegisterOperation {
+			t.Fatalf("session %s carries the Operation register %q, want no admission", sessionID, reg.Key.OperationID)
+		}
+	}
 }
 
 // captureSweepStderr redirects os.Stderr into a temp file for the test's
@@ -353,13 +387,22 @@ func seedStaleSession(t *testing.T, store harness.Storage, workspace string, sta
 // TestMaintenanceInitialPassRunsAtStartup proves the startup pass: one
 // automatic sweep completes before the owner publication returns, under the
 // initial policy, through the real Harness transition on both stores, with
-// no model admission.
+// no model admission. The fixture's agent types select the local model and a
+// real preparation hook, so accidental work would reach the probe rather
+// than fail for absent metadata.
 func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":365}`))
+		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":365}`))
+		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		hook := &recordHook{name: "hook.first", events: &traceLog{}}
+		var opOpens, agOpens atomic.Int64
+		r, err := e.open(context.Background(),
+			e.storagePlugin(store),
+			hookPlugin(hook),
+			shortScopeProbe("probe", ScopeOperation, &opOpens),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -370,9 +413,16 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 		if rec.Lifecycle != harness.LifecycleArchived || rec.ArchivedAt == nil {
 			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec)
 		}
-		if calls, opens := e.prep.counts(); calls != 0 || opens != 0 {
-			t.Fatalf("preparation/opener calls during startup = %d/%d, want the sweep to admit no model work", calls, opens)
+		if got := e.server.requests(); got != 0 {
+			t.Fatalf("HTTP requests during startup = %d, want the sweep to admit no model work", got)
 		}
+		if calls := len(hook.calls()); calls != 0 {
+			t.Fatalf("preparation hook calls during startup = %d, want the sweep to admit no model work", calls)
+		}
+		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
+			t.Fatalf("short-scope factory opens during startup = %d/%d, want the sweep to admit no model work", ops, ags)
+		}
+		assertNoOperationRegisters(t, store, seeded)
 		if err := r.Close(context.Background()); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
@@ -384,14 +434,21 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 // loop: auto_archive=false disables the whole sweep even at construction,
 // Reloaded policy is sampled by the next pass, each tick timestamp is that
 // pass's explicit time at the exact 24-hour archive/delete boundaries, and
-// the pass admits no model work.
+// the pass admits no model work. The created Session's agent type selects
+// the local model and a real preparation hook, so accidental work would
+// reach the probe rather than fail for absent metadata.
 func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
 		wrapped := newSweepStore(store)
+		hook := &recordHook{name: "hook.first", events: &traceLog{}}
+		var opOpens, agOpens atomic.Int64
 		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
+		opts := e.options(e.storagePlugin(wrapped), hookPlugin(hook),
+			shortScopeProbe("probe", ScopeOperation, &opOpens),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
 		if err != nil {
@@ -409,7 +466,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 
 		archiveBoundary := created.State.LastActivity.Add(24 * time.Hour)
 		archivedAt := archiveBoundary.Add(time.Nanosecond)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		if _, err := r.Reload(context.Background()); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
@@ -441,9 +498,16 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		if got := wrapped.listCount(); got != 5 {
 			t.Fatalf("storage lists = %d, want recovery plus exactly the four controlled passes", got)
 		}
-		if calls, opens := e.prep.counts(); calls != 0 || opens != 0 {
-			t.Fatalf("preparation/opener calls = %d/%d, want none: the sweep admits no model work", calls, opens)
+		if got := e.server.requests(); got != 0 {
+			t.Fatalf("HTTP requests = %d, want none: the sweep admits no model work", got)
 		}
+		if calls := len(hook.calls()); calls != 0 {
+			t.Fatalf("preparation hook calls = %d, want none: the sweep admits no model work", calls)
+		}
+		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
+			t.Fatalf("short-scope factory opens = %d/%d, want none: the sweep admits no model work", ops, ags)
+		}
+		assertNoOperationRegisters(t, wrapped, id)
 		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
 			t.Fatalf("boundary passes reported diagnostics: %q", out)
 		}
@@ -702,14 +766,14 @@ func TestMaintenanceGateRejectionIsQuiet(t *testing.T) {
 // TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel proves a pass racing
 // live execution: the running Session's durable register is left unchanged,
 // the idle sibling is archived, the execution settles untouched, and the
-// only preparation/opener calls belong to the explicit submit.
+// only model request belongs to the explicit submit.
 func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
 		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
+		opts := e.options(e.storagePlugin(wrapped), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
 		if err != nil {
@@ -724,14 +788,12 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 			t.Fatalf("createSession idle: %v", err)
 		}
 		gate := make(chan struct{})
-		e.prep.mu.Lock()
-		e.prep.modelGate = gate
-		e.prep.mu.Unlock()
+		e.server.setHold(gate)
 		submitThroughRuntime(t, r, busy.Identity.SessionID, "op-busy", "work")
 		select {
-		case <-e.prep.modelArrived:
+		case <-e.server.arrived:
 		case <-time.After(10 * time.Second):
-			t.Fatal("the submitted execution never reached its model effect")
+			t.Fatal("the submitted execution never reached its model request")
 		}
 		before := readSweepRegister(t, wrapped, busy.Identity.SessionID)
 		tick := idle.State.LastActivity.Add(100 * time.Hour)
@@ -744,12 +806,11 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
 			t.Fatalf("idle sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
-		if calls, opens := e.prep.counts(); calls != 1 || opens != 1 {
-			t.Fatalf("preparation/opener calls = %d/%d, want only the explicit submit: the sweep admitted no model work", calls, opens)
+		if got := e.server.requests(); got != 1 {
+			t.Fatalf("HTTP requests = %d, want only the explicit submit: the sweep admitted no model work", got)
 		}
 		close(gate)
-		e.prep.awaitCleanups(1)
-		if op := readOperation(t, r, busy.Identity.SessionID, "op-busy"); op.State.Status != harness.OperationSuccess {
+		if op := awaitOperation(t, r, busy.Identity.SessionID, "op-busy", harness.OperationSuccess); op.State.Status != harness.OperationSuccess {
 			t.Fatalf("Operation during the sweep = %+v, want the untouched success terminal", op.State)
 		}
 		if err := r.Close(context.Background()); err != nil {
@@ -1532,9 +1593,9 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		ctx := context.Background()
-		r, err := e.open(ctx, e.storagePlugin(store))
+		r, err := e.open(ctx, e.storagePlugin(store), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}

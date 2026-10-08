@@ -188,7 +188,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		}
 		session := created.JSON201.SessionId
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		defer close(gate)
 		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
 			OperationId: "op-1", Mode: "regular",
@@ -609,7 +609,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		// class from the one idle gate.
 		session := projectionSession(t, r, filepath.Join(e.home, "busy"), "solo").Identity.SessionID
 		gate := make(chan struct{})
-		e.prep.modelGate = gate
+		e.server.setHold(gate)
 		defer close(gate)
 		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
 			OperationId: "op-1", Mode: "regular",
