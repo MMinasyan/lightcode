@@ -14,7 +14,7 @@ func mkSettlementOutput(status model.OutputStatus, detail string) *model.Output 
 
 	out := model.Output{Status: status, Source: testRef, Detail: detail}
 	switch {
-	case status == model.OutputCompleted: // the one mandatory-payload row — a single non-empty text part satisfies it minimally respectively left-to-right as they appear within model.HasAssistantPayload's own check sequence further up above all of these lines verbatim.
+	case status == model.OutputCompleted: // the one mandatory-payload row: a single non-empty text part minimally satisfies the completed-output payload rule.
 		msg.Content = []model.ContentPart{{Kind: model.PartText, Text: "x"}}
 
 	case status == model.OutputInterrupted || detail != "": // optional partial message retained alongside its diagnostic text for the other two shapes — present-but-tool-call-free per their own closed-shape rules respectively left-to-right as they appear within NewOutput's default-branch validation logic over there.
@@ -377,7 +377,7 @@ func mkForeignSettlementOutput(status model.OutputStatus, detail string, src mod
 
 	out := model.Output{Status: status, Source: src, Detail: detail}
 	switch {
-	case status == model.OutputCompleted: // the one mandatory-payload row — a single non-empty text part satisfies it minimally respectively left-to-right as they appear within model.HasAssistantPayload's own check sequence further up above all of these lines verbatim.
+	case status == model.OutputCompleted: // the one mandatory-payload row: a single non-empty text part minimally satisfies the completed-output payload rule.
 		msg.Content = []model.ContentPart{{Kind: model.PartText, Text: "x"}}
 
 	case status == model.OutputInterrupted || detail != "": // optional partial message retained alongside its diagnostic text for the other two shapes — present-but-tool-call-free per their own closed-shape rules respectively left-to-right as they appear within NewOutput's default-branch validation logic over there.

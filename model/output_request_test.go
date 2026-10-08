@@ -234,8 +234,8 @@ func TestAssistantContentAndPayloadQueries(t *testing.T) {
 			if got := HasAssistantContent(tc.msg); got != tc.content {
 				t.Fatalf("HasAssistantContent = %v, want %v", got, tc.content)
 			}
-			if got := HasAssistantPayload(tc.msg); got != tc.payload {
-				t.Fatalf("HasAssistantPayload = %v, want %v", got, tc.payload)
+			if got := hasAssistantPayload(tc.msg); got != tc.payload {
+				t.Fatalf("hasAssistantPayload = %v, want %v", got, tc.payload)
 			}
 		})
 	}

@@ -702,28 +702,18 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 // runPreparationHooks binds and directly invokes, in selected order inside
 // the same preparation guard, every available long-lived selected binding
 // whose declared type satisfies PreparationHook, passing the captured
-// Invocation unchanged and a fresh owned capture copy to each hook. The owned
-// baseline is allocated only when the first applicable hook is reached: a
-// selection with no bound preparation hook keeps the concrete producer's
-// already-owned capture. An invalid result, error or observed cancellation
-// aborts admission before the next hook runs, so no partial hook consequence
-// is published; the retained chain owns its values and never aliases a hook's
-// slice.
+// Invocation unchanged and a fresh owned capture copy to each hook. The
+// concrete-owned prepared capture is the comparison baseline and the zero-hook
+// result: it is never handed to a hook and never aliased by one. An invalid
+// result, error or observed cancellation aborts admission before the next hook
+// runs, so no partial hook consequence is published; the retained chain owns
+// its values and never aliases a hook's slice.
 func runPreparationHooks(ctx context.Context, sel selection, prepared harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	capture := prepared
-	var baseline harness.ExecutionCapture
-	bound := false
+	baseline, capture := prepared, prepared
 	for _, id := range sel.agent.Capabilities {
 		entry, ok := sel.bindings.entries[id]
 		if !ok || !entry.declared.Implements(preparationHookType) {
 			continue
-		}
-		if !bound { // baseline ownership belongs to the first applicable hook, never a hookless selection
-			owned, err := ownExecutionCapture(prepared)
-			if err != nil {
-				return harness.ExecutionCapture{}, err
-			}
-			baseline, capture, bound = owned, owned, true
 		}
 		hook, err := Bind[PreparationHook](sel.bindings, id)
 		if err != nil {

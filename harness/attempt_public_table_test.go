@@ -178,28 +178,11 @@ func attemptTableSeedHistory(t *testing.T, f *attemptTableFixture, session strin
 	}
 }
 
-// attemptTableAdmitCompact admits one manual compact Operation, retrying the
-// transient idle guard, without waiting for its settlement.
-func attemptTableAdmitCompact(t *testing.T, f *attemptTableFixture, session, operation string) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: operation}); err == nil {
-			return
-		} else if !strings.Contains(err.Error(), "is not idle; admission requires an idle Session") {
-			t.Fatalf("Compact %s: %v", operation, err)
-		} else if time.Now().After(deadline) {
-			t.Fatalf("Compact %s never admitted within the wait bound", operation)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 // attemptTableRunCompact admits one manual compact Operation and waits for
 // its terminal settlement.
 func attemptTableRunCompact(t *testing.T, f *attemptTableFixture, session, operation string) harness.OperationRecord {
 	t.Helper()
-	attemptTableAdmitCompact(t, f, session, operation)
+	compactWhenIdle(t, f.h, session, operation)
 	return awaitTerminal(t, f.h, session, operation)
 }
 
@@ -356,7 +339,7 @@ var publicAttemptTableRows = []struct {
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
-				attemptTableAdmitCompact(t, f, session, operation)
+				compactWhenIdle(t, f.h, session, operation)
 			}
 			<-requests // the first attempt failed into the standard backoff
 			if err := f.h.Interrupt(context.Background(), session); err != nil {
@@ -452,7 +435,7 @@ var publicAttemptTableRows = []struct {
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
-				attemptTableAdmitCompact(t, f, session, operation)
+				compactWhenIdle(t, f.h, session, operation)
 			}
 			interruptParkedAttempt(t, f, session, arrived)
 			rec := awaitTerminal(t, f.h, session, operation)
@@ -479,7 +462,7 @@ var publicAttemptTableRows = []struct {
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
-				attemptTableAdmitCompact(t, f, session, operation)
+				compactWhenIdle(t, f.h, session, operation)
 			}
 			interruptParkedAttempt(t, f, session, arrived)
 			rec := awaitTerminal(t, f.h, session, operation)
@@ -511,7 +494,7 @@ var publicAttemptTableRows = []struct {
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
-				attemptTableAdmitCompact(t, f, session, operation)
+				compactWhenIdle(t, f.h, session, operation)
 			}
 			interruptParkedAttempt(t, f, session, arrived)
 			rec := awaitTerminal(t, f.h, session, operation)

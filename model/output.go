@@ -80,8 +80,8 @@ func HasAssistantContent(m *Message) bool {
 	return m.Extra.HasValues()
 }
 
-// HasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view: the content of HasAssistantContent plus at least one tool call. A nil message reports false. The query validates, retains or mutates nothing.
-func HasAssistantPayload(m *Message) bool {
+// hasAssistantPayload reports whether an assistant message carries model-visible payload under the finalization view: the content of HasAssistantContent plus at least one tool call. A nil message reports false. It is the private completed-output rule shared with ValidateOutput; the public content-only and part-level queries stay exported for their cross-package consumers. The query validates, retains or mutates nothing.
+func hasAssistantPayload(m *Message) bool {
 	return HasAssistantContent(m) || m != nil && len(m.ToolCalls) > 0
 }
 
@@ -102,7 +102,7 @@ func ValidateOutput(in Output) error {
 		if err := validateOutputMessage(*in.Message, in.Source); err != nil {
 			return err
 		}
-		if !HasAssistantPayload(in.Message) {
+		if !hasAssistantPayload(in.Message) {
 			return errors.New("completed output requires an assistant payload (content parts, refusal, tool calls, or finalized extras)")
 		}
 		if in.Detail != "" {
