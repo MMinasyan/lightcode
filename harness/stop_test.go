@@ -341,15 +341,17 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 		t.Fatalf("stopped child bgState = %q, want permanently closed", childC.bgState)
 	}
 
-	close(tree.release) // the parked root Operation completes, absorbing both steered completions at its next boundary
+	close(tree.release) // the parked root Operation completes; the boundary hands off to the steered completions
 	watch.next()        // the child's interruption, committed during the stop
-	watch.next()        // op-1 settles with the steered completions committed as its inputs
+	watch.next()        // op-1 settles quiet success at its boundary
+	watch.next()        // the first steered completion's own Operation settles
+	watch.next()        // the second steered completion's own Operation settles
 	watch.next()        // the queued message admitted after the reopen
 	if rec := settledOperation(t, tree.store, tree.root, "op-2"); rec.State.Status != OperationSuccess {
 		t.Fatalf("queued operation status = %s, want the preserved queued message admitted and successful", rec.State.Status)
 	}
 	if rec := settledOperation(t, tree.store, tree.root, "op-1"); rec.State.Status != OperationSuccess {
-		t.Fatalf("root operation status = %s, want the steered completions delivered into the running Operation", rec.State.Status)
+		t.Fatalf("root operation status = %s, want the quiet handoff success", rec.State.Status)
 	}
 	// The member-stop order is unspecified (snapshot map iteration), so the
 	// two completions may commit in either order; the set is what survives.
@@ -359,6 +361,31 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 	sort.Strings(want)
 	if !reflect.DeepEqual(texts, want) {
 		t.Fatalf("root entries = %q, want the surviving buffers delivered", texts)
+	}
+	// Each delivered completion owns its own Operation: op-1 keeps exactly its
+	// admitted input and the completions arrive through ordinary admission.
+	rootGraph, err := validateFixture(t, tree.store, tree.root)
+	if err != nil {
+		t.Fatalf("root graph: %v", err)
+	}
+	for _, entry := range rootGraph.Entries {
+		if entry.Input == nil || len(entry.Input.Content) == 0 {
+			continue
+		}
+		switch entry.Input.Content[0].Text {
+		case "hello":
+			if entry.Envelope.OperationID != "op-1" {
+				t.Fatalf("admitted input owned by %q, want op-1", entry.Envelope.OperationID)
+			}
+		case "queued-msg":
+			if entry.Envelope.OperationID != "op-2" {
+				t.Fatalf("queued input owned by %q, want op-2", entry.Envelope.OperationID)
+			}
+		default:
+			if entry.Envelope.OperationID == "op-1" || entry.Input.Origin != InputOriginRuntime {
+				t.Fatalf("completion input %q owned by %q (%q), want its own successor Operation with runtime origin", entry.Input.Content[0].Text, entry.Envelope.OperationID, entry.Input.Origin)
+			}
+		}
 	}
 }
 

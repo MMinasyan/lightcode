@@ -209,7 +209,7 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
 		t.Fatalf("operation state = %+v, want a quiet running Operation with the call settled", rec.State)
 	}
-	messages, err := h.contextSource(c, testOpID)(context.Background())
+	messages, err := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("context source: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestToolArgumentHookInvalidOpenedExecutionRejectsHooks(t *testing.T) {
 					return nil
 				}}, nil
 			})
-			if err := h.execute(c, testOpID, prepared, h.ctx); err == nil {
+			if err := executeDirect(h, c, h.ctx, testOpID, prepared); err == nil {
 				t.Fatalf("execute = nil, want the invalid-hook rejection")
 			}
 			if closed != 1 {

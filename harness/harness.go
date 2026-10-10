@@ -217,11 +217,16 @@ type pendingMessage struct {
 // after the admission commit and released only after the terminal settlement
 // and the post-terminal buffer drain have converged. Its execution context is
 // a child of the Harness context; Interrupt cancels it and the retirement
-// tail cancels it once after the drain.
+// tail cancels it once after the drain. A successful steering handoff parks
+// its reservation's release closure here — written by the execution
+// goroutine at the handoff and consumed by the same goroutine's drain — so
+// the reservation stays held from the handoff's settlement through the
+// successor's installation without a second acquisition.
 type activeExecution struct {
-	done    chan struct{}      // closed when the execution goroutine finishes
-	execCtx context.Context    // the execution context driving the opener, the Agent run, and every effect attempt
-	cancel  context.CancelFunc // cancels execCtx; idempotent, so a retiring predecessor's cancel is a harmless no-op
+	done           chan struct{}      // closed when the execution goroutine finishes
+	execCtx        context.Context    // the execution context driving the opener, the Agent run, and every effect attempt
+	cancel         context.CancelFunc // cancels execCtx; idempotent, so a retiring predecessor's cancel is a harmless no-op
+	handoffRelease func()             // non-nil while a steering handoff's reservation is carried to the drain
 }
 
 // coordinator is the one per-Session authority: the validated Session view,
@@ -1569,7 +1574,7 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	c.mu.Unlock()
 	h.observeInvalidation(c)
 	go func() {
-		err := h.execute(c, operationID, prepared, run.execCtx)
+		err := h.execute(c, run, operationID, prepared)
 		h.recordStorageFailure(err)
 		h.drainBuffers(c, run)
 		retired := false
@@ -1593,14 +1598,22 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 // A selected head stays pending until admission or final failure/duplicate.
 // Successful admission starts the successor; failure advances to the next
 // head. Harness loss discards both FIFOs. An empty scan retires only this run
-// under the same hold, never a successor's slot.
+// under the same hold, never a successor's slot. A steering handoff's
+// reservation is carried here by the retiring execution and consumed —
+// released exactly once on every path — instead of reacquired; natural
+// terminal paths still obtain the reservation normally.
 func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
 	c.mu.Unlock()
-	release, err := h.reserve(h.ctx, c)
-	if err != nil {
-		return
+	release := run.handoffRelease // the handoff's carried reservation: consumed, never reacquired
+	run.handoffRelease = nil
+	if release == nil {
+		var err error
+		release, err = h.reserve(h.ctx, c)
+		if err != nil {
+			return
+		}
 	}
 	defer release()
 	for {

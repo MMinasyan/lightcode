@@ -291,12 +291,12 @@ func TestSubmitRoutesIdleAndActive(t *testing.T) {
 	}
 }
 
-// TestSteeringDrainsAtModelBoundaryInFIFOOrder proves the steering row: while
-// an Operation is active, waiting steering is committed as ordinary user input
-// in FIFO order at the model boundary, the next request projects it in the
-// same Operation, and a ready boundary with waiting steering continues the
-// Operation instead of returning.
-func TestSteeringDrainsAtModelBoundaryInFIFOOrder(t *testing.T) {
+// TestSteeringHandsOffAtModelBoundaryInFIFOOrder proves the steering row: while
+// an Operation is active, waiting steering is delivered through ordinary
+// admission in FIFO order at the conversation boundary — the predecessor
+// settles quiet success and each head's own Operation makes the next first
+// request carrying it — and a queued head follows the steering heads.
+func TestSteeringHandsOffAtModelBoundaryInFIFOOrder(t *testing.T) {
 	store := emptyStore(t)
 	script := newModelScript()
 	gate := make(chan struct{})
@@ -310,7 +310,7 @@ func TestSteeringDrainsAtModelBoundaryInFIFOOrder(t *testing.T) {
 	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
-	<-script.arrived // parked at the first model boundary
+	receiveBounded(t, script.arrived, "op-1's first model request") // parked at the first model boundary
 	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1"); err != nil {
 		t.Fatalf("steering submit 1: %v", err)
 	}
@@ -318,26 +318,43 @@ func TestSteeringDrainsAtModelBoundaryInFIFOOrder(t *testing.T) {
 		t.Fatalf("steering submit 2: %v", err)
 	}
 
-	script.releaseGate() // the first model result commits with steering waiting
-	<-script.arrived
-	if texts := strings.Join(script.lastTexts(), "|"); texts != "system|hello|done|s1|s2" {
-		t.Fatalf("continuation projection = %q, want the drained steering after the first turn's history", texts)
+	script.releaseGate() // the first model result settles with steering waiting: the boundary hands off
+	for _, op := range []string{"op-1", "op-2", "op-3"} {
+		nextSettlementBounded(t, watch, "the split Operations' settlements")
+		if rec := settledOperation(t, store, session, op); rec.State.Status != OperationSuccess {
+			t.Fatalf("operation %q settled %q, want success", op, rec.State.Status)
+		}
 	}
-	watch.next()
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationSuccess {
-		t.Fatalf("steered operation settled %q, want success", rec.State.Status)
+	reqs := script.seen()
+	if len(reqs) != 3 {
+		t.Fatalf("model requests = %d, want one per delivered head", len(reqs))
+	}
+	if texts := strings.Join(textsOf(reqs[0]), "|"); texts != "system|hello" {
+		t.Fatalf("first request = %q, want the admitted input only", texts)
+	}
+	if texts := strings.Join(textsOf(reqs[1]), "|"); texts != "system|hello|done|s1" {
+		t.Fatalf("successor request = %q, want s1 as its own Operation's first receiving request", texts)
+	}
+	if texts := strings.Join(textsOf(reqs[2]), "|"); texts != "system|hello|done|s1|done|s2" {
+		t.Fatalf("last request = %q, want s2 delivered after s1's own turn", texts)
 	}
 	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,s1,s2" {
-		t.Fatalf("committed inputs = %q, want steering committed in FIFO order", got)
+		t.Fatalf("committed inputs = %q, want steering admitted in FIFO order", got)
+	}
+	if owner, _ := steeringInputOwner(t, store, session, "s1"); owner != "op-2" {
+		t.Fatalf("steering input s1 owned by %q, want op-2", owner)
+	}
+	if owner, _ := steeringInputOwner(t, store, session, "s2"); owner != "op-3" {
+		t.Fatalf("steering input s2 owned by %q, want op-3", owner)
 	}
 }
 
 // TestSteeringContinuationAcrossOutputShapes proves the boundary decision is
-// independent of output shape: steering continues the Operation across a
-// completed output without calls, a completed output with calls, and an
-// errored output retaining a payload — and an errored output without a
-// payload settles failure while its steering drains through ordinary
-// admission.
+// independent of output shape: a completed output without calls, a completed
+// output with calls, and an errored output retaining a payload all hand the
+// Operation off at its next boundary so the steering arrives through its own
+// successor admission — and an errored output without a payload settles
+// failure while its steering drains through ordinary admission.
 func TestSteeringContinuationAcrossOutputShapes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -364,33 +381,22 @@ func TestSteeringContinuationAcrossOutputShapes(t *testing.T) {
 			if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
 				t.Fatalf("first submit: %v", err)
 			}
-			<-script.arrived
+			receiveBounded(t, script.arrived, "op-1's first model request")
 			if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
 				t.Fatalf("steering submit: %v", err)
 			}
 			script.releaseGate()
 
-			if tc.wantEnd == OperationSuccess { // the continuation projected the drained steering
-				<-script.arrived
-				if texts := strings.Join(script.lastTexts(), "|"); !strings.Contains(texts, "steer") {
-					t.Fatalf("continuation projection = %q, want the drained steering", texts)
-				}
-				watch.next()
-				if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != tc.wantEnd {
-					t.Fatalf("operation settled %q, want %q", rec.State.Status, tc.wantEnd)
-				}
-				return
-			}
-			// A payload-less errored continuation settles failure: the
-			// preserved steering drains through ordinary admission.
-			watch.next()
+			nextSettlementBounded(t, watch, "op-1's terminal settlement")
 			if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != tc.wantEnd {
 				t.Fatalf("operation settled %q, want %q", rec.State.Status, tc.wantEnd)
 			}
-			<-script.arrived
-			watch.next()
-			if texts := strings.Join(script.lastTexts(), "|"); texts != "system|hello|steer" {
-				t.Fatalf("admitted steering projection = %q, want the preserved steering as a new admission", texts)
+			nextSettlementBounded(t, watch, "the steering successor's settlement")
+			if texts := strings.Join(script.lastTexts(), "|"); !strings.Contains(texts, "steer") {
+				t.Fatalf("delivered projection = %q, want the steering carried by its own Operation's request", texts)
+			}
+			if owner, _ := steeringInputOwner(t, store, session, "steer"); owner != "op-2" {
+				t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
 			}
 		})
 	}
@@ -574,12 +580,13 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 }
 
 // TestFinalBoundarySerialization proves the coordinator linearizes the final
-// model-result boundary against submissions: input submitted inside the model
-// callback while the Operation is still current is never stranded — regular
-// input continues the Operation through steering, queued input drains through
-// ordinary admission after the terminal commit.
+// model-result boundary against submissions: regular input submitted inside
+// the model callback while the Operation is still current is never stranded —
+// it hands off at the natural-success boundary and arrives through its own
+// successor admission — and queued input drains through ordinary admission
+// after the terminal commit.
 func TestFinalBoundarySerialization(t *testing.T) {
-	t.Run("regular input at the boundary continues through steering", func(t *testing.T) {
+	t.Run("regular input at the boundary hands off to its own Operation", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript()
 		var (
@@ -606,15 +613,22 @@ func TestFinalBoundarySerialization(t *testing.T) {
 		if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
 			t.Fatalf("first submit: %v", err)
 		}
-		watch.next()
+		nextSettlementBounded(t, watch, "turn-1's quiet success settlement") // the natural-success handoff
+		nextSettlementBounded(t, watch, "the boundary input's own settlement")
 		if rec := settledOperation(t, store, session, "turn-1"); rec.State.Status != OperationSuccess {
-			t.Fatalf("operation settled %q, want the boundary steering to continue it to success", rec.State.Status)
+			t.Fatalf("operation settled %q, want the boundary handoff success", rec.State.Status)
+		}
+		if rec := settledOperation(t, store, session, "boundary"); rec.State.Status != OperationSuccess {
+			t.Fatalf("boundary operation settled %q, want the boundary input admitted and successful", rec.State.Status)
 		}
 		if texts := strings.Join(script.lastTexts(), "|"); texts != "system|hello|done|at-boundary" {
-			t.Fatalf("final projection = %q, want the boundary steering drained in the same Operation", texts)
+			t.Fatalf("final projection = %q, want the boundary steering as the successor's first request", texts)
 		}
 		if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,at-boundary" {
-			t.Fatalf("committed inputs = %q, want the boundary input owned by the same Operation", got)
+			t.Fatalf("committed inputs = %q, want each input owned by its own Operation", got)
+		}
+		if owner, _ := steeringInputOwner(t, store, session, "at-boundary"); owner != "boundary" {
+			t.Fatalf("boundary input owned by %q, want its own Operation", owner)
 		}
 	})
 

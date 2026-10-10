@@ -128,8 +128,14 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 }
 
 // TestPublicLaunchChildSessionAutomaticCompaction retains the launched-child
-// trigger oracle on both stores. Completion delivery, terminal publication,
-// scoped Close and run retirement are separate observations.
+// trigger oracle on both stores and extends it with the frozen-checkpoint
+// steering row: the child's actual compact request parks inside the
+// checkpoint, a user steering head submitted during the freeze stays pending
+// with no successor scoped, the compaction summary and usage commit once
+// under the preceding child Operation, and the successor then owns its caller
+// identity/input and receives the summary projection. Completion delivery,
+// terminal publication, scoped Close and run retirement are separate
+// observations.
 func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -162,6 +168,8 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		}
 		var requests []requestObservation
 		var compactRequests []model.Request
+		compactArrived := make(chan struct{})
+		compactGate := make(chan struct{})
 		parentRequest := make(chan string, 1)
 		parentClose := make(chan string, 1)
 		root := ""
@@ -190,7 +198,12 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 							CompactModel: func(_ context.Context, req model.Request) (model.Stream, error) {
 								mu.Lock()
 								compactRequests = append(compactRequests, req)
+								first := len(compactRequests) == 1
 								mu.Unlock()
+								if first {
+									close(compactArrived) // the actual compact request parks inside the frozen checkpoint
+									<-compactGate
+								}
 								return summaryTurnStream("child summary", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
 							},
 							Tool:          publicImmediateTool,
@@ -294,9 +307,38 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		if result, err := submit(t, h, child, "child-op-2", harness.MessageModeRegular, huge); err != nil || result.Disposition != harness.DispositionAdmitted {
 			t.Fatalf("second child submit = %+v, %v", result, err)
 		}
+		select {
+		case <-compactArrived: // the overflowing turn is inside its frozen compact checkpoint
+		case <-time.After(10 * time.Second):
+			t.Fatal("the child compact request never arrived")
+		}
+		// a user steering head submitted during the frozen checkpoint stays
+		// pending: no compact piece hands off and no successor is scoped
+		steered, err := submit(t, h, child, "child-op-3", harness.MessageModeRegular, "steered child")
+		if err != nil || steered.Disposition != harness.DispositionSteering || steered.Operation != nil {
+			t.Fatalf("checkpoint steering submit = %+v, %v", steered, err)
+		}
+		frozen, err := h.SnapshotSession(context.Background(), child)
+		if err != nil {
+			t.Fatalf("frozen snapshot: %v", err)
+		}
+		if len(frozen.Steering) != 1 || frozen.Steering[0].OperationID != "child-op-3" {
+			t.Fatalf("steering during the checkpoint = %+v, want the head pending", frozen.Steering)
+		}
+		for _, op := range frozen.Operations {
+			if op.Admission.OperationID == "child-op-3" {
+				t.Fatalf("the pending head was scoped as an Operation inside the frozen checkpoint")
+			}
+		}
+		close(compactGate) // the pieces complete and the turn settles
+
 		secondOperation := awaitTerminal(t, h, child, "child-op-2")
 		if rec := secondOperation; rec.State.Status != harness.OperationSuccess || rec.Admission.Execution.ContextWindow != window {
 			t.Fatalf("second child capture/terminal: %+v", rec)
+		}
+		thirdOperation := awaitSettled(t, h, child, "child-op-3")
+		if thirdOperation.State.Status != harness.OperationSuccess {
+			t.Fatalf("checkpoint successor terminal: %+v", thirdOperation.State)
 		}
 		childQuiet := awaitPublicQuiet(t, h, child, sink)
 		mu.Lock()
@@ -304,22 +346,43 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		observedRequests := append([]requestObservation(nil), requests...)
 		observedPrepares := append([]harness.PreparationRequest(nil), prepares...)
 		mu.Unlock()
-		if len(observedRequests) != 3 {
-			t.Fatalf("conversation requests = %d, want child, parent completion, rebuilt child", len(observedRequests))
+		if len(observedRequests) != 4 {
+			t.Fatalf("conversation requests = %d, want child, parent completion, rebuilt child, checkpoint successor", len(observedRequests))
 		}
 		if len(observedPieces) != 1 {
 			t.Fatalf("child compact calls = %d, want one complete piece", len(observedPieces))
 		}
 		var rebuilt model.Request
-		rebuiltCalls := 0
+		var successor model.Request
+		rebuiltCalls, successorCalls := 0, 0
 		for _, observed := range observedRequests {
 			if observed.session == child && observed.operation == "child-op-2" {
 				rebuilt, rebuiltCalls = observed.request, rebuiltCalls+1
+			}
+			if observed.session == child && observed.operation == "child-op-3" {
+				successor, successorCalls = observed.request, successorCalls+1
 			}
 		}
 		got := texts(rebuilt)
 		if rebuiltCalls != 1 || len(got) != 2 || got[1] != "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]" || rebuilt.Messages[1].Source != compactRef {
 			t.Fatalf("child rebuilt calls/projection = %d/%q", rebuiltCalls, got)
+		}
+		successorGot := texts(successor)
+		if successorCalls != 1 || len(successorGot) != 4 || successorGot[1] != got[1] || successorGot[2] != "child answer" || successorGot[3] != "steered child" {
+			t.Fatalf("checkpoint successor calls/projection = %d/%v, want the summary, the post-checkpoint turn, then its own admitted input", successorCalls, successorGot)
+		}
+		steerOwned := false
+		for _, fact := range childQuiet.Facts {
+			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 &&
+				fact.Input.Content[0].Text == "steered child" {
+				if fact.OperationID != "child-op-3" {
+					t.Fatalf("checkpoint steering input owned by %q, want child-op-3", fact.OperationID)
+				}
+				steerOwned = true
+			}
+		}
+		if !steerOwned {
+			t.Fatalf("the checkpoint steering head never committed under its own Operation")
 		}
 		compactions := 0
 		for _, fact := range childQuiet.Facts {
@@ -348,7 +411,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		if !pieceCount(secondOperation.State.Usage) || !pieceCount(childQuiet.Session.State.Usage) {
 			t.Fatalf("child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.Session.State.Usage)
 		}
-		if len(observedPrepares) != 3 || observedPrepares[0].Session.Identity.SessionID != child || observedPrepares[1].Session.Identity.SessionID != root || observedPrepares[2].Session.Identity.SessionID != child {
+		if len(observedPrepares) != 4 || observedPrepares[0].Session.Identity.SessionID != child || observedPrepares[1].Session.Identity.SessionID != root || observedPrepares[2].Session.Identity.SessionID != child || observedPrepares[3].Session.Identity.SessionID != child {
 			t.Fatalf("shared preparation lineage = %+v", observedPrepares)
 		}
 		for _, preparation := range observedPrepares {

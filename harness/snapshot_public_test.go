@@ -282,9 +282,10 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		defer f.close()
 		// preparation call 0 is op-1's admission; the post-terminal drain's
 		// admission parks on its gate so the selected-but-unresolved delivery
-		// state stays stable. The steering item is not on this path: a waiting
-		// steering item continues the completed turn, and its boundary
-		// delivers the input under the running Operation's identity.
+		// state stays stable. The steering item leads the drain: the waiting
+		// steering item hands the settled Operation off at the natural-success
+		// boundary, and the drain admits it before the queued head under its
+		// own identity.
 		prepGate := make(chan struct{})
 		drainGate := make(chan struct{})
 		releasePrep := sync.OnceFunc(func() { close(prepGate) })
@@ -372,47 +373,44 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 				reread.Steering[0].Content[0].Text, reread.Queued[0].Content[0].Text, err)
 		}
 
-		// Releasing the boundary lets op-1's completed turn continue for the
-		// waiting steering item: that boundary commits op-3's content as an
-		// op-1-owned input — the selected head leaves the buffer in the
-		// adoption section — op-1 settles, and the post-terminal drain selects
-		// op-2 and parks in its admission preparation with the queued head
-		// still pending.
+		// Releasing the boundary settles op-1 through the natural-success
+		// handoff: the waiting steering item is selected by the post-terminal
+		// drain — before the queued head — and the drain's admission parks in
+		// its preparation with both heads still pending.
 		script.releaseGate()
-		<-script.arrived // the continuation turn for the waiting steering item
-		<-f.prepare      // the drain admission of op-2 is preparing
+		<-f.prepare // the drain admission of the steering head (op-3) is preparing
 		parked, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
 			t.Fatalf("snapshot during the parked delivery: %v", err)
 		}
-		if len(parked.Steering) != 0 {
-			t.Fatalf("steering buffer during the parked delivery = %+v, want the adopted input's head gone", parked.Steering)
+		if len(parked.Steering) != 1 || parked.Steering[0].OperationID != "op-3" {
+			t.Fatalf("steering buffer during the parked delivery = %+v, want the selected head still pending until adoption", parked.Steering)
 		}
 		if len(parked.Queued) != 1 || parked.Queued[0].OperationID != "op-2" {
-			t.Fatalf("queued buffer during the parked delivery = %+v, want the selected head still pending", parked.Queued)
+			t.Fatalf("queued buffer during the parked delivery = %+v, want the queued head pending behind the steering head", parked.Queued)
+		}
+		if parked.Session.State.CurrentOperationID != "" {
+			t.Fatalf("current operation during the parked delivery = %q, want the handed-off predecessor settled", parked.Session.State.CurrentOperationID)
 		}
 		for _, op := range parked.Operations {
 			if op.Admission.OperationID == "op-2" || op.Admission.OperationID == "op-3" {
 				t.Fatalf("the pending item %s committed before its delivery completed", op.Admission.OperationID)
 			}
-		}
-		steered := false
-		for _, fact := range parked.Facts {
-			if fact.Input != nil && fact.Input.OperationID == "op-1" && fact.Input.Content[0].Text == "steer-1" {
-				steered = true // the steering delivery adopted at its durable commit
+			if op.Admission.OperationID == "op-1" && op.State.Status != harness.OperationSuccess {
+				t.Fatalf("op-1 = %q during the parked delivery, want the handoff's quiet success", op.State.Status)
 			}
 		}
-		if !steered {
-			t.Fatalf("the delivered steering input is missing from the committed facts")
-		}
-		// the drain's reservation is the only local publication between the
-		// buffering and the parked admission: the steering delivery's removal
-		// rode its durable adoption
+		// the handoff's carried reservation is the only local publication
+		// between the buffering and the parked admission: the drain consumes
+		// it instead of acquiring a second one
 		if parked.LocalRevision != buffered.LocalRevision+1 {
 			t.Fatalf("parked revision = %d, want %d", parked.LocalRevision, buffered.LocalRevision+1)
 		}
-		releaseDrain()   // op-2 admits, runs, and settles
-		<-script.arrived // the admitted Operation's execution started
+		releaseDrain()   // the steering head admits, runs, and settles; the queued head follows
+		<-script.arrived // the admitted steering Operation's execution started
+		awaitTerminal(t, f.h, session, "op-3")
+		<-f.prepare      // the queued head's admission preparation
+		<-script.arrived // the queued Operation's execution started
 		awaitTerminal(t, f.h, session, "op-2")
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
@@ -424,12 +422,26 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if final.ExecutionBusy || len(final.Steering) != 0 || len(final.Queued) != 0 {
 			t.Fatalf("final snapshot = busy %v steering %d queued %d", final.ExecutionBusy, len(final.Steering), len(final.Queued))
 		}
-		if len(final.Operations) != 2 {
-			t.Fatalf("final operations = %d, want the two admitted Operations", len(final.Operations))
+		if len(final.Operations) != 3 {
+			t.Fatalf("final operations = %d, want the three split Operations", len(final.Operations))
 		}
-		for _, op := range final.Operations {
-			if op.Admission.OperationID == "op-3" {
-				t.Fatalf("the steering item became an Operation; its content belongs to op-1's history")
+		for _, fact := range final.Facts {
+			if fact.Kind != harness.EntryInput || fact.Input == nil || len(fact.Input.Content) == 0 {
+				continue
+			}
+			switch fact.Input.Content[0].Text {
+			case "hello":
+				if fact.OperationID != "op-1" {
+					t.Fatalf("admitted input owned by %q, want op-1", fact.OperationID)
+				}
+			case "steer-1":
+				if fact.OperationID != "op-3" {
+					t.Fatalf("steering input owned by %q, want its own Operation op-3", fact.OperationID)
+				}
+			case "queued-1":
+				if fact.OperationID != "op-2" {
+					t.Fatalf("queued input owned by %q, want op-2", fact.OperationID)
+				}
 			}
 		}
 	})

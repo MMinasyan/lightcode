@@ -251,7 +251,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		}
 	})
 
-	t.Run("steering reaches the model boundary and continues the operation", func(t *testing.T) {
+	t.Run("steering delivers through the completion identity at the boundary", func(t *testing.T) {
 		store := emptyStore(t)
 		script := newModelScript()
 		script.gate = make(chan struct{})
@@ -278,7 +278,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		}
 
 		script.releaseGate()
-		<-script.arrived // the continuation drained the steering at the boundary
+		<-script.arrived // the completion identity's own Operation carries the steered completion
 		if texts := strings.Join(script.lastTexts(), "|"); !strings.Contains(texts, "steered completion") {
 			t.Fatalf("continuation projection = %q, want the steered completion", texts)
 		}
@@ -286,6 +286,10 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationSuccess {
 			t.Fatalf("steered operation settled %q, want success", rec.State.Status)
 		}
+		// The delivered completion runs as its own successor Operation: wait
+		// for its terminal commit and Session quiet before raw graph reads.
+		awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
+		awaitHarnessQuiet(t, h, session)
 		if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"hello", "steered completion"}) {
 			t.Fatalf("committed inputs = %q, want the steered completion after the first input", got)
 		}
@@ -457,7 +461,6 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
 	session := createSession(t, h)
-	watch := watchSettlements(store)
 	c := cachedCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
@@ -489,18 +492,19 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 		t.Fatalf("raced delivery: %v", err)
 	}
 
-	// The rerouted completion is steering, never a separate admission: it is
-	// either still buffered or already committed as the active Operation's
-	// runtime input at its first model boundary.
+	// The rerouted completion is steering, never a separate admission while
+	// it waits: it is either still buffered or already delivered through its
+	// own successor admission after the boundary handoff.
 	if storedOperationExists(store, session, member.completionID) {
 		t.Fatalf("the raced completion admitted a new operation")
 	}
 
 	script.releaseGate()
-	<-script.arrived // the boundary drained the steering into the running operation
+	<-script.arrived // the boundary hands off; the successor admission delivers the steering
 	// The rerouted completion actually reached the model boundary: whether
 	// the steering committed before the winning Operation started or during
-	// its first boundary, the last request the Operation sent carries it.
+	// its first boundary, the request that carries it is sent by its own
+	// successor admission.
 	deadline := time.After(2 * time.Second)
 	for {
 		reqs := script.seen()
@@ -516,9 +520,15 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 	if reqs := script.seen(); len(reqs) > 2 {
 		t.Fatalf("model requests = %d, want the boundary plus at most the drained continuation", len(reqs))
 	}
-	watch.next()
+	// The completion executes as its own successor Operation: wait for its
+	// terminal commit and Session quiet before any raw graph validation.
+	awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
+	awaitHarnessQuiet(t, h, session)
 	if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"hello", "raced"}) {
 		t.Fatalf("committed inputs = %q, want the rerouted completion as steering", got)
+	}
+	if owner, origin := steeringInputOwner(t, store, session, "raced"); owner != member.completionID || origin != InputOriginRuntime {
+		t.Fatalf("raced input owner/origin = %q/%v, want %q/%v", owner, origin, member.completionID, InputOriginRuntime)
 	}
 	waitMemberDone(t, member)
 }

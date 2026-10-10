@@ -425,15 +425,16 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	if prior.EntryID == "" || prior.Summary != "prior summary" || prior.Usage == nil || *prior.Usage != priorUsage || operationStateOf(t, priorGraph, testOpID).Status != OperationSuccess {
 		t.Fatalf("successful nonempty prior checkpoint missing: %+v", prior)
 	}
-	const failingOperation = "op-2"
+	const firstPieceOp = "op-2"
+	const failingOperation = "op-3"
 	pieces := compactTwoPieceSnapshot(t)
-	mustAdmitWithoutExecution(t, h, sessionID, failingOperation, pieces[0].Content)
-	if res, err := h.Submit(context.Background(), SubmitRequest{SessionID: sessionID, OperationID: "steering", Origin: InputOriginUser, Content: pieces[1].Content, Mode: MessageModeRegular}); err != nil || res.Disposition != DispositionSteering {
-		t.Fatalf("later checkpoint steering = %+v, %v", res, err)
-	}
-	if _, err := h.contextSource(c, failingOperation)(context.Background()); err != nil {
+	// Two durable admitted inputs — the split-Operation shape of two delivered
+	// messages — make the later checkpoint need a continuation piece.
+	mustAdmitWithoutExecution(t, h, sessionID, firstPieceOp, pieces[0].Content)
+	if err := h.settleAgentTerminal(c, firstPieceOp, agent.TerminalResult{Status: agent.TerminalSuccess}, nil); err != nil {
 		t.Fatal(err)
 	}
+	mustAdmitWithoutExecution(t, h, sessionID, failingOperation, pieces[1].Content)
 	before, err := h.projectContext(c, failingOperation)
 	if err != nil {
 		t.Fatalf("projectContext: %v", err)
@@ -556,9 +557,11 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 }
 
 // TestModelEffectCompactTriggerSteeringStaysBuffered proves the steering row:
-// steering submitted during the orchestration is not drained again and stays
-// buffered — the rebuilt request carries only the compacted projection — and
-// it drains at the next model boundary through the ordinary context source.
+// steering submitted during the orchestration never enters the frozen snapshot
+// and stays buffered — the rebuilt request carries only the compacted
+// projection, no compact piece performs a steering handoff, and the completed
+// turn settles ready so the steering is delivered through ordinary successor
+// admission after the Operation's terminal.
 func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	req := projectedTriggerRequest(t, h, c)
@@ -587,10 +590,11 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("model effect: %v", err)
 	}
-	// The waiting steering kept the Operation running across the ready
-	// boundary; the rebuilt request itself carried none of it.
-	if set.Disposition != agent.DispoContinue {
-		t.Fatalf("settlement disposition %q, want the waiting steering to continue the Operation", set.Disposition)
+	// The completed turn settles ready: waiting steering never keeps the
+	// Operation running inside the model effect, and no compact piece drains
+	// or hands off the steering.
+	if set.Disposition != agent.DispoReady {
+		t.Fatalf("settlement disposition %q, want the ordinary ready settlement", set.Disposition)
 	}
 	if len(sent) != 1 {
 		t.Fatalf("conversation transport calls = %d, want exactly one", len(sent))
@@ -606,41 +610,18 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 	if buffered != 1 {
 		t.Fatalf("steering buffered = %d, want the steering submitted during compaction to stay buffered", buffered)
 	}
-	// The next model boundary drains it through the ordinary context source.
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
-	if err != nil {
-		t.Fatalf("context source: %v", err)
+	if got := strings.Join(entryTexts(t, store, sessionID), ","); got != "hello" {
+		t.Fatalf("committed inputs = %q, want the steering never committed in place", got)
 	}
-	drained := false
-	for _, msg := range msgs {
-		if msg.Role == model.RoleUser && msg.TextContent() == "s1" {
-			drained = true
-		}
-	}
-	if !drained {
-		t.Fatalf("next-boundary projection = %+v, want the drained steering message", msgs)
-	}
-	if got := strings.Join(entryTexts(t, store, sessionID), ","); got != "hello,s1" {
-		t.Fatalf("committed inputs = %q, want the steering committed as ordinary input at the boundary", got)
-	}
-	// The drained steering input belongs to the compaction-owning Operation:
-	// no separate Operation was ever admitted under the steering identity.
+	// The steering stays pending under its own identity for the successor
+	// admission after the compaction-owning Operation's terminal: no separate
+	// Operation was ever admitted while the orchestration ran.
 	if storedOperationExists(store, sessionID, "op-2") {
 		t.Fatalf("the steering submitted during compaction admitted its own operation")
 	}
-	steeringGraph, err := validateFixture(t, store, sessionID)
-	if err != nil {
+	if _, err := validateFixture(t, store, sessionID); err != nil {
 		t.Fatalf("graph: %v", err)
 	}
-	for i := range steeringGraph.Entries {
-		if input := steeringGraph.Entries[i].Input; input != nil && len(input.Content) > 0 && input.Content[0].Text == "s1" {
-			if owner := steeringGraph.Entries[i].Envelope.OperationID; owner != testOpID {
-				t.Fatalf("steering input owned by %q, want the compaction-owning %q", owner, testOpID)
-			}
-			return
-		}
-	}
-	t.Fatalf("no committed steering input found for %q", "s1")
 }
 
 // TestModelEffectCompactTriggerSecondOverflowSameOperation proves the

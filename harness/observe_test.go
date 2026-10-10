@@ -301,13 +301,13 @@ func TestObserveRunLifecycle(t *testing.T) {
 }
 
 // TestObserveBufferClocks proves the buffer clocks: the active enqueue, the
-// steering delivery's durable commit, the drain's admission, and the
-// Harness-loss discard each emit exactly when the counter advances. A
-// delivery's head selection publishes nothing: the removal rides the durable
-// adoption, or is the failed attempt's final outcome under its own hold.
+// drain's admission, and the Harness-loss discard each emit exactly when the
+// counter advances. A delivery's head selection publishes nothing: the
+// removal rides the durable adoption, or is the failed attempt's final
+// outcome under its own hold.
 func TestObserveBufferClocks(t *testing.T) {
-	t.Run("active enqueue and steering delivery", func(t *testing.T) {
-		h, _, c, sessionID := newEffectHarness(t, nil)
+	t.Run("active enqueue holds the reservation across the enqueue", func(t *testing.T) {
+		h, _, _, sessionID := newEffectHarness(t, nil)
 		col := observeHarness(h)
 		base := snapshotPair(t, h, sessionID)
 
@@ -323,14 +323,6 @@ func TestObserveBufferClocks(t *testing.T) {
 			t.Fatalf("active submit facts = %d, want reserve, enqueue and release", len(facts))
 		}
 		wantPairAt(t, h, sessionID, base.DurableRevision, base.LocalRevision+3)
-
-		col.reset()
-		h.drainSteering(context.Background(), c, testOpID)
-		facts = col.invalidations()
-		if len(facts) != 1 {
-			t.Fatalf("steering delivery facts = %d, want exactly the durable input commit (the selection publishes nothing)", len(facts))
-		}
-		wantPairAt(t, h, sessionID, base.DurableRevision+1, base.LocalRevision+3) // the durable steering input; the removal rode its adoption
 	})
 
 	t.Run("drain selection and admission", func(t *testing.T) {
@@ -393,15 +385,19 @@ func TestObserveBufferClocks(t *testing.T) {
 		base := snapshotPair(t, h, testSessionID)
 		cancel()
 
-		h.drainSteering(context.Background(), c, testOpID)
+		c.mu.Lock()
+		c.run = &activeExecution{done: make(chan struct{})} // the pre-terminal run the real flow would have retired
+		run := c.run
+		c.mu.Unlock()
+		h.drainBuffers(c, run) // the drain's loss gate discards both buffers
 		facts := col.invalidations()
-		if len(facts) != 1 {
-			t.Fatalf("discard facts = %d, want exactly the buffer discard", len(facts))
+		if len(facts) != 3 {
+			t.Fatalf("discard facts = %d, want the drain's reservation, the buffer discard and the release", len(facts))
 		}
-		wantPairAt(t, h, testSessionID, base.DurableRevision, base.LocalRevision+1)
+		wantPairAt(t, h, testSessionID, base.DurableRevision, base.LocalRevision+3)
 
-		h.drainSteering(context.Background(), c, testOpID) // an empty discard emits nothing
-		if got := len(col.invalidations()); got != 1 {
+		h.drainBuffers(c, run) // an empty discard emits only the reservation cycle
+		if got := len(col.invalidations()); got != 5 {
 			t.Fatalf("empty discard advanced the facts to %d", got)
 		}
 	})
@@ -610,7 +606,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		wantPairAt(t, h, testSessionID, 2, 2)
 	})
 
-	t.Run("model result, compaction and steering", func(t *testing.T) {
+	t.Run("model result and compaction", func(t *testing.T) {
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(), nil
 		}
@@ -640,20 +636,6 @@ func TestObserveDurableAdvances(t *testing.T) {
 		after := snapshotPair(t, h, sessionID)
 		if after.DurableRevision <= compactionBase.DurableRevision {
 			t.Fatalf("compaction pair = %+v, want a durable advance over %+v", after, compactionBase)
-		}
-
-		col.reset()
-		steeringBase := snapshotPair(t, h, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steer")}); err != nil {
-			t.Fatalf("commitSteeringInput: %v", err)
-		}
-		facts = col.invalidations()
-		if len(facts) != 1 {
-			t.Fatalf("steering facts = %d, want one", len(facts))
-		}
-		after = snapshotPair(t, h, sessionID)
-		if after.DurableRevision <= steeringBase.DurableRevision {
-			t.Fatalf("steering pair = %+v, want a durable advance over %+v", after, steeringBase)
 		}
 	})
 
@@ -952,7 +934,7 @@ func TestObserveConcurrentCommits(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steer")}); err != nil {
+		if _, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{}); err != nil {
 			t.Errorf("second commit: %v", err)
 		}
 	}()

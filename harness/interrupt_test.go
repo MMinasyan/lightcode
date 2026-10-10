@@ -172,7 +172,7 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		if err := h.Interrupt(context.Background(), sessionID); err != nil { // the durable Operation runs; no execution is installed yet
 			t.Fatalf("Interrupt: %v", err)
 		}
-		if err := h.execute(c, testOpID, prepared, h.ctx); !errors.Is(err, context.Canceled) {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
 			t.Fatalf("execute = %v, want the entry interruption", err)
 		}
 		if opens != 0 {
@@ -216,7 +216,7 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		default:
 			t.Fatalf("the retiring predecessor's done channel was reopened")
 		}
-		if err := h.execute(c, testOpID, prepared, h.ctx); !errors.Is(err, context.Canceled) {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
 			t.Fatalf("execute = %v, want the entry interruption", err)
 		}
 		if opens != 0 {
@@ -242,7 +242,7 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		c.mu.Lock()
 		c.interruptOp = "op-other"
 		c.mu.Unlock()
-		if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 			t.Fatalf("execute: %v", err)
 		}
 		if opens != 1 {
@@ -267,45 +267,47 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 	})
 }
 
-// TestInterruptSteeringCommitsAndQueuedAdmits proves the buffer row: steering
-// already popped and committed at the model boundary stays committed through
-// the interrupted Operation's settlement, the steering submitted after that
-// boundary stays unpopped for the post-terminal drain, the interrupted
-// Operation settles with the contract detail, and the queued input submitted
-// before the interrupt is admitted afterward.
-func TestInterruptSteeringCommitsAndQueuedAdmits(t *testing.T) {
+// TestInterruptSteeringPreservesBufferOrder proves the buffer row: steering
+// waiting when the interrupt lands stays buffered and unpopped — nothing is
+// committed in place — the interrupted Operation settles with the contract
+// detail, and the post-terminal drain admits the buffered heads in FIFO
+// order, steering before queued input.
+func TestInterruptSteeringPreservesBufferOrder(t *testing.T) {
 	store := emptyStore(t)
 	var (
-		mu      sync.Mutex
-		calls   int
-		gate1   = make(chan struct{}) // parks boundary 1 until the buffered inputs are submitted
-		park2   = make(chan struct{}) // parks boundary 2 until the interrupt lands
-		started = make(chan struct{})
-		second  = make(chan struct{})
+		mu          sync.Mutex
+		toolCalls   int
+		modelCalls  int
+		toolArrived = make(chan struct{})
+		toolGate    = make(chan struct{})
 	)
-	modelFn := func(ctx context.Context, req model.Request) (model.Stream, error) {
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		mu.Lock()
-		calls++
-		n := calls
+		modelCalls++
+		firstModel := modelCalls == 1
 		mu.Unlock()
-		switch n {
-		case 1:
-			started <- struct{}{}
-			<-gate1
-			return completedTurnStream(), nil
-		case 2: // the boundary drain has already popped and committed s1 on the Harness context
-			second <- struct{}{}
-			select {
-			case <-park2:
-				return completedTurnStream(), nil
-			case <-ctx.Done(): // the interrupt cancels the execution context while the boundary is parked
-				return nil, ctx.Err()
-			}
-		default:
-			return completedTurnStream(), nil
+		if firstModel {
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
+		return completedTurnStream(), nil
+	}
+	toolFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
+		mu.Lock()
+		toolCalls++
+		first := toolCalls == 1
+		mu.Unlock()
+		if !first {
+			return immediateToolPlan(ctx, call)
+		}
+		toolArrived <- struct{}{} // the first batch parks mid-execution: the pre-handoff window
+		select {
+		case <-toolGate:
+			return immediateToolPlan(ctx, call)
+		case <-ctx.Done(): // the interrupt cancels the execution context inside the batch
+			return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}}
 		}
 	}
-	prepared := modelPrepared(modelFn)
+	prepared := successToolExecution(modelFn, toolFn)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
@@ -314,38 +316,36 @@ func TestInterruptSteeringCommitsAndQueuedAdmits(t *testing.T) {
 	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
-	<-started // parked at the first model boundary
+	receiveBounded(t, toolArrived, "the first tool batch") // op-1 parks inside its tool batch, before any handoff boundary
 	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1"); err != nil {
-		t.Fatalf("steering submit 1: %v", err)
+		t.Fatalf("steering submit: %v", err)
 	}
 	if _, err := submitText(t, h, session, "op-4", MessageModeQueued, "q1"); err != nil {
 		t.Fatalf("queued submit: %v", err)
 	}
-
-	close(gate1) // the first turn commits; the boundary drain pops and commits s1, then boundary 2 parks
-	<-second
-	if _, err := submitText(t, h, session, "op-3", MessageModeRegular, "s2"); err != nil {
-		t.Fatalf("steering submit 2: %v", err)
-	}
 	if err := h.Interrupt(context.Background(), session); err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
+	close(toolGate)
 
-	watch.next() // op-1 settles as the interrupted Operation
+	nextSettlementBounded(t, watch, "op-1's interrupted terminal") // op-1 settles as the interrupted Operation
 	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationInterruption ||
 		rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
 		t.Fatalf("op-1 state = %+v, want terminal interruption with the contract detail", rec.State)
 	}
-	watch.next() // the unpopped steering drains through ordinary admission and succeeds
-	if rec := settledOperation(t, store, session, "op-3"); rec.State.Status != OperationSuccess {
-		t.Fatalf("op-3 status = %s, want the preserved steering admitted and successful", rec.State.Status)
+	nextSettlementBounded(t, watch, "the steering head's settlement") // the buffered steering drains through ordinary admission
+	if rec := settledOperation(t, store, session, "op-2"); rec.State.Status != OperationSuccess {
+		t.Fatalf("op-2 status = %s (%s), want the preserved steering admitted and successful", rec.State.Status, rec.State.Terminal.Detail)
 	}
-	watch.next() // the queued input drains next
+	nextSettlementBounded(t, watch, "the queued head's settlement") // the queued input drains next
 	if rec := settledOperation(t, store, session, "op-4"); rec.State.Status != OperationSuccess {
 		t.Fatalf("op-4 status = %s, want the queued input admitted and successful", rec.State.Status)
 	}
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,s1,s2,q1" {
-		t.Fatalf("committed inputs = %q, want the popped steering committed and the buffers drained", got)
+	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,s1,q1" {
+		t.Fatalf("committed inputs = %q, want the buffers drained in FIFO order", got)
+	}
+	if owner, _ := steeringInputOwner(t, store, session, "s1"); owner != "op-2" {
+		t.Fatalf("steering input s1 owned by %q, want op-2", owner)
 	}
 	requireSessionCleared(t, h, session)
 	if _, err := validateFixture(t, store, session); err != nil {

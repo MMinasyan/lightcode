@@ -20,18 +20,6 @@ func newProjectionFixture(t *testing.T, fixture *testGraph) (*Harness, *coordina
 	return h, c
 }
 
-// projectionInput returns one operation-owned input fixture entry with the
-// given identity and text.
-func projectionInput(entryID, text string, sequence int64) testEntry {
-	v := validInputEntry(testOpID)
-	v.EntryID = entryID
-	v.Content = []model.ContentPart{{Kind: model.PartText, Text: text}}
-	return testEntry{
-		env:   Entry{SessionID: testSessionID, ID: entryID, OperationID: testOpID, Kind: EntryInput, Sequence: sequence, CommittedAt: testTime},
-		input: &v,
-	}
-}
-
 // projectionAssistant returns one assistant fixture entry with the given
 // identity and text.
 func projectionAssistant(entryID, text string, sequence int64) testEntry {
@@ -56,10 +44,40 @@ func projectionCompaction(entryID, boundaryID string, sequence int64) testEntry 
 	}
 }
 
+// projectionFollowUp returns one settled follow-up message Operation and its
+// admitted input entry with the given identities and text — the split
+// Operation shape every later delivered input takes, so fixture graphs keep
+// the one admitted input per message Operation rule.
+func projectionFollowUp(entryID, operationID, text, settlementID string, sequence, settlementSequence int64) (testEntry, testEntry, OperationRecord) {
+	input := validInputEntry(operationID)
+	input.EntryID = entryID
+	input.Content = []model.ContentPart{{Kind: model.PartText, Text: text}}
+	stamped := testTime
+	settlement := validSettlementEntry()
+	settlement.EntryID = settlementID
+	settlement.OperationID = operationID
+	settlement.Status = OperationSuccess
+	op := validOperationRecord()
+	op.Admission.OperationID = operationID
+	op.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: entryID}
+	op.State.Status = OperationSuccess
+	op.State.SettledAt = &stamped
+	op.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: settlementID}}
+	return testEntry{
+			env:   Entry{SessionID: testSessionID, ID: entryID, OperationID: operationID, Kind: EntryInput, Sequence: sequence, CommittedAt: testTime},
+			input: &input,
+		}, testEntry{
+			env:        Entry{SessionID: testSessionID, ID: settlementID, OperationID: operationID, Kind: EntryOperationSettlement, Sequence: settlementSequence, CommittedAt: testTime},
+			settlement: &settlement,
+		}, op
+}
+
 // projectionMessages calls the context source once and returns its messages.
+// The bare run is the first-request projection shape: these fixtures carry no
+// steering, so no handoff is ever attempted.
 func projectionMessages(t *testing.T, h *Harness, c *coordinator) []model.Message {
 	t.Helper()
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
+	msgs, err := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("context source: %v", err)
 	}
@@ -98,11 +116,13 @@ func assertProjectionEqual(t *testing.T, got, want []model.Message) {
 // sequence order — nothing at or before the boundary projects.
 func TestContextSourceSummarizedProjection(t *testing.T) {
 	fixture := validTestGraph()
-	fixture.entries = append(fixture.entries,
-		projectionCompaction(hexID(3), hexID(2), 3),
-		projectionInput(hexID(4), "second", 4),
-		projectionAssistant(hexID(5), "later", 5),
-	)
+	fixture.entries = append(fixture.entries, projectionCompaction(hexID(3), hexID(2), 3))
+	followInput, followSettlement, followOp := projectionFollowUp(hexID(4), "op-2", "second", hexID(6), 4, 6)
+	later := projectionAssistant(hexID(5), "later", 5)
+	later.env.OperationID = "op-2"
+	later.assistant.OperationID = "op-2"
+	fixture.entries = append(fixture.entries, followInput, later, followSettlement)
+	fixture.ops = append(fixture.ops, followOp)
 	fixture.session.State.CompactionEntryID = hexID(3)
 	h, c := newProjectionFixture(t, fixture)
 
@@ -140,12 +160,12 @@ func TestContextSourceUncompactedProjectionGolden(t *testing.T) {
 // named boundary alone project.
 func TestContextSourceTwoSequentialCompactions(t *testing.T) {
 	fixture := validTestGraph()
-	fixture.entries = append(fixture.entries,
-		projectionCompaction(hexID(3), hexID(2), 3),
-		projectionInput(hexID(4), "second", 4),
-		projectionCompaction(hexID(5), hexID(4), 5),
-		projectionInput(hexID(6), "third", 6),
-	)
+	fixture.entries = append(fixture.entries, projectionCompaction(hexID(3), hexID(2), 3))
+	secondInput, secondSettlement, secondOp := projectionFollowUp(hexID(4), "op-2", "second", hexID(7), 4, 7)
+	fixture.entries = append(fixture.entries, secondInput, projectionCompaction(hexID(5), hexID(4), 5))
+	thirdInput, thirdSettlement, thirdOp := projectionFollowUp(hexID(6), "op-3", "third", hexID(8), 6, 8)
+	fixture.entries = append(fixture.entries, thirdInput, thirdSettlement, secondSettlement)
+	fixture.ops = append(fixture.ops, secondOp, thirdOp)
 	fixture.session.State.CompactionEntryID = hexID(5)
 	second := *fixture.entries[4].compaction
 	second.Summary = "Second summary."
@@ -183,11 +203,10 @@ func projectionSignal(entryID string, sequence int64) testEntry {
 func TestContextSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
 	t.Run("the entry between the boundary target and the compaction projects", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.entries = append(fixture.entries,
-			projectionSignal(hexID(3), 3),
-			projectionCompaction(hexID(4), hexID(2), 4),
-			projectionInput(hexID(5), "later", 5),
-		)
+		fixture.entries = append(fixture.entries, projectionSignal(hexID(3), 3), projectionCompaction(hexID(4), hexID(2), 4))
+		laterInput, laterSettlement, laterOp := projectionFollowUp(hexID(5), "op-2", "later", hexID(6), 5, 6)
+		fixture.entries = append(fixture.entries, laterInput, laterSettlement)
+		fixture.ops = append(fixture.ops, laterOp)
 		fixture.session.State.CompactionEntryID = hexID(4)
 		h, c := newProjectionFixture(t, fixture)
 

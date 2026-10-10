@@ -16,6 +16,14 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// executeDirect drives one admitted Operation's private execution
+// composition directly, without installing a run — the direct effect-test
+// shape. No steering handoff can fire on this shape: the run is never
+// installed, so the handoff's eligibility recheck always declines.
+func executeDirect(h *Harness, c *coordinator, execCtx context.Context, operationID string, prepared PreparedExecution) error {
+	return h.execute(c, &activeExecution{execCtx: execCtx}, operationID, prepared)
+}
+
 // newEffectHarness admits one running Operation ("op-1") with the given
 // prepared physical model request function and returns the pieces the effect
 // fixtures need.
@@ -278,7 +286,7 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	}
 
 	// The second context projection reads the entry the first effect committed.
-	source := h.contextSource(c, testOpID)
+	source := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)
 	msgs, err := source(context.Background())
 	if err != nil {
 		t.Fatalf("second context projection: %v", err)
@@ -703,7 +711,7 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("coordinator: %v", err)
 	}
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
+	msgs, err := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("context projection: %v", err)
 	}
@@ -738,58 +746,6 @@ func TestSignalProjectionEscaping(t *testing.T) {
 	got := signalProjectedText(`a & b < c > d`)
 	if got != "<system-signal>a &amp; b &lt; c &gt; d</system-signal>" {
 		t.Fatalf("signalProjectedText = %q, want the escaped wrapper", got)
-	}
-}
-
-// TestSteeringInputHelper proves the steering-input producer commits one
-// Operation-owned input entry, preserves the item's own submission origin,
-// and advances last activity to its commit time.
-func TestSteeringInputHelper(t *testing.T) {
-	h, store, c, sessionID := newEffectHarness(t, nil)
-	before, err := h.ReadSessionHeader(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); err != nil {
-		t.Fatalf("commitSteeringInput: %v", err)
-	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginRuntime, content: admissionContent("steered-by-runtime")}); err != nil {
-		t.Fatalf("commitSteeringInput with a non-user origin: %v", err)
-	}
-	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-steering graph: %v", err)
-	}
-	var user, runtime *inputEntry
-	for i := range graph.Entries {
-		if graph.Entries[i].Input == nil || graph.Entries[i].Envelope.OperationID != testOpID {
-			continue
-		}
-		switch graph.Entries[i].Input.Content[0].Text {
-		case "steering":
-			user = graph.Entries[i].Input
-		case "steered-by-runtime":
-			runtime = graph.Entries[i].Input
-		}
-	}
-	if user == nil || user.Origin != InputOriginUser {
-		t.Fatalf("user steering entry not committed with its own origin: %+v", user)
-	}
-	if runtime == nil || runtime.Origin != InputOriginRuntime {
-		t.Fatalf("runtime steering entry did not preserve its submission origin: %+v", runtime)
-	}
-	after, err := h.ReadSessionHeader(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if after.Identity.SessionID != sessionID {
-		t.Fatalf("session identity changed")
-	}
-	if !after.LastActivity.After(before.LastActivity) {
-		t.Fatalf("last activity = %v, want it advanced to the steering commit time", after.LastActivity)
-	}
-	if after.CurrentOperationID != testOpID {
-		t.Fatalf("current operation = %q, want the running operation preserved", after.CurrentOperationID)
 	}
 }
 
@@ -875,16 +831,6 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
-	t.Run("steering transaction", func(t *testing.T) {
-		h, store, c, sessionID := newEffectHarness(t, nil)
-		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrConflict) {
-			t.Fatalf("steering over a foreign revision = %v, want the revision-race conflict", err)
-		}
-		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
-			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
-		}
-	})
 }
 
 // archiveSettledSession moves one open Session with no running Operation to
@@ -925,57 +871,6 @@ func archiveSettledSession(t *testing.T, c *coordinator, store *graphStorage, se
 	if err != nil {
 		t.Fatalf("archive fixture: %v", err)
 	}
-}
-
-// TestSteeringInputPreconditions proves the steering transition's
-// in-transaction preconditions: an open Session whose current Operation is the
-// steering target.
-func TestSteeringInputPreconditions(t *testing.T) {
-	t.Run("steering after terminal settlement", func(t *testing.T) {
-		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return nil, errors.New("model failure")
-		}
-		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-			t.Fatalf("terminal effect: %v", err)
-		}
-		before, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph before steering: %v", err)
-		}
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering after terminal settlement = %v, want ErrInvalid", err)
-		}
-		after, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after refused steering: %v", err)
-		}
-		if len(after.Entries) != len(before.Entries) {
-			t.Fatalf("%d entries after refused steering, want the unchanged %d", len(after.Entries), len(before.Entries))
-		}
-	})
-	t.Run("steering on an archived session", func(t *testing.T) {
-		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return nil, errors.New("model failure")
-		}
-		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-			t.Fatalf("terminal effect: %v", err)
-		}
-		archiveSettledSession(t, c, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering on an archived session = %v, want ErrInvalid", err)
-		}
-		after, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after refused steering: %v", err)
-		}
-		for _, entry := range after.Entries {
-			if entry.Input != nil && entry.Input.Content[0].Text == "steering" {
-				t.Fatalf("steering entry %s committed on an archived session", entry.Envelope.ID)
-			}
-		}
-	})
 }
 
 // foreignTerminalSettle writes one foreign terminal settlement directly into
@@ -1050,13 +945,6 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		store, sessionID = st, sid
 		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("result over a foreign terminal operation = %v, want ErrInvalid", err)
-		}
-	})
-	t.Run("steering over a foreign archive", func(t *testing.T) {
-		h, store, c, sessionID := newEffectHarness(t, nil)
-		foreignArchive(t, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering over a foreign archive = %v, want ErrInvalid", err)
 		}
 	})
 }
@@ -1196,7 +1084,7 @@ func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1243,7 +1131,7 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 		opens = append(opens, openRecord{ctx: ctx, adm: adm})
 		return effectExecution(modelFn, spy.tool), nil
 	})
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if len(opens) != 1 {
@@ -1281,7 +1169,7 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 		return effectExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
 	})
 	cancel() // the execution context is lost before the opener could start
-	if err := h.execute(c, testOpID, prepared, h.ctx); !errors.Is(err, context.Canceled) {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
 		t.Fatalf("execute = %v, want the context error", err)
 	}
 	if opens != 0 {
@@ -1318,7 +1206,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 			}, openErr
 		})
-		if err := h.execute(c, testOpID, prepared, h.ctx); err != openErr {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != openErr {
 			t.Fatalf("execute = %v, want the exact opener error", err)
 		}
 		if modelRuns != 0 {
@@ -1342,7 +1230,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{}, storageErr
 		})
-		if err := h.execute(c, testOpID, prepared, h.ctx); err != storageErr {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != storageErr {
 			t.Fatalf("execute = %v, want the exact storage-class error", err)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1403,7 +1291,7 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			var sessionID string
 			var prepared PreparedExecution
 			h, store, c, sessionID, prepared, _ = newOpenerHarness(t, open)
-			err := h.execute(c, testOpID, prepared, h.ctx)
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatalf("execute = %v, want the invalid-execution rejection", err)
 			}
@@ -2371,7 +2259,7 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if got := spy.dispatched(); len(got) != 2 || got[0] != "call-1" || got[1] != "call-2" {
@@ -2424,7 +2312,7 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -2467,7 +2355,7 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	}
 	spy := &toolSpy{plan: toolFn}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if got := spy.dispatched(); len(got) != 1 || got[0] != "call-1" {
@@ -2520,7 +2408,7 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2546,7 +2434,7 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2595,7 +2483,7 @@ func (s *cancelOnCloseStream) Close() error {
 func TestToolResultAdoptsIntoView(t *testing.T) {
 	h, _, c, sessionID := newEffectHarness(t, nil)
 	publishCalls(t, h, c, sessionID, testToolCall("call-1"), testToolCall("call-2"))
-	source := h.contextSource(c, testOpID)
+	source := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)
 	immediate := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}}
 	}
@@ -2662,7 +2550,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			}
 			return nil
 		}
-		err := h.execute(c, testOpID, prepared, h.ctx)
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
 		if !errors.Is(err, ErrStorage) {
 			t.Fatalf("execute = %v, want the injected storage failure", err)
 		}
@@ -2864,7 +2752,7 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2918,7 +2806,7 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)

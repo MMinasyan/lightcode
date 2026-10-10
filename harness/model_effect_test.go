@@ -497,7 +497,7 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 	}
 	// Partial continuation: the next context projection reads the committed
 	// partial from history.
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
+	msgs, err := h.contextSource(c, &activeExecution{execCtx: context.Background()}, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("continuation projection: %v", err)
 	}

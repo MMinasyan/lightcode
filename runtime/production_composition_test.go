@@ -716,12 +716,13 @@ func chainSessionSignals(t *testing.T, store harness.Storage, sessionID string) 
 // TestProductionCrossBoundaryComposition chains, in one production
 // composition over both stores through public Open: an end-to-end
 // hook-rewritten tool call, a mid-flight config reload, a buffered steering
-// submit with no group of its own whose delivered mutating call reuses the
-// operation's one group on the old capture, a denied multi-target apply_patch
-// move settling only its call, a later allowed apply_patch call retaining the
-// preview and snapshot evidence, the next admitted operation on the reloaded
-// revision, an owner-context cancellation settling the standard interruption
-// signal, and a restart over the same data root with a post-repair admission.
+// submit with no group of its own while it waits whose delivered mutating
+// call derives its own group through the successor admission on the current
+// capture, a denied multi-target apply_patch move settling only its call, a
+// later allowed apply_patch call retaining the preview and snapshot
+// evidence, the next admitted operation on the reloaded revision, an
+// owner-context cancellation settling the standard interruption signal, and a
+// restart over the same data root with a post-repair admission.
 func TestProductionCrossBoundaryComposition(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
@@ -857,31 +858,38 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		close(release2)
 		server.awaitRequests(t, 3)
 
-		// The steering input delivers at the next model boundary: the
-		// continued turn's request carries it, still on the old capture —
-		// the reloaded revision never reaches running work.
+		// The steering input delivers at the next conversation boundary: the
+		// handoff settles op-1 quietly and the steering head's own Operation
+		// makes the next request — still on the old capture, so the reloaded
+		// revision never reaches running work — and its mutating call derives
+		// the steering head's own code group beside the predecessor's.
 		close(release3)
 		server.awaitRequests(t, 4)
-		if got := chainCodeGroupDirs(t, dataDir, sessionID); !slices.Equal(got, []string{admitted}) {
-			t.Fatalf("code groups after the delivered steering's mutating call = %v, want still only the one group %q", got, admitted)
+		steerAdmitted := readOperation(t, r, sessionID, "op-1-steer").Admission.AdmittedEntry.EntryID
+		if got := chainCodeGroupDirs(t, dataDir, sessionID); len(got) != 2 || !slices.Contains(got, admitted) || !slices.Contains(got, steerAdmitted) {
+			t.Fatalf("code groups after the delivered steering's mutating call = %v, want the predecessor's %q and the steering head's own %q", got, admitted, steerAdmitted)
 		}
 
 		// 4+5. The denied multi-target move settles only its call; the later
-		// allowed call in the subsequent turn succeeds. The operation runs
-		// out on its scripted tail.
+		// allowed call in the subsequent turn succeeds. The steering head's
+		// Operation runs out on its scripted tail.
 		rec := awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		if rec.Admission.Execution.ConfigurationRevision != "1" {
 			t.Fatalf("capture revision = %q, want the admitted 1", rec.Admission.Execution.ConfigurationRevision)
+		}
+		steerRec := awaitOperation(t, r, sessionID, "op-1-steer", harness.OperationSuccess)
+		if steerRec.Admission.Execution.ConfigurationRevision != "2" {
+			t.Fatalf("steering head capture revision = %q, want the current reloaded 2", steerRec.Admission.Execution.ConfigurationRevision)
 		}
 		if _, err := os.Stat(filepath.Join(workspace, ".env")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf(".env = err %v, want absent: the denied move's destination must never be written", err)
 		}
 
 		// The steering input's delivery is durable evidence now: a committed
-		// input entry owned by the same operation.
+		// input entry owned by the steering head's own Operation.
 		steeringCommitted := false
 		for _, entry := range mustChainEntries(t, e.store, sessionID) {
-			if entry.Kind == harness.EntryInput && entry.OperationID == "op-1" && strings.Contains(string(entry.Payload), steeringText) {
+			if entry.Kind == harness.EntryInput && entry.OperationID == "op-1-steer" && strings.Contains(string(entry.Payload), steeringText) {
 				steeringCommitted = true
 			}
 		}
@@ -920,9 +928,9 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		}
 
 		// 7. The retained snapshot evidence: the moved file's preimage in the
-		// operation's one code group carries the original bytes.
+		// steering head's own code group carries the original bytes.
 		found := false
-		turnDir := filepath.Join(dataDir, "code", sessionID, admitted, "snapshots", "1")
+		turnDir := filepath.Join(dataDir, "code", sessionID, steerAdmitted, "snapshots", "1")
 		entries, err := os.ReadDir(turnDir)
 		if err != nil {
 			t.Fatalf("read group turn dir: %v", err)
@@ -957,19 +965,23 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 			t.Fatalf("argument hook observations = %v, want each call's original arguments exactly once", seen)
 		}
 
-		// The requests of the running operation all carried the old capture:
-		// turn 2 (pre-reload) and turn 3 (the steering-continued turn after
-		// the reload) both project the captured prompt, and turn 3's history
-		// carries the delivered steering input.
+		// The predecessor's own requests carry its immutable old capture, and
+		// the steering head's own first request carries the current reloaded
+		// capture with the delivered steering input in its history.
 		oldPrompt := rec.Admission.Execution.SystemPrompt
-		for _, i := range []int{1, 2} {
-			wire := decodeWireChatBody(t, server.bodyAt(i))
-			if len(wire.Messages) == 0 || wire.Messages[0].Role != "system" {
-				t.Fatalf("request %d messages = %+v, want the captured system prompt first", i, wire.Messages)
-			}
-			if want, _ := json.Marshal(oldPrompt); string(wire.Messages[0].Content) != string(want) {
-				t.Fatalf("request %d system message = %.120s, want the old captured prompt %.120s", i, wire.Messages[0].Content, want)
-			}
+		wire := decodeWireChatBody(t, server.bodyAt(1))
+		if len(wire.Messages) == 0 || wire.Messages[0].Role != "system" {
+			t.Fatalf("pre-steering request messages = %+v, want the captured system prompt first", wire.Messages)
+		}
+		if want, _ := json.Marshal(oldPrompt); string(wire.Messages[0].Content) != string(want) {
+			t.Fatalf("pre-steering system message = %.120s, want the old captured prompt %.120s", wire.Messages[0].Content, want)
+		}
+		steerWire := decodeWireChatBody(t, server.bodyAt(2))
+		if len(steerWire.Messages) == 0 || steerWire.Messages[0].Role != "system" {
+			t.Fatalf("steering-continued request messages = %+v, want the successor system prompt first", steerWire.Messages)
+		}
+		if want, _ := json.Marshal(steerRec.Admission.Execution.SystemPrompt); string(steerWire.Messages[0].Content) != string(want) {
+			t.Fatalf("steering-continued system message = %.120s, want the successor's current captured prompt %.120s", steerWire.Messages[0].Content, want)
 		}
 		if !strings.Contains(server.bodyAt(2), steeringText) {
 			t.Fatalf("steering-continued request = %s, want the delivered steering input in its history", server.bodyAt(2))

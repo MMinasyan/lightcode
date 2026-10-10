@@ -778,13 +778,9 @@ func projectedSnapshot(t *testing.T, h *Harness, c *coordinator) []model.Message
 // summary message is part of the frozen snapshot together with the entries
 // after the boundary, and the system prompt stays outside the input.
 func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
-	input4 := validInputEntry(testOpID)
-	input4.EntryID = hexID(4)
-	input4.Content = admissionContent("after the boundary")
-	fixture := compactedFixtureGraph(testEntry{
-		env:   Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime},
-		input: &input4,
-	})
+	input4, settlement4, op4 := projectionFollowUp(hexID(4), "op-2", "after the boundary", hexID(5), 4, 5)
+	fixture := compactedFixtureGraph(input4, settlement4)
+	fixture.ops = append(fixture.ops, op4)
 	h := newTestHarness(t, fixture.storage(t), nil)
 	c, err := h.coordinatorFor(context.Background(), testSessionID)
 	if err != nil {

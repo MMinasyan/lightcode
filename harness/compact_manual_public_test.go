@@ -466,8 +466,8 @@ func TestPublicManualCompactRejectsNonIdle(t *testing.T) {
 		// An active Session.
 		rejectIdle("active")
 
-		// A Session with buffered steering: the running Operation consumes it
-		// at its next boundary; Compact must not admit beside it.
+		// A Session with buffered steering: the boundary handoff delivers it
+		// through its own successor admission; Compact must not admit beside it.
 		if res, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "steer"); err != nil || res.Disposition != harness.DispositionSteering {
 			t.Fatalf("steering submit = %+v err %v, want steering", res, err)
 		}

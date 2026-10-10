@@ -143,7 +143,7 @@ type bgDelivery int
 
 const (
 	bgDeliverClosed   bgDelivery = iota // the durable signal entry
-	bgDeliverSteering                   // the parent's active Operation consumes it
+	bgDeliverSteering                   // the successor admission delivers it after the boundary handoff
 	bgDeliverIdle                       // normal admission under the completion identity
 )
 
@@ -151,7 +151,7 @@ const (
 // the caller-held coordinator mutex: a not-receivable parent (harness loss, a
 // non-open lifecycle, or a closed group) closes regardless of activity; an
 // active Operation steers — the waiting steering item is enqueued here, under
-// the same hold; an idle Session admits. Receivability outranks activity.
+// the same hold — an idle Session admits. Receivability outranks activity.
 func backgroundDeliveryPriority(h *Harness, c *coordinator, item *pendingMessage) bgDelivery {
 	if h.ctx.Err() != nil || c.graph.Session.State.Lifecycle != LifecycleOpen || c.bgState == bgClosed {
 		return bgDeliverClosed
@@ -228,7 +228,7 @@ func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinato
 
 	switch mode {
 	case bgDeliverSteering:
-		return nil // enqueued at evaluation; the active Operation's boundary or drain delivers it
+		return nil // enqueued at evaluation; the boundary handoff and the successor admission deliver it
 	case bgDeliverIdle:
 		return h.deliverIdleCompletion(validated, member, parts, content)
 	default:

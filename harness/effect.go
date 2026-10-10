@@ -208,19 +208,6 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, res); err != nil {
 			return agent.ModelSettlement{}, err
 		}
-		// Coordinator decision at the model-result boundary, linearized
-		// against submissions: waiting steering keeps the Operation running
-		// independent of completed/errored status, text, or tool calls. The
-		// only shape where Agent would otherwise return is a ready settlement
-		// with no tool calls, so the wrapper bridges it with the continue
-		// disposition — the only source of a completed-output continue.
-		c.mu.Lock()
-		waiting := len(c.steering) > 0
-		c.mu.Unlock()
-		if waiting && owned.Disposition == agent.DispoReady &&
-			(owned.Output == nil || owned.Output.Message == nil || len(owned.Output.Message.ToolCalls) == 0) {
-			owned.Disposition = agent.DispoContinue
-		}
 		return owned, nil
 	}
 }
@@ -388,16 +375,41 @@ func (h *Harness) beginModelEffect(ctx context.Context, c *coordinator, operatio
 // the Session current Operation — all atomically. A non-nil intent must find
 // its committed model effect intent, whose reserved identity the settlement
 // consumes when no assistant payload exists; a nil intent (the outer terminal
-// settlement after agent.Run) requires a quiet Operation and always assigns a
-// fresh settlement identity. A publication failure leaves the committed
-// running/intent state for recovery.
+// settlement after agent.Run, and the steering handoff) requires a quiet
+// Operation and always assigns a fresh settlement identity. A publication
+// failure leaves the committed running/intent state for recovery.
 func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operationID string, intent *modelEffectIntent, res modelResult) (OperationRecord, error) {
 	c.mu.Lock()
+	sessionID, rec, entries, err := h.commitEffectResultLocked(ctx, c, operationID, intent, res)
+	if err != nil {
+		c.mu.Unlock()
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
+				return OperationRecord{}, rerr
+			}
+		}
+		return OperationRecord{}, err
+	}
+	c.mu.Unlock()
+	h.observeInvalidation(c) // every result/terminal Session register replacement advances
+	h.emitToolResultFacts(entries, sessionID, operationID)
+	return rec, nil
+}
+
+// commitEffectResultLocked is commitEffectResult's coordinator-held body: the
+// cached-view preconditions, the in-transaction result publication, and the
+// cached-graph adoption, all under the caller-held coordinator mutex so the
+// steering handoff can share one continuous hold with its eligibility
+// recheck. A transaction failure runs the filtered corruption marker inside
+// the hold and returns the raw error; the caller owns the unlock, the
+// revision-race rematerialization, the invalidation emission and the
+// tool-result facts. It returns the owning Session identity for that error
+// path.
+func (h *Harness) commitEffectResultLocked(ctx context.Context, c *coordinator, operationID string, intent *modelEffectIntent, res modelResult) (string, OperationRecord, []graphEntry, error) {
 	viewOp, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
-		c.mu.Unlock()
-		return OperationRecord{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return sessionID, OperationRecord{}, nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
 	sessionID := viewOp.Admission.SessionID
 	viewSession := c.graph.Session
@@ -547,21 +559,12 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 	})
 	if err != nil {
 		h.markCorrupt(sessionID, err)
-		c.mu.Unlock()
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
-			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return OperationRecord{}, rerr
-			}
-		}
-		return OperationRecord{}, err
+		return sessionID, OperationRecord{}, nil, err
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
 	c.graph.replaceOperation(operationID, committedOp)
 	c.graph.Session = committedSess
-	c.mu.Unlock()
-	h.observeInvalidation(c) // every result/terminal Session register replacement advances
-	h.emitToolResultFacts(newEntries, sessionID, operationID)
-	return committedOp, nil
+	return sessionID, committedOp, newEntries, nil
 }
 
 // commitTerminalSettlement performs the complete terminal transition in one
@@ -1683,7 +1686,13 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 // once after that settlement attempt — before the slot releases or the next
 // buffered delivery starts. The execution context is the installed run's
 // execCtx: Interrupt cancels it, and closure or a consumed interrupt marker
-// settles the durable Operation as interruption at entry. The Agent's
+// settles the durable Operation as interruption at entry. When agent.Run
+// returns natural success, the same steering handoff action as the context
+// boundary runs first — a completed no-tool response returns without another
+// context call — so waiting steering settles the predecessor quietly and the
+// shared post-terminal drain admits the successor; the Agent has already
+// returned, so no fabricated return value is needed. The handoff's error
+// propagates through the ordinary outer settlement policy. The Agent's
 // expected model and advertised tools
 // come from an independent capture retained before the opener runs, so an
 // opener mutating its admission input locally never changes what is
@@ -1694,7 +1703,7 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 // its non-nil Close invoked before rejection, and no Agent runs with invalid
 // effects. A cleanup failure never rewrites the terminal Operation; it is
 // retained for Wait alongside the first storage failure.
-func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) error {
+func (h *Harness) execute(c *coordinator, run *activeExecution, operationID string, prepared PreparedExecution) error {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -1716,7 +1725,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		}
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
-	exec, err := prepared.Open(execCtx, admission)
+	exec, err := prepared.Open(run.execCtx, admission)
 	if err != nil {
 		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
 	}
@@ -1749,7 +1758,9 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	// failure or interruption has already settled the terminal durably with
 	// the accumulated usage (a piece failure inside its own effect, any other
 	// failure through the direct terminal settlement), and only an actually
-	// empty conversation fails with the retained detail.
+	// empty conversation fails with the retained detail. A compact Operation
+	// never performs a steering handoff; its steering stays buffered for the
+	// shared post-terminal drain.
 	if admission.RequestKind == RequestKindCompact {
 		messages, err := h.projectContext(c, operationID)
 		if err != nil {
@@ -1759,19 +1770,24 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
 			snapshot = snapshot[1:]
 		}
-		summary, usage, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
+		summary, usage, err := h.runCompaction(run.execCtx, c, operationID, exec, agentCapture, snapshot)
 		if err != nil {
 			return err
 		}
 		return h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
 	}
-	res, err := agent.Run(execCtx, agent.Invocation{
+	res, err := agent.Run(run.execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Tools:         agentCapture.Tools,
-		Context:       h.contextSource(c, operationID),
+		Context:       h.contextSource(c, run, operationID),
 		ModelEffect:   h.modelEffect(c, operationID, exec, agentCapture),
 		ToolEffect:    h.toolEffect(c, operationID, exec, agentCapture),
 	})
+	if err == nil && res.Status == agent.TerminalSuccess { // natural success: the same handoff action before the outer settlement
+		if _, herr := h.attemptSteeringHandoff(c, run, operationID); herr != nil {
+			err = herr // the publication failure propagates through the existing outer settlement policy
+		}
+	}
 	return h.settleAgentTerminal(c, operationID, res, err)
 }
 

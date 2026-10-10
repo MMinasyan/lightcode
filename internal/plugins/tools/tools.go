@@ -120,9 +120,11 @@ func (in *instance) settings(inv runtime.Invocation) (settings, error) {
 
 // openCodeGroup opens the calling Operation's one disk code group, keyed by
 // the admitted-input identity from the ToolContext — a validated Harness
-// identity, never model-supplied data. One Operation has one group; steering
-// shares it because the Operation's admitted input never changes. The handle
-// is opened per call, shared by that call's sub-operations, and not retained.
+// identity, never model-supplied data. One Operation has one group keyed by
+// its one admitted input; every delivered message owns exactly one Operation,
+// so every normally delivered head — steering included — opens its own group.
+// The handle is opened per call, shared by that call's sub-operations, and
+// not retained.
 func (in *instance) openCodeGroup(tc runtime.ToolContext) (codeGroupStore, error) {
 	directory := filepath.Join(in.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID)
 	store, err := snapshot.OpenCodeStore(directory)

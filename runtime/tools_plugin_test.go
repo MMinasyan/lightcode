@@ -2090,6 +2090,13 @@ func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testin
 	mu.Lock()
 	gotCompletion := completion
 	mu.Unlock()
+	deadline := time.Now().Add(15 * time.Second)
+	for gotCompletion == "" && time.Now().Before(deadline) { // the completion's own Operation carries it after the handoff
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+		gotCompletion = completion
+		mu.Unlock()
+	}
 	if gotCompletion == "" {
 		t.Fatal("the completion never reached a model boundary as steering input")
 	}

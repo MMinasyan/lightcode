@@ -11,13 +11,29 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// contextSource returns the Agent context boundary of one Operation: before
-// every model effect it drains eligible steering in FIFO order and projects
-// fresh model.Message history from the committed entries plus the captured
-// system prompt. Phase 3 accepts only full immutable-history projection.
-func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
+// contextSource returns the Agent context boundary of one Operation: the
+// first call projects the newly admitted input only, and every later call
+// first attempts the steering handoff — the one per-boundary decision point
+// that quietly settles the predecessor through ordinary admission once
+// eligible steering waits after a complete tool batch — then projects the
+// fresh model.Message history. Physical retries and compact-piece context
+// callbacks never reach this boundary.
+func (h *Harness) contextSource(c *coordinator, run *activeExecution, operationID string) agent.ContextSource {
+	firstRequest := true
 	return func(ctx context.Context) ([]model.Message, error) {
-		h.drainSteering(ctx, c, operationID)
+		if !firstRequest { // first-request protection: the admitted input owns the first receiving request
+			handed, err := h.attemptSteeringHandoff(c, run, operationID)
+			if err != nil {
+				return nil, err
+			}
+			if handed { // the Agent exits through its existing cancellation contract
+				if cerr := run.execCtx.Err(); cerr != nil {
+					return nil, cerr
+				}
+				return nil, context.Canceled
+			}
+		}
+		firstRequest = false
 		return h.projectContext(c, operationID)
 	}
 }
@@ -142,35 +158,84 @@ func signalProjectedText(content string) string {
 	return "<system-signal>" + strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(content) + "</system-signal>"
 }
 
-// drainSteering delivers each waiting head once at a model boundary, retaining
-// it until commit or final failure. Harness loss discards both buffers; a
-// canceled boundary leaves unselected items for the post-terminal drain.
-// Selected steering commits on the Harness context despite interruption.
-func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID string) {
-	for {
-		c.mu.Lock()
-		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			discarded := c.discardBuffers()
-			c.mu.Unlock()
-			if discarded {
-				h.observeInvalidation(c)
-			}
-			return
-		}
-		if ctx.Err() != nil { // a canceled boundary context leaves unselected items for the post-terminal drain
-			c.mu.Unlock()
-			return
-		}
-		if len(c.steering) == 0 {
-			c.mu.Unlock()
-			return
-		}
-		item := c.steering[0] // peek: the head stays pending while its delivery is unresolved
-		c.mu.Unlock()
-		if err := h.commitSteeringInput(h.ctx, c, operationID, item); err != nil {
-			_ = err // one failed delivery attempt is final; the selected head left the buffer under the commit's hold
-		}
+// attemptSteeringHandoff is the one private handoff action at a conversation
+// boundary: it checks for eligible steering without taking a reservation, and
+// when steering waits acquires the Session's admission reservation on the
+// predecessor execution context, rechecks eligibility under the coordinator
+// hold, and publishes the predecessor's quiet success through the shared
+// result-transaction body under that same hold. The publication settles
+// OperationSuccess with empty detail and no assistant, signal or usage; its
+// release closure is carried on the execution until the retiring run's
+// cleanup and the shared post-terminal drain have installed a successor, so
+// no second reservation is ever acquired and no other admission can overtake
+// the selected handoff. A decline or a reserve wait aborted by the
+// predecessor's cancellation writes nothing and releases immediately; a
+// publication failure releases the reservation and propagates its original
+// error, never retried and never reclassified.
+func (h *Harness) attemptSteeringHandoff(c *coordinator, run *activeExecution, operationID string) (bool, error) {
+	c.mu.Lock()
+	pending := len(c.steering) > 0
+	c.mu.Unlock()
+	if !pending { // no reservation on unrelated boundaries
+		return false, nil
 	}
+	release, err := h.reserve(run.execCtx, c)
+	if err != nil { // the predecessor died while waiting: the ordinary cancellation path owns the run
+		return false, nil
+	}
+	c.mu.Lock()
+	if !steeringHandoffEligible(h, c, run, operationID) {
+		c.mu.Unlock()
+		release() // a declined handoff writes nothing and releases immediately
+		return false, nil
+	}
+	sessionID, _, entries, err := h.commitEffectResultLocked(context.WithoutCancel(h.ctx), c, operationID, nil, modelResult{terminal: OperationSuccess})
+	if err != nil {
+		c.mu.Unlock()
+		release()                            // a failed publication releases the handoff reservation
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if rerr := h.rematerialize(context.WithoutCancel(h.ctx), c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
+				return false, rerr
+			}
+		}
+		return false, err
+	}
+	run.handoffRelease = release // retained until the execution's cleanup and the shared drain finish
+	c.mu.Unlock()
+	h.observeInvalidation(c) // the durable quiet-success settlement
+	h.emitToolResultFacts(entries, sessionID, operationID)
+	run.cancel() // only this predecessor, after the commit
+	return true, nil
+}
+
+// steeringHandoffEligible is the handoff's recheck under the coordinator hold
+// with the reservation already acquired: the execution is still installed,
+// its message Operation is the current running quiet Operation with no
+// pending calls, steering remains pending, the lifecycle is open, the group
+// is not permanently closed — a root stop's stopping state never blocks the
+// handoff — both contexts are live, and no interrupt marker names this
+// Operation.
+func steeringHandoffEligible(h *Harness, c *coordinator, run *activeExecution, operationID string) bool {
+	if c.run != run { // that execution is no longer installed
+		return false
+	}
+	if h.ctx.Err() != nil || run.execCtx.Err() != nil { // both contexts must be live
+		return false
+	}
+	if c.interruptOp == operationID { // a matching marker hands the run to the ordinary interruption path
+		return false
+	}
+	if c.graph.Session.State.Lifecycle != LifecycleOpen || c.bgState == bgClosed {
+		return false
+	}
+	if c.graph.Session.State.CurrentOperationID != operationID || len(c.steering) == 0 {
+		return false
+	}
+	op, ok := c.graph.Operation(operationID)
+	if !ok || op.Admission.RequestKind != RequestKindMessage {
+		return false
+	}
+	return op.State.Status == OperationRunning && op.State.ActiveEffect == nil && len(op.State.PendingToolCalls) == 0
 }
 
 // Interrupt interrupts one Session's execution, keyed on the durable state:
@@ -178,11 +243,10 @@ func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID
 // interrupt vehicles fire: the installed execution's context is canceled, and
 // the not-yet-started executions' marker is set to the durable current
 // Operation. The marker is consumed at execute's entry when it matches that
-// operation — a marker for a running operation is inert — and canceling a
-// retiring predecessor is a harmless no-op. Buffers are never discarded by an
-// interrupt: an in-flight selected steering item commits on the Harness
-// context and unselected items drain after the interrupted Operation's
-// terminal.
+// operation — a marker for a running operation is inert — and a handoff
+// declines under a matching marker so the ordinary interruption path owns the
+// run. Buffers are never discarded by an interrupt: unselected items drain
+// after the interrupted Operation's terminal.
 func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	c, err := h.coordinatorFor(ctx, sessionID)
 	if err != nil {
@@ -200,115 +264,5 @@ func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	if run != nil {
 		run.cancel()
 	}
-	return nil
-}
-
-// commitSteeringInput commits one selected head as an Operation-owned input.
-// Removal shares the commit/adoption hold; a failed attempt instead publishes
-// a final local drop. A concurrent discard never makes a replacement removable.
-func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, item *pendingMessage) error {
-	c.mu.Lock()
-	fail := func(err error) error { // the attempt's final outcome under this hold
-		dropped := c.dropBufferedLocked(item)
-		if dropped {
-			c.bumpLocalRevision()
-		}
-		c.mu.Unlock()
-		if dropped {
-			h.observeInvalidation(c)
-		}
-		return err
-	}
-	owned := make([]model.ContentPart, 0, len(item.content))
-	for i, part := range item.content {
-		validated, err := model.NewContentPart(part)
-		if err != nil {
-			return fail(invalidInput("content[%d]: %v", i, err))
-		}
-		owned = append(owned, validated)
-	}
-	view := c.graph.Session
-	if _, ok := c.graph.Operation(operationID); !ok {
-		return fail(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, view.Identity.SessionID))
-	}
-	entryID, err := newHexID()
-	if err != nil {
-		return fail(fmt.Errorf("%w: %v", ErrStorage, err))
-	}
-	input := inputEntry{
-		SessionID:   view.Identity.SessionID,
-		EntryID:     entryID,
-		OperationID: operationID,
-		Origin:      item.origin,
-		Content:     owned,
-	}
-	payload, err := encodeInputEntry(input)
-	if err != nil {
-		return fail(err)
-	}
-	var (
-		committedSession SessionRecord
-		inserted         Entry
-	)
-	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
-		key := RegisterKey{SessionID: view.Identity.SessionID, Kind: RegisterSession}
-		reg, err := tx.ReadRegister(key)
-		if err != nil {
-			return err
-		}
-		current, err := decodeSessionRegister(reg)
-		if err != nil {
-			return corruptSession(view.Identity.SessionID, "session register: %v", err)
-		}
-		// a violated semantic precondition outranks the conflict class: steering
-		// targets the open Session's one running Operation
-		if current.State.Lifecycle != LifecycleOpen {
-			return invalidInput("session %q is archived; steering requires an open Session", view.Identity.SessionID)
-		}
-		if current.State.CurrentOperationID != operationID {
-			return invalidInput("session %q runs operation %q; steering requires the target operation current", view.Identity.SessionID, current.State.CurrentOperationID)
-		}
-		if reg.Revision != view.Revision {
-			return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, view.Identity.SessionID, view.Revision, reg.Revision)
-		}
-		inserted, err = tx.InsertEntry(EntryDraft{
-			SessionID:   view.Identity.SessionID,
-			ID:          entryID,
-			OperationID: operationID,
-			Kind:        EntryInput,
-			Payload:     payload,
-		})
-		if err != nil {
-			return err
-		}
-		state := current.State
-		state.LastActivity = inserted.CommittedAt
-		committedSession = SessionRecord{Identity: current.Identity, State: state}
-		sessionPayload, err := encodeSessionRegister(committedSession)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.ReplaceRegister(key, reg.Revision, sessionPayload)
-		if err != nil {
-			return err
-		}
-		committedSession.Revision = replaced.Revision
-		return nil
-	})
-	if err != nil {
-		h.markCorrupt(view.Identity.SessionID, err)
-		err = fail(err)
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
-			if rerr := h.rematerialize(ctx, c, view.Identity.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return rerr
-			}
-		}
-		return err
-	}
-	c.graph.Entries = append(c.graph.Entries, graphEntry{Envelope: inserted, Input: &input})
-	c.graph.Session = committedSession
-	c.dropBufferedLocked(item) // the adopted input's own advance is the one publication the removal rides
-	c.mu.Unlock()
-	h.observeInvalidation(c) // the durable steering-input advance
 	return nil
 }

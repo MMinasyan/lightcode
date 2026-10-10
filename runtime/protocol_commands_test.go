@@ -189,8 +189,10 @@ func TestSessionCommandAgentType(t *testing.T) {
 
 // TestSessionCommandSubmitModes covers C4, C5 (buffer and op-nil), C6 (submit
 // half), C7 (both stores) and the origin oracle: idle modes admit, active
-// modes buffer with no invented Operation, retries resolve existing, and
-// cross-Session Operation identity reuse is rejected by the landed rule.
+// modes buffer with no invented Operation, retries resolve existing, the
+// buffered steering head arrives through its own Operation after the boundary
+// handoff, and cross-Session Operation identity reuse is rejected by the
+// landed rule.
 func TestSessionCommandSubmitModes(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -288,16 +290,12 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		steeringCommitted := false
 		close(gate)
 		awaitOperation(t, r, sessionID, "op-active", harness.OperationSuccess)
+		awaitOperation(t, r, sessionID, "op-steer", harness.OperationSuccess) // the steering head's own Operation
 		awaitOperation(t, r, sessionID, "op-queued", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
 		drained := snapshotThroughRuntime(t, r, sessionID)
-		for _, op := range drained.Operations {
-			if op.Admission.OperationID == "op-steer" {
-				t.Fatal("the steering item was admitted as a new Operation instead of continuing the active one")
-			}
-		}
 		for _, fact := range drained.Facts {
-			if fact.Kind != harness.EntryInput || fact.OperationID != "op-active" {
+			if fact.Kind != harness.EntryInput || fact.OperationID != "op-steer" {
 				continue
 			}
 			if fact.Input.Origin != harness.InputOriginUser {
@@ -308,7 +306,11 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 			}
 		}
 		if !steeringCommitted {
-			t.Fatal("the steering input never committed under its owning Operation after the drain")
+			t.Fatal("the steering input never committed as its own Operation's admitted entry")
+		}
+		activeRec := readOperation(t, r, sessionID, "op-active")
+		if activeRec.State.Status != harness.OperationSuccess || activeRec.State.Terminal == nil || activeRec.State.Terminal.Detail != "" {
+			t.Fatalf("active operation = %+v, want the handoff's quiet success", activeRec)
 		}
 
 		second, err := r.createSession(ctx, filepath.Join(e.home, "modes-b"), "solo")
@@ -722,8 +724,8 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		}
 		sessionID := rec.Identity.SessionID
 
-		// Publish a local revision: a steering enqueue and its drain pop both
-		// count, so a fake LocalRevision 0 header is distinguishable.
+		// Publish a local revision: a steering enqueue and its handoff delivery
+		// cycle both count, so a fake LocalRevision 0 header is distinguishable.
 		drainCommandModelArrivals(e)
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
