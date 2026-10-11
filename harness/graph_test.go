@@ -743,6 +743,51 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries[0].input = &input
 			fixture.entries[0].env.OperationID = "ghost"
 		}},
+		{"extra owned input under a running message operation", func(t *testing.T, fixture *testGraph) {
+			extra := validInputEntry(testOpID)
+			extra.EntryID = hexID(4)
+			fixture.entries = append(fixture.entries, testEntry{
+				env:   Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime},
+				input: &extra,
+			})
+		}},
+		{"extra owned input under a terminal message operation", func(t *testing.T, fixture *testGraph) {
+			fixture.session.State.CurrentOperationID = ""
+			op := &fixture.ops[0]
+			stamped := testTime
+			op.State.Status = OperationSuccess
+			op.State.SettledAt = &stamped
+			op.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}}
+			settlement := operationSettlementEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, Status: OperationSuccess}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 3, CommittedAt: testTime}, settlement: &settlement})
+			extra := validInputEntry(testOpID)
+			extra.EntryID = hexID(4)
+			fixture.entries = append(fixture.entries, testEntry{
+				env:   Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime},
+				input: &extra,
+			})
+		}},
+		{"input owned by a compact operation", func(t *testing.T, fixture *testGraph) {
+			fixture.session.State.CurrentOperationID = ""
+			op := &fixture.ops[0]
+			op.Admission.RequestKind = RequestKindCompact
+			op.Admission.AdmittedEntry = EntryRef{}
+			stamped := testTime
+			op.State.Status = OperationSuccess
+			op.State.SettledAt = &stamped
+			op.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}}
+			settlement := operationSettlementEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, Status: OperationSuccess}
+			fixture.entries = []testEntry{
+				{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 3, CommittedAt: testTime}, settlement: &settlement},
+			}
+			extra := validInputEntry(testOpID)
+			extra.EntryID = hexID(4)
+			fixture.entries = append(fixture.entries, testEntry{
+				env:   Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime},
+				input: &extra,
+			})
+		}},
 		{"published call neither pending nor result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
@@ -1339,6 +1384,14 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			})
 		}},
 	}
+	// The input-ownership rows share ONE generic typed-corruption diagnostic:
+	// any per-case wording is a regression this rejects.
+	ownershipDetail := fmt.Sprintf("input entry %s is not its owning operation's admitted input", hexID(4))
+	ownership := map[string]bool{
+		"extra owned input under a running message operation":  true,
+		"extra owned input under a terminal message operation": true,
+		"input owned by a compact operation":                   true,
+	}
 	for _, tc := range corruptions {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := validTestGraph()
@@ -1347,10 +1400,13 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			if tc.name == "orphan entries without session register" {
 				delete(store.registers, testSessionID)
 			}
-			wantCorruption(t, func() error {
+			corrupt := wantCorruption(t, func() error {
 				_, err := validateFixture(t, store, testSessionID)
 				return err
 			}())
+			if ownership[tc.name] && corrupt.Detail != ownershipDetail {
+				t.Fatalf("ownership corruption detail = %q, want the one generic %q", corrupt.Detail, ownershipDetail)
+			}
 		})
 	}
 

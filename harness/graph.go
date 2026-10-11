@@ -297,14 +297,28 @@ func (v *graphValidation) validateSessionState() error {
 }
 
 // validateEntryOwnership verifies every owned entry names an existing
-// Operation register of this Session.
+// Operation register of this Session, and the one durable input rule: an
+// Operation-owned input is exactly its owning message Operation's admitted
+// entry. A compact Operation owns no input and an extra input under a message
+// Operation is corruption; independently copied inputs omit Operation
+// ownership and stay valid.
 func (v *graphValidation) validateEntryOwnership() error {
 	for _, entry := range v.graph.Entries {
 		if entry.Envelope.OperationID == "" {
 			continue
 		}
-		if _, ok := v.opsByID[entry.Envelope.OperationID]; !ok {
+		op, ok := v.opsByID[entry.Envelope.OperationID]
+		if !ok {
 			return v.corrupt("entry %s is owned by unknown Operation %q", entry.Envelope.ID, entry.Envelope.OperationID)
+		}
+		if entry.Input == nil {
+			continue
+		}
+		// the one valid set: an owned input is exactly its message
+		// Operation's admitted entry; everything outside it is one ordinary
+		// typed corruption
+		if op.Admission.RequestKind != RequestKindMessage || op.Admission.AdmittedEntry.EntryID != entry.Envelope.ID {
+			return v.corrupt("input entry %s is not its owning operation's admitted input", entry.Envelope.ID)
 		}
 	}
 	return nil

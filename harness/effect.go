@@ -60,6 +60,11 @@ type modelResult struct {
 	detail     string          // terminal detail; empty for ready/continue
 	usage      *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
 	usageModel model.ModelRef  // the terminal no-output usage model when no intent is live; zero otherwise
+	// successContext is the execution context of an outer prospective
+	// success only; the publisher's shared guard consults it before the
+	// transaction. Effect-origin terminals, compaction commits and recovery
+	// leave it nil.
+	successContext context.Context
 }
 
 // modelEffect encloses one complete invocation of the prepared model function
@@ -207,19 +212,6 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		}
 		if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, res); err != nil {
 			return agent.ModelSettlement{}, err
-		}
-		// Coordinator decision at the model-result boundary, linearized
-		// against submissions: waiting steering keeps the Operation running
-		// independent of completed/errored status, text, or tool calls. The
-		// only shape where Agent would otherwise return is a ready settlement
-		// with no tool calls, so the wrapper bridges it with the continue
-		// disposition — the only source of a completed-output continue.
-		c.mu.Lock()
-		waiting := len(c.steering) > 0
-		c.mu.Unlock()
-		if waiting && owned.Disposition == agent.DispoReady &&
-			(owned.Output == nil || owned.Output.Message == nil || len(owned.Output.Message.ToolCalls) == 0) {
-			owned.Disposition = agent.DispoContinue
 		}
 		return owned, nil
 	}
@@ -388,11 +380,20 @@ func (h *Harness) beginModelEffect(ctx context.Context, c *coordinator, operatio
 // the Session current Operation — all atomically. A non-nil intent must find
 // its committed model effect intent, whose reserved identity the settlement
 // consumes when no assistant payload exists; a nil intent (the outer terminal
-// settlement after agent.Run) requires a quiet Operation and always assigns a
-// fresh settlement identity. A publication failure leaves the committed
-// running/intent state for recovery.
+// settlement after agent.Run) requires a quiet
+// Operation and always assigns a fresh settlement identity. A publication
+// failure leaves the committed running/intent state for recovery.
 func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operationID string, intent *modelEffectIntent, res modelResult) (OperationRecord, error) {
 	c.mu.Lock()
+	if res.successContext != nil { // the shared success guard: one hold with the publication, before the transaction
+		if res.successContext.Err() != nil || c.interruptOp == operationID || c.bgState == bgClosed {
+			// Interrupt winning this hold cannot be missed; a foreign
+			// marker or a root stop's stopping state never converts the
+			// success, and an Interrupt after the committed success cannot
+			// rewrite it.
+			res = modelResult{terminal: OperationInterruption, detail: executionInterruptedDetail}
+		}
+	}
 	viewOp, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
@@ -1676,31 +1677,36 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 }
 
 // execute is the private agent.Run composition of one admitted execution:
-// after the commit it invokes the preparation's opener exactly once with the
-// execution context and the owned committed admission, runs the Agent over
-// the opened effects, then the outer terminal settlement converges the
-// durable state with the run's outcome, and a non-nil resource cleanup runs
-// once after that settlement attempt — before the slot releases or the next
-// buffered delivery starts. The execution context is the installed run's
-// execCtx: Interrupt cancels it, and closure or a consumed interrupt marker
-// settles the durable Operation as interruption at entry. The Agent's
-// expected model and advertised tools
-// come from an independent capture retained before the opener runs, so an
-// opener mutating its admission input locally never changes what is
-// advertised after admission. An opener error resolves through the ordinary
-// terminal settlement: cancellation interrupts, a storage failure retains the
-// running state for recovery, and any other error fails. A canceled
-// execution skips an unstarted opener. A successful invalid Execution has
-// its non-nil Close invoked before rejection, and no Agent runs with invalid
-// effects. A cleanup failure never rewrites the terminal Operation; it is
-// retained for Wait alongside the first storage failure.
-func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) error {
+// after the admission it invokes the preparation's opener exactly once with
+// the execution context and the owned committed admission, and runs the same
+// Agent/compaction work over the opened effects. It returns a pointer to the
+// actual Agent terminal — including its zero value on an Agent error — and
+// the valid execution's Close; the conversation outer settlement belongs to
+// finishExecution and never happens here. Entry/Open/invalid-Execution
+// rejection returns a non-nil zero terminal for ordinary outer error
+// classification; an invalid execution still closes immediately and returns
+// no cleanup function. The valid compact branch returns a nil terminal, its
+// Close and its original error: its compaction path already owns every
+// settlement attempt, so completion must not feed that publication error
+// into another terminal attempt. A missing Operation returns nil terminal, no
+// Close, and the original lookup error. No public Agent result is forged.
+// The execution context is execCtx: Interrupt cancels it, and closure or a
+// consumed interrupt marker settles the durable Operation as interruption at
+// entry. The Agent's expected model and advertised tools come from an
+// independent capture retained before the opener runs, so an opener mutating
+// its admission input locally never changes what is advertised after
+// admission. An opener error resolves through the ordinary outer terminal
+// settlement: cancellation interrupts, a storage failure retains the running
+// state for recovery, and any other error fails. A canceled execution skips
+// an unstarted opener. A cleanup failure never rewrites the terminal
+// Operation; it is retained for Wait alongside the first storage failure.
+func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) (*agent.TerminalResult, func() error, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return nil, nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
 	admission := ownOperationRecord(op).Admission
 	agentCapture := ownCapture(admission.Execution)
@@ -1714,18 +1720,18 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		if err == nil {
 			err = context.Canceled
 		}
-		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
+		return &agent.TerminalResult{}, nil, err
 	}
 	exec, err := prepared.Open(execCtx, admission)
 	if err != nil {
-		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{}, err)
+		return &agent.TerminalResult{}, nil, err
 	}
 	if exec.Model == nil || exec.CompactModel == nil || exec.Tool == nil || exec.NormalizeTool == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
 		}
-		return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
-			invalidInput("opened execution requires non-nil model, compact model, tool and normalization functions"))
+		return &agent.TerminalResult{}, nil,
+			invalidInput("opened execution requires non-nil model, compact model, tool and normalization functions")
 	}
 	seenHooks := make(map[string]bool, len(exec.ToolHooks))
 	for _, hook := range exec.ToolHooks {
@@ -1733,13 +1739,10 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 			if exec.Close != nil {
 				h.recordCleanupFailure(exec.Close())
 			}
-			return h.settleAgentTerminal(c, operationID, agent.TerminalResult{},
-				invalidInput("opened execution requires a non-empty unique ID and a non-nil run function for every argument hook"))
+			return &agent.TerminalResult{}, nil,
+				invalidInput("opened execution requires a non-empty unique ID and a non-nil run function for every argument hook")
 		}
 		seenHooks[hook.ID] = true
-	}
-	if exec.Close != nil {
-		defer func() { h.recordCleanupFailure(exec.Close()) }()
 	}
 	// A compact Operation wires no conversation Agent invocation: it projects
 	// the pure conversation snapshot — the projected messages minus the
@@ -1753,7 +1756,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	if admission.RequestKind == RequestKindCompact {
 		messages, err := h.projectContext(c, operationID)
 		if err != nil {
-			return err
+			return nil, exec.Close, err
 		}
 		snapshot := messages
 		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
@@ -1761,29 +1764,69 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		}
 		summary, usage, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
 		if err != nil {
-			return err
+			return nil, exec.Close, err
 		}
-		return h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
+		return nil, exec.Close, h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
 	}
-	res, err := agent.Run(execCtx, agent.Invocation{
+	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Tools:         agentCapture.Tools,
 		Context:       h.contextSource(c, operationID),
 		ModelEffect:   h.modelEffect(c, operationID, exec, agentCapture),
 		ToolEffect:    h.toolEffect(c, operationID, exec, agentCapture),
 	})
-	return h.settleAgentTerminal(c, operationID, res, err)
+	return &res, exec.Close, runErr
+}
+
+// finishExecution is the one completion owner of a finished execution: it
+// acquires the Session's admission reservation once before the outer
+// terminal settlement and releases it as a local deferred call, settles a
+// non-nil terminal exactly once through the shared publisher (a nil terminal
+// preserves the already-owned compact/lookup outcome without another
+// attempt), records the resulting storage-class error once, invokes a
+// non-nil Close once and records its cleanup error, and invokes the ordinary
+// drain while the reservation is held so a successor installs before the
+// release. A canceled contended acquisition skips only the drain. Cleanup
+// errors keep their existing Wait owner.
+func (h *Harness) finishExecution(c *coordinator, run *activeExecution, operationID string, res *agent.TerminalResult, runErr error, closeExecution func() error) error {
+	release, reserveErr := h.reserve(h.ctx, c)
+	if reserveErr == nil {
+		defer release()
+	}
+	err := runErr
+	if res != nil {
+		err = h.settleAgentTerminal(c, operationID, *res, runErr, run.execCtx)
+	}
+	h.recordStorageFailure(err) // the sole storage-class recorder, including nil-terminal outcomes
+	if closeExecution != nil {
+		h.recordCleanupFailure(closeExecution())
+	}
+	if reserveErr == nil {
+		h.drainBuffers(c, run)
+	}
+	return err
 }
 
 // settleAgentTerminal is the outer terminal settlement: terminal settlement
 // after opening or running the Agent reuses the common terminal helper only
 // when the Operation is still running, because model-effect-originated
-// terminals already settled durably inside their own result transactions. A
-// non-storage callback or Agent protocol error settles failure with the
-// error's own text; an Agent terminal result preserves its non-empty detail.
-// A committed running/intent state left by a publication failure stays for
-// recovery.
-func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res agent.TerminalResult, runErr error) error {
+// terminals already settled durably inside their own result transactions. The
+// private boundary token is consumed here by exact identity before the
+// settled/active-effect guard: it selects the prospective quiet success and
+// clears the private run error, which the guard then returns; no invalid
+// Agent TerminalSuccess is manufactured. A non-storage callback or Agent
+// protocol error settles failure with the error's own text; an Agent terminal
+// result preserves its non-empty detail; natural success and the consumed
+// token map to the identical guarded modelResult. The existing
+// settled/active-effect/ErrStorage discriminator and the ordinary
+// failure/interruption classifications construct one modelResult and call
+// the shared publisher once. A committed running/intent state left by a
+// publication failure stays for recovery.
+func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res agent.TerminalResult, runErr error, execCtx context.Context) error {
+	prospectiveSuccess := runErr == errSteeringBoundary // exact identity only; a projection/model/tool error is never this token
+	if prospectiveSuccess {                             // consumed before the guards: the private run error clears to its settled value
+		runErr = nil
+	}
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
@@ -1797,41 +1840,29 @@ func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res ag
 	if settled || !quiet { // already settled by a model effect, or a publication failure left the intent state for recovery
 		return runErr
 	}
-	settleCtx := context.WithoutCancel(h.ctx)
-	if runErr != nil {
-		if errors.Is(runErr, ErrStorage) { // a storage-class error performs no compensating write: the committed running state stays for recovery
-			return runErr
-		}
-		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) { // between-effect cancellation settles the fixed interruption detail
-			if _, err := h.commitEffectResult(settleCtx, c, operationID, nil, modelResult{
-				terminal: OperationInterruption,
-				detail:   executionInterruptedDetail,
-			}); err != nil {
-				return err
-			}
-			return runErr
-		}
-		if _, err := h.commitEffectResult(settleCtx, c, operationID, nil, modelResult{
-			terminal: OperationFailure,
-			detail:   runErr.Error(),
-		}); err != nil {
-			return err
-		}
+	if runErr != nil && errors.Is(runErr, ErrStorage) { // a storage-class error performs no compensating write: the committed running state stays for recovery
 		return runErr
 	}
-	switch res.Status {
-	case agent.TerminalSuccess:
-		if _, err := h.commitEffectResult(settleCtx, c, operationID, nil, modelResult{terminal: OperationSuccess}); err != nil {
-			return err
-		}
-	case agent.TerminalFailure, agent.TerminalInterruption:
+	settleCtx := context.WithoutCancel(h.ctx)
+	var result modelResult
+	switch {
+	case runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)):
+		result = modelResult{terminal: OperationInterruption, detail: executionInterruptedDetail}
+	case runErr != nil:
+		result = modelResult{terminal: OperationFailure, detail: runErr.Error()}
+	case prospectiveSuccess, res.Status == agent.TerminalSuccess:
+		result = modelResult{terminal: OperationSuccess, successContext: execCtx}
+	case res.Status == agent.TerminalFailure, res.Status == agent.TerminalInterruption:
 		term := OperationFailure
 		if res.Status == agent.TerminalInterruption {
 			term = OperationInterruption
 		}
-		if _, err := h.commitEffectResult(settleCtx, c, operationID, nil, modelResult{terminal: term, detail: res.Detail}); err != nil {
-			return err
-		}
+		result = modelResult{terminal: term, detail: res.Detail}
+	default:
+		return nil // a zero terminal without an error carries nothing to publish
 	}
-	return nil
+	if _, err := h.commitEffectResult(settleCtx, c, operationID, nil, result); err != nil {
+		return err
+	}
+	return runErr
 }

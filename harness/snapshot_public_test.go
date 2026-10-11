@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,22 +281,48 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		script.gate = make(chan struct{})
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
-		// preparation call 0 is op-1's admission; the post-terminal drain's
-		// admission parks on its gate so the selected-but-unresolved delivery
-		// state stays stable. The steering item is not on this path: a waiting
-		// steering item continues the completed turn, and its boundary
-		// delivers the input under the running Operation's identity.
+		// preparation call 0 is op-1's admission; its Close parks before the
+		// post-terminal drain's admission, which parks on the successor gate so
+		// the selected-but-unresolved delivery state stays stable. The steering
+		// item leads the drain: the settled predecessor's completion admits it
+		// before the queued head under its own identity. The no-tool turn is
+		// the natural completion this same path serves.
 		prepGate := make(chan struct{})
 		drainGate := make(chan struct{})
+		closeArrived := make(chan struct{})
+		closeGate := make(chan struct{})
+		var closeOnce sync.Once
+		var preparedCalls atomic.Int32
 		releasePrep := sync.OnceFunc(func() { close(prepGate) })
 		releaseDrain := sync.OnceFunc(func() { close(drainGate) })
+		releaseClose := sync.OnceFunc(func() { close(closeGate) })
 		defer releasePrep()
 		defer releaseDrain()
+		defer releaseClose()
 		defer script.releaseGate()
 		f.prepareHook = func(call int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
+			preparedCalls.Add(1)
 			switch call {
 			case 0:
 				<-prepGate
+				base := scriptPrepared(script)
+				return harness.PreparedExecution{
+					Capture: base.Capture,
+					Open: func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+						exec, err := base.Open(ctx, admission)
+						if err != nil {
+							return exec, err
+						}
+						exec.Close = func() error { // the predecessor's Close parks before the successor's preparation, then fails
+							closeOnce.Do(func() {
+								close(closeArrived)
+								<-closeGate
+							})
+							return errors.New("cleanup broke")
+						}
+						return exec, nil
+					},
+				}, nil
 			case 1:
 				<-drainGate
 			}
@@ -372,50 +399,140 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 				reread.Steering[0].Content[0].Text, reread.Queued[0].Content[0].Text, err)
 		}
 
-		// Releasing the boundary lets op-1's completed turn continue for the
-		// waiting steering item: that boundary commits op-3's content as an
-		// op-1-owned input — the selected head leaves the buffer in the
-		// adoption section — op-1 settles, and the post-terminal drain selects
-		// op-2 and parks in its admission preparation with the queued head
-		// still pending.
+		// Releasing the boundary settles op-1 quietly through the one
+		// completion owner; its Close parks before the drain, so success is
+		// readable with the heads still pending and no successor prepared,
+		// and Archive/Fork reach the held reservation's wait.
 		script.releaseGate()
-		<-script.arrived // the continuation turn for the waiting steering item
-		<-f.prepare      // the drain admission of op-2 is preparing
+		<-closeArrived // the predecessor's Close parks
+		parkedClose, err := f.h.SnapshotSession(ctx, session)
+		if err != nil {
+			t.Fatalf("snapshot at the parked Close: %v", err)
+		}
+		if parkedClose.Session.State.CurrentOperationID != "" {
+			t.Fatalf("current operation at the parked Close = %q, want the settled predecessor", parkedClose.Session.State.CurrentOperationID)
+		}
+		for _, op := range parkedClose.Operations {
+			if op.Admission.OperationID == "op-1" && op.State.Status != harness.OperationSuccess {
+				t.Fatalf("op-1 = %q at the parked Close, want the quiet success readable", op.State.Status)
+			}
+		}
+		if len(parkedClose.Steering) != 1 || parkedClose.Steering[0].OperationID != "op-3" ||
+			len(parkedClose.Queued) != 1 || parkedClose.Queued[0].OperationID != "op-2" {
+			t.Fatalf("heads at the parked Close = %+v / %+v, want both still pending", parkedClose.Steering, parkedClose.Queued)
+		}
+		if got := preparedCalls.Load(); got != 1 {
+			t.Fatalf("preparations = %d, want no successor preparation/Open before the Close", got)
+		}
+		// Archive and Fork reach the held reservation's wait — observed
+		// through each call's own waitContext barrier — and their own live
+		// contexts cancel the wait; the timeouts only bound hangs.
+		archiveBase, archiveCancel := context.WithCancel(ctx)
+		defer archiveCancel()
+		archiveWait := &waitContext{Context: archiveBase, consulted: make(chan struct{})}
+		archiveDone := make(chan error, 1)
+		go func() {
+			_, err := f.h.ArchiveSession(archiveWait, session)
+			archiveDone <- err
+		}()
+		select {
+		case <-archiveWait.consulted: // parked consulting its context in the reservation wait
+		case <-time.After(10 * time.Second):
+			t.Fatal("Archive never reached the reservation wait")
+		}
+		select {
+		case err := <-archiveDone:
+			t.Fatalf("Archive returned %v while the reservation was held, want the wait", err)
+		default: // still waiting
+		}
+		archiveCancel()
+		select {
+		case err := <-archiveDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Archive at the held reservation = %v, want the canceled wait", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Archive never returned after its cancellation")
+		}
+		boundary := ""
+		for _, fact := range parkedClose.Facts {
+			if fact.Kind == harness.EntryInput && fact.Input != nil && fact.OperationID == "op-1" {
+				boundary = fact.EntryID
+			}
+		}
+		if boundary == "" {
+			t.Fatalf("the predecessor's admitted entry is missing from the parked snapshot")
+		}
+		forkBase, forkCancel := context.WithCancel(ctx)
+		defer forkCancel()
+		forkWait := &waitContext{Context: forkBase, consulted: make(chan struct{})}
+		forkDone := make(chan error, 1)
+		go func() {
+			_, err := f.h.Fork(forkWait, harness.ForkRequest{
+				SourceSessionID: session, BoundaryEntryID: boundary, OperationID: "fork-1",
+				Content: []model.ContentPart{{Kind: model.PartText, Text: "fork work"}},
+			})
+			forkDone <- err
+		}()
+		select {
+		case <-forkWait.consulted: // parked consulting its context in the reservation wait
+		case <-time.After(10 * time.Second):
+			t.Fatal("Fork never reached the reservation wait")
+		}
+		select {
+		case err := <-forkDone:
+			t.Fatalf("Fork returned %v while the reservation was held, want the wait", err)
+		default: // still waiting
+		}
+		forkCancel()
+		select {
+		case err := <-forkDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Fork at the held reservation = %v, want the canceled wait", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Fork never returned after its cancellation")
+		}
+		releaseClose() // completion resumes: the drain selects the steering head and its admission parks
+		<-f.prepare    // the drain admission of the steering head (op-3) is preparing
 		parked, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
 			t.Fatalf("snapshot during the parked delivery: %v", err)
 		}
-		if len(parked.Steering) != 0 {
-			t.Fatalf("steering buffer during the parked delivery = %+v, want the adopted input's head gone", parked.Steering)
+		if len(parked.Steering) != 1 || parked.Steering[0].OperationID != "op-3" {
+			t.Fatalf("steering buffer during the parked delivery = %+v, want the selected head still pending until adoption", parked.Steering)
 		}
 		if len(parked.Queued) != 1 || parked.Queued[0].OperationID != "op-2" {
-			t.Fatalf("queued buffer during the parked delivery = %+v, want the selected head still pending", parked.Queued)
+			t.Fatalf("queued buffer during the parked delivery = %+v, want the queued head pending behind the steering head", parked.Queued)
+		}
+		if parked.Session.State.CurrentOperationID != "" {
+			t.Fatalf("current operation during the parked delivery = %q, want the settled predecessor cleared", parked.Session.State.CurrentOperationID)
 		}
 		for _, op := range parked.Operations {
 			if op.Admission.OperationID == "op-2" || op.Admission.OperationID == "op-3" {
 				t.Fatalf("the pending item %s committed before its delivery completed", op.Admission.OperationID)
 			}
-		}
-		steered := false
-		for _, fact := range parked.Facts {
-			if fact.Input != nil && fact.Input.OperationID == "op-1" && fact.Input.Content[0].Text == "steer-1" {
-				steered = true // the steering delivery adopted at its durable commit
+			if op.Admission.OperationID == "op-1" && op.State.Status != harness.OperationSuccess {
+				t.Fatalf("op-1 = %q during the parked delivery, want the quiet success", op.State.Status)
 			}
 		}
-		if !steered {
-			t.Fatalf("the delivered steering input is missing from the committed facts")
-		}
-		// the drain's reservation is the only local publication between the
-		// buffering and the parked admission: the steering delivery's removal
-		// rode its durable adoption
+		// the one completion owner's reservation is the only local publication
+		// between the buffering and the parked admission: one reservation and
+		// one release span the whole delivery cycle
 		if parked.LocalRevision != buffered.LocalRevision+1 {
 			t.Fatalf("parked revision = %d, want %d", parked.LocalRevision, buffered.LocalRevision+1)
 		}
-		releaseDrain()   // op-2 admits, runs, and settles
-		<-script.arrived // the admitted Operation's execution started
+		releaseDrain()   // the steering head admits, runs, and settles; the queued head follows
+		<-script.arrived // the admitted steering Operation's execution started
+		awaitTerminal(t, f.h, session, "op-3")
+		<-f.prepare      // the queued head's admission preparation
+		<-script.arrived // the queued Operation's execution started
 		awaitTerminal(t, f.h, session, "op-2")
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		if err := converge(t, f); err == nil || !strings.Contains(err.Error(), "cleanup broke") {
+			t.Fatalf("Wait = %v, want the retained cleanup failure", err)
+		}
+		if rec, err := f.h.ReadOperation(ctx, session, "op-1"); err != nil || rec.State.Status != harness.OperationSuccess {
+			t.Fatalf("op-1 after Wait = %+v err %v, want the settlement preserved", rec, err)
 		}
 		final, err := f.h.SnapshotSession(ctx, session)
 		if err != nil {
@@ -424,12 +541,26 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if final.ExecutionBusy || len(final.Steering) != 0 || len(final.Queued) != 0 {
 			t.Fatalf("final snapshot = busy %v steering %d queued %d", final.ExecutionBusy, len(final.Steering), len(final.Queued))
 		}
-		if len(final.Operations) != 2 {
-			t.Fatalf("final operations = %d, want the two admitted Operations", len(final.Operations))
+		if len(final.Operations) != 3 {
+			t.Fatalf("final operations = %d, want the three split Operations", len(final.Operations))
 		}
-		for _, op := range final.Operations {
-			if op.Admission.OperationID == "op-3" {
-				t.Fatalf("the steering item became an Operation; its content belongs to op-1's history")
+		for _, fact := range final.Facts {
+			if fact.Kind != harness.EntryInput || fact.Input == nil || len(fact.Input.Content) == 0 {
+				continue
+			}
+			switch fact.Input.Content[0].Text {
+			case "hello":
+				if fact.OperationID != "op-1" {
+					t.Fatalf("admitted input owned by %q, want op-1", fact.OperationID)
+				}
+			case "steer-1":
+				if fact.OperationID != "op-3" {
+					t.Fatalf("steering input owned by %q, want its own Operation op-3", fact.OperationID)
+				}
+			case "queued-1":
+				if fact.OperationID != "op-2" {
+					t.Fatalf("queued input owned by %q, want op-2", fact.OperationID)
+				}
 			}
 		}
 	})

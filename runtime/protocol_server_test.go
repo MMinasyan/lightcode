@@ -430,9 +430,9 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			t.Fatalf("queued submit = %s, want a buffered queued item with no invented Operation", body)
 		}
 		steering := submit("op-3", "regular", "mid")
-		if steering.JSON200 == nil || steering.JSON200.Disposition != protocol.SubmitResultDispositionSteering {
+		if steering.JSON200 == nil || steering.JSON200.Disposition != protocol.SubmitResultDispositionSteering || steering.JSON200.Operation != nil {
 			body, _ := json.Marshal(steering.JSON200)
-			t.Fatalf("steering submit = %s, want the steering disposition", body)
+			t.Fatalf("steering submit = %s, want the pending caller ID with no invented Operation", body)
 		}
 
 		hydration, err := client.GetSessionHydrationWithResponse(ctx, session)
@@ -489,18 +489,83 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			t.Fatalf("empty code snapshot groups = %s, want the empty JSON array", body)
 		}
 
-		// The interrupt control answers 204 while the gated Operation runs;
-		// the queued and steering buffers then drain and the whole Session
-		// converges before the fork addresses it.
+		// Releasing the model gate completes the flow cleanly: the
+		// predecessor and both drained successors settle success under their
+		// own identities before the source Session is addressed as idle.
+		release()
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
+		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
+		awaitOperation(t, r, session, "op-3", harness.OperationSuccess)
+		awaitIdleSession(t, r, session)
+
+		// The clean flow's items: every input is owned by its own Operation,
+		// every Operation ends in clean success, and the delivery manufactures
+		// no signal.
+		steeringHistory, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{})
+		if err != nil || steeringHistory.JSON200 == nil {
+			t.Fatalf("GetSessionHistory = (%v, %+v)", err, steeringHistory.JSON200)
+		}
+		owned, ended := map[string]string{}, map[string]bool{}
+		for _, item := range steeringHistory.JSON200.Items {
+			switch itemKind(t, item) {
+			case "input":
+				input, err := item.AsInputItem()
+				if err != nil {
+					t.Fatalf("input item: %v", err)
+				}
+				if input.OperationId == nil || *input.OperationId == "" {
+					t.Fatalf("input item %s carries no owning Operation", input.ItemId)
+				}
+				owned[input.ItemId] = *input.OperationId
+			case "operation_end":
+				end, err := item.AsOperationEndItem()
+				if err != nil {
+					t.Fatalf("end item: %v", err)
+				}
+				if end.Status != protocol.OperationEndItemStatusSuccess || end.Detail != "" || end.OperationId == nil {
+					t.Fatalf("end item = %+v, want clean success under its identity", end)
+				}
+				ended[*end.OperationId] = true
+			case "signal":
+				signal, err := item.AsSignalItem()
+				if err != nil {
+					t.Fatalf("signal item: %v", err)
+				}
+				t.Fatalf("artificial signal %q in the clean flow", signal.Subtype)
+			}
+		}
+		for text, op := range map[string]string{"first": "op-1", "later": "op-2", "mid": "op-3"} {
+			found := false
+			for _, owner := range owned {
+				if owner == op {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("input %q has no item owned by %q (owners %v)", text, op, owned)
+			}
+			if !ended[op] {
+				t.Fatalf("operation %q has no clean-success end item (ended %v)", op, ended)
+			}
+		}
+
+		// The mounted interrupt control answers 204 against a further held
+		// Operation, which settles the terminal interruption.
+		intGate := make(chan struct{})
+		e.server.setHold(intGate)
+		releaseInt := sync.OnceFunc(func() { close(intGate) })
+		defer releaseInt()
+		if admitted := submit("op-int", "regular", "interrupt me"); admitted.JSON200 == nil ||
+			admitted.JSON200.Disposition != protocol.SubmitResultDispositionAdmitted {
+			body, _ := json.Marshal(admitted.JSON200)
+			t.Fatalf("interrupted-run submit = %s, want the admitted op-int", body)
+		}
+		awaitModelArrival(t, e)
 		if response, err := client.InterruptSessionWithResponse(ctx, session); err != nil || response.HTTPResponse.StatusCode != http.StatusNoContent {
 			t.Fatalf("interrupt = (%d, %v), want 204", response.HTTPResponse.StatusCode, err)
 		}
-		release()
-		// The drained buffers settle deterministically under their own
-		// identities before the source Session is addressed as idle.
-		awaitOperation(t, r, session, "op-1", harness.OperationInterruption)
-		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
-		awaitOperation(t, r, session, "op-3", harness.OperationSuccess)
+		releaseInt()
+		awaitOperation(t, r, session, "op-int", harness.OperationInterruption)
 		awaitIdleSession(t, r, session)
 
 		// The boundary item id of the committed first input resolves through

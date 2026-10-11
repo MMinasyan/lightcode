@@ -11,13 +11,36 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// contextSource returns the Agent context boundary of one Operation: before
-// every model effect it drains eligible steering in FIFO order and projects
-// fresh model.Message history from the committed entries plus the captured
-// system prompt. Phase 3 accepts only full immutable-history projection.
+// errSteeringBoundary is the one package-private non-cancellation context
+// token: a conversation boundary returns it instead of projecting another
+// request while steering waits. Agent.Run hands a non-cancellation context
+// error back verbatim with a zero terminal, and the outer terminal settlement
+// consumes this token by exact identity before its guards. It is produced
+// only by the contextSource closure and is never persisted, returned
+// publicly, or latched in Wait.
+var errSteeringBoundary = errors.New("harness: steering boundary")
+
+// contextSource returns the Agent context boundary of one Operation: the
+// first call projects the newly admitted input only (first-request
+// protection), and every later call selects the conversation boundary —
+// when steering waits it returns errSteeringBoundary instead of projecting
+// another request, leaving every head buffered for the ordinary post-terminal
+// drain — otherwise it projects the fresh model.Message history. Selection
+// consumes no head and performs no storage, reservation, cancellation or
+// observation. Physical retries and compact-piece context callbacks never
+// reach this boundary.
 func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
+	firstRequest := true
 	return func(ctx context.Context) ([]model.Message, error) {
-		h.drainSteering(ctx, c, operationID)
+		if !firstRequest {
+			c.mu.Lock()
+			waiting := len(c.steering) > 0
+			c.mu.Unlock()
+			if waiting {
+				return nil, errSteeringBoundary
+			}
+		}
+		firstRequest = false
 		return h.projectContext(c, operationID)
 	}
 }
@@ -142,46 +165,15 @@ func signalProjectedText(content string) string {
 	return "<system-signal>" + strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(content) + "</system-signal>"
 }
 
-// drainSteering delivers each waiting head once at a model boundary, retaining
-// it until commit or final failure. Harness loss discards both buffers; a
-// canceled boundary leaves unselected items for the post-terminal drain.
-// Selected steering commits on the Harness context despite interruption.
-func (h *Harness) drainSteering(ctx context.Context, c *coordinator, operationID string) {
-	for {
-		c.mu.Lock()
-		if h.ctx.Err() != nil { // Harness loss discards both buffers
-			discarded := c.discardBuffers()
-			c.mu.Unlock()
-			if discarded {
-				h.observeInvalidation(c)
-			}
-			return
-		}
-		if ctx.Err() != nil { // a canceled boundary context leaves unselected items for the post-terminal drain
-			c.mu.Unlock()
-			return
-		}
-		if len(c.steering) == 0 {
-			c.mu.Unlock()
-			return
-		}
-		item := c.steering[0] // peek: the head stays pending while its delivery is unresolved
-		c.mu.Unlock()
-		if err := h.commitSteeringInput(h.ctx, c, operationID, item); err != nil {
-			_ = err // one failed delivery attempt is final; the selected head left the buffer under the commit's hold
-		}
-	}
-}
-
 // Interrupt interrupts one Session's execution, keyed on the durable state:
 // an idle Session — no current Operation — returns nil. Otherwise both
 // interrupt vehicles fire: the installed execution's context is canceled, and
 // the not-yet-started executions' marker is set to the durable current
 // Operation. The marker is consumed at execute's entry when it matches that
-// operation — a marker for a running operation is inert — and canceling a
-// retiring predecessor is a harmless no-op. Buffers are never discarded by an
-// interrupt: an in-flight selected steering item commits on the Harness
-// context and unselected items drain after the interrupted Operation's
+// operation — a marker for a running operation is inert for that entry and
+// stays visible to the shared success guard — and canceling a retiring
+// predecessor is a harmless no-op. Buffers are never discarded by an
+// interrupt: unselected items drain after the interrupted Operation's
 // terminal.
 func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	c, err := h.coordinatorFor(ctx, sessionID)
@@ -200,115 +192,5 @@ func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
 	if run != nil {
 		run.cancel()
 	}
-	return nil
-}
-
-// commitSteeringInput commits one selected head as an Operation-owned input.
-// Removal shares the commit/adoption hold; a failed attempt instead publishes
-// a final local drop. A concurrent discard never makes a replacement removable.
-func (h *Harness) commitSteeringInput(ctx context.Context, c *coordinator, operationID string, item *pendingMessage) error {
-	c.mu.Lock()
-	fail := func(err error) error { // the attempt's final outcome under this hold
-		dropped := c.dropBufferedLocked(item)
-		if dropped {
-			c.bumpLocalRevision()
-		}
-		c.mu.Unlock()
-		if dropped {
-			h.observeInvalidation(c)
-		}
-		return err
-	}
-	owned := make([]model.ContentPart, 0, len(item.content))
-	for i, part := range item.content {
-		validated, err := model.NewContentPart(part)
-		if err != nil {
-			return fail(invalidInput("content[%d]: %v", i, err))
-		}
-		owned = append(owned, validated)
-	}
-	view := c.graph.Session
-	if _, ok := c.graph.Operation(operationID); !ok {
-		return fail(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, view.Identity.SessionID))
-	}
-	entryID, err := newHexID()
-	if err != nil {
-		return fail(fmt.Errorf("%w: %v", ErrStorage, err))
-	}
-	input := inputEntry{
-		SessionID:   view.Identity.SessionID,
-		EntryID:     entryID,
-		OperationID: operationID,
-		Origin:      item.origin,
-		Content:     owned,
-	}
-	payload, err := encodeInputEntry(input)
-	if err != nil {
-		return fail(err)
-	}
-	var (
-		committedSession SessionRecord
-		inserted         Entry
-	)
-	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
-		key := RegisterKey{SessionID: view.Identity.SessionID, Kind: RegisterSession}
-		reg, err := tx.ReadRegister(key)
-		if err != nil {
-			return err
-		}
-		current, err := decodeSessionRegister(reg)
-		if err != nil {
-			return corruptSession(view.Identity.SessionID, "session register: %v", err)
-		}
-		// a violated semantic precondition outranks the conflict class: steering
-		// targets the open Session's one running Operation
-		if current.State.Lifecycle != LifecycleOpen {
-			return invalidInput("session %q is archived; steering requires an open Session", view.Identity.SessionID)
-		}
-		if current.State.CurrentOperationID != operationID {
-			return invalidInput("session %q runs operation %q; steering requires the target operation current", view.Identity.SessionID, current.State.CurrentOperationID)
-		}
-		if reg.Revision != view.Revision {
-			return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, view.Identity.SessionID, view.Revision, reg.Revision)
-		}
-		inserted, err = tx.InsertEntry(EntryDraft{
-			SessionID:   view.Identity.SessionID,
-			ID:          entryID,
-			OperationID: operationID,
-			Kind:        EntryInput,
-			Payload:     payload,
-		})
-		if err != nil {
-			return err
-		}
-		state := current.State
-		state.LastActivity = inserted.CommittedAt
-		committedSession = SessionRecord{Identity: current.Identity, State: state}
-		sessionPayload, err := encodeSessionRegister(committedSession)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.ReplaceRegister(key, reg.Revision, sessionPayload)
-		if err != nil {
-			return err
-		}
-		committedSession.Revision = replaced.Revision
-		return nil
-	})
-	if err != nil {
-		h.markCorrupt(view.Identity.SessionID, err)
-		err = fail(err)
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
-			if rerr := h.rematerialize(ctx, c, view.Identity.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return rerr
-			}
-		}
-		return err
-	}
-	c.graph.Entries = append(c.graph.Entries, graphEntry{Envelope: inserted, Input: &input})
-	c.graph.Session = committedSession
-	c.dropBufferedLocked(item) // the adopted input's own advance is the one publication the removal rides
-	c.mu.Unlock()
-	h.observeInvalidation(c) // the durable steering-input advance
 	return nil
 }

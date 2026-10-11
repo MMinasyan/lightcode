@@ -42,12 +42,13 @@ type codeGroup struct {
 // codeGroups derives the Session's target code groups from one owned
 // snapshot: every Operation whose OWN admitted input entry appears among the
 // validated facts, ordered by that entry's committed sequence. The match is
-// on the admitted-entry identity, never on the Operation identity (a steering
-// input committed under the same Operation must not create or displace a
-// group) and never on Operation IDs or admission timestamps (the Operation
-// list is identity-sorted). A manual-compaction Operation has no admitted
-// entry and derives no group; an ordinary message Operation derives its group
-// even when no snapshots were recorded for it, because a later group still
+// on the admitted-entry identity, never on the Operation identity (every
+// delivered message — steering included — owns exactly one Operation and one
+// admitted input, so every normally delivered head derives its own group) and
+// never on Operation IDs or admission timestamps (the Operation list is
+// identity-sorted). A manual-compaction Operation has no admitted entry and
+// derives no group; an ordinary message Operation derives its group even
+// when no snapshots were recorded for it, because a later group still
 // rewinds.
 func codeGroups(snap harness.SessionSnapshot) []codeGroup {
 	sequences := make(map[string]int64, len(snap.Facts))
