@@ -1,0 +1,647 @@
+{
+ "compare": [
+  {
+   "name": "equal_components",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "equal"
+  },
+  {
+   "name": "newer_durable_only",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"9\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "newer"
+  },
+  {
+   "name": "newer_local_only",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"4\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "newer"
+  },
+  {
+   "name": "older_durable_only",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "older"
+  },
+  {
+   "name": "older_local_only",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"2\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "older"
+  },
+  {
+   "name": "older_both_components",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "older"
+  },
+  {
+   "name": "incomparable_mixed_components",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"4\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "error": true
+  },
+  {
+   "name": "incomparable_mixed_components_reverse",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"2\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"3\"}",
+   "error": true
+  },
+  {
+   "name": "equal_with_leading_zeroes",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"007\",\"local_revision\":\"03\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "result": "equal"
+  },
+  {
+   "name": "equal_at_zero_local",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "result": "equal"
+  },
+  {
+   "name": "durable_lower_bound",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"2\",\"local_revision\":\"0\"}",
+   "result": "older"
+  },
+  {
+   "name": "durable_zero_out_of_range",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"0\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "durable_max_int64",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"9223372036854775807\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"9223372036854775807\",\"local_revision\":\"0\"}",
+   "result": "equal"
+  },
+  {
+   "name": "durable_above_max_int64",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"9223372036854775808\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"9223372036854775807\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "local_max_uint64",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"18446744073709551615\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"18446744073709551615\"}",
+   "result": "equal"
+  },
+  {
+   "name": "local_above_max_uint64",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"18446744073709551616\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_letters",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"abc\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_sign",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"+7\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_whitespace",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7 \",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_exponent",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1e2\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_float",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7.0\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_durable_empty",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"\",\"local_revision\":\"0\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_local_letters",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"x\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"1\",\"local_revision\":\"0\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_instance_uppercase",
+   "a": "{\"instance_id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_instance_short",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "error": true
+  },
+  {
+   "name": "malformed_instance_non_hex",
+   "a": "{\"instance_id\":\"gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "error": true
+  },
+  {
+   "name": "foreign_instances",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "b": "{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"durable_revision\":\"7\",\"local_revision\":\"3\"}",
+   "error": true
+  }
+ ],
+ "accept": [
+  {
+   "name": "initial_accepts_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "equal_clocks_accept",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "newer_session_durable_accept",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "newer_session_local_accept",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "newer_session_both_accept",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "stale_session_durable_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "stale_session_local_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "incomparable_session_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "newer_configuration_accepts",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "newer_warnings_accepts",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "stale_configuration_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "stale_warnings_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "stale_configuration_behind_newer_session_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "stale_warnings_behind_newer_session_rejects",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "configuration_floor_rejects_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"}",
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "configuration_floor_equal_accepts_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"}",
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "configuration_floor_rejects_with_current",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"}",
+   "warnings": null,
+   "accept": false
+  },
+  {
+   "name": "warnings_floor_rejects_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}",
+   "accept": false
+  },
+  {
+   "name": "warnings_floor_equal_accepts_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}",
+   "accept": true
+  },
+  {
+   "name": "warnings_floor_rejects_with_current",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}",
+   "accept": false
+  },
+  {
+   "name": "zero_floor_generation_accepts",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"0\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"0\"}",
+   "warnings": null,
+   "accept": true
+  },
+  {
+   "name": "malformed_floor_generation_errors_without_current",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"abc\"}",
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "malformed_floor_warning_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"x\"}",
+   "error": true
+  },
+  {
+   "name": "foreign_next_instance_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "foreign_floor_instance_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": "{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":\"9\"}",
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "foreign_cross_clock_instance_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "foreign_current_instance_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "empty_expected_instance_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "empty_expected_instance_with_current_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "empty_expected_instance_stale_body_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "empty_expected_instance_foreign_body_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "malformed_expected_instance_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "malformed_next_session_errors",
+   "current": null,
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"x\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "malformed_current_session_errors",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"x\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "error": true
+  },
+  {
+   "name": "all_clocks_newer_accepts",
+   "current": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"9\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"6\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":\"10\"},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"5\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "configuration": null,
+   "warnings": null,
+   "accept": true
+  }
+ ],
+ "item_ids": [
+  {
+   "name": "input_variant_id",
+   "item": "{\"item_id\":\"item-input\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"x\"}]}",
+   "id": "item-input"
+  },
+  {
+   "name": "assistant_variant_id",
+   "item": "{\"item_id\":\"item-assistant\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"x\"}],\"tool_calls\":[]}",
+   "id": "item-assistant"
+  },
+  {
+   "name": "signal_variant_id",
+   "item": "{\"item_id\":\"item-signal\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"subtype\":\"interruption\",\"content\":\"stopped\"}",
+   "id": "item-signal"
+  },
+  {
+   "name": "compaction_variant_id",
+   "item": "{\"item_id\":\"item-compaction\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"sum\",\"model\":\"prov/m\"}",
+   "id": "item-compaction"
+  },
+  {
+   "name": "operation_end_variant_id",
+   "item": "{\"item_id\":\"item-operation-end\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"status\":\"success\",\"detail\":\"done\"}",
+   "id": "item-operation-end"
+  },
+  {
+   "name": "unknown_kind_rejected",
+   "item": "{\"item_id\":\"item-future\",\"kind\":\"future\"}",
+   "error": true
+  },
+  {
+   "name": "missing_kind_rejected",
+   "item": "{\"item_id\":\"item-nokind\"}",
+   "error": true
+  },
+  {
+   "name": "empty_item_id_rejected",
+   "item": "{\"item_id\":\"\",\"kind\":\"input\"}",
+   "error": true
+  },
+  {
+   "name": "missing_item_id_rejected",
+   "item": "{\"kind\":\"input\"}",
+   "error": true
+  },
+  {
+   "name": "numeric_item_id_rejected",
+   "item": "{\"item_id\":7,\"kind\":\"input\"}",
+   "error": true
+  }
+ ],
+ "merge": [
+  {
+   "name": "overlap_suffix_prefix",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]}]",
+   "newer": "[{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]},{\"item_id\":\"m5\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-5\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]},{\"item_id\":\"m5\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-5\"}]}]"
+  },
+  {
+   "name": "overlap_newer_contained",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-4\"}]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-4\"}]}]"
+  },
+  {
+   "name": "overlap_older_contained",
+   "older": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]}]",
+   "newer": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]"
+  },
+  {
+   "name": "overlap_equal_ranges",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]}]",
+   "newer": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]"
+  },
+  {
+   "name": "overlap_mixed_variants",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}],\"tool_calls\":[]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"new-3\",\"model\":\"prov/m\"}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"new-3\",\"model\":\"prov/m\"}]"
+  },
+  {
+   "name": "disjoint_concatenates",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]}]",
+   "newer": "[{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]"
+  },
+  {
+   "name": "empty_older",
+   "older": "[]",
+   "newer": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]"
+  },
+  {
+   "name": "empty_newer",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]}]",
+   "newer": "[]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]}]"
+  },
+  {
+   "name": "both_empty",
+   "older": "[]",
+   "newer": "[]",
+   "result": "[]"
+  },
+  {
+   "name": "duplicate_within_older",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1-again\"}]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]",
+   "error": true
+  },
+  {
+   "name": "duplicate_within_newer",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2-again\"}]}]",
+   "error": true
+  },
+  {
+   "name": "reversed_overlap",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]}]",
+   "error": true
+  },
+  {
+   "name": "inconsistent_gap",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-4\"}]}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]},{\"item_id\":\"m5\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-5\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]",
+   "error": true
+  },
+  {
+   "name": "divergent_prefix",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-4\"}]}]",
+   "newer": "[{\"item_id\":\"m5\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-5\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]}]",
+   "error": true
+  },
+  {
+   "name": "divergent_suffix",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}]},{\"item_id\":\"m3\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-3\"}]}]",
+   "newer": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-1\"}]},{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]},{\"item_id\":\"m4\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-4\"}]}]",
+   "error": true
+  },
+  {
+   "name": "unidentifiable_item_rejected",
+   "older": "[{\"item_id\":\"m1\",\"kind\":\"future\"}]",
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}]}]",
+   "error": true
+  }
+ ],
+ "typescript_only": [
+  {
+   "name": "numeric_durable_revision_compare",
+   "function": "compare",
+   "a": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":7,\"local_revision\":\"1\"}",
+   "b": "{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"7\",\"local_revision\":\"1\"}"
+  },
+  {
+   "name": "numeric_generation_accept",
+   "function": "accept",
+   "next": "{\"session_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"durable_revision\":\"5\",\"local_revision\":\"2\"},\"configuration_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":7},\"warnings_revision\":{\"instance_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":\"4\"}}",
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+ ]
+}
