@@ -1241,6 +1241,47 @@ func TestProductionBlockedShutdown(t *testing.T) {
 			t.Fatal("the parked admission succeeded after the owner canceled; want the cancellation failure")
 		}
 	})
+
+	// With a pending steering head, the joined shutdown never starts a
+	// successor: the buffered head is discarded and becomes no Operation.
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		session, err := r.createSession(ctx, e.workspace("shutdown-successor-ws"), "worker")
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		e.server.armGate() // the run parks at its first model request
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-run", "hello")
+		e.server.awaitRequests(1)
+		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			res, err := h.Submit(ctx, harness.SubmitRequest{
+				SessionID: session.Identity.SessionID, OperationID: "op-steer", Origin: harness.InputOriginUser,
+				Content: []model.ContentPart{{Kind: model.PartText, Text: "steer"}}, Mode: harness.MessageModeRegular,
+			})
+			if err != nil {
+				return err
+			}
+			if res.Disposition != harness.DispositionSteering {
+				t.Errorf("steering submit disposition = %q, want steering", res.Disposition)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("steering submit: %v", err)
+		}
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		e.server.releaseGate()
+		if _, err := e.store.ReadRegister(ctx, harness.RegisterKey{
+			SessionID: session.Identity.SessionID, Kind: harness.RegisterOperation, OperationID: "op-steer",
+		}); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("shutdown started a successor: %v", err)
+		}
+	})
 }
 
 func TestProductionDuplicateTools(t *testing.T) {

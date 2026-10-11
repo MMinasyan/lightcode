@@ -276,11 +276,12 @@ func (f *codeRuntime) submitMode(sessionID, operationID, text string, mode harne
 	return disposition
 }
 
-// TestCodeSnapshotsSteeringSharesAdmittedGroup proves a real drained steering
-// input that shares its owning Operation does not create or displace the
-// group: the group key is the Operation's own admitted entry, never the later
-// steering entry, over the multi-boundary compact-lifecycle fixture.
-func TestCodeSnapshotsSteeringSharesAdmittedGroup(t *testing.T) {
+// TestCodeSnapshotsSteeringDerivesOwnGroup proves a delivered steering input
+// derives its own rewind group: the buffered head records no group while it
+// waits, and after the boundary handoff its own Operation's admitted entry is
+// a full group key — listed beside the predecessor's and restorable to the
+// predecessor's boundary — over the multi-boundary compact-lifecycle fixture.
+func TestCodeSnapshotsSteeringDerivesOwnGroup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		f := openCodeRuntime(t, store)
 		defer func() { _ = f.r.Close(context.Background()) }()
@@ -296,19 +297,18 @@ func TestCodeSnapshotsSteeringSharesAdmittedGroup(t *testing.T) {
 		if got := f.submitMode(session, "op-steer", "steering text", harness.MessageModeRegular); got != harness.DispositionSteering {
 			t.Fatalf("steering submit = %q, want steering", got)
 		}
+		if got := snapshotThroughRuntime(t, f.r, session); len(got.Operations) != 1 {
+			t.Fatalf("operations while the steering input is buffered = %d, want only the predecessor", len(got.Operations))
+		}
 		close(gate)
 		awaitOperation(t, f.r, session, "op-1", harness.OperationSuccess)
+		awaitOperation(t, f.r, session, "op-steer", harness.OperationSuccess) // the steering head's own Operation
 		awaitIdleSession(t, f.r, session)
 
+		steered := readOperation(t, f.r, session, "op-steer").Admission.AdmittedEntry.EntryID
 		admitted := readOperation(t, f.r, session, "op-1").Admission.AdmittedEntry.EntryID
-		var steering string
-		for _, fact := range snapshotThroughRuntime(t, f.r, session).Facts {
-			if fact.Kind == harness.EntryInput && fact.OperationID == "op-1" && fact.EntryID != admitted {
-				steering = fact.EntryID
-			}
-		}
-		if admitted == "" || steering == "" {
-			t.Fatalf("admitted/steering entries = (%q, %q), want a real same-Operation steering input", admitted, steering)
+		if admitted == "" || steered == "" || steered == admitted {
+			t.Fatalf("admitted/steering entries = (%q, %q), want two distinct admitted inputs", admitted, steered)
 		}
 
 		workspace := filepath.Join(f.r.dataDir, "steering-ws")
@@ -324,26 +324,49 @@ func TestCodeSnapshotsSteeringSharesAdmittedGroup(t *testing.T) {
 		if err := os.WriteFile(steeringFile, []byte("s0"), 0o600); err != nil {
 			t.Fatalf("write steering preimage: %v", err)
 		}
-		captureCodeMutation(t, codeGroupRoot(f.r, session, steering), steeringFile, steeringFile, []byte("s1"))
+		captureCodeMutation(t, codeGroupRoot(f.r, session, steered), steeringFile, steeringFile, []byte("s1"))
 
 		awaitRestorableSession(t, f.r, session)
 		groups, err := f.r.listSessionCodeSnapshots(context.Background(), session)
 		if err != nil {
 			t.Fatalf("listSessionCodeSnapshots: %v", err)
 		}
-		if len(groups) != 1 || groups[0].OperationId != "op-1" || groups[0].GroupItemId != projectItemID(session, admitted) {
-			t.Fatalf("groups = %+v, want exactly the admitted-entry group %q", groups, admitted)
+		if len(groups) != 2 {
+			t.Fatalf("groups = %+v, want the predecessor's and the steering head's own groups", groups)
+		}
+		byOperation := map[string]protocol.CodeSnapshotGroup{}
+		for _, group := range groups {
+			byOperation[group.OperationId] = group
+		}
+		if _, ok := byOperation["op-1"]; !ok {
+			t.Fatalf("groups = %+v, want the predecessor's admitted-entry group", groups)
+		}
+		steerGroup, ok := byOperation["op-steer"]
+		if !ok || steerGroup.GroupItemId != projectItemID(session, steered) {
+			t.Fatalf("steering group = %+v, want the steering head's own admitted-entry group %q", steerGroup, steered)
 		}
 
-		result, err := f.r.revertSessionCode(context.Background(), session, "op-1")
+		// Restoring to the steering head's boundary leaves the predecessor's
+		// group untouched; restoring to the predecessor covers both.
+		result, err := f.r.revertSessionCode(context.Background(), session, "op-steer")
 		if err != nil {
-			t.Fatalf("revertSessionCode: %v", err)
+			t.Fatalf("revertSessionCode(op-steer): %v", err)
+		}
+		if len(result.Restored) != 1 || result.Restored[0] != steeringFile {
+			t.Fatalf("restored = %v, want only the steering head's file", result.Restored)
+		}
+		if data, err := os.ReadFile(admittedFile); err != nil || string(data) != "v1" {
+			t.Fatalf("admitted-entry file = (%q, %v), want it untouched by the steering head's restore", data, err)
+		}
+		result, err = f.r.revertSessionCode(context.Background(), session, "op-1")
+		if err != nil {
+			t.Fatalf("revertSessionCode(op-1): %v", err)
 		}
 		if len(result.Restored) != 1 || result.Restored[0] != admittedFile {
-			t.Fatalf("restored = %v, want only the admitted group's file", result.Restored)
+			t.Fatalf("restored to the predecessor = %v, want the predecessor's file (the consumed steering group already restored)", result.Restored)
 		}
-		if data, err := os.ReadFile(steeringFile); err != nil || string(data) != "s1" {
-			t.Fatalf("steering-entry file = (%q, %v), want it untouched: the steering entry is not a group key", data, err)
+		if data, err := os.ReadFile(steeringFile); err != nil || string(data) != "s0" {
+			t.Fatalf("steering-entry file = (%q, %v), want the earlier restore's preimage retained", data, err)
 		}
 	})
 }

@@ -1569,9 +1569,8 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	c.mu.Unlock()
 	h.observeInvalidation(c)
 	go func() {
-		err := h.execute(c, operationID, prepared, run.execCtx)
-		h.recordStorageFailure(err)
-		h.drainBuffers(c, run)
+		res, closeExecution, err := h.execute(c, operationID, prepared, run.execCtx)
+		_ = h.finishExecution(c, run, operationID, res, err, closeExecution)
 		retired := false
 		c.mu.Lock()
 		if c.run == run { // a buffered drain may have installed the next execution already
@@ -1593,16 +1592,13 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 // A selected head stays pending until admission or final failure/duplicate.
 // Successful admission starts the successor; failure advances to the next
 // head. Harness loss discards both FIFOs. An empty scan retires only this run
-// under the same hold, never a successor's slot.
+// under the same hold, never a successor's slot. Its sole production caller,
+// finishExecution, holds the one reservation across this body: the successor
+// installs before that release.
 func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
 	c.mu.Unlock()
-	release, err := h.reserve(h.ctx, c)
-	if err != nil {
-		return
-	}
-	defer release()
 	for {
 		c.mu.Lock()
 		if h.ctx.Err() != nil { // Harness loss discards both buffers

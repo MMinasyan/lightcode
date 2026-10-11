@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -503,20 +504,16 @@ func TestSnapshotSessionMemberPublications(t *testing.T) {
 }
 
 // TestSnapshotSessionSteeringDeliveryPublications proves the steering
-// delivery's publication shape: the selected head stays buffered while its
-// delivery attempt runs, a failed attempt drops it exactly once as the final
-// outcome with no durable entry and no register advance, and a parked
-// delivery blocks any snapshot until the adoption completes, which then
-// observes the entirely-new state with the removal riding the durable
-// advance.
+// delivery's publication shape through the successor admission: the selected
+// head stays buffered while its delivery attempt runs, a failed attempt drops
+// it exactly once as the final outcome with no durable entry and no register
+// advance, and a parked delivery leaves snapshots available: the mid-admission
+// read observes the coherent pending state, and the post-adoption read
+// observes the entirely-new state with the removal riding the durable advance.
 func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 	t.Run("failed delivery is a final dropped publication", func(t *testing.T) {
 		store := emptyStore(t)
-		// the second attempt parks inside its assembly, so the post-attempt
-		// state stays stable until the subtest's assertions complete
-		release2 := make(chan struct{})
-		defer close(release2)
-		script := newModelScript(turn(testToolCall("call-1")), modelAttempt{stream: &parkingStream{release: release2}})
+		script := newModelScript(turn(testToolCall("call-1")))
 		script.gate = make(chan struct{})
 		h, cancel := newCancelableHarness(t, store, steeringPrepared(script), nil)
 		defer cancel()
@@ -548,24 +545,23 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 			t.Fatalf("enqueue revision = %d, want %d", buffered.LocalRevision, baseline.LocalRevision+3)
 		}
 
-		// The steering delivery's entry insert fails once: the selected head
+		// The successor admission's entry insert fails once: the selected head
 		// stays buffered through the attempt, is dropped exactly once as the
-		// attempt's final outcome, the register does not adopt the entry, and
-		// the Operation continues.
+		// attempt's final outcome, and the register never adopts it.
 		var once sync.Once
 		deliveryAttempted := make(chan struct{})
 		store.entryHook = func(draft EntryDraft) error {
-			// a steered input commits under the running Operation's identity,
-			// so the delivery is recognized by its content
+			// the successor admission commits its admitted input entry, so the
+			// delivery is recognized by its content
 			if !strings.Contains(string(draft.Payload), "steer-me") {
 				return nil
 			}
 			once.Do(func() { close(deliveryAttempted) })
 			return errors.New("delivery failed")
 		}
-		script.releaseGate()
+		script.releaseGate() // the boundary exits through the token; the drain's admission fails
 		receiveBounded(t, deliveryAttempted, "failed steering delivery")
-		receiveBounded(t, script.arrived, "post-failure model boundary")
+		awaitHarnessQuiet(t, h, session) // the drop settled and the drain converged
 
 		after, err := h.SnapshotSession(context.Background(), session)
 		if err != nil {
@@ -579,9 +575,11 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 				t.Fatalf("the failed delivery committed entry %s", fact.EntryID)
 			}
 		}
-		if after.LocalRevision != buffered.LocalRevision+1 {
-			t.Fatalf("local revision after the failed attempt = %d, want %d (the drop is the failed attempt's final publication)",
-				after.LocalRevision, buffered.LocalRevision+1)
+		// the completion owner's reservation, the drop, the retirement and
+		// the release: the predecessor's settlement is the one durable advance
+		if after.LocalRevision != buffered.LocalRevision+4 {
+			t.Fatalf("local revision after the failed attempt = %d, want %d (the reservation, the drop, the retirement and the release)",
+				after.LocalRevision, buffered.LocalRevision+4)
 		}
 		sessionKey := RegisterKey{SessionID: session, Kind: RegisterSession}
 		if after.Session.Revision != registerRevision(t, store, session, sessionKey) {
@@ -597,9 +595,15 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 				t.Fatalf("the failed delivery's entry %s reached storage", entry.ID)
 			}
 		}
+		if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationSuccess {
+			t.Fatalf("op-1 = %q, want the quiet success preserved through the failed delivery", rec.State.Status)
+		}
+		if storedOperationExists(store, session, "op-2") {
+			t.Fatalf("the failed delivery admitted the successor Operation")
+		}
 	})
 
-	t.Run("a parked delivery blocks snapshots until the adoption", func(t *testing.T) {
+	t.Run("a parked delivery keeps snapshots coherent until the adoption", func(t *testing.T) {
 		store := emptyStore(t)
 		// the second attempt parks inside its assembly, so the post-adoption
 		// state stays stable until the subtest's assertions complete: no
@@ -654,36 +658,61 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 
 		receiveBounded(t, deliveryStarted, "parked steering delivery")
 
-		// The parked producer must hold the coordinator mutex across the
-		// parked transaction: a free mutex here means the critical section
-		// was lost around the park. On this deterministic fixture the main
-		// test and the one parked producer are the only runners, so the check
-		// cannot pass spuriously.
-		if c.mu.TryLock() {
-			c.mu.Unlock()
+		// The parked admission runs under the completion owner's reservation:
+		// the drain holds it from the settlement through the successor's
+		// installation, so no competing admission can interleave.
+		c.mu.Lock()
+		held := c.reserved != nil
+		c.mu.Unlock()
+		if !held {
 			releaseDelivery()
 			receiveBounded(t, deliverySettled, "released steering transaction")
-			receiveBounded(t, script.arrived, "successor model boundary")
-			t.Fatal("the parked delivery transaction does not hold the coordinator mutex")
+			t.Fatal("the parked delivery lost the completion owner's reservation")
 		}
 
-		// The reader starts while the mutex is provably held and completes
-		// only after the adoption: its body must be the entirely-new state.
+		// A snapshot during the parked admission reads the pre-adoption state
+		// exactly: the completion owner has settled the predecessor, the selected head
+		// is still pending, and nothing of the successor is half-applied.
 		type snapResult struct {
 			snap SessionSnapshot
 			err  error
 		}
-		results := make(chan snapResult, 1)
+		parkedSnap := make(chan snapResult, 1)
 		go func() {
 			snap, err := h.SnapshotSession(context.Background(), session)
-			results <- snapResult{snap, err}
+			parkedSnap <- snapResult{snap, err}
 		}()
+		p := receiveBounded(t, parkedSnap, "mid-admission snapshot")
+		if p.err != nil {
+			t.Fatalf("snapshot during the parked admission: %v", p.err)
+		}
+		if len(p.snap.Steering) != 1 || p.snap.Steering[0].OperationID != "op-2" {
+			t.Fatalf("mid-admission steering = %+v, want the selected head still pending", p.snap.Steering)
+		}
+		if p.snap.Session.State.CurrentOperationID != "" {
+			t.Fatalf("mid-admission current operation = %q, want the settled predecessor cleared", p.snap.Session.State.CurrentOperationID)
+		}
+		for _, op := range p.snap.Operations {
+			if op.Admission.OperationID == "op-2" {
+				t.Fatalf("the parked admission exposed a half-applied successor Operation")
+			}
+		}
 		releaseDelivery()
 		receiveBounded(t, script.arrived, "post-adoption model boundary")
-		r := receiveBounded(t, results, "post-adoption snapshot")
-		if r.err != nil {
-			t.Fatalf("snapshot after the adoption: %v", r.err)
+		// The arrival proves successor installation and request start only;
+		// the completion owner's deferred release publishes its local
+		// revision after the drain returns, so the exact publication count
+		// reads only after that release.
+		releaseWait, stopWait := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopWait()
+		if err := c.waitIdle(releaseWait); err != nil {
+			t.Fatalf("waiting for the completion owner's release: %v", err)
 		}
+		post, err := h.SnapshotSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("snapshot after the adoption: %v", err)
+		}
+		r := snapResult{snap: post}
 		if len(r.snap.Steering) != 0 {
 			t.Fatalf("steering buffer after the adoption = %+v", r.snap.Steering)
 		}
@@ -691,6 +720,9 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		for _, fact := range r.snap.Facts {
 			if fact.Input != nil && fact.Input.Content[0].Text == "steer-me" {
 				found = true
+				if fact.OperationID != "op-2" {
+					t.Fatalf("the adopted delivery's input is owned by %q, want its own Operation op-2", fact.OperationID)
+				}
 			}
 		}
 		if !found {
@@ -702,14 +734,58 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		}
 		// The selected head stayed buffered through the parked attempt; the
 		// durable adoption advanced only the register — the removal rode it,
-		// so no local publication fired.
-		if r.snap.LocalRevision != buffered.LocalRevision {
-			t.Fatalf("post-adoption local revision = %d, want %d", r.snap.LocalRevision, buffered.LocalRevision)
+		// publishing nothing of its own. The completion owner's reservation,
+		// the successor installation and its release are the delivery cycle's
+		// local publications, the last visible only after the release waited
+		// for above.
+		if r.snap.LocalRevision != buffered.LocalRevision+3 {
+			t.Fatalf("post-adoption local revision = %d, want %d (the reservation, the installation and the release)",
+				r.snap.LocalRevision, buffered.LocalRevision+3)
 		}
 		if !r.snap.ExecutionBusy {
-			t.Fatalf("post-adoption snapshot = busy %v, want the still-running Operation", r.snap.ExecutionBusy)
+			t.Fatalf("post-adoption snapshot = busy %v, want the admitted successor Operation", r.snap.ExecutionBusy)
 		}
 	})
+}
+
+// TestSnapshotOwnerWaitsForReservationRelease proves the release barrier the
+// steering-delivery owner's exact publication counts depend on: waitIdle is
+// the reservation release wait — it reports a bounded caller context instead
+// of hanging while the reservation is held and returns once released — and
+// that release is exactly one local publication, so a count read before it
+// observes one publication fewer.
+func TestSnapshotOwnerWaitsForReservationRelease(t *testing.T) {
+	store := emptyStore(t)
+	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
+	defer cancel()
+	session := createSession(t, h)
+	c := cachedCoordinator(t, h, session)
+
+	release, err := h.reserve(context.Background(), c)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	held, err := h.SnapshotSession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("snapshot under the held reservation: %v", err)
+	}
+	bounded, stopWait := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stopWait()
+	if err := c.waitIdle(bounded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitIdle under a held reservation = %v, want the bounded caller deadline", err)
+	}
+	release()
+	if err := c.waitIdle(context.Background()); err != nil {
+		t.Fatalf("waitIdle after the release: %v", err)
+	}
+	free, err := h.SnapshotSession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("snapshot after the release: %v", err)
+	}
+	if free.LocalRevision != held.LocalRevision+1 {
+		t.Fatalf("local revision across the release = %d, want %d: the release is one publication, so counts read after it",
+			free.LocalRevision, held.LocalRevision+1)
+	}
 }
 
 func TestBufferedDeliverySelectionIdentity(t *testing.T) {
@@ -745,30 +821,40 @@ func TestBufferedDeliverySelectionIdentity(t *testing.T) {
 }
 
 func TestBufferedDuplicateDeliveryFinal(t *testing.T) {
-	store := emptyStore(t)
-	script := newModelScript(turn(), turn())
-	script.gate = make(chan struct{})
-	h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
-	defer cancel()
-	defer script.releaseGate()
-	session := createSession(t, h)
-	if _, err := submitText(t, h, session, "initial", MessageModeRegular, "hello"); err != nil {
-		t.Fatal(err)
-	}
-	receiveBounded(t, script.arrived, "initial model boundary")
-	for _, text := range []string{"first", "duplicate"} {
-		result, err := submitText(t, h, session, "queued", MessageModeQueued, text)
-		if err != nil || result.Disposition != DispositionQueued {
-			t.Fatalf("buffer %q = %+v, %v", text, result, err)
-		}
-	}
-	script.releaseGate()
-	quiet := awaitHarnessQuiet(t, h, session)
-	if len(quiet.Steering) != 0 || len(quiet.Queued) != 0 || len(quiet.Operations) != 2 {
-		t.Fatalf("duplicate did not retire exactly once: %+v", quiet)
-	}
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,first" {
-		t.Fatalf("committed inputs = %q, want only the first buffered payload", got)
+	for _, tc := range []struct {
+		mode MessageMode
+		want SubmitDisposition
+	}{
+		{MessageModeQueued, DispositionQueued},
+		{MessageModeRegular, DispositionSteering},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			store := emptyStore(t)
+			script := newModelScript(turn(), turn())
+			script.gate = make(chan struct{})
+			h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
+			defer cancel()
+			defer script.releaseGate()
+			session := createSession(t, h)
+			if _, err := submitText(t, h, session, "initial", MessageModeRegular, "hello"); err != nil {
+				t.Fatal(err)
+			}
+			receiveBounded(t, script.arrived, "initial model boundary")
+			for _, text := range []string{"first", "duplicate"} {
+				result, err := submitText(t, h, session, "buffered", tc.mode, text)
+				if err != nil || result.Disposition != tc.want {
+					t.Fatalf("buffer %q = %+v, %v, want disposition %s", text, result, err, tc.want)
+				}
+			}
+			script.releaseGate()
+			quiet := awaitHarnessQuiet(t, h, session)
+			if len(quiet.Steering) != 0 || len(quiet.Queued) != 0 || len(quiet.Operations) != 2 {
+				t.Fatalf("duplicate did not retire exactly once: %+v", quiet)
+			}
+			if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,first" {
+				t.Fatalf("committed inputs = %q, want only the first buffered payload", got)
+			}
+		})
 	}
 }
 

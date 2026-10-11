@@ -728,8 +728,18 @@ func toolNames(tools []model.ToolDefinition) []string {
 // constraints while the next capture uses revision 2 — for normal, drained
 // and Fork admission alike, on both stores.
 func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
-	for _, kind := range []string{"normal", "drained", "fork"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		mode harness.MessageMode
+		want harness.SubmitDisposition
+	}{
+		{name: "normal", kind: "normal"},
+		{name: "drained queued delivery", kind: "drained", mode: harness.MessageModeQueued, want: harness.DispositionQueued},
+		{name: "drained regular delivery", kind: "drained", mode: harness.MessageModeRegular, want: harness.DispositionSteering},
+		{name: "fork", kind: "fork"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 				e := newPrepEnv(t, store)
 				session := e.session("dual")
@@ -741,14 +751,14 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				var submitErr error
 				var forked harness.SessionRecord
 
-				switch kind {
+				switch tc.kind {
 				case "drained":
 					hold := make(chan struct{})
 					e.server.setHold(hold)
 					e.admit(session, "op-1", "one")
 					<-e.server.arrived
-					if res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
-						t.Fatalf("queued submit = %+v err %v, want queued", res, err)
+					if res, err := e.submit(context.Background(), session, "op-2", "two", tc.mode); err != nil || res.Disposition != tc.want {
+						t.Fatalf("buffered submit = %+v err %v, want disposition %s", res, err, tc.want)
 					}
 					e.hooks[0].parkNext(release, arrived)
 					close(hold) // op-1 converges; the post-terminal drain reaches the parked hook
@@ -798,7 +808,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					t.Fatalf("reload publish: %v", err)
 				}
 				close(release)
-				if kind != "drained" {
+				if tc.kind != "drained" {
 					<-heldDone // the held admission's caller finished its submit
 				}
 
@@ -812,7 +822,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				// The in-flight admission committed revision 1 and the
 				// captured constraints.
 				var inFlight harness.OperationRecord
-				if kind == "fork" {
+				if tc.kind == "fork" {
 					mu.Lock()
 					destination := forked.Identity.SessionID
 					mu.Unlock()
@@ -843,7 +853,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					t.Fatalf("Wait: %v", err)
 				}
 
-				if kind == "drained" {
+				if tc.kind == "drained" {
 					// Buffered messages captured only on delivery, and the
 					// successor preparation started only after the
 					// predecessor's scope closed: close-before-successor.

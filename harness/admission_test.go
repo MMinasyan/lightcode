@@ -192,6 +192,17 @@ func mustAdmit(t *testing.T, h *Harness, sessionID, operationID string, content 
 // storedSessionState reads back the store's session fixtures for one Session.
 // It returns stable snapshots: an auto-started execution mutates register
 // values in place, so callers never alias the store's backing arrays.
+// registerLookup returns one register envelope by key from a stored state
+// copy.
+func registerLookup(regs []Register, key RegisterKey) (Register, bool) {
+	for _, reg := range regs {
+		if reg.Key == key {
+			return reg, true
+		}
+	}
+	return Register{}, false
+}
+
 func storedSessionState(s *graphStorage, sessionID string) (entries []Entry, regs []Register) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -834,50 +845,184 @@ func TestAdmissionIdempotency(t *testing.T) {
 		}
 	})
 
-	t.Run("admitted race after preparation returns the first operation", func(t *testing.T) {
-		gate := make(chan struct{})
-		stub := newPrepareStub(validPrepared())
-		stub.gate = gate
-		store := freshSessionStore(t)
-		h := newTestHarness(t, store, stub.prepare)
-
-		dispCh := make(chan SubmitDisposition, 1)
-		go func() {
-			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("raced"), Mode: MessageModeRegular})
+	// One local winner table over the shared parked-preparation driver: each
+	// case keeps its own winner construction and result/entry/revision/
+	// ownership assertions.
+	for _, tc := range []struct {
+		name  string
+		seed  func(t *testing.T, store *graphStorage, h *Harness, other string)
+		check func(t *testing.T, store *graphStorage, h *Harness, other string, baseRevision int64, res SubmitResult, err error)
+	}{
+		{
+			name: "admitted race after preparation returns the first operation",
+			seed: func(t *testing.T, store *graphStorage, _ *Harness, _ string) {
+				// A concurrent admission of the same identity wins: it
+				// publishes the full input, operation, and session state
+				// directly into storage.
+				if err := store.Transact(context.Background(), func(tx Transaction) error {
+					return insertForeignAdmission(t, tx, testSessionID, testOpID)
+				}); err != nil {
+					t.Fatalf("foreign admission: %v", err)
+				}
+			},
+			check: func(t *testing.T, store *graphStorage, h *Harness, _ string, _ int64, res SubmitResult, err error) {
+				if err != nil {
+					t.Fatalf("raced admission: %v", err)
+				}
+				if res.Disposition != DispositionExisting {
+					t.Fatalf("raced admission disposition = %q, want existing", res.Disposition)
+				}
+				entries, regs := storedSessionState(store, testSessionID)
+				if len(entries) != 1 || len(regs) != 2 {
+					t.Fatalf("raced admission published entries %v registers %v", entries, regs)
+				}
+				rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
+				if err != nil {
+					t.Fatalf("ReadOperation: %v", err)
+				}
+				if rec.Admission.Execution.ConfigurationRevision != testCapture().ConfigurationRevision {
+					t.Fatalf("raced admission returned the wrong operation: %+v", rec)
+				}
+			},
+		},
+		{
+			name: "same-session terminal compact winner rejects without alias",
+			seed: func(t *testing.T, store *graphStorage, _ *Harness, _ string) {
+				// The winner is a terminal compact Operation under the same
+				// caller ID, with its typed settlement and no Session-register
+				// change.
+				settlementID := hexID(60)
+				if err := store.Transact(context.Background(), func(tx Transaction) error {
+					settlement, err := encodeOperationSettlementEntry(operationSettlementEntry{
+						SessionID: testSessionID, EntryID: settlementID, OperationID: testOpID, Status: OperationSuccess,
+					})
+					if err != nil {
+						return err
+					}
+					if _, err := tx.InsertEntry(EntryDraft{SessionID: testSessionID, ID: settlementID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: settlement}); err != nil {
+						return err
+					}
+					winner := compactOperationRecord(testOpID)
+					stamped := testTime
+					winner.State.Status = OperationSuccess
+					winner.State.SettledAt = &stamped
+					winner.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: settlementID}}
+					payload, err := encodeOperationRegister(winner)
+					if err != nil {
+						return err
+					}
+					_, err = tx.InsertRegister(RegisterDraft{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: payload})
+					return err
+				}); err != nil {
+					t.Fatalf("compact winner: %v", err)
+				}
+			},
+			check: func(t *testing.T, store *graphStorage, _ *Harness, _ string, _ int64, _ SubmitResult, err error) {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("raced admission = %v, want the wrong-kind rejection", err)
+				}
+				entries, regs := storedSessionState(store, testSessionID)
+				if len(entries) != 1 || entries[0].ID != hexID(60) {
+					t.Fatalf("raced admission published %v, want no extra input beside the winner's settlement", entries)
+				}
+				if len(regs) != 2 {
+					t.Fatalf("raced admission published %d registers, want only the session and the winner", len(regs))
+				}
+				wire, ok := registerLookup(regs, RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID})
+				if !ok {
+					t.Fatalf("the compact winner's register vanished")
+				}
+				rec, err := decodeOperationRegister(wire)
+				if err != nil || rec.Admission.RequestKind != RequestKindCompact ||
+					rec.State.Terminal == nil || rec.State.Terminal.SettlementEntry.EntryID != hexID(60) {
+					t.Fatalf("winner rewritten = %+v err %v, want the compact terminal untouched", rec, err)
+				}
+			},
+		},
+		{
+			name: "foreign-session winner rejects without alias",
+			seed: func(t *testing.T, store *graphStorage, _ *Harness, other string) {
+				// The winner lands in its own Session and changes only that
+				// Session.
+				if err := store.Transact(context.Background(), func(tx Transaction) error {
+					return insertForeignAdmission(t, tx, other, testOpID)
+				}); err != nil {
+					t.Fatalf("foreign admission: %v", err)
+				}
+			},
+			check: func(t *testing.T, store *graphStorage, _ *Harness, other string, baseRevision int64, _ SubmitResult, err error) {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("raced admission = %v, want the foreign-identity rejection", err)
+				}
+				entries, _ := storedSessionState(store, testSessionID)
+				if len(entries) != 0 {
+					t.Fatalf("raced admission published %v, want no extra input", entries)
+				}
+				_, otherRegs := storedSessionState(store, other)
+				otherWire, ok := registerLookup(otherRegs, RegisterKey{SessionID: other, Kind: RegisterOperation, OperationID: testOpID})
+				if !ok {
+					t.Fatalf("the foreign winner is not durable in its own Session")
+				}
+				if otherRec, err := decodeOperationRegister(otherWire); err != nil || otherRec.Admission.SessionID != other {
+					t.Fatalf("foreign winner = %+v err %v, want it owned by its own Session", otherRec, err)
+				}
+				_, regs := storedSessionState(store, testSessionID)
+				wire, ok := registerLookup(regs, RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
+				if !ok {
+					t.Fatalf("the session register vanished")
+				}
+				current, err := decodeSessionRegister(wire)
+				if err != nil || current.Revision != baseRevision {
+					t.Fatalf("this Session changed = %+v err %v (revision %d, was %d), want the foreign winner confined to its own Session", current, err, current.Revision, baseRevision)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := make(chan struct{})
+			stub := newPrepareStub(validPrepared())
+			stub.gate = gate
+			store := freshSessionStore(t)
+			h := newTestHarness(t, store, stub.prepare)
+			created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
 			if err != nil {
-				t.Errorf("raced admission: %v", err)
+				t.Fatalf("CreateSession: %v", err)
 			}
-			dispCh <- res.Disposition
-		}()
-		<-stub.arrived
+			other := created.Identity.SessionID
 
-		// A concurrent admission of the same identity wins: it publishes the
-		// full input, operation, and session state directly into storage.
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignAdmission(t, tx, testSessionID, testOpID)
-		}); err != nil {
-			t.Fatalf("foreign admission: %v", err)
-		}
-		close(gate)
-		disposition := <-dispCh
-		if disposition != DispositionExisting {
-			t.Fatalf("raced admission disposition = %q, want existing", disposition)
-		}
-		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 1 || len(regs) != 2 {
-			t.Fatalf("raced admission published entries %v registers %v", entries, regs)
-		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one", got)
-		}
-		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.Admission.Execution.ConfigurationRevision != testCapture().ConfigurationRevision {
-			t.Fatalf("raced admission returned the wrong operation: %+v", rec)
-		}
-	})
+			type outcome struct {
+				res SubmitResult
+				err error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				res, err := h.Submit(context.Background(), SubmitRequest{
+					SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser,
+					Content: admissionContent("raced"), Mode: MessageModeRegular,
+				})
+				done <- outcome{res, err}
+			}()
+			<-stub.arrived // the admission is parked in preparation
+
+			_, baseRegs := storedSessionState(store, testSessionID)
+			baseWire, ok := registerLookup(baseRegs, RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
+			if !ok {
+				t.Fatalf("the session register vanished")
+			}
+			base, err := decodeSessionRegister(baseWire)
+			if err != nil {
+				t.Fatalf("decode session register: %v", err)
+			}
+
+			tc.seed(t, store, h, other)
+			close(gate)
+			out := <-done
+			if got := stub.callCount(); got != 1 {
+				t.Fatalf("preparation calls = %d, want one", got)
+			}
+			tc.check(t, store, h, other, base.Revision, out.res, out.err)
+		})
+	}
 
 	t.Run("global operation reuse in another session is invalid", func(t *testing.T) {
 		store := freshSessionStore(t)

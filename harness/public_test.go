@@ -445,8 +445,10 @@ func TestPublicTurnLifecycle(t *testing.T) {
 
 // TestPublicSteeringContinuation proves the coordination row through public
 // operations: regular input submitted while an Operation is active enters the
-// steering buffer, and the same Operation continues across the model boundary
-// with the steering projected before the next request.
+// steering buffer, the predecessor settles quiet success at the boundary, and
+// the steering arrives as its own successor Operation whose first request
+// projects it after the predecessor's history — with the queued head draining
+// after the successor's terminal.
 func TestPublicSteeringContinuation(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		script := newScriptModel()
@@ -468,18 +470,35 @@ func TestPublicSteeringContinuation(t *testing.T) {
 			t.Fatalf("queued submit = %+v err %v, want queued", queued, err)
 		}
 		script.releaseGate()
-		<-script.arrived
+		<-f.prepare      // the drain admitted the steering item: op-1's quiet terminal committed
+		<-script.arrived // the steering item's own Operation makes the next request
 		if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "steer" {
-			t.Fatalf("continuation projection = %v, want the drained steering in the same Operation", got)
+			t.Fatalf("successor projection = %v, want the steering as its own Operation's first request", got)
 		}
-		<-f.prepare // the drain admitted the queued item: op-1's terminal committed
+		awaitTerminal(t, f.h, session, "op-2")
+		<-f.prepare // the queued item drains after the successor's terminal
 		<-script.arrived
 		if err := converge(t, f); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
 		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("steered operation = %+v err %v, want success", rec, err)
+		if err != nil || rec.State.Status != harness.OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
+			t.Fatalf("settled predecessor = %+v err %v, want quiet success with empty detail", rec, err)
+		}
+		successor, err := f.h.ReadOperation(context.Background(), session, "op-2")
+		if err != nil || successor.State.Status != harness.OperationSuccess {
+			t.Fatalf("steering operation = %+v err %v, want the successor's success", successor, err)
+		}
+		snap, err := f.h.SnapshotSession(context.Background(), session)
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		for _, fact := range snap.Facts {
+			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "steer" {
+				if fact.OperationID != "op-2" {
+					t.Fatalf("steering input owned by %q, want its own Operation op-2", fact.OperationID)
+				}
+			}
 		}
 	})
 }
@@ -1505,14 +1524,15 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 // TestPublicFinalBoundarySerialization proves the coordinator linearizes the
 // final model-result boundary against submissions through public operations:
 // input submitted inside the model callback while the Operation is still
-// current is never stranded — regular input continues the Operation, queued
-// input drains after the terminal commit.
+// current is never stranded — regular input arrives through its own successor
+// Operation after the natural-success boundary exit, queued input drains after
+// the terminal commit.
 func TestPublicFinalBoundarySerialization(t *testing.T) {
-	t.Run("regular input at the boundary continues the operation", func(t *testing.T) {
+	t.Run("regular input at the boundary arrives through its own Operation", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			script := newScriptModel(
-				publicTurn(),                   // the boundary result commits; steering continues it
-				publicFail("boundary settled"), // model-originated terminal
+				publicTurn(), // the boundary result commits; the completion owner settles it
+				publicFail("successor settled"),
 			)
 			var (
 				f       *publicFixture
@@ -1537,21 +1557,33 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				t.Fatalf("first submit: %v", err)
 			}
 			<-script.arrived
-			<-script.arrived // the boundary steering continued the same Operation
+			<-script.arrived // the boundary input's own Operation makes the next request
 			if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "at-boundary" {
-				t.Fatalf("continuation projection = %v, want the boundary steering in the same Operation", got)
+				t.Fatalf("successor projection = %v, want the boundary steering as its own Operation's first request", got)
 			}
-			awaitTerminal(t, f.h, session, "op-1") // the settlement commits before the convergence cancellation
+			awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
 			if err := converge(t, f); err != nil {
 				t.Fatalf("Wait: %v", err)
 			}
 			rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-			if err != nil || rec.State.Status != harness.OperationFailure ||
-				rec.State.Terminal == nil || rec.State.Terminal.Detail != "boundary settled" {
-				t.Fatalf("operation = %+v err %v, want the boundary steering to continue it to its terminal", rec, err)
+			if err != nil || rec.State.Status != harness.OperationSuccess || rec.State.Terminal == nil {
+				t.Fatalf("operation = %+v err %v, want the natural-success boundary's quiet success", rec, err)
 			}
-			if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); err == nil {
-				t.Fatalf("boundary steering became an Operation, want it owned by the running one")
+			successor, err := f.h.ReadOperation(context.Background(), session, "op-2")
+			if err != nil || successor.State.Status != harness.OperationFailure ||
+				successor.State.Terminal == nil || successor.State.Terminal.Detail != "successor settled" {
+				t.Fatalf("successor operation = %+v err %v, want the boundary input's own Operation at its terminal", successor, err)
+			}
+			snap, err := f.h.SnapshotSession(context.Background(), session)
+			if err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+			for _, fact := range snap.Facts {
+				if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "at-boundary" {
+					if fact.OperationID != "op-2" {
+						t.Fatalf("boundary input owned by %q, want its own Operation op-2", fact.OperationID)
+					}
+				}
 			}
 		})
 	})

@@ -16,6 +16,15 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// executeDirect drives one admitted Operation's private execution and
+// completion directly, without installing a run slot — the direct effect-test
+// shape over the two actual production functions with a constructed run.
+func executeDirect(h *Harness, c *coordinator, execCtx context.Context, operationID string, prepared PreparedExecution) error {
+	run := &activeExecution{execCtx: execCtx, cancel: func() {}}
+	res, closeExecution, err := h.execute(c, operationID, prepared, execCtx)
+	return h.finishExecution(c, run, operationID, res, err, closeExecution)
+}
+
 // newEffectHarness admits one running Operation ("op-1") with the given
 // prepared physical model request function and returns the pieces the effect
 // fixtures need.
@@ -730,6 +739,87 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 	if msgs[4].Role != model.RoleUser || msgs[4].TextContent() != want {
 		t.Fatalf("signal message = %+v, want the wrapped signal text %q", msgs[4], want)
 	}
+
+	// The two live boundary-selection cases share the fixture pieces: one
+	// immediate tool plan and the real model/tool effect drivers, whose
+	// callbacks complete before any late arrival.
+	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+	}
+	runEffects := func(t *testing.T, h *Harness, c *coordinator, modelFn func(context.Context, model.Request) (model.Stream, error)) {
+		t.Helper()
+		exec := effectExecution(modelFn, plan)
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), nil); err != nil {
+			t.Fatalf("model effect: %v", err)
+		}
+		if _, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1")); err != nil {
+			t.Fatalf("tool effect: %v", err)
+		}
+	}
+
+	t.Run("first projection ignores early pending steering", func(t *testing.T) {
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
+		h, _, c, sessionID := newEffectHarness(t, modelFn)
+		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
+			t.Fatalf("steering submit: %v", err)
+		}
+		first, err := h.contextSource(c, testOpID)(context.Background())
+		if err != nil {
+			t.Fatalf("first projection with pending steering: %v", err)
+		}
+		if len(first) != 2 || first[1].TextContent() != "hello" {
+			t.Fatalf("first projection = %+v, want the admitted input only despite the pending head", first)
+		}
+	})
+
+	t.Run("late arrival selects the boundary at the next call", func(t *testing.T) {
+		modelCalls := 0
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			modelCalls++
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
+		h, store, c, sessionID := newEffectHarness(t, modelFn)
+		liveCtx, liveCancel := context.WithCancel(context.Background())
+		defer liveCancel()
+		run := &activeExecution{done: make(chan struct{}), execCtx: liveCtx, cancel: func() {}}
+		c.mu.Lock()
+		c.run = run // the live execution whose context selection must leave alone
+		c.mu.Unlock()
+		source := h.contextSource(c, testOpID)
+		first, err := source(context.Background()) // steering is empty through the first projection
+		if err != nil || len(first) != 2 || first[1].TextContent() != "hello" {
+			t.Fatalf("first projection = (%+v, %v), want the admitted input with empty steering", first, err)
+		}
+		runEffects(t, h, c, modelFn) // the real model and tool callbacks return before the head arrives
+		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
+			t.Fatalf("late steering submit: %v", err)
+		}
+		before := storedEntryCount(store, sessionID)
+		msgs, err := source(context.Background())
+		if err != errSteeringBoundary { // exact identity: the private token, never a text or cancellation class
+			t.Fatalf("boundary selection = (%v, %v), want the private boundary token verbatim", msgs, err)
+		}
+		if msgs != nil {
+			t.Fatalf("boundary selection projected %v, want no messages", msgs)
+		}
+		if got := storedEntryCount(store, sessionID); got != before {
+			t.Fatalf("boundary selection wrote %d entries, want no storage", got-before)
+		}
+		if modelCalls != 1 {
+			t.Fatalf("model calls = %d, want no second request behind the token", modelCalls)
+		}
+		c.mu.Lock()
+		buffered := len(c.steering)
+		c.mu.Unlock()
+		if buffered != 1 {
+			t.Fatalf("buffered heads = %d, want the sole head still pending after selection", buffered)
+		}
+		if run.execCtx.Err() != nil {
+			t.Fatalf("execution context = %v, want it unchanged and live after selection", run.execCtx.Err())
+		}
+	})
 }
 
 // TestSignalProjectionEscaping proves the signal wrapper escapes &, < and >
@@ -738,58 +828,6 @@ func TestSignalProjectionEscaping(t *testing.T) {
 	got := signalProjectedText(`a & b < c > d`)
 	if got != "<system-signal>a &amp; b &lt; c &gt; d</system-signal>" {
 		t.Fatalf("signalProjectedText = %q, want the escaped wrapper", got)
-	}
-}
-
-// TestSteeringInputHelper proves the steering-input producer commits one
-// Operation-owned input entry, preserves the item's own submission origin,
-// and advances last activity to its commit time.
-func TestSteeringInputHelper(t *testing.T) {
-	h, store, c, sessionID := newEffectHarness(t, nil)
-	before, err := h.ReadSessionHeader(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); err != nil {
-		t.Fatalf("commitSteeringInput: %v", err)
-	}
-	if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginRuntime, content: admissionContent("steered-by-runtime")}); err != nil {
-		t.Fatalf("commitSteeringInput with a non-user origin: %v", err)
-	}
-	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-steering graph: %v", err)
-	}
-	var user, runtime *inputEntry
-	for i := range graph.Entries {
-		if graph.Entries[i].Input == nil || graph.Entries[i].Envelope.OperationID != testOpID {
-			continue
-		}
-		switch graph.Entries[i].Input.Content[0].Text {
-		case "steering":
-			user = graph.Entries[i].Input
-		case "steered-by-runtime":
-			runtime = graph.Entries[i].Input
-		}
-	}
-	if user == nil || user.Origin != InputOriginUser {
-		t.Fatalf("user steering entry not committed with its own origin: %+v", user)
-	}
-	if runtime == nil || runtime.Origin != InputOriginRuntime {
-		t.Fatalf("runtime steering entry did not preserve its submission origin: %+v", runtime)
-	}
-	after, err := h.ReadSessionHeader(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if after.Identity.SessionID != sessionID {
-		t.Fatalf("session identity changed")
-	}
-	if !after.LastActivity.After(before.LastActivity) {
-		t.Fatalf("last activity = %v, want it advanced to the steering commit time", after.LastActivity)
-	}
-	if after.CurrentOperationID != testOpID {
-		t.Fatalf("current operation = %q, want the running operation preserved", after.CurrentOperationID)
 	}
 }
 
@@ -875,107 +913,6 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
-	t.Run("steering transaction", func(t *testing.T) {
-		h, store, c, sessionID := newEffectHarness(t, nil)
-		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrConflict) {
-			t.Fatalf("steering over a foreign revision = %v, want the revision-race conflict", err)
-		}
-		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
-			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
-		}
-	})
-}
-
-// archiveSettledSession moves one open Session with no running Operation to
-// archived consistently across the coordinator view and storage: a genuinely
-// archived Session with a running Operation is graph-invalid and cannot be
-// produced through storage, so the fixture writes both sides at one revision.
-func archiveSettledSession(t *testing.T, c *coordinator, store *graphStorage, sessionID string) {
-	t.Helper()
-	stamped := testTime
-	err := store.Transact(context.Background(), func(tx Transaction) error {
-		key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
-		reg, err := tx.ReadRegister(key)
-		if err != nil {
-			return err
-		}
-		current, err := decodeSessionRegister(reg)
-		if err != nil {
-			return err
-		}
-		state := current.State
-		state.Lifecycle = LifecycleArchived
-		state.ArchivedAt = &stamped
-		archived := SessionRecord{Identity: current.Identity, State: state}
-		payload, err := encodeSessionRegister(archived)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.ReplaceRegister(key, reg.Revision, payload)
-		if err != nil {
-			return err
-		}
-		archived.Revision = replaced.Revision
-		c.mu.Lock()
-		c.graph.Session = archived
-		c.mu.Unlock()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("archive fixture: %v", err)
-	}
-}
-
-// TestSteeringInputPreconditions proves the steering transition's
-// in-transaction preconditions: an open Session whose current Operation is the
-// steering target.
-func TestSteeringInputPreconditions(t *testing.T) {
-	t.Run("steering after terminal settlement", func(t *testing.T) {
-		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return nil, errors.New("model failure")
-		}
-		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-			t.Fatalf("terminal effect: %v", err)
-		}
-		before, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph before steering: %v", err)
-		}
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering after terminal settlement = %v, want ErrInvalid", err)
-		}
-		after, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after refused steering: %v", err)
-		}
-		if len(after.Entries) != len(before.Entries) {
-			t.Fatalf("%d entries after refused steering, want the unchanged %d", len(after.Entries), len(before.Entries))
-		}
-	})
-	t.Run("steering on an archived session", func(t *testing.T) {
-		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return nil, errors.New("model failure")
-		}
-		h, store, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-			t.Fatalf("terminal effect: %v", err)
-		}
-		archiveSettledSession(t, c, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering on an archived session = %v, want ErrInvalid", err)
-		}
-		after, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after refused steering: %v", err)
-		}
-		for _, entry := range after.Entries {
-			if entry.Input != nil && entry.Input.Content[0].Text == "steering" {
-				t.Fatalf("steering entry %s committed on an archived session", entry.Envelope.ID)
-			}
-		}
-	})
 }
 
 // foreignTerminalSettle writes one foreign terminal settlement directly into
@@ -1011,16 +948,6 @@ func foreignTerminalSettle(t *testing.T, store *graphStorage, sessionID, operati
 	}
 }
 
-// foreignArchive wraps the landed foreign-archive writer in one transaction.
-func foreignArchive(t *testing.T, store *graphStorage, sessionID string) {
-	t.Helper()
-	if err := store.Transact(context.Background(), func(tx Transaction) error {
-		return foreignArchiveChange(tx, sessionID)
-	}); err != nil {
-		t.Fatalf("foreign archive: %v", err)
-	}
-}
-
 // TestEffectTransactionsPreconditionsOutrankRevisionRace proves the mismatch
 // path of every effect transaction mirrors publishAdmission: a freshly decoded
 // register showing the semantic precondition violated returns ErrInvalid; only
@@ -1050,13 +977,6 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		store, sessionID = st, sid
 		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("result over a foreign terminal operation = %v, want ErrInvalid", err)
-		}
-	})
-	t.Run("steering over a foreign archive", func(t *testing.T) {
-		h, store, c, sessionID := newEffectHarness(t, nil)
-		foreignArchive(t, store, sessionID)
-		if err := h.commitSteeringInput(context.Background(), c, testOpID, &pendingMessage{origin: InputOriginUser, content: admissionContent("steering")}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("steering over a foreign archive = %v, want ErrInvalid", err)
 		}
 	})
 }
@@ -1196,7 +1116,7 @@ func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1243,7 +1163,7 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 		opens = append(opens, openRecord{ctx: ctx, adm: adm})
 		return effectExecution(modelFn, spy.tool), nil
 	})
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if len(opens) != 1 {
@@ -1281,7 +1201,7 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 		return effectExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
 	})
 	cancel() // the execution context is lost before the opener could start
-	if err := h.execute(c, testOpID, prepared, h.ctx); !errors.Is(err, context.Canceled) {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
 		t.Fatalf("execute = %v, want the context error", err)
 	}
 	if opens != 0 {
@@ -1318,7 +1238,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 			}, openErr
 		})
-		if err := h.execute(c, testOpID, prepared, h.ctx); err != openErr {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != openErr {
 			t.Fatalf("execute = %v, want the exact opener error", err)
 		}
 		if modelRuns != 0 {
@@ -1342,7 +1262,7 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{}, storageErr
 		})
-		if err := h.execute(c, testOpID, prepared, h.ctx); err != storageErr {
+		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != storageErr {
 			t.Fatalf("execute = %v, want the exact storage-class error", err)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1403,7 +1323,7 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			var sessionID string
 			var prepared PreparedExecution
 			h, store, c, sessionID, prepared, _ = newOpenerHarness(t, open)
-			err := h.execute(c, testOpID, prepared, h.ctx)
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatalf("execute = %v, want the invalid-execution rejection", err)
 			}
@@ -2370,10 +2290,24 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 		return completedTurnStream(), nil
 	}
 	spy := &toolSpy{}
-	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	var h *Harness
+	var sessionID string
+	var steered bool
+	toolFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
+		if !steered { // pending steering arrives inside the batch
+			steered = true
+			if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-batch"); err != nil {
+				t.Errorf("steering submit: %v", err)
+			}
+		}
+		return spy.tool(ctx, call)
+	}
+	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, toolFn)
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
+	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head's own successor settles
+	awaitHarnessQuiet(t, h, sessionID)
 	if got := spy.dispatched(); len(got) != 2 || got[0] != "call-1" || got[1] != "call-2" {
 		t.Fatalf("dispatch order = %v, want [call-1 call-2]", got)
 	}
@@ -2382,7 +2316,7 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 		t.Fatalf("graph after the batch: %v", err)
 	}
 	results := map[string]int{}
-	var lastSeq int64
+	var lastSeq, firstAdmission int64
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			results[entry.ToolResult.ToolCallID]++
@@ -2390,10 +2324,24 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 				t.Fatalf("tool result %s committed out of order", entry.Envelope.ID)
 			}
 		}
+		if entry.Input != nil && entry.Input.Content[0].Text == "steer-batch" {
+			firstAdmission = entry.Envelope.Sequence
+		}
 		lastSeq = entry.Envelope.Sequence
 	}
 	if results["call-1"] != 1 || results["call-2"] != 1 {
 		t.Fatalf("result counts = %v, want exactly one per call", results)
+	}
+	if firstAdmission == 0 || lastSeq == 0 {
+		t.Fatalf("missing the successor admission or the last result entry")
+	}
+	for _, entry := range graph.Entries {
+		if entry.ToolResult != nil && entry.Envelope.Sequence >= firstAdmission {
+			t.Fatalf("tool result %s committed after the successor admission", entry.Envelope.ID)
+		}
+	}
+	if owner, _ := steeringInputOwner(t, store, sessionID, "steer-batch"); owner != "op-2" {
+		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	if err != nil {
@@ -2424,7 +2372,7 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -2467,9 +2415,14 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	}
 	spy := &toolSpy{plan: toolFn}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-int"); err != nil { // pending steering through the stopped batch
+		t.Fatalf("steering submit: %v", err)
+	}
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
+	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head drains as its own Operation
+	awaitHarnessQuiet(t, h, sessionID)
 	if got := spy.dispatched(); len(got) != 1 || got[0] != "call-1" {
 		t.Fatalf("dispatch order = %v, want the batch stopped after call-1", got)
 	}
@@ -2496,6 +2449,9 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
 		t.Fatalf("operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
 	}
+	if owner, _ := steeringInputOwner(t, store, sessionID, "steer-int"); owner != "op-2" {
+		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
+	}
 	requireSessionCleared(t, h, sessionID)
 }
 
@@ -2520,7 +2476,7 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	cancel = harnessCancel
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2540,13 +2496,37 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 // the outer path: the Operation settles failure with the Agent's cap detail
 // after the last settled continuation.
 func TestExecuteCapSettlesFailure(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		modelRuns int
+		arrived25 = make(chan struct{})
+		gate25    = make(chan struct{})
+	)
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		mu.Lock()
+		modelRuns++
+		n := modelRuns
+		mu.Unlock()
+		if n == 25 { // pending steering arrives at the last effect, before the cap check
+			close(arrived25)
+			<-gate25
+		}
+		if n > 25 {
+			return completedTurnStream(), nil // the drained successor's own turn
+		}
 		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	done := make(chan error, 1)
+	go func() { done <- executeDirect(h, c, h.ctx, testOpID, prepared) }()
+	receiveBounded(t, arrived25, "the 25th model effect")
+	if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
+		t.Fatalf("steering submit: %v", err)
+	}
+	close(gate25)
+	if err := <-done; err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2556,21 +2536,26 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent exceeded 25 model effects" {
 		t.Fatalf("operation state = %+v, want terminal failure at the cap", rec.State)
 	}
+	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head drains as its own Operation
+	awaitHarnessQuiet(t, h, sessionID)
 	graph, err := validateFixture(t, store, sessionID)
 	if err != nil {
 		t.Fatalf("graph at the cap: %v", err)
 	}
 	assistants, signals := 0, 0
 	for _, entry := range graph.Entries {
-		if entry.Assistant != nil {
+		if entry.Assistant != nil && entry.Envelope.OperationID == testOpID {
 			assistants++
 		}
-		if entry.Signal != nil {
+		if entry.Signal != nil && entry.Envelope.OperationID == testOpID {
 			signals++
 		}
 	}
 	if assistants != 25 || signals != 25 {
 		t.Fatalf("%d assistants and %d signals committed, want 25 of each", assistants, signals)
+	}
+	if owner, _ := steeringInputOwner(t, store, sessionID, "s1"); owner != "op-2" {
+		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
 	}
 	requireSessionCleared(t, h, sessionID)
 }
@@ -2662,7 +2647,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			}
 			return nil
 		}
-		err := h.execute(c, testOpID, prepared, h.ctx)
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
 		if !errors.Is(err, ErrStorage) {
 			t.Fatalf("execute = %v, want the injected storage failure", err)
 		}
@@ -2687,7 +2672,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 		for _, runErr := range []error{context.Canceled, context.DeadlineExceeded} {
 			h, store, c, sessionID := newEffectHarness(t, nil)
 			publishCalls(t, h, c, sessionID, testToolCall("call-1"))
-			if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr); !errors.Is(err, runErr) {
+			if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background()); !errors.Is(err, runErr) {
 				t.Fatalf("settleAgentTerminal(%v) = %v, want the run error back", runErr, err)
 			}
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2705,7 +2690,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 	t.Run("non-storage protocol error still settles failure", func(t *testing.T) {
 		h, _, c, sessionID := newEffectHarness(t, nil)
 		runErr := errors.New("context source broke")
-		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr); !errors.Is(err, runErr) {
+		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background()); !errors.Is(err, runErr) {
 			t.Fatalf("settleAgentTerminal = %v, want the run error back", err)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2714,6 +2699,296 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 		}
 		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != runErr.Error() {
 			t.Fatalf("operation state = %+v, want terminal failure with the error text", rec.State)
+		}
+	})
+	t.Run("boundary token settles the quiet success", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, errSteeringBoundary, context.Background()); err != nil {
+			t.Fatalf("settleAgentTerminal(token) = %v, want the cleared run error", err)
+		}
+		rec := settledOperation(t, store, sessionID, testOpID)
+		if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
+			t.Fatalf("operation state = %+v, want quiet success with empty detail", rec.State)
+		}
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("graph after the token: %v", err)
+		}
+		for _, entry := range graph.Entries {
+			if entry.Signal != nil || (entry.Assistant != nil && entry.Envelope.OperationID == testOpID) {
+				t.Fatalf("entry %s added a signal or assistant behind the boundary token", entry.Envelope.ID)
+			}
+		}
+	})
+	t.Run("shared success guard converts only the matching interruption", func(t *testing.T) {
+		rows := []struct {
+			name   string
+			marker string
+			cancel bool
+			group  bgState
+			want   OperationState
+		}{
+			{"matching interrupt marker becomes interruption", testOpID, false, bgOpen, OperationInterruption},
+			{"canceled execution becomes interruption", "", true, bgOpen, OperationInterruption},
+			{"permanently closed group becomes interruption", "", false, bgClosed, OperationInterruption},
+			{"foreign interrupt marker keeps success", "op-other", false, bgOpen, OperationSuccess},
+			{"root stop's stopping state keeps success", "", false, bgStopping, OperationSuccess},
+		}
+		for _, tc := range rows {
+			t.Run(tc.name, func(t *testing.T) {
+				h, store, c, sessionID := newEffectHarness(t, nil)
+				c.mu.Lock()
+				c.interruptOp = tc.marker
+				c.bgState = tc.group
+				c.mu.Unlock()
+				execCtx := context.Background()
+				if tc.cancel {
+					canceled, cancel := context.WithCancel(context.Background())
+					cancel()
+					execCtx = canceled
+				}
+				if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, execCtx); err != nil {
+					t.Fatalf("settleAgentTerminal = %v, want the guarded success settled", err)
+				}
+				rec := settledOperation(t, store, sessionID, testOpID)
+				if rec.State.Status != tc.want {
+					t.Fatalf("operation state = %+v, want %s", rec.State, tc.want)
+				}
+				if tc.want == OperationInterruption && (rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail) {
+					t.Fatalf("terminal = %+v, want the fixed interrupted detail", rec.State.Terminal)
+				}
+			})
+		}
+	})
+	t.Run("one attempted success publication keeps its original error", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
+			t.Fatalf("steering submit: %v", err)
+		}
+		attempts := 0
+		injected := fmt.Errorf("%w: injected publication failure", ErrStorage)
+		store.txHook = func(step string) error {
+			if step == "insert_entry" {
+				attempts++
+				return injected
+			}
+			return nil
+		}
+		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
+		err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+		if !errors.Is(err, ErrStorage) || err.Error() != injected.Error() {
+			t.Fatalf("finishExecution = %v, want the original injected error", err)
+		}
+		store.txHook = nil
+		if attempts != 1 {
+			t.Fatalf("publication attempts = %d, want exactly one", attempts)
+		}
+		c.mu.Lock()
+		held, buffered := c.reserved != nil, len(c.steering)
+		c.mu.Unlock()
+		if held {
+			t.Fatalf("admission reservation stayed held after the completion")
+		}
+		if buffered != 1 {
+			t.Fatalf("buffered heads = %d, want the pending head retained", buffered)
+		}
+		if storedOperationExists(store, sessionID, "op-2") {
+			t.Fatalf("successor admitted while the current work remains")
+		}
+		if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != OperationRunning {
+			t.Fatalf("operation state = %+v, want the running state left for recovery", rec.State)
+		}
+	})
+	t.Run("acquisition cancellation skips only the drain", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			res     *agent.TerminalResult
+			runErr  error
+			want    OperationState
+			wantSet int
+		}{
+			{"conversation terminal settles under a canceled acquisition", &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, OperationSuccess, 1},
+			{"nil-terminal outcome keeps its original run error", nil, fmt.Errorf("%w: compaction broke", ErrStorage), OperationRunning, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h, store, c, sessionID, _, harnessCancel := newExecutionHarness(t, func(context.Context, model.Request) (model.Stream, error) {
+					return completedTurnStream(), nil
+				}, func(_ context.Context, call model.ToolCall) PreparedTool {
+					return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+				})
+				if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
+					t.Fatalf("steering submit: %v", err)
+				}
+				release, err := h.reserve(context.Background(), c) // another holder owns the reservation
+				if err != nil {
+					t.Fatalf("reserve: %v", err)
+				}
+				defer release()
+				harnessCancel() // the Harness context dies: the acquisition is canceled
+				closes := 0
+				run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
+				got := h.finishExecution(c, run, testOpID, tc.res, tc.runErr, func() error {
+					closes++
+					return nil
+				})
+				if tc.res == nil && got != tc.runErr {
+					t.Fatalf("finishExecution = %v, want the original run error retained", got)
+				}
+				if tc.res != nil && got != nil {
+					t.Fatalf("finishExecution = %v, want the settled outcome, never the acquisition error", got)
+				}
+				if closes != 1 {
+					t.Fatalf("Close calls = %d, want exactly one", closes)
+				}
+				c.mu.Lock()
+				held, buffered := c.reserved != nil, len(c.steering)
+				c.mu.Unlock()
+				if !held {
+					t.Fatalf("the other holder's reservation was released")
+				}
+				if buffered != 1 {
+					t.Fatalf("buffered heads = %d, want the drain skipped and the head retained", buffered)
+				}
+				if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != tc.want {
+					t.Fatalf("operation state = %+v, want %s", rec.State, tc.want)
+				}
+				graph, err := validateFixture(t, store, sessionID)
+				if err != nil {
+					t.Fatalf("graph: %v", err)
+				}
+				settlements := 0
+				for _, entry := range graph.Entries {
+					if entry.Settlement != nil && entry.Envelope.OperationID == testOpID {
+						settlements++
+					}
+				}
+				if settlements != tc.wantSet {
+					t.Fatalf("settlement entries = %d, want %d", settlements, tc.wantSet)
+				}
+				h.mu.Lock()
+				latched, cleanup := h.storageFailure, h.cleanupFailure
+				h.mu.Unlock()
+				if tc.res == nil {
+					if latched != tc.runErr {
+						t.Fatalf("recorded storage failure = %v, want the authoritative original %v", latched, tc.runErr)
+					}
+				} else if latched != nil || cleanup != nil {
+					t.Fatalf("recorded failures = (%v, %v), want the successful outcome unmodified", latched, cleanup)
+				}
+			})
+		}
+	})
+
+	t.Run("rematerialized running state is not settled a second time", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			foreign func(t *testing.T, h *Harness, store *graphStorage, c *coordinator, sessionID string)
+		}{
+			{"quiet running state", func(t *testing.T, h *Harness, store *graphStorage, c *coordinator, sessionID string) {
+				foreignEffectRace(t, store, sessionID, testOpID, "foreign")
+			}},
+			{"retained active effect", func(t *testing.T, h *Harness, store *graphStorage, c *coordinator, sessionID string) {
+				if err := store.Transact(context.Background(), func(tx Transaction) error {
+					key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+					reg, err := tx.ReadRegister(key)
+					if err != nil {
+						return err
+					}
+					op, err := decodeOperationRegister(reg)
+					if err != nil {
+						return err
+					}
+					op.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(7)}
+					payload, err := encodeOperationRegister(op)
+					if err != nil {
+						return err
+					}
+					_, err = tx.ReplaceRegister(key, reg.Revision, payload)
+					return err
+				}); err != nil {
+					t.Fatalf("foreign active effect: %v", err)
+				}
+				if err := h.rematerialize(context.Background(), c, sessionID); err != nil {
+					t.Fatalf("rematerialize: %v", err)
+				}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h, store, c, sessionID := newEffectHarness(t, nil)
+				tc.foreign(t, h, store, c, sessionID)
+				run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
+				err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+				if tc.name == "quiet running state" && !errors.Is(err, ErrConflict) {
+					t.Fatalf("finishExecution = %v, want the revision race's original error", err)
+				}
+				if tc.name == "retained active effect" && err != nil {
+					t.Fatalf("finishExecution = %v, want the guarded skip's cleared value", err)
+				}
+				graph, err := validateFixture(t, store, sessionID)
+				if err != nil {
+					t.Fatalf("graph after the completion: %v", err)
+				}
+				for _, entry := range graph.Entries {
+					if entry.Settlement != nil && entry.Envelope.OperationID == testOpID {
+						t.Fatalf("settlement entry %s published over the rematerialized running state", entry.Envelope.ID)
+					}
+				}
+				if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != OperationRunning {
+					t.Fatalf("operation state = %+v, want the running state left for recovery", rec.State)
+				}
+			})
+		}
+	})
+	t.Run("an already committed settlement is never rewritten", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		var settlementID string
+		if err := store.Transact(context.Background(), func(tx Transaction) error { // one coherent foreign settle
+			skey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+			sreg, err := tx.ReadRegister(skey)
+			if err != nil {
+				return err
+			}
+			session, err := decodeSessionRegister(sreg)
+			if err != nil {
+				return err
+			}
+			okey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+			oreg, err := tx.ReadRegister(okey)
+			if err != nil {
+				return err
+			}
+			op, err := decodeOperationRegister(oreg)
+			if err != nil {
+				return err
+			}
+			committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil)
+			if err != nil {
+				return err
+			}
+			settlementID = committed.State.Terminal.SettlementEntry.EntryID
+			return nil
+		}); err != nil {
+			t.Fatalf("foreign settle: %v", err)
+		}
+		if err := h.rematerialize(context.Background(), c, sessionID); err != nil {
+			t.Fatalf("rematerialize: %v", err)
+		}
+		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
+		if err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil); err != nil {
+			t.Fatalf("finishExecution = %v, want the guarded skip's cleared value", err)
+		}
+		rec := settledOperation(t, store, sessionID, testOpID)
+		if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.SettlementEntry.EntryID != settlementID {
+			t.Fatalf("operation state = %+v, want the committed settlement %s preserved", rec.State, settlementID)
+		}
+		graph, err := validateFixture(t, store, sessionID)
+		if err != nil {
+			t.Fatalf("graph after the completion: %v", err)
+		}
+		for _, entry := range graph.Entries {
+			if entry.Settlement != nil && entry.Envelope.OperationID == testOpID && entry.Envelope.ID != settlementID {
+				t.Fatalf("settlement entry %s rewrote the committed settlement", entry.Envelope.ID)
+			}
 		}
 	})
 }
@@ -2750,7 +3025,7 @@ func TestToolEffectGateBeforePreparation(t *testing.T) {
 	}
 	// The run settles interruption and the terminal helper interrupts the
 	// remaining unstarted call.
-	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}, nil); err != nil {
+	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}, nil, context.Background()); err != nil {
 		t.Fatalf("outer settlement: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -2864,7 +3139,7 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -2918,7 +3193,7 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.execute(c, testOpID, prepared, h.ctx); err != nil {
+	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
