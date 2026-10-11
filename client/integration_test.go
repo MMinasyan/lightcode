@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -327,6 +328,29 @@ func TestRealRuntimeClient(t *testing.T) {
 		path := writeDiscovery(t, ps.Endpoint(), testInstance, "1", "0"+testCredential[1:])
 		_, err := client.Connect(context.Background(), path)
 		assertNoRuntime(t, err)
+	})
+
+	t.Run("byte request over the verified transport", func(t *testing.T) {
+		c := connectFixture(t, record)
+		response, err := c.Request(context.Background(), "GET", "/v1/health", nil)
+		if err != nil {
+			t.Fatalf("Request: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("Request status = %d, want 200", response.StatusCode)
+		}
+		data, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		var health protocol.Health
+		if err := json.Unmarshal(data, &health); err != nil {
+			t.Fatalf("decode health response: %v", err)
+		}
+		if health.InstanceId != c.InstanceID() || health.ProtocolVersion != protocol.N1 {
+			t.Fatalf("byte health = %+v, want the connected owner %q", health, c.InstanceID())
+		}
 	})
 }
 
