@@ -1,112 +1,110 @@
-package cli
+package terminal
 
-import (
-	"strings"
-)
+import "strings"
 
-// keyMsg represents a key event from the terminal.
-type keyMsg struct {
+// KeyMsg represents a key event from the terminal.
+type KeyMsg struct {
 	Rune    rune
-	Special keySpecial
+	Special KeySpecial
 }
 
-type keySpecial int
+type KeySpecial int
 
 const (
-	keyNone keySpecial = iota
-	keyEnter
-	keyBackspace
-	keyTab
-	keyEscape
-	keyUp
-	keyDown
-	keyLeft
-	keyRight
-	keyCtrlC
-	keyCtrlD
-	keyCtrlT
-	keyDelete
-	keyHome
-	keyEnd
+	KeyNone KeySpecial = iota
+	KeyEnter
+	KeyBackspace
+	KeyTab
+	KeyEscape
+	KeyUp
+	KeyDown
+	KeyLeft
+	KeyRight
+	KeyCtrlC
+	KeyCtrlD
+	KeyCtrlT
+	KeyDelete
+	KeyHome
+	KeyEnd
 )
 
-func parseInputBytes(b []byte) []keyMsg {
-	var keys []keyMsg
+func ParseInputBytes(b []byte) []KeyMsg {
+	var keys []KeyMsg
 	i := 0
 	for i < len(b) {
 		switch {
 		case b[i] == 0x03:
-			keys = append(keys, keyMsg{Special: keyCtrlC})
+			keys = append(keys, KeyMsg{Special: KeyCtrlC})
 			i++
 		case b[i] == 0x04:
-			keys = append(keys, keyMsg{Special: keyCtrlD})
+			keys = append(keys, KeyMsg{Special: KeyCtrlD})
 			i++
 		case b[i] == 0x14:
-			keys = append(keys, keyMsg{Special: keyCtrlT})
+			keys = append(keys, KeyMsg{Special: KeyCtrlT})
 			i++
 		case b[i] == '\r' || b[i] == '\n':
-			keys = append(keys, keyMsg{Special: keyEnter})
+			keys = append(keys, KeyMsg{Special: KeyEnter})
 			i++
 		case b[i] == 0x7f || b[i] == 0x08:
-			keys = append(keys, keyMsg{Special: keyBackspace})
+			keys = append(keys, KeyMsg{Special: KeyBackspace})
 			i++
 		case b[i] == '\t':
-			keys = append(keys, keyMsg{Special: keyTab})
+			keys = append(keys, KeyMsg{Special: KeyTab})
 			i++
 		case b[i] == 0x1b:
 			if i+2 < len(b) && b[i+1] == '[' {
 				consumed := 3
 				switch b[i+2] {
 				case 'A':
-					keys = append(keys, keyMsg{Special: keyUp})
+					keys = append(keys, KeyMsg{Special: KeyUp})
 				case 'B':
-					keys = append(keys, keyMsg{Special: keyDown})
+					keys = append(keys, KeyMsg{Special: KeyDown})
 				case 'C':
-					keys = append(keys, keyMsg{Special: keyRight})
+					keys = append(keys, KeyMsg{Special: KeyRight})
 				case 'D':
-					keys = append(keys, keyMsg{Special: keyLeft})
+					keys = append(keys, KeyMsg{Special: KeyLeft})
 				case 'H':
-					keys = append(keys, keyMsg{Special: keyHome})
+					keys = append(keys, KeyMsg{Special: KeyHome})
 				case 'F':
-					keys = append(keys, keyMsg{Special: keyEnd})
+					keys = append(keys, KeyMsg{Special: KeyEnd})
 				case '3':
 					if i+3 < len(b) && b[i+3] == '~' {
-						keys = append(keys, keyMsg{Special: keyDelete})
+						keys = append(keys, KeyMsg{Special: KeyDelete})
 						consumed = 4
 					} else {
-						keys = append(keys, keyMsg{Special: keyEscape})
+						keys = append(keys, KeyMsg{Special: KeyEscape})
 					}
 				default:
-					keys = append(keys, keyMsg{Special: keyEscape})
+					keys = append(keys, KeyMsg{Special: KeyEscape})
 				}
 				i += consumed
 			} else {
-				keys = append(keys, keyMsg{Special: keyEscape})
+				keys = append(keys, KeyMsg{Special: KeyEscape})
 				i++
 			}
 		default:
-			keys = append(keys, keyMsg{Rune: rune(b[i])})
+			keys = append(keys, KeyMsg{Rune: rune(b[i])})
 			i++
 		}
 	}
 	return keys
 }
 
-// inputLine manages a single-line text input with cursor.
-type inputLine struct {
+// InputLine manages a single-line text input with cursor.
+type InputLine struct {
 	text   []rune
 	cursor int
 }
 
-func newInputLine() *inputLine {
-	return &inputLine{}
+func NewInputLine() *InputLine {
+	return &InputLine{}
 }
 
-func (il *inputLine) String() string {
+func (il *InputLine) String() string {
 	return string(il.text)
 }
 
-func (il *inputLine) CursorText() string {
+func (il *InputLine) CursorText() string {
 	if il.cursor <= 0 {
 		return ""
 	}
@@ -116,12 +114,12 @@ func (il *inputLine) CursorText() string {
 	return string(il.text[:il.cursor])
 }
 
-func (il *inputLine) Insert(r rune) {
+func (il *InputLine) Insert(r rune) {
 	il.text = append(il.text[:il.cursor], append([]rune{r}, il.text[il.cursor:]...)...)
 	il.cursor++
 }
 
-func (il *inputLine) DeleteBack() bool {
+func (il *InputLine) DeleteBack() bool {
 	if il.cursor == 0 {
 		return false
 	}
@@ -130,7 +128,7 @@ func (il *inputLine) DeleteBack() bool {
 	return true
 }
 
-func (il *inputLine) DeleteForward() bool {
+func (il *InputLine) DeleteForward() bool {
 	if il.cursor >= len(il.text) {
 		return false
 	}
@@ -138,7 +136,7 @@ func (il *inputLine) DeleteForward() bool {
 	return true
 }
 
-func (il *inputLine) MoveLeft() bool {
+func (il *InputLine) MoveLeft() bool {
 	if il.cursor == 0 {
 		return false
 	}
@@ -146,7 +144,7 @@ func (il *inputLine) MoveLeft() bool {
 	return true
 }
 
-func (il *inputLine) MoveRight() bool {
+func (il *InputLine) MoveRight() bool {
 	if il.cursor >= len(il.text) {
 		return false
 	}
@@ -154,35 +152,35 @@ func (il *inputLine) MoveRight() bool {
 	return true
 }
 
-func (il *inputLine) MoveHome() {
+func (il *InputLine) MoveHome() {
 	il.cursor = 0
 }
 
-func (il *inputLine) MoveEnd() {
+func (il *InputLine) MoveEnd() {
 	il.cursor = len(il.text)
 }
 
-func (il *inputLine) Set(text string) {
+func (il *InputLine) Set(text string) {
 	il.text = []rune(text)
 	il.cursor = len(il.text)
 }
 
-func (il *inputLine) Clear() {
+func (il *InputLine) Clear() {
 	il.text = nil
 	il.cursor = 0
 }
 
-type inputHistory struct {
+type InputHistory struct {
 	entries []string
 	pos     int
 	draft   string
 }
 
-func newInputHistory() inputHistory {
-	return inputHistory{pos: 0}
+func NewInputHistory() InputHistory {
+	return InputHistory{pos: 0}
 }
 
-func (h *inputHistory) Reset(entries []string) {
+func (h *InputHistory) Reset(entries []string) {
 	h.entries = h.entries[:0]
 	for _, e := range entries {
 		if strings.TrimSpace(e) != "" {
@@ -193,7 +191,7 @@ func (h *inputHistory) Reset(entries []string) {
 	h.draft = ""
 }
 
-func (h *inputHistory) Add(text string) {
+func (h *InputHistory) Add(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
@@ -204,7 +202,7 @@ func (h *inputHistory) Add(text string) {
 	h.draft = ""
 }
 
-func (h *inputHistory) Prev(current string) (string, bool) {
+func (h *InputHistory) Prev(current string) (string, bool) {
 	if len(h.entries) == 0 || h.pos == 0 {
 		return "", false
 	}
@@ -215,7 +213,7 @@ func (h *inputHistory) Prev(current string) (string, bool) {
 	return h.entries[h.pos], true
 }
 
-func (h *inputHistory) Next() (string, bool) {
+func (h *InputHistory) Next() (string, bool) {
 	if h.pos >= len(h.entries) {
 		return "", false
 	}
@@ -226,17 +224,14 @@ func (h *inputHistory) Next() (string, bool) {
 	return h.entries[h.pos], true
 }
 
-func (h *inputHistory) Edited() {
+func (h *InputHistory) Edited() {
 	h.pos = len(h.entries)
 	h.draft = ""
 }
 
-func completeSlashCommand(text string) string {
-	commands := []string{
-		"/help", "/clear", "/model", "/session", "/project", "/new", "/resume",
-		"/revert", "/fork", "/context", "/compact", "/copy", "/exit",
-	}
-
+// CompleteSlashCommand completes text against the caller-supplied command
+// list. The list is the caller's vocabulary; this helper holds none.
+func CompleteSlashCommand(text string, commands []string) string {
 	if !strings.HasPrefix(text, "/") {
 		return text
 	}

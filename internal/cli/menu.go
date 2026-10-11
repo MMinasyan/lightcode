@@ -4,328 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/terminal"
 )
-
-type menuItem struct {
-	label      string
-	detail     string
-	selectable bool
-	current    bool
-	group      string
-	extra      any
-}
-
-type menuResult struct {
-	selected int
-	extra    any
-	action   string
-}
-
-const defaultMenuFooter = "   ↑↓ navigate  Enter select  Esc cancel"
-
-type transientMenuFrame struct {
-	rows int
-}
-
-func (f *transientMenuFrame) draw(out func(string), rendered string, width int) {
-	if f.rows > 0 {
-		out(eraseBlock(f.rows))
-	} else {
-		out("\r\x1b[2K")
-	}
-	out(rendered)
-	out(nl)
-	f.rows = renderedTerminalRows(rendered, width) + 1
-}
-
-func (f *transientMenuFrame) clear(out func(string)) {
-	if f.rows <= 0 {
-		return
-	}
-	out(eraseBlock(f.rows))
-	f.rows = 0
-}
-
-func menuLineWidth(width int) int {
-	if width < 30 {
-		width = 30
-	}
-	lineWidth := width - 12
-	if lineWidth > 56 {
-		lineWidth = 56
-	}
-	if lineWidth < 20 {
-		lineWidth = width - 2
-	}
-	return lineWidth
-}
-
-func renderedTerminalRows(rendered string, width int) int {
-	lineWidth := menuLineWidth(width)
-	rows := 0
-	for _, line := range strings.Split(rendered, nl) {
-		w := visibleWidth(line)
-		if w == 0 {
-			rows++
-			continue
-		}
-		rows += (w + lineWidth - 1) / lineWidth
-	}
-	if rows == 0 {
-		return 1
-	}
-	return rows
-}
-
-func normalizeMenuText(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-func menuDisplayText(s string, maxW int) string {
-	return truncate(normalizeMenuText(s), maxW)
-}
-
-func renderMenu(title string, items []menuItem, selected int, width int, footer string) string {
-	if width < 30 {
-		width = 30
-	}
-	if footer == "" {
-		footer = defaultMenuFooter
-	}
-	if selected < 0 || selected >= len(items) || !items[selected].selectable {
-		selected = firstSelectableMenuItem(items)
-	}
-	lineWidth := menuLineWidth(width)
-	var b strings.Builder
-	b.WriteString(colorDim)
-	b.WriteString(menuDisplayText("── "+title+" ──", lineWidth))
-	b.WriteString(colorReset)
-	b.WriteString(nl)
-
-	for i, it := range items {
-		label := normalizeMenuText(it.label)
-		detail := normalizeMenuText(it.detail)
-
-		if !it.selectable {
-			b.WriteString(colorDim)
-			b.WriteString("   ")
-			b.WriteString(truncate(label, lineWidth-3))
-			b.WriteString(colorReset)
-			b.WriteString(nl)
-			continue
-		}
-
-		if i == selected {
-			b.WriteString(colorInv)
-			b.WriteString("❯ ")
-		} else {
-			b.WriteString("  ")
-		}
-
-		if it.current {
-			b.WriteString(colorCyan)
-			b.WriteString("● ")
-			b.WriteString(colorReset)
-			if i == selected {
-				b.WriteString(colorInv)
-			}
-		}
-
-		prefixW := 2
-		if it.current {
-			prefixW = 4
-		}
-		avail := lineWidth - prefixW
-
-		labelW := visibleWidth(label)
-		detailW := 0
-		if detail != "" && labelW < avail-2 {
-			detail = truncate(detail, avail-labelW-2)
-			detailW = visibleWidth(detail) + 2
-		} else {
-			detail = ""
-		}
-
-		if labelW+detailW > avail && detailW > 0 {
-			maxDetail := avail - labelW - 2
-			if maxDetail < 3 || labelW > avail-2 {
-				b.WriteString(truncate(label, avail))
-			} else {
-				b.WriteString(label)
-				b.WriteString(colorDim)
-				b.WriteString("  ")
-				b.WriteString(truncate(detail, maxDetail))
-				b.WriteString(colorReset)
-				if i == selected {
-					b.WriteString(colorInv)
-				}
-			}
-		} else {
-			b.WriteString(truncate(label, avail))
-			if detail != "" {
-				b.WriteString(colorDim)
-				b.WriteString("  ")
-				b.WriteString(detail)
-				b.WriteString(colorReset)
-				if i == selected {
-					b.WriteString(colorInv)
-				}
-			}
-		}
-
-		if i == selected {
-			b.WriteString(colorReset)
-		}
-		b.WriteString(nl)
-	}
-
-	b.WriteString(colorDim)
-	b.WriteString(menuDisplayText(footer, lineWidth))
-	b.WriteString(colorReset)
-
-	return b.String()
-}
-
-func menuRows(items []menuItem) int {
-	return menuRowsForItemCount(len(items))
-}
-
-func menuRowsForItemCount(itemCount int) int {
-	return itemCount + 2
-}
-
-func firstSelectableMenuItem(items []menuItem) int {
-	for i, it := range items {
-		if it.selectable {
-			return i
-		}
-	}
-	return -1
-}
-
-func showMenu(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), title string, items []menuItem, width int) menuResult {
-	if width < 30 {
-		width = 30
-	}
-
-	sel := firstSelectableMenuItem(items)
-
-	var frame transientMenuFrame
-
-	draw := func() {
-		mu.Lock()
-		frame.draw(out, renderMenu(title, items, sel, width, defaultMenuFooter), width)
-		mu.Unlock()
-	}
-
-	draw()
-
-	for {
-		k, err := readKeyFn()
-		if err != nil {
-			return menuResult{selected: -1}
-		}
-
-		switch k.Special {
-		case keyEscape, keyCtrlC:
-			mu.Lock()
-			frame.clear(out)
-			mu.Unlock()
-			return menuResult{selected: -1}
-
-		case keyEnter:
-			if sel >= 0 && sel < len(items) && items[sel].selectable {
-				mu.Lock()
-				frame.clear(out)
-				mu.Unlock()
-				return menuResult{selected: sel, extra: items[sel].extra}
-			}
-
-		case keyUp:
-			moved := false
-			for i := sel - 1; i >= 0; i-- {
-				if items[i].selectable {
-					sel = i
-					moved = true
-					break
-				}
-			}
-			if moved {
-				draw()
-			}
-
-		case keyDown:
-			moved := false
-			for i := sel + 1; i < len(items); i++ {
-				if items[i].selectable {
-					sel = i
-					moved = true
-					break
-				}
-			}
-			if moved {
-				draw()
-			}
-		}
-	}
-}
-
-// confirmYN asks a Yes/No question and reports the choice, distinguishing a
-// deliberate No from a failed key read: a read error means the terminal is
-// exiting, and the caller must abort rather than treat it as an answer.
-// Escape cancels as No, exactly as showMenu's cancel does. It reads keys
-// itself because showMenu collapses a read error into selected -1, which
-// would be indistinguishable from No.
-func confirmYN(mu *sync.Mutex, out func(string), readKeyFn func() (keyMsg, error), question string, width int) (bool, error) {
-	items := []menuItem{
-		{label: "Yes", selectable: true},
-		{label: "No", selectable: true},
-	}
-	if width < 30 {
-		width = 30
-	}
-	sel := 0
-	var frame transientMenuFrame
-	draw := func() {
-		mu.Lock()
-		frame.draw(out, renderMenu(question, items, sel, width, defaultMenuFooter), width)
-		mu.Unlock()
-	}
-	draw()
-	for {
-		k, err := readKeyFn()
-		if err != nil {
-			return false, err
-		}
-		switch k.Special {
-		case keyEscape, keyCtrlC:
-			mu.Lock()
-			frame.clear(out)
-			mu.Unlock()
-			return false, nil
-		case keyEnter:
-			mu.Lock()
-			frame.clear(out)
-			mu.Unlock()
-			return sel == 0, nil
-		case keyUp:
-			if sel > 0 {
-				sel--
-				draw()
-			}
-		case keyDown:
-			if sel < len(items)-1 {
-				sel++
-				draw()
-			}
-		}
-	}
-}
 
 func (c *CLI) showModelMenu() {
 	c.mu.Lock()
@@ -334,13 +18,13 @@ func (c *CLI) showModelMenu() {
 
 	models := c.agent.ModelList()
 	if len(models) == 0 {
-		c.printLine(renderErrorMsg("no models configured"))
+		c.printLine(terminal.RenderErrorMsg("no models configured"))
 		return
 	}
 
 	cur := c.currentModel()
 
-	var items []menuItem
+	var items []terminal.MenuItem
 	lastProvider := ""
 	for _, entry := range models {
 		providerLabel := entry.ProviderName
@@ -348,37 +32,37 @@ func (c *CLI) showModelMenu() {
 			providerLabel = entry.Provider
 		}
 		if entry.Provider != lastProvider {
-			items = append(items, menuItem{label: providerLabel, selectable: false})
+			items = append(items, terminal.MenuItem{Label: providerLabel, Selectable: false})
 			lastProvider = entry.Provider
 		}
 		label := entry.DisplayName
 		if label == "" {
 			label = entry.Model
 		}
-		items = append(items, menuItem{
-			label:      label,
-			detail:     entry.Ref,
-			selectable: true,
-			current:    entry.Ref == cur.Ref,
-			group:      entry.Provider,
-			extra:      modelChoice{ref: entry.Ref, label: label},
+		items = append(items, terminal.MenuItem{
+			Label:      label,
+			Detail:     entry.Ref,
+			Selectable: true,
+			Current:    entry.Ref == cur.Ref,
+			Group:      entry.Provider,
+			Extra:      modelChoice{ref: entry.Ref, label: label},
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Model", items, c.currentWidth())
-	if result.selected >= 0 {
-		choice := result.extra.(modelChoice)
+	result := terminal.ShowMenu(c.mu, c.writeRaw, c.readKeyFn, "Model", items, c.currentWidth())
+	if result.Selected >= 0 {
+		choice := result.Extra.(modelChoice)
 		sessionID, err := c.currentSession()
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		if err := c.agent.SwitchModelForSession(sessionID, choice.ref); err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		c.modelRef = choice.ref
-		c.printLine(renderSystemMsg(fmt.Sprintf("  model switched to %s", choice.ref)))
+		c.printLine(terminal.RenderSystemMsg(fmt.Sprintf("  model switched to %s", choice.ref)))
 	}
 }
 
@@ -398,24 +82,24 @@ func (c *CLI) showSessionMenuInner(state string) {
 
 	sessions, err := c.scope.SessionList(state)
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 
 	cur := c.currentSessionSummary()
 
-	var items []menuItem
+	var items []terminal.MenuItem
 	if len(sessions) == 0 {
-		items = append(items, menuItem{label: "(no sessions)", selectable: false})
+		items = append(items, terminal.MenuItem{Label: "(no sessions)", Selectable: false})
 	} else {
 		for _, s := range sessions {
 			detail := time.Unix(s.LastActivity, 0).Format("Jan 02 15:04")
-			items = append(items, menuItem{
-				label:      s.ID,
-				detail:     detail,
-				selectable: true,
-				current:    s.ID == cur.ID,
-				extra:      s.ID,
+			items = append(items, terminal.MenuItem{
+				Label:      s.ID,
+				Detail:     detail,
+				Selectable: true,
+				Current:    s.ID == cur.ID,
+				Extra:      s.ID,
 			})
 		}
 	}
@@ -426,10 +110,10 @@ func (c *CLI) showSessionMenuInner(state string) {
 	}
 
 	result := c.showSessionMenuWithActions(title, items, state)
-	switch result.action {
+	switch result.Action {
 	case "select":
-		if result.selected >= 0 {
-			id := result.extra.(string)
+		if result.Selected >= 0 {
+			id := result.Extra.(string)
 			// The source is reserved immediately before the destination open
 			// and released at the selection commit: a busy or transitioning
 			// source refuses here with the owner's mutability error, and an
@@ -438,14 +122,14 @@ func (c *CLI) showSessionMenuInner(state string) {
 			// hold the source transitioning.
 			release, err := c.reserveSelection()
 			if err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				return
 			}
 			summary, err := c.agent.OpenSession(id)
 			if err != nil {
 				if !errors.Is(err, snapshot.ErrSessionContended) {
 					release()
-					c.printLine(renderErrorMsg(err.Error()))
+					c.printLine(terminal.RenderErrorMsg(err.Error()))
 					return
 				}
 				// The user named a session another process is driving: it
@@ -454,7 +138,7 @@ func (c *CLI) showSessionMenuInner(state string) {
 				state, herr := c.owner.HydrateSession(id)
 				if herr != nil {
 					release()
-					c.printLine(renderErrorMsg(herr.Error()))
+					c.printLine(terminal.RenderErrorMsg(herr.Error()))
 					return
 				}
 				c.scope.SetProjectPath(state.Session.ProjectPath)
@@ -479,7 +163,7 @@ func (c *CLI) showSessionMenuInner(state string) {
 		// reserve.
 		release, err := c.reserveSelection()
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		id, err := c.scope.NewSession("primary")
@@ -490,10 +174,10 @@ func (c *CLI) showSessionMenuInner(state string) {
 				c.setCurrentSessionID(id)
 				release()
 				c.refreshSession()
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			default: // a plain precommit error retains the source exactly as it was
 				release()
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			}
 			return
 		}
@@ -501,8 +185,8 @@ func (c *CLI) showSessionMenuInner(state string) {
 		release()
 		c.refreshSession()
 	case "archive":
-		if result.selected >= 0 {
-			id := result.extra.(string)
+		if result.Selected >= 0 {
+			id := result.Extra.(string)
 			err := c.agent.SessionArchive(id)
 			if err != nil {
 				var committed *snapshot.CommittedMutationError
@@ -510,15 +194,15 @@ func (c *CLI) showSessionMenuInner(state string) {
 				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
 					c.clearRemovedCurrent(id)
 				}
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				return
 			}
-			c.printLine(renderSystemMsg("  session archived"))
+			c.printLine(terminal.RenderSystemMsg("  session archived"))
 			c.clearRemovedCurrent(id)
 		}
 	case "delete":
-		if result.selected >= 0 {
-			id := result.extra.(string)
+		if result.Selected >= 0 {
+			id := result.Extra.(string)
 			err := c.agent.SessionDelete(id)
 			if err != nil {
 				var committed *snapshot.CommittedMutationError
@@ -526,10 +210,10 @@ func (c *CLI) showSessionMenuInner(state string) {
 				case errors.As(err, &committed): // the removal ran durably before failing: run exactly the success reconciliation — stale-safe, so a noncurrent target preserves current — then surface the rejection. A plain precommit error reconciles nothing.
 					c.clearRemovedCurrent(id)
 				}
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				return
 			}
-			c.printLine(renderSystemMsg("  session deleted"))
+			c.printLine(terminal.RenderSystemMsg("  session deleted"))
 			c.clearRemovedCurrent(id)
 		}
 	case "toggle":
@@ -541,10 +225,10 @@ func (c *CLI) showSessionMenuInner(state string) {
 	}
 }
 
-func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state string) menuResult {
-	sel := firstSelectableMenuItem(items)
+func (c *CLI) showSessionMenuWithActions(title string, items []terminal.MenuItem, state string) terminal.MenuResult {
+	sel := terminal.FirstSelectableMenuItem(items)
 
-	var frame transientMenuFrame
+	var frame terminal.TransientMenuFrame
 
 	draw := func() {
 		width := c.currentWidth()
@@ -555,7 +239,7 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 		footer := "   ↑↓ navigate  Enter select  n:new  a:archive  d:delete  " + tabHint + "  Esc cancel"
 
 		c.mu.Lock()
-		frame.draw(c.writeRaw, renderMenu(title, items, sel, width, footer), width)
+		frame.Draw(c.writeRaw, terminal.RenderMenu(title, items, sel, width, footer), width)
 		c.mu.Unlock()
 	}
 
@@ -564,28 +248,28 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 	for {
 		k, err := c.readKeyFn()
 		if err != nil {
-			return menuResult{selected: -1}
+			return terminal.MenuResult{Selected: -1}
 		}
 
 		switch k.Special {
-		case keyEscape, keyCtrlC:
+		case terminal.KeyEscape, terminal.KeyCtrlC:
 			c.mu.Lock()
-			frame.clear(c.writeRaw)
+			frame.Clear(c.writeRaw)
 			c.mu.Unlock()
-			return menuResult{selected: -1}
+			return terminal.MenuResult{Selected: -1}
 
-		case keyEnter:
-			if sel >= 0 && sel < len(items) && items[sel].selectable {
+		case terminal.KeyEnter:
+			if sel >= 0 && sel < len(items) && items[sel].Selectable {
 				c.mu.Lock()
-				frame.clear(c.writeRaw)
+				frame.Clear(c.writeRaw)
 				c.mu.Unlock()
-				return menuResult{selected: sel, extra: items[sel].extra, action: "select"}
+				return terminal.MenuResult{Selected: sel, Extra: items[sel].Extra, Action: "select"}
 			}
 
-		case keyUp:
+		case terminal.KeyUp:
 			moved := false
 			for i := sel - 1; i >= 0; i-- {
-				if items[i].selectable {
+				if items[i].Selectable {
 					sel = i
 					moved = true
 					break
@@ -595,10 +279,10 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 				draw()
 			}
 
-		case keyDown:
+		case terminal.KeyDown:
 			moved := false
 			for i := sel + 1; i < len(items); i++ {
-				if items[i].selectable {
+				if items[i].Selectable {
 					sel = i
 					moved = true
 					break
@@ -608,32 +292,32 @@ func (c *CLI) showSessionMenuWithActions(title string, items []menuItem, state s
 				draw()
 			}
 
-		case keyTab:
+		case terminal.KeyTab:
 			c.mu.Lock()
-			frame.clear(c.writeRaw)
+			frame.Clear(c.writeRaw)
 			c.mu.Unlock()
-			return menuResult{action: "toggle"}
+			return terminal.MenuResult{Action: "toggle"}
 		}
 
 		switch k.Rune {
 		case 'n':
 			c.mu.Lock()
-			frame.clear(c.writeRaw)
+			frame.Clear(c.writeRaw)
 			c.mu.Unlock()
-			return menuResult{action: "new"}
+			return terminal.MenuResult{Action: "new"}
 		case 'a':
-			if sel >= 0 && sel < len(items) && items[sel].selectable {
+			if sel >= 0 && sel < len(items) && items[sel].Selectable {
 				c.mu.Lock()
-				frame.clear(c.writeRaw)
+				frame.Clear(c.writeRaw)
 				c.mu.Unlock()
-				return menuResult{selected: sel, extra: items[sel].extra, action: "archive"}
+				return terminal.MenuResult{Selected: sel, Extra: items[sel].Extra, Action: "archive"}
 			}
 		case 'd':
-			if sel >= 0 && sel < len(items) && items[sel].selectable {
+			if sel >= 0 && sel < len(items) && items[sel].Selectable {
 				c.mu.Lock()
-				frame.clear(c.writeRaw)
+				frame.Clear(c.writeRaw)
 				c.mu.Unlock()
-				return menuResult{selected: sel, extra: items[sel].extra, action: "delete"}
+				return terminal.MenuResult{Selected: sel, Extra: items[sel].Extra, Action: "delete"}
 			}
 		}
 	}
@@ -646,35 +330,35 @@ func (c *CLI) showProjectMenu() {
 
 	projects, err := c.agent.ProjectList()
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 
 	cur, err := c.scope.ProjectCurrent()
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 
-	var items []menuItem
+	var items []terminal.MenuItem
 	for _, p := range projects {
 		detail := p.Path
 		if len(detail) > 40 {
 			detail = "..." + detail[len(detail)-37:]
 		}
-		items = append(items, menuItem{
-			label:      p.Name,
-			detail:     detail,
-			selectable: true,
-			current:    p.ID == cur.ID,
-			extra:      p.Path,
+		items = append(items, terminal.MenuItem{
+			Label:      p.Name,
+			Detail:     detail,
+			Selectable: true,
+			Current:    p.ID == cur.ID,
+			Extra:      p.Path,
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Project", items, c.currentWidth())
-	if result.selected >= 0 {
-		path := result.extra.(string)
-		c.printLine(renderSystemMsg("  switching to " + path + "..."))
+	result := terminal.ShowMenu(c.mu, c.writeRaw, c.readKeyFn, "Project", items, c.currentWidth())
+	if result.Selected >= 0 {
+		path := result.Extra.(string)
+		c.printLine(terminal.RenderSystemMsg("  switching to " + path + "..."))
 		c.projectSwitch(path)
 	}
 }
@@ -691,7 +375,7 @@ func (c *CLI) showRevertMenu() error {
 
 	msgs := c.sessionMessages()
 	if len(msgs) == 0 {
-		c.printLine(renderErrorMsg("no messages to revert"))
+		c.printLine(terminal.RenderErrorMsg("no messages to revert"))
 		return nil
 	}
 
@@ -707,56 +391,56 @@ func (c *CLI) showRevertMenu() error {
 	}
 
 	if len(turns) == 0 {
-		c.printLine(renderErrorMsg("no user turns to revert"))
+		c.printLine(terminal.RenderErrorMsg("no user turns to revert"))
 		return nil
 	}
 
-	var items []menuItem
+	var items []terminal.MenuItem
 	for _, t := range turns {
-		items = append(items, menuItem{
-			label:      fmt.Sprintf("Turn %d", t.turn),
-			detail:     t.content,
-			selectable: true,
-			extra:      t.turn,
+		items = append(items, terminal.MenuItem{
+			Label:      fmt.Sprintf("Turn %d", t.turn),
+			Detail:     t.content,
+			Selectable: true,
+			Extra:      t.turn,
 		})
 	}
 
-	result := showMenu(c.mu, c.writeRaw, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
-	if result.selected < 0 {
+	result := terminal.ShowMenu(c.mu, c.writeRaw, c.readKeyFn, "Revert — pick turn", items, c.currentWidth())
+	if result.Selected < 0 {
 		return nil
 	}
-	turn := result.extra.(int)
+	turn := result.Extra.(int)
 
-	actionItems := []menuItem{
-		{label: "Revert code", detail: "restore files, keep history", selectable: true, extra: "code"},
-		{label: "Fork from here", detail: "new session from this point", selectable: true, extra: "fork"},
-		{label: "Back", selectable: true, extra: "back"},
+	actionItems := []terminal.MenuItem{
+		{Label: "Revert code", Detail: "restore files, keep history", Selectable: true, Extra: "code"},
+		{Label: "Fork from here", Detail: "new session from this point", Selectable: true, Extra: "fork"},
+		{Label: "Back", Selectable: true, Extra: "back"},
 	}
 
-	actionResult := showMenu(c.mu, c.writeRaw, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
-	if actionResult.selected < 0 {
+	actionResult := terminal.ShowMenu(c.mu, c.writeRaw, c.readKeyFn, fmt.Sprintf("Turn %d — action", turn), actionItems, c.currentWidth())
+	if actionResult.Selected < 0 {
 		return nil
 	}
 
-	action := actionResult.extra.(string)
+	action := actionResult.Extra.(string)
 	sessionID, err := c.currentSession()
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return nil
 	}
 	switch action {
 	case "code":
 		result, err := c.agent.ApplyTurnActionForSession(sessionID, turn, agent.TurnActionRevertCode, false)
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			c.printRevertSkipped(result)
 			return nil
 		}
-		c.printLine(renderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
+		c.printLine(terminal.RenderSystemMsg(fmt.Sprintf("  reverted code to before turn %d", turn)))
 		c.printRevertSkipped(result)
 
 	case "fork":
-		alsoCode, err := confirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
+		alsoCode, err := terminal.ConfirmYN(c.mu, c.writeRaw, c.readKeyFn, "also revert code?", c.currentWidth())
 		if err != nil {
 			// The confirmation read failed (the terminal is exiting): abort the
 			// fork rather than performing it as a "no", and hand the error to
@@ -771,9 +455,9 @@ func (c *CLI) showRevertMenu() error {
 				c.setCurrentSessionID(result.Session.ID)
 				c.refreshSession()
 				c.printRevertSkipped(result)
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			default: // a plain precommit error retains the source; its partial result carries no adopted session
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			}
 			return nil
 		}
@@ -785,7 +469,7 @@ func (c *CLI) showRevertMenu() error {
 		// The fork committed; only the best-effort code revert may have
 		// failed, which the result carries as a warning on the success path.
 		if result.Warning != "" {
-			c.printLine(renderErrorMsg(result.Warning))
+			c.printLine(terminal.RenderErrorMsg(result.Warning))
 		}
 
 	case "back":
@@ -812,5 +496,5 @@ func (c *CLI) printRevertSkipped(result agent.TurnActionResult) {
 			b.WriteByte(')')
 		}
 	}
-	c.printLine(renderSystemMsg(b.String()))
+	c.printLine(terminal.RenderSystemMsg(b.String()))
 }
