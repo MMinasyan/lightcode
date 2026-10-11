@@ -58,32 +58,35 @@ func TestPublicFoundationDependencyIsolation(t *testing.T) {
 // checkTrackedGoFile applies the dependency baseline to one tracked production file.
 func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []string {
 	const (
-		modelPkg      = publicModule + "/model"
-		agentPkg      = publicModule + "/agent"
-		harnessPkg    = publicModule + "/harness"
-		storagePkg    = publicModule + "/internal/storage"
-		runtimePkg    = publicModule + "/runtime"
-		configPkg     = publicModule + "/internal/config"
-		toolPkg       = publicModule + "/internal/tool"
-		snapshotPkg   = publicModule + "/internal/snapshot"
-		editprePkg    = publicModule + "/internal/editpreview"
-		pathutilPkg   = publicModule + "/internal/pathutil"
-		permissionPkg = publicModule + "/internal/permission"
-		safefsPkg     = publicModule + "/internal/safefs"
-		agentsPkg     = publicModule + "/internal/agents"
-		catalogPkg    = publicModule + "/internal/catalog"
-		atomicfsPkg   = publicModule + "/internal/atomicfs"
-		promptPkg     = publicModule + "/internal/prompt"
-		adaptationPkg = publicModule + "/internal/adaptation"
-		legacyAgent   = publicModule + "/internal/agent"
-		pluginsPkg    = publicModule + "/internal/plugins"
-		shellparsePkg = publicModule + "/internal/shellparse"
-		lspPkg        = publicModule + "/internal/lsp"
-		cmdoutputPkg  = publicModule + "/internal/cmdoutput"
-		jobsPkg       = publicModule + "/plugins/jobs"
-		tasksPkg      = publicModule + "/internal/plugins/tasks"
-		toolargsPkg   = publicModule + "/internal/toolargs"
-		protocolPkg   = publicModule + "/protocol"
+		modelPkg       = publicModule + "/model"
+		agentPkg       = publicModule + "/agent"
+		harnessPkg     = publicModule + "/harness"
+		storagePkg     = publicModule + "/internal/storage"
+		runtimePkg     = publicModule + "/runtime"
+		configPkg      = publicModule + "/internal/config"
+		toolPkg        = publicModule + "/internal/tool"
+		snapshotPkg    = publicModule + "/internal/snapshot"
+		editprePkg     = publicModule + "/internal/editpreview"
+		pathutilPkg    = publicModule + "/internal/pathutil"
+		permissionPkg  = publicModule + "/internal/permission"
+		safefsPkg      = publicModule + "/internal/safefs"
+		agentsPkg      = publicModule + "/internal/agents"
+		catalogPkg     = publicModule + "/internal/catalog"
+		atomicfsPkg    = publicModule + "/internal/atomicfs"
+		promptPkg      = publicModule + "/internal/prompt"
+		adaptationPkg  = publicModule + "/internal/adaptation"
+		legacyAgent    = publicModule + "/internal/agent"
+		pluginsPkg     = publicModule + "/internal/plugins"
+		shellparsePkg  = publicModule + "/internal/shellparse"
+		lspPkg         = publicModule + "/internal/lsp"
+		cmdoutputPkg   = publicModule + "/internal/cmdoutput"
+		jobsPkg        = publicModule + "/plugins/jobs"
+		tasksPkg       = publicModule + "/internal/plugins/tasks"
+		toolargsPkg    = publicModule + "/internal/toolargs"
+		protocolPkg    = publicModule + "/protocol"
+		clientPkg      = publicModule + "/client"
+		clienthostPkg  = publicModule + "/internal/clienthost"
+		hostprocessPkg = publicModule + "/internal/hostprocess"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -171,8 +174,14 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if !std[imp] {
 				problems = append(problems, rel+": internal/hostprocess imports "+imp+"; hostprocess may import only the standard library")
 			}
+		case "internal/clienthost":
+			if imp != clientPkg && imp != protocolPkg && imp != hostprocessPkg && !std[imp] {
+				problems = append(problems, rel+": internal/clienthost imports "+imp+"; clienthost may import only the standard library, "+clientPkg+", "+protocolPkg+", and "+hostprocessPkg)
+			}
 		default:
-			if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
+			if imp == clienthostPkg {
+				problems = append(problems, rel+": production file imports "+clienthostPkg+"; the shared startup helper is reserved for its exact target consumers, and no legacy, root, or adapter file may start a Runtime before the coordinated cutover")
+			} else if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
 				imp == runtimePkg || imp == pluginsPkg || strings.HasPrefix(imp, pluginsPkg+"/") ||
 				imp == publicModule+"/plugins" || strings.HasPrefix(imp, publicModule+"/plugins/") ||
 				imp == toolargsPkg || imp == protocolPkg {
@@ -186,7 +195,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 // TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
@@ -515,11 +524,34 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	}
 }
 
+// TestDependencyRulesClientHostStartupIsolation enforces the shared startup
+// helper's exact allowlist. The reverse edge is covered by the directory matrix.
+func TestDependencyRulesClientHostStartupIsolation(t *testing.T) {
+	std := standardLibraryImports(t)
+	if problems := checkTrackedGoFile("internal/clienthost/x.go", []string{
+		"context", "errors", "fmt", "os", "os/exec", "path/filepath", "time",
+		publicModule + "/client", publicModule + "/protocol", publicModule + "/internal/hostprocess",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/clienthost imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
+		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/config",
+		publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins",
+		publicModule + "/internal/terminal", publicModule + "/internal/cli",
+		publicModule + "/internal/desktopclient", publicModule + "/internal/clientops",
+	} {
+		if problems := checkTrackedGoFile("internal/clienthost/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/clienthost importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+}
+
 // TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor), root files, and arbitrary internal/ paths are ordinary production files whose imports of any foundation package or the SQLite driver are reported, and internal/storage subpackages are rejected like public-package ones.
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "main.go", "internal/anything/x.go"} {
-		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", sqliteDriverPkg} {
+		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}
