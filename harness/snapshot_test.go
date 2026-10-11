@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -506,9 +507,9 @@ func TestSnapshotSessionMemberPublications(t *testing.T) {
 // delivery's publication shape through the successor admission: the selected
 // head stays buffered while its delivery attempt runs, a failed attempt drops
 // it exactly once as the final outcome with no durable entry and no register
-// advance, and a parked delivery blocks any snapshot until the adoption
-// completes, which then observes the entirely-new state with the removal
-// riding the durable advance.
+// advance, and a parked delivery leaves snapshots available: the mid-admission
+// read observes the coherent pending state, and the post-adoption read
+// observes the entirely-new state with the removal riding the durable advance.
 func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 	t.Run("failed delivery is a final dropped publication", func(t *testing.T) {
 		store := emptyStore(t)
@@ -602,7 +603,7 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		}
 	})
 
-	t.Run("a parked delivery blocks snapshots until the adoption", func(t *testing.T) {
+	t.Run("a parked delivery keeps snapshots coherent until the adoption", func(t *testing.T) {
 		store := emptyStore(t)
 		// the second attempt parks inside its assembly, so the post-adoption
 		// state stays stable until the subtest's assertions complete: no
@@ -698,6 +699,15 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		}
 		releaseDelivery()
 		receiveBounded(t, script.arrived, "post-adoption model boundary")
+		// The arrival proves successor installation and request start only;
+		// the completion owner's deferred release publishes its local
+		// revision after the drain returns, so the exact publication count
+		// reads only after that release.
+		releaseWait, stopWait := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopWait()
+		if err := c.waitIdle(releaseWait); err != nil {
+			t.Fatalf("waiting for the completion owner's release: %v", err)
+		}
 		post, err := h.SnapshotSession(context.Background(), session)
 		if err != nil {
 			t.Fatalf("snapshot after the adoption: %v", err)
@@ -726,7 +736,8 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		// durable adoption advanced only the register — the removal rode it,
 		// publishing nothing of its own. The completion owner's reservation,
 		// the successor installation and its release are the delivery cycle's
-		// local publications visible once the successor's request started.
+		// local publications, the last visible only after the release waited
+		// for above.
 		if r.snap.LocalRevision != buffered.LocalRevision+3 {
 			t.Fatalf("post-adoption local revision = %d, want %d (the reservation, the installation and the release)",
 				r.snap.LocalRevision, buffered.LocalRevision+3)
@@ -735,6 +746,46 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 			t.Fatalf("post-adoption snapshot = busy %v, want the admitted successor Operation", r.snap.ExecutionBusy)
 		}
 	})
+}
+
+// TestSnapshotOwnerWaitsForReservationRelease proves the release barrier the
+// steering-delivery owner's exact publication counts depend on: waitIdle is
+// the reservation release wait — it reports a bounded caller context instead
+// of hanging while the reservation is held and returns once released — and
+// that release is exactly one local publication, so a count read before it
+// observes one publication fewer.
+func TestSnapshotOwnerWaitsForReservationRelease(t *testing.T) {
+	store := emptyStore(t)
+	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
+	defer cancel()
+	session := createSession(t, h)
+	c := cachedCoordinator(t, h, session)
+
+	release, err := h.reserve(context.Background(), c)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	held, err := h.SnapshotSession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("snapshot under the held reservation: %v", err)
+	}
+	bounded, stopWait := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stopWait()
+	if err := c.waitIdle(bounded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitIdle under a held reservation = %v, want the bounded caller deadline", err)
+	}
+	release()
+	if err := c.waitIdle(context.Background()); err != nil {
+		t.Fatalf("waitIdle after the release: %v", err)
+	}
+	free, err := h.SnapshotSession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("snapshot after the release: %v", err)
+	}
+	if free.LocalRevision != held.LocalRevision+1 {
+		t.Fatalf("local revision across the release = %d, want %d: the release is one publication, so counts read after it",
+			free.LocalRevision, held.LocalRevision+1)
+	}
 }
 
 func TestBufferedDeliverySelectionIdentity(t *testing.T) {
