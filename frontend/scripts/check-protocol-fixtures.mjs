@@ -16,6 +16,8 @@ const frontendDir = dirname(scriptsDir);
 const repoDir = dirname(frontendDir);
 const generatedDir = join(frontendDir, 'src', 'generated', 'protocol');
 const projectionPath = join(frontendDir, 'src', 'client', 'projection.ts');
+const transportPath = join(frontendDir, 'src', 'client', 'transport.ts');
+const bootstrapPath = join(frontendDir, 'src', 'client', 'main.ts');
 const corpusPath = join(repoDir, 'protocol', 'testdata', 'protocol_contract_fixtures.json');
 const tsc = join(frontendDir, 'node_modules', '.bin', 'tsc');
 
@@ -98,12 +100,12 @@ function main() {
     writeFileSync(join(workspace, 'checks.ts'), lines.join('\n') + '\n');
     // One tsc pass: the temporary project extends the repository's protocol
     // tsconfig (the one source of compiler settings) and includes the emitted
-    // literal checks, the full generated tree and the target projection module
+    // literal checks, the full generated tree and the target client modules
     // over those generated types, so no second project pass is needed.
     const toPosix = (target) => relative(workspace, target).split(sep).join('/');
     writeFileSync(join(workspace, 'tsconfig.json'), JSON.stringify({
       extends: toPosix(join(frontendDir, 'tsconfig.protocol.json')),
-      include: ['checks.ts', `${toPosix(generatedDir)}/**/*.ts`, toPosix(projectionPath)],
+      include: ['checks.ts', `${toPosix(generatedDir)}/**/*.ts`, toPosix(projectionPath), toPosix(transportPath), toPosix(bootstrapPath)],
     }, null, 2) + '\n');
 
     const result = spawnSync(tsc, ['-p', join(workspace, 'tsconfig.json')], { stdio: 'inherit' });

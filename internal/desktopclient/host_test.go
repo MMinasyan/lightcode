@@ -1,0 +1,1234 @@
+package desktopclient
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/MMinasyan/lightcode/runtime"
+)
+
+// The desktop host's controlled fixtures: a scripted loopback server models
+// the transport for the generation, pull and byte rows, and the mounted
+// smoke test drives the real authenticated owner through the public Runtime
+// composition, the same boundary the client integration fixtures use.
+
+const (
+	testInstance   = "0123456789abcdef0123456789abcdef"
+	testCredential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+// recordContent builds one private discovery document pointing at the
+// fixture endpoint.
+func recordContent(endpoint string) string {
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"1","credential":%q}`,
+		endpoint, testInstance, testCredential)
+}
+
+// newFixture starts one scripted loopback fixture with the given health and
+// events handlers; each supplied extra map is mounted beside them.
+func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[string]http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	if health != nil {
+		mux.HandleFunc("/v1/health", health)
+	}
+	if events != nil {
+		mux.HandleFunc("/v1/events", events)
+	}
+	for _, routes := range extra {
+		for path, handler := range routes {
+			mux.HandleFunc(path, handler)
+		}
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// jsonHealth answers one authenticated health body for the fixture instance.
+func jsonHealth() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+	}
+}
+
+// parkedStream answers the events route with an open stream that holds until
+// the request context ends.
+func parkedStream() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}
+}
+
+// missingExecutable names one launcher that is guaranteed absent, so a host
+// never starts a contender behind its fixture.
+func missingExecutable(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "absent-binary")
+}
+
+// newHost wires one started host to the fixture's discovery record under an
+// isolated data directory, and shuts it down on cleanup.
+func newHost(t *testing.T, server *httptest.Server) *Host {
+	t.Helper()
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(recordContent(server.URL)), 0o600); err != nil {
+		t.Fatalf("write discovery record: %v", err)
+	}
+	host := New(clienthost.Options{DataDir: dataDir, Executable: missingExecutable(t)}, "/ws/name")
+	host.startup(context.Background())
+	t.Cleanup(func() { host.shutdown(context.Background()) })
+	return host
+}
+
+// sessionChangedFrame encodes one valid revisioned session hint as a
+// declared SSE notification frame.
+func sessionChangedFrame(durable string) string {
+	var scope protocol.Scope
+	if err := scope.FromSessionScope(protocol.SessionScope{Kind: protocol.SessionScopeKindSession, SessionId: testInstance}); err != nil {
+		panic(err)
+	}
+	var event protocol.Event
+	if err := event.FromSessionChangedEvent(protocol.SessionChangedEvent{
+		Kind:  protocol.SessionChanged,
+		Scope: scope,
+		SessionRevision: protocol.SessionRevision{
+			InstanceId:      testInstance,
+			DurableRevision: durable,
+			LocalRevision:   "0",
+		},
+	}); err != nil {
+		panic(err)
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	return "event: notification\ndata: " + string(data) + "\n\n"
+}
+
+// awaitPulling waits until one event pull has taken the outstanding-pull
+// gate.
+func awaitPulling(t *testing.T, host *Host) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		host.mu.Lock()
+		pulling := host.pulling
+		host.mu.Unlock()
+		if pulling {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the event pull never took the outstanding-pull gate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// awaitTerminal waits until the host's terminal channel holds one stream
+// error.
+func awaitTerminal(t *testing.T, host *Host) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		host.mu.Lock()
+		ready := len(host.errs) > 0
+		host.mu.Unlock()
+		if ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the stream never reported its terminal error")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestDesktopHostOpenGenerationSupersession proves a newer Open installs its
+// own generation and invalidates the previous one for requests and pulls,
+// while the current generation still reaches the owner.
+func TestDesktopHostOpenGenerationSupersession(t *testing.T) {
+	server := newFixture(t, jsonHealth(), parkedStream())
+	host := newHost(t, server)
+
+	first, err := host.Open()
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if first.InstanceID != testInstance {
+		t.Fatalf("first instance = %q, want %q", first.InstanceID, testInstance)
+	}
+	if first.Workspace != "/ws/name" {
+		t.Fatalf("first workspace = %q, want the host workspace", first.Workspace)
+	}
+	if first.Generation != "1" {
+		t.Fatalf("first generation = %q, want the first monotonic stamp", first.Generation)
+	}
+
+	second, err := host.Open()
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	if second.Generation != "2" {
+		t.Fatalf("second generation = %q, want the next monotonic stamp", second.Generation)
+	}
+
+	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil {
+		t.Fatal("a superseded generation accepted a request")
+	}
+	if _, err := host.NextEvent(first.Generation); err == nil {
+		t.Fatal("a superseded generation accepted an event pull")
+	}
+
+	response, err := host.Request(second.Generation, "GET", "/v1/health", "")
+	if err != nil {
+		t.Fatalf("current generation Request: %v", err)
+	}
+	if response.Status != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", response.Status)
+	}
+	if !strings.Contains(response.ContentType, "application/json") {
+		t.Fatalf("health content type = %q, want application/json", response.ContentType)
+	}
+	if !strings.Contains(response.Body, testInstance) {
+		t.Fatalf("health body = %q, want the authenticated instance", response.Body)
+	}
+}
+
+// TestDesktopHostOpenCancelsInFlightRequest proves a newer Open cancels a
+// request the previous generation still holds in flight.
+func TestDesktopHostOpenCancelsInFlightRequest(t *testing.T) {
+	arrived := make(chan struct{})
+	observed := make(chan struct{})
+	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
+		"/v1/parked": func(_ http.ResponseWriter, r *http.Request) {
+			close(arrived)
+			<-r.Context().Done()
+			close(observed)
+		},
+	})
+	host := newHost(t, server)
+	info, err := host.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := host.Request(info.Generation, "GET", "/v1/parked", "")
+		done <- err
+	}()
+	<-arrived
+	if _, err := host.Open(); err != nil {
+		t.Fatalf("superseding Open: %v", err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("superseded request = %v, want context.Canceled", err)
+	}
+	select {
+	case <-observed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the parked transport never observed the cancellation")
+	}
+}
+
+// TestDesktopHostRequestBytes proves the byte bridge: method, body and raw
+// response bytes pass through unchanged, an empty body sends none, and
+// partial and error documents survive with their exact numeric lexemes.
+func TestDesktopHostRequestBytes(t *testing.T) {
+	const partial = `{"restored":[1,2],"failed":[3],"durable_revision":"9007199254740993"}`
+	var captured struct {
+		method string
+		target string
+		body   string
+	}
+	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
+		"/v1/sessions/abc/restore": func(w http.ResponseWriter, r *http.Request) {
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read request body: %v", err)
+			}
+			captured = struct {
+				method string
+				target string
+				body   string
+			}{method: r.Method, target: r.URL.String(), body: string(data)}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, partial)
+		},
+	})
+	host := newHost(t, server)
+	info, err := host.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	response, err := host.Request(info.Generation, "POST", "/v1/sessions/abc/restore?keep=a+b", `{"operation_id":"op-1"}`)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	if response.Status != http.StatusConflict {
+		t.Fatalf("status = %d, want the raw 409", response.Status)
+	}
+	if response.ContentType != "application/json" {
+		t.Fatalf("content type = %q, want application/json", response.ContentType)
+	}
+	if response.Body != partial {
+		t.Fatalf("body = %q, want the exact raw bytes %q", response.Body, partial)
+	}
+	if captured.method != "POST" || captured.target != "/v1/sessions/abc/restore?keep=a+b" || captured.body != `{"operation_id":"op-1"}` {
+		t.Fatalf("captured request = %+v", captured)
+	}
+
+	empty, err := host.Request(info.Generation, "GET", "/v1/health", "")
+	if err != nil {
+		t.Fatalf("bodyless Request: %v", err)
+	}
+	if empty.Status != http.StatusOK || empty.Body == "" {
+		t.Fatalf("bodyless health response = (%d, %q)", empty.Status, empty.Body)
+	}
+}
+
+// TestDesktopHostNextEventPullOwnership proves the one outstanding pull, the
+// terminal channel dominating buffered progress, and channel closure as
+// loss, over the host's actual channel fields.
+func TestDesktopHostNextEventPullOwnership(t *testing.T) {
+	t.Run("channel closure is loss", func(t *testing.T) {
+		events := make(chan protocol.Event)
+		errs := make(chan error)
+		close(events)
+		close(errs)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("NextEvent = %v, want a closure loss", err)
+		}
+	})
+
+	t.Run("one outstanding pull at a time", func(t *testing.T) {
+		events := make(chan protocol.Event)
+		errs := make(chan error)
+		ctx, cancel := context.WithCancel(context.Background())
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+		firstDone := make(chan struct{})
+		go func() {
+			_, _ = host.NextEvent("1")
+			close(firstDone)
+		}()
+		awaitPulling(t, host)
+		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "already outstanding") {
+			t.Fatalf("second pull = %v, want the one outstanding pull", err)
+		}
+		cancel()
+		<-firstDone
+	})
+
+	t.Run("canceled generation rejects buffered progress", func(t *testing.T) {
+		events := make(chan protocol.Event, 1)
+		errs := make(chan error, 1)
+		var scope protocol.Scope
+		if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
+			t.Fatalf("build scope: %v", err)
+		}
+		var event protocol.Event
+		if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
+			t.Fatalf("build event: %v", err)
+		}
+		events <- event
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+		if raw, err := host.NextEvent("1"); err == nil {
+			t.Fatalf("NextEvent delivered progress on a canceled generation: %q", raw)
+		}
+	})
+
+	t.Run("progress closure without a terminal error is loss", func(t *testing.T) {
+		events := make(chan protocol.Event)
+		errs := make(chan error)
+		close(events)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "closed without a terminal error") {
+			t.Fatalf("NextEvent = %v, want the closure loss", err)
+		}
+	})
+}
+
+// TestDesktopHostLateTerminalDominatesSelectedEvent proves the one
+// terminal-first rule on a PARKED pull: the select wakes on an event while
+// the terminal error becomes readable before acceptance, so the pull must
+// reject with the terminal error, never deliver the selected progress. The
+// synctest bubble runs its goroutines one at a time, so the queued event and
+// the terminal write are both established before the parked pull resumes.
+func TestDesktopHostLateTerminalDominatesSelectedEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		events := make(chan protocol.Event, 2)
+		errs := make(chan error, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+		type pullResult struct {
+			raw string
+			err error
+		}
+		pulled := make(chan pullResult, 1)
+		go func() {
+			raw, err := host.NextEvent("1")
+			pulled <- pullResult{raw: raw, err: err}
+		}()
+		synctest.Wait() // the pull is durably parked in the blocking select
+
+		var scope protocol.Scope
+		if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
+			t.Fatalf("build scope: %v", err)
+		}
+		var event protocol.Event
+		if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
+			t.Fatalf("build event: %v", err)
+		}
+		events <- event
+		errs <- client.ErrResyncRequired
+
+		result := <-pulled
+		if !errors.Is(result.err, client.ErrResyncRequired) {
+			t.Fatalf("parked pull = (%q, %v), want the terminal error to dominate the selected event", result.raw, result.err)
+		}
+	})
+}
+
+// TestDesktopHostTerminalFailureDominatesQueuedEvents drives the real stream
+// through a queue overflow: the flood is gated until after Open establishes
+// the stream (the response is flushed first), so Open can never randomly
+// reject an already overflowed stream. The bounded queue fills with progress,
+// the terminal error dominates it at pull start and leaves the actual queue
+// untouched, the terminal failure cancels exactly that connection
+// generation, and a later Request on the failed generation is rejected.
+func TestDesktopHostTerminalFailureDominatesQueuedEvents(t *testing.T) {
+	const total = 300
+	start := make(chan struct{})
+	server := newFixture(t, jsonHealth(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		select {
+		case <-start:
+		case <-r.Context().Done():
+			return
+		}
+		for i := 0; i < total; i++ {
+			if r.Context().Err() != nil {
+				return
+			}
+			if _, err := io.WriteString(w, sessionChangedFrame("1")); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	})
+	host := newHost(t, server)
+	info, err := host.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	close(start)
+	awaitTerminal(t, host)
+
+	if _, err := host.NextEvent(info.Generation); !errors.Is(err, client.ErrResyncRequired) {
+		t.Fatalf("NextEvent = %v, want the terminal error over the buffered queue", err)
+	}
+	host.mu.Lock()
+	buffered := len(host.events)
+	generationErr := host.connCtx.Err()
+	host.mu.Unlock()
+	if buffered != 256 {
+		t.Fatalf("buffered events = %d, want the full 256-event queue untouched", buffered)
+	}
+	if generationErr == nil {
+		t.Fatal("the terminal failure did not cancel its connection generation")
+	}
+	if _, err := host.Request(info.Generation, "GET", "/v1/health", ""); err == nil {
+		t.Fatal("a request on the failed generation succeeded")
+	}
+}
+
+// TestDesktopHostOpenRejectsEstablishmentFailure proves an already reported
+// stream establishment failure refuses the open instead of installing a
+// healthy-looking connection.
+func TestDesktopHostOpenRejectsEstablishmentFailure(t *testing.T) {
+	server := newFixture(t, jsonHealth(), func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no stream", http.StatusInternalServerError)
+	})
+	host := newHost(t, server)
+	if _, err := host.Open(); err == nil {
+		t.Fatal("Open succeeded over a failed event stream")
+	}
+	if _, err := host.Request("1", "GET", "/v1/health", ""); err == nil {
+		t.Fatal("no generation was installed, yet a request succeeded")
+	}
+	if _, err := host.NextEvent("1"); err == nil {
+		t.Fatal("no generation was installed, yet a pull succeeded")
+	}
+}
+
+// TestDesktopHostCloseCancelsWaits proves host close cancels an in-flight
+// request and a parked event pull without touching the Runtime.
+func TestDesktopHostCloseCancelsWaits(t *testing.T) {
+	arrived := make(chan struct{})
+	observed := make(chan struct{})
+	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
+		"/v1/parked": func(_ http.ResponseWriter, r *http.Request) {
+			close(arrived)
+			<-r.Context().Done()
+			close(observed)
+		},
+	})
+	host := newHost(t, server)
+	info, err := host.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := host.Request(info.Generation, "GET", "/v1/parked", "")
+		requestDone <- err
+	}()
+	<-arrived
+	pullDone := make(chan error, 1)
+	go func() {
+		_, err := host.NextEvent(info.Generation)
+		pullDone <- err
+	}()
+	awaitPulling(t, host)
+
+	host.shutdown(context.Background())
+	if err := <-requestDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("closed request = %v, want context.Canceled", err)
+	}
+	if err := <-pullDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("closed pull = %v, want context.Canceled", err)
+	}
+	select {
+	case <-observed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the parked transport never observed the close")
+	}
+}
+
+// TestDesktopHostPatchJSON proves pure strict one-object member replacement:
+// patch members replace their raw values, absent members are preserved,
+// unknown members remain, and numeric lexemes and unedited members survive
+// byte-for-byte.
+func TestDesktopHostPatchJSON(t *testing.T) {
+	host := &Host{}
+
+	t.Run("replace preserve and unknown members", func(t *testing.T) {
+		out, err := host.PatchJSON(`{"a":{"old":1},"keep":"x"}`, `{"a":{"new":2},"added":[1,2]}`)
+		if err != nil {
+			t.Fatalf("PatchJSON: %v", err)
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(out), &members); err != nil {
+			t.Fatalf("decode result %q: %v", out, err)
+		}
+		if string(members["a"]) != `{"new":2}` {
+			t.Fatalf("patched member = %s, want the replacement value", members["a"])
+		}
+		if string(members["keep"]) != `"x"` {
+			t.Fatalf("absent patch member = %s, want it preserved", members["keep"])
+		}
+		if string(members["added"]) != `[1,2]` {
+			t.Fatalf("unknown patch member = %s, want it retained for the server", members["added"])
+		}
+	})
+
+	t.Run("numeric lexemes survive", func(t *testing.T) {
+		out, err := host.PatchJSON(`{"n":9007199254740993}`, `{}`)
+		if err != nil {
+			t.Fatalf("PatchJSON: %v", err)
+		}
+		if out != `{"n":9007199254740993}` {
+			t.Fatalf("PatchJSON = %q, want the exact numeric lexeme", out)
+		}
+	})
+
+	t.Run("html characters survive unescaped", func(t *testing.T) {
+		out, err := host.PatchJSON(`{"s":"<b>&"}`, `{}`)
+		if err != nil {
+			t.Fatalf("PatchJSON: %v", err)
+		}
+		if out != `{"s":"<b>&"}` {
+			t.Fatalf("PatchJSON = %q, want the raw string bytes", out)
+		}
+	})
+
+	invalid := []struct {
+		name     string
+		document string
+		patch    string
+	}{
+		{"null document", "null", `{}`},
+		{"array document", `[1]`, `{}`},
+		{"trailing document data", `{"a":1} x`, `{}`},
+		{"malformed document", `{"a":`, `{}`},
+		{"number patch", `{}`, `5`},
+		{"array patch", `{}`, `[1]`},
+		{"malformed patch", `{}`, `{"a":`},
+		{"trailing patch data", `{}`, `{"a":1} x`},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if out, err := host.PatchJSON(tc.document, tc.patch); err == nil {
+				t.Fatalf("PatchJSON = %q, want a strict decode error", out)
+			}
+		})
+	}
+}
+
+// TestDesktopHostNativeInvocation exercises the host-local dialog, title and
+// version bindings through their injected native functions, over the real
+// constructor and private lifecycle.
+func TestDesktopHostNativeInvocation(t *testing.T) {
+	t.Run("picked directory passes through", func(t *testing.T) {
+		host := New(clienthost.Options{}, "/ws/name")
+		host.startup(context.Background())
+		defer host.shutdown(context.Background())
+		host.pickDirFn = func(context.Context) (string, error) { return "/chosen", nil }
+		got, err := host.PickDirectory()
+		if err != nil || got != "/chosen" {
+			t.Fatalf("PickDirectory = (%q, %v)", got, err)
+		}
+	})
+
+	t.Run("directory cancel is an empty result", func(t *testing.T) {
+		host := New(clienthost.Options{}, "/ws/name")
+		host.startup(context.Background())
+		defer host.shutdown(context.Background())
+		host.pickDirFn = func(context.Context) (string, error) { return "", nil }
+		got, err := host.PickDirectory()
+		if err != nil || got != "" {
+			t.Fatalf("PickDirectory = (%q, %v), want the cancel result", got, err)
+		}
+	})
+
+	t.Run("title matches the one shared algorithm", func(t *testing.T) {
+		for _, workspace := range []string{"/ws/name", ".", "/", ""} {
+			host := New(clienthost.Options{}, workspace)
+			host.startup(context.Background())
+			var applied []string
+			host.titleFn = func(_ context.Context, title string) { applied = append(applied, title) }
+			if err := host.SetTitle(workspace); err != nil {
+				t.Fatalf("SetTitle(%q): %v", workspace, err)
+			}
+			if err := host.SetTitle(workspace); err != nil {
+				t.Fatalf("second SetTitle(%q): %v", workspace, err)
+			}
+			// The initial window title and every subsequent SetTitle apply
+			// the one shared algorithm: the plain basename join, no
+			// special case.
+			want := "Lightcode — " + filepath.Base(workspace)
+			if got := windowTitle(workspace); got != want {
+				t.Fatalf("initial title for %q = %q, want %q", workspace, got, want)
+			}
+			if applied[0] != want || applied[1] != want {
+				t.Fatalf("SetTitle(%q) applied %q, want the initial title %q", workspace, applied, want)
+			}
+		}
+	})
+
+	t.Run("version is the native helper", func(t *testing.T) {
+		host := New(clienthost.Options{}, "/ws/name")
+		if got := host.AppVersion(); got != version.String() {
+			t.Fatalf("AppVersion = %q, want %q", got, version.String())
+		}
+	})
+}
+
+// startupProbeKey marks the exact context a test hands to the private
+// startup hook.
+type startupProbeKey struct{}
+
+// TestDesktopHostParkedCallsUnblockOnStartup proves the genuinely
+// asynchronous native lifecycle: dialog, title and open calls parked before
+// startup complete on the actual startup with that exact context. Wails
+// launches OnStartup in a goroutine with no binding-dispatch barrier, so a
+// call must never fall through to a background context.
+func TestDesktopHostParkedCallsUnblockOnStartup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := New(clienthost.Options{DataDir: t.TempDir(), Executable: missingExecutable(t)}, "/ws/name")
+		var nativeCtx context.Context
+		host.pickDirFn = func(ctx context.Context) (string, error) { nativeCtx = ctx; return "/chosen", nil }
+		var titledCtx context.Context
+		host.titleFn = func(ctx context.Context, _ string) { titledCtx = ctx }
+
+		type outcome struct {
+			value string
+			err   error
+		}
+		directory := make(chan outcome, 1)
+		title := make(chan outcome, 1)
+		opened := make(chan outcome, 1)
+		go func() {
+			got, err := host.PickDirectory()
+			directory <- outcome{value: got, err: err}
+		}()
+		go func() {
+			err := host.SetTitle("/ws/name")
+			title <- outcome{err: err}
+		}()
+		go func() {
+			// The data directory holds no discovery record: once released,
+			// the open performs the actual clienthost.Connect.
+			_, err := host.Open()
+			opened <- outcome{err: err}
+		}()
+
+		synctest.Wait() // every call is parked before the lifecycle context exists
+		select {
+		case got := <-directory:
+			t.Fatalf("PickDirectory completed before startup: %+v", got)
+		default:
+		}
+		select {
+		case got := <-title:
+			t.Fatalf("SetTitle completed before startup: %+v", got)
+		default:
+		}
+		select {
+		case got := <-opened:
+			t.Fatalf("Open completed before startup: %+v", got)
+		default:
+		}
+
+		startupCtx := context.WithValue(context.Background(), startupProbeKey{}, "startup")
+		host.startup(startupCtx)
+
+		if got := <-directory; got.err != nil || got.value != "/chosen" {
+			t.Fatalf("PickDirectory after startup = %+v", got)
+		}
+		if got := <-title; got.err != nil {
+			t.Fatalf("SetTitle after startup = %+v", got)
+		}
+		if got := <-opened; got.err == nil || !strings.Contains(got.err.Error(), "connect runtime:") {
+			t.Fatalf("Open after startup = %v, want the actual clienthost.Connect outcome", got.err)
+		}
+		if nativeCtx != startupCtx {
+			t.Fatal("the native dialog did not receive the exact startup context")
+		}
+		if titledCtx != startupCtx {
+			t.Fatal("the native title call did not receive the exact startup context")
+		}
+		host.shutdown(context.Background())
+	})
+}
+
+// TestDesktopHostShutdownBeforeStartupWakesWaiters proves shutdown-before-
+// startup marks the host closed, releases every parked call with an error,
+// and invokes no native function.
+func TestDesktopHostShutdownBeforeStartupWakesWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := New(clienthost.Options{DataDir: t.TempDir(), Executable: missingExecutable(t)}, "/ws/name")
+		invoked := false
+		host.pickDirFn = func(context.Context) (string, error) { invoked = true; return "/chosen", nil }
+		host.titleFn = func(context.Context, string) { invoked = true }
+
+		type outcome struct {
+			value string
+			err   error
+		}
+		directory := make(chan outcome, 1)
+		title := make(chan outcome, 1)
+		opened := make(chan outcome, 1)
+		go func() {
+			got, err := host.PickDirectory()
+			directory <- outcome{value: got, err: err}
+		}()
+		go func() {
+			err := host.SetTitle("/ws/name")
+			title <- outcome{err: err}
+		}()
+		go func() {
+			_, err := host.Open()
+			opened <- outcome{err: err}
+		}()
+
+		synctest.Wait() // parked before startup, as above
+		host.shutdown(context.Background())
+
+		if got := <-directory; got.err == nil {
+			t.Fatalf("PickDirectory after shutdown-before-startup = %+v, want an error", got)
+		}
+		if got := <-title; got.err == nil {
+			t.Fatalf("SetTitle after shutdown-before-startup = %+v, want an error", got)
+		}
+		if got := <-opened; got.err == nil || !strings.Contains(got.err.Error(), "closed") {
+			t.Fatalf("Open after shutdown-before-startup = %v, want the closed-host error", got.err)
+		}
+		if invoked {
+			t.Fatal("shutdown-before-startup invoked a native presentation function")
+		}
+	})
+}
+
+// TestDesktopHostPostCloseNativeCallsError proves native calls after a close
+// report the closed host instead of reaching the dialog or the window.
+func TestDesktopHostPostCloseNativeCallsError(t *testing.T) {
+	host := New(clienthost.Options{}, "/ws/name")
+	host.startup(context.Background())
+	invoked := false
+	host.pickDirFn = func(context.Context) (string, error) { invoked = true; return "/chosen", nil }
+	host.titleFn = func(context.Context, string) { invoked = true }
+	host.shutdown(context.Background())
+
+	if got, err := host.PickDirectory(); err == nil {
+		t.Fatalf("PickDirectory after close = (%q, %v), want the closed-host error", got, err)
+	}
+	if err := host.SetTitle("/ws/name"); err == nil {
+		t.Fatal("SetTitle after close succeeded")
+	}
+	if _, err := host.Open(); err == nil {
+		t.Fatal("Open after close succeeded")
+	}
+	if invoked {
+		t.Fatal("post-close native calls reached the injected presentation functions")
+	}
+}
+
+// gatedFixture scripts one authenticated health endpoint whose second and
+// later calls can be held at the gate, and one events stream whose first
+// delivery terminates on demand. It drives the real clienthost.Connect and
+// client.Events transitions without another producer.
+type gatedFixture struct {
+	mu          sync.Mutex
+	healthCalls int
+	eventsCalls int
+	held        chan struct{} // one signal per health call waiting at the gate
+	release     chan struct{} // closed to release held health calls
+	terminate   chan struct{} // closed to end the first events stream
+}
+
+func newGatedFixture() *gatedFixture {
+	return &gatedFixture{
+		held:      make(chan struct{}, 8),
+		release:   make(chan struct{}),
+		terminate: make(chan struct{}),
+	}
+}
+
+func (f *gatedFixture) health(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.healthCalls++
+	gated := f.healthCalls > 1
+	f.mu.Unlock()
+	if gated {
+		f.held <- struct{}{}
+		select {
+		case <-f.release:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+}
+
+func (f *gatedFixture) events(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.eventsCalls++
+	first := f.eventsCalls == 1
+	f.mu.Unlock()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	if first {
+		select {
+		case <-f.terminate:
+		case <-r.Context().Done():
+		}
+		return
+	}
+	<-r.Context().Done()
+}
+
+// errBarrierContext embeds one actual installed context and parks its FIRST
+// Err call: the underlying error is snapshotted, the holder is signalled,
+// the call waits, and the snapshot is returned. Done, Deadline and Value
+// delegate unchanged, so every other use behaves identically.
+type errBarrierContext struct {
+	context.Context
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	snap    error
+}
+
+func (b *errBarrierContext) Err() error {
+	b.once.Do(func() {
+		b.snap = b.Context.Err()
+		close(b.entered)
+		<-b.release
+	})
+	return b.snap
+}
+
+// recvBounded returns one channel delivery or fails at the bound; it is a
+// teardown bound, never a scheduling oracle.
+func recvBounded[T any](t *testing.T, stream <-chan T) T {
+	t.Helper()
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	select {
+	case value := <-stream:
+		return value
+	case <-timer.C:
+		var zero T
+		t.Fatalf("bounded channel wait timed out")
+		return zero
+	}
+}
+
+// TestDesktopHostPendingOpenRejectsOldStamps proves the retirement
+// invariant while a newer attempt is held mid-connect: the previous
+// generation stamp authorizes neither a request nor a pull, and both are
+// rejected before any transport or queue I/O.
+func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
+	fixture := newGatedFixture()
+	server := newFixture(t, fixture.health, fixture.events)
+	host := newHost(t, server)
+	first, err := host.Open()
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if first.Generation != "1" {
+		t.Fatalf("first generation = %q, want 1", first.Generation)
+	}
+	close(fixture.terminate)
+	awaitTerminal(t, host)
+
+	type openResult struct {
+		info ConnectionInfo
+		err  error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		second, err := host.Open()
+		opened <- openResult{info: second, err: err}
+	}()
+	recvBounded(t, fixture.held) // the newer attempt waits at its authenticated health gate
+
+	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("old-stamp request during a pending open = %v, want rejection before I/O", err)
+	}
+	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("old-stamp pull during a pending open = %v, want rejection before I/O", err)
+	}
+
+	close(fixture.release)
+	result := recvBounded(t, opened)
+	if result.err != nil || result.info.Generation != "2" {
+		t.Fatalf("pending Open = (%+v, %v), want the installed second generation", result.info, result.err)
+	}
+	response, err := host.Request(result.info.Generation, "GET", "/v1/health", "")
+	if err != nil || response.Status != http.StatusOK {
+		t.Fatalf("new-generation request = (%+v, %v), want the usable install", response, err)
+	}
+}
+
+// TestDesktopHostFailedOpenDoesNotResurrectOldStamp proves a failed newer
+// attempt leaves no valid stamp at all: the old generation stays rejected
+// instead of silently becoming authoritative again.
+func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
+	var mu sync.Mutex
+	var healthCalls int
+	failingHealth := func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		healthCalls++
+		second := healthCalls > 1
+		mu.Unlock()
+		if second {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+	}
+	server := newFixture(t, failingHealth, parkedStream())
+	host := newHost(t, server)
+	first, err := host.Open()
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, err := host.Open(); err == nil {
+		t.Fatal("second Open succeeded over a failing discovery owner")
+	}
+
+	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("old-stamp request after a failed open = %v, want the retired stamp to stay rejected", err)
+	}
+	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("old-stamp pull after a failed open = %v, want the retired stamp to stay rejected", err)
+	}
+}
+
+// TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen drives the real
+// read-to-lock window: an old pull holding its terminal cleanup is parked
+// there (first-Err barrier over the actual installed context), the newer
+// Open starts and stays pending at its authenticated health gate, and the
+// cleanup is released. The retired old stamp must not authorize canceling
+// the pending attempt: the open completes and remains usable.
+func TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen(t *testing.T) {
+	fixture := newGatedFixture()
+	server := newFixture(t, fixture.health, fixture.events)
+	host := newHost(t, server)
+	first, err := host.Open()
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+
+	host.mu.Lock()
+	barrier := &errBarrierContext{Context: host.connCtx, entered: make(chan struct{}), release: make(chan struct{})}
+	host.connCtx = barrier
+	host.mu.Unlock()
+
+	pulled := make(chan error, 1)
+	go func() {
+		_, err := host.NextEvent("1")
+		pulled <- err
+	}()
+	close(fixture.terminate) // the real producer ends the old stream
+	recvBounded(t, barrier.entered)
+
+	type openResult struct {
+		info ConnectionInfo
+		err  error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		second, err := host.Open()
+		opened <- openResult{info: second, err: err}
+	}()
+	recvBounded(t, fixture.held) // the newer attempt is pending at its health gate
+
+	close(barrier.release) // the cleanup proceeds through its read-to-lock window
+	if err := recvBounded(t, pulled); !errors.Is(err, client.ErrResyncRequired) {
+		t.Fatalf("old pull = %v, want the terminal resync error", err)
+	}
+
+	close(fixture.release)
+	result := recvBounded(t, opened)
+	if result.err != nil || result.info.Generation != "2" {
+		t.Fatalf("pending Open after the late cleanup = (%+v, %v), want the cleanup to leave the pending attempt intact", result.info, result.err)
+	}
+	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("old stamp after the new install = %v, want the stale rejection", err)
+	}
+	response, err := host.Request(result.info.Generation, "GET", "/v1/health", "")
+	if err != nil || response.Status != http.StatusOK {
+		t.Fatalf("installed generation request = (%+v, %v), want the usable connection", response, err)
+	}
+}
+
+// The mounted smoke fixture: the real production Runtime over isolated HOME,
+// data and config paths, matching the client integration fixture.
+const smokeConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}}}`
+
+const smokeAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"simple"}}`
+
+// writeServiceFile writes one owner configuration file.
+func writeServiceFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// isolateBundledCredentials empties every api_key_env declared by the bundled
+// catalog so a captured build never starts a provider discovery attempt from
+// an ambient shell key.
+func isolateBundledCredentials(t *testing.T) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join("..", "..", "internal", "catalog", "builtin"))
+	if err != nil {
+		t.Fatalf("read bundled catalog: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("..", "..", "internal", "catalog", "builtin", entry.Name()))
+		if err != nil {
+			t.Fatalf("read bundled provider %s: %v", entry.Name(), err)
+		}
+		var provider struct {
+			Transport struct {
+				APIKeyEnv string `json:"api_key_env"`
+			} `json:"transport"`
+		}
+		if err := json.Unmarshal(data, &provider); err != nil {
+			t.Fatalf("decode bundled provider %s: %v", entry.Name(), err)
+		}
+		if provider.Transport.APIKeyEnv != "" {
+			t.Setenv(provider.Transport.APIKeyEnv, "")
+		}
+	}
+}
+
+// TestDesktopHostMountedRuntime proves the host composition over one real
+// authenticated owner: Open, one byte request, one session creation, and one
+// pulled generated event.
+func TestDesktopHostMountedRuntime(t *testing.T) {
+	const baseURL = "http://127.0.0.1:1/v1"
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DESKTOP_TEST_KEY", "desktop-test-key")
+	isolateBundledCredentials(t)
+	dataDir := t.TempDir()
+	configPath := filepath.Join(dataDir, "config.json")
+	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL))
+	writeServiceFile(t, agents.PathForConfig(configPath), smokeAgentsDocument)
+	owner, err := runtime.Open(context.Background(), runtime.Options{
+		DataDir:    dataDir,
+		ConfigPath: configPath,
+		Plugins:    builtin.Plugins(),
+	})
+	if err != nil {
+		t.Fatalf("runtime.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := owner.Close(context.Background()); err != nil {
+			t.Errorf("runtime.Close: %v", err)
+		}
+	})
+	server, err := owner.OpenProtocol(context.Background())
+	if err != nil {
+		t.Fatalf("OpenProtocol: %v", err)
+	}
+	if err := server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")); err != nil {
+		t.Fatalf("PublishDiscovery: %v", err)
+	}
+
+	host := New(clienthost.Options{DataDir: dataDir, Executable: missingExecutable(t)}, "/ws/smoke")
+	host.startup(context.Background())
+	defer host.shutdown(context.Background())
+
+	info, err := host.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if info.InstanceID == "" || info.Generation != "1" || info.Workspace != "/ws/smoke" {
+		t.Fatalf("connection info = %+v", info)
+	}
+
+	response, err := host.Request(info.Generation, "GET", "/v1/health", "")
+	if err != nil {
+		t.Fatalf("health Request: %v", err)
+	}
+	if response.Status != http.StatusOK || !strings.Contains(response.ContentType, "application/json") {
+		t.Fatalf("health response = (%d, %q)", response.Status, response.ContentType)
+	}
+	var health protocol.Health
+	if err := json.Unmarshal([]byte(response.Body), &health); err != nil {
+		t.Fatalf("decode health body: %v", err)
+	}
+	if health.InstanceId != info.InstanceID || health.ProtocolVersion != protocol.N1 {
+		t.Fatalf("health = %+v, want the connected owner", health)
+	}
+
+	create, err := host.Request(info.Generation, "POST", "/v1/sessions", `{"workspace":"/ws/smoke","agent_type":"integrated"}`)
+	if err != nil {
+		t.Fatalf("create Request: %v", err)
+	}
+	if create.Status != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", create.Status, create.Body)
+	}
+	var created protocol.Session
+	if err := json.Unmarshal([]byte(create.Body), &created); err != nil {
+		t.Fatalf("decode created session: %v", err)
+	}
+
+	// The established subscription is the delivery barrier: the committed
+	// creation hint reaches the native pull.
+	deadline := time.After(30 * time.Second)
+	for {
+		type pullResult struct {
+			raw string
+			err error
+		}
+		pulled := make(chan pullResult, 1)
+		go func() {
+			raw, err := host.NextEvent(info.Generation)
+			pulled <- pullResult{raw: raw, err: err}
+		}()
+		select {
+		case result := <-pulled:
+			if result.err != nil {
+				t.Fatalf("NextEvent: %v", result.err)
+			}
+			var event protocol.Event
+			if err := json.Unmarshal([]byte(result.raw), &event); err != nil {
+				t.Fatalf("decode pulled event: %v", err)
+			}
+			kind, err := event.Discriminator()
+			if err != nil {
+				t.Fatalf("event discriminator: %v", err)
+			}
+			if kind != "session_changed" {
+				continue
+			}
+			body, err := event.AsSessionChangedEvent()
+			if err != nil {
+				t.Fatalf("session_changed body: %v", err)
+			}
+			scope, err := body.Scope.AsSessionScope()
+			if err != nil {
+				t.Fatalf("session_changed scope: %v", err)
+			}
+			if scope.SessionId != created.SessionId {
+				continue
+			}
+			if body.SessionRevision.InstanceId != info.InstanceID {
+				t.Fatalf("hint instance = %q, want %q", body.SessionRevision.InstanceId, info.InstanceID)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no session_changed event for the created session arrived")
+		}
+	}
+}
