@@ -18,6 +18,13 @@ const generatedDir = join(frontendDir, 'src', 'generated', 'protocol');
 const projectionPath = join(frontendDir, 'src', 'client', 'projection.ts');
 const transportPath = join(frontendDir, 'src', 'client', 'transport.ts');
 const bootstrapPath = join(frontendDir, 'src', 'client', 'main.ts');
+const connectionPath = join(frontendDir, 'src', 'client', 'connection.ts');
+const readerPath = join(frontendDir, 'src', 'client', 'reader.ts');
+const sessionsPath = join(frontendDir, 'src', 'client', 'sessions.ts');
+const activityPath = join(frontendDir, 'src', 'client', 'activity.ts');
+const resultsPath = join(frontendDir, 'src', 'client', 'results.ts');
+const attemptsPath = join(frontendDir, 'src', 'client', 'attempts.ts');
+const ambientPath = join(frontendDir, 'src', 'env.d.ts');
 const corpusPath = join(repoDir, 'protocol', 'testdata', 'protocol_contract_fixtures.json');
 const tsc = join(frontendDir, 'node_modules', '.bin', 'tsc');
 
@@ -105,7 +112,20 @@ function main() {
     const toPosix = (target) => relative(workspace, target).split(sep).join('/');
     writeFileSync(join(workspace, 'tsconfig.json'), JSON.stringify({
       extends: toPosix(join(frontendDir, 'tsconfig.protocol.json')),
-      include: ['checks.ts', `${toPosix(generatedDir)}/**/*.ts`, toPosix(projectionPath), toPosix(transportPath), toPosix(bootstrapPath)],
+      include: [
+        'checks.ts',
+        `${toPosix(generatedDir)}/**/*.ts`,
+        toPosix(projectionPath),
+        toPosix(transportPath),
+        toPosix(bootstrapPath),
+        toPosix(connectionPath),
+        toPosix(readerPath),
+        toPosix(sessionsPath),
+        toPosix(activityPath),
+        toPosix(resultsPath),
+        toPosix(attemptsPath),
+        toPosix(ambientPath),
+      ],
     }, null, 2) + '\n');
 
     const result = spawnSync(tsc, ['-p', join(workspace, 'tsconfig.json')], { stdio: 'inherit' });

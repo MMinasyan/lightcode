@@ -14,7 +14,7 @@ import type {
   SessionRevision,
   WarningsRevision,
 } from '../generated/protocol/types.gen';
-import { acceptHydration, compareSessionRevision, itemID, mergeConversation } from './projection';
+import { acceptHydration, compareSessionRevision, itemID, mergeConversation, validateRevisionHint } from './projection';
 
 const COMPARE_RESULTS: Record<string, number> = { older: -1, equal: 0, newer: 1 };
 
@@ -112,4 +112,37 @@ describe('typescript-only raw kinds', () => {
       expect(() => acceptHydration(null, JSON.parse(testCase.next), testCase.instance, null, null)).toThrow();
     });
   }
+});
+
+describe('validateRevisionHint', () => {
+  const INSTANCE = '0123456789abcdef0123456789abcdef';
+  const FOREIGN = 'ffffffffffffffffffffffffffffffff';
+
+  it('accepts well-formed same-instance revisions of each hint kind', () => {
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: '7', local_revision: '3' }, INSTANCE)).not.toThrow();
+    expect(() => validateRevisionHint('configuration', { instance_id: INSTANCE, generation: '9' }, INSTANCE)).not.toThrow();
+    expect(() => validateRevisionHint('warning', { instance_id: INSTANCE, revision: '4' }, INSTANCE)).not.toThrow();
+  });
+
+  it('rejects a malformed decimal in each kind', () => {
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: 'not-a-number', local_revision: '0' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: '1', local_revision: '' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('configuration', { instance_id: INSTANCE, generation: '1.5' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('warning', { instance_id: INSTANCE, revision: '-1' }, INSTANCE)).toThrow();
+  });
+
+  it('rejects out-of-range components in each kind', () => {
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: '0', local_revision: '0' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: '9223372036854775808', local_revision: '0' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('configuration', { instance_id: INSTANCE, generation: '18446744073709551616' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('warning', { instance_id: INSTANCE, revision: '18446744073709551616' }, INSTANCE)).toThrow();
+  });
+
+  it('rejects a foreign instance and a malformed instance in each kind', () => {
+    expect(() => validateRevisionHint('session', { instance_id: FOREIGN, durable_revision: '1', local_revision: '0' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('configuration', { instance_id: FOREIGN, generation: '1' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('warning', { instance_id: FOREIGN, revision: '1' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('session', { instance_id: 'nothex', durable_revision: '1', local_revision: '0' }, INSTANCE)).toThrow();
+    expect(() => validateRevisionHint('session', { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' }, 'nothex')).toThrow();
+  });
 });

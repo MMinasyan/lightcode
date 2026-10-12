@@ -109,6 +109,59 @@ export function acceptHydration(
   return true;
 }
 
+// ValidateRevisionHint validates exactly one delivered revision-hint scalar —
+// a session, configuration or warning revision — against the authenticated
+// runtime instance. It reuses the existing scalar parsers, so it enforces the
+// same well-formedness (decimal, in-range, lowercase 32-hex instance) and it
+// validates only the revision: never a whole event, DTO or any other member.
+// It throws on a malformed, out-of-range or foreign revision and returns void
+// otherwise. The connection delivery boundary and the standalone reader hint
+// path share this one rule, so a delivered revision's validity can never be
+// postponed until a view is accepted or an initialized reader exists.
+export function validateRevisionHint(
+  kind: 'session' | 'configuration' | 'warning',
+  revision: SessionRevision | ConfigurationRevision | WarningsRevision,
+  instance: string,
+): void {
+  let actual: string;
+  if (kind === 'session') {
+    actual = parseSessionClock(revision as SessionRevision, 'session hint revision').instance;
+  } else if (kind === 'configuration') {
+    actual = parseConfigurationClock(revision as ConfigurationRevision, 'configuration hint revision').instance;
+  } else {
+    actual = parseWarningsClock(revision as WarningsRevision, 'warning hint revision').instance;
+  }
+  const expected = parseInstance(instance, 'authenticated instance');
+  if (actual !== expected) {
+    throw new Error(`${kind} hint revision belongs to a different runtime instance`);
+  }
+}
+
+// CompareConfigurationRevision returns -1, 0 or 1 when a is older than, equal
+// to or newer than b under the single configuration generation. Different
+// instances, malformed members or out-of-range values throw, never a
+// fabricated order. The reader uses this to decide whether a configuration
+// hint is covered by the accepted hydration.
+export function compareConfigurationRevision(a: ConfigurationRevision, b: ConfigurationRevision): -1 | 0 | 1 {
+  return compareCounterClocks(
+    parseConfigurationClock(a, 'left configuration revision'),
+    parseConfigurationClock(b, 'right configuration revision'),
+    'configuration revisions',
+  );
+}
+// CompareWarningsRevision returns -1, 0 or 1 when a is older than, equal to or
+// newer than b under the single warnings revision. Different instances,
+// malformed members or out-of-range values throw, never a fabricated order.
+// The reader uses this to decide whether a warning hint is covered by the
+// accepted hydration.
+export function compareWarningsRevision(a: WarningsRevision, b: WarningsRevision): -1 | 0 | 1 {
+  return compareCounterClocks(
+    parseWarningsClock(a, 'left warnings revision'),
+    parseWarningsClock(b, 'right warnings revision'),
+    'warnings revisions',
+  );
+}
+
 // ItemID returns the nonempty item_id of one generated conversation item
 // variant. It reads the closed discriminator and then the matching member, so
 // unknown kinds and non-string identities throw; it validates no other item
@@ -202,6 +255,16 @@ function compareSessionClocks(a: SessionClock, b: SessionClock): -1 | 0 | 1 {
     return 1;
   }
   throw new Error('session revision components are incomparable');
+}
+
+function compareCounterClocks(a: CounterClock, b: CounterClock, label: string): -1 | 0 | 1 {
+  if (a.instance !== b.instance) {
+    throw new Error(`${label} belong to different runtime instances`);
+  }
+  if (a.value === b.value) {
+    return 0;
+  }
+  return a.value < b.value ? -1 : 1;
 }
 
 function parseSessionClock(revision: SessionRevision, label: string): SessionClock {

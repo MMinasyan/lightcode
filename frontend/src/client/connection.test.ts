@@ -12,7 +12,7 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
 import { NextEvent, Open, Request } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 import { getHealth } from '../generated/protocol/sdk.gen';
-import { RuntimeConnection } from './main';
+import { RuntimeConnection } from './connection';
 
 const eventDocument = '{"kind":"scope_opened","scope":{"kind":"runtime"}}';
 
@@ -191,6 +191,113 @@ describe('RuntimeConnection pull loop', () => {
     });
     // The retired loop issues no further pulls on the old generation.
     expect(NextEvent).toHaveBeenCalledTimes(2);
+    connection.dispose();
+  });
+});
+
+describe('RuntimeConnection delivery-boundary revision validity', () => {
+  const INSTANCE = '0123456789abcdef0123456789abcdef';
+
+  function openWith(event: string) {
+    vi.mocked(Open).mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/ws' });
+    let settle: (raw: string) => void = () => {};
+    vi.mocked(NextEvent).mockImplementation(() => new Promise<string>((resolve) => { settle = resolve; }));
+    const handler = vi.fn();
+    const failureHandler = vi.fn();
+    const connection = new RuntimeConnection();
+    connection.setEventHandler(handler);
+    connection.setFailureHandler(failureHandler);
+    return { connection, deliver: () => settle(event), handler, failureHandler };
+  }
+
+  const malformedSessionHint = JSON.stringify({
+    kind: 'session_changed',
+    scope: { kind: 'session', session_id: 's1' },
+    session_revision: { instance_id: INSTANCE, durable_revision: 'not-a-number', local_revision: '0' },
+  });
+  const outOfRangeWarningHint = JSON.stringify({
+    kind: 'warning_changed',
+    scope: { kind: 'runtime' },
+    warnings_revision: { instance_id: INSTANCE, revision: '18446744073709551616' },
+  });
+  const foreignConfigHint = JSON.stringify({
+    kind: 'configuration_changed',
+    scope: { kind: 'runtime' },
+    configuration_revision: { instance_id: 'ffffffffffffffffffffffffffffffff', generation: '1' },
+  });
+  const validSessionHint = JSON.stringify({
+    kind: 'session_changed',
+    scope: { kind: 'session', session_id: 's1' },
+    session_revision: { instance_id: INSTANCE, durable_revision: '2', local_revision: '0' },
+  });
+
+  it('repairs on a malformed session hint before any reader exists and does not dispatch it', async () => {
+    const ctx = openWith(malformedSessionHint);
+    await ctx.connection.open();
+    ctx.deliver();
+    await vi.waitFor(() => {
+      expect(ctx.failureHandler).toHaveBeenCalledTimes(1);
+    });
+    expect(ctx.failureHandler.mock.calls[0][1]).toBe('1');
+    expect(ctx.handler).not.toHaveBeenCalled();
+    ctx.connection.dispose();
+  });
+
+  it('repairs on an out-of-range warning hint', async () => {
+    const ctx = openWith(outOfRangeWarningHint);
+    await ctx.connection.open();
+    ctx.deliver();
+    await vi.waitFor(() => {
+      expect(ctx.failureHandler).toHaveBeenCalledTimes(1);
+    });
+    expect(ctx.handler).not.toHaveBeenCalled();
+    ctx.connection.dispose();
+  });
+
+  it('repairs on a foreign-instance configuration hint even though its Session is not selected', async () => {
+    // The hint addresses no displayed Session; validity is not gated on view
+    // relevance, so the delivery boundary still repairs.
+    const ctx = openWith(foreignConfigHint);
+    await ctx.connection.open();
+    ctx.deliver();
+    await vi.waitFor(() => {
+      expect(ctx.failureHandler).toHaveBeenCalledTimes(1);
+    });
+    expect(ctx.handler).not.toHaveBeenCalled();
+    ctx.connection.dispose();
+  });
+
+  it('dispatches a valid hint unchanged', async () => {
+    const ctx = openWith(validSessionHint);
+    await ctx.connection.open();
+    ctx.deliver();
+    await vi.waitFor(() => {
+      expect(ctx.handler).toHaveBeenCalledTimes(1);
+    });
+    expect(ctx.handler.mock.calls[0][0].kind).toBe('session_changed');
+    expect(ctx.failureHandler).not.toHaveBeenCalled();
+    ctx.connection.dispose();
+  });
+
+  it('ignores a malformed hint delivered on a superseded generation', async () => {
+    vi.mocked(Open)
+      .mockResolvedValueOnce({ instance_id: INSTANCE, generation: '1', workspace: '/ws' })
+      .mockResolvedValueOnce({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
+    const pending: Array<(raw: string) => void> = [];
+    vi.mocked(NextEvent).mockImplementation(() => new Promise<string>((resolve) => { pending.push(resolve); }));
+    const handler = vi.fn();
+    const failureHandler = vi.fn();
+    const connection = new RuntimeConnection();
+    connection.setEventHandler(handler);
+    connection.setFailureHandler(failureHandler);
+    await connection.open();
+    await connection.open(); // generation 2 supersedes generation 1
+    // The superseded generation's pull delivers a malformed hint: ignored
+    // entirely, never a repair signal and never dispatched.
+    pending[0](malformedSessionHint);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(failureHandler).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
     connection.dispose();
   });
 });
