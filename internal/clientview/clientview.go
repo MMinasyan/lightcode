@@ -49,6 +49,45 @@ func CompareSessionRevision(a, b protocol.SessionRevision) (int, error) {
 	return compareSessionClocks(left, right)
 }
 
+// CompareConfigurationRevision compares exact same-instance configuration clocks.
+func CompareConfigurationRevision(a, b protocol.ConfigurationRevision) (int, error) {
+	left, err := parseConfigurationRevision(a)
+	if err != nil {
+		return 0, err
+	}
+	right, err := parseConfigurationRevision(b)
+	if err != nil {
+		return 0, err
+	}
+	return compareCounterClocks(left, right)
+}
+
+// CompareWarningsRevision compares exact same-instance warning clocks.
+func CompareWarningsRevision(a, b protocol.WarningsRevision) (int, error) {
+	left, err := parseWarningsRevision(a)
+	if err != nil {
+		return 0, err
+	}
+	right, err := parseWarningsRevision(b)
+	if err != nil {
+		return 0, err
+	}
+	return compareCounterClocks(left, right)
+}
+
+func compareCounterClocks(a, b counterClock) (int, error) {
+	if a.instance != b.instance {
+		return 0, fmt.Errorf("revisions belong to different runtime instances %q and %q", a.instance, b.instance)
+	}
+	if a.value < b.value {
+		return -1, nil
+	}
+	if a.value > b.value {
+		return 1, nil
+	}
+	return 0, nil
+}
+
 // AcceptHydration reports whether the complete top-level Session,
 // configuration and warning clocks of next are at least as new as those of the
 // previously accepted current hydration and the independently accepted

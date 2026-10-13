@@ -14,7 +14,7 @@ import type {
   SessionRevision,
   WarningsRevision,
 } from '../generated/protocol/types.gen';
-import { acceptHydration, compareSessionRevision, itemID, mergeConversation, validateRevisionHint } from './projection';
+import { acceptHydration, compareSessionRevision, compareConfigurationRevision, compareWarningsRevision, itemID, mergeConversation, validateRevisionHint } from './projection';
 
 const COMPARE_RESULTS: Record<string, number> = { older: -1, equal: 0, newer: 1 };
 
@@ -22,11 +22,25 @@ const corpus = JSON.parse(
   readFileSync(new URL('../../../protocol/testdata/client_projection_cases.json', import.meta.url), 'utf8'),
 );
 
+describe('independent counter comparators', () => {
+  for (const test of corpus.counters) {
+    it(test.name, () => {
+      const instance = '0123456789abcdef0123456789abcdef';
+      const right = test.foreign ? 'ffffffffffffffffffffffffffffffff' : instance;
+      const config = () => compareConfigurationRevision({ instance_id: instance, generation: test.a }, { instance_id: right, generation: test.b });
+      const warnings = () => compareWarningsRevision({ instance_id: instance, revision: test.a }, { instance_id: right, revision: test.b });
+      if (test.error) { expect(config).toThrow(); expect(warnings).toThrow(); }
+      else { expect(config()).toBe(COMPARE_RESULTS[test.result]); expect(warnings()).toBe(COMPARE_RESULTS[test.result]); }
+    });
+  }
+});
+
 function parseHydration(raw: string): Hydration {
   return JSON.parse(raw) as Hydration;
 }
 
 it('loads every shared corpus section', () => {
+  expect(corpus.counters.length).toBeGreaterThan(0);
   expect(corpus.compare.length).toBeGreaterThan(0);
   expect(corpus.accept.length).toBeGreaterThan(0);
   expect(corpus.item_ids.length).toBeGreaterThan(0);

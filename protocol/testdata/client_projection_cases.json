@@ -1,4 +1,16 @@
 {
+ "counters": [
+  {"name":"zero_equal","a":"0","b":"00","result":"equal"},
+  {"name":"exact_above_number_limit","a":"9007199254740993","b":"9007199254740992","result":"newer"},
+  {"name":"maximum_older","a":"18446744073709551614","b":"18446744073709551615","result":"older"},
+  {"name":"maximum_equal","a":"18446744073709551615","b":"18446744073709551615","result":"equal"},
+  {"name":"overflow","a":"18446744073709551616","b":"0","error":true},
+  {"name":"negative","a":"-1","b":"0","error":true},
+  {"name":"positive_sign","a":"+1","b":"0","error":true},
+  {"name":"fraction","a":"1.0","b":"0","error":true},
+  {"name":"empty_right","a":"0","b":"","error":true},
+  {"name":"foreign","a":"1","b":"1","foreign":true,"error":true}
+ ],
  "compare": [
   {
    "name": "equal_components",

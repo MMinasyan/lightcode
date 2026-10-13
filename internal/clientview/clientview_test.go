@@ -22,11 +22,37 @@ import (
 const projectionCorpusPath = "../../protocol/testdata/client_projection_cases.json"
 
 type projectionCorpus struct {
+	Counters []struct {
+		Name, A, B, Result string
+		Error, Foreign     bool
+	} `json:"counters"`
 	Compare        []compareCase        `json:"compare"`
 	Accept         []acceptCase         `json:"accept"`
 	ItemIDs        []itemIDCase         `json:"item_ids"`
 	Merge          []mergeCase          `json:"merge"`
 	TypeScriptOnly []typescriptOnlyCase `json:"typescript_only"`
+}
+
+func TestIndependentRevisionComparators(t *testing.T) {
+	const instance = "0123456789abcdef0123456789abcdef"
+	orders := map[string]int{"older": -1, "equal": 0, "newer": 1}
+	corpus := loadProjectionCorpus(t)
+	if len(corpus.Counters) == 0 {
+		t.Fatal("the shared corpus has no counter cases")
+	}
+	for _, test := range corpus.Counters {
+		t.Run(test.Name, func(t *testing.T) {
+			rightInstance := instance
+			if test.Foreign {
+				rightInstance = "ffffffffffffffffffffffffffffffff"
+			}
+			configuration, configErr := clientview.CompareConfigurationRevision(protocol.ConfigurationRevision{InstanceId: instance, Generation: test.A}, protocol.ConfigurationRevision{InstanceId: rightInstance, Generation: test.B})
+			warnings, warningErr := clientview.CompareWarningsRevision(protocol.WarningsRevision{InstanceId: instance, Revision: test.A}, protocol.WarningsRevision{InstanceId: rightInstance, Revision: test.B})
+			if (configErr != nil) != test.Error || (warningErr != nil) != test.Error || (!test.Error && (configuration != orders[test.Result] || warnings != orders[test.Result])) {
+				t.Fatalf("config %d/%v warnings %d/%v", configuration, configErr, warnings, warningErr)
+			}
+		})
+	}
 }
 
 type compareCase struct {
