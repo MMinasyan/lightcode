@@ -1,13 +1,8 @@
-// Provisional Model activity for one displayed Session: ONE combined
-// chronological text/refusal range plus temporary tool activity, all keyed to
-// the Session's accepted active Operation. It is never appended to a hydrated
-// assistant item, never persisted and never replayed after a read. Positions
-// and ordinals are not sequence numbers; repeated positions remain progress.
-// The single range is bounded to a UTF-8-safe trailing 64 KiB (one visible
-// truncation marker for the whole range); refusal pieces stay visibly distinct
-// from text pieces but share the one budget. Events that do not address the
-// accepted active Operation are refused by the caller (which dirties the
-// hydration) without mutating this state.
+// Provisional Model activity for one displayed Session: one chronological
+// text/refusal range plus temporary tool activity, keyed to the accepted active
+// Operation, bounded to a UTF-8-safe trailing 64 KiB. Never persisted or
+// replayed; positions are not sequence numbers. Events that do not address the
+// accepted Operation are refused by the caller without mutating this state.
 import type {
   RefusalDeltaEvent,
   TextDeltaEvent,
@@ -41,20 +36,15 @@ export interface ActivityState {
 export type ActivityEvent = TextDeltaEvent | RefusalDeltaEvent | ToolStartedEvent | ToolFinishedEvent;
 
 const encoder = new TextEncoder();
-// ignoreBOM keeps a legitimate leading U+FEFF as literal content instead of
-// letting the decoder strip it as an encoding marker.
+// ignoreBOM keeps a leading U+FEFF as literal content.
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 function byteLength(text: string): number {
   return encoder.encode(text).length;
 }
 
-// keepUtf8Suffix returns the longest UTF-8-safe suffix of text whose byte
-// length is at most limit. The byte slice is advanced past any leading UTF-8
-// continuation bytes so decoding starts on a code point boundary: a sequence
-// genuinely split at the window front is dropped whole rather than decoded to
-// a bogus leading U+FFFD. A literal U+FFFD or U+FEFF fully inside the window is
-// preserved as real content and never stripped.
+// The longest UTF-8-safe suffix within limit: decoding starts on a code point
+// boundary, so a sequence split at the window front is dropped whole.
 export function keepUtf8Suffix(text: string, limit: number): string {
   const bytes = encoder.encode(text);
   if (bytes.length <= limit) {
@@ -67,55 +57,43 @@ export function keepUtf8Suffix(text: string, limit: number): string {
   return decoder.decode(bytes.subarray(start));
 }
 
-// combineAdjacent merges runs of same-kind pieces so the range stays a minimal
-// chronological list of nonempty text/refusal segments.
-function combineAdjacent(pieces: ActivityPiece[]): ActivityPiece[] {
-  const out: ActivityPiece[] = [];
-  for (const piece of pieces) {
-    if (piece.content === '') {
-      continue;
-    }
-    const last = out[out.length - 1];
-    if (last && last.kind === piece.kind) {
-      out[out.length - 1] = { kind: last.kind, content: last.content + piece.content };
-    } else {
-      out.push({ kind: piece.kind, content: piece.content });
-    }
+// Merge one delta into the last piece of the same kind, else append it; no two
+// adjacent pieces share a kind.
+function appendPiece(pieces: ActivityPiece[], kind: PieceKind, content: string): ActivityPiece[] {
+  if (content === '') {
+    return pieces;
   }
-  return out;
+  const last = pieces[pieces.length - 1];
+  if (last !== undefined && last.kind === kind) {
+    return [...pieces.slice(0, -1), { kind, content: last.content + content }];
+  }
+  return [...pieces, { kind, content }];
 }
 
-// trimToByteBudget drops the oldest content until the whole range fits in the
-// trailing byte limit; reports whether anything was trimmed.
+// Drop the oldest content until the range fits the trailing byte limit.
 function trimToByteBudget(pieces: ActivityPiece[], limit: number): { pieces: ActivityPiece[]; truncated: boolean } {
   let total = pieces.reduce((sum, piece) => sum + byteLength(piece.content), 0);
   if (total <= limit) {
     return { pieces, truncated: false };
   }
-  let truncated = false;
-  const kept = [...pieces];
-  while (kept.length > 0) {
-    const first = kept[0];
-    const size = byteLength(first.content);
+  let start = 0;
+  while (start < pieces.length) {
+    const piece = pieces[start];
+    const size = byteLength(piece.content);
     if (size <= total - limit) {
-      // The whole oldest piece can go.
       total -= size;
-      truncated = true;
-      kept.shift();
+      start += 1;
       continue;
     }
-    // Trim the oldest piece down to the remaining budget.
-    const keepForFirst = limit - (total - size);
-    const suffix = keepUtf8Suffix(first.content, Math.max(0, keepForFirst));
-    truncated = true;
-    if (suffix === '') {
-      kept.shift();
-    } else {
-      kept[0] = { kind: first.kind, content: suffix };
-    }
-    break;
+    const suffix = keepUtf8Suffix(piece.content, Math.max(0, limit - (total - size)));
+    return {
+      pieces: suffix === ''
+        ? pieces.slice(start + 1)
+        : [{ kind: piece.kind, content: suffix }, ...pieces.slice(start + 1)],
+      truncated: true,
+    };
   }
-  return { pieces: combineAdjacent(kept), truncated };
+  return { pieces: [], truncated: true };
 }
 
 export class ProvisionalActivity {
@@ -127,9 +105,8 @@ export class ProvisionalActivity {
     return this.stateValue;
   }
 
-  // accept adopts one event when it addresses the accepted active Operation;
-  // otherwise it returns false without touching the state, and the caller
-  // dirties the hydration and discards the event.
+  // Adopt one event addressing the accepted active Operation; otherwise return
+  // false without touching the state and the caller dirties the hydration.
   accept(activeOperationID: string | null, event: ActivityEvent): boolean {
     if (activeOperationID === null || event.scope.operation_id !== activeOperationID) {
       return false;
@@ -137,34 +114,27 @@ export class ProvisionalActivity {
     const state = this.ensure(event.scope.operation_id);
     if (event.kind === 'text_delta' || event.kind === 'refusal_delta') {
       const kind: PieceKind = event.kind === 'text_delta' ? 'text' : 'refusal';
-      if (event.content !== '') {
-        const appended = combineAdjacent([...state.pieces, { kind, content: event.content }]);
-        const trimmed = trimToByteBudget(appended, ACTIVITY_BYTE_LIMIT);
-        state.pieces = trimmed.pieces;
-        state.truncated = state.truncated || trimmed.truncated;
-      }
-    } else if (event.kind === 'tool_started') {
-      const existing = state.tools.find((tool) => tool.callID === event.call_id);
-      if (existing) {
-        existing.name = event.name;
-        existing.status = null;
-      } else {
-        state.tools = [...state.tools, { callID: event.call_id, name: event.name, status: null }];
-      }
+      const appended = appendPiece(state.pieces, kind, event.content);
+      const trimmed = trimToByteBudget(appended, ACTIVITY_BYTE_LIMIT);
+      state.pieces = trimmed.pieces;
+      state.truncated = state.truncated || trimmed.truncated;
     } else {
-      const existing = state.tools.find((tool) => tool.callID === event.call_id);
-      if (existing) {
-        existing.status = event.status;
+      const index = state.tools.findIndex((tool) => tool.callID === event.call_id);
+      if (index === -1) {
+        state.tools = [...state.tools, event.kind === 'tool_started'
+          ? { callID: event.call_id, name: event.name, status: null }
+          : { callID: event.call_id, name: '', status: event.status }];
       } else {
-        state.tools = [...state.tools, { callID: event.call_id, name: '', status: event.status }];
+        state.tools = state.tools.map((tool, i) => (i === index
+          ? { ...tool, name: event.kind === 'tool_started' ? event.name : tool.name, status: event.kind === 'tool_started' ? null : event.status }
+          : tool));
       }
     }
     this.onChange();
     return true;
   }
 
-  // clear drops the provisional area: accepted hydration, selection change,
-  // repair and terminal Operation replacement all call it.
+  // Drop the provisional area.
   clear(): void {
     if (this.stateValue === null) {
       return;

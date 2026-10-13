@@ -1,4 +1,5 @@
 <script>
+  import { openDialog } from './dialogs';
   import { createEventDispatcher } from 'svelte';
   import ModelPicker from '../components/ModelPicker.svelte';
   export let agentType = '';
@@ -9,10 +10,6 @@
   const dispatch = createEventDispatcher();
   let dialog;
 
-  function openDialog(node) {
-    node.showModal();
-    return { destroy() { if (node.open) node.close(); } };
-  }
 
   function pick(ref) {
     dispatch('select', ref);
@@ -48,8 +45,6 @@
 </dialog>
 
 <style>
-  .modal { position:fixed; inset:0; width:100vw; height:100vh; max-width:none; max-height:none; margin:0; padding:0; border:0; background:transparent; }
-  .modal::backdrop { background:transparent; }
   .dialog-body { position:absolute; z-index:1; bottom:60px; left:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); min-width:320px; max-width:420px; box-shadow:var(--shadow-lg); padding:12px; display:flex; flex-direction:column; gap:8px; }
   .hdr { display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; }
   .type { color:var(--accent); text-transform:none; font-family:var(--font-mono); }

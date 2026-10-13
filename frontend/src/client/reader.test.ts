@@ -566,6 +566,52 @@ describe('SessionReader stamps, lifecycle and supersession', () => {
     expect(harness.repairMock).not.toHaveBeenCalled();
   });
 
+  it('continues the same chain with a fresh current stamp when a superseded step was dirtied', async () => {
+    const harness = makeHarness();
+    let releaseFirst: (value: ReaderOutcome<Hydration>) => void = () => {};
+    harness.hydrationMock
+      .mockImplementationOnce(() => new Promise<ReaderOutcome<Hydration>>((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce(okRead(hydration(revision('1'), range(1, 5), null)));
+    harness.reader.markDirty();
+    await vi.waitFor(() => expect(harness.hydrationMock).toHaveBeenCalledTimes(1));
+    // A selection intent moves the live reader's stamp while its read is parked
+    // and then dirties it (the App's failed-Resume behavior).
+    harness.stamp.selection += 1;
+    harness.reader.markDirty();
+    expect(harness.reader.isBusy()).toBe(true);
+    // The parked delivery is now superseded: it applies nothing, but real dirty
+    // work remains.
+    releaseFirst(okRead(hydration(revision('2'), range(9, 11), null)));
+    await harness.settle();
+    expect(harness.adopted).toHaveLength(1);
+    expect(harness.adopted[0].session_revision).toEqual(revision('1'));
+    expect(ids(harness.reader.getItems())).toEqual(range(1, 5).map((item) => item.item_id));
+    // The same serialized chain re-read with the fresh stamp; no parallel chain
+    // and no replacement reader.
+    expect(harness.hydrationMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops a dirtied reader permanently when a replacement disposes it during a superseded step', async () => {
+    const harness = makeHarness();
+    let releaseFirst: (value: ReaderOutcome<Hydration>) => void = () => {};
+    harness.hydrationMock
+      .mockImplementationOnce(() => new Promise<ReaderOutcome<Hydration>>((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce(okRead(hydration(revision('2'), range(1, 5), null)));
+    harness.reader.markDirty();
+    await vi.waitFor(() => expect(harness.hydrationMock).toHaveBeenCalledTimes(1));
+    harness.stamp.selection += 1;
+    harness.reader.markDirty();
+    // Ordinary selection/repair builds a replacement: the old reader is
+    // disposed and must never read again, dirty bit or not.
+    harness.reader.dispose();
+    releaseFirst(okRead(hydration(revision('1'), range(9, 11), null)));
+    await harness.settle();
+    expect(harness.hydrationMock).toHaveBeenCalledTimes(1);
+    expect(harness.adopted).toHaveLength(0);
+    expect(harness.reader.getItems()).toEqual([]);
+    expect(harness.reader.getHydration()).toBeNull();
+  });
+
   it('emits no orphan bridge adoption after a replacement disposes the old reader', async () => {
     const harness = makeHarness();
     harness.hydrationMock

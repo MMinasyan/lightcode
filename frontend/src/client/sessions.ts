@@ -1,15 +1,10 @@
-// Session chronology ordering for the desktop navigation. The producer emits
-// `last_activity` from a UTC time.Time, which encoding/json writes as
-// RFC3339Nano: a variable-length fractional second with trailing zeros trimmed
-// (".1", ".000000001", or no fraction at all). Comparing those strings raw is
-// wrong — "…:00Z" sorts after "…:00.5Z" though the instant is earlier. So
-// normalize the fractional suffix to exactly nine digits before comparing the
-// instant, then order descending by instant and ascending by Session ID on an
-// exact tie. No locale sorter, no millisecond rounding, no clock policy.
+// Session chronology ordering. The producer emits RFC3339Nano last_activity
+// with a variable-length trimmed fractional second, so the fraction is padded
+// to nine digits before comparing instants: descending instant, then ascending
+// Session ID on an exact tie.
 
-// normalizeInstant returns the timestamp with its fractional second padded to
-// nine digits, so lexicographic order equals chronological order. A value the
-// producer did not shape this way is compared as-is (never thrown).
+// Pad the fractional second to nine digits so lexicographic order equals
+// chronological order; an unshaped value is compared as-is.
 export function normalizeInstant(timestamp: string): string {
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/.exec(timestamp);
   if (match === null) {
@@ -20,8 +15,7 @@ export function normalizeInstant(timestamp: string): string {
   return `${match[1]}.${fraction.padEnd(9, '0')}${suffix}`;
 }
 
-// compareSessionActivity orders two Sessions descending by normalized
-// last_activity, then ascending by session_id on an exact-tied instant.
+// Descending normalized last_activity, then ascending session_id on a tie.
 export function compareSessionActivity(
   a: { last_activity: string; session_id: string },
   b: { last_activity: string; session_id: string },
@@ -37,8 +31,7 @@ export function compareSessionActivity(
   return a.session_id < b.session_id ? -1 : 1;
 }
 
-// sortOpenRoots filters out child headers and applies the shared chronology
-// order used by the initial selection, the Session picker and lineage lists.
+// Drop child headers and apply the shared chronology order.
 export function sortOpenRoots<T extends { last_activity: string; session_id: string; parent_session_id?: string }>(
   sessions: T[],
 ): T[] {

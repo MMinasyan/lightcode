@@ -1,5 +1,6 @@
 <script>
   import { createEventDispatcher } from 'svelte';
+  import { restoreLines } from './restore';
   export let text = '';
   export let active = false; // an admitted running Operation exists
   export let hasSession = true;
@@ -19,6 +20,12 @@
   function queue() {
     if (!text.trim() || !hasSession) return;
     dispatch('send', 'queued');
+  }
+
+  function attemptLabel(attempt) {
+    if (attempt.kind === 'compact') return 'compaction';
+    if (attempt.kind === 'fork') return 'fork';
+    return attempt.mode === 'queued' ? 'queued message' : 'message';
   }
 
   // Input-driven auto-resize with the 132px ceiling (the retained
@@ -56,9 +63,23 @@
     </div>
   </div>
   {#each attempts as attempt (attempt.id)}
-    {#if attempt.status === 'unknown'}
+    {#if attempt.restore?.kind === 'unknown'}
+      <!-- The rewind stage has no known outcome: Fork was never sent and no
+           Retry is offered, because a Fork retry could bypass the stage that
+           may still be running. Only explicit abandonment leaves it. -->
       <div class="attempt unknown">
-        <span class="attempt-content">Outcome unknown: {attempt.kind === 'compact' ? 'compaction' : (attempt.mode === 'queued' ? 'queued message' : 'message')} may or may not have been delivered.</span>
+        <span class="attempt-content">Rewind outcome unknown: the source restore may still be running. Fork was not sent.</span>
+        {#each restoreLines(attempt.restore) as line}
+          <span class="attempt-restore">{line}</span>
+        {/each}
+        <button class="attempt-btn" on:click={() => dispatch('abandon', attempt)} aria-label="Abandon">Abandon</button>
+      </div>
+    {:else if attempt.status === 'unknown'}
+      <div class="attempt unknown">
+        <span class="attempt-content">Outcome unknown: {attemptLabel(attempt)} may or may not have been delivered.</span>
+        {#if attempt.restore}{#each restoreLines(attempt.restore) as line}
+          <span class="attempt-restore">{line}</span>
+        {/each}{/if}
         <span class="retry-warning">Retrying keeps the same message identity. If the original was delivered before the connection loss, the message may be duplicated.</span>
         <button class="attempt-btn" on:click={() => dispatch('retry', attempt)} aria-label="Retry">Retry</button>
         <button class="attempt-btn" on:click={() => dispatch('abandon', attempt)} aria-label="Abandon">Abandon</button>
@@ -66,6 +87,9 @@
     {:else if attempt.status === 'rejected'}
       <div class="attempt rejected">
         <span class="attempt-content">{attempt.error || 'Rejected'}</span>
+        {#if attempt.restore}{#each restoreLines(attempt.restore) as line}
+          <span class="attempt-restore">{line}</span>
+        {/each}{/if}
         <span class="retry-warning">Retrying keeps the same message identity. If the original was delivered before the connection loss, the message may be duplicated.</span>
         <button class="attempt-btn" on:click={() => dispatch('retry', attempt)} aria-label="Retry">Retry</button>
         <button class="attempt-btn" on:click={() => dispatch('abandon', attempt)} aria-label="Abandon">Abandon</button>
@@ -100,6 +124,7 @@
   .attempt.unknown { background:var(--accent-soft); border:1px solid var(--border-button); color:var(--text); }
   .attempt.rejected { background:var(--error-soft); border:1px solid var(--error); color:var(--error); }
   .attempt-content { flex:1 1 100%; min-width:0; overflow-wrap:anywhere; }
+  .attempt-restore { flex:1 1 100%; font-family:var(--font-mono); font-size:calc(11px * var(--scale, 1)); color:var(--text-dim); overflow-wrap:anywhere; }
   .attempt.rejected .attempt-content { color:var(--text); }
   .retry-warning { flex:1 1 100%; color:var(--warn); font-size:calc(11px * var(--scale, 1)); overflow-wrap:anywhere; }
   .attempt-btn { flex-shrink:0; background:none; border:1px solid var(--border-button); border-radius:var(--radius); color:var(--text-dim); font-family:var(--font-ui); font-size:calc(11px * var(--scale, 1)); padding:3px 10px; cursor:pointer; }

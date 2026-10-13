@@ -5,26 +5,68 @@
 // binding failure leaves response absent. The real-stack owner (stack.test.ts)
 // drives the actual SDK on top of these; this file covers the view, keyboard,
 // membership, draft and repair behaviors.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 
-import * as sdk from '../generated/protocol/sdk.gen';
-import type { Hydration, Session } from '../generated/protocol/types.gen';
-
 vi.mock('../generated/protocol/sdk.gen', () => ({
+  archiveSession: vi.fn(),
   compactSession: vi.fn(),
+  connectProvider: vi.fn(),
+  createProvider: vi.fn(),
   createSession: vi.fn(),
+  deleteProviderDetail: vi.fn(),
+  deleteProviderModel: vi.fn(),
+  deleteSession: vi.fn(),
+  discoverProviderCandidates: vi.fn(),
+  discoverProviderModelCandidates: vi.fn(),
+  disconnectProvider: vi.fn(),
+  forkSession: vi.fn(),
   getConfiguration: vi.fn(),
+  getProviderDetail: vi.fn(),
+  getRetainedCodeSnapshots: vi.fn(),
+  getSessionCodeSnapshots: vi.fn(),
   getSessionHistory: vi.fn(),
   getSessionHydration: vi.fn(),
   getWarnings: vi.fn(),
   interruptSession: vi.fn(),
   listModels: vi.fn(),
+  listProviders: vi.fn(),
   listSessions: vi.fn(),
+  listWorkspaces: vi.fn(),
+  readWorkspaceFile: vi.fn(),
+  reloadConfiguration: vi.fn(),
+  reopenSession: vi.fn(),
+  resetProviderField: vi.fn(),
+  resetProviderModelField: vi.fn(),
+  revertRetainedCode: vi.fn(),
+  revertSessionCode: vi.fn(),
   setAgentTypeModel: vi.fn(),
+  setSessionAgentType: vi.fn(),
   stopSession: vi.fn(),
   submitSession: vi.fn(),
+  updateConfigurationSettings: vi.fn(),
+  updateProviderDetail: vi.fn(),
+  updateProviderModel: vi.fn(),
 }));
+
+// The native bindings module: the App and its editors import PatchJSON,
+// PickDirectory and SetTitle directly, so the whole module is replaced. The
+// PatchJSON double performs the same one-object raw member replacement as the
+// native helper using the exact-JSON round trip; the Go helper keeps its own
+// oracle (internal/desktopclient/host_test.go).
+vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
+  NextEvent: vi.fn(),
+  Open: vi.fn(),
+  Request: vi.fn(),
+  PatchJSON: vi.fn(),
+  PickDirectory: vi.fn(),
+  SetTitle: vi.fn(),
+}));
+
+import * as sdk from '../generated/protocol/sdk.gen';
+import type { Hydration, Session } from '../generated/protocol/types.gen';
+import { PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { parseExactJSON } from './exactjson';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 const mounted: Array<ReturnType<typeof mount>> = [];
@@ -155,21 +197,33 @@ async function mountAppNoWait(connection: ReturnType<typeof fakeConnection>) {
 }
 
 // basicMocks installs the standard successful composition: one connection,
-// two open roots, an empty hydration and accepted global clocks.
+// two open roots, an empty hydration and accepted global clocks. The native
+// bindings get their inert defaults here; individual tests override them.
 function basicMocks(connection: ReturnType<typeof fakeConnection>) {
   connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/ws' });
-  vi.mocked(sdk.listSessions).mockResolvedValue(ok([rootSession('root1', NEWER), rootSession('root2', OLDER)]));
+  vi.mocked(sdk.listSessions).mockImplementation(async () => ok([rootSession('root1', NEWER), rootSession('root2', OLDER)]));
   vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration()));
   vi.mocked(sdk.getConfiguration).mockResolvedValue(ok({
     configuration_revision: { instance_id: INSTANCE, generation: '1' },
     settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
-    agents: [],
+    agents: [
+      { name: 'primary', description: 'Primary agent', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      { name: 'compact', description: 'Compaction', subagent: false, model: '', readonly: true, write_dir: '', tools: [], capabilities: [] },
+    ],
     providers: [],
   }));
   vi.mocked(sdk.getWarnings).mockResolvedValue(ok({
     warnings_revision: { instance_id: INSTANCE, revision: '1' },
     warnings: [],
   }));
+  vi.mocked(SetTitle).mockResolvedValue(undefined);
+  vi.mocked(PickDirectory).mockResolvedValue('');
+  vi.mocked(PatchJSON).mockImplementation(async (document, patch) => {
+    const members = parseExactJSON(document) as Record<string, unknown>;
+    const edits = parseExactJSON(patch) as Record<string, unknown>;
+    for (const [name, value] of Object.entries(edits)) members[name] = value;
+    return JSON.stringify(members);
+  });
 }
 
 async function mountBasic() {
@@ -200,6 +254,12 @@ afterEach(async () => {
   }
   document.body.innerHTML = '';
   vi.clearAllMocks();
+  // clearAllMocks does not reset implementations; a previous test's
+  // mockImplementation can leak into the next test.  Reset the two
+  // highest-traffic mocks to a neutral default so every test that needs
+  // specific behavior sets its own implementation explicitly.
+  vi.mocked(sdk.listSessions).mockImplementation(async () => ok([]));
+  vi.mocked(sdk.getSessionHydration).mockImplementation(async () => ok(makeHydration()));
 });
 
 describe('initial composition', () => {
@@ -751,6 +811,43 @@ describe('keyboard pickers', () => {
     await vi.waitFor(() => expect(vi.mocked(sdk.getConfiguration).mock.calls.length).toBeGreaterThanOrEqual(2));
   });
 
+  it('keeps an unavailable selected_model from the accepted hydration and reports a selection rejection', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({ selected_model: 'prov/missing' })));
+    vi.mocked(sdk.listModels).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      models: [
+        { ref: 'prov/available', provider: 'prov', provider_name: 'Provider', model: 'available', display_name: 'Available', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' },
+      ],
+    }));
+    vi.mocked(sdk.setAgentTypeModel).mockResolvedValue(httpError(404, { code: 'not_found', message: 'model not available' }));
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
+    await settle();
+    await settle();
+    // The accepted hydration's selected_model is retained as-is; the offered
+    // list does not automatically replace it.
+    expect(target.textContent).toContain('Currently selected model:');
+    expect(target.textContent).toContain('prov/missing');
+    expect(vi.mocked(sdk.setAgentTypeModel)).not.toHaveBeenCalled();
+    (target.querySelector('.mp-btn') as HTMLElement).click();
+    await settle();
+    (target.querySelector('.mp .item') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The generated rejection is displayed and the accepted selection is not
+    // changed by the client.
+    expect(vi.mocked(sdk.setAgentTypeModel)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      query: { agent_type: 'primary' },
+      body: { model: 'prov/available' },
+    });
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Model selection failed');
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('model not available');
+    expect(target.textContent).toContain('prov/missing');
+  });
+
   it('a model success from an old selection reports success but pollutes no current floor and starts no repair', async () => {
     vi.mocked(sdk.listModels).mockResolvedValue(ok({
       configuration_revision: { instance_id: INSTANCE, generation: '1' },
@@ -1165,5 +1262,3513 @@ describe('repair', () => {
     expect(document.body.textContent).toContain('invalid');
     // No unbounded recursion: at most the one coalesced re-drive happened.
     expect(connection.openMock.mock.calls.length).toBeLessThanOrEqual(opensBefore + 2);
+  });
+});
+
+// --- Step 8: navigation, configuration, viewer and code tasks ----------------
+
+const RAW_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+  + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1},'
+  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}},'
+  + '"agents":[],"providers":[]}';
+
+const EXACT_SETTINGS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1},'
+  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}}';
+
+function inputItem(itemID: string, origin: 'user' | 'runtime' | 'plugin', operationID?: string) {
+  return {
+    item_id: itemID,
+    kind: 'input' as const,
+    committed_at: '0',
+    ...(operationID ? { operation_id: operationID } : {}),
+    origin,
+    content: [{ kind: 'text' as const, text: 'text ' + itemID }],
+  };
+}
+
+function runningOperation(id: string) {
+  return {
+    operation_id: id,
+    request_kind: 'message' as const,
+    status: 'running' as const,
+    admitted_at: '0',
+    agent_type: 'primary',
+    model: 'p/m',
+    usage: { totals: { by_model: [] } },
+  };
+}
+
+function providerFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'prov1',
+    name: 'Prov One',
+    builtin: false,
+    connected: true,
+    key_source: 'managed',
+    base_url: 'http://127.0.0.1:1/v1',
+    api_key_env: 'PROV1_KEY',
+    headers: {},
+    user_headers: {},
+    system_role: 'system',
+    usage_in_stream: false,
+    max_tokens_field: 'max_tokens',
+    discovery: true,
+    hidden: false,
+    models: [modelFixture()],
+    ...overrides,
+  };
+}
+
+function modelFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'm1',
+    name: 'Model One',
+    context_window: 1000,
+    max_output_tokens: 100,
+    input_modalities: ['text'],
+    system_role: 'system',
+    usage_in_stream: false,
+    hidden: false,
+    source: 'user',
+    incomplete: false,
+    provider_hidden: false,
+    usable: true,
+    ...overrides,
+  };
+}
+
+async function openSettings(target: HTMLElement) {
+  (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+  await settle();
+  await settle();
+}
+
+// A faithful generated-read double: the actual SDK parses JSON for an ordinary
+// read and returns the raw body text for a parseAs:'text' read, so one authored
+// document drives both shapes.
+function exactReadResult(value: unknown, options: unknown) {
+  return (options as { parseAs?: string }).parseAs === 'text' ? ok(JSON.stringify(value)) : ok(value);
+}
+
+function exactRead(value: unknown) {
+  return async (options: unknown) => exactReadResult(value, options);
+}
+
+// exactReadDoc pairs an exact raw document with its ordinary parsed shape: the
+// non-text path sees whatever Number parse the raw text produces, the exact
+// path preserves every lexeme.
+function exactReadDoc(raw: string, parsed: unknown) {
+  return async (options: unknown) => ((options as { parseAs?: string }).parseAs === 'text' ? ok(raw) : ok(parsed));
+}
+
+async function changeInput(target: HTMLElement, label: string, value: string) {
+  const input = target.querySelector(`[aria-label="${label}"]`) as HTMLInputElement;
+  input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  await tick();
+}
+
+async function toggleCheckbox(target: HTMLElement, label: string, checked: boolean) {
+  const input = target.querySelector(`[aria-label="${label}"]`) as HTMLInputElement;
+  input.checked = checked;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  await tick();
+}
+
+function bodyOf(call: { body?: unknown; bodySerializer?: (body: unknown) => unknown }): string {
+  return String((call.bodySerializer as (body: unknown) => unknown)(call.body));
+}
+
+describe('repair projection ownership', () => {
+  function ownedHydration() {
+    return makeHydration({
+      conversation: { items: [inputItem('i-owned', 'user', 'op-owned')] },
+      operations: [runningOperation('op-owned')],
+      warnings: [{ source: 's', kind: 'k', message: 'own warning', session_id: 'root1' }],
+    });
+  }
+
+  async function repair(connection: ReturnType<typeof fakeConnection>) {
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
+    connection.failureHandler?.(new Error('lost'), '1');
+    await settle();
+    await settle();
+    await settle();
+  }
+
+  it('closes every runtime-data dialog when a new-instance repair starts', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([{ root: '/ws', display_name: 'ws' }]));
+    vi.mocked(sdk.listModels).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      models: [{ ref: 'prov/a', provider: 'prov', provider_name: 'Provider', model: 'a', display_name: 'Model A', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' }],
+    }));
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(ownedHydration()));
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
+    await settle();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Background sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Show warnings"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    expect(target.querySelectorAll('dialog').length).toBeGreaterThan(0);
+    await repair(connection);
+    // Every runtime-data dialog closed with the discarded generation.
+    expect(target.querySelectorAll('dialog')).toHaveLength(0);
+  });
+
+  it('discards cached picker rows before the new instance answers', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('root1');
+    await repair(connection);
+    // The reopened picker reads fresh; the old cached rows are gone while the
+    // read is still parked.
+    vi.mocked(sdk.listSessions).mockImplementation(() => new Promise(() => {}) as never);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    expect(target.textContent).not.toContain('Select session root1');
+    expect(target.textContent).toContain('loading…');
+  });
+
+  it('a failed fresh configuration/warning read leaves no old-owner roster or warning data', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getConfiguration).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [{ name: 'other-agent', description: 'Old owner roster', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }],
+      providers: [],
+    }));
+    vi.mocked(sdk.getWarnings).mockResolvedValue(ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' },
+      warnings: [{ source: 'g', kind: 'k', message: 'old owner global' }],
+    }));
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      warnings: [{ source: 'g', kind: 'k', message: 'old owner global' }],
+    })));
+    const { target } = await mountApp(connection);
+    await settle();
+    expect(target.querySelector('[aria-label="Show warnings"]')).not.toBeNull();
+    // The repair's own fresh global reads fail; no stale payload may survive.
+    vi.mocked(sdk.getConfiguration).mockResolvedValue(bridgeLoss('configuration down'));
+    vi.mocked(sdk.getWarnings).mockResolvedValue(bridgeLoss('warnings down'));
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(bridgeLoss('hydration down'));
+    await repair(connection);
+    expect(target.querySelector('[aria-label="Show warnings"]')).toBeNull();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('(no agent definitions)');
+    expect(target.textContent).not.toContain('other-agent');
+  });
+
+  it('preserves the composer draft and pending attempts across a repair without resending', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(ownedHydration()));
+    let releaseSubmit: (value: unknown) => void = () => {};
+    const submitGate = new Promise((resolve) => { releaseSubmit = resolve; });
+    let releaseFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    vi.mocked(sdk.submitSession).mockImplementationOnce(() => submitGate as never);
+    vi.mocked(sdk.forkSession).mockImplementationOnce(() => forkGate as never);
+    const { target } = await mountApp(connection);
+    await settle();
+    (target.querySelector('[aria-label="Message input"]') as HTMLTextAreaElement).value = 'keep this draft';
+    (target.querySelector('[aria-label="Message input"]') as HTMLTextAreaElement).dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    (target.querySelector('[aria-label="Send"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+    await settle();
+    await repair(connection);
+    // The open Fork form is discarded with the generation; the submitted
+    // attempts and the composer draft survive.
+    expect(target.querySelector('[aria-label="Close fork dialog"]')).toBeNull();
+    expect((target.querySelector('[aria-label="Message input"]') as HTMLTextAreaElement).value).toBe('keep this draft');
+    releaseSubmit(bridgeLoss('submit lost'));
+    releaseFork(bridgeLoss('fork lost'));
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.submitSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.forkSession)).toHaveBeenCalledTimes(1);
+    // Both outstanding attempts remain reachable with Retry/Abandon.
+    const rows = [...target.querySelectorAll('.attempt')];
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(target.querySelectorAll('.attempt [aria-label="Abandon"]').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('reports an addressed pending mutation after unmount and publishes no stale read body', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const prov1 = providerFixture({ connected: false, key_source: 'external' });
+    const prov2 = providerFixture({ id: 'prov2', name: 'Prov Two' });
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [prov1, prov2] }));
+    let releaseRead: (value: unknown) => void = () => {};
+    const readGate = new Promise((resolve) => { releaseRead = resolve; });
+    vi.mocked(sdk.getProviderDetail).mockImplementation(async (options) => {
+      const id = (options as { query: { provider_id: string } }).query.provider_id;
+      if (id === 'prov2') return readGate as never;
+      return exactReadResult({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: prov1 }, options);
+    });
+    let releaseMutation: (value: unknown) => void = () => {};
+    const mutationGate = new Promise((resolve) => { releaseMutation = resolve; });
+    vi.mocked(sdk.connectProvider).mockImplementationOnce(() => mutationGate as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Connect provider"]') as HTMLElement).click();
+    await settle();
+    const key = target.querySelector('[aria-label="Connect api key"]') as HTMLInputElement;
+    key.value = 'connect-secret';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Submit connect"]') as HTMLElement).click();
+    await settle();
+    // A second detail read parks; the repair unmounts the editor with both the
+    // mutation and the read outstanding.
+    (target.querySelector('[aria-label="Select provider prov2"]') as HTMLElement).click();
+    await settle();
+    await repair(connection);
+    expect(target.querySelector('[aria-label="Close provider editor"]')).toBeNull();
+    // The stale read parked across the unmount publishes nothing.
+    releaseRead(ok(JSON.stringify({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: prov2 })));
+    await settle();
+    expect(target.querySelector('.note.outcome')).toBeNull();
+    // The addressed pending mutation still reports through the App note.
+    releaseMutation(httpError(401, { code: 'unauthorized', message: 'key refused' }));
+    await settle();
+    await settle();
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Provider connect failed for prov1');
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('key refused');
+  });
+});
+
+describe('workspace navigation', () => {
+  it('lists generated workspaces and re-composes the initial selection on an explicit change', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([
+      { root: '/ws', display_name: 'ws' },
+      { root: '/ws2', display_name: 'ws2' },
+    ]));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /ws2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const listCall = vi.mocked(sdk.listSessions).mock.calls.at(-1)?.[0] as { query: { workspace: string } };
+    expect(listCall.query.workspace).toBe('/ws2');
+    expect(vi.mocked(SetTitle)).toHaveBeenCalledWith('/ws2');
+    // The same shared initial-selection composition selected the newest root.
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.at(-1)?.[0]).toEqual({ client: expect.anything(), path: { id: 'root1' } });
+  });
+
+  it('picks a directory natively and ignores a cancelled dialog', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([{ root: '/ws', display_name: 'ws' }]));
+    vi.mocked(PickDirectory).mockResolvedValueOnce('').mockResolvedValueOnce('/ws3');
+    const { target } = await mountApp(connection);
+    const listsBefore = vi.mocked(sdk.listSessions).mock.calls.length;
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Choose workspace directory"]') as HTMLElement).click();
+    await settle();
+    expect(vi.mocked(sdk.listSessions).mock.calls.length).toBe(listsBefore);
+    (target.querySelector('[aria-label="Choose workspace directory"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const listCall = vi.mocked(sdk.listSessions).mock.calls.at(-1)?.[0] as { query: { workspace: string } };
+    expect(listCall.query.workspace).toBe('/ws3');
+  });
+
+  it('ignores a superseded workspace list/create completion and keeps the newest choice', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([
+      { root: '/ws2', display_name: 'ws2' },
+      { root: '/ws3', display_name: 'ws3' },
+    ]));
+    let releaseStale: (value: unknown) => void = () => {};
+    const staleGate = new Promise((resolve) => { releaseStale = resolve; });
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const workspace = (options as { query: { workspace: string } }).query.workspace;
+      if (workspace === '/ws2') return staleGate as never;
+      return ok([rootSession('root3', NEWER)]);
+    });
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /ws2"]') as HTMLElement).click();
+    await settle();
+    // Choose /ws3 while the /ws2 list is still held.
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /ws3"]') as HTMLElement).click();
+    await settle();
+    releaseStale(ok([rootSession('stale-root', NEWER)]));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('root3');
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.some(
+      (call) => (call[0] as { path: { id: string } }).path.id === 'stale-root',
+    )).toBe(false);
+    expect(vi.mocked(sdk.createSession)).not.toHaveBeenCalled();
+  });
+
+  it('rejects a directory chosen after another Workspace selection, before composition or title', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([
+      { root: '/ws', display_name: 'ws' },
+      { root: '/ws2', display_name: 'ws2' },
+    ]));
+    let releasePick: (value: string) => void = () => {};
+    const pickGate = new Promise<string>((resolve) => { releasePick = resolve; });
+    vi.mocked(PickDirectory).mockImplementationOnce(() => pickGate as never);
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Choose workspace directory"]') as HTMLElement).click();
+    await settle();
+    // Another Workspace selection supersedes the parked native dialog.
+    (target.querySelector('[aria-label="Select workspace /ws2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releasePick('/ws3');
+    await settle();
+    await settle();
+    expect(vi.mocked(SetTitle)).not.toHaveBeenCalledWith('/ws3');
+    expect(vi.mocked(sdk.listSessions).mock.calls.some(
+      (call) => (call[0] as { query: { workspace: string } }).query.workspace === '/ws3',
+    )).toBe(false);
+    expect(target.textContent).toContain('/ws2');
+  });
+
+  it('rejects a superseded directory failure before any current note change', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([{ root: '/ws', display_name: 'ws' }]));
+    let rejectPick: (error: Error) => void = () => {};
+    const pickGate = new Promise<string>((_resolve, reject) => { rejectPick = reject; });
+    vi.mocked(PickDirectory).mockImplementationOnce(() => pickGate as never);
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Choose workspace directory"]') as HTMLElement).click();
+    await settle();
+    // A new-instance repair supersedes the parked dialog.
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
+    connection.failureHandler?.(new Error('lost'), '1');
+    await settle();
+    await settle();
+    await settle();
+    rejectPick(new Error('dialog failed'));
+    await settle();
+    await settle();
+    expect(target.querySelector('.note.outcome')).toBeNull();
+    expect(target.textContent).toContain('/ws');
+  });
+
+  it('reports a current directory pick failure and keeps the current Workspace', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([{ root: '/ws', display_name: 'ws' }]));
+    vi.mocked(PickDirectory).mockRejectedValueOnce(new Error('dialog failed'));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Choose workspace directory"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Directory pick failed');
+    expect(target.textContent).toContain('/ws');
+  });
+});
+
+describe('session picker tasks', () => {
+  async function openPicker(target: HTMLElement) {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+  }
+
+  it('archives then deletes an open root and clears only its local selection', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue({ data: undefined, error: undefined, request: new Request('http://runtime.invalid/v1/x'), response: new Response(null, { status: 204 }) });
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.archiveSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root1' } });
+    expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root1' } });
+    // The selected root's removal clears only its selection; nothing else is
+    // selected and no replacement Session is created.
+    expect(target.textContent).toContain('no session');
+    expect(vi.mocked(sdk.createSession)).not.toHaveBeenCalled();
+    // The list was refreshed after the deletion.
+    expect(vi.mocked(sdk.listSessions).mock.calls.length).toBeGreaterThan(3);
+  });
+
+  it('stops the open-root delete sequence after an unknown archive', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.archiveSession).mockResolvedValue(bridgeLoss('archive lost'));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="Delete session root2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.archiveSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.deleteSession)).not.toHaveBeenCalled();
+    // The unknown Archive is reported through the one shared addressed-outcome
+    // rule; the sequence stops, so no Delete follows.
+    expect(target.textContent).toContain('Archive outcome unknown for session root2; nothing was retransmitted.');
+  });
+
+  it('resumes an archived root through Reopen before hydrating it', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const archived = { ...rootSession('root9', OLDER), lifecycle: 'archived' as const };
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      return lifecycle === 'open' ? ok([rootSession('root1', NEWER)]) : ok([archived]);
+    });
+    vi.mocked(sdk.reopenSession).mockResolvedValue(ok({ ...archived, lifecycle: 'open' as const }));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="Archived sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session root9"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.reopenSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root9' } });
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.at(-1)?.[0]).toEqual({ client: expect.anything(), path: { id: 'root9' } });
+  });
+
+  it('invalidates an older list after a deletion, including a nonselected one', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseFirstDeleteList: (value: unknown) => void = () => {};
+    const firstDeleteList = new Promise((resolve) => { releaseFirstDeleteList = resolve; });
+    let openCalls = 0;
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      if (lifecycle !== 'open') return ok([]);
+      openCalls += 1;
+      if (openCalls <= 2) return ok([rootSession('root1', NEWER), rootSession('root2', OLDER)]);
+      if (openCalls === 3) return firstDeleteList as never;
+      return ok([rootSession('root1', NEWER)]);
+    });
+    vi.mocked(sdk.deleteSession).mockResolvedValue({ data: undefined, error: undefined, request: new Request('http://runtime.invalid/v1/x'), response: new Response(null, { status: 204 }) });
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root2', OLDER)));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    // Delete the NONselected root2; its refresh is held.
+    (target.querySelector('[aria-label="Delete session root2"]') as HTMLElement).click();
+    await settle();
+    // A newer list (from deleting the selected root1) resolves first.
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The held older reply still carries root2; it must be ignored.
+    releaseFirstDeleteList(ok([rootSession('root1', NEWER), rootSession('root2', OLDER)]));
+    await settle();
+    await settle();
+    const rows = [...target.querySelectorAll('dialog .row')];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain('root1');
+    expect(target.textContent).toContain('no session');
+  });
+
+  it('keeps the archive-success selection and list state while Delete is parked', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let archived = false;
+    vi.mocked(sdk.archiveSession).mockImplementation(async () => {
+      archived = true;
+      return ok(rootSession('root1', NEWER));
+    });
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      if (lifecycle === 'open') {
+        return ok(archived ? [rootSession('root2', OLDER)] : [rootSession('root1', NEWER), rootSession('root2', OLDER)]);
+      }
+      return ok([]);
+    });
+    let releaseDelete: (value: unknown) => void = () => {};
+    const deleteGate = new Promise((resolve) => { releaseDelete = resolve; });
+    vi.mocked(sdk.deleteSession).mockImplementationOnce(() => deleteGate as never);
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The archive stage already cleared only the matching selected root and
+    // refreshed the list while Delete is still parked.
+    expect(target.textContent).toContain('no session');
+    const rows = [...target.querySelectorAll('dialog .row')].map((row) => row.textContent ?? '');
+    expect(rows.some((text) => text.includes('root1'))).toBe(false);
+    expect(rows.some((text) => text.includes('root2'))).toBe(true);
+    releaseDelete(noContent());
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('no session');
+    expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches Delete without waiting for the archive-stage list refresh', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let openListCalls = 0;
+    let releaseStage: (value: unknown) => void = () => {};
+    const stageGate = new Promise((resolve) => { releaseStage = resolve; });
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      if (lifecycle === 'archived') {
+        if (openListCalls === 3) return stageGate as never;
+        return ok([]);
+      }
+      openListCalls += 1;
+      if (openListCalls === 3) return stageGate as never;
+      return ok(openListCalls >= 4 ? [rootSession('root2', OLDER)] : [rootSession('root1', NEWER), rootSession('root2', OLDER)]);
+    });
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue(noContent());
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // Delete was dispatched even though the archive-stage lifecycle reads are
+    // still parked, and the selected-root clear was immediate.
+    expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root1' } });
+    expect(target.textContent).toContain('no session');
+    releaseStage(ok([rootSession('root1', NEWER), rootSession('root2', OLDER)]));
+    await settle();
+    await settle();
+    // The superseded archive-stage read cannot resurrect the removed row; the
+    // final awaited refresh lists the post-delete state.
+    const rows = [...target.querySelectorAll('dialog .row')].map((row) => row.textContent ?? '');
+    expect(rows.some((text) => text.includes('root1'))).toBe(false);
+  });
+
+  it('nested lifecycle keydown stays with the nested control while row keys still activate', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      return lifecycle === 'open'
+        ? ok([rootSession('root1', NEWER), rootSession('root2', OLDER)])
+        : ok([{ ...rootSession('arch8', OLDER), lifecycle: 'archived' as const }]);
+    });
+    vi.mocked(sdk.archiveSession).mockImplementation(async (options) => {
+      const id = (options as { path: { id: string } }).path.id;
+      return ok(rootSession(id, OLDER));
+    });
+    vi.mocked(sdk.deleteSession).mockResolvedValue(noContent());
+    vi.mocked(sdk.reopenSession).mockResolvedValue(ok(rootSession('arch8', OLDER)));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    const hydratedIDs = () => vi.mocked(sdk.getSessionHydration).mock.calls.map(
+      (call) => (call[0] as { path: { id: string } }).path.id,
+    );
+    // A nested Archive button's keydown bubbles to its row: the row must not
+    // select the row subject or close the picker.
+    const archive = target.querySelector('[aria-label="Archive session root2"]') as HTMLElement;
+    const archiveKey = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    archive.dispatchEvent(archiveKey);
+    archive.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true, cancelable: true }));
+    await settle();
+    expect(target.querySelector('#session-picker-title')).not.toBeNull();
+    expect(hydratedIDs()).not.toContain('root2');
+    expect(archiveKey.defaultPrevented).toBe(false);
+    archive.click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.archiveSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root2' } });
+    // A nested Delete button on an archived row must not resume that row.
+    (target.querySelector('[aria-label="Archived sessions"]') as HTMLElement).click();
+    await settle();
+    const archivedDelete = target.querySelector('[aria-label="Delete session arch8"]') as HTMLElement;
+    const deleteKey = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+    archivedDelete.dispatchEvent(deleteKey);
+    await settle();
+    expect(vi.mocked(sdk.reopenSession)).not.toHaveBeenCalled();
+    expect(target.querySelector('#session-picker-title')).not.toBeNull();
+    expect(deleteKey.defaultPrevented).toBe(false);
+    archivedDelete.click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.archiveSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'arch8' } });
+    expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'arch8' } });
+    // Own-row Space/Enter still activate deliberately and prevent the default.
+    const archivedRow = target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement;
+    const space = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+    archivedRow.dispatchEvent(space);
+    await settle();
+    expect(space.defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(vi.mocked(sdk.reopenSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'arch8' } }));
+    // The successful Resume closed the picker; reopen it for the open-row sibling.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    const openRow = target.querySelector('[aria-label="Select session root2"]') as HTMLElement;
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    openRow.dispatchEvent(enter);
+    await settle();
+    expect(enter.defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(hydratedIDs()).toContain('root2'));
+  });
+
+  it('creates an explicit new session from the picker', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.createSession).mockResolvedValue(ok(rootSession('root-new', NEWER)));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.createSession)).toHaveBeenCalledWith({ client: expect.anything(), body: { workspace: '/ws', agent_type: 'primary' } });
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.at(-1)?.[0]).toEqual({ client: expect.anything(), path: { id: 'root-new' } });
+  });
+});
+
+describe('resume selection intent', () => {  function archivedSession(id: string) {
+    return { ...rootSession(id, OLDER), lifecycle: 'archived' as const };
+  }
+
+  function archivedConnection() {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      return lifecycle === 'open'
+        ? ok([rootSession('root1', NEWER), rootSession('root2', OLDER)])
+        : ok([archivedSession('arch8'), archivedSession('arch9')]);
+    });
+    vi.mocked(sdk.reopenSession).mockResolvedValue(ok(rootSession('arch9', OLDER)));
+    return connection;
+  }
+
+  async function openArchived(target: HTMLElement) {
+    if (!target.querySelector('#session-picker-title')) {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+      await settle();
+      await settle();
+    }
+    (target.querySelector('[aria-label="Archived sessions"]') as HTMLElement).click();
+    await settle();
+  }
+
+  // A fresh picker instance on the archived tab: closes a still-open picker so
+  // its tab state cannot leak across a scenario.
+  async function reopenArchived(target: HTMLElement) {
+    if (target.querySelector('#session-picker-title')) {
+      (target.querySelector('[aria-label="Close session picker"]') as HTMLElement).click();
+      await settle();
+    }
+    await openArchived(target);
+  }
+
+  function hydratedIDs() {
+    return vi.mocked(sdk.getSessionHydration).mock.calls.map((call) => (call[0] as { path: { id: string } }).path.id);
+  }
+
+  it('adopts only the newest resume when the later Reopen settles first', async () => {
+    const connection = archivedConnection();
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.reopenSession)
+      .mockImplementationOnce(() => first as never)
+      .mockResolvedValueOnce(ok(rootSession('arch9', OLDER)));
+    const { target } = await mountApp(connection);
+    await openArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session arch9"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(hydratedIDs()).toContain('arch9');
+    releaseFirst(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    // The stale success reports no adoption and hydrates no unrelated root.
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.textContent).toContain('arch9');
+  });
+
+  it('keeps the newest resume intent when the earlier Reopen settles first', async () => {
+    const connection = archivedConnection();
+    let releaseFirst: (value: unknown) => void = () => {};
+    let releaseSecond: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.reopenSession)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+    const { target } = await mountApp(connection);
+    await openArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session arch9"]') as HTMLElement).click();
+    await settle();
+    // A settles first: its success is stale and never adopted or hydrated.
+    releaseFirst(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).not.toContain('arch8');
+    // B's own success still adopts arch9.
+    releaseSecond(ok(rootSession('arch9', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).toContain('arch9');
+  });
+
+  it('a rejected or lost newest resume keeps the prior root and never adopts a stale success', async () => {
+    const connection = archivedConnection();
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.reopenSession)
+      .mockImplementationOnce(() => first as never)
+      .mockResolvedValueOnce(httpError(404, { code: 'not_found', message: 'no longer archived' }));
+    const { target } = await mountApp(connection);
+    await openArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session arch9"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Resume failed for session arch9');
+    releaseFirst(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    // The prior root is preserved; the stale A success never lands.
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.querySelector('.toolbar')?.textContent).toContain('root1');
+    // A lost newest resume behaves the same.
+    let releaseSecond: (value: unknown) => void = () => {};
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.reopenSession)
+      .mockImplementationOnce(() => second as never)
+      .mockResolvedValueOnce(bridgeLoss('reopen lost'));
+    await reopenArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session arch9"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Resume outcome unknown for session arch9');
+    releaseSecond(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.querySelector('.toolbar')?.textContent).toContain('root1');
+  });
+
+  it('later root, New and Workspace selection supersede a parked resume', async () => {    const connection = archivedConnection();
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([
+      { root: '/ws', display_name: 'ws' },
+      { root: '/ws2', display_name: 'ws2' },
+    ]));
+    vi.mocked(sdk.createSession).mockResolvedValue(ok(rootSession('root-new', NEWER)));
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.reopenSession).mockImplementationOnce(() => first as never);
+    const { target } = await mountApp(connection);
+    await openArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    // A later explicit root selection supersedes the parked resume.
+    (target.querySelector('[aria-label="Open sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select session root2"]') as HTMLElement).click();
+    await settle();
+    releaseFirst(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.querySelector('.toolbar')?.textContent).toContain('root2');
+    // A Workspace composition supersedes a parked resume too.
+    let releaseSecond: (value: unknown) => void = () => {};
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.reopenSession).mockImplementationOnce(() => second as never);
+    await reopenArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /ws2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releaseSecond(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.textContent).toContain('/ws2');
+    // A picker New that succeeds supersedes a parked resume as well.
+    let releaseThird: (value: unknown) => void = () => {};
+    const third = new Promise((resolve) => { releaseThird = resolve; });
+    vi.mocked(sdk.reopenSession).mockImplementationOnce(() => third as never);
+    await reopenArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Open sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releaseThird(ok(rootSession('arch8', OLDER)));
+    await settle();
+    await settle();
+    expect(hydratedIDs()).not.toContain('arch8');
+    expect(target.textContent).toContain('root-new');
+  });
+
+  it('a failed Resume re-reads the retained root without another hint and keeps its loaded history', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      return lifecycle === 'open'
+        ? ok([rootSession('root1', NEWER)])
+        : ok([{ ...rootSession('arch8', OLDER), lifecycle: 'archived' as const }]);
+    });
+    vi.mocked(sdk.reopenSession).mockResolvedValue(httpError(404, { code: 'not_found', message: 'no longer archived' }));
+    const initial = makeHydration({
+      conversation: { items: [inputItem('i-old', 'user', 'op-old')] },
+      operations: [runningOperation('op-old')],
+    });
+    const fresh = makeHydration({
+      conversation: { items: [inputItem('i-old', 'user', 'op-old'), inputItem('i-new', 'user', 'op-new')] },
+      operations: [runningOperation('op-old')],
+    });
+    let releaseParked: (value: unknown) => void = () => {};
+    const parked = new Promise((resolve) => { releaseParked = resolve; });
+    vi.mocked(sdk.getSessionHydration)
+      .mockResolvedValueOnce(ok(initial))
+      .mockImplementationOnce(() => parked as never)
+      .mockResolvedValue(ok(fresh));
+    const { target } = await mountApp(connection);
+    await vi.waitFor(() => expect(target.textContent).toContain('i-old'));
+    // A revision hint starts the refresh that the failed Resume supersedes.
+    deliverEvent(connection, {
+      kind: 'session_changed',
+      scope: { session_id: 'root1' },
+      session_revision: { instance_id: INSTANCE, durable_revision: '2', local_revision: '0' },
+    });
+    await vi.waitFor(() => expect(vi.mocked(sdk.getSessionHydration)).toHaveBeenCalledTimes(2));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Archived sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Resume failed for session arch8');
+    // The superseded parked response settles: the retained root re-reads with
+    // the fresh stamp WITHOUT another hint and keeps its loaded history.
+    releaseParked(ok(initial));
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.getSessionHydration)).toHaveBeenCalledTimes(3);
+    expect(target.querySelector('.toolbar')?.textContent).toContain('root1');
+    expect(target.textContent).toContain('i-old');
+    expect(target.textContent).toContain('i-new');
+  });
+
+  it('a stale failed Resume never refreshes a newer selected root', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      return lifecycle === 'open'
+        ? ok([rootSession('root1', NEWER), rootSession('root2', OLDER)])
+        : ok([{ ...rootSession('arch8', OLDER), lifecycle: 'archived' as const }]);
+    });
+    let releaseResume: (value: unknown) => void = () => {};
+    const resumeGate = new Promise((resolve) => { releaseResume = resolve; });
+    vi.mocked(sdk.reopenSession).mockImplementationOnce(() => resumeGate as never);
+    const { target } = await mountApp(connection);
+    await openArchived(target);
+    (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
+    await settle();
+    // Move to another root while the Resume is parked.
+    (target.querySelector('[aria-label="Open sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select session root2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const root2Reads = vi.mocked(sdk.getSessionHydration).mock.calls.filter(
+      (call) => (call[0] as { path: { id: string } }).path.id === 'root2',
+    ).length;
+    releaseResume(httpError(404, { code: 'not_found', message: 'no longer archived' }));
+    await settle();
+    await settle();
+    // The addressed failure is still reported, but the newer root is neither
+    // dirtied nor refreshed by the stale Resume.
+    expect(target.textContent).toContain('Resume failed for session arch8');
+    expect(target.querySelector('.toolbar')?.textContent).toContain('root2');
+    const root2ReadsAfter = vi.mocked(sdk.getSessionHydration).mock.calls.filter(
+      (call) => (call[0] as { path: { id: string } }).path.id === 'root2',
+    ).length;
+    expect(root2ReadsAfter).toBe(root2Reads);
+  });
+});
+
+describe('agent type ownership', () => {
+  it('offers every returned definition including compact and dispatches the actual name', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getConfiguration).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [
+        { name: 'primary', description: 'Primary agent', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+        { name: 'compact', description: 'Compaction', subagent: false, model: '', readonly: true, write_dir: '', tools: [], capabilities: [] },
+        { name: 'reviewer', description: 'Reviewer', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      ],
+      providers: [],
+    }));
+    vi.mocked(sdk.setSessionAgentType).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    const { target } = await mountApp(connection);
+    const openAgentPicker = async () => {
+      await openSettings(target);
+      (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+      await settle();
+    };
+    await openAgentPicker();
+    const choices = [...target.querySelectorAll('dialog .row')].map((row) => row.textContent);
+    expect(choices.some((text) => text?.includes('primary'))).toBe(true);
+    expect(choices.some((text) => text?.includes('compact'))).toBe(true);
+    expect(choices.some((text) => text?.includes('reviewer'))).toBe(true);
+    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.setSessionAgentType)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      path: { id: 'root1' },
+      body: { agent_type: 'compact' },
+    });
+    // A second returned definition dispatches its own actual name as well.
+    await openAgentPicker();
+    (target.querySelector('[aria-label="Set session agent type reviewer"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.setSessionAgentType).mock.calls.at(-1)?.[0]).toEqual({
+      client: expect.anything(),
+      path: { id: 'root1' },
+      body: { agent_type: 'reviewer' },
+    });
+    // The server stays the accepting owner: a generated rejection is displayed.
+    vi.mocked(sdk.setSessionAgentType).mockResolvedValue(httpError(400, { code: 'invalid', message: 'unknown agent type' }));
+    await openAgentPicker();
+    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Agent type change failed');
+    expect(target.textContent).toContain('unknown agent type');
+  });
+});
+
+describe('settings editor', () => {
+  it('saves the complete body with every unedited token and plugin string preserved', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    expect(target.textContent).toContain('Uses plugin defaults');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe(`{"settings":${EXACT_SETTINGS_TEXT}}`);
+    // The published mutation triggers no Reload; a re-read through the same
+    // exact editor read replaces the text.
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+    const textReads = vi.mocked(sdk.getConfiguration).mock.calls.filter(
+      (call) => (call[0] as { parseAs?: string }).parseAs === 'text',
+    );
+    expect(textReads.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('authors an absent plugin document only on the first member edit, one member at a time', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'jobs max_background_processes', '3');
+    await settle();
+    await settle();
+    // First patch: the absent document becomes {} and receives only the member.
+    expect(vi.mocked(PatchJSON).mock.calls[0]).toEqual(['{}', '{"max_background_processes":3}']);
+    // Second patch: the plugins member keeps the unedited tools document exact.
+    const [document, patch] = vi.mocked(PatchJSON).mock.calls[1];
+    expect(document).toBe(EXACT_SETTINGS_TEXT);
+    expect(patch).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
+    expect(patch).toContain('"jobs":"{\\"max_background_processes\\":3}"');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    const body = bodyOf(call);
+    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3}"');
+    expect(body).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
+  });
+
+  it('gates every authored control while a save is pending and sends the complete body with no precondition', async () => {
+    const connection = settingsRawConnection();
+    let releaseSave: (value: unknown) => void = () => {};
+    const gate = new Promise((resolve) => { releaseSave = resolve; });
+    vi.mocked(sdk.updateConfigurationSettings).mockImplementationOnce(() => gate as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    await settle();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    // The pending Save gates the editor: no second local operation exists.
+    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="jobs max_background_processes"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseSave(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: {} }));
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    // The complete captured document is sent once; whole-settings LWW keeps
+    // the endpoint's established contract without a revision precondition.
+    expect(bodyOf(call)).toContain('"archive_after_days":5');
+    expect(bodyOf(call)).toContain('"delete_after_archive_days":1');
+    expect(bodyOf(call)).not.toContain('revision');
+    expect(vi.mocked(sdk.updateConfigurationSettings)).toHaveBeenCalledTimes(1);
+    // The success refresh releases the editor.
+    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('displays a known settings save rejection and retains the editor draft', async () => {
+    const connection = settingsRawConnection();
+    vi.mocked(sdk.updateConfigurationSettings).mockResolvedValueOnce(
+      httpError(400, { code: 'invalid', message: 'sessions interval rejected' }),
+    );
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    await settle();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The generated error is displayed and the editor's draft is retained.
+    expect(target.textContent).toContain('Settings save failed');
+    expect(target.textContent).toContain('sessions interval rejected');
+    // A subsequent save carries the retained edited document.
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls.at(-1)?.[0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toContain('"archive_after_days":5');
+    expect(target.textContent).toContain('Settings saved');
+  });
+});
+
+describe('provider and model tasks', () => {
+  it('sends only the edited field and refreshes through its own stamped read', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.updateProviderDetail).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'provider name', 'Renamed');
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateProviderDetail).mock.calls[0][0] as { query: unknown; body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(call.query).toEqual({ provider_id: 'prov1' });
+    expect(bodyOf(call)).toBe('{"provider":{"name":"Renamed"}}');
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.getProviderDetail).mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('resets one provider field through the generated reset path', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.resetProviderField).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Reset provider name"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.resetProviderField)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      query: { provider_id: 'prov1' },
+      path: { field: 'name' },
+    });
+  });
+
+  it('resets one model field through the generated model reset path', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.resetProviderModelField).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    // The one reset rule selects the model operation and adds the model_id.
+    (target.querySelector('[aria-label="Reset m1 name"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.resetProviderModelField)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      query: { provider_id: 'prov1', model_id: 'm1' },
+      path: { field: 'name' },
+    });
+  });
+
+  it('resets model input_modalities through the shared model reset rule', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.resetProviderModelField).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Reset m1 input_modalities"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.resetProviderModelField)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      query: { provider_id: 'prov1', model_id: 'm1' },
+      path: { field: 'input_modalities' },
+    });
+    // A reset sends no metadata echo and triggers no reload.
+    expect(vi.mocked(sdk.updateProviderModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+  });
+
+  it('resets model cost through the shared model reset rule', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.resetProviderModelField).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Reset m1 cost"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.resetProviderModelField)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      query: { provider_id: 'prov1', model_id: 'm1' },
+      path: { field: 'cost' },
+    });
+    expect(vi.mocked(sdk.updateProviderModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+  });
+
+  it('forwards an authored null and a raw JSON member verbatim', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.updateProviderDetail).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    const textarea = target.querySelector('[aria-label="provider extra_body"]') as HTMLTextAreaElement;
+    textarea.value = 'null';
+    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateProviderDetail).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"provider":{"extra_body":null}}');
+  });
+
+  it('keeps Reload explicit: no automatic reload after a published model mutation', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.updateProviderModel).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: modelFixture() }));
+    vi.mocked(sdk.reloadConfiguration).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '3' } }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    await toggleCheckbox(target, 'm1 hidden', true);
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateProviderModel).mock.calls[0][0] as { query: unknown; body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(call.query).toEqual({ provider_id: 'prov1', model_id: 'm1' });
+    expect(bodyOf(call)).toBe('{"model":{"hidden":true}}');
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+    (target.querySelector('[aria-label="Reload configuration"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.reloadConfiguration)).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an external credential refusal from connect', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const disconnected = providerFixture({ connected: false, key_source: 'external' });
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [disconnected] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: disconnected }));
+    vi.mocked(sdk.connectProvider).mockResolvedValue(httpError(401, { code: 'unauthorized', message: 'external key rejected' }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Connect provider"]') as HTMLElement).click();
+    await settle();
+    const keyInput = target.querySelector('[aria-label="Connect api key"]') as HTMLInputElement;
+    keyInput.value = 'secret-value';
+    keyInput.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Submit connect"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.connectProvider).mock.calls[0][0] as { body: { api_key?: string } };
+    expect(call.body).toEqual({ api_key: 'secret-value' });
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('external key rejected');
+  });
+
+  it('discovers candidates and selects them into the authored create body', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [] }));
+    vi.mocked(sdk.discoverProviderCandidates).mockImplementation(exactRead([
+      { id: 'cand-1', name: 'Candidate One', context_window: 4096, max_output_tokens: 512, usable: true },
+    ]));
+    vi.mocked(sdk.createProvider).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: null }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider id', 'prov2');
+    await changeInput(target, 'Provider name', 'Prov Two');
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:2/v1');
+    await changeInput(target, 'Provider api key env', 'PROV2_KEY');
+    const key = target.querySelector('[aria-label="Provider api key"]') as HTMLInputElement;
+    key.value = 'create-secret';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Discover provider candidates"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const discover = vi.mocked(sdk.discoverProviderCandidates).mock.calls[0][0] as { body: Record<string, unknown> };
+    expect(discover.body).toEqual({ base_url: 'http://127.0.0.1:2/v1', api_key_env: 'PROV2_KEY', api_key: 'create-secret' });
+    expect((target.querySelector('[aria-label="Select candidate cand-1"]') as HTMLInputElement).checked).toBe(true);
+    (target.querySelector('[aria-label="Create provider"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.createProvider).mock.calls[0][0] as { body: Record<string, unknown> };
+    // The generated JSON serializer emits the exact-parsed candidate tokens
+    // verbatim, so compare the actual serialized document.
+    expect(JSON.parse(JSON.stringify(call.body))).toEqual({
+      id: 'prov2',
+      provider: { name: 'Prov Two', base_url: 'http://127.0.0.1:2/v1', api_key_env: 'PROV2_KEY' },
+      models: { 'cand-1': { name: 'Candidate One', context_window: 4096, max_output_tokens: 512 } },
+      api_key: 'create-secret',
+    });
+  });
+
+  it('treats prototype-named candidates as ordinary data and never inherits selection', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [] }));
+    vi.mocked(sdk.discoverProviderCandidates).mockImplementation(exactRead([
+      { id: '__proto__', name: 'Proto Model', context_window: 4096, max_output_tokens: 512, usable: true },
+      { id: 'toString', name: 'String Model', context_window: 2048, max_output_tokens: 256, usable: true },
+      { id: 'constructor', name: 'Ctor Model', context_window: 1024, max_output_tokens: 128, usable: false },
+    ]));
+    vi.mocked(sdk.createProvider).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: null }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider id', 'protos');
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:9/v1');
+    (target.querySelector('[aria-label="Discover provider candidates"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // An unavailable prototype-named candidate is not selected by inheritance.
+    expect((target.querySelector('[aria-label="Select candidate constructor"]') as HTMLInputElement).checked).toBe(false);
+    // The user unselects the ordinary prototype-named candidate; __proto__ stays selected.
+    expect((target.querySelector('[aria-label="Select candidate toString"]') as HTMLInputElement).checked).toBe(true);
+    (target.querySelector('[aria-label="Select candidate toString"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Create provider"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.createProvider).mock.calls[0][0] as { body: unknown };
+    const text = JSON.stringify(call.body);
+    expect(text).toContain('"models":{"__proto__":{"name":"Proto Model","context_window":4096,"max_output_tokens":512}}');
+    expect(text).not.toContain('toString');
+    expect(text).not.toContain('constructor');
+  });
+
+  it('omits a blank api_key_env from the create body so Runtime can allocate with a supplied key', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [] }));
+    vi.mocked(sdk.createProvider).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: null }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider id', 'prov2');
+    await changeInput(target, 'Provider name', 'Authored Name');
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:2/v1');
+    const key = target.querySelector('[aria-label="Provider api key"]') as HTMLInputElement;
+    key.value = 'supplied-key';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Create provider"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = (vi.mocked(sdk.createProvider).mock.calls[0][0] as { body: Record<string, unknown> }).body;
+    const provider = body.provider as Record<string, unknown>;
+    expect('api_key_env' in provider).toBe(false);
+    expect(provider.name).toBe('Authored Name');
+    expect(body.api_key).toBe('supplied-key');
+    // No client-side allocation, reload or disconnect policy follows the create.
+    expect(vi.mocked(sdk.reloadConfiguration)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.connectProvider)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.disconnectProvider)).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the provider list for every successful metadata mutation, including a model edit', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    vi.mocked(sdk.updateProviderModel).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: modelFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    const listReadsBefore = vi.mocked(sdk.listProviders).mock.calls.length;
+    await toggleCheckbox(target, 'm1 hidden', true);
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.updateProviderModel)).toHaveBeenCalledTimes(1);
+    // The provider's connected label is derived from model metadata, so a
+    // successful model mutation refreshes the provider list too.
+    expect(vi.mocked(sdk.listProviders).mock.calls.length).toBeGreaterThan(listReadsBefore);
+  });
+
+  it('sends an explicit api_key_env unchanged and a keyless create carries no api_key', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [] }));
+    vi.mocked(sdk.createProvider).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: null }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider id', 'prov2');
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:2/v1');
+    await changeInput(target, 'Provider api key env', 'AUTHORED_KEY');
+    (target.querySelector('[aria-label="Create provider"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = (vi.mocked(sdk.createProvider).mock.calls[0][0] as { body: Record<string, unknown> }).body;
+    expect((body.provider as Record<string, unknown>).api_key_env).toBe('AUTHORED_KEY');
+    expect('api_key' in body).toBe(false);
+  });
+});
+
+describe('provider exact reads', () => {
+  const RAW_DETAIL = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+    + '"provider":{"id":"prov1","name":"Prov One","builtin":false,"connected":true,"key_source":"managed",'
+    + '"base_url":"http://127.0.0.1:1/v1","api_key_env":"PROV1_KEY","headers":{},"user_headers":{},'
+    + '"system_role":"system","usage_in_stream":false,"max_tokens_field":"max_tokens","discovery":true,"hidden":false,'
+    + '"protocol_metadata":{"limit":9007199254740993,"rate":1e400},'
+    + '"models":[{"id":"m1","name":"Model One","context_window":9007199254740993,"max_output_tokens":1e400,'
+    + '"input_modalities":["text"],"system_role":"system","usage_in_stream":false,"hidden":false,"source":"user",'
+    + '"incomplete":false,"provider_hidden":false,"usable":true,"cost":{"input":9007199254740993,"output":2.5}}]}}';
+
+  async function exactEditor(rawDetail: string) {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      providers: [providerFixture()],
+    }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactReadDoc(rawDetail, JSON.parse(rawDetail)));
+    vi.mocked(sdk.updateProviderModel).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: modelFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    return target;
+  }
+
+  it('retains opaque provider/model lexemes from the exact read through a cost reconstruction', async () => {
+    const target = await exactEditor(RAW_DETAIL);
+    expect((target.querySelector('[aria-label="m1 context_window"]') as HTMLInputElement).value).toBe('9007199254740993');
+    expect((target.querySelector('[aria-label="m1 max_output_tokens"]') as HTMLInputElement).value).toBe('1e400');
+    expect((target.querySelector('[aria-label="m1 cost input"]') as HTMLInputElement).value).toBe('9007199254740993');
+    expect((target.querySelector('[aria-label="provider protocol_metadata"]') as HTMLTextAreaElement).value)
+      .toBe('{"limit":9007199254740993,"rate":1e400}');
+    await changeInput(target, 'm1 cost output', '3');
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateProviderModel).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"model":{"cost":{"input":9007199254740993,"output":3}}}');
+  });
+
+  it('prefills candidate number fields with their exact tokens and writes them unchanged', async () => {
+    const target = await exactEditor(RAW_DETAIL);
+    vi.mocked(sdk.discoverProviderModelCandidates).mockImplementation(exactReadDoc(
+      '[{"id":"cand-big","name":"Big","context_window":9007199254740993,"max_output_tokens":1e400,"usable":true}]',
+      [{ id: 'cand-big', name: 'Big', context_window: 9007199254740992, max_output_tokens: null, usable: true }],
+    ));
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Select candidate cand-big"]') as HTMLElement).click();
+    await tick();
+    expect((target.querySelector('[aria-label="Model context window"]') as HTMLInputElement).value).toBe('9007199254740993');
+    expect((target.querySelector('[aria-label="Model max output"]') as HTMLInputElement).value).toBe('1e400');
+    (target.querySelector('[aria-label="Upsert model"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateProviderModel).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"model":{"name":"Big","context_window":9007199254740993,"max_output_tokens":1e400}}');
+  });
+});
+
+describe('provider discovery supersession and busy controls', () => {
+  // One-shot implementation queues are per-test state: reset the SDK calls
+  // this describe scripts so a failing case never leaks an unconsumed gate
+  // into the next mounted editor.
+  beforeEach(() => {
+    for (const call of [
+      sdk.listProviders,
+      sdk.getProviderDetail,
+      sdk.discoverProviderModelCandidates,
+      sdk.discoverProviderCandidates,
+      sdk.updateProviderDetail,
+      sdk.updateProviderModel,
+      sdk.connectProvider,
+      sdk.createProvider,
+    ]) {
+      vi.mocked(call).mockReset();
+    }
+  });
+
+  function editorConnection(providers: unknown[]) {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      providers: providers as never,
+    }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(async (options) => {
+      const id = (options as { query: { provider_id: string } }).query.provider_id;
+      return exactReadResult({
+        configuration_revision: { instance_id: INSTANCE, generation: '1' },
+        provider: (providers as Array<{ id: string }>).find((provider) => provider.id === id) as never,
+      }, options);
+    });
+    return connection;
+  }
+
+  async function openProviderEditor(target: HTMLElement) {
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+  }
+
+  function candidate(id: string) {
+    return { id, name: id, context_window: 8, max_output_tokens: 1, usable: true };
+  }
+
+  it('publishes only the newest model-discovery response for the same provider', async () => {
+    const connection = editorConnection([providerFixture()]);
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.discoverProviderModelCandidates)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(exactRead([candidate('cand-new')]));
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Select candidate cand-new"]')).not.toBeNull();
+    releaseFirst(ok(JSON.stringify([candidate('cand-old')])));
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Select candidate cand-new"]')).not.toBeNull();
+    expect(target.querySelector('[aria-label="Select candidate cand-old"]')).toBeNull();
+  });
+
+  it('discards an earlier provider discovery success after the selection moves', async () => {
+    const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
+    let releaseFirst: (value: unknown) => void = () => {};
+    let releaseSecond: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.discoverProviderModelCandidates)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    // Move to prov2 and open its own discovery panel.
+    (target.querySelector('[aria-label="Select provider prov2"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    releaseFirst(ok(JSON.stringify([candidate('cand-a')])));
+    await settle();
+    await settle();
+    // The stale success belongs to prov1 and must not populate prov2's panel.
+    expect(target.querySelector('[aria-label="Select candidate cand-a"]')).toBeNull();
+    releaseSecond(ok(JSON.stringify([candidate('cand-b')])));
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Select candidate cand-b"]')).not.toBeNull();
+    expect(target.querySelector('[aria-label="Select candidate cand-a"]')).toBeNull();
+  });
+
+  it('discards an earlier provider discovery error after the selection moves', async () => {
+    const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.discoverProviderModelCandidates).mockImplementationOnce(() => first as never);
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov2"]') as HTMLElement).click();
+    await settle();
+    releaseFirst(httpError(404, { code: 'not_found', message: 'provider gone' }));
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('Model discovery failed');
+  });
+
+  it('invalidates an earlier discovery request across an A-to-B-to-A selection move', async () => {
+    const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.discoverProviderModelCandidates)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(exactRead([candidate('cand-new')]));
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov2"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Select candidate cand-new"]')).not.toBeNull();
+    releaseFirst(ok(JSON.stringify([candidate('cand-old')])));
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Select candidate cand-new"]')).not.toBeNull();
+    expect(target.querySelector('[aria-label="Select candidate cand-old"]')).toBeNull();
+  });
+
+  it('discovers provider candidates from a base URL without an environment name', async () => {
+    const connection = editorConnection([]);
+    vi.mocked(sdk.discoverProviderCandidates).mockImplementation(exactRead([]));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:9/v1');
+    const discoverButton = target.querySelector('[aria-label="Discover provider candidates"]') as HTMLButtonElement;
+    expect(discoverButton.disabled).toBe(false);
+    discoverButton.click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.discoverProviderCandidates)).toHaveBeenCalledTimes(1);
+    expect((vi.mocked(sdk.discoverProviderCandidates).mock.calls[0][0] as { body: unknown }).body)
+      .toEqual({ base_url: 'http://127.0.0.1:9/v1', api_key_env: '' });
+    // A supplied one-off key still needs no environment name.
+    const key = target.querySelector('[aria-label="Provider api key"]') as HTMLInputElement;
+    key.value = 'supplied-key';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    discoverButton.click();
+    await settle();
+    await settle();
+    expect((vi.mocked(sdk.discoverProviderCandidates).mock.calls[1][0] as { body: unknown }).body)
+      .toEqual({ base_url: 'http://127.0.0.1:9/v1', api_key_env: '', api_key: 'supplied-key' });
+  });
+
+  it('keeps provider and model controls disabled through a parked mutation and its parked refresh', async () => {
+    const connection = editorConnection([providerFixture()]);
+    let releaseWrite: (value: unknown) => void = () => {};
+    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+    let releaseRefresh: (value: unknown) => void = () => {};
+    const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+    vi.mocked(sdk.updateProviderDetail).mockImplementationOnce(() => writeGate as never);
+    vi.mocked(sdk.getProviderDetail)
+      .mockImplementationOnce(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }))
+      .mockImplementationOnce(() => refreshGate as never);
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'provider name', 'Renamed');
+    await settle();
+    const control = (label: string) => target.querySelector(`[aria-label="${label}"]`) as HTMLInputElement;
+    expect(control('provider name').disabled).toBe(true);
+    expect(control('provider usage_in_stream').disabled).toBe(true);
+    expect(control('provider extra_body').disabled).toBe(true);
+    expect(control('m1 name').disabled).toBe(true);
+    expect(control('m1 hidden').disabled).toBe(true);
+    expect(control('m1 cost input').disabled).toBe(true);
+    releaseWrite(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: providerFixture() }));
+    await settle();
+    await settle();
+    // Still busy: the required follow-up detail read is parked.
+    expect(control('provider name').disabled).toBe(true);
+    expect(control('m1 hidden').disabled).toBe(true);
+    releaseRefresh(ok(JSON.stringify({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture({ name: 'Renamed' }) })));
+    await settle();
+    await settle();
+    expect(control('provider name').disabled).toBe(false);
+    expect(control('m1 hidden').disabled).toBe(false);
+  });
+
+  it('keeps the connect form disabled through its mutation and the provider-list refresh', async () => {
+    const disconnected = providerFixture({ connected: false, key_source: 'external' });
+    const connection = editorConnection([disconnected]);
+    let releaseConnect: (value: unknown) => void = () => {};
+    const connectGate = new Promise((resolve) => { releaseConnect = resolve; });
+    let releaseList: (value: unknown) => void = () => {};
+    const listGate = new Promise((resolve) => { releaseList = resolve; });
+    vi.mocked(sdk.connectProvider).mockImplementationOnce(() => connectGate as never);
+    vi.mocked(sdk.listProviders)
+      .mockImplementationOnce(async () => ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [disconnected] }))
+      .mockImplementationOnce(() => listGate as never);
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Connect provider"]') as HTMLElement).click();
+    await settle();
+    const key = target.querySelector('[aria-label="Connect api key"]') as HTMLInputElement;
+    key.value = 'connect-secret';
+    key.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Submit connect"]') as HTMLElement).click();
+    await settle();
+    expect(key.disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Submit connect"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseConnect(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: disconnected }));
+    await settle();
+    await settle();
+    // The mutation settled, but its provider-list refresh is still parked.
+    expect((target.querySelector('[aria-label="Connect provider"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseList(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, providers: [disconnected] }));
+    await settle();
+    await settle();
+    expect((target.querySelector('[aria-label="Connect provider"]') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('keeps the create form and candidate selection disabled while the create is parked', async () => {
+    const connection = editorConnection([]);
+    vi.mocked(sdk.discoverProviderCandidates).mockImplementation(exactRead([candidate('cand-1')]));
+    let releaseCreate: (value: unknown) => void = () => {};
+    const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+    vi.mocked(sdk.createProvider).mockImplementationOnce(() => createGate as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="New provider"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Provider id', 'prov2');
+    await changeInput(target, 'Provider base url', 'http://127.0.0.1:2/v1');
+    await changeInput(target, 'Provider api key env', 'PROV2_KEY');
+    (target.querySelector('[aria-label="Discover provider candidates"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const checkbox = target.querySelector('[aria-label="Select candidate cand-1"]') as HTMLInputElement;
+    expect(checkbox.disabled).toBe(false);
+    (target.querySelector('[aria-label="Create provider"]') as HTMLElement).click();
+    await settle();
+    expect((target.querySelector('[aria-label="Provider id"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Provider base url"]') as HTMLInputElement).disabled).toBe(true);
+    expect(checkbox.disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Discover provider candidates"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseCreate(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: null }));
+    await settle();
+    await settle();
+  });
+
+  it('keeps the upsert form and candidate selection disabled while the upsert is parked', async () => {
+    const connection = editorConnection([providerFixture()]);
+    vi.mocked(sdk.discoverProviderModelCandidates).mockImplementation(exactRead([candidate('cand-9')]));
+    let releaseUpsert: (value: unknown) => void = () => {};
+    const upsertGate = new Promise((resolve) => { releaseUpsert = resolve; });
+    let releaseDetail: (value: unknown) => void = () => {};
+    const detailGate = new Promise((resolve) => { releaseDetail = resolve; });
+    vi.mocked(sdk.updateProviderModel).mockImplementationOnce(() => upsertGate as never);
+    vi.mocked(sdk.getProviderDetail)
+      .mockImplementationOnce(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }))
+      .mockImplementationOnce(() => detailGate as never);
+    const { target } = await mountApp(connection);
+    await openProviderEditor(target);
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Add model"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Select candidate cand-9"]') as HTMLElement).click();
+    await tick();
+    (target.querySelector('[aria-label="Upsert model"]') as HTMLElement).click();
+    await settle();
+    expect((target.querySelector('[aria-label="Model id"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Model name"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Select candidate cand-9"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseUpsert(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: modelFixture() }));
+    await settle();
+    await settle();
+    // The upsert settled, but its required follow-up detail read is parked.
+    expect((target.querySelector('[aria-label="Add model"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseDetail(ok(JSON.stringify({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, provider: providerFixture() })));
+    await settle();
+    await settle();
+    expect((target.querySelector('[aria-label="Add model"]') as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe('file viewer', () => {
+  it('reads an explicit workspace/path and displays canonical path and truncation', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.readWorkspaceFile).mockResolvedValue(ok({ content: 'file body', canonical_path: '/ws/src/a.ts', truncated: true }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'src/a.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.readWorkspaceFile)).toHaveBeenCalledWith({ client: expect.anything(), body: { workspace: '/ws', path: 'src/a.ts' } });
+    expect(target.textContent).toContain('/ws/src/a.ts');
+    expect(target.textContent).toContain('truncated');
+    expect(target.textContent).toContain('file body');
+  });
+
+  it('ignores a superseded viewer reply and keeps the newest read', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.readWorkspaceFile)
+      .mockImplementationOnce(() => first as never)
+      .mockResolvedValueOnce(ok({ content: 'second body', canonical_path: '/ws/b.ts', truncated: false }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'a.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'b.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releaseFirst(ok({ content: 'stale body', canonical_path: '/ws/a.ts', truncated: false }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('/ws/b.ts');
+    expect(target.textContent).not.toContain('stale body');
+  });
+
+  it('shows a denied read as an addressed error', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.readWorkspaceFile).mockResolvedValue(httpError(404, { code: 'not_found', message: 'path is outside the workspace' }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', '../etc/passwd');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('path is outside the workspace');
+  });
+});
+
+describe('code snapshots', () => {
+  it('reverts current code to a chosen Operation boundary and shows a partial failure', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionCodeSnapshots).mockResolvedValue(ok([
+      { operation_id: 'op1', group_item_id: 'group1', files: [{ path: 'a.ts', existed: true }] },
+    ]));
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(httpError(409, {
+      restored: ['a.ts'],
+      skipped: [{ path: 'b.ts', reason: 'io' }],
+      error: { code: 'storage', message: 'partial failure' },
+    }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Operation op1');
+    (target.querySelector('[aria-label="Revert code to before operation op1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.revertSessionCode)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      path: { id: 'root1' },
+      body: { boundary_operation_id: 'op1' },
+    });
+    expect(target.textContent).toContain('Restored: a.ts');
+    expect(target.textContent).toContain('Skipped: b.ts (io)');
+    expect(target.textContent).toContain('Restore failed: partial failure');
+  });
+
+  it('reads retained turns as exact text and sends after_turn as an exact token', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getRetainedCodeSnapshots).mockResolvedValue(ok(
+      '{"turns":[{"turn":9007199254740993,"files":[{"path":"legacy.ts","existed":true}]}]}',
+    ));
+    vi.mocked(sdk.revertRetainedCode).mockResolvedValue(bridgeLoss('retained rewind lost'));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Retained session id', 'abcd1234');
+    (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('after turn 9007199254740993');
+    (target.querySelector('[aria-label="Revert after retained turn 9007199254740993"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.revertRetainedCode).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":9007199254740993}');
+    expect(target.textContent).toContain('Rewind outcome unknown');
+  });
+
+  it('offers the initial retained boundary 0 for a loaded target with only later turns', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getRetainedCodeSnapshots).mockResolvedValue(ok(
+      '{"turns":[{"turn":1,"files":[{"path":"legacy.ts","existed":true}]}]}',
+    ));
+    vi.mocked(sdk.revertRetainedCode).mockResolvedValue(bridgeLoss('retained rewind lost'));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Retained session id', 'abcd1234');
+    (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The existing per-turn boundary row keeps its exact lexeme.
+    expect(target.querySelector('[aria-label="Revert after retained turn 1"]')).not.toBeNull();
+    // The draft retarget must not retarget the initial boundary either.
+    await changeInput(target, 'Retained session id', 'ffffffff');
+    const initial = target.querySelector('[aria-label="Revert to initial retained boundary"]');
+    expect(initial).not.toBeNull();
+    (initial as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.revertRetainedCode).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":0}');
+    expect(target.textContent).toContain('Retained snapshot boundary after turn 0');
+    expect(target.textContent).toContain('Rewind outcome unknown');
+  });
+
+  it('reports a current rewind outcome addressed to its loaded Session', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionCodeSnapshots).mockResolvedValue(ok([
+      { operation_id: 'op1', group_item_id: 'group1', files: [{ path: 'a.ts', existed: true }] },
+    ]));
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(httpError(409, {
+      restored: ['a.ts'],
+      skipped: [],
+      error: { code: 'storage', message: 'partial failure' },
+    }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Revert code to before operation op1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const note = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(note).toContain('session root1');
+    expect(note).toContain('Restored: a.ts');
+    expect(note).toContain('Restore failed: partial failure');
+  });
+
+  it('reports a retained rewind outcome addressed to its loaded Workspace and ID', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getRetainedCodeSnapshots).mockResolvedValue(ok(
+      '{"turns":[{"turn":1,"files":[{"path":"legacy.ts","existed":true}]}]}',
+    ));
+    vi.mocked(sdk.revertRetainedCode).mockResolvedValue(ok({ restored: ['legacy.ts'], skipped: [] }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Retained session id', 'abcd1234');
+    (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Revert to initial retained boundary"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const note = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(note).toContain('/ws');
+    expect(note).toContain('abcd1234');
+    expect(note).toContain('Restored: legacy.ts');
+  });
+
+  it('reports a pending rewind after a repair unmounts the dialog, without retransmitting', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionCodeSnapshots).mockResolvedValue(ok([
+      { operation_id: 'op1', group_item_id: 'group1', files: [{ path: 'a.ts', existed: true }] },
+    ]));
+    let releaseRevert: (value: unknown) => void = () => {};
+    const revertGate = new Promise((resolve) => { releaseRevert = resolve; });
+    vi.mocked(sdk.revertSessionCode).mockImplementationOnce(() => revertGate as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Revert code to before operation op1"]') as HTMLElement).click();
+    await settle();
+    // A new-instance repair unmounts the dialog while the rewind is parked.
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
+    connection.failureHandler?.(new Error('lost'), '1');
+    await settle();
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Close snapshots"]')).toBeNull();
+    releaseRevert(bridgeLoss('rewind lost'));
+    await settle();
+    await settle();
+    const note = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(note).toContain('Rewind outcome unknown');
+    expect(note).toContain('session root1');
+    expect(vi.mocked(sdk.revertSessionCode)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('usage details and global warnings', () => {
+  it('lists exact per-model usage rows without inventing zero rows', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      usage: {
+        totals: {
+          by_model: [
+            { model: 'p/m', usage: { input_tokens: '9007199254740993', cached_input_tokens: '2', output_tokens: '3' } },
+          ],
+        },
+        context: { used_tokens: '123456789012345678901', context_window: 200000 },
+      },
+    })));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('9007199254740993');
+    expect(target.textContent).toContain('123456789012345678901');
+    // Exactly one model row plus the header; absence is not displayed as zero.
+    expect(target.querySelectorAll('dialog .row')).toHaveLength(2);
+  });
+
+  it('falls back to GetWarnings globals when no hydration is displayed', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getWarnings).mockResolvedValue(ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' },
+      warnings: [
+        { source: 'g', kind: 'k', message: 'global warning' },
+        { source: 's', kind: 'k', message: 'session warning', session_id: 'root1' },
+      ],
+    }));
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue({ data: undefined, error: undefined, request: new Request('http://runtime.invalid/v1/x'), response: new Response(null, { status: 204 }) });
+    const { target } = await mountApp(connection);
+    // Remove the selected root: no hydration remains, so the global-only
+    // indicator filters absent session_id from the GetWarnings snapshot.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const warn = target.querySelector('.warn') as HTMLElement;
+    expect(warn.textContent).toContain('⚠ 1');
+    warn.click();
+    await settle();
+    expect(target.textContent).toContain('global warning');
+    expect(target.textContent).not.toContain('session warning');
+  });
+});
+
+describe('replacement Fork and ordered rewind', () => {
+  function forkConnection(overrides: Partial<Hydration> = {}) {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      conversation: {
+        items: [
+          inputItem('i-owned', 'user', 'op-owned'),
+          inputItem('i-copied', 'user'),
+          inputItem('i-runtime', 'runtime', 'op-runtime'),
+          inputItem('i-plugin', 'plugin', 'op-plugin'),
+        ],
+      },
+      operations: [runningOperation('op-owned'), runningOperation('op-runtime'), runningOperation('op-plugin')],
+      ...overrides,
+    })));
+    return connection;
+  }
+
+  async function openOwnedFork(target: HTMLElement, rewind: boolean) {
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    if (rewind) await toggleCheckbox(target, 'Rewind code before Fork', true);
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+  }
+
+  it('exposes Fork only on root user-origin inputs, with rewind only for an owned input', async () => {
+    const connection = forkConnection();
+    const { target } = await mountApp(connection);
+    expect(target.querySelectorAll('.fork')).toHaveLength(2);
+    expect(target.querySelector('[aria-label="Fork from input i-runtime"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Fork from input i-plugin"]')).toBeNull();
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('[aria-label="Rewind code before Fork"]')).not.toBeNull();
+    (target.querySelector('[aria-label="Close fork dialog"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Fork from input i-copied"]') as HTMLElement).click();
+    await settle();
+    // A copied input keeps a normal Fork: no invented Operation boundary.
+    expect(target.querySelector('[aria-label="Rewind code before Fork"]')).toBeNull();
+  });
+
+  it('leaves the child inspector passive: no Fork actions there', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockImplementation(async (options) => {
+      const id = (options as { path: { id: string } }).path.id;
+      if (id === 'child1') {
+        return ok(makeHydration({ conversation: { items: [inputItem('child-owned', 'user', 'op-child')] } }));
+      }
+      return ok(makeHydration({ background: [{ kind: 'child', id: 'child1' }] }));
+    });
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Background sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Inspect child session child1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const childPane = target.querySelector('.child-pane') as HTMLElement;
+    expect(childPane).not.toBeNull();
+    expect(childPane.querySelector('.fork')).toBeNull();
+  });
+
+  it('prefills the generated content parts and forwards the exact edited replacement text', async () => {
+    const connection = forkConnection();
+    const multipart = [
+      { kind: 'text' as const, text: 'hi' },
+      { kind: 'image_url' as const, url: 'http://img/x.png' },
+      { kind: 'opaque' as const, opaque_wire_type: 'w', extra: { a: 1 } },
+    ];
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      conversation: { items: [{ ...inputItem('i-owned', 'user', 'op-owned'), content: multipart }] },
+      operations: [runningOperation('op-owned')],
+    })));
+    vi.mocked(sdk.forkSession).mockResolvedValue(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('caller') }));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    const textarea = target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    expect(JSON.parse(textarea.value)).toEqual(multipart);
+    const edited = '[ {"kind":"text","text":"edited"} ]';
+    textarea.value = edited;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.forkSession).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    const body = JSON.parse(bodyOf(call)) as { content: unknown };
+    expect(body.content).toEqual(JSON.parse(edited));
+    expect(bodyOf(call)).toContain('"content":[ {"kind":"text","text":"edited"} ]');
+  });
+
+  it('awaits the rewind reply, shows it, then issues the Fork with the same attempt identity', async () => {
+    const connection = forkConnection();
+    const order: string[] = [];
+    vi.mocked(sdk.revertSessionCode).mockImplementation(async () => {
+      order.push('rewind');
+      return ok({ restored: ['a.ts'], skipped: [{ path: 'b.ts', reason: 'unchanged' }] });
+    });
+    vi.mocked(sdk.forkSession).mockImplementation(async (options) => {
+      order.push('fork');
+      const request = options as { body: unknown; bodySerializer: (body: unknown) => unknown };
+      const body = JSON.parse(bodyOf(request)) as { operation_id: string };
+      return ok({ session: rootSession('dest1', NEWER), operation: runningOperation(body.operation_id) });
+    });
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    await settle();
+    expect(order).toEqual(['rewind', 'fork']);
+    expect(vi.mocked(sdk.revertSessionCode)).toHaveBeenCalledWith({
+      client: expect.anything(),
+      path: { id: 'root1' },
+      body: { boundary_operation_id: 'op-owned' },
+    });
+    const forkCall = vi.mocked(sdk.forkSession).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    const forkBody = JSON.parse(bodyOf(forkCall)) as { boundary_item_id: string; operation_id: string; content: unknown };
+    expect(forkBody.boundary_item_id).toBe('i-owned');
+    expect(forkBody.operation_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(forkBody.content).toEqual([{ kind: 'text', text: 'text i-owned' }]);
+    // The returned destination is adopted while the initiating selection still
+    // matches.
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.at(-1)?.[0]).toEqual({ client: expect.anything(), path: { id: 'dest1' } });
+  });
+
+  it('shows a known partial restore failure before still issuing Fork', async () => {
+    const connection = forkConnection();
+    let releaseFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(httpError(409, {
+      restored: ['a.ts'],
+      skipped: [{ path: 'b.ts', reason: 'io' }],
+      error: { code: 'storage', message: 'partial failure' },
+    }));
+    vi.mocked(sdk.forkSession).mockImplementationOnce(() => forkGate as never);
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    // The complete known rewind result is displayed before Fork settles.
+    expect(target.textContent).toContain('Restored: a.ts');
+    expect(target.textContent).toContain('Skipped: b.ts (io)');
+    expect(target.textContent).toContain('Restore failed: partial failure');
+    expect(vi.mocked(sdk.forkSession)).toHaveBeenCalledTimes(1);
+    releaseFork(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    await settle();
+    await settle();
+    // The fast successful Fork closes the dialog but the earlier effects stay
+    // published with the addressed outcome.
+    expect(target.querySelector('[aria-label="Close fork dialog"]')).toBeNull();
+    const outcome = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(outcome).toContain('Restored: a.ts');
+    expect(outcome).toContain('Skipped: b.ts (io)');
+    expect(outcome).toContain('Restore failed: partial failure');
+    expect(outcome).toContain('Fork admitted to session dest1.');
+  });
+
+  it('publishes a handled restore success with the addressed Fork outcome', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(ok({ restored: ['a.ts'], skipped: [] }));
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    await settle();
+    const outcome = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(outcome).toContain('Restored: a.ts');
+    expect(outcome).toContain('Fork admitted to session dest1.');
+  });
+
+  it('a late non-adopted destination still reports the earlier restore effects', async () => {
+    const connection = forkConnection();
+    let releaseFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(httpError(409, {
+      restored: ['a.ts'],
+      skipped: [],
+      error: { code: 'storage', message: 'partial failure' },
+    }));
+    vi.mocked(sdk.forkSession).mockImplementationOnce(() => forkGate as never);
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    // Move the selection while the Fork is parked.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    (target.querySelectorAll('dialog .row')[1] as HTMLElement).click();
+    await settle();
+    releaseFork(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    await settle();
+    await settle();
+    const outcome = target.querySelector('.note.outcome')?.textContent ?? '';
+    expect(outcome).toContain('Restored: a.ts');
+    expect(outcome).toContain('Restore failed: partial failure');
+    expect(outcome).toContain('selection moved');
+    expect(target.textContent).toContain('root2');
+  });
+
+  it('stops on an unknown rewind: Fork is never sent and no Retry could bypass it', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(bridgeLoss('rewind lost'));
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.revertSessionCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.forkSession)).not.toHaveBeenCalled();
+    expect(target.textContent).toContain('Rewind outcome unknown');
+    // The dialog and the retained composer row both offer abandonment only.
+    expect(target.querySelector('[aria-label="Abandon fork attempt"]')).not.toBeNull();
+    const row = target.querySelector('.attempt.unknown') as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row.querySelector('[aria-label="Retry"]')).toBeNull();
+    expect(row.querySelector('[aria-label="Abandon"]')).not.toBeNull();
+  });
+
+  it('retries an unknown Fork with the same identity and never reruns the handled restore', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(ok({ restored: [], skipped: [] }));
+    vi.mocked(sdk.forkSession)
+      .mockResolvedValueOnce(bridgeLoss('fork lost'))
+      .mockImplementationOnce(async (options) => {
+        const request = options as { body: unknown; bodySerializer: (body: unknown) => unknown };
+        const body = JSON.parse(bodyOf(request)) as { operation_id: string };
+        return ok({ session: rootSession('dest1', NEWER), operation: runningOperation(body.operation_id) });
+      });
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Outcome unknown');
+    const firstBody = bodyOf(vi.mocked(sdk.forkSession).mock.calls[0][0] as never);
+    (target.querySelector('[aria-label="Retry"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.revertSessionCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.forkSession)).toHaveBeenCalledTimes(2);
+    expect(bodyOf(vi.mocked(sdk.forkSession).mock.calls[1][0] as never)).toBe(firstBody);
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.at(-1)?.[0]).toEqual({ client: expect.anything(), path: { id: 'dest1' } });
+    // The explicit retry keeps the handled restore outcome in the report
+    // without repeating the restore stage.
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Restored: (none)');
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Fork admitted to session dest1.');
+  });
+
+  it('never adopts a late destination over a moved selection and keeps a newer replacement draft', async () => {
+    const connection = forkConnection();
+    let releaseFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    vi.mocked(sdk.forkSession).mockImplementationOnce(() => forkGate as never);
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, false);
+    await settle();
+    // A newer replacement draft is typed while the Fork is in flight.
+    const textarea = target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    textarea.value = '[{"kind":"text","text":"newer draft"}]';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    // The selection moves to another root before the Fork settles.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    (target.querySelectorAll('dialog .row')[1] as HTMLElement).click();
+    await settle();
+    releaseFork(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('selection moved');
+    // The moved view stays; the destination is not adopted.
+    expect(target.textContent).toContain('root2');
+    expect(vi.mocked(sdk.getSessionHydration).mock.calls.some(
+      (call) => (call[0] as { path: { id: string } }).path.id === 'dest1',
+    )).toBe(false);
+    // One active first-party dialog: opening the picker retired the Fork form.
+    expect(target.querySelector('[aria-label="Close fork dialog"]')).toBeNull();
+  });
+
+  it('a rejected Fork keeps a newer replacement draft while the dialog stays open', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.forkSession).mockResolvedValue(httpError(409, { code: 'conflict', message: 'fork rejected' }));
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, false);
+    await settle();
+    // A newer replacement draft is typed while the Fork is in flight.
+    const textarea = target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    textarea.value = '[{"kind":"text","text":"newer draft"}]';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    await settle();
+    // The rejection is displayed, the dialog stays open for Retry/Abandon, and
+    // the newer draft is not cleared by the late settlement.
+    expect(target.textContent).toContain('fork rejected');
+    const dialogTextarea = document.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    expect(dialogTextarea.value).toBe('[{"kind":"text","text":"newer draft"}]');
+  });
+});
+
+describe('restore outcomes through the fork path', () => {
+  function forkConnection() {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      conversation: { items: [inputItem('i-owned', 'user', 'op-owned')] },
+      operations: [runningOperation('op-owned')],
+    })));
+    vi.mocked(sdk.forkSession).mockResolvedValue(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    return connection;
+  }
+
+  async function submitRewindFork(target: HTMLElement) {
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    await toggleCheckbox(target, 'Rewind code before Fork', true);
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+  }
+
+  it('warns on a plain pre-traversal restore rejection and still issues Fork', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(httpError(404, { code: 'not_found', message: 'no snapshot group' }));
+    const { target } = await mountApp(connection);
+    await submitRewindFork(target);
+    await settle();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.forkSession)).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a malformed 2xx restore body as outcome unknown and never sends Fork', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(ok({}));
+    const { target } = await mountApp(connection);
+    await submitRewindFork(target);
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.forkSession)).not.toHaveBeenCalled();
+    expect(target.textContent).toContain('Rewind outcome unknown');
+  });
+
+  it('treats a 2xx restore body carrying an error member as outcome unknown and never sends Fork', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.revertSessionCode).mockResolvedValue(ok({
+      restored: ['a.ts'],
+      skipped: [],
+      error: { code: 'storage', message: 'partial failure' },
+    }));
+    const { target } = await mountApp(connection);
+    await submitRewindFork(target);
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.forkSession)).not.toHaveBeenCalled();
+    expect(target.textContent).toContain('Rewind outcome unknown');
+  });
+});
+
+describe('viewer supersession with an error', () => {
+  it('ignores a superseded viewer error and keeps the newest read', async () => {    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.readWorkspaceFile)
+      .mockImplementationOnce(() => first as never)
+      .mockResolvedValueOnce(ok({ content: 'fresh body', canonical_path: '/ws/b.ts', truncated: false }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'a.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'b.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releaseFirst(httpError(404, { code: 'not_found', message: 'stale denial' }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('/ws/b.ts');
+    expect(target.textContent).not.toContain('stale denial');
+  });
+});
+
+describe('editor read supersession', () => {
+  it('ignores a superseded provider detail read after switching providers', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const prov1 = providerFixture();
+    const prov2 = providerFixture({ id: 'prov2', name: 'Prov Two' });
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      providers: [prov1, prov2],
+    }));
+    let releaseFirst: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.getProviderDetail).mockImplementation(async (options) => {
+      const id = (options as { query: { provider_id: string } }).query.provider_id;
+      if (id === 'prov1') return first as never;
+      return exactReadResult({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: prov2 }, options);
+    });
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    releaseFirst(ok(JSON.stringify({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: prov1 })));
+    await settle();
+    await settle();
+    expect((target.querySelector('[aria-label="provider name"]') as HTMLInputElement).value).toBe('Prov Two');
+  });
+});
+
+describe('read lifetime boundaries', () => {
+  // Switching the root while another surface's read is parked moves the
+  // shared selection stamp without starting a replacement read there.
+  async function selectRoot2ByLabel(target: HTMLElement) {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Select session root2"]') as HTMLElement).click();
+    await settle();
+  }
+
+  it('releases its own viewer loading when a superseded read settles without a newer read', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseRead: (value: unknown) => void = () => {};
+    const read = new Promise((resolve) => { releaseRead = resolve; });
+    vi.mocked(sdk.readWorkspaceFile).mockImplementationOnce(() => read as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'a.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('Opening…');
+    // The selection moves; no newer viewer read starts.
+    await selectRoot2ByLabel(target);
+    releaseRead(ok({ content: 'late body', canonical_path: '/ws/a.ts', truncated: false }));
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('late body');
+    expect(target.textContent).not.toContain('Opening…');
+  });
+
+  it('lets no older same-stamp viewer reply publish over or clear a newer read', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseFirst: (value: unknown) => void = () => {};
+    let releaseSecond: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.readWorkspaceFile)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="File viewer"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'a.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'File path', 'b.ts');
+    (target.querySelector('[aria-label="Open file"]') as HTMLElement).click();
+    await settle();
+    // The newer read owns the loading state.
+    expect(target.textContent).toContain('Opening…');
+    releaseFirst(ok({ content: 'stale body', canonical_path: '/ws/a.ts', truncated: false }));
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('stale body');
+    expect(target.textContent).toContain('Opening…');
+    releaseSecond(ok({ content: 'fresh body', canonical_path: '/ws/b.ts', truncated: false }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('fresh body');
+    expect(target.textContent).not.toContain('Opening…');
+  });
+
+  it('a superseded settings read publishes nothing and a reopen reads fresh', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseText: (value: unknown) => void = () => {};
+    const textRead = new Promise((resolve) => { releaseText = resolve; });
+    let textCalls = 0;
+    vi.mocked(sdk.getConfiguration).mockImplementation(async (options) => {
+      if ((options as { parseAs?: string }).parseAs === 'text') {
+        textCalls += 1;
+        return (textCalls === 1 ? textRead : ok(RAW_CONFIGURATION)) as never;
+      }
+      return ok({
+        configuration_revision: { instance_id: INSTANCE, generation: '1' },
+        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+        agents: [], providers: [],
+      });
+    });
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('Loading…');
+    // The selection move retires the editor; the stale body publishes nothing.
+    await selectRoot2ByLabel(target);
+    releaseText(ok(RAW_CONFIGURATION));
+    await settle();
+    await settle();
+    expect(target.querySelector('[aria-label="Close settings"]')).toBeNull();
+    expect(target.textContent).not.toContain('Uses plugin defaults');
+    // A reopen is a fresh read, not the superseded body.
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Uses plugin defaults');
+  });
+
+  it('a reopened model dialog discards an older same-stamp read and keeps the newer loading', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseFirst: (value: unknown) => void = () => {};
+    let releaseSecond: (value: unknown) => void = () => {};
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    vi.mocked(sdk.listModels)
+      .mockImplementationOnce(() => first as never)
+      .mockImplementationOnce(() => second as never);
+    const { target } = await mountApp(connection);
+    const model = (ref: string, name: string) => ({
+      ref, provider: 'prov', provider_name: 'Provider', model: ref, display_name: name,
+      context_window: 1, max_output_tokens: 1, hidden: false, provider_hidden: false, incomplete: false, source: 'user',
+    });
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
+    await settle();
+    expect(target.textContent).toContain('Loading models...');
+    // Close and reopen while the first read is still parked.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await settle();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
+    await settle();
+    releaseFirst(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, models: [model('prov/a', 'Model A')] }));
+    await settle();
+    await settle();
+    // The older read neither populated the reopened dialog nor cleared its loading.
+    expect(target.textContent).toContain('Loading models...');
+    releaseSecond(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, models: [model('prov/b', 'Model B')] }));
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('Loading models...');
+    (target.querySelector('.mp-btn') as HTMLElement).click();
+    await settle();
+    const items = [...target.querySelectorAll('.mp .item')].map((item) => item.textContent);
+    expect(items.some((text) => text?.includes('Model B'))).toBe(true);
+    expect(items.some((text) => text?.includes('Model A'))).toBe(false);
+  });
+});
+
+// --- First-review correction regressions: settings edit tail and documents ----
+
+const EDITED_SESSIONS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":5,"delete_after_archive_days":1},'
+  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}}';
+
+function settingsRawConnection(raw = RAW_CONFIGURATION) {
+  const connection = fakeConnection();
+  basicMocks(connection);
+  vi.mocked(sdk.getConfiguration).mockImplementation(async (options) => {
+    if ((options as { parseAs?: string }).parseAs === 'text') return ok(raw);
+    return ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [],
+      providers: [],
+    });
+  });
+  vi.mocked(sdk.updateConfigurationSettings).mockResolvedValue(ok({
+    configuration_revision: { instance_id: INSTANCE, generation: '2' },
+    result: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+  }));
+  return connection;
+}
+
+describe('settings ordered edit tail', () => {
+  it('holds the editor pending through one native edit and applies the next against its output', async () => {
+    const connection = settingsRawConnection();
+    let releaseFirst: (value: string) => void = () => {};
+    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
+    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    await settle();
+    // While the native edit is pending the authored controls and Save are
+    // disabled: no second local operation can exist.
+    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="delete_after_archive_days"]') as HTMLInputElement).disabled).toBe(true);
+    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(true);
+    releaseFirst(EDITED_SESSIONS_TEXT);
+    await settle();
+    await settle();
+    expect(vi.mocked(PatchJSON)).toHaveBeenCalledTimes(1);
+    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).disabled).toBe(false);
+    // A subsequent explicit edit composes against the first edit's applied output.
+    await changeInput(target, 'delete_after_archive_days', '7');
+    await settle();
+    await settle();
+    expect(vi.mocked(PatchJSON)).toHaveBeenCalledTimes(2);
+    const [secondDocument, secondPatch] = vi.mocked(PatchJSON).mock.calls[1];
+    expect(secondDocument).toBe(EDITED_SESSIONS_TEXT);
+    expect(secondPatch).toContain('"delete_after_archive_days":7');
+    expect(secondPatch).toContain('"archive_after_days":5');
+    // Both edits are in the saved complete body.
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toContain('"archive_after_days":5');
+    expect(bodyOf(call)).toContain('"delete_after_archive_days":7');
+  });
+
+  it('cannot start a Save while an edit is pending', async () => {
+    const connection = settingsRawConnection();
+    let releaseFirst: (value: string) => void = () => {};
+    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
+    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    await settle();
+    // Save is gated by the pending edit; a click cannot leave a PUT.
+    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(true);
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    expect(vi.mocked(sdk.updateConfigurationSettings)).not.toHaveBeenCalled();
+    // Once the edit settles, the explicit Save includes it.
+    releaseFirst(EDITED_SESSIONS_TEXT);
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toContain('"archive_after_days":5');
+  });
+
+  it('a failed edit shows its error, leaves the document unchanged and a later edit recovers', async () => {
+    const connection = settingsRawConnection();
+    vi.mocked(PatchJSON).mockImplementationOnce(() => Promise.reject(new Error('patch rejected')) as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Edit rejected');
+    expect(target.textContent).toContain('patch rejected');
+    // The document is unchanged: a Save sends the original token, never the
+    // failed edit as if it applied.
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const first = bodyOf(vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as never);
+    expect(first).toContain('"archive_after_days":-9223372036854775808');
+    expect(first).not.toContain('"archive_after_days":5');
+    // A later explicit valid edit recovers against the last valid document.
+    await changeInput(target, 'delete_after_archive_days', '7');
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.updateConfigurationSettings).mock.calls.at(-1)?.[0] as never);
+    expect(body).toContain('"delete_after_archive_days":7');
+    expect(body).toContain('"archive_after_days":-9223372036854775808');
+  });
+
+  it('teardown suppresses a held local edit completion', async () => {
+    const connection = settingsRawConnection();
+    let releaseFirst: (value: string) => void = () => {};
+    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
+    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'archive_after_days', '5');
+    (target.querySelector('[aria-label="Close settings"]') as HTMLElement).click();
+    await settle();
+    releaseFirst(EDITED_SESSIONS_TEXT);
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('Edit rejected');
+    expect(vi.mocked(sdk.updateConfigurationSettings)).not.toHaveBeenCalled();
+  });
+});
+
+describe('all authored plugin documents', () => {
+  const RAW_WITH_CUSTOM = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+    + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1},'
+    + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}","lsp":"{\\"servers\\":[]}"}},'
+    + '"agents":[],"providers":[]}';
+
+  it('renders raw inspect/edit/remove for every authored plugin-map entry', async () => {
+    const connection = settingsRawConnection(RAW_WITH_CUSTOM);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    const custom = target.querySelector('[aria-label="lsp raw document"]') as HTMLTextAreaElement;
+    expect(custom).not.toBeNull();
+    expect(custom.value).toBe('{"servers":[]}');
+    // Raw edit of the custom document through the same ordered edit path.
+    custom.value = '{"servers":[{"id":"x"}]}';
+    custom.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    await settle();
+    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
+    expect(patch).toContain('"lsp":"{\\"servers\\":[{\\"id\\":\\"x\\"}]}"');
+    expect(patch).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
+    // Raw remove.
+    (target.querySelector('[aria-label="Remove lsp document"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const [, removePatch] = vi.mocked(PatchJSON).mock.calls[1];
+    expect(removePatch).not.toContain('"lsp"');
+    expect(removePatch).toContain('"tools"');
+  });
+
+  it('lists, edits and removes prototype-named plugin documents as ordinary author data', async () => {
+    const raw = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+      + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1},'
+      + '"plugins":{"constructor":"{\\"a\\":1}","__proto__":"{\\"b\\":2}"}},'
+      + '"agents":[],"providers":[]}';
+    const connection = settingsRawConnection(raw);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    // Both prototype-named documents are authored members: inspectable.
+    const ctor = target.querySelector('[aria-label="constructor raw document"]') as HTMLTextAreaElement;
+    const proto = target.querySelector('[aria-label="__proto__ raw document"]') as HTMLTextAreaElement;
+    expect(ctor).not.toBeNull();
+    expect(proto).not.toBeNull();
+    expect(ctor.value).toBe('{"a":1}');
+    expect(proto.value).toBe('{"b":2}');
+    // Edit `constructor`; the sibling keeps its exact text.
+    ctor.value = '{"a":3}';
+    ctor.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    await settle();
+    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
+    expect(patch).toContain('"constructor":"{\\"a\\":3}"');
+    expect(patch).toContain('"__proto__":"{\\"b\\":2}"');
+    // Remove `__proto__` as an ordinary own member.
+    (target.querySelector('[aria-label="Remove __proto__ document"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const [, removePatch] = vi.mocked(PatchJSON).mock.calls[1];
+    expect(removePatch).not.toContain('__proto__');
+    expect(removePatch).toContain('"constructor":"{\\"a\\":3}"');
+  });
+
+  it('authors a prototype-named plugin document through the explicit ID form', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'Plugin id', '__proto__');
+    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
+    document.value = '{"c":1}';
+    document.dispatchEvent(new Event('input', { bubbles: true }));
+    document.dispatchEvent(new Event('change', { bubbles: true }));
+    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
+    // The authored prototype-named member is emitted verbatim beside the
+    // retained compiled plugin document.
+    expect(patch).toBe('{"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}","__proto__":"{\\"c\\":1}"}}');
+  });
+
+  it('authors an absent custom section by explicit ID and raw document', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'Plugin id', 'sqlite');
+    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
+    document.value = '{"cache_size":1e400}';
+    document.dispatchEvent(new Event('input', { bubbles: true }));
+    document.dispatchEvent(new Event('change', { bubbles: true }));
+    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
+    expect(patch).toContain('"sqlite":"{\\"cache_size\\":1e400}"');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.updateConfigurationSettings).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toContain('"sqlite":"{\\"cache_size\\":1e400}"');
+  });
+
+  it('forwards a backend-invalid authored ID/document as a candidate without local policy', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'Plugin id', 'Not A Compiled Plugin');
+    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
+    document.value = 'not json at all';
+    document.dispatchEvent(new Event('input', { bubbles: true }));
+    document.dispatchEvent(new Event('change', { bubbles: true }));
+    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // The authored string is forwarded verbatim; the server decides validity.
+    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
+    expect(patch).toContain('"Not A Compiled Plugin":"not json at all"');
+  });
+});
+
+// --- First-review correction regressions: snapshots, repair, clocks, cost ----
+
+const NO_CONTENT = () => ({ data: undefined, error: undefined, request: new Request('http://runtime.invalid/v1/x'), response: new Response(null, { status: 204 }) });
+
+describe('loaded snapshot identity', () => {
+  it('a selection move retires the snapshots dialog and a reopen reads the new session', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionCodeSnapshots).mockResolvedValue(ok([
+      { operation_id: 'op1', group_item_id: 'g1', files: [{ path: 'a.ts', existed: true }] },
+    ]));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('loaded root1');
+    // One active first-party dialog: the move retires the snapshots dialog and
+    // no revert action remains for the previously loaded identity.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelectorAll('dialog .row')[1] as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('[aria-label="Revert code to before operation op1"]')).toBeNull();
+    expect(vi.mocked(sdk.revertSessionCode)).not.toHaveBeenCalled();
+    // A reopen reads the currently selected session through the plain task.
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.getSessionCodeSnapshots).mock.calls.at(-1)?.[0]).toEqual({
+      client: expect.anything(),
+      path: { id: 'root2' },
+    });
+  });
+
+  it('retained revert uses the loaded Workspace/ID and boundary after the draft ID changes', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getRetainedCodeSnapshots).mockResolvedValue(ok(
+      '{"turns":[{"turn":9007199254740993,"files":[{"path":"legacy.ts","existed":true}]}]}',
+    ));
+    vi.mocked(sdk.revertRetainedCode).mockResolvedValue(ok({ restored: ['legacy.ts'], skipped: [] }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Retained session id', 'abcd1234');
+    (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Loaded retained target: /ws · abcd1234');
+    // A draft retarget must not silently retarget the displayed rows/actions.
+    await changeInput(target, 'Retained session id', 'ffffffff');
+    (target.querySelector('[aria-label="Revert after retained turn 9007199254740993"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.revertRetainedCode).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":9007199254740993}');
+  });
+
+  it('invalidates a pending retained read when its draft target changes', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseRead: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => { releaseRead = resolve; });
+    vi.mocked(sdk.getRetainedCodeSnapshots).mockImplementationOnce(() => pending as never);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
+    await settle();
+    await changeInput(target, 'Retained session id', 'abcd1234');
+    (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
+    await settle();
+    // The draft target changes while the read is parked.
+    await changeInput(target, 'Retained session id', 'ffffffff');
+    releaseRead(ok('{"turns":[{"turn":1,"files":[]}]}'));
+    await settle();
+    await settle();
+    // The stale completion publishes nothing.
+    expect(target.textContent).not.toContain('after turn 1');
+    expect(target.textContent).not.toContain('Loaded retained target');
+  });
+});
+
+describe('workspace and empty-selection repair', () => {
+  it('a repair preserves the selected Workspace and title', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const { target } = await mountApp(connection);
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/other' });
+    connection.failureHandler?.(new Error('lost'), '1');
+    await vi.waitFor(() => {
+      expect(vi.mocked(sdk.getConfiguration).mock.calls.length).toBeGreaterThan(1);
+    });
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('/ws');
+    expect(target.textContent).not.toContain('/other');
+    expect(vi.mocked(SetTitle).mock.calls.at(-1)?.[0]).toBe('/ws');
+  });
+
+  it('a repair does not recompose an intentionally empty selection', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue(NO_CONTENT() as never);
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('no session');
+    const createsBefore = vi.mocked(sdk.createSession).mock.calls.length;
+    const listsBefore = vi.mocked(sdk.listSessions).mock.calls.length;
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/other' });
+    connection.failureHandler?.(new Error('lost'), '1');
+    await vi.waitFor(() => {
+      expect(vi.mocked(sdk.getConfiguration).mock.calls.length).toBeGreaterThan(1);
+    });
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.createSession).mock.calls.length).toBe(createsBefore);
+    expect(vi.mocked(sdk.listSessions).mock.calls.length).toBe(listsBefore);
+    expect(target.textContent).toContain('no session');
+  });
+});
+
+describe('session mutation commits', () => {
+  it('an archive success clears the selected root even when Delete then fails', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue(httpError(500, { code: 'internal', message: 'delete blew up' }));
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalledWith({ client: expect.anything(), path: { id: 'root1' } });
+    expect(target.textContent).toContain('no session');
+    expect(target.textContent).toContain('delete blew up');
+  });
+
+  it('a stale archive completion cannot clear a newer selection', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    let releaseArchive: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => { releaseArchive = resolve; });
+    vi.mocked(sdk.archiveSession).mockImplementationOnce(() => pending as never);
+    vi.mocked(sdk.deleteSession).mockResolvedValue(NO_CONTENT() as never);
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    // Move to root2 while the archive of root1 is parked: the first Ctrl+S
+    // closes the still-open picker, the second reopens a fresh list.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelectorAll('dialog .row')[1] as HTMLElement).click();
+    await settle();
+    releaseArchive(ok(rootSession('root1', NEWER)));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('root2');
+    expect(target.textContent).not.toContain('no session');
+  });
+});
+
+describe('global snapshot adoption', () => {
+  const OTHER_AGENT = { name: 'other-agent', description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] };
+
+  it('never publishes a stale configuration payload with its older clock', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const { target } = await mountApp(connection);
+    vi.mocked(sdk.getConfiguration).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '0' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [OTHER_AGENT],
+      providers: [],
+    }));
+    deliverEvent(connection, {
+      kind: 'configuration_changed',
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+    });
+    await settle();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('primary');
+    expect(target.textContent).not.toContain('other-agent');
+  });
+
+  it('adopts an equal-clock configuration payload', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const { target } = await mountApp(connection);
+    vi.mocked(sdk.getConfiguration).mockResolvedValue(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [OTHER_AGENT],
+      providers: [],
+    }));
+    deliverEvent(connection, {
+      kind: 'configuration_changed',
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+    });
+    await settle();
+    await settle();
+    await openSettings(target);
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('other-agent');
+  });
+
+  it('never publishes a stale warnings payload with its older clock', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getWarnings).mockResolvedValue(ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '2' },
+      warnings: [{ source: 'g', kind: 'k', message: 'g-old' }],
+    }));
+    vi.mocked(sdk.archiveSession).mockResolvedValue(ok(rootSession('root1', NEWER)));
+    vi.mocked(sdk.deleteSession).mockResolvedValue(NO_CONTENT() as never);
+    // The displayed hydration must clear the accepted warnings floor ('2');
+    // the fixture carries the matching revision so the reader is not held
+    // dirty by an inconsistent mock.
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      warnings_revision: { instance_id: INSTANCE, revision: '2' },
+    })));
+    const { target } = await mountApp(connection);
+    vi.mocked(sdk.getWarnings).mockResolvedValue(ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' },
+      warnings: [{ source: 'g', kind: 'k', message: 'g-stale' }],
+    }));
+    deliverEvent(connection, {
+      kind: 'warning_changed',
+      warnings_revision: { instance_id: INSTANCE, revision: '2' },
+    });
+    await settle();
+    await settle();
+    // Remove the selected root so the global-only fallback is displayed.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('.warn') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('g-old');
+    expect(target.textContent).not.toContain('g-stale');
+  });
+});
+
+describe('cost whole-member replacement', () => {
+  async function costEditor(model: Record<string, unknown>) {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture({ models: [model] })] }));
+    vi.mocked(sdk.getProviderDetail).mockImplementation(exactRead({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture({ models: [model] }) }));
+    vi.mocked(sdk.updateProviderModel).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: model as never }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    return target;
+  }
+
+  it('preserves present siblings, omits absent ones and omits a cleared price', async () => {
+    // Absent siblings are omitted: the first read carries input only.
+    const single = modelFixture({ cost: { input: 1 } });
+    const first = await costEditor(single);
+    await changeInput(first, 'm1 cost input', '2');
+    await settle();
+    await settle();
+    let call = vi.mocked(sdk.updateProviderModel).mock.calls[0][0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"model":{"cost":{"input":2}}}');
+    // Present zero survives and only the cost top-level field is sent. The
+    // exact read serves a fresh document per call, so this editor reads the
+    // zero-bearing cost from its own detail read.
+    const both = modelFixture({ cost: { input: 0, output: 5 } });
+    const second = await costEditor(both);
+    await changeInput(second, 'm1 cost output', '6');
+    await settle();
+    await settle();
+    call = vi.mocked(sdk.updateProviderModel).mock.calls.at(-1)?.[0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"model":{"cost":{"input":0,"output":6}}}');
+    // A cleared price is omitted, never manufactured as null.
+    await changeInput(second, 'm1 cost input', '');
+    await settle();
+    await settle();
+    call = vi.mocked(sdk.updateProviderModel).mock.calls.at(-1)?.[0] as { body: unknown; bodySerializer: (body: unknown) => unknown };
+    expect(bodyOf(call)).toBe('{"model":{"cost":{"output":5}}}');
+  });
+});
+
+describe('selection-bound Fork source', () => {
+  it('an in-flight Fork cannot pair its captured item with another live root', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.getSessionHydration).mockResolvedValue(ok(makeHydration({
+      conversation: { items: [inputItem('i-owned', 'user', 'op-owned')] },
+      operations: [runningOperation('op-owned')],
+    })));
+    let releaseFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    vi.mocked(sdk.forkSession).mockImplementationOnce(() => forkGate as never);
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+    await settle();
+    // Move to root2 while the Fork is in flight; the one-modal owner retires
+    // the form but the mutation keeps its captured source Session.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelectorAll('dialog .row')[1] as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('[aria-label="Close fork dialog"]')).toBeNull();
+    releaseFork(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    await settle();
+    await settle();
+    const call = vi.mocked(sdk.forkSession).mock.calls[0][0] as { path: { id: string } };
+    expect(call.path).toEqual({ id: 'root1' });
+    expect(target.textContent).toContain('selection moved');
+  });
+
+  it('a Workspace change retires the open Session picker and its rows', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listWorkspaces).mockResolvedValue(ok([
+      { root: '/ws', display_name: 'ws' },
+      { root: '/ws2', display_name: 'ws2' },
+    ]));
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    expect(target.querySelector('#session-picker-title')).not.toBeNull();
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /ws2"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.querySelector('#session-picker-title')).toBeNull();
+    expect(target.querySelector('[aria-label="Select session root1"]')).toBeNull();
+  });
+});
+
+// --- Second correction pass regressions: per-workspace Create uncertainty, uniform archive, discovery token, busy inputs, edit tail authority ----
+
+describe('per-workspace Create uncertainty', () => {
+  it('old-A unknown Create never blocks empty B; return to A shows the note without replay', async () => {
+    const connection = fakeConnection();
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
+    let listCalls = 0;
+    vi.mocked(sdk.listSessions).mockImplementation(async () => {
+      listCalls += 1;
+      return ok([]);
+    });
+    vi.mocked(sdk.createSession).mockImplementation(async () => bridgeLoss('gone'));
+    vi.mocked(sdk.getSessionHydration).mockImplementation(async () => ok(makeHydration()));
+    vi.mocked(sdk.getConfiguration).mockImplementation(async () => ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [], providers: [],
+    }));
+    vi.mocked(sdk.getWarnings).mockImplementation(async () => ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
+    }));
+    vi.mocked(sdk.listWorkspaces).mockImplementation(async () => ok([
+      { root: '/wsA', display_name: 'A' },
+      { root: '/wsB', display_name: 'B' },
+    ]));
+    const { target } = await mountAppNoWait(connection);
+    await settle();
+    await settle();
+    // A's unknown Create is reported.
+    expect(target.textContent).toContain('Session create outcome unknown');
+    expect(target.textContent).toContain('/wsA');
+    const createCallsAfterA = vi.mocked(sdk.createSession).mock.calls.length;
+    expect(createCallsAfterA).toBe(1);
+    // Switch to workspace B: B is empty and gets its own Create.
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    // B's Create is attempted independently (A's uncertainty doesn't block B).
+    expect(vi.mocked(sdk.createSession).mock.calls.length).toBeGreaterThan(createCallsAfterA);
+  });
+
+  it('binds an initial-composition Create uncertainty to its addressed workspace when B was selected while it was parked', async () => {
+    const connection = fakeConnection();
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
+    vi.mocked(sdk.getConfiguration).mockImplementation(async () => ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [], providers: [],
+    }));
+    vi.mocked(sdk.getWarnings).mockImplementation(async () => ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
+    }));
+    vi.mocked(sdk.listSessions).mockImplementation(async () => ok([]));
+    vi.mocked(sdk.listWorkspaces).mockImplementation(async () => ok([
+      { root: '/wsA', display_name: 'A' },
+      { root: '/wsB', display_name: 'B' },
+    ]));
+    let releaseCreate: (value: unknown) => void = () => {};
+    const parkedCreate = new Promise((resolve) => { releaseCreate = resolve; });
+    vi.mocked(sdk.createSession)
+      .mockImplementationOnce(() => parkedCreate as never)
+      .mockResolvedValue(ok(rootSession('b-1', NEWER)));
+    vi.mocked(sdk.getSessionHydration).mockImplementation(async () => ok(makeHydration({ session: rootSession('b-1', NEWER) })));
+    const { target } = await mountAppNoWait(connection);
+    await vi.waitFor(() => expect(vi.mocked(sdk.createSession)).toHaveBeenCalledTimes(1));
+    // B is chosen while A's Create is parked; B's composition waits on it.
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
+    await settle();
+    releaseCreate(bridgeLoss('A create lost'));
+    await settle();
+    await settle();
+    // The loss belongs to A: empty B still creates its own Session.
+    const workspaces = vi.mocked(sdk.createSession).mock.calls.map(
+      (call) => (call[0] as { body: { workspace: string } }).body.workspace,
+    );
+    expect(workspaces).toEqual(['/wsA', '/wsB']);
+    expect(target.textContent).toContain('b-1');
+    // Returning to A replays nothing: A's uncertainty is still recorded.
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /wsA"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.createSession).mock.calls.length).toBe(2);
+    expect(target.textContent).toContain('Session create outcome unknown');
+    expect(target.textContent).toContain('/wsA');
+  });
+
+  it('binds a picker Create uncertainty to its addressed workspace across a move', async () => {
+    const connection = fakeConnection();
+    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
+    vi.mocked(sdk.getConfiguration).mockImplementation(async () => ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [], providers: [],
+    }));
+    vi.mocked(sdk.getWarnings).mockImplementation(async () => ok({
+      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
+    }));
+    vi.mocked(sdk.listWorkspaces).mockImplementation(async () => ok([
+      { root: '/wsA', display_name: 'A' },
+      { root: '/wsB', display_name: 'B' },
+    ]));
+    let releaseBList: (value: unknown) => void = () => {};
+    const parkedBList = new Promise((resolve) => { releaseBList = resolve; });
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const workspace = (options as { query: { workspace: string } }).query.workspace;
+      if (workspace === '/wsB') return parkedBList as never;
+      return ok([rootSession('a-1', NEWER)]);
+    });
+    vi.mocked(sdk.getSessionHydration).mockImplementation(async (options) => {
+      const id = (options as { path: { id: string } }).path.id;
+      return ok(makeHydration({ session: id === 'b-1' ? rootSession('b-1', NEWER) : rootSession('a-1', NEWER) }));
+    });
+    let releasePickerCreate: (value: unknown) => void = () => {};
+    const parkedPickerCreate = new Promise((resolve) => { releasePickerCreate = resolve; });
+    vi.mocked(sdk.createSession)
+      .mockImplementationOnce(() => parkedPickerCreate as never)
+      .mockResolvedValue(ok(rootSession('b-1', NEWER)));
+    const { target } = await mountApp(connection);
+    // The picker's explicit New is parked.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
+    await settle();
+    expect(vi.mocked(sdk.createSession)).toHaveBeenCalledTimes(1);
+    // B is chosen and its composition parks in B's held list.
+    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
+    await settle();
+    // The parked picker Create is lost while B is the live workspace.
+    releasePickerCreate(bridgeLoss('A picker create lost'));
+    await settle();
+    await settle();
+    releaseBList(ok([]));
+    await settle();
+    await settle();
+    const workspaces = vi.mocked(sdk.createSession).mock.calls.map(
+      (call) => (call[0] as { body: { workspace: string } }).body.workspace,
+    );
+    expect(workspaces).toEqual(['/wsA', '/wsB']);
+  });
+});
+
+describe('uniform archive→delete for both lifecycles', () => {
+  it('archived root delete also goes through archive first (no-write success)', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.listSessions).mockImplementation(async (options) => {
+      const lifecycle = (options as { query: { lifecycle: string } }).query.lifecycle;
+      if (lifecycle === 'open') return ok([rootSession('root1', NEWER)]);
+      return ok([{ ...rootSession('arch1', OLDER), lifecycle: 'archived' as const }]);
+    });
+    vi.mocked(sdk.archiveSession).mockImplementation(async () => ok(rootSession('arch1', OLDER)));
+    vi.mocked(sdk.deleteSession).mockImplementation(async () => noContent());
+    const { target } = await mountApp(connection);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    // Switch to Archived tab.
+    (target.querySelector('[aria-label="Show archived sessions"]') as HTMLElement)?.click();
+    await settle();
+    // Delete the archived root: archive is called first (no-write success), then delete.
+    const deleteBtn = target.querySelector('[aria-label="Delete session arch1"]');
+    if (deleteBtn) {
+      (deleteBtn as HTMLElement).click();
+      await settle();
+      await settle();
+      expect(vi.mocked(sdk.archiveSession)).toHaveBeenCalled();
+      expect(vi.mocked(sdk.deleteSession)).toHaveBeenCalled();
+    }
   });
 });

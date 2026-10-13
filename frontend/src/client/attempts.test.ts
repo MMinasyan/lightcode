@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { Hydration } from '../generated/protocol/types.gen';
 import { AttemptLedger, mintOperationID } from './attempts';
+import type { RestoreOutcome } from './restore';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 
@@ -140,5 +141,93 @@ describe('AttemptLedger', () => {
     }));
     expect(ledger.getAttempts()).toHaveLength(0);
     expect(onChange.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('fork attempts', () => {
+  function fork(ledger: AttemptLedger, rewind = true) {
+    return ledger.createFork('s1', 'item-1', 'op-1', '[{"kind":"text","text":"edited"}]', rewind, 7);
+  }
+
+  it('captures the immutable Fork payload with a minted caller ID', () => {
+    const ledger = new AttemptLedger(() => {});
+    const attempt = fork(ledger);
+    expect(attempt.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(attempt).toMatchObject({
+      kind: 'fork',
+      sessionID: 's1',
+      boundaryItemID: 'item-1',
+      boundaryOperationID: 'op-1',
+      replacementText: '[{"kind":"text","text":"edited"}]',
+      rewind: true,
+      draftRevision: 7,
+      status: 'pending',
+      restore: null,
+    });
+    expect(ledger.get(attempt.id)).toBe(attempt);
+  });
+
+  it('stores each handled restore outcome directly, unknown included', () => {
+    const ledger = new AttemptLedger(() => {});
+    const handled = fork(ledger);
+    const failure: RestoreOutcome = { kind: 'failed', result: { restored: ['a'], skipped: [] }, message: 'partial' };
+    ledger.markRestore(handled.id, failure);
+    expect(ledger.get(handled.id)?.restore).toEqual(failure);
+    const unknown = fork(ledger);
+    const lost: RestoreOutcome = { kind: 'unknown', message: 'lost' };
+    ledger.markRestore(unknown.id, lost);
+    expect(ledger.get(unknown.id)?.restore).toEqual(lost);
+  });
+
+  it('lists a Fork whose rewind outcome is unknown as outstanding for explicit abandonment', () => {
+    const ledger = new AttemptLedger(() => {});
+    const unknown = fork(ledger);
+    ledger.markRestore(unknown.id, { kind: 'unknown', message: 'lost' });
+    expect(ledger.outstanding('s1').map((entry) => entry.id)).toEqual([unknown.id]);
+  });
+
+  it('accepts a Fork attempt through a destination hydration with immutable source lineage', () => {
+    const ledger = new AttemptLedger(() => {});
+    const attempt = fork(ledger);
+    ledger.markUnknown(attempt.id);
+    const accepted = ledger.adoptHydration('dest1', makeHydration({
+      session: {
+        session_id: 'dest1',
+        workspace: '/ws',
+        source_session_id: 's1',
+        lifecycle: 'open',
+        agent_type: 'primary',
+        created_at: '0',
+        last_activity: '0',
+        session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
+      },
+      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+    }));
+    expect(accepted.map((entry) => entry.id)).toEqual([attempt.id]);
+    expect(ledger.getAttempts()).toHaveLength(0);
+  });
+
+  it('never accepts a Fork attempt from an unrelated destination or from source absence', () => {
+    const ledger = new AttemptLedger(() => {});
+    const attempt = fork(ledger);
+    ledger.markUnknown(attempt.id);
+    // Another destination without the lineage does not accept.
+    const unrelated = ledger.adoptHydration('dest2', makeHydration({
+      session: {
+        session_id: 'dest2',
+        workspace: '/ws',
+        lifecycle: 'open',
+        agent_type: 'primary',
+        created_at: '0',
+        last_activity: '0',
+        session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
+      },
+      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+    }));
+    expect(unrelated).toHaveLength(0);
+    // The source Session's own hydration absence proves nothing.
+    const source = ledger.adoptHydration('s1', makeHydration());
+    expect(source).toHaveLength(0);
+    expect(ledger.get(attempt.id)?.status).toBe('unknown');
   });
 });

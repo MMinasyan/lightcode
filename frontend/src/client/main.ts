@@ -3,6 +3,7 @@
 // side-effect free and lives in ./connection; no component imports this
 // module, so importing UI code can never boot a second connection or App.
 import '../styles/global.css';
+import './dialogs.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
 import { RuntimeConnection } from './connection';

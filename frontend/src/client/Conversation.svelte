@@ -11,15 +11,15 @@
   export let error = '';
   export let olderAvailable = false;
   export let viewKey = ''; // root/child + connection generation identity
+  // Fork actions exist only on the root view; the child inspector stays passive.
+  export let forksEnabled = false;
   const dispatch = createEventDispatcher();
 
   let el;
   let userScrolled = false;
   let lastViewKey = viewKey;
 
-  // A genuine view-identity change (root/child switch or a repair's new
-  // generation) resets following so the new view starts pinned to its newest
-  // item; deliberate scroll within the SAME view is preserved.
+  // A view-identity change resets following; scroll within the same view is kept.
   $: if (viewKey !== lastViewKey) {
     lastViewKey = viewKey;
     userScrolled = false;
@@ -37,7 +37,6 @@
     if (part.kind === 'image_url') return part.url || '';
     if (part.kind === 'opaque') {
       // Opaque content stays raw display text; no control interpretation.
-      // Values are decoded JSON, so JSON.stringify cannot throw here.
       const extra = part.extra === undefined ? '' : JSON.stringify(part.extra);
       return `[opaque ${part.opaque_wire_type || ''}${extra ? ' ' + extra : ''}]`;
     }
@@ -88,6 +87,9 @@
     {#if item.kind === 'input'}
       <div class="message user">
         <div class="body plain">{itemContent(item)}</div>
+        {#if forksEnabled && item.origin === 'user'}
+          <button class="fork" on:click={() => dispatch('fork', item)} aria-label={`Fork from input ${item.item_id}`}>Fork</button>
+        {/if}
       </div>
     {:else if item.kind === 'assistant'}
       <div class="message assistant">
@@ -169,6 +171,8 @@
   .message-list { flex:1; overflow-y:auto; padding:8px 0; min-width:0; }
   .message { position:relative; }
   .message.user { margin:10px 12px; padding:8px 12px; background:var(--bg-user-msg); border:1px solid var(--border); border-radius:var(--radius); }
+  .fork { margin-top:4px; background:none; border:1px solid var(--border-button); border-radius:var(--radius); color:var(--text-dim); font-family:var(--font-ui); font-size:calc(11px * var(--scale, 1)); padding:2px 10px; cursor:pointer; }
+  .fork:hover { color:var(--accent); border-color:var(--accent); }
   .message.assistant { padding:4px 12px; }
   .body { font-family:var(--font-ui); font-size:calc(13px * var(--scale, 1)); line-height:1.6; }
   .plain { white-space:pre-wrap; word-break:break-word; }

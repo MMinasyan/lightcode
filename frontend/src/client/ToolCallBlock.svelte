@@ -4,8 +4,7 @@
   import EditPreview from '../components/EditPreview.svelte';
   export let call = {}; // ToolCallView
 
-  // Arguments, output and the edit preview are three independent expansion
-  // states with their own preview slices and native buttons. No shared flag.
+  // Three independent expansion states: arguments, output, edit preview.
   let argsExpanded = false;
   let outputExpanded = false;
   let editExpanded = false;
@@ -21,9 +20,7 @@
   $: editHunks = (recognizePreview(call.metadata && call.metadata.edit_preview) || []).filter((hunk) => hunk.rows.length > 0);
   $: editRowCount = countEditRows(editHunks);
   $: editHasMore = editRowCount > collapsedPreviewLines;
-  // The apply_patch producer emits edit_preview_files: one entry per file with
-  // its own path/op/preview. Each file is its own collapse unit — never one
-  // shared toggle across files. Expanded state is keyed by file index.
+  // edit_preview_files: each file is its own collapse unit, keyed by index.
   $: editFiles = recognizeEditFiles(call.metadata && call.metadata.edit_preview_files);
   $: extraText = serializeExtra(call.extra);
   $: metadataText = serializeExtra(call.metadata);
@@ -34,9 +31,7 @@
 
   function formatArguments(argumentsText, normalized) {
     if (normalized !== undefined && normalized !== null) {
-      // The authoritative normalized arguments win when present; both stay
-      // plain text, never interpreted controls. Values are decoded JSON, so
-      // JSON.stringify cannot throw here.
+      // Normalized arguments win when present; plain text, decoded JSON only.
       return JSON.stringify(normalized, null, 1);
     }
     return argumentsText || '';
@@ -47,17 +42,14 @@
     return JSON.stringify(extra);
   }
 
-  // isOptionalFiniteNumber matches the consumed row shape: absent or finite.
+  // The consumed row shape: absent or finite.
   function isOptionalFiniteNumber(value) {
     return value === undefined || (typeof value === 'number' && Number.isFinite(value));
   }
 
-  // recognizePreview validates the ONE consumed shape shared by the
-  // single-file and per-file preview paths before anything reaches EditPreview.
-  // ToolMetadata is arbitrary non-null JSON: a candidate that does not match is
-  // not a preview, so it yields no structured preview — never an exception,
-  // guessed rows or a fabricated outcome. Unknown members are allowed and stay
-  // visible in the unchanged complete raw metadata.
+  // Validate the ONE consumed preview shape before EditPreview: a non-matching
+  // candidate yields no preview, never an exception or guessed rows; unknown
+  // members stay visible in the unchanged raw metadata.
   function recognizePreview(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
     const hunks = value.hunks;
@@ -81,9 +73,7 @@
     return out;
   }
 
-  // Multi-file candidates additionally require their actual nonempty path and
-  // an A/M/D op — there is no fabricated 'M' default. An unrecognized file
-  // produces no preview block while the raw metadata keeps it complete.
+  // Multi-file candidates require a nonempty path and an A/M/D op; no fabricated default.
   function recognizeEditFiles(files) {
     if (!Array.isArray(files)) return [];
     const out = [];
@@ -98,8 +88,6 @@
     return out;
   }
 
-  // After recognition the rows arrays are guaranteed, so the count needs no
-  // second tolerant decoder.
   function countEditRows(hunks) {
     return hunks.reduce((sum, hunk) => sum + hunk.rows.length, 0);
   }

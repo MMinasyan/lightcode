@@ -24,6 +24,8 @@ const sessionsPath = join(frontendDir, 'src', 'client', 'sessions.ts');
 const activityPath = join(frontendDir, 'src', 'client', 'activity.ts');
 const resultsPath = join(frontendDir, 'src', 'client', 'results.ts');
 const attemptsPath = join(frontendDir, 'src', 'client', 'attempts.ts');
+const exactJSONPath = join(frontendDir, 'src', 'client', 'exactjson.ts');
+const restorePath = join(frontendDir, 'src', 'client', 'restore.ts');
 const ambientPath = join(frontendDir, 'src', 'env.d.ts');
 const corpusPath = join(repoDir, 'protocol', 'testdata', 'protocol_contract_fixtures.json');
 const tsc = join(frontendDir, 'node_modules', '.bin', 'tsc');
@@ -124,6 +126,8 @@ function main() {
         toPosix(activityPath),
         toPosix(resultsPath),
         toPosix(attemptsPath),
+        toPosix(exactJSONPath),
+        toPosix(restorePath),
         toPosix(ambientPath),
       ],
     }, null, 2) + '\n');

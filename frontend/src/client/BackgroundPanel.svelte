@@ -1,4 +1,5 @@
 <script>
+  import { openDialog } from './dialogs';
   import { createEventDispatcher } from 'svelte';
   export let children = []; // [{ id, agentType, lifecycle, lastActivity, live, unknownHeader }]
   export let jobs = []; // [{ id }]
@@ -6,10 +7,6 @@
   const dispatch = createEventDispatcher();
   let dialog;
 
-  function openDialog(node) {
-    node.showModal();
-    return { destroy() { if (node.open) node.close(); } };
-  }
 
   function detail(child) {
     // A live child missing from both lifecycle lists keeps only its actual
@@ -56,12 +53,8 @@
 </dialog>
 
 <style>
-  .modal { position:fixed; inset:0; width:100vw; height:100vh; max-width:none; max-height:none; margin:0; padding:0; border:0; background:transparent; }
-  .modal::backdrop { background:transparent; }
   .menu { position:absolute; z-index:1; top:40px; right:12px; background:var(--bg-elevated); border:1px solid var(--border-strong); min-width:300px; max-height:420px; display:flex; flex-direction:column; box-shadow:var(--shadow-menu); }
   .hdr { display:flex; justify-content:space-between; align-items:center; padding:6px 12px; font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
-  .panel-close { background:none; border:none; color:var(--text-dim); font-size:16px; cursor:pointer; padding:0 4px; }
-  .panel-close:hover { color:var(--accent); }
   .list { flex:1; overflow:auto; }
   .section { padding:6px 12px 2px; font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; }
   .empty { padding:4px 12px 8px; color:var(--text-dim); font-family:var(--font-ui); font-size:12px; }
