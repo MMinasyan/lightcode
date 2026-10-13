@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -288,13 +289,85 @@ func markFactory(pluginID string) {
 	}
 }
 
-// writeMarker writes one rendezvous marker when the role declares it.
+// writeMarker atomically publishes one rendezvous marker when the role declares it.
 func writeMarker(path, content string) {
 	if path == "" {
 		return
 	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := atomicfs.Write(path, []byte(content), 0o600); err != nil {
 		childAbort("write marker %s: %v", path, err)
+	}
+}
+
+func TestClientHostMarkerPublication(t *testing.T) {
+	t.Run("omitted", func(t *testing.T) {
+		called := false
+		oldSync := atomicfs.SyncFileFunc
+		atomicfs.SyncFileFunc = func(file *os.File) error {
+			called = true
+			return file.Sync()
+		}
+		t.Cleanup(func() { atomicfs.SyncFileFunc = oldSync })
+		writeMarker("", "unused")
+		if called {
+			t.Fatal("an omitted marker path reached publication")
+		}
+	})
+	for _, before := range []string{"", "http://127.0.0.1:12345\n"} {
+		name := "first"
+		if before != "" {
+			name = "replacement"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ready")
+			if before != "" {
+				writeMarker(path, before)
+			}
+			const content = "http://127.0.0.1:43210\n"
+			parked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			oldSync := atomicfs.SyncFileFunc
+			atomicfs.SyncFileFunc = func(file *os.File) error {
+				close(parked)
+				<-release
+				return file.Sync()
+			}
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(func() {
+				unblock()
+				<-done
+				atomicfs.SyncFileFunc = oldSync
+			})
+			go func() {
+				writeMarker(path, content)
+				close(done)
+			}()
+			select {
+			case <-parked:
+			case <-done:
+				data, err := os.ReadFile(path)
+				t.Fatalf("writeMarker returned before the prepublication sync gate: marker=%q err=%v", data, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("writeMarker did not reach the prepublication sync gate")
+			}
+			data, err := os.ReadFile(path)
+			if before == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("first marker visible before publication: marker=%q err=%v", data, err)
+				}
+			} else if err != nil || string(data) != before {
+				t.Fatalf("marker before replacement=%q err=%v, want %q", data, err, before)
+			}
+			unblock()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("writeMarker did not finish after publication was released")
+			}
+			if got := string(readFile(t, path)); got != content {
+				t.Fatalf("published marker=%q, want exact contents %q", got, content)
+			}
+		})
 	}
 }
 
