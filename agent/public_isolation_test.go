@@ -95,6 +95,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		clientPkg      = publicModule + "/client"
 		clienthostPkg  = publicModule + "/internal/clienthost"
 		clientviewPkg  = publicModule + "/internal/clientview"
+		clientopsPkg   = publicModule + "/internal/clientops"
+		acpclientPkg   = publicModule + "/internal/acpclient"
 		desktopPkg     = publicModule + "/internal/desktopclient"
 		hostprocessPkg = publicModule + "/internal/hostprocess"
 		versionPkg     = publicModule + "/internal/version"
@@ -193,6 +195,14 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != protocolPkg && !std[imp] {
 				problems = append(problems, rel+": internal/clientview imports "+imp+"; clientview may import only the standard library and "+protocolPkg)
 			}
+		case "internal/clientops":
+			if imp != clientPkg && imp != protocolPkg && !std[imp] {
+				problems = append(problems, rel+": internal/clientops imports "+imp+"; the shared typed invocation helper may import only the standard library, "+clientPkg+", and "+protocolPkg)
+			}
+		case "internal/acpclient":
+			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != clientopsPkg && imp != versionPkg && !std[imp] {
+				problems = append(problems, rel+": internal/acpclient imports "+imp+"; the target ACP bridge may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", and the native version helper")
+			}
 		case "internal/desktopclient":
 			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != versionPkg &&
 				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && !std[imp] {
@@ -203,8 +213,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": cmd/desktopclient imports "+imp+"; the preview entry may import only the standard library, the desktop host it runs, the shared startup helper its constructor inputs come from, and the Wails root package")
 			}
 		default:
-			if imp == clienthostPkg || imp == clientviewPkg || imp == desktopPkg {
-				problems = append(problems, rel+": production file imports "+imp+"; the shared startup and scalar projection helpers and the desktop host are reserved for their exact target consumers, and no legacy, root, or adapter file may start a Runtime or adopt target view rules before the coordinated cutover")
+			if imp == clienthostPkg || imp == clientviewPkg || imp == clientopsPkg || imp == acpclientPkg || imp == desktopPkg {
+				problems = append(problems, rel+": production file imports "+imp+"; the shared startup, scalar projection, and typed invocation helpers and the desktop host and ACP bridge are reserved for their exact target consumers, and no legacy, root, or adapter file may start a Runtime or adopt target view or invocation rules before the coordinated cutover")
 			} else if imp == modelPkg || imp == agentPkg || imp == harnessPkg || imp == storagePkg || imp == sqliteDriverPkg ||
 				imp == runtimePkg || imp == pluginsPkg || strings.HasPrefix(imp, pluginsPkg+"/") ||
 				imp == publicModule+"/plugins" || strings.HasPrefix(imp, publicModule+"/plugins/") ||
@@ -219,7 +229,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 // TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/desktopclient/x.go", "cmd/desktopclient/x.go"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/desktopclient/x.go", "cmd/desktopclient/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
@@ -596,6 +606,68 @@ func TestDependencyRulesClientViewIsolation(t *testing.T) {
 	}
 }
 
+// TestDependencyRulesClientOpsIsolation enforces the shared typed invocation
+// helper's exact allowlist. The reverse edge is covered by the directory
+// matrix.
+func TestDependencyRulesClientOpsIsolation(t *testing.T) {
+	std := standardLibraryImports(t)
+	if problems := checkTrackedGoFile("internal/clientops/x.go", []string{
+		"bytes", "context", "encoding/json", "errors", "fmt", "io", "net/http",
+		publicModule + "/client", publicModule + "/protocol",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/clientops imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
+		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/config",
+		publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins",
+		publicModule + "/internal/terminal", publicModule + "/internal/cli",
+		publicModule + "/internal/clienthost", publicModule + "/internal/clientview",
+		publicModule + "/internal/desktopclient", publicModule + "/internal/acpclient",
+		publicModule + "/internal/version", publicModule + "/internal/hostprocess",
+	} {
+		if problems := checkTrackedGoFile("internal/clientops/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/clientops importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+}
+
+// TestDependencyRulesACPClientIsolation enforces the target ACP bridge's
+// exact allowlist and proves the new helpers stay reserved for their exact
+// consumers.
+func TestDependencyRulesACPClientIsolation(t *testing.T) {
+	std := standardLibraryImports(t)
+	if problems := checkTrackedGoFile("internal/acpclient/x.go", []string{
+		"bufio", "bytes", "context", "encoding/json", "errors", "fmt", "io", "os", "os/signal",
+		"path/filepath", "slices", "strings", "sync", "syscall", "time",
+		publicModule + "/client", publicModule + "/protocol", publicModule + "/internal/clienthost",
+		publicModule + "/internal/clientops", publicModule + "/internal/version",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/acpclient imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
+		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/acp",
+		publicModule + "/internal/config", publicModule + "/internal/storage", sqliteDriverPkg,
+		publicModule + "/internal/plugins", publicModule + "/internal/terminal", publicModule + "/internal/cli",
+		publicModule + "/internal/clientview", publicModule + "/internal/desktopclient",
+		publicModule + "/internal/hostprocess",
+	} {
+		if problems := checkTrackedGoFile("internal/acpclient/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/acpclient importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+	// Neither root files, legacy adapters, nor sibling target hosts may reach
+	// the typed invocation helper or the ACP bridge.
+	for _, rel := range []string{"main.go", "app.go", "internal/acp/x.go", "internal/cli/x.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
+		for _, imp := range []string{publicModule + "/internal/clientops", publicModule + "/internal/acpclient"} {
+			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
+				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
+			}
+		}
+	}
+}
+
 // TestDependencyRulesDesktopHostIsolation enforces the native desktop host's
 // exact allowlist. The reverse edge and the preview entry consumer are covered
 // by the directory matrix and the entry row.
@@ -655,7 +727,7 @@ func TestDependencyRulesDesktopClientEntryIsolation(t *testing.T) {
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
 	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "main.go", "internal/anything/x.go", "cmd/desktopclient/sub/x.go"} {
-		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", publicModule + "/internal/clientview", publicModule + "/internal/desktopclient", sqliteDriverPkg} {
+		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", publicModule + "/internal/clientview", publicModule + "/internal/clientops", publicModule + "/internal/acpclient", publicModule + "/internal/desktopclient", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
 			}
