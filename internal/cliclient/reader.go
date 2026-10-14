@@ -73,16 +73,7 @@ func (c *CLI) resetReadersLocked() {
 	c.forkRewind = false
 	c.clearProgressLocked()
 }
-func (c *CLI) restampRootLocked() {
-	if c.root != nil {
-		if c.root.chain != nil {
-			c.root.chain.cancel()
-			c.root.chain = nil
-		}
-		c.root.dirty = true
-		c.kickReaderLocked(c.root)
-	}
-}
+func (c *CLI) restampRootLocked() { c.resumeReaderLocked(c.root) }
 func (c *CLI) readerCurrentLocked(r *sessionReader, chain *readChain) bool {
 	return c.currentLocked(chain.stamp) && (c.root == r || c.child == r) && r.chain == chain
 }
@@ -372,7 +363,7 @@ func (c *CLI) readGlobals() {
 		var warnings protocol.WarningsSnapshot
 		_, warningErr := call(s, "GetWarnings", "", nil, nil, &warnings)
 		c.mu.Lock()
-		if !c.currentLocked(s) {
+		if !c.connectionCurrentLocked(s) {
 			c.globalsDirty = true
 			c.mu.Unlock()
 			continue
@@ -419,11 +410,13 @@ func (c *CLI) readGlobals() {
 		}
 		c.notifyLocked()
 		c.mu.Unlock()
+		// Runtime-global outcomes stay valid on their serving connection alone:
+		// a local Session navigation neither drops nor re-reads them.
 		if configErr != nil {
-			c.report(s, terminal.RenderErrorMsg(configErr.Error()), false)
+			c.reportConnection(s, terminal.RenderErrorMsg(configErr.Error()))
 		}
 		if warningErr != nil {
-			c.report(s, terminal.RenderErrorMsg(warningErr.Error()), false)
+			c.reportConnection(s, terminal.RenderErrorMsg(warningErr.Error()))
 		}
 	}
 }

@@ -81,76 +81,133 @@ func (c *CLI) navigationLocked() {
 	c.forkBoundary = nil
 	c.forkRewind = false
 	c.clearProgressLocked()
-	c.globalsDirty = true
-	c.kickGlobalsLocked()
 }
-func (c *CLI) selectRoot(id string, reopen bool) {
+
+// beginNavigationLocked starts one navigation intent: advancing the existing
+// selection stamp is the one guard that rejects a superseded adoption or error,
+// and it supersedes stamped task output and passive lists while the accepted
+// source stays displayed until adoption.
+func (c *CLI) beginNavigationLocked() stamp {
+	c.navigationLocked()
+	return c.stampLocked()
+}
+
+// resumeReaderLocked restarts one retained reader under the current selection:
+// its chain was superseded (or the reader is dirty) but its accepted state is
+// still the displayed one, so the existing serialized reader owner re-reads it.
+func (c *CLI) resumeReaderLocked(r *sessionReader) {
+	if r == nil {
+		return
+	}
+	if r.chain != nil {
+		r.chain.cancel()
+		r.chain = nil
+	}
+	r.dirty = true
+	c.kickReaderLocked(r)
+}
+
+// navigationReport keeps a failed current navigation live: the retained source
+// root and inspector resume reading under the current selection, and the error
+// is delivered. A superseded navigation neither refreshes nor clears the newer
+// destination.
+func (c *CLI) navigationReport(s stamp, text string) {
 	c.mu.Lock()
-	knownRoot := c.root != nil && c.root.id == id && c.root.hydration != nil && c.root.hydration.Session.ParentSessionId == nil
-	for _, session := range c.sessions {
-		if session.SessionId == id && session.ParentSessionId == nil {
-			knownRoot = true
-		}
+	current := c.currentLocked(s)
+	if current {
+		c.resumeReaderLocked(c.root)
+		c.resumeReaderLocked(c.child)
+	}
+	c.mu.Unlock()
+	if current {
+		c.report(s, text, false)
+	}
+}
+
+// adoptRoot publishes one resolved destination — its immutable Workspace, its
+// root reader and an empty child inspector. Adoption is a second navigation
+// step: every task, menu and Fork begun against the retained source during
+// resolution is superseded before the destination publishes, and a superseded
+// resolution never adopts.
+func (c *CLI) adoptRoot(s stamp, workspace, id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.currentLocked(s) {
+		return
 	}
 	c.navigationLocked()
 	c.resetReadersLocked()
+	if workspace != "" {
+		c.workspace = workspace
+	}
 	c.rootID = id
 	c.childID = ""
-	s := c.stampLocked()
-	listGeneration := c.listGeneration
+	c.root = c.newReaderLocked(id)
+	c.kickReaderLocked(c.root)
+	c.notifyLocked()
+}
+
+// selectRoot begins one named root navigation.
+func (c *CLI) selectRoot(id string) {
+	c.mu.Lock()
+	s := c.beginNavigationLocked()
 	c.mu.Unlock()
-	c.task(func() {
-		if !knownRoot {
-			found := false
-			for _, lifecycle := range []protocol.SessionLifecycle{"open", "archived"} {
-				var sessions []protocol.Session
-				_, err := call(s, "ListSessions", "", nil, protocol.ListSessionsParams{Workspace: s.workspace, Lifecycle: lifecycle}, &sessions)
-				c.mu.Lock()
-				current := c.currentLocked(s) && c.listGeneration == listGeneration
-				c.mu.Unlock()
-				if !current {
-					return
-				}
-				if err != nil {
-					c.reportList(s, listGeneration, terminal.RenderErrorMsg(err.Error()))
-					return
-				}
-				for _, session := range rootSessions(sessions) {
-					if session.SessionId == id {
-						found = true
-					}
-				}
-				if found {
-					break
-				}
-			}
-			if !found {
-				c.mu.Lock()
-				if c.currentLocked(s) {
-					c.rootID = ""
-					c.notifyLocked()
-				}
-				c.mu.Unlock()
-				c.report(s, terminal.RenderErrorMsg("Select a root Session in this Workspace; children are inspection-only."), false)
-				return
-			}
-		}
-		if reopen {
-			raw, err := call(s, "ReopenSession", id, nil, nil, nil)
-			c.report(s, resultText(raw, err), true)
-			if err != nil {
-				return
-			}
-		}
+	c.task(func() { c.selectRootWith(s, id) })
+}
+
+// selectRootWith resolves one named root through the globally addressed passive
+// Session read, reopens an archived destination and adopts the destination
+// Workspace on success; the adopted reader owns the one fresh hydration. A
+// failed read, eligibility check or reopen keeps the previous accepted
+// selection live.
+func (c *CLI) selectRootWith(s stamp, id string) {
+	var hydration protocol.Hydration
+	if _, err := call(s, "GetSessionHydration", id, nil, nil, &hydration); err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	if hydration.Session.SessionId != id {
+		c.navigationReport(s, terminal.RenderErrorMsg("Session read answered for a different Session"))
+		return
+	}
+	if hydration.Session.ParentSessionId != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg("Select a root Session; children are inspection-only"))
+		return
+	}
+	if hydration.Session.Lifecycle == protocol.Archived {
+		// The reopen is a work mutation: an already-superseded resolution must
+		// not issue one.
 		c.mu.Lock()
-		defer c.mu.Unlock()
-		if !c.currentLocked(s) {
+		current := c.currentLocked(s)
+		c.mu.Unlock()
+		if !current {
 			return
 		}
-		c.root = c.newReaderLocked(id)
-		c.kickReaderLocked(c.root)
-		c.notifyLocked()
-	})
+		if _, err := call(s, "ReopenSession", id, nil, nil, nil); err != nil {
+			c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+			return
+		}
+	}
+	c.adoptRoot(s, hydration.Session.Workspace, id)
+}
+
+// resumeNewest selects the newest open root in the current Workspace: this is
+// the retained no-argument form. It never creates a Session and never consults
+// archived Sessions; an empty open list reports the retained no-session
+// outcome and keeps the current selection.
+func (c *CLI) resumeNewest(s stamp) {
+	var list []protocol.Session
+	_, err := call(s, "ListSessions", "", nil, protocol.ListSessionsParams{Workspace: s.workspace, Lifecycle: protocol.SessionLifecycle("open")}, &list)
+	if err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	roots := rootSessions(list)
+	if len(roots) == 0 {
+		c.navigationReport(s, terminal.RenderErrorMsg("no active sessions"))
+		return
+	}
+	c.adoptRoot(s, roots[0].Workspace, roots[0].SessionId)
 }
 func (c *CLI) inspectChild(id string) {
 	c.mu.Lock()
@@ -608,10 +665,13 @@ func (c *CLI) command(text string) {
 		c.mu.Unlock()
 		c.task(func() { c.create(s) })
 	case "/resume":
+		c.mu.Lock()
+		intent := c.beginNavigationLocked()
+		c.mu.Unlock()
 		if arg == "" {
-			c.task(func() { c.refreshList(s, "archived", true) })
+			c.task(func() { c.resumeNewest(intent) })
 		} else {
-			c.selectRoot(arg, true)
+			c.task(func() { c.selectRootWith(intent, arg) })
 		}
 	case "/project":
 		if arg != "" {

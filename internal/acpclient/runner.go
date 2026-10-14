@@ -118,9 +118,11 @@ func New(opts Options) *Runner {
 }
 
 // Run serves the bridge until input ends, the output writer fails, the
-// process receives an interrupt or termination signal, the caller's context
-// ends, or input overflows. It starts input, signal, and output resources
-// without a connection; closing them cancels no Runtime work.
+// process receives an interrupt or termination signal, or the caller's context
+// ends. It starts input, signal, and output resources without a connection;
+// closing them cancels no Runtime work. Valid input never ends the run: a full
+// pending slot backpressures the scanner until dispatch or cancellation
+// releases it.
 func (r *Runner) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -167,14 +169,12 @@ func (r *Runner) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	return runErr
 }
 
-// errInputOverflow ends a run whose single pending input slot is already
-// full: the scanner never waits for dispatch and never drops a line.
-var errInputOverflow = errors.New("acp input overflow: a pending request is already admitted")
-
 // scanLines admits one line at a time into the bridge's single pending slot.
 // Every admitted line is a fresh copy, never a slice aliasing Scanner's
-// reusable buffer. A full slot ends the run with an input overflow; EOF ends
-// it normally, without waiting for the pending line to be dispatched.
+// reusable buffer. A full slot backpressures the scanner — capacity alone
+// never drops a line or ends the run — and a canceled context releases that
+// wait. EOF is therefore observed only after every preceding line was
+// admitted and dispatched.
 func scanLines(ctx context.Context, in io.Reader, pending chan<- []byte) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, maxLineBytes), maxLineBytes)
@@ -194,8 +194,6 @@ func scanLines(ctx context.Context, in io.Reader, pending chan<- []byte) error {
 		case pending <- admitted:
 		case <-ctx.Done():
 			return nil
-		default:
-			return errInputOverflow
 		}
 	}
 }

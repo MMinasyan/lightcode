@@ -28,7 +28,7 @@ func (c *CLI) writer(output io.Writer) {
 		case <-c.wake:
 		case d := <-c.outputs:
 			c.mu.Lock()
-			if (d.actual || c.currentLocked(d.stamp)) && (d.listGeneration == 0 || d.listGeneration == c.listGeneration) {
+			if (d.actual || (d.connectionOnly && c.connectionCurrentLocked(d.stamp)) || c.currentLocked(d.stamp)) && (d.listGeneration == 0 || d.listGeneration == c.listGeneration) {
 				content = d.text
 			}
 			c.mu.Unlock()

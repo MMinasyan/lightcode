@@ -1,12 +1,13 @@
 <script>
   import { openDialog } from './dialogs';
   // Runtime settings editor: Settings stay the exact JSON text read from the
-  // generated ConfigurationView and are edited one member at a time through
-  // native PatchJSON. A save is one complete-body PUT (no revision
-  // precondition), so a stale save intentionally overwrites newer changes.
-  // ONE pending value (idle/read/edit/save) gates every input and action.
+  // generated ConfigurationView and are edited locally, one member at a time,
+  // through the existing exact parser. A save is one complete-body PUT (no
+  // revision precondition), so a stale save intentionally overwrites newer
+  // changes. ONE pending value (idle/read/save) gates every control; a local
+  // edit is synchronous and never enters native state.
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
-  import { AppVersion, PatchJSON } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+  import { AppVersion } from '../../client-bindings/wailsjs/go/desktopclient/Host';
   import { errorText } from '../lib/errors.js';
   import { settings } from '../lib/settings.js';
   import { invokeNative } from './results';
@@ -19,6 +20,7 @@
     extractSettingsText,
     parseExactJSON,
     parseSettingsObject,
+    replaceObjectMembers,
   } from './exactjson';
   export let getClient;
   export let stamp; // () => ReaderStamp
@@ -77,54 +79,49 @@
 
   const invoke = (label, operation, params, decode) => invokeNative(getClient, label, operation, params, decode);
 
-  // One local edit unit: compose against the current document, publish only
-  // while not disposed; a native failure leaves the document unchanged.
-  async function applyEdit(compose) {
-    if (disposed || pending !== 'idle') return;
-    pending = 'edit';
+  // One local edit unit: compose against the current document and publish only
+  // while not disposed; a rejected composition leaves the document unchanged.
+  function applyEdit(compose) {
+    if (disposed) return;
+    const current = settingsText;
+    if (current === null) return;
     try {
-      const current = settingsText;
-      if (current === null) return;
-      const next = await compose(current);
-      if (disposed) return;
-      settingsText = next;
+      settingsText = compose(current);
       noteText = '';
     } catch (e) {
       noteText = 'Edit rejected: ' + errorText(e);
-    } finally {
-      pending = 'idle';
     }
   }
 
   function editSession(member, valueText) {
-    void applyEdit(async (current) => {
+    applyEdit((current) => {
       const sessionsNow = parseSettingsObject(current).sessions || {};
-      return PatchJSON(current, composeMemberPatch('sessions', composeSessionsPatch(sessionsNow, member, valueText)));
+      return replaceObjectMembers(current, composeMemberPatch('sessions', composeSessionsPatch(sessionsNow, member, valueText)));
     });
   }
 
   // A plugin edit patches the member, then places the document back into `plugins`.
   function patchPlugin(pluginID, member, valueText) {
-    void applyEdit(async (current) => {
+    applyEdit((current) => {
       const pluginsNow = parseSettingsObject(current).plugins || {};
       const document = typeof pluginsNow[pluginID] === 'string' ? pluginsNow[pluginID] : '{}';
-      const nextDocument = await PatchJSON(document, composeMemberPatch(member, valueText));
-      return PatchJSON(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, nextDocument)));
+      const nextDocument = replaceObjectMembers(document, composeMemberPatch(member, valueText));
+      return replaceObjectMembers(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, nextDocument)));
     });
   }
 
   // Raw authoring/edit/remove for any plugin entry; the server decides validity.
   function editDocument(pluginID, document) {
-    void applyEdit(async (current) => {
+    applyEdit((current) => {
       const pluginsNow = parseSettingsObject(current).plugins || {};
-      return PatchJSON(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, document)));
+      return replaceObjectMembers(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, document)));
     });
   }
 
   function authorPlugin() {
     const id = newPluginID.trim();
     if (id === '') return;
-    void editDocument(id, newPluginDocument);
+    editDocument(id, newPluginDocument);
     newPluginDocument = '';
   }
 
@@ -246,7 +243,7 @@
         {#each SESSION_FIELDS as member (member)}
           <label class="row"><span class="label">{member}</span>
             <input class="num" type="text" value={sessionValue(member)} aria-label={member} disabled={busy}
-              on:change={(e) => void editSession(member, e.target.value)} />
+              on:change={(e) => editSession(member, e.target.value)} />
           </label>
         {/each}
 
@@ -258,16 +255,16 @@
           {#each PLUGIN_FIELDS[pluginID] as member (member)}
             <label class="row"><span class="label">{member}</span>
               <input class="num" type="text" value={memberValue(pluginID, member)} aria-label={`${pluginID} ${member}`} disabled={busy}
-                on:change={(e) => void patchPlugin(pluginID, member, e.target.value)} />
+                on:change={(e) => patchPlugin(pluginID, member, e.target.value)} />
             </label>
           {/each}
           {#if documentText(pluginID) !== null}
             <label class="row raw"><span class="label">Raw document</span>
               <textarea class="doc" rows="3" value={documentText(pluginID)} aria-label={`${pluginID} raw document`} disabled={busy}
-                on:change={(e) => void editDocument(pluginID, e.target.value)}></textarea>
+                on:change={(e) => editDocument(pluginID, e.target.value)}></textarea>
             </label>
             <div class="row"><span class="label"></span>
-              <button class="ghost" disabled={busy} on:click={() => void editDocument(pluginID, null)} aria-label={`Remove ${pluginID} document`}>Remove authored document</button>
+              <button class="ghost" disabled={busy} on:click={() => editDocument(pluginID, null)} aria-label={`Remove ${pluginID} document`}>Remove authored document</button>
             </div>
           {/if}
         {/each}
@@ -277,10 +274,10 @@
           {#each otherAuthoredIDs as pluginID (pluginID)}
             <label class="row raw"><span class="label">{pluginID}</span>
               <textarea class="doc" rows="3" value={documentText(pluginID)} aria-label={`${pluginID} raw document`} disabled={busy}
-                on:change={(e) => void editDocument(pluginID, e.target.value)}></textarea>
+                on:change={(e) => editDocument(pluginID, e.target.value)}></textarea>
             </label>
             <div class="row"><span class="label"></span>
-              <button class="ghost" disabled={busy} on:click={() => void editDocument(pluginID, null)} aria-label={`Remove ${pluginID} document`}>Remove authored document</button>
+              <button class="ghost" disabled={busy} on:click={() => editDocument(pluginID, null)} aria-label={`Remove ${pluginID} document`}>Remove authored document</button>
             </div>
           {/each}
         {/if}

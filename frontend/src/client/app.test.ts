@@ -8,17 +8,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 
-// The native bindings module: the App and its editors import Call, PatchJSON,
-// PickDirectory and SetTitle directly, so the whole module is replaced. The
-// PatchJSON double performs the same one-object raw member replacement as the
-// native helper using the exact-JSON round trip; the Go helper keeps its own
-// oracle (internal/desktopclient/host_test.go).
+// The native bindings module: the App and its editors import Call, AppVersion,
+// PickDirectory and SetTitle directly, so the whole module is replaced.
 vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
   AppVersion: vi.fn(),
   Call: vi.fn(),
   NextEvent: vi.fn(),
   Open: vi.fn(),
-  PatchJSON: vi.fn(),
   PickDirectory: vi.fn(),
   SetTitle: vi.fn(),
 }));
@@ -28,9 +24,8 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
 vi.mock('../../wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
 
 import type { Hydration, Session } from '../generated/protocol/types.gen';
-import { AppVersion, Call, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { AppVersion, Call, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
-import { parseExactJSON } from './exactjson';
 import { SessionReader } from './reader';
 import { AttemptLedger } from './attempts';
 
@@ -159,6 +154,7 @@ function noContent() {
 function fakeConnection() {
   const client = { generation: '1' };
   let installed = '';
+  let installedInfo: { instance_id: string; generation: string; workspace: string } | null = null;
   const connection: {
     handler: ((event: never) => void) | null;
     failureHandler: ((error: unknown, generation: string) => void) | null;
@@ -168,6 +164,7 @@ function fakeConnection() {
     setEventHandler: (handler: (event: never) => void) => void;
     setFailureHandler: (handler: (error: unknown, generation: string) => void) => void;
     isCurrentGeneration: (generation: string) => boolean;
+    getInfo: () => { instance_id: string; generation: string; workspace: string } | null;
     open: () => Promise<{ instance_id: string; generation: string; workspace: string }>;
     dispose: () => void;
   } = {
@@ -181,12 +178,17 @@ function fakeConnection() {
     // Mirrors RuntimeConnection: only the generation the connection currently
     // presents is "current"; a superseded pull's failure is subsumed.
     isCurrentGeneration: (generation) => generation === installed,
+    // Mirrors RuntimeConnection: the installed info retires at open start and
+    // after disposal, and only the resolved object installs.
+    getInfo: () => installedInfo,
     open: async () => {
+      installedInfo = null;
       const info = await connection.openMock();
+      installedInfo = info;
       installed = info.generation;
       return info;
     },
-    dispose: () => { connection.disposeMock(); installed = ''; },
+    dispose: () => { connection.disposeMock(); installedInfo = null; installed = ''; },
   };
   return connection;
 }
@@ -237,12 +239,6 @@ function basicMocks(connection: ReturnType<typeof fakeConnection>) {
   vi.mocked(SetTitle).mockResolvedValue(undefined);
   vi.mocked(PickDirectory).mockResolvedValue('');
   vi.mocked(AppVersion).mockResolvedValue('dev (test)');
-  vi.mocked(PatchJSON).mockImplementation(async (document, patch) => {
-    const members = parseExactJSON(document) as Record<string, unknown>;
-    const edits = parseExactJSON(patch) as Record<string, unknown>;
-    for (const [name, value] of Object.entries(edits)) members[name] = value;
-    return JSON.stringify(members);
-  });
 }
 
 async function mountBasic() {
@@ -316,6 +312,33 @@ describe('initial composition', () => {
     // The stale-body hydration never rendered; the accepted-floor fresh read did.
     expect(vi.mocked(sdk.GetSessionHydration).mock.calls.length).toBeGreaterThanOrEqual(2);
     await vi.waitFor(() => expect(document.body.textContent).toContain('item i9'));
+  });
+
+  it('rejects a malformed initial global revision before adopting it', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    // The very first configuration read carries a revision outside the closed
+    // decimal shape. No reader floor exists yet, so only the initial global
+    // validation can reject it; the repair's own read is valid.
+    vi.mocked(sdk.GetConfiguration)
+      .mockResolvedValueOnce(ok({
+        configuration_revision: { instance_id: INSTANCE, generation: 'not-a-number' },
+        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+        agents: [],
+        providers: [],
+      }))
+      .mockResolvedValue(ok({
+        configuration_revision: { instance_id: INSTANCE, generation: '1' },
+        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+        agents: [],
+        providers: [],
+      }));
+    // No hydration floor ever exists: the initial global comparison is the only
+    // place that can reject this revision.
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(() => new Promise(() => {}) as never);
+    const { target } = await mountAppNoWait(connection);
+    await vi.waitFor(() => expect(connection.openMock.mock.calls.length).toBe(2));
+    expect(target.querySelector('.note.warn')).not.toBeNull();
   });
 
   it('repairs once on a foreign global floor and converges after the reopen clears it', async () => {
@@ -1452,6 +1475,57 @@ describe('repair', () => {
   });
 });
 
+  it('adopts a Runtime-global read completed during a navigation on its connection alone', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async (params: string) => {
+      const id = (JSON.parse(params) as { session_id: string }).session_id;
+      return ok(makeHydration({
+        session: rootSession(id, NEWER),
+        configuration_revision: { instance_id: INSTANCE, generation: '2' },
+      }));
+    });
+    const { target } = await mountApp(connection);
+    await vi.waitFor(() => expect(target.textContent).toContain('root1'));
+    // A configuration update arrives and its own read is held while the user
+    // navigates to another root.
+    let releaseConfiguration: (value: unknown) => void = () => {};
+    const held = new Promise((resolve) => { releaseConfiguration = resolve; });
+    let reads = 0;
+    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
+      reads += 1;
+      return held as never;
+    });
+    deliverEvent(connection, {
+      kind: 'configuration_changed',
+      scope: { kind: 'session', session_id: 'root1' },
+      configuration_revision: { instance_id: INSTANCE, generation: '2' },
+    });
+    await settle();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Select session root2"]') as HTMLElement).click();
+    await vi.waitFor(() => expect(target.textContent).toContain('root2'));
+    releaseConfiguration(ok({
+      configuration_revision: { instance_id: INSTANCE, generation: '2' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+      agents: [{ name: 'reviewer', description: 'Review changes', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }],
+      providers: [],
+    }));
+    await settle();
+    await settle();
+    // The navigation scheduled no second global read: the one held read is the
+    // only one this update caused.
+    expect(reads).toBe(1);
+    // The completed global payload is adopted across the navigation.
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await vi.waitFor(() => expect(target.textContent).toContain('reviewer'));
+  });
+
 // --- Step 8: navigation, configuration, viewer and code tasks ----------------
 
 const RAW_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
@@ -2527,26 +2601,20 @@ describe('settings editor', () => {
     expect(vi.mocked(sdk.GetConfiguration).mock.calls.length).toBeGreaterThanOrEqual(readsBeforeSave + 1);
   });
 
-  it('authors an absent plugin document only on the first member edit, one member at a time', async () => {
+  it('authors an absent plugin document on its first member edit, one member at a time', async () => {
     const connection = settingsRawConnection();
     const { target } = await mountApp(connection);
     await openSettings(target);
+    expect(target.textContent).toContain('Uses plugin defaults');
     await changeInput(target, 'jobs max_background_processes', '3');
-    await settle();
-    await settle();
-    // First patch: the absent document becomes {} and receives only the member.
-    expect(vi.mocked(PatchJSON).mock.calls[0]).toEqual(['{}', '{"max_background_processes":3}']);
-    // Second patch: the plugins member keeps the unedited tools document exact.
-    const [document, patch] = vi.mocked(PatchJSON).mock.calls[1];
-    expect(document).toBe(EXACT_SETTINGS_TEXT);
-    expect(patch).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
-    expect(patch).toContain('"jobs":"{\\"max_background_processes\\":3}"');
+    await changeInput(target, 'jobs max_output_bytes', '9');
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
-    const call = vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as string;
-    const body = bodyOf(call);
-    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3}"');
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    // The absent document became {}-plus-its-edited-members, composed one member
+    // at a time, and the unedited tools document keeps its exact lexeme.
+    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3,\\"max_output_bytes\\":9}"');
     expect(body).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
   });
 
@@ -2632,10 +2700,8 @@ describe('host-local appearance and version', () => {
     expect((target.querySelector('[aria-label="Font scale"]') as HTMLInputElement).value).toBe('50');
     await toggleCheckbox(target, 'Wrap code blocks', false);
     expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(false);
-    // Appearance is client-owned UI state: no configuration write and no
-    // native document edit.
+    // Appearance is client-owned UI state: no configuration write.
     expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
-    expect(vi.mocked(PatchJSON)).not.toHaveBeenCalled();
   });
 
   it('keeps the host-local rows live while the Runtime settings read is pending', async () => {
@@ -4408,36 +4474,18 @@ function settingsRawConnection(raw = RAW_CONFIGURATION) {
   return connection;
 }
 
-describe('settings ordered edit tail', () => {
-  it('holds the editor pending through one native edit and applies the next against its output', async () => {
+describe('settings local edit tail', () => {
+  it('applies each local edit synchronously and keeps both in the saved complete body', async () => {
     const connection = settingsRawConnection();
-    let releaseFirst: (value: string) => void = () => {};
-    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
-    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
     await changeInput(target, 'archive_after_days', '5');
-    await settle();
-    // While the native edit is pending the authored controls and Save are
-    // disabled: no second local operation can exist.
-    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).disabled).toBe(true);
-    expect((target.querySelector('[aria-label="delete_after_archive_days"]') as HTMLInputElement).disabled).toBe(true);
-    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(true);
-    releaseFirst(EDITED_SESSIONS_TEXT);
-    await settle();
-    await settle();
-    expect(vi.mocked(PatchJSON)).toHaveBeenCalledTimes(1);
-    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).disabled).toBe(false);
-    // A subsequent explicit edit composes against the first edit's applied output.
+    expect((target.querySelector('[aria-label="archive_after_days"]') as HTMLInputElement).value).toBe('5');
+    // No native edit state is entered: the controls stay live.
+    expect((target.querySelector('[aria-label="delete_after_archive_days"]') as HTMLInputElement).disabled).toBe(false);
+    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(false);
     await changeInput(target, 'delete_after_archive_days', '7');
-    await settle();
-    await settle();
-    expect(vi.mocked(PatchJSON)).toHaveBeenCalledTimes(2);
-    const [secondDocument, secondPatch] = vi.mocked(PatchJSON).mock.calls[1];
-    expect(secondDocument).toBe(EDITED_SESSIONS_TEXT);
-    expect(secondPatch).toContain('"delete_after_archive_days":7');
-    expect(secondPatch).toContain('"archive_after_days":5');
-    // Both edits are in the saved complete body.
+    expect((target.querySelector('[aria-label="delete_after_archive_days"]') as HTMLInputElement).value).toBe('7');
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
@@ -4446,195 +4494,43 @@ describe('settings ordered edit tail', () => {
     expect(bodyOf(call)).toContain('"delete_after_archive_days":7');
   });
 
-  it('cannot start a Save while an edit is pending', async () => {
+  it('keeps every unedited numeric lexeme of a local plugin edit exact', async () => {
     const connection = settingsRawConnection();
-    let releaseFirst: (value: string) => void = () => {};
-    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
-    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
-    await changeInput(target, 'archive_after_days', '5');
-    await settle();
-    // Save is gated by the pending edit; a click cannot leave a PUT.
-    expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(true);
-    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
-    await settle();
-    expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
-    // Once the edit settles, the explicit Save includes it.
-    releaseFirst(EDITED_SESSIONS_TEXT);
-    await settle();
-    await settle();
+    await changeInput(target, 'jobs max_background_processes', '3');
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
-    const call = vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as string;
-    expect(bodyOf(call)).toContain('"archive_after_days":5');
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    expect(body).toContain('"archive_after_days":-9223372036854775808');
+    expect(body).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
+    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3}"');
   });
 
-  it('a failed edit shows its error, leaves the document unchanged and a later edit recovers', async () => {
+  it('a rejected local edit shows its error, leaves the document unchanged and a later edit recovers', async () => {
     const connection = settingsRawConnection();
-    vi.mocked(PatchJSON).mockImplementationOnce(() => Promise.reject(new Error('patch rejected')) as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
-    await changeInput(target, 'archive_after_days', '5');
-    await settle();
+    // A malformed composed member is a local syntax rejection with no Runtime
+    // payload: the exact document is untouched.
+    await changeInput(target, 'archive_after_days', '5x');
     await settle();
     expect(target.textContent).toContain('Edit rejected');
-    expect(target.textContent).toContain('patch rejected');
-    // The document is unchanged: a Save sends the original token, never the
-    // failed edit as if it applied.
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
     const first = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
     expect(first).toContain('"archive_after_days":-9223372036854775808');
-    expect(first).not.toContain('"archive_after_days":5');
+    expect(first).not.toContain('5x');
     // A later explicit valid edit recovers against the last valid document.
     await changeInput(target, 'delete_after_archive_days', '7');
-    await settle();
-    await settle();
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
     const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls.at(-1)?.[0] as never);
     expect(body).toContain('"delete_after_archive_days":7');
     expect(body).toContain('"archive_after_days":-9223372036854775808');
-  });
-
-  it('teardown suppresses a held local edit completion', async () => {
-    const connection = settingsRawConnection();
-    let releaseFirst: (value: string) => void = () => {};
-    const first = new Promise<string>((resolve) => { releaseFirst = resolve; });
-    vi.mocked(PatchJSON).mockImplementationOnce(() => first as never);
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    await changeInput(target, 'archive_after_days', '5');
-    (target.querySelector('[aria-label="Close settings"]') as HTMLElement).click();
-    await settle();
-    releaseFirst(EDITED_SESSIONS_TEXT);
-    await settle();
-    await settle();
-    expect(target.textContent).not.toContain('Edit rejected');
-    expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
-  });
-});
-
-describe('all authored plugin documents', () => {
-  const RAW_WITH_CUSTOM = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
-    + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1},'
-    + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}","lsp":"{\\"servers\\":[]}"}},'
-    + '"agents":[],"providers":[]}';
-
-  it('renders raw inspect/edit/remove for every authored plugin-map entry', async () => {
-    const connection = settingsRawConnection(RAW_WITH_CUSTOM);
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    const custom = target.querySelector('[aria-label="lsp raw document"]') as HTMLTextAreaElement;
-    expect(custom).not.toBeNull();
-    expect(custom.value).toBe('{"servers":[]}');
-    // Raw edit of the custom document through the same ordered edit path.
-    custom.value = '{"servers":[{"id":"x"}]}';
-    custom.dispatchEvent(new Event('change', { bubbles: true }));
-    await settle();
-    await settle();
-    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
-    expect(patch).toContain('"lsp":"{\\"servers\\":[{\\"id\\":\\"x\\"}]}"');
-    expect(patch).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
-    // Raw remove.
-    (target.querySelector('[aria-label="Remove lsp document"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const [, removePatch] = vi.mocked(PatchJSON).mock.calls[1];
-    expect(removePatch).not.toContain('"lsp"');
-    expect(removePatch).toContain('"tools"');
-  });
-
-  it('lists, edits and removes prototype-named plugin documents as ordinary author data', async () => {
-    const raw = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
-      + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1},'
-      + '"plugins":{"constructor":"{\\"a\\":1}","__proto__":"{\\"b\\":2}"}},'
-      + '"agents":[],"providers":[]}';
-    const connection = settingsRawConnection(raw);
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    // Both prototype-named documents are authored members: inspectable.
-    const ctor = target.querySelector('[aria-label="constructor raw document"]') as HTMLTextAreaElement;
-    const proto = target.querySelector('[aria-label="__proto__ raw document"]') as HTMLTextAreaElement;
-    expect(ctor).not.toBeNull();
-    expect(proto).not.toBeNull();
-    expect(ctor.value).toBe('{"a":1}');
-    expect(proto.value).toBe('{"b":2}');
-    // Edit `constructor`; the sibling keeps its exact text.
-    ctor.value = '{"a":3}';
-    ctor.dispatchEvent(new Event('change', { bubbles: true }));
-    await settle();
-    await settle();
-    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
-    expect(patch).toContain('"constructor":"{\\"a\\":3}"');
-    expect(patch).toContain('"__proto__":"{\\"b\\":2}"');
-    // Remove `__proto__` as an ordinary own member.
-    (target.querySelector('[aria-label="Remove __proto__ document"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const [, removePatch] = vi.mocked(PatchJSON).mock.calls[1];
-    expect(removePatch).not.toContain('__proto__');
-    expect(removePatch).toContain('"constructor":"{\\"a\\":3}"');
-  });
-
-  it('authors a prototype-named plugin document through the explicit ID form', async () => {
-    const connection = settingsRawConnection();
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    await changeInput(target, 'Plugin id', '__proto__');
-    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
-    document.value = '{"c":1}';
-    document.dispatchEvent(new Event('input', { bubbles: true }));
-    document.dispatchEvent(new Event('change', { bubbles: true }));
-    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
-    // The authored prototype-named member is emitted verbatim beside the
-    // retained compiled plugin document.
-    expect(patch).toBe('{"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}","__proto__":"{\\"c\\":1}"}}');
-  });
-
-  it('authors an absent custom section by explicit ID and raw document', async () => {
-    const connection = settingsRawConnection();
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    await changeInput(target, 'Plugin id', 'sqlite');
-    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
-    document.value = '{"cache_size":1e400}';
-    document.dispatchEvent(new Event('input', { bubbles: true }));
-    document.dispatchEvent(new Event('change', { bubbles: true }));
-    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
-    expect(patch).toContain('"sqlite":"{\\"cache_size\\":1e400}"');
-    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const call = vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as string;
-    expect(bodyOf(call)).toContain('"sqlite":"{\\"cache_size\\":1e400}"');
-  });
-
-  it('forwards a backend-invalid authored ID/document as a candidate without local policy', async () => {
-    const connection = settingsRawConnection();
-    const { target } = await mountApp(connection);
-    await openSettings(target);
-    await changeInput(target, 'Plugin id', 'Not A Compiled Plugin');
-    const document = target.querySelector('[aria-label="Plugin document"]') as HTMLTextAreaElement;
-    document.value = 'not json at all';
-    document.dispatchEvent(new Event('input', { bubbles: true }));
-    document.dispatchEvent(new Event('change', { bubbles: true }));
-    (target.querySelector('[aria-label="Author plugin document"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    // The authored string is forwarded verbatim; the server decides validity.
-    const [, patch] = vi.mocked(PatchJSON).mock.calls[0];
-    expect(patch).toContain('"Not A Compiled Plugin":"not json at all"');
   });
 });
 

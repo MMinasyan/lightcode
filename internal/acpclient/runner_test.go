@@ -231,10 +231,11 @@ func (w *gatedWriter) awaitContains(t *testing.T, fragment string) {
 // bridge is one running Runner over an input pipe and, by default, an output
 // pipe drained into a frame channel.
 type bridge struct {
-	t     *testing.T
-	in    *io.PipeWriter
-	lines chan string
-	done  chan error
+	t      *testing.T
+	in     *io.PipeWriter
+	lines  chan string
+	done   chan error
+	cancel context.CancelFunc
 }
 
 func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
@@ -268,7 +269,7 @@ func startRunner(t *testing.T, startup clienthost.Options, workspace string, wri
 	inR, inW := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	b := &bridge{t: t, in: inW, done: done}
+	b := &bridge{t: t, in: inW, done: done, cancel: cancel}
 	if writer == nil {
 		outR, outW := io.Pipe()
 		go func() {
@@ -1075,28 +1076,33 @@ func TestACPProgressOverflowDisconnectsAndResyncs(t *testing.T) {
 	}
 }
 
-// TestACPInputPressureCancelsParkedCalls parks one Runtime call, admits one
-// queued line, then ends the bridge by EOF and separately by input overflow
-// while the call is still parked; both cancel the call without releasing
-// dispatch first, and neither reaches for owner cleanup.
+// Input pressure preserves admission order. Observed EOF and independent
+// cancellation end only client resources, without owner cleanup.
 func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
-	newPressureFixture := func(t *testing.T) (*fixture, chan struct{}, chan struct{}) {
+	newPressureFixture := func(t *testing.T) (*fixture, chan struct{}, chan struct{}, chan struct{}) {
 		t.Helper()
 		arrived := make(chan struct{})
+		released := make(chan struct{})
 		canceled := make(chan struct{})
 		var arriveOnce, cancelOnce sync.Once
 		f := newFixture(t, map[string]http.HandlerFunc{
 			"/v1/sessions/s1/stop": func(w http.ResponseWriter, r *http.Request) {
 				arriveOnce.Do(func() { close(arrived) })
-				<-r.Context().Done()
-				cancelOnce.Do(func() { close(canceled) })
+				select {
+				case <-released:
+				case <-r.Context().Done():
+					cancelOnce.Do(func() { close(canceled) })
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
 			},
 		})
-		return f, arrived, canceled
+		return f, arrived, released, canceled
 	}
 
 	t.Run("EOF ends the bridge with one line still pending", func(t *testing.T) {
-		f, arrived, canceled := newPressureFixture(t)
+		f, arrived, _, canceled := newPressureFixture(t)
 		writer := newGatedWriter()
 		b := startBridgeWith(t, f, "/ws", writer)
 		b.send(t, requestLine("1", "initialize", ""))
@@ -1128,8 +1134,57 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 		}
 	})
 
-	t.Run("input overflow ends the bridge without releasing dispatch", func(t *testing.T) {
-		f, arrived, canceled := newPressureFixture(t)
+	t.Run("EOF behind a capacity-blocked line is observed in order", func(t *testing.T) {
+		f, arrived, released, _ := newPressureFixture(t)
+		writer := newGatedWriter()
+		b := startBridgeWith(t, f, "/ws", writer)
+		defer b.cancel()
+		b.send(t, requestLine("1", "initialize", ""))
+		f.awaitEventsOpen(t)
+
+		b.send(t, requestLine("2", "runtime/StopSession", `{"session_id":"s1"}`))
+		select {
+		case <-arrived:
+		case <-time.After(15 * time.Second):
+			t.Fatal("the parked Stop call never arrived")
+		}
+		// The single pending slot is filled while two further valid lines wait in
+		// the scanner and the input is then closed: the EOF cannot be observed
+		// before those tokens were admitted, so the queued line still progresses
+		// first and only the lines behind it may be released by the teardown.
+		before := f.total()
+		healthBefore := f.count("/v1/health")
+		b.send(t, strings.Join([]string{
+			requestLine("3", "runtime/GetHealth", ""),
+			requestLine("4", "runtime/GetWarnings", ""),
+			requestLine("5", "runtime/GetHealth", ""),
+		}, "\n"))
+		b.eof()
+		close(released)
+		writer.release()
+		deadline := time.Now().Add(15 * time.Second)
+		for f.count("/v1/health") < healthBefore+1 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := f.count("/v1/health"); got < healthBefore+1 || got > healthBefore+2 {
+			t.Fatalf("the line admitted before EOF never progressed: health requests %d -> %d, calls=%v", healthBefore, got, f.paths())
+		}
+		// The ordered EOF then ends the run normally, never as an overflow.
+		if err := b.awaitRun(t); err != nil {
+			t.Fatalf("Run after an ordered EOF = %v, want nil", err)
+		}
+		// Every line that reached dispatch kept its admission order; the racy
+		// tail behind the observed EOF may be released, never reordered.
+		want := []string{"/v1/health", "/v1/warnings", "/v1/health"}
+		for i, path := range f.paths()[before:] {
+			if i >= len(want) || path != want[i] {
+				t.Fatalf("a line was reordered or skipped behind EOF: %v", f.paths())
+			}
+		}
+	})
+
+	t.Run("context cancellation releases a capacity-blocked scanner without dispatch or output", func(t *testing.T) {
+		f, arrived, _, canceled := newPressureFixture(t)
 		writer := newGatedWriter()
 		b := startBridgeWith(t, f, "/ws", writer)
 		b.send(t, requestLine("1", "initialize", ""))
@@ -1141,29 +1196,28 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 		case <-time.After(15 * time.Second):
 			t.Fatal("the parked Stop call never arrived")
 		}
+		before := f.total()
 		b.send(t, requestLine("3", "runtime/GetHealth", ""))
-		healthBefore := f.count("/v1/health")
 		b.send(t, requestLine("4", "runtime/GetHealth", ""))
+		// Cancellation releases the blocked producer and cancels the parked
+		// Runtime call while dispatch and output capacity stay held.
+		b.cancel()
 		select {
 		case <-canceled:
 		case <-time.After(15 * time.Second):
-			t.Fatal("input overflow did not cancel the parked Runtime call")
+			t.Fatal("out-of-band cancellation did not cancel the parked Runtime call")
+		}
+		if err := b.awaitRun(t); err == nil {
+			t.Fatal("Run returned nil after its context was canceled")
 		}
 		writer.release()
-		err := b.awaitRun(t)
-		if err == nil {
-			t.Fatal("input overflow ended Run without an error")
-		}
-		if !strings.Contains(err.Error(), "input overflow") {
-			t.Fatalf("Run = %v, want the input-overflow error", err)
-		}
-		if got := f.count("/v1/health"); got != healthBefore {
-			t.Fatalf("a queued line was dispatched after overflow: health requests %d -> %d", healthBefore, got)
+		if got := f.total(); got != before {
+			t.Fatalf("a capacity-blocked line was dispatched after cancellation: requests %d -> %d", before, got)
 		}
 	})
 
 	t.Run("an uninterruptible output write stays bounded", func(t *testing.T) {
-		f, _, _ := newPressureFixture(t)
+		f, _, _, _ := newPressureFixture(t)
 		writer := newGatedWriter()
 		b := startBridgeWith(t, f, "/ws", writer)
 		b.send(t, requestLine("1", "initialize", ""))

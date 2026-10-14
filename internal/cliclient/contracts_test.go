@@ -3,10 +3,12 @@ package cliclient
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -144,7 +146,8 @@ func TestQueuedTaskMenuAndErrorCannotPublishAfterNavigation(t *testing.T) {
 				old.respond([]protocol.Workspace{{DisplayName: "stale workspace menu", Root: "/old"}})
 			}
 			settleTasks(t, c)
-			c.selectRoot(rootB, false)
+			c.selectRoot(rootB)
+			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			fresh := receive(t, transport.requests)
 			fresh.respond(hydration(rootB, "1", nil, nil))
 			settleTasks(t, c)
@@ -175,7 +178,8 @@ func TestRuntimeFileSuccessAndErrorAreStampedAndUseGeneratedAddress(t *testing.T
 			if !strings.Contains(string(old.body), `"workspace":"/workspace"`) || !strings.Contains(string(old.body), `"path":"file.go"`) {
 				t.Fatal("file read omitted explicit address")
 			}
-			c.selectRoot(rootB, false)
+			c.selectRoot(rootB)
+			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			if fail {
 				old.reject(400, protocol.Error{Code: "invalid", Message: "stale file error"})
@@ -379,51 +383,264 @@ func TestCreateUnknownRemainsCapturedAcrossWorkspaceIntent(t *testing.T) {
 	}
 }
 
-func TestExplicitResumeCannotPromoteChildOrSubmitBeforeRootHydration(t *testing.T) {
+func TestExplicitResumeCannotPromoteChildOrSubmitToItBeforeAdoption(t *testing.T) {
 	c, transport := fixture(t)
 	settledReader(t, c, transport)
+	// A live writer admits the explicit follow-up typed while the destination is
+	// resolved.
+	go c.writer(io.Discard)
+	c.mu.Lock()
+	source, sourceID := c.root, c.rootID
+	c.mu.Unlock()
 	c.command("/resume " + childA)
-	open := receive(t, transport.requests)
+	destination := receive(t, transport.requests)
+	if !strings.HasSuffix(destination.req.URL.Path, "/hydration") {
+		t.Fatal("named resume did not read its destination globally")
+	}
+	// The retained source keeps accepting explicit work while the destination is
+	// resolved, and nothing is addressed to the unadopted child.
 	setDraft(c, "forged child follow up")
 	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
-	open.respond([]protocol.Session{{SessionId: childA, ParentSessionId: pointer(rootA)}})
-	receive(t, transport.requests).respond([]protocol.Session{{SessionId: childA, ParentSessionId: pointer(rootA), Lifecycle: "archived"}})
-	settleTasks(t, c)
+	submit := receive(t, transport.requests)
+	if !strings.Contains(submit.req.URL.Path, sourceID) {
+		t.Fatalf("follow-up addressed outside the accepted source: %s", submit.req.URL.Path)
+	}
+	submit.respond(protocol.SubmitResult{Disposition: "admitted", Operation: &protocol.Operation{OperationId: "forged"}})
+	// The destination read's own Session record is the eligibility authority.
+	child := hydration(childA, "1", nil, nil)
+	child.Session.ParentSessionId = pointer(rootA)
+	destination.respond(child)
+	settleAnswering(t, c, transport)
 	c.mu.Lock()
-	if c.rootID != "" || c.root != nil || len(c.attempts) != 0 {
-		t.Fatal("child became root work selection")
+	if c.rootID != sourceID || c.root != source || c.childID != "" {
+		t.Fatal("child resume promoted the child or erased the source")
 	}
 	c.mu.Unlock()
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	for _, route := range transport.calls {
-		if strings.Contains(route, "/reopen") || strings.Contains(route, "/submit") {
+		if strings.Contains(route, "/reopen") || strings.Contains(route, childA+"/submit") {
 			t.Fatalf("child root bypass %s", route)
 		}
 	}
 }
 
-func TestResumeUnknownRootVerifiesHeaderThenReopensAndHydrates(t *testing.T) {
+func TestNamedResumeAdoptsCrossWorkspaceRootAndReopensArchived(t *testing.T) {
 	c, transport := fixture(t)
 	settledReader(t, c, transport)
+	// An open root elsewhere resolves through the global read alone and adopts
+	// its immutable destination Workspace.
+	c.command("/resume " + rootB)
+	destination := hydration(rootB, "1", nil, nil)
+	destination.Session.Workspace = "/different"
+	receive(t, transport.requests).respond(destination)
+	receive(t, transport.requests).respond(destination)
+	settleTasks(t, c)
+	c.mu.Lock()
+	if c.rootID != rootB || c.workspace != "/different" || c.root == nil {
+		t.Fatalf("cross-Workspace root resume was refused or not adopted: root=%q workspace=%q", c.rootID, c.workspace)
+	}
+	c.mu.Unlock()
+	// An archived root is reopened first and its fresh hydration is then adopted.
 	c.command("/resume " + childA)
-	receive(t, transport.requests).respond([]protocol.Session{})
-	receive(t, transport.requests).respond([]protocol.Session{{SessionId: childA, Lifecycle: "archived", Workspace: "/workspace"}})
+	archived := hydration(childA, "1", nil, nil)
+	archived.Session.Lifecycle = protocol.Archived
+	receive(t, transport.requests).respond(archived)
 	reopen := receive(t, transport.requests)
 	if !strings.HasSuffix(reopen.req.URL.Path, "/reopen") {
-		t.Fatal("archived work selection did not reopen first")
+		t.Fatal("archived destination did not reopen before work")
 	}
-	reopen.respond(protocol.Session{SessionId: childA, Lifecycle: "open"})
+	reopen.respond(protocol.Session{SessionId: childA, Lifecycle: protocol.Open})
+	// The adopted reader owns the one fresh hydration after the reopen.
 	fresh := receive(t, transport.requests)
 	if !strings.HasSuffix(fresh.req.URL.Path, "/hydration") {
-		t.Fatal("reopen did not precede hydration")
+		t.Fatal("reopen did not precede the fresh destination read")
 	}
-	fresh.respond(hydration(childA, "1", nil, nil))
+	fresh.respond(hydration(childA, "2", nil, nil))
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rootID != childA || c.root.hydration == nil {
-		t.Fatal("valid root resume not adopted")
+	if c.rootID != childA || c.root == nil || c.root.hydration == nil || c.root.hydration.SessionRevision.DurableRevision != "2" {
+		t.Fatal("reopened root was not adopted with its fresh read")
+	}
+}
+
+func TestBareResumeSelectsNewestOpenRootAndKeepsSelectionWithoutAny(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	// The newest open root wins; archived and child headers never appear.
+	c.command("/resume")
+	receive(t, transport.requests).respond([]protocol.Session{
+		{SessionId: childA, ParentSessionId: pointer(rootA), Workspace: "/workspace", LastActivity: time.Unix(9, 0)},
+		{SessionId: rootA, Workspace: "/workspace", LastActivity: time.Unix(1, 0)},
+		{SessionId: rootB, Workspace: "/workspace", LastActivity: time.Unix(5, 0)},
+	})
+	receive(t, transport.requests).respond(hydration(rootB, "2", nil, nil))
+	settleTasks(t, c)
+	c.mu.Lock()
+	if c.rootID != rootB || c.menu != nil {
+		t.Fatalf("bare resume did not select the newest open root: root=%q menu=%v", c.rootID, c.menu)
+	}
+	c.mu.Unlock()
+	// No available root reports the retained no-session outcome and keeps the
+	// current selection; no Session is created.
+	c.command("/resume")
+	receive(t, transport.requests).respond([]protocol.Session{})
+	// The retained source stays live: its own refresh follows the failed intent.
+	settleAnsweringRequested(t, c, transport)
+	c.mu.Lock()
+	if c.rootID != rootB {
+		t.Fatalf("empty bare resume moved the selection: %q", c.rootID)
+	}
+	c.mu.Unlock()
+	if !strings.Contains(outputs(c), "no active sessions") {
+		t.Fatal("no-session outcome was not reported")
+	}
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	for _, route := range transport.calls {
+		if strings.Contains(route, "/create") || strings.Contains(route, "/archived") {
+			t.Fatalf("bare resume created a Session or consulted archived Sessions: %s", route)
+		}
+	}
+}
+
+func TestFailedNamedResumeKeepsTheAcceptedSelection(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.mu.Lock()
+	source, sourceID, workspace := c.root.id, c.rootID, c.workspace
+	c.mu.Unlock()
+	// A refused destination read keeps root, inspector and Workspace, and says so.
+	c.command("/resume missing-root")
+	receive(t, transport.requests).reject(404, protocol.Error{Code: "not_found", Message: "no such session"})
+	// The retained source is live again: its own refresh follows the failure.
+	settleAnsweringRequested(t, c, transport)
+	c.mu.Lock()
+	if c.root.id != source || c.rootID != sourceID || c.workspace != workspace || c.menu != nil {
+		t.Fatalf("failed resume changed the accepted selection: root=%q workspace=%q", c.rootID, c.workspace)
+	}
+	c.mu.Unlock()
+	if !strings.Contains(outputs(c), "no such session") {
+		t.Fatal("selection error was not reported")
+	}
+	// A superseded intent's late error is dropped with its adoption.
+	c.command("/resume also-missing")
+	parked := receive(t, transport.requests)
+	c.command("/resume " + sourceID)
+	receive(t, transport.requests).respond(hydration(sourceID, "3", nil, nil))
+	receive(t, transport.requests).respond(hydration(sourceID, "3", nil, nil))
+	parked.reject(404, protocol.Error{Code: "not_found", Message: "stale destination error"})
+	settleTasks(t, c)
+	c.mu.Lock()
+	current := c.root
+	c.mu.Unlock()
+	c.mu.Lock()
+	if c.root != current || c.rootID != sourceID {
+		t.Fatal("superseded destination error moved the selection")
+	}
+	c.mu.Unlock()
+	if strings.Contains(outputs(c), "stale destination error") {
+		t.Fatal("superseded destination error printed")
+	}
+}
+
+func TestSourceAgentMenuCannotPublishAfterDestinationAdoption(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	// The menu's own configuration read parks so its completion can be ordered
+	// after the destination adoption.
+	transport.globals = true
+	// The destination intent starts, then the source's own /agent menu is begun
+	// while the destination is still being resolved.
+	c.command("/resume " + rootB)
+	destination := receive(t, transport.requests)
+	c.command("/agent")
+	menuRead := receive(t, transport.requests)
+	if !strings.HasSuffix(menuRead.req.URL.Path, "/configuration") {
+		t.Fatalf("agent menu did not read the configuration: %s", menuRead.req.URL.Path)
+	}
+	// The adopted reader's own read proves the destination published, then the
+	// menu task completes afterwards.
+	destination.respond(hydration(rootB, "2", nil, nil))
+	adopted := receive(t, transport.requests)
+	menuRead.respond(configuration("1"))
+	adopted.respond(hydration(rootB, "2", nil, nil))
+	settleTasks(t, c)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.menu != nil {
+		t.Fatalf("source agent menu published after destination adoption: %+v", c.menu)
+	}
+	if c.rootID != rootB || c.root == nil {
+		t.Fatalf("destination was not adopted: root=%q", c.rootID)
+	}
+}
+
+func TestSourceForkCompletionCannotReplaceAdoptedDestination(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.command("/resume " + rootB)
+	destination := receive(t, transport.requests)
+	// The Fork attempt is begun against the retained source during resolution.
+	c.mu.Lock()
+	c.forkBoundary = &protocol.InputItem{ItemId: "boundary"}
+	a, err := c.formAttemptLocked("ForkSession", "fork-op")
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatalf("fork attempt: %v", err)
+	}
+	c.task(func() { c.runAttempt(a.id) })
+	fork := receive(t, transport.requests)
+	if !strings.HasSuffix(fork.req.URL.Path, "/fork") {
+		t.Fatalf("fork attempt did not fork: %s", fork.req.URL.Path)
+	}
+	// The adopted reader's own read proves the destination published, then the
+	// source Fork completes afterwards.
+	destination.respond(hydration(rootB, "2", nil, nil))
+	adopted := receive(t, transport.requests)
+	fork.respond(protocol.ForkResult{Session: protocol.Session{SessionId: childA}, Operation: protocol.Operation{OperationId: a.id}})
+	adopted.respond(hydration(rootB, "2", nil, nil))
+	settleTasks(t, c)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rootID != rootB || c.root == nil {
+		t.Fatalf("source Fork completion replaced the adopted destination: root=%q", c.rootID)
+	}
+	// The attempt's own outcome and identity survive.
+	settled := c.attempts["fork-op"]
+	if settled == nil || settled.outcome != "accepted" || settled.session != rootA {
+		t.Fatalf("fork outcome/identity lost: %+v", settled)
+	}
+}
+
+func TestFailedResumeLeavesTheSourceLiveUnderAHeldHydration(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	// A source refresh is in flight, and a further dirty hint lands while the
+	// destination is resolved.
+	c.mu.Lock()
+	c.root.dirty = true
+	c.kickReaderLocked(c.root)
+	c.mu.Unlock()
+	held := receive(t, transport.requests)
+	c.command("/resume missing-root")
+	destination := receive(t, transport.requests)
+	c.mu.Lock()
+	c.refreshReadersLocked()
+	c.mu.Unlock()
+	destination.reject(404, protocol.Error{Code: "not_found", Message: "no such session"})
+	held.respond(hydration(rootA, "2", inputs(1, 1), nil))
+	fresh := receive(t, transport.requests)
+	if !strings.Contains(fresh.req.URL.Path, rootA) || !strings.HasSuffix(fresh.req.URL.Path, "/hydration") {
+		t.Fatalf("the retained source did not resume reading: %s", fresh.req.URL.Path)
+	}
+	fresh.respond(hydration(rootA, "3", inputs(1, 1), nil))
+	settleTasks(t, c)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rootID != rootA || c.root == nil || c.root.hydration == nil || c.root.hydration.SessionRevision.DurableRevision != "3" {
+		t.Fatal("the retained source was left stale after a failed resume")
 	}
 }
 

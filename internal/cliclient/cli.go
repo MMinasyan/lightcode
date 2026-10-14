@@ -41,6 +41,7 @@ type delivery struct {
 	stamp          stamp
 	text           string
 	actual         bool
+	connectionOnly bool
 	listGeneration uint64
 }
 type eventDelivery struct {
@@ -109,18 +110,19 @@ func (c *CLI) requestExit(err error) {
 	}
 }
 
+// enqueueKey admits one key under bounded backpressure: a full queue makes the
+// input reader wait for the writer instead of ending the client, and a latched
+// exit releases that wait. The exit latch is read, never held, across the wait.
 func (c *CLI) enqueueKey(key terminal.KeyMsg) {
 	c.exitMu.Lock()
-	defer c.exitMu.Unlock()
-	if c.exiting {
+	exiting := c.exiting
+	c.exitMu.Unlock()
+	if exiting {
 		return
 	}
 	select {
 	case c.keys <- key:
-	default:
-		c.exiting = true
-		c.exitErr = errors.New("terminal input overflow")
-		close(c.exit)
+	case <-c.exit:
 	}
 }
 
@@ -274,6 +276,12 @@ func (c *CLI) stampLocked() stamp {
 func (c *CLI) currentLocked(s stamp) bool {
 	return !c.closed && s.conn != nil && c.conn == s.conn && c.selection == s.selection
 }
+
+// connectionCurrentLocked is the Runtime-global validity scope: the serving
+// connection alone, never the local Session selection.
+func (c *CLI) connectionCurrentLocked(s stamp) bool {
+	return !c.closed && s.conn != nil && c.conn == s.conn
+}
 func (c *CLI) displayedLocked() *sessionReader {
 	if c.child != nil {
 		return c.child
@@ -291,6 +299,26 @@ func (c *CLI) report(s stamp, text string, actual bool) {
 	overflow := false
 	select {
 	case c.outputs <- delivery{stamp: s, text: text, actual: actual}:
+	default:
+		overflow = true
+	}
+	c.mu.Unlock()
+	if overflow {
+		c.requestExit(errors.New("terminal output overflow"))
+	}
+}
+
+// reportConnection delivers one Runtime-global outcome whose validity is its
+// serving connection alone; a superseded connection's queued text is dropped.
+func (c *CLI) reportConnection(s stamp, text string) {
+	c.mu.Lock()
+	if !c.connectionCurrentLocked(s) {
+		c.mu.Unlock()
+		return
+	}
+	overflow := false
+	select {
+	case c.outputs <- delivery{stamp: s, text: text, connectionOnly: true}:
 	default:
 		overflow = true
 	}

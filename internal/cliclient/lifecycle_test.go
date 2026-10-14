@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -149,19 +150,13 @@ type errorWriter struct{}
 
 func (errorWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
-func TestRunEOFSignalReadErrorOutputErrorAndInputOverflow(t *testing.T) {
-	for _, exit := range []string{"EOF", "signal", "read-error", "output-error", "overflow"} {
+func TestRunEOFSignalReadErrorAndOutputError(t *testing.T) {
+	for _, exit := range []string{"EOF", "signal", "read-error", "output-error"} {
 		t.Run(exit, func(t *testing.T) {
 			live := liveFixture(t, false, nil)
 			input, write := pipeInput(t)
 			c := New(Options{Startup: live.opts, Workspace: "/workspace"})
 			var output io.Writer = io.Discard
-			var blocked *blockedWriter
-			if exit == "overflow" {
-				blocked = &blockedWriter{entered: make(chan struct{}), release: make(chan struct{})}
-				output = blocked
-				defer close(blocked.release)
-			}
 			if exit == "output-error" {
 				output = errorWriter{}
 			}
@@ -176,12 +171,6 @@ func TestRunEOFSignalReadErrorOutputErrorAndInputOverflow(t *testing.T) {
 					write.Close()
 				case "signal":
 					c.handleSignal(syscall.SIGTERM, int(input.Fd()))
-				case "overflow":
-					barrier(t, blocked.entered)
-					_, err := write.Write([]byte(strings.Repeat("x", 5000)))
-					if err != nil {
-						t.Fatal(err)
-					}
 				}
 			}
 			err := receive(t, done)
@@ -203,13 +192,72 @@ func TestRunEOFSignalReadErrorOutputErrorAndInputOverflow(t *testing.T) {
 				if !errors.Is(err, io.ErrClosedPipe) {
 					t.Fatal(err)
 				}
-			case "overflow":
-				if err == nil || err.Error() != "terminal input overflow" {
-					t.Fatal(err)
-				}
 			}
 			assertNoImplicitControls(t, live)
 		})
+	}
+}
+
+// TestRunInputPressureBackpressuresAndReleases pins the accepted input-pressure
+// contract: a full key queue makes the input reader wait for the writer instead
+// of ending the client, and an EOF already pending behind the blocked keys is
+// observed only after they were admitted, keeping the ordinary EOF teardown.
+func TestRunInputPressureBackpressuresAndReleases(t *testing.T) {
+	live := liveFixture(t, false, nil)
+	input, write := pipeInput(t)
+	c := New(Options{Startup: live.opts, Workspace: "/workspace"})
+	blocked := &blockedWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	done := runClient(c, input, blocked)
+	barrier(t, live.streams)
+	barrier(t, blocked.entered)
+	// Far more keys than the queue holds: every one past capacity waits, so the
+	// reader never reads past them while the input is closed behind them.
+	if _, err := write.Write([]byte(strings.Repeat("x", 5000))); err != nil {
+		t.Fatal(err)
+	}
+	write.Close()
+	close(blocked.release)
+	if err := receive(t, done); err != nil {
+		t.Fatalf("Run after EOF behind blocked keys = %v, want nil", err)
+	}
+	assertNoImplicitControls(t, live)
+}
+
+// TestRunInputPressureReleasesOnSignal pins that explicit signal cancellation
+// releases a capacity-blocked input reader without waiting for output
+// capacity, holding no exit/state mutex across the wait.
+func TestRunInputPressureReleasesOnSignal(t *testing.T) {
+	live := liveFixture(t, false, nil)
+	input, write := pipeInput(t)
+	c := New(Options{Startup: live.opts, Workspace: "/workspace"})
+	blocked := &blockedWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(blocked.release)
+	done := runClient(c, input, blocked)
+	barrier(t, live.streams)
+	barrier(t, blocked.entered)
+	if _, err := write.Write([]byte(strings.Repeat("x", 5000))); err != nil {
+		t.Fatal(err)
+	}
+	barrierUntilFull(t, c)
+	c.handleSignal(syscall.SIGTERM, int(input.Fd()))
+	err := receive(t, done)
+	var e ExitError
+	if !errors.As(err, &e) || e.Code != 130 {
+		t.Fatalf("Run = %v, want the signal exit while input pressure persists", err)
+	}
+	assertNoImplicitControls(t, live)
+}
+
+// barrierUntilFull waits until the bounded key queue is full: the reader is then
+// provably blocked on admission, not read-ahead.
+func barrierUntilFull(t *testing.T, c *CLI) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for len(c.keys) != cap(c.keys) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(c.keys) != cap(c.keys) {
+		t.Fatal("the bounded key queue never filled")
 	}
 }
 

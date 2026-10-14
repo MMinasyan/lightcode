@@ -45,6 +45,28 @@ func settleAnswering(t *testing.T, c *CLI, transport *scriptedTransport) {
 		}
 	}
 }
+
+// settleAnsweringRequested replies to every remaining scripted request with one
+// hydration for the Session its own path addresses, until all CLI tasks settle:
+// the retained source and the adopted destination ask for different Sessions.
+func settleAnsweringRequested(t *testing.T, c *CLI, transport *scriptedTransport) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { c.wg.Wait(); close(done) }()
+	for {
+		select {
+		case req := <-transport.requests:
+			parts := strings.Split(req.req.URL.Path, "/")
+			req.respond(hydration(parts[3], "3", inputs(1, 1), nil))
+		case <-done:
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatal("channel barrier not reached")
+			return
+		}
+	}
+}
+
 func outputs(c *CLI) string {
 	var b strings.Builder
 	for len(c.outputs) > 0 {
@@ -268,7 +290,8 @@ func TestForkRestoreOrderedPartialRetainedAcrossRetryAndNavigation(t *testing.T)
 			if restoreKind == "partial" && (!strings.Contains(out, "one.go") || !strings.Contains(out, "two.go") || !strings.Contains(out, "partial")) {
 				t.Fatal("partial restore dropped")
 			}
-			c.selectRoot(rootB, false)
+			c.selectRoot(rootB)
+			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			fresh := receive(t, transport.requests)
 			fresh.respond(hydration(rootB, "1", nil, nil))
 			settleTasks(t, c)
@@ -418,7 +441,8 @@ func TestChildrenListsAndNavigationTaskMenusSuperseded(t *testing.T) {
 			c.mu.Unlock()
 			c.task(func() { c.childrenMenu(s) })
 			old := receive(t, transport.requests)
-			c.selectRoot(rootB, false)
+			c.selectRoot(rootB)
+			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			selected := receive(t, transport.requests)
 			selected.respond(hydration(rootB, "1", nil, nil))
 			if fail {

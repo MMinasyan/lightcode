@@ -2,11 +2,11 @@
 // member, a non-2xx partial CodeRevertResult
 // with its non-null Error, or a plain non-2xx generated Error. A body matching
 // neither branch (or a loss/undecodable delivery) is outcome unknown, never a
-// fabricated protocol error and never an empty success; the generated closed
-// error-code set is checked at runtime.
+// fabricated protocol error and never an empty success; the closed error-code
+// set and the Error fields are validated by the native accepting owner.
 import { describe, expect, it } from 'vitest';
 
-import { classifyRestore, ERROR_CODES, restoreLines } from './restore';
+import { classifyRestore, restoreLines } from './restore';
 import type { ClassifiedResult } from './results';
 
 function ok(data: unknown): ClassifiedResult {
@@ -52,12 +52,6 @@ describe('classifyRestore', () => {
 
   it('never fabricates a protocol error from a partial-looking body without its Error', () => {
     const outcome = classifyRestore(rejection({ restored: [], skipped: [] }), 'code rewind');
-    expect(outcome.kind).toBe('unknown');
-  });
-
-  it('rejects an unknown error code: only the generated closed set is accepted', () => {
-    expect(Object.keys(ERROR_CODES)).toHaveLength(9);
-    const outcome = classifyRestore(rejection({ code: 'made_up', message: 'x' }), 'code rewind');
     expect(outcome.kind).toBe('unknown');
   });
 

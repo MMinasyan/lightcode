@@ -54,9 +54,8 @@ func writeDiscovery(t *testing.T, endpoint, instance, version, credential string
 }
 
 // newFixture starts one controlled loopback fixture with the given health and
-// events handlers; a nil handler leaves that route unmounted, and each
-// supplied extra map is mounted beside them.
-func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[string]http.HandlerFunc) *httptest.Server {
+// events handlers; a nil handler leaves that route unmounted.
+func newFixture(t *testing.T, health, events http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	if health != nil {
@@ -64,11 +63,6 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 	}
 	if events != nil {
 		mux.HandleFunc("/v1/events", events)
-	}
-	for _, routes := range extra {
-		for path, handler := range routes {
-			mux.HandleFunc(path, handler)
-		}
 	}
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)

@@ -127,7 +127,11 @@ func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
 	}
 }
 
-func TestGlobalsSupersededSelectionIgnoresSuccessAndErrors(t *testing.T) {
+// TestGlobalReadsStayValidAcrossSelectionChanges pins the Runtime-global
+// scope: a global read is accepted, and its error reported, on its serving
+// connection alone, and a local Session navigation neither drops it nor
+// triggers another global read.
+func TestGlobalReadsStayValidAcrossSelectionChanges(t *testing.T) {
 	c, transport := fixture(t)
 	transport.globals = true
 	c.mu.Lock()
@@ -135,22 +139,41 @@ func TestGlobalsSupersededSelectionIgnoresSuccessAndErrors(t *testing.T) {
 	c.kickGlobalsLocked()
 	c.mu.Unlock()
 	oldConfig := receive(t, transport.requests)
-	oldConfig.respond(configuration("900"))
-	oldWarning := receive(t, transport.requests)
-	c.selectRoot(rootB, false)
+	c.selectRoot(rootB)
+	// The completed global read belongs to its connection: the selection change
+	// neither drops it nor schedules another one. The destination hydration
+	// carries the same independent floors, so only the global scope is under
+	// test here.
+	destination := hydration(rootB, "1", nil, nil)
+	destination.ConfigurationRevision = configuration("900").ConfigurationRevision
+	destination.WarningsRevision = warnings("900").WarningsRevision
+	receive(t, transport.requests).respond(destination)
 	rootReq := receive(t, transport.requests)
-	rootReq.respond(hydration(rootB, "1", nil, nil))
-	oldWarning.lost()
-	receive(t, transport.requests).respond(configuration("1"))
-	receive(t, transport.requests).respond(warnings("1"))
+	oldConfig.respond(configuration("900"))
+	rootReq.respond(destination)
+	receive(t, transport.requests).lost()
 	settleTasks(t, c)
 	c.mu.Lock()
-	if c.configuration.ConfigurationRevision.Generation != "1" || c.warnings.WarningsRevision.Revision != "1" || c.root.hydration == nil {
-		t.Fatal("superseded global success poisoned hydration")
+	if c.configuration == nil || c.configuration.ConfigurationRevision.Generation != "900" {
+		t.Fatal("the connection's completed global read was dropped with the selection")
+	}
+	if c.root == nil || c.root.hydration == nil || c.rootID != rootB {
+		t.Fatal("the destination root was not adopted")
 	}
 	c.mu.Unlock()
-	if strings.Contains(outputs(c), "unexpected EOF") {
-		t.Fatal("superseded global error printed")
+	transport.mu.Lock()
+	configCalls := 0
+	for _, call := range transport.calls {
+		if strings.HasSuffix(call, "/v1/configuration") {
+			configCalls++
+		}
+	}
+	transport.mu.Unlock()
+	if configCalls != 1 {
+		t.Fatalf("navigation triggered a global re-read: configuration reads %d", configCalls)
+	}
+	if !strings.Contains(outputs(c), "unexpected EOF") {
+		t.Fatal("a current connection's global read error was suppressed")
 	}
 }
 

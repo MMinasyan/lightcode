@@ -1,12 +1,11 @@
 // Package desktopclient is the native desktop host for the target client: one
 // credential-free Wails byte bridge carrying generated HTTP operations, one
-// event pull over the generated Go subscription, and host-local dialogs,
-// titles and JSON editing. It owns no Session selection, projection state, or
+// event pull over the generated Go subscription, and host-local dialogs and
+// titles. It owns no Session selection, projection state, or
 // work lifetime; the frontend and the Runtime own those.
 package desktopclient
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +13,6 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/wailsapp/wails/v2"
@@ -406,43 +404,4 @@ func (h *Host) SetTitle(workspace string) error {
 // AppVersion returns the retained native version helper.
 func (h *Host) AppVersion() string {
 	return version.String()
-}
-
-// PatchJSON is pure strict one-object JSON member replacement: every patch
-// member replaces its raw value in the document, absent members are
-// preserved, unknown members remain for the server to validate, and unedited
-// members and numeric lexemes survive byte-for-byte. It never reads or
-// writes Runtime files.
-func (h *Host) PatchJSON(document, patch string) (string, error) {
-	members, err := parseJSONObject(document, "document")
-	if err != nil {
-		return "", err
-	}
-	edits, err := parseJSONObject(patch, "patch")
-	if err != nil {
-		return "", err
-	}
-	for name, value := range edits {
-		members[name] = value
-	}
-	var out bytes.Buffer
-	encoder := json.NewEncoder(&out)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(members); err != nil {
-		return "", fmt.Errorf("encode document: %w", err)
-	}
-	return strings.TrimSuffix(out.String(), "\n"), nil
-}
-
-// parseJSONObject strictly decodes one JSON document into its raw member
-// map, rejecting non-objects and trailing data.
-func parseJSONObject(raw, what string) (map[string]json.RawMessage, error) {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &members); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", what, err)
-	}
-	if members == nil {
-		return nil, fmt.Errorf("%s is not a JSON object", what)
-	}
-	return members, nil
 }

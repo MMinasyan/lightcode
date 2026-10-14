@@ -100,6 +100,31 @@ func TestPTYRawRestorationNormalEOFAndActualSignal(t *testing.T) {
 	}
 }
 
+// TestPTYInputPressureSignalReleasesAndRestores proves one real terminal under
+// valid-input pressure: the pasted keys fill the bounded queue while the writer
+// is held, the signal releases the capacity-blocked reader, and Run restores raw
+// mode without the held output ever being released.
+func TestPTYInputPressureSignalReleasesAndRestores(t *testing.T) {
+	live := liveFixture(t, false, nil)
+	master, slave, old := pty(t)
+	blocked := &blockedWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(blocked.release)
+	c := New(Options{Startup: live.opts, Workspace: "/workspace"})
+	done := runClient(c, slave, blocked)
+	barrier(t, blocked.entered)
+	go func() { _, _ = master.Write([]byte(strings.Repeat("x", 8192))) }()
+	barrierUntilFull(t, c)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	var exit ExitError
+	if err := receive(t, done); !errors.As(err, &exit) || exit.Code != 130 {
+		t.Fatal(err)
+	}
+	rawRestored(t, slave, old)
+	assertNoImplicitControls(t, live)
+}
+
 func TestPTYBlockedCopyIdleActiveSIGINTRestoresWithoutWriterJoin(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		t.Run(fmt.Sprint(active), func(t *testing.T) {

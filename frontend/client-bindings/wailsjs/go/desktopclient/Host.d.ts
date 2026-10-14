@@ -10,8 +10,6 @@ export function NextEvent(arg1:string):Promise<string>;
 
 export function Open():Promise<desktopclient.ConnectionInfo>;
 
-export function PatchJSON(arg1:string,arg2:string):Promise<string>;
-
 export function PickDirectory():Promise<string>;
 
 export function SetTitle(arg1:string):Promise<void>;

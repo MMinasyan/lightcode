@@ -331,43 +331,50 @@
     await Promise.all([refreshGlobal('configuration'), refreshGlobal('warnings')]);
   }
 
-  // ONE global read/adoption path for the two actual generated kinds.
+  // ONE global read/adoption path for the two actual generated kinds. Validity
+  // is the installed connection object that served the read plus its own
+  // revision comparison: never a cached App field and never the local Session
+  // selection, so a navigation cannot drop a completed global payload.
   async function refreshGlobal(kind) {
-    const cap = stampFor(rootID, 'root')();
+    const info = connection.getInfo();
     const classified = kind === 'configuration'
       ? await invoke('configuration', 'GetConfiguration', '{}', JSON.parse)
       : await invoke('warnings', 'GetWarnings', '{}', JSON.parse);
-    if (!sameStamp(cap, stampFor(rootID, 'root')())) return;
+    // A read started with no installed connection, or whose installed
+    // connection was retired or superseded meanwhile, is dropped whole.
+    if (info === null || connection.getInfo() !== info) return;
     if (classified.kind !== 'ok') {
       if (classified.kind === 'invalid') { repairNote = classified.message; void requestRepair(); }
       else outcomeNote = classified.message;
       return;
     }
     if (kind === 'configuration') {
-      acceptGlobal('configuration', classified.data.configuration_revision, classified.data.agents);
+      acceptGlobal('configuration', classified.data.configuration_revision, classified.data.agents, info);
     } else {
-      acceptGlobal('warnings', classified.data.warnings_revision, classified.data.warnings.filter((warning) => !warning.session_id));
+      acceptGlobal('warnings', classified.data.warnings_revision, classified.data.warnings.filter((warning) => !warning.session_id), info);
     }
   }
 
   // Malformed/foreign repairs; older body rejected whole; equal adopts; newer advances.
-  function acceptGlobal(kind, revision, payload) {
+  // The initial document is validated against its serving instance too.
+  function acceptGlobal(kind, revision, payload, info) {
     const accepted = kind === 'configuration' ? configuration : warnings;
+    const floor = accepted !== null
+      ? accepted.revision
+      : (kind === 'configuration' ? { instance_id: info.instance_id, generation: '0' } : { instance_id: info.instance_id, revision: '0' });
     let comparison = null;
-    if (accepted !== null) {
-      try {
-        comparison = kind === 'configuration'
-          ? compareConfigurationRevision(accepted.revision, revision)
-          : compareWarningsRevision(accepted.revision, revision);
-      } catch {
-        repairNote = `${kind} revision is malformed or foreign`;
-        void requestRepair();
-        return;
-      }
-      if (comparison === 1) {
-        pushFloors();
-        return;
-      }
+    try {
+      comparison = kind === 'configuration'
+        ? compareConfigurationRevision(floor, revision)
+        : compareWarningsRevision(floor, revision);
+    } catch {
+      repairNote = `${kind} revision is malformed or foreign`;
+      void requestRepair();
+      return;
+    }
+    if (accepted !== null && comparison === 1) {
+      pushFloors();
+      return;
     }
     if (kind === 'configuration') configuration = { revision, payload };
     else warnings = { revision, payload };

@@ -12,6 +12,9 @@ interface JSONRawJSON {
 
 interface JSON {
   rawJSON(text: string): JSONRawJSON;
+  // The raw-number predicate the exact-object replacement uses to exclude
+  // numeric raw wrappers from object roots.
+  isRawJSON(value: unknown): boolean;
   parse(
     text: string,
     reviver: (this: unknown, key: string, value: unknown, context: { source?: string }) => unknown,

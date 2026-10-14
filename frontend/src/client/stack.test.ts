@@ -13,15 +13,14 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
   Call: vi.fn(),
   NextEvent: vi.fn(),
   Open: vi.fn(),
-  PatchJSON: vi.fn(),
   PickDirectory: vi.fn(),
   SetTitle: vi.fn(),
 }));
 
-import { AppVersion, Call, Open, NextEvent, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { AppVersion, Call, Open, NextEvent, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 import { RuntimeConnection } from './connection';
-import { extractSettingsText, parseExactJSON } from './exactjson';
+import { extractSettingsText } from './exactjson';
 import { invokeNative } from './results';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
@@ -82,6 +81,13 @@ interface Script {
   events?: string[];
   // Scripted raw hydration responses consumed in order (e.g. an empty 200).
   hydration?: Array<{ status: number; content_type: string; body: string; invalid: boolean }>;
+  // Scripted GetConfiguration results consumed in order: each waits for its own
+  // gate and then answers with its outcome, so one held global read can span a
+  // connection retirement.
+  configuration?: Array<{ wait: Promise<void>; outcome: { status: number; content_type: string; body: string; invalid: boolean } | 'throw' }>;
+  // A held successor Open: opens after the first await it, retiring the
+  // installed connection until the test releases the new info.
+  openGate?: Promise<desktopclient.ConnectionInfo>;
   // An exact raw ConfigurationView body, so numeric tokens beyond Number
   // precision reach the frontend exactly as the producer wrote them.
   configurationRaw?: string;
@@ -113,6 +119,12 @@ function bridge(script: Script = {}) {
       return json(200, hydration(envelope.session_id!));
     }
     if (operation === 'GetConfiguration') {
+      const scriptedRead = script.configuration?.shift();
+      if (scriptedRead) {
+        await scriptedRead.wait;
+        if (scriptedRead.outcome === 'throw') throw new Error('native bridge: configuration lost');
+        return native(scriptedRead.outcome.status, scriptedRead.outcome.content_type, scriptedRead.outcome.body, scriptedRead.outcome.invalid);
+      }
       if (script.configurationRaw) {
         return native(200, 'application/json', script.configurationRaw, false);
       }
@@ -206,16 +218,17 @@ function bridge(script: Script = {}) {
     }
     return json(404, { code: 'not_found', message: 'no fixture for ' + operation });
   });
-  vi.mocked(Open).mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/ws' });
+  let opens = 0;
+  vi.mocked(Open).mockImplementation(async () => {
+    opens += 1;
+    if (script.openGate !== undefined && opens > 1) {
+      return script.openGate;
+    }
+    return { instance_id: INSTANCE, generation: '1', workspace: '/ws' };
+  });
   vi.mocked(SetTitle).mockResolvedValue(undefined);
   vi.mocked(AppVersion).mockResolvedValue('dev (test)');
   vi.mocked(PickDirectory).mockResolvedValue('');
-  vi.mocked(PatchJSON).mockImplementation(async (document, patch) => {
-    const members = parseExactJSON(document) as Record<string, unknown>;
-    const edits = parseExactJSON(patch) as Record<string, unknown>;
-    for (const [name, value] of Object.entries(edits)) members[name] = value;
-    return JSON.stringify(members);
-  });
   const events = script.events ?? [];
   let pullIndex = 0;
   vi.mocked(NextEvent).mockImplementation(async () => {
@@ -243,6 +256,20 @@ async function mountReal(script: Script = {}) {
   });
   await tick();
   return { connection, component, target, calls };
+}
+
+// One complete ConfigurationView for the actual global read.
+function configurationView(generation: string, agentName: string) {
+  return {
+    configuration_revision: { instance_id: INSTANCE, generation },
+    settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+    agents: [{ name: agentName, description: agentName, subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }],
+    providers: [],
+  };
+}
+
+function rawJSONResponse(value: unknown) {
+  return { status: 200, content_type: 'application/json', body: JSON.stringify(value), invalid: false };
 }
 
 function typeInto(target: HTMLElement, text: string) {
@@ -448,6 +475,61 @@ describe('real generated stack over the byte bridge', () => {
     // render from the unusable body.
     await vi.waitFor(() => expect(vi.mocked(Open).mock.calls.length).toBeGreaterThan(1));
     expect(target.textContent).toContain('root1');
+  });
+
+  it.each(['success', 'loss', 'invalid'])('a global read completed against a retired connection (%s) neither repopulates globals nor republishes', async (variant) => {
+    let releaseOpen: (info: desktopclient.ConnectionInfo) => void = () => {};
+    const openGate = new Promise<desktopclient.ConnectionInfo>((resolve) => { releaseOpen = resolve; });
+    let releaseRead: () => void = () => {};
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const retired = variant === 'success'
+      ? rawJSONResponse(configurationView('9', 'stale'))
+      : variant === 'loss'
+        ? ('throw' as const)
+        : { status: 200, content_type: 'application/json', body: '{not json', invalid: true };
+    const { target, calls, connection } = await mountReal({
+      openGate,
+      configuration: [
+        { wait: Promise.resolve(), outcome: rawJSONResponse(configurationView('1', 'boot')) },
+        { wait: readGate, outcome: retired },
+        { wait: Promise.resolve(), outcome: rawJSONResponse(configurationView('1', 'successor')) },
+      ],
+      events: [
+        JSON.stringify({
+          kind: 'configuration_changed',
+          scope: { kind: 'session', session_id: 'root1' },
+          configuration_revision: { instance_id: INSTANCE, generation: '2' },
+        }),
+        '{not json',
+      ],
+    });
+    // The update's own read parks, then the pull failure opens a successor whose
+    // Open is held: the installed connection is retired meanwhile.
+    await vi.waitFor(() => expect(calls.filter((call) => call.operation === 'GetConfiguration').length).toBe(2));
+    await vi.waitFor(() => expect(vi.mocked(Open).mock.calls.length).toBe(2));
+    expect(connection.getInfo()).toBeNull();
+    // The retired read completes against the retirement window.
+    releaseRead();
+    await settle();
+    await settle();
+    expect(target.querySelector('.note.outcome')).toBeNull();
+    // The successor installs and adopts its own global read.
+    releaseOpen({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
+    await vi.waitFor(() => expect(connection.getInfo()).not.toBeNull());
+    await settle();
+    await settle();
+    await settle();
+    // No extra repair was requested by the retired read...
+    expect(vi.mocked(Open).mock.calls.length).toBe(2);
+    // ...the stale payload never repopulated the globals, and the successor's
+    // own payload did.
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    expect(target.textContent).toContain('successor');
+    expect(target.textContent).not.toContain('stale');
   });
 
   it('preserves every repeated pending occurrence across initial and replacement hydration', async () => {

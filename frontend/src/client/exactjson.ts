@@ -1,5 +1,6 @@
-// Exact-JSON text helpers: parse source access plus JSON.rawJSON keep every
-// numeric lexeme exactly as carried. Native PatchJSON owns document mutation.
+// The exact-JSON text helpers: parse source access plus JSON.rawJSON keep every
+// numeric lexeme exactly as carried, and object edits are local member
+// replacement over that parser.
 import type { JsonObject, SnapshotFile } from '../generated/protocol/types.gen';
 
 // Parse one document, replacing every number with its exact source token.
@@ -20,6 +21,31 @@ export function rawJSONText(value: unknown): string | null {
   return typeof candidate.rawJSON === 'string' ? candidate.rawJSON : null;
 }
 
+// Local exact one-object member replacement over the exact parser: every patch
+// member replaces its raw value in the document, absent members are preserved
+// and unedited numeric lexemes survive byte-for-byte. The document never
+// leaves the client for an edit.
+export function replaceObjectMembers(document: string, patch: string): string {
+  const members = exactObject(document, 'document');
+  const edits = exactObject(patch, 'patch');
+  let next: Record<string, unknown> = members;
+  for (const [member, value] of Object.entries(edits)) {
+    // A computed-property spread writes own data properties, so a member named
+    // `__proto__` stays ordinary data instead of hitting the prototype setter.
+    next = { ...next, [member]: value };
+  }
+  return JSON.stringify(next);
+}
+
+// One exact-parsed object root; a numeric raw wrapper is not a JSON object.
+function exactObject(text: string, what: string): Record<string, unknown> {
+  const parsed = parseExactJSON(text);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || JSON.isRawJSON(parsed)) {
+    throw new Error(`${what} is not a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
 export function extractSettingsText(configurationText: string): string {
   const view = parseExactJSON(configurationText);
   if (view === null || typeof view !== 'object' || (view as { settings?: unknown }).settings === undefined) {
@@ -29,11 +55,7 @@ export function extractSettingsText(configurationText: string): string {
 }
 
 export function parseSettingsObject(settingsText: string): JsonObject {
-  const parsed = parseExactJSON(settingsText);
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('settings document is not a JSON object');
-  }
-  return parsed as JsonObject;
+  return exactObject(settingsText, 'settings document') as JsonObject;
 }
 
 // One-member patch document; valueText is raw JSON text.

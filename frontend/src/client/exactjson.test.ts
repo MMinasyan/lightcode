@@ -14,6 +14,7 @@ import {
   parseExactJSON,
   parseSettingsObject,
   rawJSONText,
+  replaceObjectMembers,
   readRetainedTurnsText,
 } from './exactjson';
 
@@ -39,6 +40,44 @@ describe('parseExactJSON', () => {
 
   it('rejects malformed text through the native JSON boundary', () => {
     expect(() => parseExactJSON('{not json')).toThrow();
+  });
+});
+
+// The local exact object replacement the settings editor edits through: every
+// numeric lexeme of an unedited member survives, ordinary prototype-named
+// members stay data, and a non-object root (raw-number wrapper included) or a
+// malformed patch rejects the whole edit without touching the source text.
+describe('replaceObjectMembers', () => {
+  it('replaces patch members, preserves absent members and keeps exact lexemes', () => {
+    const out = replaceObjectMembers(
+      '{"a":{"old":1},"keep":"x","n":9007199254740993,"f":1e400}',
+      '{"a":{"new":2},"added":[1,2]}',
+    );
+    expect(out).toBe('{"a":{"new":2},"keep":"x","n":9007199254740993,"f":1e400,"added":[1,2]}');
+  });
+
+  it('keeps a prototype-named member ordinary data', () => {
+    const out = replaceObjectMembers('{"__proto__":{"polluted":true},"a":1}', '{"a":2}');
+    expect(Object.hasOwn(JSON.parse(out), '__proto__')).toBe(true);
+    expect(JSON.parse(out).__proto__).toEqual({ polluted: true });
+    expect(JSON.parse(out).a).toBe(2);
+  });
+
+  it('does not mistake an ordinary rawJSON member for a raw-number wrapper', () => {
+    const out = replaceObjectMembers('{"rawJSON":"kept"}', '{"a":1}');
+    expect(JSON.parse(out)).toEqual({ rawJSON: 'kept', a: 1 });
+  });
+
+  it('rejects non-object roots and malformed members without touching the document', () => {
+    const document = '{"a":1}';
+    for (const [root, patch] of [['9007199254740993', '{}'], ['[1]', '{}'], ['null', '{}'], ['"s"', '{}']]) {
+      expect(() => replaceObjectMembers(root, patch)).toThrow();
+    }
+    for (const patch of ['5', '[1]', '{"a":', '{"a":1} x']) {
+      expect(() => replaceObjectMembers(document, patch)).toThrow();
+    }
+    expect(() => replaceObjectMembers('{not json', '{}')).toThrow();
+    expect(document).toBe('{"a":1}');
   });
 });
 

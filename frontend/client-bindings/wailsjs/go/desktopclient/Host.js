@@ -18,10 +18,6 @@ export function Open() {
   return window['go']['desktopclient']['Host']['Open']();
 }
 
-export function PatchJSON(arg1, arg2) {
-  return window['go']['desktopclient']['Host']['PatchJSON'](arg1, arg2);
-}
-
 export function PickDirectory() {
   return window['go']['desktopclient']['Host']['PickDirectory']();
 }

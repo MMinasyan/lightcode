@@ -8,32 +8,17 @@ import type {
 } from '../generated/protocol/types.gen';
 import type { ClassifiedResult } from './results';
 
-// The generated closed error-code enum as an exhaustive runtime record.
-export const ERROR_CODES: Record<RuntimeError['code'], true> = {
-  invalid: true,
-  unauthorized: true,
-  not_found: true,
-  conflict: true,
-  corrupt: true,
-  closed: true,
-  configuration: true,
-  storage: true,
-  internal: true,
-};
-
 export type RestoreOutcome =
   | { kind: 'ok'; result: CodeRevertResult }
   | { kind: 'failed'; result: CodeRevertResult | null; message: string }
   | { kind: 'unknown'; message: string };
 
-function isRuntimeError(value: unknown): value is RuntimeError {
-  if (value === null || typeof value !== 'object') return false;
-  const candidate = value as { code?: unknown; message?: unknown };
-  return (
-    typeof candidate.code === 'string'
-    && Object.prototype.hasOwnProperty.call(ERROR_CODES, candidate.code)
-    && typeof candidate.message === 'string'
-  );
+// The error member of one already-validated partial body, re-read only to reach
+// its message.
+function partialError(value: unknown): RuntimeError | null {
+  if (value === null || typeof value !== 'object') return null;
+  const candidate = (value as { error?: unknown }).error;
+  return candidate !== null && typeof candidate === 'object' ? (candidate as RuntimeError) : null;
 }
 
 function isSkippedEntry(value: unknown): boolean {
@@ -79,16 +64,20 @@ export function classifyRestore(classified: ClassifiedResult, label: string): Re
   }
   if (classified.kind === 'rejection') {
     const payload = classified.payload;
+    // The accepting owner validated every non-2xx Error/partial body; only the
+    // consumed restore shape and the partial's error member are re-read here. A
+    // local syntax rejection carries no Runtime payload and stays outcome unknown.
     if (hasRestoreResultMember(payload)) {
-      if (!hasRestoreArrays(payload) || !isRuntimeError(payload.error)) {
+      const error = partialError(payload);
+      if (!hasRestoreArrays(payload) || error === null) {
         return invalidBody(label);
       }
-      return { kind: 'failed', result: payload, message: payload.error.message };
+      return { kind: 'failed', result: payload, message: error.message };
     }
-    if (isRuntimeError(payload)) {
-      return { kind: 'failed', result: null, message: payload.message };
+    if (payload === undefined) {
+      return invalidBody(label);
     }
-    return invalidBody(label);
+    return { kind: 'failed', result: null, message: (payload as RuntimeError).message };
   }
   return { kind: 'unknown', message: classified.message };
 }

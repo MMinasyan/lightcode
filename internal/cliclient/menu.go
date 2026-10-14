@@ -301,7 +301,7 @@ func (c *CLI) menuKeyLocked(key terminal.KeyMsg) func() {
 	switch m.kind {
 	case "session":
 		if session, ok := extra.(protocol.Session); ok {
-			return func() { c.selectRoot(session.SessionId, string(session.Lifecycle) == "archived") }
+			return func() { c.selectRoot(session.SessionId) }
 		}
 		return func() { c.attemptsMenu(m.stamp) }
 	case "workspace":
