@@ -366,21 +366,6 @@ func (c *CLI) formAttemptLocked(operation, id string) (*attempt, error) {
 	if c.conn == nil || c.rootID == "" || c.childID != "" || c.root == nil || c.root.hydration == nil || c.root.hydration.Session.ParentSessionId != nil {
 		return nil, errors.New("Return to a selected root Session to send work")
 	}
-	for _, a := range c.attempts {
-		if a.session != c.rootID || a.stamp.workspace != c.workspace || (!a.inflight && !strings.HasPrefix(a.outcome, "unknown")) {
-			continue
-		}
-		same := operation == "CompactSession" && a.operation == operation
-		if operation != "CompactSession" && a.operation != "CompactSession" && a.draftRevision == c.draftRevision {
-			same = true
-		}
-		if same {
-			if a.inflight {
-				return nil, errors.New("Awaiting this attempt's response; edit the draft to form new work")
-			}
-			return nil, errors.New("Outcome unknown: use /session Outstanding attempts to Retry or Abandon; edit the draft to form new work")
-		}
-	}
 	a := &attempt{id: id, operation: operation, session: c.rootID, content: textParts(c.draft.String()), mode: protocol.SubmitRequestModeRegular, draftRevision: c.draftRevision, stamp: c.stampLocked(), inflight: true}
 	if c.queued {
 		a.mode = protocol.SubmitRequestModeQueued

@@ -266,10 +266,12 @@ func (h *Host) Call(generation, operation, params string) (HTTPResponse, error) 
 }
 
 // NextEvent returns one JSON-marshaled generated Event from the connection
-// generation's bounded queue. One pull may be outstanding at a time; the
-// terminal channel is checked before queued progress, so a known terminal
-// failure dominates remaining buffered events, channel closure is loss, and
-// a terminal failure cancels only that connection generation.
+// generation's bounded queue. One pull may be outstanding at a time. The
+// events, error and context channels are consumed with the same single-select
+// discipline as the CLI/ACP pumps: a valid buffered event may be delivered
+// before a terminal error that has not been observed yet, and once a terminal
+// error or channel closure is observed the pull is rejected and only its
+// matching generation is canceled and retired.
 func (h *Host) NextEvent(generation string) (string, error) {
 	h.mu.Lock()
 	if h.closed {
@@ -294,47 +296,32 @@ func (h *Host) NextEvent(generation string) (string, error) {
 		delivered *protocol.Event
 		pullErr   error
 	)
-	// The one terminal-first rule: the terminal channel is checked before any
-	// acceptance, and every received event is rechecked against the terminal
-	// and the generation context before it is accepted, including the event
-	// that wakes the parked select. A raced terminal or canceled generation
-	// rejects the pull; the progress channel never outranks the terminal.
 	select {
 	case err, ok := <-errs:
 		pullErr = pullTerminal(err, ok)
-	default:
-	}
-	if pullErr == nil {
-		select {
-		case err, ok := <-errs:
-			pullErr = pullTerminal(err, ok)
-		case event, ok := <-events:
-			if !ok {
-				pullErr = closedEventsLoss(errs)
-			} else {
-				select {
-				case err, ok := <-errs:
-					pullErr = pullTerminal(err, ok)
-				case <-ctx.Done():
-					pullErr = ctx.Err()
-				default:
-					delivered = &event
-				}
-			}
-		case <-ctx.Done():
-			pullErr = ctx.Err()
+	case event, ok := <-events:
+		if !ok {
+			pullErr = closedEventsLoss(errs)
+		} else {
+			delivered = &event
 		}
+	case <-ctx.Done():
+		pullErr = ctx.Err()
 	}
 
-	// A genuine terminal stream failure cancels only its still-current
-	// generation; a canceled context means the generation was already
-	// superseded or the host closed, whose owner performs that cancellation.
-	// A matching nonempty generation implies the installed attempt cancel is
-	// stored, so the read under the mutex is always this generation's own.
+	// An observed terminal stream failure or closure retires only its
+	// still-current generation: a canceled context means the generation was
+	// already superseded or the host closed, whose owner performs that
+	// retirement. A matching nonempty generation implies the installed
+	// attempt cancel is stored, so the read under the mutex is always this
+	// generation's own. Retiring the stamp is what keeps every later pull or
+	// request from acting healthy on the lost generation before Open.
 	if pullErr != nil && ctx.Err() == nil {
 		h.mu.Lock()
 		if h.generation == generation {
 			cancel := h.connCancel
+			h.generation = ""
+			h.pulling = false
 			h.mu.Unlock()
 			cancel()
 		} else {

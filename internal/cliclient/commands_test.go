@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -23,6 +24,26 @@ func settleTasks(t *testing.T, c *CLI) {
 	done := make(chan struct{})
 	go func() { c.wg.Wait(); close(done) }()
 	barrier(t, done)
+}
+
+// settleAnswering replies to every remaining scripted request with one
+// hydration body until all CLI tasks settle, so concurrently settling
+// attempts cannot park the drain on an unanswered read.
+func settleAnswering(t *testing.T, c *CLI, transport *scriptedTransport) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { c.wg.Wait(); close(done) }()
+	for {
+		select {
+		case req := <-transport.requests:
+			req.respond(hydration(rootA, "3", inputs(1, 1), nil))
+		case <-done:
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatal("channel barrier not reached")
+			return
+		}
+	}
 }
 func outputs(c *CLI) string {
 	var b strings.Builder
@@ -462,70 +483,136 @@ func TestUnknownCreateCapturedWorkspaceNoBlindComposition(t *testing.T) {
 	}
 }
 
-func TestUnresolvedAttemptCannotBeReplacedByUnchangedComposer(t *testing.T) {
-	for _, operation := range []string{"SubmitSession", "CompactSession", "ForkSession"} {
-		t.Run(operation, func(t *testing.T) {
-			c, transport := fixture(t)
-			r := settledReader(t, c, transport)
-			setDraft(c, "retained draft")
-			minted := operationID()
-			c.mu.Lock()
-			if operation == "ForkSession" {
-				input, _ := r.items[0].AsInputItem()
-				c.forkBoundary = &input
-			}
-			a, err := c.formAttemptLocked(operation, minted)
-			c.mu.Unlock()
-			if err != nil {
-				t.Fatal(err)
-			}
-			c.task(func() { c.runAttempt(a.id) })
-			first := receive(t, transport.requests)
-			resubmit := func() {
-				if operation == "CompactSession" {
-					c.command("/compact")
-				} else {
+// Explicit actions form independent work from unchanged text; loss and repair
+// never form or resend work.
+func TestExplicitNewWorkIsNotRetransmission(t *testing.T) {
+	const draft = "retained draft"
+	wantContent := `[{"kind":"text","text":"` + draft + `"}]`
+
+	t.Run("explicit actions form independent work from unchanged text", func(t *testing.T) {
+		for _, test := range []struct {
+			name         string
+			operation    string
+			secondQueued bool
+		}{
+			{"Send", "SubmitSession", false},
+			{"Queue with the changed mode", "SubmitSession", true},
+			{"Compact", "CompactSession", false},
+			{"Fork", "ForkSession", false},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				c, transport := fixture(t)
+				r := settledReader(t, c, transport)
+				setDraft(c, draft)
+				form := func(queued bool) {
+					c.mu.Lock()
+					c.queued = queued
+					if test.operation == "ForkSession" {
+						input, _ := r.items[0].AsInputItem()
+						c.forkBoundary = &input
+					}
+					c.mu.Unlock()
+					if test.operation == "CompactSession" {
+						c.command("/compact")
+						return
+					}
 					press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
 				}
-			}
-			resubmit()
-			c.mu.Lock()
-			if len(c.attempts) != 1 {
-				t.Fatal("pending response formed a replacement ID")
-			}
-			c.mu.Unlock()
-			if !strings.Contains(outputs(c), "Awaiting this attempt") {
-				t.Fatal("pending attempt not explained")
-			}
-			first.lost()
-			receive(t, transport.requests).respond(hydration(rootA, "2", inputs(1, 1), nil))
-			settleTasks(t, c)
-			outputs(c)
-			resubmit()
-			c.mu.Lock()
-			if len(c.attempts) != 1 || c.attempts[a.id].outcome != "unknown" {
-				t.Fatal("unknown attempt formed a replacement ID")
-			}
-			c.mu.Unlock()
-			if !strings.Contains(outputs(c), "Outcome unknown") {
-				t.Fatal("unchanged unknown composition lacked explicit retry guidance")
-			}
-			if operation != "CompactSession" {
-				setDraft(c, "new edited draft")
-				resubmit()
-				fresh := receive(t, transport.requests)
-				body := attemptBody(t, fresh)
-				var id string
-				_ = json.Unmarshal(body["operation_id"], &id)
-				if id == a.id {
-					t.Fatal("editing changed retained retry payload instead of forming new attempt")
+				form(false)
+				first := receive(t, transport.requests) // A's response is held
+				form(test.secondQueued)                 // B from the unchanged draft
+				c.mu.Lock()
+				formed := len(c.attempts)
+				c.mu.Unlock()
+				if formed != 2 {
+					t.Fatal("explicit new work was blocked while a response is held")
 				}
-				fresh.reject(409, protocol.Error{Code: "conflict", Message: "server rejection"})
-				receive(t, transport.requests).respond(hydration(rootA, "3", inputs(1, 1), nil))
-				settleTasks(t, c)
+				second := receive(t, transport.requests)
+				firstBody, secondBody := attemptBody(t, first), attemptBody(t, second)
+				var firstID, secondID string
+				_ = json.Unmarshal(firstBody["operation_id"], &firstID)
+				_ = json.Unmarshal(secondBody["operation_id"], &secondID)
+				if len(firstID) != 32 || len(secondID) != 32 || firstID == secondID {
+					t.Fatalf("independent work identities = %q %q, want distinct caller IDs", firstID, secondID)
+				}
+				secondMode := `"regular"`
+				if test.secondQueued {
+					secondMode = `"queued"`
+				}
+				switch test.operation {
+				case "SubmitSession":
+					if string(firstBody["mode"]) != `"regular"` || string(firstBody["content"]) != wantContent ||
+						string(secondBody["mode"]) != secondMode || string(secondBody["content"]) != wantContent {
+						t.Fatalf("per-attempt payloads = %s %s, want the exact immutable captures", first.body, second.body)
+					}
+				case "CompactSession":
+					if len(firstBody) != 1 || len(secondBody) != 1 {
+						t.Fatalf("compact payloads = %s %s, want the exact caller IDs", first.body, second.body)
+					}
+				case "ForkSession":
+					if string(firstBody["content"]) != wantContent || string(secondBody["content"]) != wantContent ||
+						string(firstBody["boundary_item_id"]) != `"item-1"` || string(secondBody["boundary_item_id"]) != `"item-1"` {
+						t.Fatalf("fork payloads = %s %s, want the exact immutable captures", first.body, second.body)
+					}
+				}
+				first.lost()
+				second.lost()
+				settleAnswering(t, c, transport)
+			})
+		}
+	})
+
+	t.Run("a lost response alone followed by connection repair sends nothing", func(t *testing.T) {
+		live := liveFixture(t, false, nil)
+		c, transport := fixture(t)
+		settledReader(t, c, transport)
+		setDraft(c, draft)
+		press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+		first := receive(t, transport.requests)
+		first.lost()
+		receive(t, transport.requests).respond(hydration(rootA, "2", inputs(1, 1), nil))
+		settleTasks(t, c)
+		transport.mu.Lock()
+		sends := 0
+		for _, route := range transport.calls {
+			if strings.Contains(route, "/submit") || strings.Contains(route, "/fork") || strings.Contains(route, "/compact") {
+				sends++
 			}
-		})
-	}
+		}
+		transport.mu.Unlock()
+		if sends != 1 {
+			t.Fatalf("the lost response alone sent %d work requests, want exactly the one attempt", sends)
+		}
+		oldConn := c.conn
+		c.mu.Lock()
+		c.opts.Startup = live.opts
+		c.mu.Unlock()
+		c.task(func() { c.connect(true, oldConn) })
+		// The repair installs its pump and reports completion; its
+		// authoritative read then runs on the repaired connection.
+		var out strings.Builder
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			out.WriteString(outputs(c))
+			live.mu.Lock()
+			routes := append([]string(nil), live.calls...)
+			live.mu.Unlock()
+			if strings.Contains(out.String(), "Connection repaired") && len(routes) > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the connection repair did not run")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		live.mu.Lock()
+		defer live.mu.Unlock()
+		for _, route := range live.calls {
+			if strings.Contains(route, "/submit") || strings.Contains(route, "/fork") || strings.Contains(route, "/compact") {
+				t.Fatalf("connection repair resent work: %s", route)
+			}
+		}
+	})
 }
 
 func TestKnownForkFailureRetainsHandledRestoreAndSourceSelection(t *testing.T) {

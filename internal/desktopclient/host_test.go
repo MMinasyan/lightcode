@@ -324,8 +324,10 @@ func TestDesktopHostCallClassification(t *testing.T) {
 }
 
 // TestDesktopHostNextEventPullOwnership proves the one outstanding pull, the
-// terminal channel dominating buffered progress, and channel closure as
-// loss, over the host's actual channel fields.
+// uniform single-select observation of the progress, terminal and context
+// channels, channel closure as loss, and that an observed loss retires its
+// generation so no buffered progress or later call survives it, over the
+// host's actual channel fields.
 func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 	t.Run("channel closure is loss", func(t *testing.T) {
 		events := make(chan protocol.Event)
@@ -358,26 +360,6 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 		<-firstDone
 	})
 
-	t.Run("canceled generation rejects buffered progress", func(t *testing.T) {
-		events := make(chan protocol.Event, 1)
-		errs := make(chan error, 1)
-		var scope protocol.Scope
-		if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
-			t.Fatalf("build scope: %v", err)
-		}
-		var event protocol.Event
-		if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
-			t.Fatalf("build event: %v", err)
-		}
-		events <- event
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
-		if raw, err := host.NextEvent("1"); err == nil {
-			t.Fatalf("NextEvent delivered progress on a canceled generation: %q", raw)
-		}
-	})
-
 	t.Run("progress closure without a terminal error is loss", func(t *testing.T) {
 		events := make(chan protocol.Event)
 		errs := make(chan error)
@@ -389,32 +371,23 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 			t.Fatalf("NextEvent = %v, want the closure loss", err)
 		}
 	})
-}
 
-// TestDesktopHostLateTerminalDominatesSelectedEvent proves the one
-// terminal-first rule on a PARKED pull: the select wakes on an event while
-// the terminal error becomes readable before acceptance, so the pull must
-// reject with the terminal error, never deliver the selected progress. The
-// synctest bubble runs its goroutines one at a time, so the queued event and
-// the terminal write are both established before the parked pull resumes.
-func TestDesktopHostLateTerminalDominatesSelectedEvent(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		events := make(chan protocol.Event, 2)
+	t.Run("events closure after a queued terminal keeps the producer's actual error", func(t *testing.T) {
+		events := make(chan protocol.Event)
 		errs := make(chan error, 1)
+		errs <- client.ErrResyncRequired
+		close(events)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
-		type pullResult struct {
-			raw string
-			err error
+		if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
+			t.Fatalf("NextEvent = %v, want the producer's queued terminal error", err)
 		}
-		pulled := make(chan pullResult, 1)
-		go func() {
-			raw, err := host.NextEvent("1")
-			pulled <- pullResult{raw: raw, err: err}
-		}()
-		synctest.Wait() // the pull is durably parked in the blocking select
+	})
 
+	t.Run("an observed loss retires the generation and its buffered progress", func(t *testing.T) {
+		events := make(chan protocol.Event, 1)
+		errs := make(chan error, 1)
 		var scope protocol.Scope
 		if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
 			t.Fatalf("build scope: %v", err)
@@ -423,24 +396,73 @@ func TestDesktopHostLateTerminalDominatesSelectedEvent(t *testing.T) {
 		if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
 			t.Fatalf("build event: %v", err)
 		}
-		events <- event
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
 		errs <- client.ErrResyncRequired
-
-		result := <-pulled
-		if !errors.Is(result.err, client.ErrResyncRequired) {
-			t.Fatalf("parked pull = (%q, %v), want the terminal error to dominate the selected event", result.raw, result.err)
+		if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
+			t.Fatalf("pull = %v, want the observed terminal error", err)
+		}
+		// The loss retires the generation before any later pull can observe
+		// its remaining buffered progress.
+		events <- event
+		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+			t.Fatalf("later pull = %v, want the stale-generation rejection", err)
+		}
+		host.mu.Lock()
+		canceled, retired := ctx.Err() != nil, host.generation == ""
+		host.mu.Unlock()
+		if !canceled || !retired {
+			t.Fatal("an observed loss must cancel and retire only its matching generation")
 		}
 	})
 }
 
-// TestDesktopHostTerminalFailureDominatesQueuedEvents drives the real stream
+// TestDesktopHostProgressPrecedesUnobservedTerminal proves the uniform
+// observation order: valid queued progress is delivered ahead of a terminal
+// signal that has not been observed yet, and the terminal arriving afterwards
+// is observed by a later pull, which retires the generation. Whichever ready
+// select case wins when both are queued at once is never promised.
+func TestDesktopHostProgressPrecedesUnobservedTerminal(t *testing.T) {
+	events := make(chan protocol.Event, 1)
+	errs := make(chan error, 1)
+	var scope protocol.Scope
+	if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
+		t.Fatalf("build scope: %v", err)
+	}
+	var event protocol.Event
+	if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
+		t.Fatalf("build event: %v", err)
+	}
+	want, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
+
+	events <- event
+	raw, err := host.NextEvent("1")
+	if err != nil || raw != string(want) {
+		t.Fatalf("progress pull = (%q, %v), want the exact %q ahead of the unobserved terminal", raw, err, want)
+	}
+	errs <- client.ErrResyncRequired
+	if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
+		t.Fatalf("later pull = %v, want the now-observed terminal error", err)
+	}
+}
+
+// TestDesktopHostOverflowTerminalRetiresGeneration drives the real stream
 // through a queue overflow: the flood is gated until after Open establishes
 // the stream (the response is flushed first), so Open can never randomly
-// reject an already overflowed stream. The bounded queue fills with progress,
-// the terminal error dominates it at pull start and leaves the actual queue
-// untouched, the terminal failure cancels exactly that connection
-// generation, and a later Request on the failed generation is rejected.
-func TestDesktopHostTerminalFailureDominatesQueuedEvents(t *testing.T) {
+// reject an already overflowed stream. Pulls observe the valid queued
+// progress and the terminal failure in whatever order the single select
+// chooses, and every delivered pull is the valid queued progress. Once the
+// terminal failure is observed it cancels and retires exactly that
+// connection generation, and no later pull or forwarded request acts healthy
+// on it.
+func TestDesktopHostOverflowTerminalRetiresGeneration(t *testing.T) {
 	const total = 300
 	start := make(chan struct{})
 	server := newFixture(t, jsonHealth(), func(w http.ResponseWriter, r *http.Request) {
@@ -475,21 +497,39 @@ func TestDesktopHostTerminalFailureDominatesQueuedEvents(t *testing.T) {
 	close(start)
 	awaitTerminal(t, host)
 
-	if _, err := host.NextEvent(info.Generation); !errors.Is(err, client.ErrResyncRequired) {
-		t.Fatalf("NextEvent = %v, want the terminal error over the buffered queue", err)
+	var observed error
+	for pulls := 0; ; pulls++ {
+		if pulls > total {
+			t.Fatal("the terminal failure was never observed")
+		}
+		raw, err := host.NextEvent(info.Generation)
+		if err != nil {
+			observed = err
+			break
+		}
+		var delivered map[string]any
+		if json.Unmarshal([]byte(raw), &delivered) != nil || delivered["kind"] != "session_changed" {
+			t.Fatalf("pull delivered %q, want only the valid queued progress", raw)
+		}
+	}
+	if !errors.Is(observed, client.ErrResyncRequired) {
+		t.Fatalf("observed terminal = %v, want the overflow resync error", observed)
 	}
 	host.mu.Lock()
-	buffered := len(host.events)
 	generationErr := host.connCtx.Err()
+	retired := host.generation == ""
 	host.mu.Unlock()
-	if buffered != 256 {
-		t.Fatalf("buffered events = %d, want the full 256-event queue untouched", buffered)
-	}
 	if generationErr == nil {
 		t.Fatal("the terminal failure did not cancel its connection generation")
 	}
-	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil {
-		t.Fatal("a call on the failed generation succeeded")
+	if !retired {
+		t.Fatal("the terminal failure did not retire its connection generation")
+	}
+	if _, err := host.NextEvent(info.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatalf("later pull = %v, want the stale-generation rejection", err)
+	}
+	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+		t.Fatal("a later request acted healthy on the lost generation")
 	}
 }
 

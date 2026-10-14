@@ -501,6 +501,29 @@ describe('provisional activity', () => {
     expect(target.querySelector('.provisional-text')).toBeNull();
   });
 
+  it('renders progress delivered before an unobserved terminal only in the provisional area', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(runningHydration()));
+    const { target } = await mountApp(connection);
+    await vi.waitFor(() => expect(target.querySelector('.activity-label')).not.toBeNull());
+    await settle();
+    await settle();
+    // Valid queued progress is delivered before the terminal failure is
+    // observed.
+    deliverEvent(connection, { kind: 'text_delta', scope: { kind: 'operation', session_id: 'root1', operation_id: 'op1' }, position: 0, content: 'live text' });
+    await settle();
+    expect(target.querySelector('.provisional-text')?.textContent).toBe('live text');
+    // The provisional delivery never becomes a canonical transcript item.
+    for (const node of target.querySelectorAll('.message, .system-msg, .queued-msg')) {
+      expect(node.textContent).not.toContain('live text');
+    }
+    // The terminal failure is observed afterwards; the existing repair
+    // clears the provisional progress.
+    connection.failureHandler?.(new Error('event stream resync required'), '1');
+    await vi.waitFor(() => expect(target.querySelector('.provisional-text')).toBeNull());
+  });
+
   it('marks truncation after the trailing 64 KiB bound', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
@@ -559,6 +582,36 @@ describe('composer', () => {
     const call = JSON.parse(vi.mocked(sdk.SubmitSession).mock.calls[0][0]) as { body: { mode: string; content: unknown[] } };
     expect(call.body.mode).toBe('queued');
     expect(call.body.content).toEqual([{ kind: 'text', text: 'queued message' }]);
+  });
+
+  it('forms independent work from unchanged text while a response is held', async () => {
+    let releaseFirst: (value: unknown) => void = () => {};
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    vi.mocked(sdk.SubmitSession)
+      .mockImplementationOnce(() => firstGate as never)
+      .mockResolvedValue(ok({ disposition: 'queued' }));
+    const { target } = await mountBasic();
+    typeInto(target, 'same text');
+    await settle();
+    (target.querySelector('.send') as HTMLElement).click();
+    await settle();
+    // The held response blocks nothing: the explicit Queue action forms
+    // independent work from the unchanged text with its own caller ID and
+    // captured mode/content.
+    (target.querySelector('.queue') as HTMLElement).click();
+    await settle();
+    const calls = vi.mocked(sdk.SubmitSession).mock.calls.map((call) =>
+      JSON.parse(call[0]) as { body: { operation_id: string; mode: string; content: unknown[] } });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].body.operation_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(calls[1].body.operation_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(calls[0].body.operation_id).not.toBe(calls[1].body.operation_id);
+    expect(calls[0].body.mode).toBe('regular');
+    expect(calls[1].body.mode).toBe('queued');
+    expect(calls[0].body.content).toEqual([{ kind: 'text', text: 'same text' }]);
+    expect(calls[1].body.content).toEqual([{ kind: 'text', text: 'same text' }]);
+    releaseFirst(ok({ disposition: 'admitted' }));
+    await settle();
   });
 
   it('keeps the draft and shows the generated error on a known rejection', async () => {
