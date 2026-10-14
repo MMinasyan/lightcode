@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 
 vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
+  AppVersion: vi.fn(),
   Call: vi.fn(),
   NextEvent: vi.fn(),
   Open: vi.fn(),
@@ -17,7 +18,7 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
   SetTitle: vi.fn(),
 }));
 
-import { Call, Open, NextEvent, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { AppVersion, Call, Open, NextEvent, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 import { RuntimeConnection } from './connection';
 import { extractSettingsText, parseExactJSON } from './exactjson';
@@ -207,6 +208,7 @@ function bridge(script: Script = {}) {
   });
   vi.mocked(Open).mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/ws' });
   vi.mocked(SetTitle).mockResolvedValue(undefined);
+  vi.mocked(AppVersion).mockResolvedValue('dev (test)');
   vi.mocked(PickDirectory).mockResolvedValue('');
   vi.mocked(PatchJSON).mockImplementation(async (document, patch) => {
     const members = parseExactJSON(document) as Record<string, unknown>;

@@ -6,8 +6,9 @@
   // precondition), so a stale save intentionally overwrites newer changes.
   // ONE pending value (idle/read/edit/save) gates every input and action.
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
-  import { PatchJSON } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+  import { AppVersion, PatchJSON } from '../../client-bindings/wailsjs/go/desktopclient/Host';
   import { errorText } from '../lib/errors.js';
+  import { settings } from '../lib/settings.js';
   import { invokeNative } from './results';
   import { sameStamp } from './reader';
   import {
@@ -33,8 +34,16 @@
 
   let dialog;
 
+  // The retained native version row starts from its fallback and keeps it when
+  // the native read fails, reporting that failure through the existing note
+  // surface; the appearance rows below are host-local.
+  let appVersion = '';
+
   onMount(() => {
     void load();
+    AppVersion().then((value) => { appVersion = value; }).catch((error) => {
+      dispatch('note', 'Version read failed: ' + errorText(error));
+    });
   });
   let settingsText = null;
   let parsed = null;
@@ -216,6 +225,19 @@
       {#if readError}
         <div class="error">{readError}</div>
       {/if}
+      <!-- Appearance and the native version are host-local UI state: they stay
+           usable while the Runtime settings read is pending or unavailable and
+           never author Runtime configuration. -->
+      <div class="sec">Appearance</div>
+      <label class="row"><span class="label">Wrap code blocks</span>
+        <input class="check" type="checkbox" checked={$settings.wrapCode} aria-label="Wrap code blocks"
+          on:change={(e) => settings.update((s) => ({ ...s, wrapCode: e.target.checked }))} />
+      </label>
+      <label class="row"><span class="label">Font scale</span>
+        <input class="num" type="number" min="50" max="200" step="5" value={$settings.fontScale} aria-label="Font scale"
+          on:change={(e) => settings.update((s) => ({ ...s, fontScale: Math.max(50, Math.min(200, Number(e.target.value) || 100)) }))} />
+      </label>
+      <div class="row"><span class="label">Version</span><span class="readonly" aria-label="Version">{appVersion}</span></div>
       {#if settingsText === null}
         <div class="empty">{pending === 'read' ? 'Loading…' : '(no settings read yet)'}</div>
       {:else}

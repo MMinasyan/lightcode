@@ -6,7 +6,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 
+// The Wails runtime bridge: the assistant Markdown link action forwards the
+// exact href here instead of letting the webview navigate itself.
+vi.mock('../../wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
+
 import type { ConversationItem } from '../generated/protocol/types.gen';
+import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
 
 const items: ConversationItem[] = [
   {
@@ -39,12 +44,17 @@ const items: ConversationItem[] = [
   },
 ];
 
+const clipboardWrite = vi.fn();
+
 beforeEach(() => {
   document.body.innerHTML = '';
+  clipboardWrite.mockReset();
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText: clipboardWrite }, configurable: true });
 });
 
 afterEach(() => {
   document.body.innerHTML = '';
+  vi.clearAllMocks();
 });
 
 async function mountConversation(props = {}) {
@@ -262,6 +272,121 @@ describe('Conversation apply_patch multi-file preview', () => {
     });
     expect(target.textContent).toContain('opaque_thing');
     expect(target.querySelectorAll('.output-block.edit-preview')).toHaveLength(0);
+  });
+});
+
+// --- Assistant link and per-message Markdown copy actions ---------------------
+
+// The same renderer serves the root and the passive child inspector; the child
+// instantiation is this component with forksEnabled false.
+const actionItems: ConversationItem[] = [
+  {
+    item_id: 'u1', kind: 'input', committed_at: '0', operation_id: 'op-u1', origin: 'user',
+    content: [{ kind: 'text', text: 'hello user' }],
+  },
+  {
+    item_id: 'a-link', kind: 'assistant', committed_at: '0', operation_id: 'op-a-link', status: 'completed', source: 'prov/model',
+    content: [{ kind: 'text', text: 'see [the docs](https://example.com/a?b=1#c) for details' }],
+    tool_calls: [],
+  },
+  {
+    item_id: 'a-parts', kind: 'assistant', committed_at: '0', operation_id: 'op-a-parts', status: 'errored', source: 'prov/model',
+    content: [
+      { kind: 'text', text: '**bold** raw' },
+      { kind: 'image_url', url: 'http://img/x.png' },
+      { kind: 'text', text: 'second part' },
+      { kind: 'opaque', opaque_wire_type: 'w', extra: { a: 1 } },
+    ],
+    tool_calls: [],
+  },
+  {
+    item_id: 'a-notext', kind: 'assistant', committed_at: '0', operation_id: 'op-a-notext', status: 'interrupted', source: 'prov/model',
+    content: [{ kind: 'image_url', url: 'http://img/y.png' }, { kind: 'opaque', opaque_wire_type: 'weird', extra: {} }],
+    tool_calls: [],
+  },
+];
+
+describe('assistant link and copy actions', () => {
+  it('cancels anchor navigation and forwards the exact href while non-anchor clicks stay inert (root and child renderer)', async () => {
+    for (const forksEnabled of [true, false]) {
+      const { target, component } = await mountConversation({ items: actionItems, forksEnabled });
+      expect(target.querySelectorAll('.fork')).toHaveLength(forksEnabled ? 1 : 0);
+      const row = target.querySelector('.message.assistant') as HTMLElement;
+      const anchor = row.querySelector('.md a') as HTMLAnchorElement;
+      expect(anchor.getAttribute('href')).toBe('https://example.com/a?b=1#c');
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+      anchor.dispatchEvent(click);
+      expect(click.defaultPrevented).toBe(true);
+      expect(vi.mocked(BrowserOpenURL)).toHaveBeenCalledExactlyOnceWith('https://example.com/a?b=1#c');
+      // A non-anchor click inside the same container is inert.
+      const inert = new MouseEvent('click', { bubbles: true, cancelable: true });
+      row.querySelector('.md p')!.dispatchEvent(inert);
+      expect(inert.defaultPrevented).toBe(false);
+      expect(vi.mocked(BrowserOpenURL)).toHaveBeenCalledTimes(1);
+      unmount(component);
+      document.body.innerHTML = '';
+      vi.mocked(BrowserOpenURL).mockClear();
+    }
+  });
+
+  it('copies each row’s canonical text parts joined with newline and keeps feedback per message', async () => {
+    const { target, component } = await mountConversation({ items: actionItems });
+    const rows = [...target.querySelectorAll('.message.assistant')];
+    const buttons = rows.map((row) => row.querySelector('.copy-icon'));
+    expect(buttons[0]).not.toBeNull(); // completed with canonical text
+    expect(buttons[1]).not.toBeNull(); // errored with canonical text: the same rule
+    expect(buttons[2]).toBeNull(); // interrupted without canonical text: no action
+    clipboardWrite.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    try {
+      (buttons[1] as HTMLElement).click();
+      await Promise.resolve();
+      await tick();
+      // Raw canonical text parts joined with newline: no image URL, no
+      // synthesized opaque text and no rendered HTML.
+      expect(clipboardWrite).toHaveBeenCalledExactlyOnceWith('**bold** raw\nsecond part');
+      expect((buttons[1] as HTMLElement).classList.contains('copied')).toBe(true);
+      // Feedback is per message row.
+      expect((buttons[0] as HTMLElement).classList.contains('copied')).toBe(false);
+      await vi.advanceTimersByTimeAsync(1500);
+      await tick();
+      expect((buttons[1] as HTMLElement).classList.contains('copied')).toBe(false);
+      clipboardWrite.mockClear();
+      (buttons[0] as HTMLElement).click();
+      await Promise.resolve();
+      await tick();
+      expect(clipboardWrite).toHaveBeenCalledExactlyOnceWith('see [the docs](https://example.com/a?b=1#c) for details');
+    } finally {
+      vi.useRealTimers();
+    }
+    unmount(component);
+  });
+
+  it('leaves the row action and its feedback unchanged when the clipboard write rejects', async () => {
+    const { target, component } = await mountConversation({ items: [actionItems[1]] });
+    clipboardWrite.mockRejectedValue(new Error('clipboard denied'));
+    const button = target.querySelector('.copy-icon') as HTMLElement;
+    button.click();
+    await Promise.resolve();
+    await tick();
+    expect(clipboardWrite).toHaveBeenCalledTimes(1);
+    expect(button.classList.contains('copied')).toBe(false);
+    // The failure stays local to the row: no invented success or error text.
+    expect(target.querySelector('.message.assistant')?.textContent).not.toContain('clipboard denied');
+    unmount(component);
+  });
+
+  it('offers no copy action without canonical text, including the provisional area', async () => {
+    const activity = { operationID: 'op1', pieces: [{ kind: 'text', content: 'live provisional text' }], truncated: false, tools: [] };
+    const { target, component } = await mountConversation({ items: [actionItems[0], actionItems[3]], activity, busy: true });
+    // The committed row still renders its opaque/image-only body...
+    expect(target.querySelector('.message.assistant .md')).not.toBeNull();
+    expect(target.querySelector('.provisional-text')?.textContent).toBe('live provisional text');
+    // ...but no row without canonical text gains the action, and neither does a
+    // user input row or a provisional piece.
+    expect(target.querySelector('.copy-icon')).toBeNull();
+    expect(target.querySelector('.message.user .copy-icon')).toBeNull();
+    unmount(component);
   });
 });
 

@@ -2,6 +2,8 @@
   import { afterUpdate, createEventDispatcher } from 'svelte';
   import { renderMarkdown } from '../lib/markdown.js';
   import { settings } from '../lib/settings.js';
+  import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
+  import CopyMarkdown from './CopyMarkdown.svelte';
   import ToolCallBlock from './ToolCallBlock.svelte';
   export let items = [];
   export let activity = null; // ActivityState | null
@@ -45,6 +47,25 @@
 
   function itemContent(item) {
     return (item.content || []).map(contentText).join('\n');
+  }
+
+  // The copy action carries the canonical text parts only; image URLs and
+  // synthesized opaque text are display-only.
+  function canonicalText(item) {
+    return (item.content || [])
+      .filter((part) => part.kind === 'text')
+      .map((part) => part.text || '')
+      .join('\n');
+  }
+
+  // A safe Markdown anchor opens in the system browser; the webview itself
+  // never navigates. Every other click stays inert.
+  function handleMdClick(e) {
+    const a = e.target.closest('a');
+    if (!a) return;
+    e.preventDefault();
+    const href = a.getAttribute('href') || '';
+    if (href) BrowserOpenURL(href);
   }
 
   function signalLabel(item) {
@@ -93,9 +114,13 @@
       </div>
     {:else if item.kind === 'assistant'}
       <div class="message assistant">
+        {#if canonicalText(item)}
+          <CopyMarkdown text={canonicalText(item)} />
+        {/if}
         <div class="source">{item.source || ''}{item.status && item.status !== 'completed' ? ` · ${item.status}` : ''}</div>
         {#if renderedMarkdown.get(item.item_id)}
-          <div class="body md" class:wrap={$settings.wrapCode}>{@html renderedMarkdown.get(item.item_id)}</div>
+          <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+          <div class="body md" class:wrap={$settings.wrapCode} on:click={handleMdClick}>{@html renderedMarkdown.get(item.item_id)}</div>
         {/if}
         {#if item.refusal}
           <div class="refusal">Refused: {item.refusal}</div>

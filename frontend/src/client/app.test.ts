@@ -14,6 +14,7 @@ import { mount, tick, unmount } from 'svelte';
 // native helper using the exact-JSON round trip; the Go helper keeps its own
 // oracle (internal/desktopclient/host_test.go).
 vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
+  AppVersion: vi.fn(),
   Call: vi.fn(),
   NextEvent: vi.fn(),
   Open: vi.fn(),
@@ -22,8 +23,13 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
   SetTitle: vi.fn(),
 }));
 
+// The Wails runtime bridge: the assistant Markdown link action forwards the
+// exact href here instead of letting the webview navigate itself.
+vi.mock('../../wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
+
 import type { Hydration, Session } from '../generated/protocol/types.gen';
-import { Call, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { AppVersion, Call, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
 import { parseExactJSON } from './exactjson';
 import { SessionReader } from './reader';
 import { AttemptLedger } from './attempts';
@@ -230,6 +236,7 @@ function basicMocks(connection: ReturnType<typeof fakeConnection>) {
   }));
   vi.mocked(SetTitle).mockResolvedValue(undefined);
   vi.mocked(PickDirectory).mockResolvedValue('');
+  vi.mocked(AppVersion).mockResolvedValue('dev (test)');
   vi.mocked(PatchJSON).mockImplementation(async (document, patch) => {
     const members = parseExactJSON(document) as Record<string, unknown>;
     const edits = parseExactJSON(patch) as Record<string, unknown>;
@@ -1024,6 +1031,59 @@ describe('child inspection and background', () => {
     expect(childPane.querySelector('textarea')).toBeNull();
     expect(childPane.querySelector('.send')).toBeNull();
     expect(childPane.querySelector('.compact')).toBeNull();
+  });
+
+  it('restores the Markdown link and copy actions on the root and passive child renderers', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const rootItems = [{
+      item_id: 'root-a', kind: 'assistant' as const, committed_at: '0', status: 'completed' as const, source: 'p/m',
+      content: [{ kind: 'text' as const, text: 'root raw **markdown**' }], tool_calls: [],
+    }];
+    const childItems = [{
+      item_id: 'child-a', kind: 'assistant' as const, committed_at: '0', status: 'completed' as const, source: 'p/m',
+      content: [{ kind: 'text' as const, text: 'child raw [docs](https://example.com/child?x=1)' }], tool_calls: [],
+    }];
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
+      const id = (JSON.parse(options) as { session_id: string }).session_id;
+      if (id === 'child1') {
+        return ok(makeHydration({
+          session: childSession('child1', 'open'),
+          conversation: { items: childItems as Hydration['conversation']['items'] },
+        }));
+      }
+      return ok(makeHydration({
+        conversation: { items: rootItems as Hydration['conversation']['items'] },
+        background: [{ kind: 'child', id: 'child1' }],
+      }));
+    });
+    const { target } = await mountApp(connection);
+    // Root pane: the exact raw Markdown is copied, never the rendered HTML.
+    const rootRow = target.querySelector('.content > .message-list .message.assistant') as HTMLElement;
+    expect(rootRow.querySelector('.md strong')?.textContent).toBe('markdown');
+    (rootRow.querySelector('.copy-icon') as HTMLElement).click();
+    await settle();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('root raw **markdown**');
+    // The passive child pane keeps the same link and copy behavior.
+    (target.querySelector('[aria-label="Background sessions"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Inspect child session child1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const childPane = target.querySelector('.child-pane') as HTMLElement;
+    expect(childPane.querySelector('.fork')).toBeNull();
+    const childRow = childPane.querySelector('.message.assistant') as HTMLElement;
+    const anchor = childRow.querySelector('.md a') as HTMLAnchorElement;
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+    anchor.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
+    expect(vi.mocked(BrowserOpenURL)).toHaveBeenCalledExactlyOnceWith('https://example.com/child?x=1');
+    writeText.mockClear();
+    (childRow.querySelector('.copy-icon') as HTMLElement).click();
+    await settle();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('child raw [docs](https://example.com/child?x=1)');
   });
 
   it('renders the child own pending projection in the passive inspector, including repeats', async () => {
@@ -2541,6 +2601,101 @@ describe('settings editor', () => {
     const call = vi.mocked(sdk.UpdateConfigurationSettings).mock.calls.at(-1)?.[0] as string;
     expect(bodyOf(call)).toContain('"archive_after_days":5');
     expect(target.textContent).toContain('Settings saved');
+  });
+});
+
+// --- Host-local appearance and version (no Runtime document involvement) ------
+
+describe('host-local appearance and version', () => {
+  const DEFAULTS = { wrapCode: false, fontScale: 100, viewerFraction: 0.5 };
+
+  afterEach(async () => {
+    // The shared store is a module singleton; restore its defaults so this
+    // surface leaves no appearance state for its neighbours.
+    const { settings } = await import('../lib/settings.js');
+    settings.set({ ...DEFAULTS });
+    localStorage.removeItem('lightcode.settings');
+  });
+
+  it('edits and persists the shared store with the 50-200 clamp and never touches the Runtime document', async () => {
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
+    await toggleCheckbox(target, 'Wrap code blocks', true);
+    await changeInput(target, 'Font scale', '900');
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+      .toEqual({ wrapCode: true, fontScale: 200, viewerFraction: 0.5 });
+    await changeInput(target, 'Font scale', '10');
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+      .toEqual({ wrapCode: true, fontScale: 50, viewerFraction: 0.5 });
+    expect((target.querySelector('[aria-label="Font scale"]') as HTMLInputElement).value).toBe('50');
+    await toggleCheckbox(target, 'Wrap code blocks', false);
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(false);
+    // Appearance is client-owned UI state: no configuration write and no
+    // native document edit.
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
+    expect(vi.mocked(PatchJSON)).not.toHaveBeenCalled();
+  });
+
+  it('keeps the host-local rows live while the Runtime settings read is pending', async () => {
+    const connection = settingsRawConnection();
+    let release: (value: unknown) => void = () => {};
+    const gate = new Promise((resolve) => { release = resolve; });
+    let reads = 0;
+    // The boot global read resolves; the editor's own exact read stays parked.
+    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
+      reads += 1;
+      return reads === 1 ? okRaw(RAW_CONFIGURATION) : (gate as never);
+    });
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    // Runtime settings are still pending...
+    expect(target.textContent).toContain('Loading…');
+    // ...while the host-local rows are already live.
+    expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
+    await toggleCheckbox(target, 'Wrap code blocks', true);
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(true);
+    release(okRaw(RAW_CONFIGURATION));
+    await settle();
+    await settle();
+    expect(target.textContent).not.toContain('Loading…');
+    expect(target.querySelector('[aria-label="archive_after_days"]')).not.toBeNull();
+  });
+
+  it('keeps the host-local rows live when the Runtime settings read is unavailable', async () => {
+    const connection = settingsRawConnection();
+    let reads = 0;
+    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
+      reads += 1;
+      if (reads === 1) return okRaw(RAW_CONFIGURATION);
+      throw new Error('runtime unavailable');
+    });
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('runtime unavailable');
+    expect(target.querySelector('[aria-label="archive_after_days"]')).toBeNull();
+    expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
+    await toggleCheckbox(target, 'Wrap code blocks', true);
+    await changeInput(target, 'Font scale', '150');
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+      .toEqual({ wrapCode: true, fontScale: 150, viewerFraction: 0.5 });
+  });
+
+  it('displays the actual version read failure while keeping the fallback and usable appearance controls', async () => {
+    vi.mocked(AppVersion).mockRejectedValueOnce(new Error('version unavailable'));
+    const connection = settingsRawConnection();
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    // The retained fallback survives a failed read...
+    expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('');
+    // ...and the actual failure reaches the existing visible note surface.
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('version unavailable');
+    await toggleCheckbox(target, 'Wrap code blocks', true);
+    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(true);
   });
 });
 
