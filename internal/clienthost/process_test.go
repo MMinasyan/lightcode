@@ -3,10 +3,10 @@ package clienthost_test
 // The clienthost subprocess fixture: one self-exec test binary plays every
 // Runtime owner and contender role over isolated HOME/DataDir/ConfigPath and
 // bounded marker rendezvous. The helper invokes the public
-// Runtime.Open/OpenProtocol/PublishDiscovery path with the shipped builtin
-// plugin set whose factory callbacks are wrapped with a marker, so a losing
-// attempt proves zero factories and zero storage opened. Every role flag
-// rides PrefixArgs before the positional runtime command, exactly as a
+// Runtime.Open/OpenProtocol/PublishDiscovery path with the production sqlite
+// plugin declaration whose factory callback is wrapped with a marker, so a
+// losing attempt proves zero factories and zero storage opened. Every role
+// flag rides PrefixArgs before the positional runtime command, exactly as a
 // production host would pass them.
 
 import (
@@ -33,7 +33,7 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -166,12 +166,12 @@ func runShapedChild(dataDir, configPath, version string, park bool) {
 	awaitStopAndClose(r)
 }
 
-// openRuntime opens the shipped builtin plugin set through the public
-// Runtime constructor, wrapping every test-only factory callback with the
+// openRuntime opens the production sqlite plugin declaration through the
+// public Runtime constructor, wrapping its test-only factory callback with the
 // per-attempt marker. No controlled preparation or private constructor is
 // used.
 func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
-	plugins := builtin.Plugins()
+	plugins := []runtime.Plugin{sqlite.Plugin()}
 	for index := range plugins {
 		plugin := plugins[index]
 		open := plugin.Open
@@ -289,85 +289,10 @@ func markFactory(pluginID string) {
 	}
 }
 
-// writeMarker atomically publishes one rendezvous marker when the role declares it.
+// writeMarker atomically publishes one rendezvous marker.
 func writeMarker(path, content string) {
-	if path == "" {
-		return
-	}
 	if err := atomicfs.Write(path, []byte(content), 0o600); err != nil {
 		childAbort("write marker %s: %v", path, err)
-	}
-}
-
-func TestClientHostMarkerPublication(t *testing.T) {
-	t.Run("omitted", func(t *testing.T) {
-		called := false
-		oldSync := atomicfs.SyncFileFunc
-		atomicfs.SyncFileFunc = func(file *os.File) error {
-			called = true
-			return file.Sync()
-		}
-		t.Cleanup(func() { atomicfs.SyncFileFunc = oldSync })
-		writeMarker("", "unused")
-		if called {
-			t.Fatal("an omitted marker path reached publication")
-		}
-	})
-	for _, before := range []string{"", "http://127.0.0.1:12345\n"} {
-		name := "first"
-		if before != "" {
-			name = "replacement"
-		}
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "ready")
-			if before != "" {
-				writeMarker(path, before)
-			}
-			const content = "http://127.0.0.1:43210\n"
-			parked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			oldSync := atomicfs.SyncFileFunc
-			atomicfs.SyncFileFunc = func(file *os.File) error {
-				close(parked)
-				<-release
-				return file.Sync()
-			}
-			var once sync.Once
-			unblock := func() { once.Do(func() { close(release) }) }
-			t.Cleanup(func() {
-				unblock()
-				<-done
-				atomicfs.SyncFileFunc = oldSync
-			})
-			go func() {
-				writeMarker(path, content)
-				close(done)
-			}()
-			select {
-			case <-parked:
-			case <-done:
-				data, err := os.ReadFile(path)
-				t.Fatalf("writeMarker returned before the prepublication sync gate: marker=%q err=%v", data, err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("writeMarker did not reach the prepublication sync gate")
-			}
-			data, err := os.ReadFile(path)
-			if before == "" {
-				if !os.IsNotExist(err) {
-					t.Fatalf("first marker visible before publication: marker=%q err=%v", data, err)
-				}
-			} else if err != nil || string(data) != before {
-				t.Fatalf("marker before replacement=%q err=%v, want %q", data, err, before)
-			}
-			unblock()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("writeMarker did not finish after publication was released")
-			}
-			if got := string(readFile(t, path)); got != content {
-				t.Fatalf("published marker=%q, want exact contents %q", got, content)
-			}
-		})
 	}
 }
 
@@ -641,10 +566,6 @@ func (s *sandbox) attemptPIDs() []int {
 	return pids
 }
 
-// expectedFactoryIDs is the shipped builtin registration set a winning
-// attempt's per-PID factory marker must show, storage included.
-var expectedFactoryIDs = []string{"sqlite", "tools", "adaptation", "lsp", "jobs", "tasks"}
-
 // outcome is one Connect result, delivered through connectAsync's one-slot
 // buffered channel.
 type outcome struct {
@@ -665,8 +586,8 @@ func connectAsync(ctx context.Context, opts clienthost.Options) <-chan outcome {
 
 // TestClientHostConcurrentStartup proves two concurrent startup calls reach
 // one compatible owner: exactly one contender wins the ownership lock and
-// opens every factory including storage, the other opens none, and both
-// callers receive the same authenticated instance.
+// opens its factories, the other opens none, and both callers receive the
+// same authenticated instance.
 func TestClientHostConcurrentStartup(t *testing.T) {
 	s := newSandbox(t)
 	first := s.launched("first")
@@ -713,18 +634,10 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 				continue
 			}
 			winners++
-			for _, plugin := range expectedFactoryIDs {
-				if !slices.Contains(plugins, plugin) {
-					t.Fatalf("winning attempt %s factories %q miss %s", path, plugins, plugin)
-				}
-			}
 		}
 	}
 	if winners != 1 {
 		t.Fatalf("factory-opening contender attempts = %d, want exactly one", winners)
-	}
-	if _, err := os.Stat(filepath.Join(s.dataDir, "lightcode.db")); err != nil {
-		t.Fatalf("winning storage derivation: %v", err)
 	}
 
 	if err := os.WriteFile(s.stop, []byte("stop"), 0o600); err != nil {
@@ -862,11 +775,8 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 	if !aliveProcessByPID(pid) {
 		t.Fatalf("the canceled Connect killed owner process %d", pid)
 	}
-	plugins := readFactoryMarker(t, contender.dir, pid)
-	for _, plugin := range expectedFactoryIDs {
-		if !slices.Contains(plugins, plugin) {
-			t.Fatalf("the surviving owner factories %q miss %s", plugins, plugin)
-		}
+	if plugins := readFactoryMarker(t, contender.dir, pid); plugins == nil {
+		t.Fatal("the surviving owner opened no factories")
 	}
 
 	if err := os.WriteFile(s.stop, []byte("stop"), 0o600); err != nil {

@@ -4,6 +4,7 @@
 // Session); absence is not rejection. Nothing is retransmitted automatically.
 import type { ContentPart, Hydration } from '../generated/protocol/types.gen';
 import type { RestoreOutcome } from './restore';
+import { writable, type Readable, type Subscriber, type Unsubscriber } from 'svelte/store';
 
 export type AttemptKind = 'submit' | 'compact' | 'fork';
 export type AttemptStatus = 'pending' | 'rejected' | 'unknown';
@@ -34,10 +35,15 @@ export function mintOperationID(): string {
   ).join('');
 }
 
-export class AttemptLedger {
+export class AttemptLedger implements Readable<AttemptLedger> {
+  // The owner publishes itself after every mutation; subscribers observe the
+  // same one state owner, never a copied value record.
+  private readonly store = writable<AttemptLedger>(this);
   private attemptsValue: ComposerAttempt[] = [];
 
-  constructor(private readonly onChange: () => void) {}
+  subscribe(run: Subscriber<AttemptLedger>, invalidate?: () => void): Unsubscriber {
+    return this.store.subscribe(run, invalidate);
+  }
 
   getAttempts(): ComposerAttempt[] {
     return this.attemptsValue;
@@ -74,7 +80,7 @@ export class AttemptLedger {
       restore: null,
     };
     this.attemptsValue = [...this.attemptsValue, attempt];
-    this.onChange();
+    this.store.set(this);
     return attempt;
   }
 
@@ -117,7 +123,7 @@ export class AttemptLedger {
     const next = this.attemptsValue.filter((attempt) => attempt.id !== id);
     if (next.length !== this.attemptsValue.length) {
       this.attemptsValue = next;
-      this.onChange();
+      this.store.set(this);
     }
   }
 
@@ -145,7 +151,7 @@ export class AttemptLedger {
     }
     if (accepted.length > 0) {
       this.attemptsValue = kept;
-      this.onChange();
+      this.store.set(this);
     }
     return accepted;
   }
@@ -160,7 +166,7 @@ export class AttemptLedger {
       return { ...attempt, ...patch };
     });
     if (changed) {
-      this.onChange();
+      this.store.set(this);
     }
   }
 }

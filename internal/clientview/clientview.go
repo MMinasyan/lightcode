@@ -264,17 +264,8 @@ func MergeConversation(older, newer []protocol.ConversationItem) ([]protocol.Con
 	for start+length < len(olderIDs) && newerStart+length < len(newerIDs) && olderIDs[start+length] == newerIDs[newerStart+length] {
 		length++
 	}
-	olderPositions := make(map[string]int, len(olderIDs))
-	for i, id := range olderIDs {
-		olderPositions[id] = i
-	}
 	for i, id := range olderIDs {
 		if _, shared := newerPositions[id]; shared && (i < start || i >= start+length) {
-			return nil, errInvalidConversationDelivery
-		}
-	}
-	for j, id := range newerIDs {
-		if _, shared := olderPositions[id]; shared && (j < newerStart || j >= newerStart+length) {
 			return nil, errInvalidConversationDelivery
 		}
 	}

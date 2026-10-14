@@ -10,6 +10,7 @@ import type {
   ToolFinishedEvent,
   ToolStartedEvent,
 } from '../generated/protocol/types.gen';
+import { writable, type Readable, type Subscriber, type Unsubscriber } from 'svelte/store';
 
 export const ACTIVITY_BYTE_LIMIT = 64 * 1024;
 
@@ -96,10 +97,15 @@ function trimToByteBudget(pieces: ActivityPiece[], limit: number): { pieces: Act
   return { pieces: [], truncated: true };
 }
 
-export class ProvisionalActivity {
+export class ProvisionalActivity implements Readable<ProvisionalActivity> {
+  // The owner publishes itself after every mutation; subscribers observe the
+  // same one state owner, never a copied value record.
+  private readonly store = writable<ProvisionalActivity>(this);
   private stateValue: ActivityState | null = null;
 
-  constructor(private readonly onChange: () => void) {}
+  subscribe(run: Subscriber<ProvisionalActivity>, invalidate?: () => void): Unsubscriber {
+    return this.store.subscribe(run, invalidate);
+  }
 
   getState(): ActivityState | null {
     return this.stateValue;
@@ -130,7 +136,7 @@ export class ProvisionalActivity {
           : tool));
       }
     }
-    this.onChange();
+    this.store.set(this);
     return true;
   }
 
@@ -140,7 +146,7 @@ export class ProvisionalActivity {
       return;
     }
     this.stateValue = null;
-    this.onChange();
+    this.store.set(this);
   }
 
   private ensure(operationID: string): ActivityState {

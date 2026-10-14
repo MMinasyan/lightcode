@@ -1,5 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
+  import { get, writable } from 'svelte/store';
   import { PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
   import { errorText } from '../lib/errors.js';
   import { settings } from '../lib/settings.js';
@@ -39,9 +40,9 @@
   let childID = '';
   let rootReader = null;
   let childReader = null;
-  let rootActivity = new ProvisionalActivity(bump);
-  let childActivity = new ProvisionalActivity(bump);
-  let attempts = new AttemptLedger(bump);
+  const rootActivity = new ProvisionalActivity();
+  const childActivity = new ProvisionalActivity();
+  const attempts = new AttemptLedger();
 
   // Accepted global snapshots: each pairs the accepted revision with its payload.
   let configuration = null;
@@ -57,8 +58,9 @@
   let repairNote = '';
   let repairTask = null;
   let disposed = false;
-  // ONE active first-party modal; the holder is self-assigned so a destroy-time close reads it synchronously.
-  let modal = { name: '' };
+  // ONE active first-party modal as a reactive scalar; named-close handlers
+  // compare through a synchronous get.
+  const modal = writable('');
   let modelLoading = false;
   let modelError = '';
   let models = [];
@@ -89,15 +91,6 @@
   let forkNote = '';
   let forkBusy = false;
 
-  // bump notifies Svelte by reassigning the mutable owners the derivations read.
-  function bump() {
-    rootReader = rootReader;
-    childReader = childReader;
-    rootActivity = rootActivity;
-    childActivity = childActivity;
-    attempts = attempts;
-  }
-
   // ONE addressed outcome rule: rejection/unknown is reported against the captured target.
   function reportAddressed(classified, label, target) {
     if (classified.kind === 'rejection') {
@@ -116,22 +109,22 @@
   }
 
   function openModal(name) {
-    modal.name = name;
-    modal = modal;
+    modal.set(name);
   }
 
   function closeModal(name) {
-    if (modal.name === name) {
-      modal.name = '';
-      modal = modal;
+    if (get(modal) === name) {
+      modal.set('');
     }
   }
 
-  // Two derived render records over the actual reader/activity owners.
-  $: root = viewOf(rootReader, rootActivity, rootID);
-  $: child = viewOf(childReader, childActivity, childID);
+  // Two derived render records over the actual subscribed owners: each pane
+  // depends on its own reader/activity references plus the shared attempt
+  // owner and the authoritative warnings it reads.
+  $: root = viewOf($rootReader, $rootActivity, rootID, $attempts, warnings);
+  $: child = viewOf($childReader, $childActivity, childID, $attempts, warnings);
 
-  function viewOf(reader, activity, sessionID) {
+  function viewOf(reader, activity, sessionID, ledger, globalWarnings) {
     const hydration = reader ? reader.getHydration() : null;
     const operation = hydration && hydration.active_operation ? hydration.active_operation : null;
     return {
@@ -147,11 +140,11 @@
       usage: usageTotals(hydration),
       // With no hydration the global indicator shows the accepted global snapshot.
       ownWarnings: hydration ? hydration.warnings.filter((warning) => warning.session_id === sessionID) : [],
-      globalWarnings: hydration ? hydration.warnings.filter((warning) => !warning.session_id) : (warnings ? warnings.payload : []),
+      globalWarnings: hydration ? hydration.warnings.filter((warning) => !warning.session_id) : (globalWarnings ? globalWarnings.payload : []),
       model: hydration && hydration.selected_model ? hydration.selected_model : '',
       agentType: hydration ? hydration.session.agent_type : '',
       activity: activity.getState(),
-      attempts: attempts.outstanding(sessionID),
+      attempts: ledger.outstanding(sessionID),
     };
   }
 
@@ -222,7 +215,6 @@
       },
       stampFor(sessionID, view),
       readerRepair,
-      bump,
       (hydration) => adoptHydration(sessionID, hydration),
     );
     reader.setFloors(configuration ? configuration.revision : null, warnings ? warnings.revision : null);
@@ -269,8 +261,7 @@
 
   // Repair start discards every runtime-derived dialog and payload; the draft and attempt ledger survive.
   function discardRuntimeProjection() {
-    modal.name = '';
-    modal = modal;
+    modal.set('');
     modelToken += 1;
     forkItem = null;
     forkAttempt = null;
@@ -801,7 +792,7 @@
   }
 
   function toggleSessionPicker() {
-    if (modal.name === 'session') {
+    if (get(modal) === 'session') {
       closeModal('session');
       return;
     }
@@ -934,7 +925,7 @@
   }
 
   function toggleModelDialog() {
-    if (modal.name === 'model') {
+    if (get(modal) === 'model') {
       closeModelDialog();
     } else {
       void openModelDialog();
@@ -1019,7 +1010,8 @@
     }
     if (e.key === 'Escape') {
       // A modal closes first; then Escape interrupts; the child pane closes only on inside focus.
-      if (modal.name !== '') { closeModal(modal.name); return; }
+      const openName = get(modal);
+      if (openName !== '') { closeModal(openName); return; }
       if (document.activeElement?.tagName === 'TEXTAREA') { e.preventDefault(); void interruptNow(); return; }
       if (childID && childPaneEl && childPaneEl.contains(document.activeElement)) closeChild();
     }
@@ -1139,7 +1131,7 @@
     on:compact={compactNow}
     on:retry={(e) => retryAttempt(e.detail)}
     on:abandon={(e) => abandonAttempt(e.detail)} />
-  {#if modal.name === 'session'}
+  {#if $modal === 'session'}
     <SessionPicker openRoots={pickerOpen} archivedRoots={pickerArchived} current={rootID} {workspace} loading={pickerLoading}
       on:select={(e) => pickerSelect(e.detail)}
       on:new={() => void pickerNew()}
@@ -1148,18 +1140,18 @@
       on:remove={(e) => void pickerRemove(e.detail)}
       on:close={() => closeModal('session')} />
   {/if}
-  {#if modal.name === 'workspace'}
+  {#if $modal === 'workspace'}
     <WorkspacePicker workspaces={workspaces} current={workspace}
       on:select={(e) => { closeModal('workspace'); void chooseWorkspace(e.detail); }}
       on:pick={() => void pickWorkspaceDirectory()}
       on:close={() => closeModal('workspace')} />
   {/if}
-  {#if modal.name === 'agent'}
+  {#if $modal === 'agent'}
     <AgentPicker agents={configuration ? configuration.payload : []} current={root.agentType}
       on:select={(e) => void pickAgentType(e.detail)}
       on:close={() => closeModal('agent')} />
   {/if}
-  {#if modal.name === 'settings'}
+  {#if $modal === 'settings'}
     <SettingsEditor getClient={clientNow} stamp={() => stampFor('', 'root')()}
       on:note={(e) => { outcomeNote = e.detail; }}
       on:changed={() => void refreshGlobal('configuration')}
@@ -1169,44 +1161,44 @@
       on:viewer={() => openModal('viewer')}
       on:close={() => closeModal('settings')} />
   {/if}
-  {#if modal.name === 'providers'}
+  {#if $modal === 'providers'}
     <ProviderEditor getClient={clientNow} stamp={() => stampFor('', 'root')()}
       on:note={(e) => { outcomeNote = e.detail; }}
       on:changed={() => void refreshGlobal('configuration')}
       on:close={() => closeModal('providers')} />
   {/if}
-  {#if modal.name === 'viewer'}
+  {#if $modal === 'viewer'}
     <FileViewer getClient={clientNow} stamp={() => stampFor('', 'root')()} {workspace}
       on:close={() => closeModal('viewer')} />
   {/if}
-  {#if modal.name === 'snapshots'}
+  {#if $modal === 'snapshots'}
     <SnapshotsDialog getClient={clientNow} stamp={() => stampFor('', 'root')()} {workspace} sessionID={rootID}
       on:note={(e) => { outcomeNote = e.detail; }}
       on:close={() => closeModal('snapshots')} />
   {/if}
-  {#if modal.name === 'usage'}
+  {#if $modal === 'usage'}
     <UsageDialog usage={root.hydration ? root.hydration.usage : { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } }}
       on:close={() => closeModal('usage')} />
   {/if}
-  {#if modal.name === 'fork' && forkItem}
+  {#if $modal === 'fork' && forkItem}
     <ForkDialog item={forkItem} bind:text={forkText} bind:rewind={forkRewind}
-      attempt={forkAttempt ? attempts.get(forkAttempt.id) : null} note={forkNote} busy={forkBusy}
+      attempt={forkAttempt ? $attempts.get(forkAttempt.id) : null} note={forkNote} busy={forkBusy}
       on:submit={submitFork}
       on:retry={(e) => retryAttempt(e.detail)}
       on:abandon={(e) => abandonAttempt(e.detail)}
       on:close={() => closeModal('fork')} />
   {/if}
-  {#if modal.name === 'model'}
+  {#if $modal === 'model'}
     <ModelDialog agentType={root.agentType} selectedModel={root.model} {models} loading={modelLoading} error={modelError}
       on:select={(e) => void pickModel(e.detail)}
       on:close={() => closeModelDialog()} />
   {/if}
-  {#if modal.name === 'background'}
+  {#if $modal === 'background'}
     <BackgroundPanel children={backgroundChildren} jobs={backgroundJobs} currentChild={childID}
       on:open={(e) => { closeModal('background'); openChild(e.detail); }}
       on:close={() => closeModal('background')} />
   {/if}
-  {#if modal.name === 'warnings'}
+  {#if $modal === 'warnings'}
     <dialog class="modal" bind:this={warningsDialog} use:openDialog
       on:click={(e) => { if (e.target === warningsDialog) warningsDialog.close(); }}
       on:close={() => closeModal('warnings')}

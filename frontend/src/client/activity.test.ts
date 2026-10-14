@@ -85,7 +85,7 @@ describe('keepUtf8Suffix', () => {
 
 describe('ProvisionalActivity', () => {
   it('refuses progress that does not address the accepted active Operation', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     expect(activity.accept(null, textEvent(OP, 'hello'))).toBe(false);
     expect(activity.getState()).toBeNull();
     expect(activity.accept('other-op', textEvent(OP, 'hello'))).toBe(false);
@@ -93,7 +93,7 @@ describe('ProvisionalActivity', () => {
   });
 
   it('keeps ordered text/refusal pieces and combines adjacent same-kind', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     activity.accept(OP, textEvent(OP, 'hello '));
     activity.accept(OP, textEvent(OP, 'world'));
     activity.accept(OP, refusalEvent(OP, 'no'));
@@ -107,7 +107,7 @@ describe('ProvisionalActivity', () => {
   });
 
   it('applies ONE combined 64 KiB budget across mixed text and refusal', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     // Fill the shared range past its single budget with an interleaved kind.
     activity.accept(OP, textEvent(OP, 't'.repeat(ACTIVITY_BYTE_LIMIT - 10)));
     activity.accept(OP, refusalEvent(OP, 'r'.repeat(10)));
@@ -123,7 +123,7 @@ describe('ProvisionalActivity', () => {
   });
 
   it('ignores repeated positions and empty fragments without a backlog', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     activity.accept(OP, textEvent(OP, 'one', 5));
     activity.accept(OP, textEvent(OP, 'two', 5));
     activity.accept(OP, textEvent(OP, '', 7));
@@ -132,7 +132,7 @@ describe('ProvisionalActivity', () => {
   });
 
   it('keys tool activity by call ID with name and status only', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     activity.accept(OP, toolStarted(OP, 'c1', 'read_file'));
     activity.accept(OP, toolStarted(OP, 'c2', 'write_file'));
     activity.accept(OP, toolFinished(OP, 'c1', 'success'));
@@ -145,18 +145,24 @@ describe('ProvisionalActivity', () => {
   });
 
   it('resets its buffer when the Operation changes', () => {
-    const activity = new ProvisionalActivity(() => {});
+    const activity = new ProvisionalActivity();
     activity.accept(OP, textEvent(OP, 'old'));
     activity.accept('op2', textEvent('op2', 'new'));
     expect(activity.getState()).toMatchObject({ operationID: 'op2', pieces: [{ kind: 'text', content: 'new' }] });
   });
 
-  it('clears on authoritative replacement', () => {
-    const onChange = vi.fn();
-    const activity = new ProvisionalActivity(onChange);
+  it('clears on authoritative replacement and publishes the same owner', () => {
+    const activity = new ProvisionalActivity();
+    const seen: ProvisionalActivity[] = [];
+    const stop = activity.subscribe((value) => { seen.push(value); });
     activity.accept(OP, textEvent(OP, 'gone'));
+    const before = seen.length;
     activity.clear();
     expect(activity.getState()).toBeNull();
-    expect(onChange).toHaveBeenCalled();
+    expect(seen.length).toBe(before + 1);
+    expect(seen.every((value) => value === activity)).toBe(true);
+    stop();
+    activity.accept(OP, textEvent(OP, 'late'));
+    expect(seen).toHaveLength(before + 1);
   });
 });

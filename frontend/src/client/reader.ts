@@ -19,6 +19,7 @@ import {
   mergeConversation,
   validateRevisionHint,
 } from './projection';
+import { writable, type Readable, type Subscriber, type Unsubscriber } from 'svelte/store';
 
 // Immutable addressing captured before every read; a completion applies only
 // while its stamp still describes the presented view.
@@ -76,7 +77,10 @@ export function unresolvedAssistantIDs(items: ConversationItem[]): string[] {
 
 type StepOutcome = 'adopted' | 'stale' | 'error' | 'repair' | 'superseded' | 'stopped';
 
-export class SessionReader {
+export class SessionReader implements Readable<SessionReader> {
+  // The owner publishes itself after every mutation; subscribers observe the
+  // same one state owner, never a copied value record.
+  private readonly store = writable<SessionReader>(this);
   private itemsValue: ConversationItem[] = [];
   private hydrationValue: Hydration | null = null;
   private floorValue: SessionRevision | null = null;
@@ -94,9 +98,12 @@ export class SessionReader {
     private readonly transport: ReaderTransport,
     private readonly stamp: () => ReaderStamp,
     private readonly onRepair: (reason: string) => void,
-    private readonly onChange: () => void,
     private readonly onAdopt?: (hydration: Hydration) => void,
   ) {}
+
+  subscribe(run: Subscriber<SessionReader>, invalidate?: () => void): Unsubscriber {
+    return this.store.subscribe(run, invalidate);
+  }
 
   getItems(): ConversationItem[] {
     return this.itemsValue;
@@ -209,7 +216,7 @@ export class SessionReader {
     if (!this.busyValue) {
       this.chainPromise = this.runChain();
     } else {
-      this.onChange();
+      this.store.set(this);
     }
   }
 
@@ -218,7 +225,7 @@ export class SessionReader {
       return;
     }
     this.busyValue = true;
-    this.onChange();
+    this.store.set(this);
     try {
       while (!this.disposedValue) {
         let outcome: StepOutcome;
@@ -244,7 +251,7 @@ export class SessionReader {
       }
     } finally {
       this.busyValue = false;
-      this.onChange();
+      this.store.set(this);
     }
   }
 
@@ -259,7 +266,7 @@ export class SessionReader {
     this.errorValue = null;
     this.dirtyValue = false;
     this.pendingOlder = false;
-    this.onChange();
+    this.store.set(this);
     this.onRepair(reason);
     return 'repair';
   }
@@ -276,7 +283,7 @@ export class SessionReader {
       return this.repairState(label + ' delivery is invalid: ' + outcome.message);
     }
     this.errorValue = outcome.message;
-    this.onChange();
+    this.store.set(this);
     return 'error';
   }
 
@@ -412,11 +419,11 @@ export class SessionReader {
     this.itemsValue = merged;
     this.errorValue = null;
     if (bridgeOnly) {
-      this.onChange();
+      this.store.set(this);
       return 'stale';
     }
     this.hydrationValue = next;
-    this.onChange();
+    this.store.set(this);
     this.onAdopt?.(next);
     return 'adopted';
   }
@@ -454,7 +461,7 @@ export class SessionReader {
     this.itemsValue = merged;
     this.oldestCursorValue = page.older_cursor ?? null;
     this.errorValue = null;
-    this.onChange();
+    this.store.set(this);
     return 'adopted';
   }
 }

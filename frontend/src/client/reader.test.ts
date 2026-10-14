@@ -121,7 +121,6 @@ function makeHarness(): Harness {
     transport,
     () => ({ ...stamp }),
     repairMock,
-    () => {},
     (value) => adopted.push(value),
   );
   async function settle(): Promise<void> {
@@ -635,6 +634,26 @@ describe('SessionReader stamps, lifecycle and supersession', () => {
   });
 });
 
+describe('SessionReader store subscription', () => {
+  it('publishes the same owner on every mutation and stops after unsubscribe', async () => {
+    const harness = makeHarness();
+    harness.hydrationMock.mockResolvedValue(okRead(hydration(revision('1'), range(1, 3), null)));
+    const seen: SessionReader[] = [];
+    const stop = harness.reader.subscribe((value) => { seen.push(value); });
+    const start = seen.length;
+    await harness.refresh();
+    expect(seen.length).toBeGreaterThan(start);
+    expect(seen.every((value) => value === harness.reader)).toBe(true);
+    stop();
+    const stopped = seen.length;
+    harness.hydrationMock.mockResolvedValueOnce(okRead(hydration(revision('2'), range(1, 4), null)));
+    expect(harness.reader.hint(revision('2'), 'session')).toBe('dirty');
+    await harness.settle();
+    expect(harness.reader.getItems()).toHaveLength(4);
+    expect(seen).toHaveLength(stopped);
+  });
+});
+
 describe('SessionReader hints', () => {
   it('covers hints at or below the accepted clocks and dirties on newer ones', async () => {
     const harness = makeHarness();
@@ -673,12 +692,6 @@ describe('SessionReader hints', () => {
     expect(harness.reader.hint(revision('not-a-number'), 'session')).toBe('repair');
     expect(harness.repairMock).toHaveBeenCalledOnce();
   });
-
-  it('dirties when no hydration has been accepted yet', () => {
-    const harness = makeHarness();
-    harness.hydrationMock.mockImplementation(() => new Promise<ReaderOutcome<Hydration>>(() => {}));
-    expect(harness.reader.hint(revision('1'), 'session')).toBe('dirty');
-  });
 });
 
 describe('SessionReader revision-hint validity', () => {
@@ -713,7 +726,7 @@ describe('SessionReader revision-hint validity', () => {
     expect(harness.repairMock).toHaveBeenCalledOnce();
   });
 
-  it('still dirties on a VALID hint during a held initial hydration', () => {
+  it('dirties on a valid hint when no hydration has been accepted yet', () => {
     const harness = makeHarness();
     harness.hydrationMock.mockImplementation(() => new Promise<ReaderOutcome<Hydration>>(() => {}));
     expect(harness.reader.hint(revision('1'), 'session')).toBe('dirty');

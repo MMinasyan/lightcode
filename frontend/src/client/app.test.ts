@@ -25,6 +25,8 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
 import type { Hydration, Session } from '../generated/protocol/types.gen';
 import { Call, PatchJSON, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import { parseExactJSON } from './exactjson';
+import { SessionReader } from './reader';
+import { AttemptLedger } from './attempts';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 
@@ -1018,6 +1020,52 @@ describe('child inspection and background', () => {
     expect(childPane.querySelector('.send')).toBeNull();
     expect(childPane.querySelector('.compact')).toBeNull();
     expect(childPane.querySelector('.queue')).toBeNull();
+  });
+
+  it('child-only provisional progress does not recompute the root pane derivation', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.ListSessions).mockResolvedValue(ok([
+      rootSession('root1', NEWER),
+      { ...rootSession('kid', OLDER), parent_session_id: 'root1' },
+    ]));
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
+      const id = (JSON.parse(options) as { session_id: string }).session_id;
+      return ok(makeHydration({
+        session: rootSession(id, OLDER),
+        active_operation: {
+          operation_id: id === 'kid' ? 'kop' : 'rop',
+          request_kind: 'message',
+          status: 'running',
+          admitted_at: '0',
+          agent_type: 'primary',
+          model: 'prov/m',
+          usage: { totals: { by_model: [] } },
+        },
+      }));
+    });
+    const { target } = await mountApp(connection);
+    await vi.waitFor(() => expect(target.textContent).toContain('root1'));
+    await settle();
+    await settle();
+    (target.querySelector('.bg-btn') as HTMLElement).click();
+    await vi.waitFor(() => expect([...target.querySelectorAll('dialog .row')].some((row) => row.textContent?.includes('kid'))).toBe(true));
+    ([...target.querySelectorAll('dialog .row')].find((row) => row.textContent?.includes('kid')) as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('.child-pane')).not.toBeNull();
+
+    // Observe the pane derivations through their actual owner getters: each
+    // viewOf consumes its own reader plus the shared attempt owner.
+    const getItems = vi.spyOn(SessionReader.prototype, 'getItems');
+    const outstanding = vi.spyOn(AttemptLedger.prototype, 'outstanding');
+    deliverEvent(connection, { kind: 'text_delta', scope: { kind: 'operation', session_id: 'kid', operation_id: 'kop' }, position: 0, content: 'kid live' });
+    await settle();
+    expect(target.querySelector('.child-pane')?.querySelector('.provisional-text')?.textContent).toBe('kid live');
+    expect(outstanding.mock.calls.map((call) => call[0])).not.toContain('root1');
+    const rootReads = getItems.mock.instances.filter((reader) => (reader as SessionReader).getHydration()?.session.session_id === 'root1');
+    expect(rootReads).toHaveLength(0);
+    getItems.mockRestore();
+    outstanding.mockRestore();
   });
 
   it('inspector changes never strand an in-flight root read', async () => {
@@ -3733,6 +3781,96 @@ describe('replacement Fork and ordered rewind', () => {
     expect(target.querySelector('.note.outcome')?.textContent).toContain('Fork admitted to session dest1.');
   });
 
+  it('a held Retry of an unknown Fork transitions to pending and permits no second retry while its response is held', async () => {
+    const connection = forkConnection();
+    vi.mocked(sdk.RevertSessionCode).mockResolvedValue(ok({ restored: [], skipped: [] }));
+    let releaseFork: (value: unknown) => void = () => {};
+    let releaseRetry: (value: unknown) => void = () => {};
+    const firstGate = new Promise((resolve) => { releaseFork = resolve; });
+    const retryGate = new Promise((resolve) => { releaseRetry = resolve; });
+    vi.mocked(sdk.ForkSession)
+      .mockImplementationOnce(() => firstGate as never)
+      .mockImplementationOnce(() => retryGate as never);
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, true);
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.RevertSessionCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(1);
+    const firstBody = bodyOf(vi.mocked(sdk.ForkSession).mock.calls[0][0] as never);
+    releaseFork(new Error('fork lost'));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('Outcome unknown');
+    expect(target.querySelector('[aria-label="Retry fork"]')).not.toBeNull();
+    expect(target.textContent).toContain('Restored: (none)');
+    (target.querySelector('[aria-label="Retry fork"]') as HTMLElement).click();
+    await settle();
+    // The explicit Retry moves the attempt to pending: the old unknown Retry
+    // Fork control is gone, so no second retry is permitted while the retry's
+    // response is held.
+    expect(target.querySelector('[aria-label="Retry fork"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Submit fork"]')?.textContent).toContain('Forking…');
+    expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(2);
+    // One retry keeps the immutable identity/payload and never reruns the
+    // handled restore.
+    expect(bodyOf(vi.mocked(sdk.ForkSession).mock.calls[1][0] as never)).toBe(firstBody);
+    expect(vi.mocked(sdk.RevertSessionCode)).toHaveBeenCalledTimes(1);
+    expect(target.textContent).toContain('Restored: (none)');
+    releaseRetry(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('x') }));
+    await settle();
+    await settle();
+    await settle();
+    // The released outcome lands with the held restore report and nothing
+    // retransmits.
+    expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(2);
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Restored: (none)');
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Fork admitted to session dest1.');
+    expect(vi.mocked(sdk.GetSessionHydration).mock.calls.at(-1)?.[0]).toEqual('{"session_id":"dest1"}');
+  });
+
+  it('a held Retry of a rejected Fork transitions to pending and its release reports the final outcome beside the newer draft', async () => {
+    const connection = forkConnection();
+    let releaseFork: (value: unknown) => void = () => {};
+    let releaseRetry: (value: unknown) => void = () => {};
+    const firstGate = new Promise((resolve) => { releaseFork = resolve; });
+    const retryGate = new Promise((resolve) => { releaseRetry = resolve; });
+    vi.mocked(sdk.ForkSession)
+      .mockImplementationOnce(() => firstGate as never)
+      .mockImplementationOnce(() => retryGate as never);
+    const { target } = await mountApp(connection);
+    await openOwnedFork(target, false);
+    await settle();
+    const firstBody = bodyOf(vi.mocked(sdk.ForkSession).mock.calls[0][0] as never);
+    releaseFork(httpError(409, { code: 'conflict', message: 'fork rejected' }));
+    await settle();
+    await settle();
+    expect(target.textContent).toContain('fork rejected');
+    expect(target.querySelector('[aria-label="Retry fork"]')).not.toBeNull();
+    (target.querySelector('[aria-label="Retry fork"]') as HTMLElement).click();
+    await settle();
+    // Pending transition: the old rejected Retry Fork control is gone while
+    // the retry's response is held.
+    expect(target.querySelector('[aria-label="Retry fork"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Submit fork"]')?.textContent).toContain('Forking…');
+    expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(2);
+    expect(bodyOf(vi.mocked(sdk.ForkSession).mock.calls[1][0] as never)).toBe(firstBody);
+    // A newer replacement draft is typed while the retry is held.
+    const textarea = target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    textarea.value = '[{"kind":"text","text":"newer draft"}]';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    releaseRetry(httpError(409, { code: 'conflict', message: 'fork rejected again' }));
+    await settle();
+    await settle();
+    // The retry's own final outcome is reported, the dialog stays open with
+    // the newer draft retained, and nothing retransmits.
+    expect(target.textContent).toContain('fork rejected again');
+    expect(target.querySelector('[aria-label="Close fork dialog"]')).not.toBeNull();
+    expect((target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement).value).toBe('[{"kind":"text","text":"newer draft"}]');
+    expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(2);
+  });
+
   it('never adopts a late destination over a moved selection and keeps a newer replacement draft', async () => {
     const connection = forkConnection();
     let releaseFork: (value: unknown) => void = () => {};
@@ -4820,16 +4958,17 @@ describe('uniform archive→delete for both lifecycles', () => {
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
     await settle();
     // Switch to Archived tab.
-    (target.querySelector('[aria-label="Show archived sessions"]') as HTMLElement)?.click();
+    const archivedTab = target.querySelector('[aria-label="Archived sessions"]') as HTMLElement;
+    expect(archivedTab).not.toBeNull();
+    archivedTab.click();
     await settle();
     // Delete the archived root: archive is called first (no-write success), then delete.
-    const deleteBtn = target.querySelector('[aria-label="Delete session arch1"]');
-    if (deleteBtn) {
-      (deleteBtn as HTMLElement).click();
-      await settle();
-      await settle();
-      expect(vi.mocked(sdk.ArchiveSession)).toHaveBeenCalled();
-      expect(vi.mocked(sdk.DeleteSession)).toHaveBeenCalled();
-    }
+    const deleteBtn = target.querySelector('[aria-label="Delete session arch1"]') as HTMLElement;
+    expect(deleteBtn).not.toBeNull();
+    deleteBtn.click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.ArchiveSession)).toHaveBeenCalledWith('{"session_id":"arch1"}');
+    expect(vi.mocked(sdk.DeleteSession)).toHaveBeenCalledWith('{"session_id":"arch1"}');
   });
 });
