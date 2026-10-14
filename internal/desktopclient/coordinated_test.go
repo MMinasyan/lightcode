@@ -292,7 +292,7 @@ func (p *pipeACP) hydrate(t *testing.T, id string) protocol.Hydration {
 func desktopHydrate(t *testing.T, host *Host, info ConnectionInfo, id string) protocol.Hydration {
 	t.Helper()
 	var h protocol.Hydration
-	response, err := host.Request(info.Generation, "GET", "/v1/sessions/"+id+"/hydration", "")
+	response, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"`+id+`"}`)
 	if err != nil || response.Status != http.StatusOK {
 		t.Fatalf("desktop hydration: %+v, %v", response, err)
 	}
@@ -417,7 +417,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldInstance := info.InstanceID
-	created, err := host.Request(info.Generation, "POST", "/v1/sessions", fmt.Sprintf(`{"workspace":%q,"agent_type":"primary"}`, workspace))
+	created, err := host.Call(info.Generation, "CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_type":"primary"}}`, workspace))
 	if err != nil || created.Status != http.StatusCreated {
 		t.Fatalf("create root: %+v, %v", created, err)
 	}
@@ -619,7 +619,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	if newInfo.InstanceID == oldInstance || newInfo.Generation == info.Generation {
 		t.Fatal("new owner reused desktop identity/generation")
 	}
-	if _, err := host.Request(info.Generation, "GET", "/v1/health", ""); err == nil {
+	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil {
 		t.Fatal("old generation survived owner replacement")
 	}
 	info = newInfo

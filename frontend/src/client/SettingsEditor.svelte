@@ -6,13 +6,13 @@
   // precondition), so a stale save intentionally overwrites newer changes.
   // ONE pending value (idle/read/edit/save) gates every input and action.
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
-  import { getConfiguration, updateConfigurationSettings } from '../generated/protocol/sdk.gen';
   import { PatchJSON } from '../../client-bindings/wailsjs/go/desktopclient/Host';
   import { errorText } from '../lib/errors.js';
-  import { invokeGenerated } from './results';
+  import { invokeNative } from './results';
   import { sameStamp } from './reader';
   import {
     composeMemberPatch,
+    composeObjectPatch,
     composePluginsPatch,
     composeSessionsPatch,
     extractSettingsText,
@@ -66,7 +66,7 @@
     disposed = true;
   });
 
-  const invoke = (call, label) => invokeGenerated(getClient, label, call);
+  const invoke = (label, operation, params, decode) => invokeNative(getClient, label, operation, params, decode);
 
   // One local edit unit: compose against the current document, publish only
   // while not disposed; a native failure leaves the document unchanged.
@@ -120,20 +120,17 @@
   }
 
   // One stamped exact read for the initial load and a successful save's refresh.
+  // The exact-text settings decoder consumes the accepted body at the boundary.
   async function readSettings() {
     const cap = stamp();
-    const classified = await invoke((client) => getConfiguration({ client, parseAs: 'text' }), 'configuration');
+    const classified = await invoke('configuration', 'GetConfiguration', '{}', extractSettingsText);
     if (disposed || !sameStamp(cap, stamp())) return;
     if (classified.kind !== 'ok') {
       readError = classified.message;
       return;
     }
-    try {
-      settingsText = extractSettingsText(classified.data);
-      readError = '';
-    } catch (e) {
-      readError = errorText(e);
-    }
+    settingsText = classified.data;
+    readError = '';
   }
 
   async function load() {
@@ -178,11 +175,10 @@
     if (text === null) return;
     pending = 'save';
     try {
-      const classified = await invoke((client) => updateConfigurationSettings({
-        client,
-        body: { settings: text },
-        bodySerializer: (body) => `{"settings":${body.settings}}`,
-      }), 'settings save');
+      // The authored settings text is composed into the body byte-exact.
+      const classified = await invoke('settings save', 'UpdateConfigurationSettings', composeObjectPatch([
+        ['body', `{"settings":${text}}`],
+      ]), JSON.parse);
       if (classified.kind === 'rejection') {
         dispatch('note', 'Settings save failed: ' + classified.message);
         return;

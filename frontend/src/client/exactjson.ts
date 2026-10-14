@@ -73,7 +73,8 @@ export function composeSessionsPatch(
   return composeObjectPatch(members);
 }
 
-// Exact Fork body; malformed replacement content stays the server's decision.
+// Exact Fork body; malformed replacement content is the invocation
+// boundary's known local rejection before dispatch.
 export function composeForkBody(boundaryItemID: string, operationID: string, contentText: string): string {
   return composeObjectPatch([
     ['boundary_item_id', JSON.stringify(boundaryItemID)],

@@ -16,7 +16,6 @@ const frontendDir = dirname(scriptsDir);
 const repoDir = dirname(frontendDir);
 const generatedDir = join(frontendDir, 'src', 'generated', 'protocol');
 const projectionPath = join(frontendDir, 'src', 'client', 'projection.ts');
-const transportPath = join(frontendDir, 'src', 'client', 'transport.ts');
 const bootstrapPath = join(frontendDir, 'src', 'client', 'main.ts');
 const connectionPath = join(frontendDir, 'src', 'client', 'connection.ts');
 const readerPath = join(frontendDir, 'src', 'client', 'reader.ts');
@@ -118,7 +117,6 @@ function main() {
         'checks.ts',
         `${toPosix(generatedDir)}/**/*.ts`,
         toPosix(projectionPath),
-        toPosix(transportPath),
         toPosix(bootstrapPath),
         toPosix(connectionPath),
         toPosix(readerPath),

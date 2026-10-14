@@ -6,6 +6,10 @@ export function AppVersion() {
   return window['go']['desktopclient']['Host']['AppVersion']();
 }
 
+export function Call(arg1, arg2, arg3) {
+  return window['go']['desktopclient']['Host']['Call'](arg1, arg2, arg3);
+}
+
 export function NextEvent(arg1) {
   return window['go']['desktopclient']['Host']['NextEvent'](arg1);
 }
@@ -20,10 +24,6 @@ export function PatchJSON(arg1, arg2) {
 
 export function PickDirectory() {
   return window['go']['desktopclient']['Host']['PickDirectory']();
-}
-
-export function Request(arg1, arg2, arg3, arg4) {
-  return window['go']['desktopclient']['Host']['Request'](arg1, arg2, arg3, arg4);
 }
 
 export function SetTitle(arg1) {

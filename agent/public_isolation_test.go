@@ -209,9 +209,9 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/cliclient imports "+imp+"; the terminal client may import only stdlib, client, protocol, clienthost, clientview, clientops, terminal, and golang.org/x/term")
 			}
 		case "internal/desktopclient":
-			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != versionPkg &&
+			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != clientopsPkg && imp != versionPkg &&
 				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && !std[imp] {
-				problems = append(problems, rel+": internal/desktopclient imports "+imp+"; the desktop host may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", the Wails framework, and the native version helper")
+				problems = append(problems, rel+": internal/desktopclient imports "+imp+"; the desktop host may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", the Wails framework, and the native version helper")
 			}
 		case "cmd/desktopclient":
 			if imp != desktopPkg && imp != clienthostPkg && imp != wailsPkg && !std[imp] {
@@ -665,11 +665,11 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 		}
 	}
 	// Root files, legacy adapters, and other sibling target hosts cannot reach
-	// the typed invocation helper; shared startup may use its response checker
-	// but cannot reach the ACP bridge.
+	// the typed invocation helper; shared startup and the desktop host may use
+	// it, but none of them can reach the ACP bridge.
 	for _, rel := range []string{"main.go", "app.go", "internal/acp/x.go", "internal/cli/x.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
 		for _, imp := range []string{publicModule + "/internal/clientops", publicModule + "/internal/acpclient"} {
-			if rel == "internal/clienthost/x.go" && imp == publicModule+"/internal/clientops" {
+			if imp == publicModule+"/internal/clientops" && (rel == "internal/clienthost/x.go" || rel == "internal/desktopclient/x.go") {
 				continue
 			}
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
@@ -685,9 +685,9 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 func TestDependencyRulesDesktopHostIsolation(t *testing.T) {
 	std := standardLibraryImports(t)
 	if problems := checkTrackedGoFile("internal/desktopclient/x.go", []string{
-		"bytes", "context", "encoding/json", "errors", "fmt", "io", "io/fs", "path/filepath", "strconv", "strings", "sync",
+		"bytes", "context", "encoding/json", "errors", "fmt", "io/fs", "path/filepath", "strconv", "strings", "sync",
 		publicModule + "/client", publicModule + "/protocol", publicModule + "/internal/clienthost",
-		publicModule + "/internal/version",
+		publicModule + "/internal/clientops", publicModule + "/internal/version",
 		wailsPkg, wailsRuntimePkg, wailsOptionsPkg, wailsAssetPkg,
 	}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/desktopclient imports flagged: %v", problems)
@@ -697,7 +697,7 @@ func TestDependencyRulesDesktopHostIsolation(t *testing.T) {
 		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/config",
 		publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins",
 		publicModule + "/internal/terminal", publicModule + "/internal/cli",
-		publicModule + "/internal/clientview", publicModule + "/internal/clientops",
+		publicModule + "/internal/clientview",
 	} {
 		if problems := checkTrackedGoFile("internal/desktopclient/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/desktopclient importing %q: %d problems, want 1: %v", imp, len(problems), problems)

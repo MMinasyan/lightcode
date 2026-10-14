@@ -1,6 +1,7 @@
 package cliclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,7 +50,12 @@ func call(s stamp, operation, id string, body, query any, result any) (json.RawM
 	}
 	raw, err := clientops.Call(s.ctx, s.conn, operation, params)
 	if err == nil && result != nil {
-		err = json.Unmarshal(raw, result)
+		// UseNumber keeps opaque numeric lexemes exact while typed fields keep
+		// their generated type checks; unused opaque fields cannot reject a
+		// valid response after the shared invocation succeeds.
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		err = decoder.Decode(result)
 	}
 	return raw, err
 }
@@ -231,7 +237,7 @@ func (c *CLI) readSession(r *sessionReader, chain *readChain) {
 		if err != nil {
 			var syntax *json.SyntaxError
 			var shape *json.UnmarshalTypeError
-			if errors.As(err, &syntax) || errors.As(err, &shape) {
+			if errors.As(err, &syntax) || errors.As(err, &shape) || errors.Is(err, clientops.ErrInvalidResponse) {
 				err = fmt.Errorf("%w: %v", errContinuity, err)
 			}
 			if errors.Is(err, errStalePage) {
@@ -404,7 +410,7 @@ func (c *CLI) readGlobals() {
 		}
 		var syntax *json.SyntaxError
 		var shape *json.UnmarshalTypeError
-		invalid = invalid || errors.As(configErr, &syntax) || errors.As(configErr, &shape) || errors.As(warningErr, &syntax) || errors.As(warningErr, &shape)
+		invalid = invalid || errors.As(configErr, &syntax) || errors.As(configErr, &shape) || errors.As(warningErr, &syntax) || errors.As(warningErr, &shape) || errors.Is(configErr, clientops.ErrInvalidResponse) || errors.Is(warningErr, clientops.ErrInvalidResponse)
 		if invalid {
 			c.globalsBusy = false
 			c.mu.Unlock()

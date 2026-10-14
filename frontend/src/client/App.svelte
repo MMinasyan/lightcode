@@ -1,34 +1,13 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import {
-    archiveSession,
-    compactSession,
-    createSession,
-    deleteSession,
-    forkSession,
-    getConfiguration,
-    getSessionHistory,
-    getSessionHydration,
-    getWarnings,
-    interruptSession,
-    listModels,
-    listSessions,
-    listWorkspaces,
-    reopenSession,
-    revertSessionCode,
-    setAgentTypeModel,
-    setSessionAgentType,
-    stopSession,
-    submitSession,
-  } from '../generated/protocol/sdk.gen';
   import { PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
   import { errorText } from '../lib/errors.js';
   import { settings } from '../lib/settings.js';
   import { ProvisionalActivity } from './activity';
   import { AttemptLedger } from './attempts';
-  import { invokeGenerated } from './results';
+  import { invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
-  import { composeForkBody } from './exactjson';
+  import { composeForkBody, composeObjectPatch } from './exactjson';
   import { SessionReader, okRead, failRead, sameStamp } from './reader';
   import { sortOpenRoots } from './sessions';
   import { compareConfigurationRevision, compareWarningsRevision } from './projection';
@@ -217,7 +196,7 @@
   }
 
   // One invocation boundary; this binding only supplies the App's client accessor.
-  const invoke = (label, call) => invokeGenerated(clientNow, label, call);
+  const invoke = (label, operation, params, decode) => invokeNative(clientNow, label, operation, params, decode);
 
   // A received non-2xx/absent response is an ordinary read failure; an undecodable success is invalid delivery.
   function readOutcome(classified) {
@@ -235,14 +214,10 @@
     const reader = new SessionReader(
       {
         async hydration() {
-          return readOutcome(await invoke('hydration', (client) => getSessionHydration({ client, path: { id: sessionID } })));
+          return readOutcome(await invoke('hydration', 'GetSessionHydration', JSON.stringify({ session_id: sessionID }), JSON.parse));
         },
         async history(_stamp, cursor) {
-          return readOutcome(await invoke('history', (client) => getSessionHistory({
-            client,
-            path: { id: sessionID },
-            query: cursor ? { cursor } : undefined,
-          })));
+          return readOutcome(await invoke('history', 'GetSessionHistory', JSON.stringify(cursor ? { session_id: sessionID, query: { cursor } } : { session_id: sessionID }), JSON.parse));
         },
       },
       stampFor(sessionID, view),
@@ -369,8 +344,8 @@
   async function refreshGlobal(kind) {
     const cap = stampFor(rootID, 'root')();
     const classified = kind === 'configuration'
-      ? await invoke('configuration', (client) => getConfiguration({ client }))
-      : await invoke('warnings', (client) => getWarnings({ client }));
+      ? await invoke('configuration', 'GetConfiguration', '{}', JSON.parse)
+      : await invoke('warnings', 'GetWarnings', '{}', JSON.parse);
     if (!sameStamp(cap, stampFor(rootID, 'root')())) return;
     if (classified.kind !== 'ok') {
       if (classified.kind === 'invalid') { repairNote = classified.message; void requestRepair(); }
@@ -439,10 +414,9 @@
 
   // ONE Create task for a captured Workspace address; callers keep their own adoption.
   async function createSessionIn(addressed) {
-    const classified = await invoke('session create', (client) => createSession({
-      client,
+    const classified = await invoke('session create', 'CreateSession', JSON.stringify({
       body: { workspace: addressed, agent_type: 'primary' },
-    }));
+    }), JSON.parse);
     if (classified.kind !== 'ok' && classified.kind !== 'rejection') {
       unknownCreateWorkspaces.add(addressed);
     }
@@ -453,7 +427,7 @@
     const cap = stampFor('', 'root')();
     // Capture the addressed Workspace before the first await.
     const addressed = workspace;
-    const classified = await invoke('session list', (client) => listSessions({ client, query: { workspace: addressed, lifecycle: 'open' } }));
+    const classified = await invoke('session list', 'ListSessions', JSON.stringify({ query: { workspace: addressed, lifecycle: 'open' } }), JSON.parse);
     if (classified.kind !== 'ok') {
       if (!sameStamp(cap, stampFor('', 'root')())) return;
       openError = classified.message;
@@ -581,16 +555,14 @@
   async function settleAttempt(attempt) {
     const cap = stampFor(attempt.sessionID, 'root')();
     const classified = attempt.kind === 'compact'
-      ? await invoke('compact', (client) => compactSession({
-        client,
-        path: { id: attempt.sessionID },
+      ? await invoke('compact', 'CompactSession', JSON.stringify({
+        session_id: attempt.sessionID,
         body: { operation_id: attempt.id },
-      }))
-      : await invoke('submit', (client) => submitSession({
-        client,
-        path: { id: attempt.sessionID },
+      }), JSON.parse)
+      : await invoke('submit', 'SubmitSession', JSON.stringify({
+        session_id: attempt.sessionID,
         body: { operation_id: attempt.id, mode: attempt.mode, content: attempt.content },
-      }));
+      }), JSON.parse);
     if (classified.kind === 'rejection') {
       attempts.markRejected(attempt.id, classified.message);
       return;
@@ -635,7 +607,7 @@
 
   async function addressControl(operation, label, sessionID) {
     const cap = stampFor(sessionID, 'root')();
-    const classified = await invoke(label, (client) => operation({ client, path: { id: sessionID } }));
+    const classified = await invoke(label, operation, JSON.stringify({ session_id: sessionID }), JSON.parse);
     if (!reportAddressed(classified, label, `session ${sessionID}`)) {
       return;
     }
@@ -645,12 +617,12 @@
 
   function interruptNow() {
     if (!rootID) return;
-    void addressControl(interruptSession, 'Interrupt', rootID);
+    void addressControl('InterruptSession', 'Interrupt', rootID);
   }
 
   function stopNow() {
     if (!rootID) return;
-    void addressControl(stopSession, 'Stop', rootID);
+    void addressControl('StopSession', 'Stop', rootID);
   }
 
   // --- Replacement Fork and ordered code rewind -------------------------------
@@ -692,11 +664,10 @@
     forkBusy = true;
     try {
       if (rewind && attempt.restore === null) {
-        const classified = await invoke('code rewind', (client) => revertSessionCode({
-          client,
-          path: { id: attempt.sessionID },
+        const classified = await invoke('code rewind', 'RevertSessionCode', JSON.stringify({
+          session_id: attempt.sessionID,
           body: { boundary_operation_id: attempt.boundaryOperationID },
-        }));
+        }), JSON.parse);
         const outcome = classifyRestore(classified, 'code rewind');
         attempts.markRestore(attempt.id, outcome);
         forkAttempt = attempts.get(attempt.id);
@@ -706,12 +677,10 @@
         }
       }
       const bodyText = composeForkBody(attempt.boundaryItemID, attempt.id, attempt.replacementText);
-      const classified = await invoke('fork', (client) => forkSession({
-        client,
-        path: { id: attempt.sessionID },
-        body: { boundary_item_id: attempt.boundaryItemID, operation_id: attempt.id, content: [] },
-        bodySerializer: () => bodyText,
-      }));
+      const classified = await invoke('fork', 'ForkSession', composeObjectPatch([
+        ['session_id', JSON.stringify(attempt.sessionID)],
+        ['body', bodyText],
+      ]), JSON.parse);
       if (classified.kind === 'rejection') {
         attempts.markRejected(attempt.id, classified.message);
         forkAttempt = attempts.get(attempt.id);
@@ -751,7 +720,7 @@
   // ListWorkspaces choices and native directory picks both re-run initial composition.
   async function openWorkspacePicker() {
     const cap = stampFor(rootID, 'root')();
-    const classified = await invoke('workspace list', (client) => listWorkspaces({ client }));
+    const classified = await invoke('workspace list', 'ListWorkspaces', '{}', JSON.parse);
     if (!sameStamp(cap, stampFor(rootID, 'root')())) return;
     if (classified.kind !== 'ok') {
       outcomeNote = classified.message;
@@ -802,8 +771,8 @@
   // Workspace, the combined non-ok error and the two actual list calls.
   async function readLifecycleLists() {
     const [openList, archivedList] = await Promise.all([
-      invoke('session list', (client) => listSessions({ client, query: { workspace, lifecycle: 'open' } })),
-      invoke('session list', (client) => listSessions({ client, query: { workspace, lifecycle: 'archived' } })),
+      invoke('session list', 'ListSessions', JSON.stringify({ query: { workspace, lifecycle: 'open' } }), JSON.parse),
+      invoke('session list', 'ListSessions', JSON.stringify({ query: { workspace, lifecycle: 'archived' } }), JSON.parse),
     ]);
     if (openList.kind !== 'ok' || archivedList.kind !== 'ok') {
       return { error: (openList.kind !== 'ok' ? openList : archivedList).message };
@@ -872,7 +841,7 @@
   async function pickerResume(id) {
     rootSelection += 1;
     const cap = stampFor(rootID, 'root')();
-    const classified = await invoke('session reopen', (client) => reopenSession({ client, path: { id } }));
+    const classified = await invoke('session reopen', 'ReopenSession', JSON.stringify({ session_id: id }), JSON.parse);
     if (!reportAddressed(classified, 'Resume', `session ${id}`)) {
       if (sameStamp(cap, stampFor(rootID, 'root')()) && rootReader) rootReader.markDirty();
       return;
@@ -889,7 +858,7 @@
   // archive-first Delete sequence: a known success on the addressed selected
   // root clears only that matching selection; every outcome is reported.
   async function archiveAddressed(id, cap) {
-    const classified = await invoke('session archive', (client) => archiveSession({ client, path: { id } }));
+    const classified = await invoke('session archive', 'ArchiveSession', JSON.stringify({ session_id: id }), JSON.parse);
     if (!reportAddressed(classified, 'Archive', `session ${id}`)) return false;
     if (id === rootID && sameStamp(cap, stampFor(rootID, 'root')())) {
       resetRoot('');
@@ -909,7 +878,7 @@
       return;
     }
     void refreshPicker();
-    const removed = await invoke('session delete', (client) => deleteSession({ client, path: { id } }));
+    const removed = await invoke('session delete', 'DeleteSession', JSON.stringify({ session_id: id }), JSON.parse);
     reportAddressed(removed, 'Delete', `session ${id}`);
     await refreshPicker();
   }
@@ -922,11 +891,10 @@
     const addressed = rootID;
     if (!addressed || !type) return;
     const cap = stampFor(addressed, 'root')();
-    const classified = await invoke('agent type', (client) => setSessionAgentType({
-      client,
-      path: { id: addressed },
+    const classified = await invoke('agent type', 'SetSessionAgentType', JSON.stringify({
+      session_id: addressed,
       body: { agent_type: type },
-    }));
+    }), JSON.parse);
     if (!reportAddressed(classified, 'Agent type change', `session ${addressed}`)) {
       return;
     }
@@ -939,7 +907,7 @@
     modelLoading = true;
     modelError = '';
     const cap = stampFor(rootID, 'root')();
-    const classified = await invoke('model list', (client) => listModels({ client, query: { all: false } }));
+    const classified = await invoke('model list', 'ListModels', JSON.stringify({ query: { all: false } }), JSON.parse);
     try {
       if (token !== modelToken || !sameStamp(cap, stampFor(rootID, 'root')())) return;
       if (classified.kind === 'ok') {
@@ -978,11 +946,10 @@
     const addressedType = root.agentType;
     if (!addressedType) return;
     const cap = stampFor(rootID, 'root')();
-    const classified = await invoke('model selection', (client) => setAgentTypeModel({
-      client,
+    const classified = await invoke('model selection', 'SetAgentTypeModel', JSON.stringify({
       query: { agent_type: addressedType },
       body: { model: ref },
-    }));
+    }), JSON.parse);
     if (!reportAddressed(classified, 'Model selection', `agent type ${addressedType}`)) {
       modelError = classified.message;
       return;

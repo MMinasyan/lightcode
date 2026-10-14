@@ -262,3 +262,134 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 		})
 	}
 }
+
+// opaqueOverflowConfiguration is one valid configuration document whose
+// unused opaque extra_body and options members carry the overflow numeric
+// lexemes as exact bytes, plus its malformed-delivery sibling body.
+const opaqueOverflowConfiguration = `{"configuration_revision":{"instance_id":"` + instance + `","generation":"2"},` +
+	`"settings":{"plugins":{}},"agents":[{"name":"primary","description":"primary agent"},{"name":"planner","description":"planning agent"}],` +
+	`"providers":[{"id":"prov","name":"Prov","connected":true,` +
+	`"extra_body":{"n":9007199254740993},"options":{"big":1e400},` +
+	`"models":[{"id":"m","name":"M","context_window":4096,"source":"user",` +
+	`"extra_body":{"n":9007199254740993},"options":{"big":1e400}}]}]}`
+
+// TestGlobalsAndAgentMenuOpaqueOverflowConfiguration drives the two
+// configuration consumers over the shared call decoder: the global read
+// adopts the valid opaque document and the /agent menu lists it without a
+// repair loop, while the malformed-delivery sibling repairs on the global
+// path and malformed menu data is never adopted.
+func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
+	t.Run("global valid opaque configuration is adopted without a repair loop", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		c.opts.Startup = liveFixture(t, false, nil).opts
+		oldConn := c.conn
+		c.acceptEvent(eventDelivery{c.conn, configHint("2")})
+		receive(t, transport.requests).respondBody(opaqueOverflowConfiguration)
+		receive(t, transport.requests).respond(warnings("2"))
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.configuration == nil || len(c.configuration.Agents) != 2 || c.configuration.Agents[0].Name != "primary" {
+			t.Fatal("valid opaque configuration was not adopted")
+		}
+		if c.conn != oldConn {
+			t.Fatal("valid opaque configuration triggered a repair loop")
+		}
+		select {
+		case <-c.exit:
+			t.Fatal("adoption exited the client")
+		default:
+		}
+	})
+	t.Run("global malformed delivery repairs", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		probed := make(chan struct{}, 4)
+		c.opts.Startup = liveFixture(t, false, func(_ http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path == "/v1/health" {
+				select {
+				case probed <- struct{}{}:
+				default:
+				}
+			}
+			return false
+		}).opts
+		oldConn := c.conn
+		c.acceptEvent(eventDelivery{c.conn, configHint("2")})
+		receive(t, transport.requests).respondBody(`{"configuration_revision":`)
+		receive(t, transport.requests).respond(warnings("2"))
+		// The repair's authenticated readiness probe is the proof the
+		// invalid delivery entered the actual reconnect path.
+		barrier(t, probed)
+		c.mu.Lock()
+		if c.conn == oldConn {
+			c.mu.Unlock()
+			t.Fatal("malformed delivery did not repair the actual connection")
+		}
+		if c.configuration != nil && c.configuration.ConfigurationRevision.Generation != "1" {
+			c.mu.Unlock()
+			t.Fatal("malformed delivery was adopted")
+		}
+		c.closed = true
+		c.cancel()
+		if c.connCancel != nil {
+			c.connCancel()
+		}
+		c.mu.Unlock()
+		settleTasks(t, c)
+	})
+	t.Run("/agent lists the valid opaque configuration without a repair loop", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		c.opts.Startup = liveFixture(t, false, nil).opts
+		c.mu.Lock()
+		oldConn := c.conn
+		c.mu.Unlock()
+		c.command("/agent")
+		receive(t, transport.requests).respondBody(opaqueOverflowConfiguration)
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.menu == nil || len(c.menu.items) != 2 || c.menu.items[0].Label != "primary" || c.menu.items[1].Label != "planner" {
+			t.Fatal("valid opaque configuration was not listed")
+		}
+		if c.conn != oldConn {
+			t.Fatal("the /agent menu triggered a repair loop")
+		}
+		select {
+		case <-c.exit:
+			t.Fatal("menu listing exited the client")
+		default:
+		}
+	})
+	t.Run("malformed menu data is never adopted", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		c.opts.Startup = liveFixture(t, false, nil).opts
+		c.mu.Lock()
+		oldConn := c.conn
+		c.mu.Unlock()
+		c.command("/agent")
+		receive(t, transport.requests).respondBody(`{"agents":`)
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.menu != nil {
+			t.Fatal("malformed menu data was adopted as menu items")
+		}
+		if c.configuration != nil {
+			t.Fatal("malformed menu data was adopted as global state")
+		}
+		// Command paths report the failure and keep their unknown-outcome
+		// behavior; they never repair or resend.
+		if c.conn != oldConn {
+			t.Fatal("the /agent command path repaired instead of reporting")
+		}
+		select {
+		case <-c.exit:
+			t.Fatal("the /agent command path exited the client")
+		default:
+		}
+	})
+}

@@ -20,6 +20,7 @@ export namespace desktopclient {
 	    status: number;
 	    content_type: string;
 	    body: string;
+	    invalid: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new HTTPResponse(source);
@@ -30,6 +31,7 @@ export namespace desktopclient {
 	        this.status = source["status"];
 	        this.content_type = source["content_type"];
 	        this.body = source["body"];
+	        this.invalid = source["invalid"];
 	    }
 	}
 

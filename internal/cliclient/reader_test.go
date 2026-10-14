@@ -29,6 +29,7 @@ const childA = "cccccccccccccccccccccccccccccccc"
 type reply struct {
 	status int
 	value  any
+	raw    string
 	err    error
 }
 type request struct {
@@ -38,6 +39,7 @@ type request struct {
 }
 
 func (r request) respond(value any)            { r.reply <- reply{status: 200, value: value} }
+func (r request) respondBody(raw string)       { r.reply <- reply{status: 200, raw: raw} }
 func (r request) reject(status int, value any) { r.reply <- reply{status: status, value: value} }
 func (r request) lost()                        { r.reply <- reply{err: io.ErrUnexpectedEOF} }
 
@@ -79,7 +81,10 @@ func (s *scriptedTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if result.err != nil {
 		return nil, result.err
 	}
-	raw, _ := json.Marshal(result.value)
+	raw := []byte(result.raw)
+	if result.raw == "" {
+		raw, _ = json.Marshal(result.value)
+	}
 	if result.status == 204 {
 		raw = nil
 	}

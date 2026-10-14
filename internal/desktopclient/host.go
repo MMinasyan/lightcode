@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"path/filepath"
 	"strconv"
@@ -25,9 +24,14 @@ import (
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/clientops"
 	"github.com/MMinasyan/lightcode/internal/version"
 	"github.com/MMinasyan/lightcode/protocol"
 )
+
+// contentTypeJSON is the one content type this host's local invocation
+// results carry.
+const contentTypeJSON = "application/json"
 
 // ConnectionInfo describes one opened native connection generation. The
 // snake-case members are the generated binding wire shape.
@@ -38,12 +42,13 @@ type ConnectionInfo struct {
 }
 
 // HTTPResponse is one raw byte response the native transport forwards: the
-// status, the content type, and the exact body bytes. The snake-case members
-// are the generated binding wire shape.
+// status, the content type, the exact body bytes, and the one invalid-delivery
+// bit. The snake-case members are the generated binding wire shape.
 type HTTPResponse struct {
 	Status      int    `json:"status"`
 	ContentType string `json:"content_type"`
 	Body        string `json:"body"`
+	Invalid     bool   `json:"invalid"`
 }
 
 // Host is the Wails-bound native desktop host. Every exported method is a
@@ -223,11 +228,16 @@ func (h *Host) Open() (ConnectionInfo, error) {
 	return ConnectionInfo{InstanceID: conn.InstanceID(), Generation: generation, Workspace: workspace}, nil
 }
 
-// Request performs one authenticated byte request over the named connection
-// generation and returns its raw status, content type and body bytes. An
-// empty body means no request body. The connection and its context are
-// captured before I/O, so a later open or close cancels the request.
-func (h *Host) Request(generation, method, path, body string) (HTTPResponse, error) {
+// Call performs one lossless generated operation over the named connection
+// generation and returns its actual status and available raw body bytes. The
+// connection and its context are captured before I/O, so a later open or
+// close cancels the call. A received success, a validated Runtime rejection
+// or an invalid delivery all return their status/body without rejecting the
+// binding; an invalid delivery sets the one local Invalid bit because a
+// rejected Wails promise cannot preserve a Go error identity. Any other error
+// rejects the binding. Content-Type is JSON for this local invocation result;
+// credentials are never exposed.
+func (h *Host) Call(generation, operation, params string) (HTTPResponse, error) {
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -235,30 +245,24 @@ func (h *Host) Request(generation, method, path, body string) (HTTPResponse, err
 	}
 	if h.generation == "" || h.generation != generation {
 		h.mu.Unlock()
-		return HTTPResponse{}, errors.New("request carries a stale connection generation")
+		return HTTPResponse{}, errors.New("call carries a stale connection generation")
 	}
 	conn := h.conn
 	ctx := h.connCtx
 	h.mu.Unlock()
 
-	var reader io.Reader
-	if body != "" {
-		reader = strings.NewReader(body)
-	}
-	response, err := conn.Request(ctx, method, path, reader)
+	status, body, err := clientops.Invoke(ctx, conn, operation, json.RawMessage(params))
 	if err != nil {
+		var responseErr *clientops.ResponseError
+		if errors.As(err, &responseErr) {
+			return HTTPResponse{Status: status, ContentType: contentTypeJSON, Body: string(body)}, nil
+		}
+		if errors.Is(err, clientops.ErrInvalidResponse) {
+			return HTTPResponse{Status: status, ContentType: contentTypeJSON, Body: string(body), Invalid: true}, nil
+		}
 		return HTTPResponse{}, err
 	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return HTTPResponse{}, fmt.Errorf("read response body: %w", err)
-	}
-	return HTTPResponse{
-		Status:      response.StatusCode,
-		ContentType: response.Header.Get("Content-Type"),
-		Body:        string(data),
-	}, nil
+	return HTTPResponse{Status: status, ContentType: contentTypeJSON, Body: string(body)}, nil
 }
 
 // NextEvent returns one JSON-marshaled generated Event from the connection

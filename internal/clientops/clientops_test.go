@@ -244,8 +244,8 @@ var dispatchCases = []dispatchCase{
 		body: `{"session_id":"0123456789abcdef0123456789abcdef","turn":1}`,
 	},
 	{
-		name: "GetConfiguration", operation: "GetConfiguration",
-		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"}}`,
+		name: "GetConfiguration with opaque overflow extra_body and options numbers", operation: "GetConfiguration",
+		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","context_window":8192,"extra_body":{"n":9007199254740993},"source":"user"}]}]}`,
 		method: "GET", path: "/v1/configuration",
 	},
 	{
@@ -303,6 +303,13 @@ var dispatchCases = []dispatchCase{
 		status: 200, response: `{"provider":{"id":"prov"}}`,
 		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
 		body: `{"options":{"k":1}}`,
+	},
+	{
+		name: "UpdateProviderDetail with opaque overflow extra_body and options", operation: "UpdateProviderDetail",
+		params: `{"query":{"provider_id":"prov"},"body":{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
+		status: 200, response: `{"provider":{"id":"prov","extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
+		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
+		body: `{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}`,
 	},
 	{
 		name: "DeleteProviderDetail", operation: "DeleteProviderDetail",
@@ -545,20 +552,28 @@ func TestOperationNames(t *testing.T) {
 	}
 }
 
-// TestCheckResponseMapsDeclaredErrors covers the one shared response checker:
-// every 2xx is success, and a non-2xx body is either the declared Error or
-// the partial code-revert result.
-func TestCheckResponseMapsDeclaredErrors(t *testing.T) {
-	for _, status := range []int{200, 201, 204, 299} {
-		if err := clientops.CheckResponse(status, nil); err != nil {
-			t.Errorf("CheckResponse(%d) = %v, want success", status, err)
+// TestInvokeMapsDeclaredErrors drives the shared response owner over the
+// accepting fixture: a declared non-2xx body is either the Error or the
+// partial code-revert result, each returned beside the retained received
+// status and exact body bytes.
+func TestInvokeMapsDeclaredErrors(t *testing.T) {
+	invokeRejection := func(t *testing.T, body string) (int, json.RawMessage, error) {
+		t.Helper()
+		c, doer := newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusConflict, body), nil
 		}
+		return clientops.Invoke(context.Background(), c, "GetHealth", nil)
 	}
 	t.Run("plain error", func(t *testing.T) {
-		err := clientops.CheckResponse(http.StatusConflict, []byte(`{"code":"conflict","message":"in use","session_id":"s1"}`))
+		const payload = `{"code":"conflict","message":"in use","session_id":"s1"}`
+		status, raw, err := invokeRejection(t, payload)
 		var responseErr *clientops.ResponseError
 		if !errors.As(err, &responseErr) {
 			t.Fatalf("error = %v, want *clientops.ResponseError", err)
+		}
+		if status != http.StatusConflict || string(raw) != payload {
+			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
 		}
 		if responseErr.Status != http.StatusConflict {
 			t.Errorf("status = %d, want %d", responseErr.Status, http.StatusConflict)
@@ -572,13 +587,20 @@ func TestCheckResponseMapsDeclaredErrors(t *testing.T) {
 		if responseErr.Error() != "in use" {
 			t.Errorf("Error() = %q, want the returned message", responseErr.Error())
 		}
+		// Declared and malformed remain disjoint outcomes.
+		if errors.Is(err, clientops.ErrInvalidResponse) {
+			t.Fatalf("declared rejection wrapped ErrInvalidResponse: %v", err)
+		}
 	})
 	t.Run("partial result", func(t *testing.T) {
-		body := `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","error":"denied"}]}`
-		err := clientops.CheckResponse(http.StatusConflict, []byte(body))
+		const payload = `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","error":"denied"}]}`
+		status, raw, err := invokeRejection(t, payload)
 		var responseErr *clientops.ResponseError
 		if !errors.As(err, &responseErr) {
 			t.Fatalf("error = %v, want *clientops.ResponseError", err)
+		}
+		if status != http.StatusConflict || string(raw) != payload {
+			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
 		}
 		if responseErr.Partial == nil {
 			t.Fatal("partial = nil, want the complete generated result")
@@ -597,7 +619,7 @@ func TestCheckResponseMapsDeclaredErrors(t *testing.T) {
 		}
 	})
 	t.Run("partial result with empty arrays", func(t *testing.T) {
-		err := clientops.CheckResponse(http.StatusConflict, []byte(`{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`))
+		_, _, err := invokeRejection(t, `{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`)
 		var responseErr *clientops.ResponseError
 		if !errors.As(err, &responseErr) || responseErr.Partial == nil {
 			t.Fatalf("error = %v, want a partial result", err)
@@ -605,9 +627,10 @@ func TestCheckResponseMapsDeclaredErrors(t *testing.T) {
 	})
 }
 
-// TestCheckResponseRejectsMalformedBodies proves every malformed body is a
-// transport failure, never a forged protocol error.
-func TestCheckResponseRejectsMalformedBodies(t *testing.T) {
+// TestInvokeRejectsMalformedRejectionBodies proves every malformed declared
+// non-2xx body is invalid delivery beside its retained status/body, never a
+// forged protocol error and never a local binding failure.
+func TestInvokeRejectsMalformedRejectionBodies(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
@@ -634,17 +657,18 @@ func TestCheckResponseRejectsMalformedBodies(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := clientops.CheckResponse(http.StatusConflict, []byte(tc.body))
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(http.StatusConflict, tc.body), nil
+			}
+			status, raw, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
 			if err == nil {
-				t.Fatal("CheckResponse accepted a malformed body")
+				t.Fatal("Invoke accepted a malformed body")
 			}
-			var responseErr *clientops.ResponseError
-			if errors.As(err, &responseErr) {
-				t.Fatalf("malformed body mapped to a protocol error: %v", err)
+			if status != http.StatusConflict || string(raw) != tc.body {
+				t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
 			}
-			if errors.Is(err, clientops.ErrInvalidParams) {
-				t.Fatalf("malformed body mapped to a local binding failure: %v", err)
-			}
+			assertInvalidDelivery(t, err)
 		})
 	}
 }
@@ -654,29 +678,29 @@ func TestCheckResponseRejectsMalformedBodies(t *testing.T) {
 // *ResponseError, and every transport or malformed failure as neither a
 // protocol error nor a local binding failure.
 func TestCallResponseMappingAndTransportFailures(t *testing.T) {
-	t.Run("unexpected success status", func(t *testing.T) {
+	t.Run("unexpected success status is invalid delivery", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
 			return scriptedResponse(http.StatusCreated, `{}`), nil
 		}
 		_, err := clientops.Call(context.Background(), c, "GetHealth", nil)
-		assertTransportFailure(t, err)
+		assertInvalidDelivery(t, err)
 	})
-	t.Run("malformed success body", func(t *testing.T) {
+	t.Run("malformed success body is invalid delivery", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
 			return scriptedResponse(http.StatusOK, "not json"), nil
 		}
 		_, err := clientops.Call(context.Background(), c, "GetHealth", nil)
-		assertTransportFailure(t, err)
+		assertInvalidDelivery(t, err)
 	})
-	t.Run("empty success body", func(t *testing.T) {
+	t.Run("empty success body is invalid delivery", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
 			return scriptedResponse(http.StatusOK, ""), nil
 		}
 		_, err := clientops.Call(context.Background(), c, "GetHealth", nil)
-		assertTransportFailure(t, err)
+		assertInvalidDelivery(t, err)
 	})
 	t.Run("received runtime error", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
@@ -732,6 +756,116 @@ func TestCallResponseMappingAndTransportFailures(t *testing.T) {
 	})
 }
 
+// TestInvokeRetainsStatusAndBodyOnFailure proves the lossless response owner:
+// a body-read failure, a malformed success or rejection, and an unexpected
+// success status all retain the received status and available body bytes,
+// wrap ErrInvalidResponse, and never become a ResponseError. A declared
+// non-2xx rejection returns the same status/body beside its ResponseError,
+// and a valid 204 returns its status with the empty HTTP body.
+func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
+	t.Run("body read failure retains the received status", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(&failingReader{data: []byte(`{"partial":`)}),
+			}, nil
+		}
+		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
+		if status != http.StatusOK || string(body) != `{"partial":` {
+			t.Fatalf("Invoke = (%d, %q), want the received status and partial bytes", status, body)
+		}
+		assertInvalidDelivery(t, err)
+	})
+	t.Run("malformed success body", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusOK, "not json"), nil
+		}
+		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
+		if status != http.StatusOK || string(body) != "not json" {
+			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, body)
+		}
+		assertInvalidDelivery(t, err)
+	})
+	t.Run("unexpected success status", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusCreated, `{}`), nil
+		}
+		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
+		if status != http.StatusCreated || string(body) != `{}` {
+			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, body)
+		}
+		assertInvalidDelivery(t, err)
+	})
+	t.Run("valid 204 returns its status and empty body", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusNoContent, ""), nil
+		}
+		status, body, err := clientops.Invoke(context.Background(), c, "DeleteSession", json.RawMessage(`{"session_id":"s1"}`))
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if status != http.StatusNoContent || len(body) != 0 {
+			t.Fatalf("Invoke = (%d, %q), want the 204 status and empty body", status, body)
+		}
+	})
+	t.Run("local binding failure returns zero status and no body", func(t *testing.T) {
+		c, _ := newScriptFixture(t)
+		status, body, err := clientops.Invoke(context.Background(), c, "Nope", nil)
+		if status != 0 || body != nil || !errors.Is(err, clientops.ErrInvalidParams) {
+			t.Fatalf("Invoke = (%d, %q, %v), want the zero-status local binding failure", status, body, err)
+		}
+	})
+	t.Run("transport failure returns zero status and no body", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		want := errors.New("dial failed")
+		doer.respond = func(*http.Request) (*http.Response, error) { return nil, want }
+		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
+		if status != 0 || body != nil || !errors.Is(err, want) {
+			t.Fatalf("Invoke = (%d, %q, %v), want the zero-status transport failure", status, body, err)
+		}
+	})
+}
+
+// failingReader delivers its data once, then fails the read, so a body-read
+// failure still yields the received prefix bytes and status.
+type failingReader struct {
+	data []byte
+	done bool
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, errors.New("connection reset")
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, nil
+}
+
+func (r *failingReader) Close() error { return nil }
+
+// assertInvalidDelivery proves one failure is ErrInvalidResponse and never a
+// ResponseError or a local binding failure.
+func assertInvalidDelivery(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, clientops.ErrInvalidResponse) {
+		t.Fatalf("error = %v, want ErrInvalidResponse", err)
+	}
+	var responseErr *clientops.ResponseError
+	if errors.As(err, &responseErr) {
+		t.Fatalf("invalid delivery mapped to a protocol error: %v", err)
+	}
+	if errors.Is(err, clientops.ErrInvalidParams) {
+		t.Fatalf("invalid delivery mapped to a local binding failure: %v", err)
+	}
+}
+
 func assertTransportFailure(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
@@ -743,5 +877,8 @@ func assertTransportFailure(t *testing.T, err error) {
 	}
 	if errors.Is(err, clientops.ErrInvalidParams) {
 		t.Fatalf("transport failure mapped to a local binding failure: %v", err)
+	}
+	if errors.Is(err, clientops.ErrInvalidResponse) {
+		t.Fatalf("transport failure mapped to an invalid delivery: %v", err)
 	}
 }

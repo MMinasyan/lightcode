@@ -6,24 +6,7 @@
   // bodies carry only the edited member; no ReloadConfiguration follows a
   // published mutation.
   import { createEventDispatcher, onMount } from 'svelte';
-  import {
-    connectProvider,
-    createProvider,
-    deleteProviderDetail,
-    deleteProviderModel,
-    discoverProviderCandidates,
-    discoverProviderModelCandidates,
-    disconnectProvider,
-    getProviderDetail,
-    listProviders,
-    reloadConfiguration,
-    resetProviderField,
-    resetProviderModelField,
-    updateProviderDetail,
-    updateProviderModel,
-  } from '../generated/protocol/sdk.gen';
-  import { errorText } from '../lib/errors.js';
-  import { invokeGenerated } from './results';
+  import { invokeNative } from './results';
   import { sameStamp } from './reader';
   import { composeMemberPatch, composeObjectPatch, parseExactJSON } from './exactjson';
   export let getClient;
@@ -87,23 +70,12 @@
   let addModelOutput = '';
 
 
-  const invoke = (call, label) => invokeGenerated(getClient, label, call);
-
-  // One exact-text read boundary: the shared classifier plus exact-JSON parse.
-  async function invokeExact(call, label) {
-    const classified = await invokeGenerated(getClient, label, call);
-    if (classified.kind !== 'ok') return classified;
-    try {
-      return { kind: 'ok', data: parseExactJSON(classified.data) };
-    } catch (e) {
-      return { kind: 'invalid', message: `${label}: ${errorText(e)}` };
-    }
-  }
+  const invoke = (label, operation, params, decode) => invokeNative(getClient, label, operation, params, decode);
 
   async function loadProviders() {
     const token = ++listToken;
     const cap = stamp();
-    const classified = await invoke((client) => listProviders({ client }), 'provider list');
+    const classified = await invoke('provider list', 'ListProviders', '{}', JSON.parse);
     if (token !== listToken || !sameStamp(cap, stamp())) return;
     if (classified.kind === 'ok') {
       providers = classified.data.providers;
@@ -125,12 +97,8 @@
   async function loadDetail(id) {
     const token = ++detailToken;
     const cap = stamp();
-    // Read as exact text so numeric lexemes survive into controls and writes.
-    const classified = await invokeExact((client) => getProviderDetail({
-      client,
-      query: { provider_id: id },
-      parseAs: 'text',
-    }), 'provider detail');
+    // Read through the exact-text decoder so numeric lexemes survive into controls and writes.
+    const classified = await invoke('provider detail', 'GetProviderDetail', JSON.stringify({ query: { provider_id: id } }), parseExactJSON);
     if (token !== detailToken || !sameStamp(cap, stamp()) || id !== selectedID) return;
     if (classified.kind === 'ok') {
       detail = classified.data;
@@ -157,11 +125,11 @@
 
   // ONE busy lifecycle for every real write: holds `busy` through the addressed
   // outcome and the uniform successful refresh (provider list + surviving detail).
-  async function mutate(call, label, target, onSuccess) {
+  async function mutate(operation, params, label, target, onSuccess) {
     if (busy) return;
     busy = true;
     try {
-      const classified = await invoke(call, label);
+      const classified = await invoke(label, operation, params, JSON.parse);
       if (!(await reportMutation(classified, label, target))) return;
       onSuccess?.();
       await loadProviders();
@@ -194,19 +162,15 @@
     // The two generated operations differ only in query identity and body root key.
     const bodyText = composeMemberPatch(modelID === null ? 'provider' : 'model', composeMemberPatch(member, valueText));
     if (modelID === null) {
-      await mutate((client) => updateProviderDetail({
-        client,
-        query: { provider_id: providerID },
-        body: { provider: {} },
-        bodySerializer: () => bodyText,
-      }), 'Provider edit', providerID);
+      await mutate('UpdateProviderDetail', composeObjectPatch([
+        ['query', JSON.stringify({ provider_id: providerID })],
+        ['body', bodyText],
+      ]), 'Provider edit', providerID);
     } else {
-      await mutate((client) => updateProviderModel({
-        client,
-        query: { provider_id: providerID, model_id: modelID },
-        body: { model: {} },
-        bodySerializer: () => bodyText,
-      }), 'Model edit', `${providerID}/${modelID}`);
+      await mutate('UpdateProviderModel', composeObjectPatch([
+        ['query', JSON.stringify({ provider_id: providerID, model_id: modelID })],
+        ['body', bodyText],
+      ]), 'Model edit', `${providerID}/${modelID}`);
     }
   }
 
@@ -214,16 +178,14 @@
     if (!detail) return;
     const providerID = detail.provider.id;
     if (modelID === null) {
-      await mutate((client) => resetProviderField({
-        client,
+      await mutate('ResetProviderField', JSON.stringify({
+        field: member,
         query: { provider_id: providerID },
-        path: { field: member },
       }), 'Provider reset', providerID);
     } else {
-      await mutate((client) => resetProviderModelField({
-        client,
+      await mutate('ResetProviderModelField', JSON.stringify({
+        field: member,
         query: { provider_id: providerID, model_id: modelID },
-        path: { field: member },
       }), 'Model reset', `${providerID}/${modelID}`);
     }
   }
@@ -231,8 +193,7 @@
   async function removeModel(modelID) {
     if (!detail) return;
     const target = detail.provider.id;
-    await mutate((client) => deleteProviderModel({
-      client,
+    await mutate('DeleteProviderModel', JSON.stringify({
       query: { provider_id: target, model_id: modelID },
     }), 'Model delete', `${target}/${modelID}`);
   }
@@ -274,11 +235,7 @@
     const target = detail.provider.id;
     const cap = stamp();
     const token = ++discoveryToken;
-    const classified = await invokeExact((client) => discoverProviderModelCandidates({
-      client,
-      query: { provider_id: target },
-      parseAs: 'text',
-    }), 'model discovery');
+    const classified = await invoke('model discovery', 'DiscoverProviderModelCandidates', JSON.stringify({ query: { provider_id: target } }), parseExactJSON);
     if (token !== discoveryToken || !sameStamp(cap, stamp())) return;
     if (classified.kind === 'ok') addCandidates = classified.data;
     else if (classified.kind === 'rejection') dispatch('note', `Model discovery failed: ${classified.message}`);
@@ -301,12 +258,10 @@
     if (addModelContext.trim() !== '') members.push(['context_window', addModelContext]);
     if (addModelOutput.trim() !== '') members.push(['max_output_tokens', addModelOutput]);
     const bodyText = composeMemberPatch('model', composeObjectPatch(members));
-    await mutate((client) => updateProviderModel({
-      client,
-      query: { provider_id: target, model_id: modelID },
-      body: { model: {} },
-      bodySerializer: () => bodyText,
-    }), 'Model upsert', `${target}/${modelID}`, () => {
+    await mutate('UpdateProviderModel', composeObjectPatch([
+      ['query', JSON.stringify({ provider_id: target, model_id: modelID })],
+      ['body', bodyText],
+    ]), 'Model upsert', `${target}/${modelID}`, () => {
       showAddModel = false;
     });
   }
@@ -320,8 +275,7 @@
     const target = connectFor;
     if (!target) return;
     const key = connectKey.trim();
-    await mutate((client) => connectProvider({
-      client,
+    await mutate('ConnectProvider', JSON.stringify({
       query: { provider_id: target },
       body: key === '' ? {} : { api_key: key },
     }), 'Provider connect', target, () => {
@@ -331,15 +285,13 @@
   }
 
   async function disconnect(providerID) {
-    await mutate((client) => disconnectProvider({
-      client,
+    await mutate('DisconnectProvider', JSON.stringify({
       query: { provider_id: providerID },
     }), 'Provider disconnect', providerID);
   }
 
   async function removeProvider(providerID) {
-    await mutate((client) => deleteProviderDetail({
-      client,
+    await mutate('DeleteProviderDetail', JSON.stringify({
       query: { provider_id: providerID },
     }), 'Provider delete', providerID, () => {
       if (selectedID === providerID) {
@@ -355,15 +307,13 @@
     busy = true;
     try {
       const cap = stamp();
-      const classified = await invokeExact((client) => discoverProviderCandidates({
-        client,
+      const classified = await invoke('provider discovery', 'DiscoverProviderCandidates', JSON.stringify({
         body: {
           base_url: createBaseURL,
           api_key_env: createKeyEnv,
           ...(createKey.trim() === '' ? {} : { api_key: createKey.trim() }),
         },
-        parseAs: 'text',
-      }), 'provider discovery');
+      }), parseExactJSON);
       if (!sameStamp(cap, stamp())) return;
       if (classified.kind === 'ok') {
         createCandidates = classified.data;
@@ -400,8 +350,7 @@
           ...(candidate.cost ? { cost: candidate.cost } : {}),
         }]),
     );
-    await mutate((client) => createProvider({
-      client,
+    await mutate('CreateProvider', JSON.stringify({
       body: {
         id,
         // A blank authored env name is omitted; the Runtime allocates the binding.
@@ -429,7 +378,7 @@
     if (busy) return;
     busy = true;
     try {
-      const classified = await invoke((client) => reloadConfiguration({ client }), 'configuration reload');
+      const classified = await invoke('configuration reload', 'ReloadConfiguration', '{}', JSON.parse);
       if (classified.kind === 'rejection') {
         dispatch('note', `Configuration reload failed: ${classified.message}`);
         return;

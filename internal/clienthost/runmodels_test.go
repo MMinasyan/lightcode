@@ -200,6 +200,31 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 	}
 }
 
+// TestRunModelsOpaqueOverflowFieldsRenders proves unused opaque extra_body
+// and options numbers beyond Number precision, delivered as their exact raw
+// lexemes through the shared invocation, do not disturb the utility's
+// retained output.
+func TestRunModelsOpaqueOverflowFieldsRenders(t *testing.T) {
+	// Raw JSON supplies the overflow lexemes exactly; a generated struct
+	// cannot carry them.
+	raw := `{"configuration_revision":{"instance_id":"` + strings.Repeat("a", 32) + `","generation":"1"},"settings":{},"agents":[{"name":"primary","model":"prov/m"}],"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","name":"M","context_window":4096,"source":"user","extra_body":{"n":9007199254740993},"options":{"big":1e400}}]}]}`
+	opts := modelsEndpoint(t, http.StatusOK, []byte(raw))
+	var out, diagnostics bytes.Buffer
+	if err := clienthost.RunModels(context.Background(), opts, nil, &out, &diagnostics); err != nil {
+		t.Fatalf("RunModels: %v", err)
+	}
+	if out.String() != "prov/m\t4096\t0\tdefault\n" {
+		t.Fatalf("stdout=%q diagnostics=%q, want the retained row despite opaque overflow fields", out.String(), diagnostics.String())
+	}
+	var jsonOut bytes.Buffer
+	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(raw)), []string{"--json"}, &jsonOut, io.Discard); err != nil {
+		t.Fatalf("RunModels --json: %v", err)
+	}
+	if jsonOut.String() != `[{"ref":"prov/m","provider":"prov","providerName":"prov","model":"m","displayName":"M","contextWindow":4096,"maxOutputTokens":0,"hidden":false,"providerHidden":false,"incomplete":false,"default":true,"source":"user"}]`+"\n" {
+		t.Fatalf("json stdout=%q", jsonOut.String())
+	}
+}
+
 func TestRunModelsUsageBeforeStartup(t *testing.T) {
 	// A missing executable would be an ordinary startup error if parsing connected.
 	opts := clienthost.Options{DataDir: t.TempDir(), Executable: "/does-not-exist"}

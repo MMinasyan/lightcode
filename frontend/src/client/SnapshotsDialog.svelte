@@ -4,14 +4,7 @@
   // generated Operation identities; retained snapshots use the selected
   // Workspace, an 8-hex retained ID and each turn's exact after_turn token.
   import { createEventDispatcher, onMount } from 'svelte';
-  import {
-    getRetainedCodeSnapshots,
-    getSessionCodeSnapshots,
-    revertRetainedCode,
-    revertSessionCode,
-  } from '../generated/protocol/sdk.gen';
-  import { errorText } from '../lib/errors.js';
-  import { invokeGenerated } from './results';
+  import { invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
   import { sameStamp } from './reader';
   import { composeObjectPatch, parseExactJSON, readRetainedTurnsText } from './exactjson';
@@ -50,7 +43,7 @@
   }
 
 
-  const invoke = (call, label) => invokeGenerated(getClient, label, call);
+  const invoke = (label, operation, params, decode) => invokeNative(getClient, label, operation, params, decode);
 
   async function loadGroups() {
     const token = ++groupsToken;
@@ -59,7 +52,7 @@
     groupsError = '';
     if (!target) { loadedCurrent = null; currentPending = null; return; }
     currentPending = target;
-    const classified = await invoke((client) => getSessionCodeSnapshots({ client, path: { id: target } }), 'code snapshots');
+    const classified = await invoke('code snapshots', 'GetSessionCodeSnapshots', JSON.stringify({ session_id: target }), JSON.parse);
     if (token !== groupsToken || !sameStamp(cap, stamp())) return;
     currentPending = null;
     if (classified.kind === 'ok') {
@@ -78,11 +71,10 @@
     retainedError = '';
     if (!target) { loadedRetained = null; retainedPending = null; return; }
     retainedPending = { workspace: targetWorkspace, sessionID: target };
-    const classified = await invoke((client) => getRetainedCodeSnapshots({
-      client,
+    // The exact-text retained decoder consumes the accepted body at the boundary.
+    const classified = await invoke('retained snapshots', 'GetRetainedCodeSnapshots', JSON.stringify({
       query: { workspace: targetWorkspace, session_id: target },
-      parseAs: 'text',
-    }), 'retained snapshots');
+    }), (body) => readRetainedTurnsText(parseExactJSON(body)));
     if (token !== retainedToken || !sameStamp(cap, stamp())) return;
     retainedPending = null;
     if (classified.kind !== 'ok') {
@@ -90,12 +82,7 @@
       retainedError = classified.message;
       return;
     }
-    try {
-      loadedRetained = { workspace: targetWorkspace, sessionID: target, turns: readRetainedTurnsText(parseExactJSON(classified.data)) };
-    } catch (e) {
-      loadedRetained = null;
-      retainedError = errorText(e);
-    }
+    loadedRetained = { workspace: targetWorkspace, sessionID: target, turns: classified.data };
   }
 
   // A restore reports its addressed outcome through the App note and inline; the
@@ -105,11 +92,10 @@
     busy = true;
     const cap = stamp();
     const target = loadedCurrent.sessionID;
-    const classified = await invoke((client) => revertSessionCode({
-      client,
-      path: { id: target },
+    const classified = await invoke('code rewind', 'RevertSessionCode', JSON.stringify({
+      session_id: target,
       body: { boundary_operation_id: group.operation_id },
-    }), 'code rewind');
+    }), JSON.parse);
     busy = false;
     const outcome = classifyRestore(classified, 'code rewind');
     restoreText = restoreLines(outcome);
@@ -127,11 +113,9 @@
       ['session_id', JSON.stringify(target)],
       ['after_turn', turnText],
     ]);
-    const classified = await invoke((client) => revertRetainedCode({
-      client,
-      body: { workspace: targetWorkspace, session_id: target, after_turn: 0 },
-      bodySerializer: () => bodyText,
-    }), 'retained rewind');
+    const classified = await invoke('retained rewind', 'RevertRetainedCode', composeObjectPatch([
+      ['body', bodyText],
+    ]), JSON.parse);
     busy = false;
     const outcome = classifyRestore(classified, 'retained rewind');
     restoreText = restoreLines(outcome);

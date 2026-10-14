@@ -1,6 +1,7 @@
 package clienthost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -70,17 +71,18 @@ func RunModels(ctx context.Context, opts Options, args []string, out, diagnostic
 	if err != nil {
 		return err
 	}
-	response, err := c.GetConfigurationWithResponse(ctx)
+	raw, err := clientops.Call(ctx, c, "GetConfiguration", nil)
 	if err != nil {
 		return err
 	}
-	if err := clientops.CheckResponse(response.StatusCode(), response.Body); err != nil {
-		return err
+	// UseNumber keeps opaque numeric lexemes exact while typed fields keep
+	// their generated type checks; only the output consumer decodes here.
+	var view protocol.ConfigurationView
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&view); err != nil {
+		return fmt.Errorf("decode configuration response: %w", err)
 	}
-	if response.JSON200 == nil {
-		return fmt.Errorf("configuration response has no generated body")
-	}
-	view := response.JSON200
 	primaryModel := ""
 	for _, agent := range view.Agents {
 		if agent.Name == "primary" {

@@ -76,10 +76,10 @@ func TestPreviewAssetsServe(t *testing.T) {
 		}
 		if strings.HasSuffix(ref, ".js") {
 			sawScript = true
-			// The bundle must carry the actual transport module: the
-			// placeholder origin string survives minification.
-			if !strings.Contains(body, "runtime.invalid") {
-				t.Fatalf("GET %s served %d bytes without the client transport marker", ref, len(body))
+			// The bundle must carry the actual invocation module: its
+			// invalid-delivery literal survives minification.
+			if !strings.Contains(body, "received an unusable response") {
+				t.Fatalf("GET %s served %d bytes without the client invocation marker", ref, len(body))
 			}
 		}
 	}

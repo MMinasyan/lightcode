@@ -4,6 +4,8 @@ import {desktopclient} from '../models';
 
 export function AppVersion():Promise<string>;
 
+export function Call(arg1:string,arg2:string,arg3:string):Promise<desktopclient.HTTPResponse>;
+
 export function NextEvent(arg1:string):Promise<string>;
 
 export function Open():Promise<desktopclient.ConnectionInfo>;
@@ -11,7 +13,5 @@ export function Open():Promise<desktopclient.ConnectionInfo>;
 export function PatchJSON(arg1:string,arg2:string):Promise<string>;
 
 export function PickDirectory():Promise<string>;
-
-export function Request(arg1:string,arg2:string,arg3:string,arg4:string):Promise<desktopclient.HTTPResponse>;
 
 export function SetTitle(arg1:string):Promise<void>;

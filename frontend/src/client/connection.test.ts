@@ -4,15 +4,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
+  Call: vi.fn(),
   NextEvent: vi.fn(),
   Open: vi.fn(),
-  Request: vi.fn(),
 }));
 
-import { NextEvent, Open, Request } from '../../client-bindings/wailsjs/go/desktopclient/Host';
+import { Call, NextEvent, Open } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
-import { getHealth } from '../generated/protocol/sdk.gen';
 import { RuntimeConnection } from './connection';
+import { invokeNative } from './results';
 
 const eventDocument = '{"kind":"scope_opened","scope":{"kind":"runtime"}}';
 
@@ -35,20 +35,21 @@ beforeEach(() => {
 });
 
 describe('RuntimeConnection.open', () => {
-  it('opens the native connection and wires the generated client over the bridge', async () => {
+  it('opens the native connection and invokes the Call binding with its frozen generation', async () => {
     vi.mocked(Open).mockResolvedValue({ instance_id: '0123456789abcdef0123456789abcdef', generation: '1', workspace: '/ws' });
     vi.mocked(NextEvent).mockImplementation(() => new Promise<string>(() => {}));
-    vi.mocked(Request).mockResolvedValue({
+    vi.mocked(Call).mockResolvedValue({
       status: 200,
       content_type: 'application/json',
       body: '{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}',
+      invalid: false,
     });
     const connection = new RuntimeConnection();
     const info = await connection.open();
     expect(info.generation).toBe('1');
-    const result = await getHealth({ client: connection.getClient() });
-    expect(result.error).toBeUndefined();
-    expect(Request).toHaveBeenCalledExactlyOnceWith('1', 'GET', '/v1/health', '');
+    const result = await invokeNative(() => connection.getClient(), 'health', 'GetHealth', '{}', JSON.parse);
+    expect(result.kind).toBe('ok');
+    expect(Call).toHaveBeenCalledExactlyOnceWith('1', 'GetHealth', '{}');
   });
 
   it('rejects opening after disposal', async () => {
@@ -88,7 +89,7 @@ describe('RuntimeConnection open attempts', () => {
     connection.dispose();
   });
 
-  it('a retained old generated client stays stamped with its own generation', async () => {
+  it('a retained old generation handle stays stamped with its own generation', async () => {
     vi.mocked(Open).mockResolvedValueOnce(connectionInfo('1')).mockResolvedValueOnce(connectionInfo('2'));
     vi.mocked(NextEvent).mockImplementation(() => new Promise<string>(() => {}));
     const connection = new RuntimeConnection();
@@ -99,16 +100,17 @@ describe('RuntimeConnection open attempts', () => {
     // The retained handle of the first connection still carries generation
     // "1"; the native host's stale-generation rejection reaches the caller
     // instead of the handle silently migrating to "2".
-    vi.mocked(Request).mockRejectedValue(new Error('request carries a stale connection generation'));
-    const result = await getHealth({ client: oldClient });
-    expect((result.error as Error).message).toContain('stale connection generation');
-    expect(Request).toHaveBeenCalledExactlyOnceWith('1', 'GET', '/v1/health', '');
+    vi.mocked(Call).mockRejectedValue(new Error('call carries a stale connection generation'));
+    const result = await invokeNative(() => oldClient, 'health', 'GetHealth', '{}', JSON.parse);
+    expect(result.kind).toBe('loss');
+    if (result.kind === 'loss') expect(result.message).toContain('stale connection generation');
+    expect(Call).toHaveBeenCalledExactlyOnceWith('1', 'GetHealth', '{}');
 
     // The current connection handle carries "2".
-    vi.mocked(Request).mockResolvedValue({ status: 204, content_type: '', body: '' });
-    const current = await getHealth({ client: connection.getClient() });
-    expect(current.error).toBeUndefined();
-    expect(Request).toHaveBeenLastCalledWith('2', 'GET', '/v1/health', '');
+    vi.mocked(Call).mockResolvedValue({ status: 204, content_type: 'application/json', body: '', invalid: false });
+    const current = await invokeNative(() => connection.getClient(), 'health', 'GetHealth', '{}', JSON.parse);
+    expect(current.kind).toBe('ok');
+    expect(Call).toHaveBeenLastCalledWith('2', 'GetHealth', '{}');
     connection.dispose();
   });
 

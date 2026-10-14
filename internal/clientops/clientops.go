@@ -42,21 +42,6 @@ type ResponseError struct {
 // Error returns the received Runtime error's message.
 func (e *ResponseError) Error() string { return e.Payload.Message }
 
-// CheckResponse maps one received generated response status/body pair for a
-// direct typed caller: every 2xx is success, and a non-2xx body is the
-// declared Runtime Error or non-2xx CodeRevertResult. A malformed body is a
-// transport failure, never a forged protocol error.
-func CheckResponse(status int, body []byte) error {
-	if status >= 200 && status < 300 {
-		return nil
-	}
-	payload, partial, err := decodeRuntimeError(body)
-	if err != nil {
-		return err
-	}
-	return &ResponseError{Status: status, Payload: payload, Partial: partial}
-}
-
 // decodeRuntimeError decodes one declared non-2xx Runtime body from its
 // preserved raw members: a partial code-revert result requires its non-null
 // restored and skipped arrays and its non-null Error, which supplies the
@@ -176,373 +161,423 @@ func OperationNames() []string {
 	return append([]string(nil), operationNames...)
 }
 
-// Call invokes one generated Runtime operation through the supplied
-// authenticated client. The envelope carries only the addressing the
-// operation declares: session_id for a schema Session path, field for the two
-// reset path enums, and query/body where the operation declares them. The
-// returned document is the generated response's exact raw JSON — the JSON
-// null for a 204 — after the expected-status and body checks.
-func Call(ctx context.Context, c *client.Client, operation string, params json.RawMessage) (json.RawMessage, error) {
+// ErrInvalidResponse marks one received unusable response: a failed body
+// read, a malformed response, or an unexpected success status. This is the
+// invalid-delivery meaning, not a Runtime error code — receiving an unusable
+// response is not absence of a response — so it is never a ResponseError.
+var ErrInvalidResponse = errors.New("invalid runtime response")
+
+// Invoke performs one generated Runtime operation through the supplied
+// authenticated client and returns its lossless result: the received HTTP
+// status and the exact body bytes. The envelope carries only the addressing
+// the operation declares: session_id for a schema Session path, field for the
+// two reset path enums, and query/body where the operation declares them. A
+// received valid response returns its actual status and exact body bytes; a
+// valid 204 returns its status and the empty HTTP body. A declared non-2xx
+// rejection returns those same status/body bytes plus the ResponseError. A
+// local binding failure or a failure to obtain an HTTP response returns zero
+// status, no body and its ordinary error; once an HTTP response exists, its
+// status and available body bytes are retained even on failure.
+func Invoke(ctx context.Context, c *client.Client, operation string, params json.RawMessage) (int, json.RawMessage, error) {
 	var (
-		response wireResponse
+		response *http.Response
 		expected int
 		callErr  error
 	)
 	switch operation {
 	case "GetHealth":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetHealthWithResponse(ctx)
+		response, callErr = c.GetHealth(ctx)
 		expected = http.StatusOK
 	case "ListSessions":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ListSessionsParams
 		if err := bindQuery(env.query, []string{"workspace", "lifecycle"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ListSessionsWithResponse(ctx, &query)
+		response, callErr = c.ListSessions(ctx, &query)
 		expected = http.StatusOK
 	case "CreateSession":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.CreateSessionWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.CreateSessionWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusCreated
 	case "DeleteSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DeleteSessionWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.DeleteSession(ctx, protocol.SessionID(env.session))
 		expected = http.StatusNoContent
 	case "ArchiveSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ArchiveSessionWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.ArchiveSession(ctx, protocol.SessionID(env.session))
 		expected = http.StatusOK
 	case "ReopenSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ReopenSessionWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.ReopenSession(ctx, protocol.SessionID(env.session))
 		expected = http.StatusOK
 	case "SubmitSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.SubmitSessionWithBodyWithResponse(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.SubmitSessionWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "CompactSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.CompactSessionWithBodyWithResponse(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.CompactSessionWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "ForkSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ForkSessionWithBodyWithResponse(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.ForkSessionWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "SetSessionAgentType":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.SetSessionAgentTypeWithBodyWithResponse(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.SetSessionAgentTypeWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "InterruptSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.InterruptSessionWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.InterruptSession(ctx, protocol.SessionID(env.session))
 		expected = http.StatusNoContent
 	case "StopSession":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.StopSessionWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.StopSession(ctx, protocol.SessionID(env.session))
 		expected = http.StatusNoContent
 	case "GetSessionHydration":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetSessionHydrationWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.GetSessionHydration(ctx, protocol.SessionID(env.session))
 		expected = http.StatusOK
 	case "GetSessionHistory":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberOptional, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.GetSessionHistoryParams
 		if env.query != nil {
 			if err := bindQuery(env.query, nil, &query); err != nil {
-				return nil, err
+				return 0, nil, err
 			}
 		}
-		response, callErr = c.GetSessionHistoryWithResponse(ctx, protocol.SessionID(env.session), &query)
+		response, callErr = c.GetSessionHistory(ctx, protocol.SessionID(env.session), &query)
 		expected = http.StatusOK
 	case "GetSessionCodeSnapshots":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetSessionCodeSnapshotsWithResponse(ctx, protocol.SessionID(env.session))
+		response, callErr = c.GetSessionCodeSnapshots(ctx, protocol.SessionID(env.session))
 		expected = http.StatusOK
 	case "RevertSessionCode":
 		env, err := bindEnvelope(params, memberRequired, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.RevertSessionCodeWithBodyWithResponse(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.RevertSessionCodeWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "ListWorkspaces":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ListWorkspacesWithResponse(ctx)
+		response, callErr = c.ListWorkspaces(ctx)
 		expected = http.StatusOK
 	case "ReadWorkspaceFile":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ReadWorkspaceFileWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.ReadWorkspaceFileWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "GetRetainedCodeSnapshots":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.GetRetainedCodeSnapshotsParams
 		if err := bindQuery(env.query, []string{"workspace", "session_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetRetainedCodeSnapshotsWithResponse(ctx, &query)
+		response, callErr = c.GetRetainedCodeSnapshots(ctx, &query)
 		expected = http.StatusOK
 	case "RevertRetainedCode":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.RevertRetainedCodeWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.RevertRetainedCodeWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "GetConfiguration":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetConfigurationWithResponse(ctx)
+		response, callErr = c.GetConfiguration(ctx)
 		expected = http.StatusOK
 	case "ReloadConfiguration":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ReloadConfigurationWithResponse(ctx)
+		response, callErr = c.ReloadConfiguration(ctx)
 		expected = http.StatusOK
 	case "UpdateConfigurationSettings":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.UpdateConfigurationSettingsWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.UpdateConfigurationSettingsWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "SetAgentTypeModel":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.SetAgentTypeModelParams
 		if err := bindQuery(env.query, []string{"agent_type"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.SetAgentTypeModelWithBodyWithResponse(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.SetAgentTypeModelWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "ListModels":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ListModelsParams
 		if err := bindQuery(env.query, []string{"all"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ListModelsWithResponse(ctx, &query)
+		response, callErr = c.ListModels(ctx, &query)
 		expected = http.StatusOK
 	case "ListProviders":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ListProvidersWithResponse(ctx)
+		response, callErr = c.ListProviders(ctx)
 		expected = http.StatusOK
 	case "CreateProvider":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.CreateProviderWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.CreateProviderWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "GetProviderDetail":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.GetProviderDetailParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetProviderDetailWithResponse(ctx, &query)
+		response, callErr = c.GetProviderDetail(ctx, &query)
 		expected = http.StatusOK
 	case "UpdateProviderDetail":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.UpdateProviderDetailParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.UpdateProviderDetailWithBodyWithResponse(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.UpdateProviderDetailWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "DeleteProviderDetail":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.DeleteProviderDetailParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DeleteProviderDetailWithResponse(ctx, &query)
+		response, callErr = c.DeleteProviderDetail(ctx, &query)
 		expected = http.StatusOK
 	case "DiscoverProviderCandidates":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DiscoverProviderCandidatesWithBodyWithResponse(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.DiscoverProviderCandidatesWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "ConnectProvider":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ConnectProviderParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ConnectProviderWithBodyWithResponse(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.ConnectProviderWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "DisconnectProvider":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.DisconnectProviderParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DisconnectProviderWithResponse(ctx, &query)
+		response, callErr = c.DisconnectProvider(ctx, &query)
 		expected = http.StatusOK
 	case "ResetProviderField":
 		env, err := bindEnvelope(params, memberForbidden, memberRequired, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ResetProviderFieldParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ResetProviderFieldWithResponse(ctx, protocol.ProviderField(env.field), &query)
+		response, callErr = c.ResetProviderField(ctx, protocol.ProviderField(env.field), &query)
 		expected = http.StatusOK
 	case "ListProviderModels":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ListProviderModelsParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ListProviderModelsWithResponse(ctx, &query)
+		response, callErr = c.ListProviderModels(ctx, &query)
 		expected = http.StatusOK
 	case "UpdateProviderModel":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberRequired)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.UpdateProviderModelParams
 		if err := bindQuery(env.query, []string{"provider_id", "model_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.UpdateProviderModelWithBodyWithResponse(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
+		response, callErr = c.UpdateProviderModelWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
 		expected = http.StatusOK
 	case "DeleteProviderModel":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.DeleteProviderModelParams
 		if err := bindQuery(env.query, []string{"provider_id", "model_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DeleteProviderModelWithResponse(ctx, &query)
+		response, callErr = c.DeleteProviderModel(ctx, &query)
 		expected = http.StatusOK
 	case "DiscoverProviderModelCandidates":
 		env, err := bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.DiscoverProviderModelCandidatesParams
 		if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.DiscoverProviderModelCandidatesWithResponse(ctx, &query)
+		response, callErr = c.DiscoverProviderModelCandidates(ctx, &query)
 		expected = http.StatusOK
 	case "ResetProviderModelField":
 		env, err := bindEnvelope(params, memberForbidden, memberRequired, memberRequired, memberForbidden)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		var query protocol.ResetProviderModelFieldParams
 		if err := bindQuery(env.query, []string{"provider_id", "model_id"}, &query); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.ResetProviderModelFieldWithResponse(ctx, protocol.ModelField(env.field), &query)
+		response, callErr = c.ResetProviderModelField(ctx, protocol.ModelField(env.field), &query)
 		expected = http.StatusOK
 	case "GetWarnings":
 		if _, err := bindEnvelope(params, memberForbidden, memberForbidden, memberForbidden, memberForbidden); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
-		response, callErr = c.GetWarningsWithResponse(ctx)
+		response, callErr = c.GetWarnings(ctx)
 		expected = http.StatusOK
 	default:
-		return nil, invalidParams("unknown operation %q", operation)
+		return 0, nil, invalidParams("unknown operation %q", operation)
 	}
 	if callErr != nil {
-		return nil, callErr
+		return 0, nil, callErr
 	}
-	return mappedResponse(response.StatusCode(), response.GetBody(), expected)
+	return receive(response, expected)
 }
 
-// wireResponse is the local structural shape every generated response type
-// implements: the raw body and received status one operation call maps.
-type wireResponse interface {
-	StatusCode() int
-	GetBody() []byte
+// Call is the thin typed consumer of Invoke: it returns the raw successful
+// JSON — the JSON null for a 204 — or the same error. It never decodes a
+// success DTO.
+func Call(ctx context.Context, c *client.Client, operation string, params json.RawMessage) (json.RawMessage, error) {
+	status, body, err := Invoke(ctx, c, operation, params)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNoContent {
+		return json.RawMessage("null"), nil
+	}
+	return body, nil
+}
+
+// receive is the one common response owner: it reads and closes the HTTP body
+// once and applies the expected-status, JSON-document, 204 and
+// Error/partial-restore rules. A body-read, malformed-response or
+// unexpected-success-status failure wraps ErrInvalidResponse and retains the
+// received status and available body bytes; a declared non-2xx rejection is
+// the ResponseError over those same bytes.
+func receive(response *http.Response, expected int) (int, json.RawMessage, error) {
+	status := response.StatusCode
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		return status, body, fmt.Errorf("read runtime response body: %w", ErrInvalidResponse)
+	}
+	if status == expected {
+		if expected == http.StatusNoContent {
+			return status, nil, nil
+		}
+		if !json.Valid(body) {
+			return status, body, fmt.Errorf("runtime returned an empty or malformed success body for status %d: %w", status, ErrInvalidResponse)
+		}
+		return status, body, nil
+	}
+	if status < 200 || status >= 300 {
+		payload, partial, err := decodeRuntimeError(body)
+		if err != nil {
+			return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
+		}
+		return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial}
+	}
+	return status, body, fmt.Errorf("runtime returned status %d for an operation expecting %d: %w", status, expected, ErrInvalidResponse)
 }
 
 // envelope is one bound invocation envelope: only the members the addressed
@@ -682,26 +717,6 @@ func bindQuery(raw json.RawMessage, required []string, target any) error {
 		return invalidParams("query: %v", err)
 	}
 	return nil
-}
-
-// mappedResponse returns one generated response's exact raw JSON after the
-// expected-status and required-body checks: a 204 is the JSON null, and a
-// typed success must carry one complete JSON document. A received non-2xx
-// body is mapped through the shared checker.
-func mappedResponse(status int, body []byte, expected int) (json.RawMessage, error) {
-	if status == expected {
-		if expected == http.StatusNoContent {
-			return json.RawMessage("null"), nil
-		}
-		if !json.Valid(body) {
-			return nil, fmt.Errorf("runtime returned an empty or malformed success body for status %d", status)
-		}
-		return json.RawMessage(body), nil
-	}
-	if err := CheckResponse(status, body); err != nil {
-		return nil, err
-	}
-	return nil, fmt.Errorf("runtime returned status %d for an operation expecting %d", status, expected)
 }
 
 // isJSONNull reports whether one raw member is the null literal.

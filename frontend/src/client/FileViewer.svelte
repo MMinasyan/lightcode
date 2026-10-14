@@ -4,10 +4,9 @@
   // and entered path, showing the canonical path and truncation marker. A
   // superseded reply, including one settling after close/reopen, is ignored.
   import { createEventDispatcher } from 'svelte';
-  import { readWorkspaceFile } from '../generated/protocol/sdk.gen';
   import { errorText } from '../lib/errors.js';
   import { settings } from '../lib/settings.js';
-  import { invokeGenerated } from './results';
+  import { invokeNative } from './results';
   import { sameStamp } from './reader';
   export let getClient;
   export let stamp; // () => ReaderStamp
@@ -22,7 +21,7 @@
   let dialog;
 
 
-  const invoke = (call) => invokeGenerated(getClient, 'file read', call);
+  const invoke = (operation, params, decode) => invokeNative(getClient, 'file read', operation, params, decode);
 
   async function open() {
     const token = ++readToken;
@@ -30,10 +29,7 @@
     const target = path;
     loading = true;
     error = '';
-    const classified = await invoke((client) => readWorkspaceFile({
-      client,
-      body: { workspace, path: target },
-    }));
+    const classified = await invoke('ReadWorkspaceFile', JSON.stringify({ body: { workspace, path: target } }), JSON.parse);
     try {
       // A superseded reply applies nothing, success and error alike.
       if (token !== readToken || !sameStamp(cap, stamp())) return;

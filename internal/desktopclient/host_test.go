@@ -198,21 +198,21 @@ func TestDesktopHostOpenGenerationSupersession(t *testing.T) {
 		t.Fatalf("second generation = %q, want the next monotonic stamp", second.Generation)
 	}
 
-	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil {
-		t.Fatal("a superseded generation accepted a request")
+	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil {
+		t.Fatal("a superseded generation accepted a call")
 	}
 	if _, err := host.NextEvent(first.Generation); err == nil {
 		t.Fatal("a superseded generation accepted an event pull")
 	}
 
-	response, err := host.Request(second.Generation, "GET", "/v1/health", "")
+	response, err := host.Call(second.Generation, "GetHealth", "")
 	if err != nil {
-		t.Fatalf("current generation Request: %v", err)
+		t.Fatalf("current generation Call: %v", err)
 	}
 	if response.Status != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", response.Status)
 	}
-	if !strings.Contains(response.ContentType, "application/json") {
+	if response.ContentType != "application/json" {
 		t.Fatalf("health content type = %q, want application/json", response.ContentType)
 	}
 	if !strings.Contains(response.Body, testInstance) {
@@ -220,13 +220,13 @@ func TestDesktopHostOpenGenerationSupersession(t *testing.T) {
 	}
 }
 
-// TestDesktopHostOpenCancelsInFlightRequest proves a newer Open cancels a
-// request the previous generation still holds in flight.
-func TestDesktopHostOpenCancelsInFlightRequest(t *testing.T) {
+// TestDesktopHostOpenCancelsInFlightCall proves a newer Open cancels a
+// generated call the previous generation still holds in flight.
+func TestDesktopHostOpenCancelsInFlightCall(t *testing.T) {
 	arrived := make(chan struct{})
 	observed := make(chan struct{})
 	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
-		"/v1/parked": func(_ http.ResponseWriter, r *http.Request) {
+		"/v1/sessions/parked/hydration": func(_ http.ResponseWriter, r *http.Request) {
 			close(arrived)
 			<-r.Context().Done()
 			close(observed)
@@ -239,7 +239,7 @@ func TestDesktopHostOpenCancelsInFlightRequest(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := host.Request(info.Generation, "GET", "/v1/parked", "")
+		_, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"parked"}`)
 		done <- err
 	}()
 	<-arrived
@@ -247,7 +247,7 @@ func TestDesktopHostOpenCancelsInFlightRequest(t *testing.T) {
 		t.Fatalf("superseding Open: %v", err)
 	}
 	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("superseded request = %v, want context.Canceled", err)
+		t.Fatalf("superseded call = %v, want context.Canceled", err)
 	}
 	select {
 	case <-observed:
@@ -256,30 +256,28 @@ func TestDesktopHostOpenCancelsInFlightRequest(t *testing.T) {
 	}
 }
 
-// TestDesktopHostRequestBytes proves the byte bridge: method, body and raw
-// response bytes pass through unchanged, an empty body sends none, and
-// partial and error documents survive with their exact numeric lexemes.
-func TestDesktopHostRequestBytes(t *testing.T) {
-	const partial = `{"restored":[1,2],"failed":[3],"durable_revision":"9007199254740993"}`
-	var captured struct {
-		method string
-		target string
-		body   string
-	}
+// TestDesktopHostCallClassification proves the Call binding carries the shared
+// invocation owner's result across Wails: success, a validated Runtime
+// rejection, and a valid 204 all return their actual status and available raw
+// body without rejecting the binding; an invalid delivery sets the one local
+// Invalid bit while retaining the received status/body; and a transport
+// failure rejects the binding. Exact request dispatch, envelope binding,
+// opaque bytes and Error/partial discrimination stay at the clientops and
+// protocol owners.
+func TestDesktopHostCallClassification(t *testing.T) {
+	const partial = `{"error":{"code":"conflict","message":"partial"},"restored":["a.go"],"skipped":[]}`
 	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
-		"/v1/sessions/abc/restore": func(w http.ResponseWriter, r *http.Request) {
-			data, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read request body: %v", err)
-			}
-			captured = struct {
-				method string
-				target string
-				body   string
-			}{method: r.Method, target: r.URL.String(), body: string(data)}
+		"/v1/sessions/abc/revert-code": func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_, _ = io.WriteString(w, partial)
+		},
+		"/v1/sessions/abc/interrupt": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		},
+		"/v1/sessions/malformed/hydration": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, "not json")
 		},
 	})
 	host := newHost(t, server)
@@ -288,29 +286,40 @@ func TestDesktopHostRequestBytes(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	response, err := host.Request(info.Generation, "POST", "/v1/sessions/abc/restore?keep=a+b", `{"operation_id":"op-1"}`)
+	success, err := host.Call(info.Generation, "GetHealth", "")
 	if err != nil {
-		t.Fatalf("Request: %v", err)
+		t.Fatalf("success Call: %v", err)
 	}
-	if response.Status != http.StatusConflict {
-		t.Fatalf("status = %d, want the raw 409", response.Status)
-	}
-	if response.ContentType != "application/json" {
-		t.Fatalf("content type = %q, want application/json", response.ContentType)
-	}
-	if response.Body != partial {
-		t.Fatalf("body = %q, want the exact raw bytes %q", response.Body, partial)
-	}
-	if captured.method != "POST" || captured.target != "/v1/sessions/abc/restore?keep=a+b" || captured.body != `{"operation_id":"op-1"}` {
-		t.Fatalf("captured request = %+v", captured)
+	if success.Status != http.StatusOK || success.Invalid || !strings.Contains(success.Body, testInstance) {
+		t.Fatalf("success response = %+v, want the authenticated health body", success)
 	}
 
-	empty, err := host.Request(info.Generation, "GET", "/v1/health", "")
+	rejected, err := host.Call(info.Generation, "RevertSessionCode", `{"session_id":"abc","body":{"operation_id":"op-1"}}`)
 	if err != nil {
-		t.Fatalf("bodyless Request: %v", err)
+		t.Fatalf("rejection Call: %v", err)
 	}
-	if empty.Status != http.StatusOK || empty.Body == "" {
-		t.Fatalf("bodyless health response = (%d, %q)", empty.Status, empty.Body)
+	if rejected.Status != http.StatusConflict || rejected.Invalid || rejected.Body != partial {
+		t.Fatalf("rejection response = %+v, want the validated partial body without rejection", rejected)
+	}
+
+	empty, err := host.Call(info.Generation, "InterruptSession", `{"session_id":"abc"}`)
+	if err != nil {
+		t.Fatalf("204 Call: %v", err)
+	}
+	if empty.Status != http.StatusNoContent || empty.Invalid || empty.Body != "" {
+		t.Fatalf("204 response = %+v, want a valid empty success", empty)
+	}
+
+	invalid, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"malformed"}`)
+	if err != nil {
+		t.Fatalf("invalid Call: %v", err)
+	}
+	if invalid.Status != http.StatusOK || !invalid.Invalid || invalid.Body != "not json" {
+		t.Fatalf("invalid response = %+v, want the received status/body with the Invalid bit", invalid)
+	}
+
+	if _, err := host.Call(info.Generation, "Nope", ""); err == nil {
+		t.Fatal("an unknown operation did not reject the binding")
 	}
 }
 
@@ -479,8 +488,8 @@ func TestDesktopHostTerminalFailureDominatesQueuedEvents(t *testing.T) {
 	if generationErr == nil {
 		t.Fatal("the terminal failure did not cancel its connection generation")
 	}
-	if _, err := host.Request(info.Generation, "GET", "/v1/health", ""); err == nil {
-		t.Fatal("a request on the failed generation succeeded")
+	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil {
+		t.Fatal("a call on the failed generation succeeded")
 	}
 }
 
@@ -495,8 +504,8 @@ func TestDesktopHostOpenRejectsEstablishmentFailure(t *testing.T) {
 	if _, err := host.Open(); err == nil {
 		t.Fatal("Open succeeded over a failed event stream")
 	}
-	if _, err := host.Request("1", "GET", "/v1/health", ""); err == nil {
-		t.Fatal("no generation was installed, yet a request succeeded")
+	if _, err := host.Call("1", "GetHealth", ""); err == nil {
+		t.Fatal("no generation was installed, yet a call succeeded")
 	}
 	if _, err := host.NextEvent("1"); err == nil {
 		t.Fatal("no generation was installed, yet a pull succeeded")
@@ -504,12 +513,12 @@ func TestDesktopHostOpenRejectsEstablishmentFailure(t *testing.T) {
 }
 
 // TestDesktopHostCloseCancelsWaits proves host close cancels an in-flight
-// request and a parked event pull without touching the Runtime.
+// call and a parked event pull without touching the Runtime.
 func TestDesktopHostCloseCancelsWaits(t *testing.T) {
 	arrived := make(chan struct{})
 	observed := make(chan struct{})
 	server := newFixture(t, jsonHealth(), parkedStream(), map[string]http.HandlerFunc{
-		"/v1/parked": func(_ http.ResponseWriter, r *http.Request) {
+		"/v1/sessions/parked/hydration": func(_ http.ResponseWriter, r *http.Request) {
 			close(arrived)
 			<-r.Context().Done()
 			close(observed)
@@ -522,7 +531,7 @@ func TestDesktopHostCloseCancelsWaits(t *testing.T) {
 	}
 	requestDone := make(chan error, 1)
 	go func() {
-		_, err := host.Request(info.Generation, "GET", "/v1/parked", "")
+		_, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"parked"}`)
 		requestDone <- err
 	}()
 	<-arrived
@@ -950,7 +959,7 @@ func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
 	}()
 	recvBounded(t, fixture.held) // the newer attempt waits at its authenticated health gate
 
-	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
 		t.Fatalf("old-stamp request during a pending open = %v, want rejection before I/O", err)
 	}
 	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
@@ -962,7 +971,7 @@ func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
 	if result.err != nil || result.info.Generation != "2" {
 		t.Fatalf("pending Open = (%+v, %v), want the installed second generation", result.info, result.err)
 	}
-	response, err := host.Request(result.info.Generation, "GET", "/v1/health", "")
+	response, err := host.Call(result.info.Generation, "GetHealth", "")
 	if err != nil || response.Status != http.StatusOK {
 		t.Fatalf("new-generation request = (%+v, %v), want the usable install", response, err)
 	}
@@ -997,7 +1006,7 @@ func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
 		t.Fatal("second Open succeeded over a failing discovery owner")
 	}
 
-	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
 		t.Fatalf("old-stamp request after a failed open = %v, want the retired stamp to stay rejected", err)
 	}
 	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
@@ -1054,10 +1063,10 @@ func TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen(t *testing.T) {
 	if result.err != nil || result.info.Generation != "2" {
 		t.Fatalf("pending Open after the late cleanup = (%+v, %v), want the cleanup to leave the pending attempt intact", result.info, result.err)
 	}
-	if _, err := host.Request(first.Generation, "GET", "/v1/health", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
+	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
 		t.Fatalf("old stamp after the new install = %v, want the stale rejection", err)
 	}
-	response, err := host.Request(result.info.Generation, "GET", "/v1/health", "")
+	response, err := host.Call(result.info.Generation, "GetHealth", "")
 	if err != nil || response.Status != http.StatusOK {
 		t.Fatalf("installed generation request = (%+v, %v), want the usable connection", response, err)
 	}
@@ -1156,11 +1165,11 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 		t.Fatalf("connection info = %+v", info)
 	}
 
-	response, err := host.Request(info.Generation, "GET", "/v1/health", "")
+	response, err := host.Call(info.Generation, "GetHealth", "")
 	if err != nil {
-		t.Fatalf("health Request: %v", err)
+		t.Fatalf("health Call: %v", err)
 	}
-	if response.Status != http.StatusOK || !strings.Contains(response.ContentType, "application/json") {
+	if response.Status != http.StatusOK || response.ContentType != "application/json" {
 		t.Fatalf("health response = (%d, %q)", response.Status, response.ContentType)
 	}
 	var health protocol.Health
@@ -1171,9 +1180,9 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 		t.Fatalf("health = %+v, want the connected owner", health)
 	}
 
-	create, err := host.Request(info.Generation, "POST", "/v1/sessions", `{"workspace":"/ws/smoke","agent_type":"integrated"}`)
+	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_type":"integrated"}}`)
 	if err != nil {
-		t.Fatalf("create Request: %v", err)
+		t.Fatalf("create Call: %v", err)
 	}
 	if create.Status != http.StatusCreated {
 		t.Fatalf("create status = %d: %s", create.Status, create.Body)
