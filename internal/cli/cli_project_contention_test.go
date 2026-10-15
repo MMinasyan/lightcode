@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/terminal"
 )
 
 func cliIdentityLock(root, projectPath string) string {
@@ -26,7 +27,7 @@ func TestCLIProjectContentionProductionPaths(t *testing.T) {
 	cli := New(svc)
 	cli.setCurrentSessionID(source)
 	cli.out = &bytes.Buffer{}
-	cli.readKeyFn = func() (keyMsg, error) { return keyMsg{Special: keyEscape}, nil }
+	cli.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{Special: terminal.KeyEscape}, nil }
 	cli.showProjectMenu()
 	lock, err := atomicfs.Acquire(cliIdentityLock(svc.Projects().Root(), svc.ProjectRoot()))
 	if err != nil {

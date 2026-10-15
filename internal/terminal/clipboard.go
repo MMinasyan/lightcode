@@ -1,4 +1,4 @@
-package cli
+package terminal
 
 import (
 	"context"
@@ -9,19 +9,18 @@ import (
 	"strings"
 )
 
-// writeClipboardOSC52 emits the OSC-52 clipboard sequence to w. It is ordinary
-// mainLoop output; the caller runs the fallback (in the op-group) only if this
-// returns a write error.
-func writeClipboardOSC52(w io.Writer, text string) error {
+// WriteClipboardOSC52 emits the OSC-52 clipboard sequence to w. The caller
+// runs WriteClipboardFallback only if this returns a write error.
+func WriteClipboardOSC52(w io.Writer, text string) error {
 	b64 := base64.StdEncoding.EncodeToString([]byte(text))
 	_, err := fmt.Fprintf(w, "\033]52;c;%s\a", b64)
 	return err
 }
 
-// writeClipboardFallback shells out to an installed clipboard tool. It is
-// context-cancellable so host shutdown can kill a blocked tool instead of wedging
-// the op-group.
-func writeClipboardFallback(ctx context.Context, text string) error {
+// WriteClipboardFallback shells out to an installed clipboard tool. It is
+// context-cancellable so a host shutdown can kill a blocked tool instead of
+// wedging its caller.
+func WriteClipboardFallback(ctx context.Context, text string) error {
 	tools := [][]string{
 		{"xsel", "--clipboard", "--input"},
 		{"xclip", "-selection", "clipboard"},

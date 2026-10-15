@@ -20,7 +20,15 @@ import (
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/terminal"
 )
+
+// slashCommands is the shipped CLI's command vocabulary; the shared completion
+// helper completes against the caller's list.
+var slashCommands = []string{
+	"/help", "/clear", "/model", "/session", "/project", "/new", "/resume",
+	"/revert", "/fork", "/context", "/compact", "/copy", "/exit",
+}
 
 type cliState int
 
@@ -50,9 +58,9 @@ type CLI struct {
 
 	state     atomic.Int32
 	busy      bool
-	input     *inputLine
-	history   inputHistory
-	readKeyFn func() (keyMsg, error)
+	input     *terminal.InputLine
+	history   terminal.InputHistory
+	readKeyFn func() (terminal.KeyMsg, error)
 	ctx       context.Context
 
 	// Exit latch: requestExit stores the exit error and closes exitLatch once. Every
@@ -67,7 +75,7 @@ type CLI struct {
 	// so a stalled mainLoop can never wedge the reader mid-send. Closed on stdin EOF
 	// and host exit.
 	keyMu     sync.Mutex
-	keyFrames []keyMsg
+	keyFrames []terminal.KeyMsg
 	keyWake   chan struct{}
 	keyClosed bool
 
@@ -120,7 +128,7 @@ type CLI struct {
 	permQueue       []*agent.PermissionRequest
 	permSelected    int
 	permPromptLines int
-	permFrame       transientMenuFrame
+	permFrame       terminal.TransientMenuFrame
 
 	toolExpanded bool
 	promptLines  int
@@ -135,8 +143,8 @@ func New(a *agent.Agent) *CLI {
 	c := &CLI{
 		out:                 os.Stdout,
 		mu:                  &sync.Mutex{},
-		input:               newInputLine(),
-		history:             newInputHistory(),
+		input:               terminal.NewInputLine(),
+		history:             terminal.NewInputHistory(),
 		keyWake:             make(chan struct{}, 1),
 		eventWake:           make(chan struct{}, 1),
 		exitLatch:           make(chan struct{}),
@@ -245,7 +253,7 @@ func (c *CLI) closeEvents() {
 // enqueueKey appends one parsed key and wakes a reader. It never blocks, so a
 // stalled mainLoop cannot wedge the key reader in a send and keep it from its next
 // stdin read.
-func (c *CLI) enqueueKey(k keyMsg) {
+func (c *CLI) enqueueKey(k terminal.KeyMsg) {
 	c.keyMu.Lock()
 	if c.keyClosed {
 		c.keyMu.Unlock()
@@ -266,16 +274,16 @@ func (c *CLI) enqueueKey(k keyMsg) {
 // This is the exit's "stop ingress" boundary: a key already dequeued when the latch
 // closes completes its handling (pop and handling cannot be atomic — handling blocks
 // on nested menus and owner calls), then the next read observes the latch and unwinds.
-func (c *CLI) popKey() (keyMsg, bool) {
+func (c *CLI) popKey() (terminal.KeyMsg, bool) {
 	c.keyMu.Lock()
 	defer c.keyMu.Unlock()
 	select {
 	case <-c.exitLatch:
-		return keyMsg{}, false
+		return terminal.KeyMsg{}, false
 	default:
 	}
 	if len(c.keyFrames) == 0 {
-		return keyMsg{}, false
+		return terminal.KeyMsg{}, false
 	}
 	k := c.keyFrames[0]
 	c.keyFrames = c.keyFrames[1:]
@@ -298,22 +306,22 @@ func (c *CLI) closeKeys() {
 // enforces exit priority (it reports empty once the latch is set), so a returned key
 // is always one the exit latch had not yet claimed; otherwise nextKey reports the
 // exit error, or the context error on cancellation.
-func (c *CLI) nextKey(ctx context.Context) (keyMsg, error) {
+func (c *CLI) nextKey(ctx context.Context) (terminal.KeyMsg, error) {
 	for {
 		if k, ok := c.popKey(); ok {
 			return k, nil
 		}
 		select {
 		case <-c.exitLatch:
-			return keyMsg{}, c.exitErr
+			return terminal.KeyMsg{}, c.exitErr
 		default:
 		}
 		select {
 		case <-c.keyWake:
 		case <-c.exitLatch:
-			return keyMsg{}, c.exitErr
+			return terminal.KeyMsg{}, c.exitErr
 		case <-ctx.Done():
-			return keyMsg{}, ctx.Err()
+			return terminal.KeyMsg{}, ctx.Err()
 		}
 	}
 }
@@ -486,7 +494,7 @@ func (c *CLI) Run(ctx context.Context) error {
 	startupErr := c.initializeSession(ctx)
 	return c.runInteractive(ctx, func() {
 		if startupErr != nil {
-			c.printLine(renderErrorMsg(startupErr.Error()))
+			c.printLine(terminal.RenderErrorMsg(startupErr.Error()))
 		}
 		c.printHeader()
 		for _, m := range c.messages {
@@ -551,7 +559,7 @@ func (c *CLI) runInteractive(ctx context.Context, startup func(), input io.Reade
 	go c.watchSignals(termCh, intCh, resizeCh, ctx)
 
 	c.ctx = ctx
-	c.readKeyFn = func() (keyMsg, error) { return c.nextKey(ctx) }
+	c.readKeyFn = func() (terminal.KeyMsg, error) { return c.nextKey(ctx) }
 
 	go c.readKeysFrom(input)
 
@@ -678,7 +686,7 @@ func (c *CLI) readKeysFrom(input io.Reader) {
 			c.closeKeys()
 			return
 		}
-		for _, k := range parseInputBytes(buf[:n]) {
+		for _, k := range terminal.ParseInputBytes(buf[:n]) {
 			c.enqueueKey(k)
 		}
 	}
@@ -722,7 +730,7 @@ func (c *CLI) mainLoop(ctx context.Context, startup func()) error {
 	}
 }
 
-func (c *CLI) handleKey(k keyMsg) error {
+func (c *CLI) handleKey(k terminal.KeyMsg) error {
 	switch cliState(c.state.Load()) {
 	case stateIdle:
 		return c.handleKeyIdle(k)
@@ -735,9 +743,9 @@ func (c *CLI) handleKey(k keyMsg) error {
 	return nil
 }
 
-func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
+func (c *CLI) handleInputEdit(k terminal.KeyMsg, redrawPrompt bool) bool {
 	switch k.Special {
-	case keyBackspace:
+	case terminal.KeyBackspace:
 		if c.input.DeleteBack() {
 			c.history.Edited()
 			if redrawPrompt {
@@ -745,7 +753,7 @@ func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
 			}
 		}
 		return true
-	case keyDelete:
+	case terminal.KeyDelete:
 		if c.input.DeleteForward() {
 			c.history.Edited()
 			if redrawPrompt {
@@ -753,33 +761,33 @@ func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
 			}
 		}
 		return true
-	case keyLeft:
+	case terminal.KeyLeft:
 		if c.input.MoveLeft() {
 			if redrawPrompt {
 				c.printInputPrompt()
 			}
 		}
 		return true
-	case keyRight:
+	case terminal.KeyRight:
 		if c.input.MoveRight() {
 			if redrawPrompt {
 				c.printInputPrompt()
 			}
 		}
 		return true
-	case keyHome:
+	case terminal.KeyHome:
 		c.input.MoveHome()
 		if redrawPrompt {
 			c.printInputPrompt()
 		}
 		return true
-	case keyEnd:
+	case terminal.KeyEnd:
 		c.input.MoveEnd()
 		if redrawPrompt {
 			c.printInputPrompt()
 		}
 		return true
-	case keyUp:
+	case terminal.KeyUp:
 		if text, ok := c.history.Prev(c.input.String()); ok {
 			c.input.Set(text)
 			if redrawPrompt {
@@ -787,7 +795,7 @@ func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
 			}
 		}
 		return true
-	case keyDown:
+	case terminal.KeyDown:
 		if text, ok := c.history.Next(); ok {
 			c.input.Set(text)
 			if redrawPrompt {
@@ -808,17 +816,17 @@ func (c *CLI) handleInputEdit(k keyMsg, redrawPrompt bool) bool {
 	}
 }
 
-func (c *CLI) handleKeyIdle(k keyMsg) error {
+func (c *CLI) handleKeyIdle(k terminal.KeyMsg) error {
 	if c.handleInputEdit(k, true) {
 		return nil
 	}
 	switch k.Special {
-	case keyEnter:
+	case terminal.KeyEnter:
 		text := c.input.String()
 		c.input.Clear()
 		c.mu.Lock()
 		if c.promptLines > 1 {
-			c.writeRaw(eraseBlock(c.promptLines))
+			c.writeRaw(terminal.EraseBlock(c.promptLines))
 		} else {
 			c.writeRaw("\r\x1b[2K")
 		}
@@ -842,29 +850,29 @@ func (c *CLI) handleKeyIdle(k keyMsg) error {
 
 		c.submitInput(text)
 
-	case keyTab:
+	case terminal.KeyTab:
 		before := c.input.String()
-		completed := completeSlashCommand(c.input.String())
+		completed := terminal.CompleteSlashCommand(c.input.String(), slashCommands)
 		c.input.Set(completed)
 		if completed != before {
 			c.history.Edited()
 		}
 		c.printInputPrompt()
 
-	case keyCtrlC, keyCtrlD:
+	case terminal.KeyCtrlC, terminal.KeyCtrlD:
 		return ExitError{Code: 0}
 	}
 	return nil
 }
 
-func (c *CLI) handleKeyStreaming(k keyMsg) {
+func (c *CLI) handleKeyStreaming(k terminal.KeyMsg) {
 	if c.handleInputEdit(k, false) {
 		return
 	}
 	switch k.Special {
-	case keyCtrlC, keyEscape:
+	case terminal.KeyCtrlC, terminal.KeyEscape:
 		c.cancelCurrent()
-	case keyEnter:
+	case terminal.KeyEnter:
 		text := c.input.String()
 		if text != "" {
 			c.input.Clear()
@@ -879,7 +887,7 @@ func (c *CLI) handleKeyStreaming(k keyMsg) {
 	}
 }
 
-func (c *CLI) handleKeyPermission(k keyMsg) error {
+func (c *CLI) handleKeyPermission(k terminal.KeyMsg) error {
 	if len(c.permQueue) == 0 {
 		return nil
 	}
@@ -887,21 +895,21 @@ func (c *CLI) handleKeyPermission(k keyMsg) error {
 	req := c.permQueue[0]
 
 	switch k.Special {
-	case keyUp:
+	case terminal.KeyUp:
 		if c.permSelected > 0 {
 			c.permSelected--
 			c.redrawPermissionBlock(req)
 		}
 		return nil
-	case keyDown:
+	case terminal.KeyDown:
 		if c.permSelected < permissionActionCount(req)-1 {
 			c.permSelected++
 			c.redrawPermissionBlock(req)
 		}
 		return nil
-	case keyEnter:
+	case terminal.KeyEnter:
 		return c.choosePermission(req)
-	case keyCtrlC, keyEscape:
+	case terminal.KeyCtrlC, terminal.KeyEscape:
 		c.popAndRespond(req, false)
 		return nil
 	}
@@ -924,7 +932,7 @@ func (c *CLI) choosePermission(req *agent.PermissionRequest) error {
 	if c.permSelected < 0 || c.permSelected >= len(actions) {
 		return nil
 	}
-	action, _ := actions[c.permSelected].extra.(string)
+	action, _ := actions[c.permSelected].Extra.(string)
 	switch action {
 	case "allow":
 		c.popAndRespond(req, true)
@@ -969,7 +977,7 @@ func (c *CLI) popAndRespondAction(req *agent.PermissionRequest, action string) {
 			// the user. Benign.
 			return
 		}
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 	}
 }
 
@@ -993,7 +1001,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 		}
 	}
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		c.printPermissionBlock(req)
 		return nil
 	}
@@ -1001,7 +1009,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 		c.mu.Lock()
 		c.erasePermissionBlockLocked()
 		c.mu.Unlock()
-		c.printLine(renderErrorMsg("no suggestions available"))
+		c.printLine(terminal.RenderErrorMsg("no suggestions available"))
 		c.printPermissionBlock(req)
 		return nil
 	}
@@ -1010,22 +1018,22 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 	c.erasePermissionBlockLocked()
 	c.mu.Unlock()
 
-	var suggestionFrame transientMenuFrame
+	var suggestionFrame terminal.TransientMenuFrame
 	renderSuggestions := func(selected int) {
 		c.mu.Lock()
 		width := c.currentWidth()
-		suggestionFrame.draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
+		suggestionFrame.Draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
 		c.mu.Unlock()
 	}
 	redrawSuggestions := func(selected int) {
 		c.mu.Lock()
 		width := c.currentWidth()
-		suggestionFrame.draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
+		suggestionFrame.Draw(c.writeRaw, renderPermissionSuggestions(req, suggestions, selected, width), width)
 		c.mu.Unlock()
 	}
 	eraseSuggestions := func() {
 		c.mu.Lock()
-		suggestionFrame.clear(c.writeRaw)
+		suggestionFrame.Clear(c.writeRaw)
 		c.mu.Unlock()
 	}
 
@@ -1042,11 +1050,11 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 		}
 
 		switch k.Special {
-		case keyEscape, keyCtrlC:
+		case terminal.KeyEscape, terminal.KeyCtrlC:
 			eraseSuggestions()
 			c.printPermissionBlock(req)
 			return nil
-		case keyEnter:
+		case terminal.KeyEnter:
 			patterns := []string{suggestions[selected].Rule}
 			eraseSuggestions()
 			c.mu.Lock()
@@ -1054,7 +1062,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 			c.mu.Unlock()
 			sessionID, err := c.resolveSessionID(req.SessionID)
 			if err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				if stillDisplayed {
 					c.printPermissionBlock(req)
 				}
@@ -1068,7 +1076,7 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 					// the user. Benign.
 					return nil
 				}
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				if stillDisplayed {
 					c.printPermissionBlock(req)
 				}
@@ -1080,12 +1088,12 @@ func (c *CLI) showPermissionSuggestions(req *agent.PermissionRequest) error {
 				c.mu.Unlock()
 			}
 			return nil
-		case keyUp:
+		case terminal.KeyUp:
 			if selected > 0 {
 				selected--
 				redrawSuggestions(selected)
 			}
-		case keyDown:
+		case terminal.KeyDown:
 			if selected < len(suggestions)-1 {
 				selected++
 				redrawSuggestions(selected)
@@ -1166,7 +1174,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			args: ev.Args,
 		})
 		c.activeToolID = ev.ToolCallID
-		c.writeRaw(renderToolCall(ev.ToolName, ev.Args, nil))
+		c.writeRaw(terminal.RenderToolCall(ev.ToolName, ev.Args, nil))
 		c.startAnimationLocked("Running")
 
 	case agent.EventToolCallEnd:
@@ -1196,12 +1204,14 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			// The tool header is the line just rendered: rewrite it in place.
 			c.writeRaw("\r\x1b[2K")
 			if ev.ToolName == "edit_file" {
-				if _, hasSummary := toolChangeSummary(ev.ToolName, ev.Args, ev.Metadata); hasSummary {
+				// The start header used nil metadata; rewrite it in place only
+				// when the end metadata would render it differently.
+				if terminal.RenderToolCall(ev.ToolName, ev.Args, nil) != terminal.RenderToolCall(ev.ToolName, ev.Args, ev.Metadata) {
 					c.writeRaw("\x1b[1A\r\x1b[2K")
-					c.writeRaw(renderToolCall(ev.ToolName, ev.Args, ev.Metadata))
+					c.writeRaw(terminal.RenderToolCall(ev.ToolName, ev.Args, ev.Metadata))
 				}
 			}
-			c.writeRaw(renderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), ev.Metadata))
+			c.writeRaw(terminal.RenderToolResult(ev.ToolName, ev.Args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), ev.Metadata))
 		} else {
 			// Late completion (a ToolCallEnd arriving after its row scrolled
 			// out of inline position): render a fresh block without
@@ -1213,8 +1223,8 @@ func (c *CLI) handleEvent(ev agent.Event) {
 				name, args, meta = row.name, row.args, row.metadata
 			}
 			c.writeRaw("\r\x1b[2K")
-			c.writeRaw(renderToolCall(name, args, meta))
-			c.writeRaw(renderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), meta))
+			c.writeRaw(terminal.RenderToolCall(name, args, meta))
+			c.writeRaw(terminal.RenderToolResult(name, args, ev.Result, !ev.IsError, c.toolExpanded, int(c.width.Load()), meta))
 		}
 		c.writeRaw(nl)
 		if c.busy {
@@ -1247,7 +1257,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			bg:      ev.BackgroundProcess,
 		})
 		c.writeRaw(renderBackgroundProcessCall(ev.BackgroundProcess, success))
-		if result := renderToolResult("background_process", "", ev.Result, success, c.toolExpanded, int(c.width.Load()), nil); result != "" {
+		if result := terminal.RenderToolResult("background_process", "", ev.Result, success, c.toolExpanded, int(c.width.Load()), nil); result != "" {
 			c.writeRaw(result)
 			c.writeRaw(nl)
 		}
@@ -1272,7 +1282,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			content: ev.Result,
 			turn:    ev.Turn,
 		})
-		c.printLineLocked(renderUserMsg(ev.Result, int(c.width.Load())))
+		c.printLineLocked(terminal.RenderUserMsg(ev.Result, int(c.width.Load())))
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
@@ -1294,7 +1304,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			typ:     "system",
 			content: content,
 		})
-		c.printLineLocked(renderSystemMsg(content))
+		c.printLineLocked(terminal.RenderSystemMsg(content))
 		if c.busy {
 			c.startAnimationLocked("Thinking")
 		}
@@ -1325,7 +1335,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.permQueue = nil
 		c.permSelected = 0
 		c.permPromptLines = 0
-		c.permFrame = transientMenuFrame{}
+		c.permFrame = terminal.TransientMenuFrame{}
 		// Queue draining is backend-owned: the agent auto-drains after the turn
 		// ends and emits turn_start for the next turn. The CLI just re-prompts.
 		c.printInputPromptLocked()
@@ -1335,7 +1345,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 		c.stopAnimationLocked()
 		c.erasePermissionBlockLocked()
 		c.writeRaw("\r\x1b[2K")
-		c.writeRaw(renderErrorMsg(ev.Error))
+		c.writeRaw(terminal.RenderErrorMsg(ev.Error))
 		c.busy = false
 		c.state.Store(int32(stateIdle))
 		c.printInputPromptLocked()
@@ -1396,7 +1406,7 @@ func (c *CLI) handleEvent(ev agent.Event) {
 			if c.lastWarningSnapshot[key] {
 				continue
 			}
-			c.writeRaw(renderWarningMsg(w.Kind + ": " + w.Message))
+			c.writeRaw(terminal.RenderWarningMsg(w.Kind + ": " + w.Message))
 		}
 		c.lastWarningSnapshot = current
 		if cliState(c.state.Load()) == stateIdle {
@@ -1419,9 +1429,9 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 	case agent.EventTextDelta:
 		c.writeRaw(prefix + strings.ReplaceAll(ev.Result, "\n", "\r\n"+prefix) + "\r\n")
 	case agent.EventToolCallStart:
-		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("▸ %s  %s", ev.ToolName, formatToolArgs(ev.ToolName, ev.Args))))
+		c.writeRaw(renderSubagentMsg(tag, fmt.Sprintf("▸ %s  %s", ev.ToolName, terminal.FormatToolArgs(ev.ToolName, ev.Args))))
 	case agent.EventToolCallEnd:
-		result := truncate(ev.Result, 200)
+		result := terminal.Truncate(ev.Result, 200)
 		status := "ok"
 		if ev.IsError {
 			status = "error"
@@ -1430,12 +1440,12 @@ func (c *CLI) handleSubagentEvent(ev agent.Event) {
 		if !ev.IsError && ev.ToolName == "edit_file" {
 			line = status
 			if preview, ok := editpreview.FromMetadata(ev.Metadata); ok {
-				line += "\n" + strings.TrimRight(renderEditPreview(preview, "", int(c.width.Load()), false), "\r\n")
+				line += "\n" + strings.TrimRight(terminal.RenderEditPreview(preview, "", int(c.width.Load()), false), "\r\n")
 			}
 		}
 		c.writeRaw(renderSubagentMsg(tag, line))
 	case agent.EventBackgroundProcessComplete:
-		result := truncate(ev.Result, 200)
+		result := terminal.Truncate(ev.Result, 200)
 		status := "ok"
 		if ev.IsError {
 			status = "error"
@@ -1461,9 +1471,9 @@ func (c *CLI) finalizeStreamBufLocked() {
 	if text != "" {
 		rows := terminalRowsForText(c.streamVisibleBuf.String(), int(c.width.Load()))
 		if rows > 0 {
-			c.writeRaw(eraseBlock(rows + 1))
+			c.writeRaw(terminal.EraseBlock(rows + 1))
 		}
-		c.writeRaw(renderAssistantMsg(text, int(c.width.Load())))
+		c.writeRaw(terminal.RenderAssistantMsg(text, int(c.width.Load())))
 
 		c.messages = append(c.messages, displayEntry{
 			typ:     "assistant",
@@ -1486,7 +1496,7 @@ func terminalRowsForText(text string, width int) int {
 	rawLines := strings.Split(trimmed, "\n")
 	rows := 0
 	for _, rl := range rawLines {
-		w := visibleWidth(rl)
+		w := terminal.VisibleWidth(rl)
 		if width > 0 && w > width {
 			rows += (w + width - 1) / width
 		} else {
@@ -1577,19 +1587,19 @@ func (c *CLI) printInputPrompt() {
 
 func (c *CLI) printInputPromptLocked() {
 	if c.promptLines > 1 {
-		c.writeRaw(eraseBlock(c.promptLines))
+		c.writeRaw(terminal.EraseBlock(c.promptLines))
 	} else {
 		c.writeRaw("\r\x1b[2K")
 	}
 	text := c.input.String()
 	c.writeRaw("> " + text)
-	cursorLen := 2 + visibleWidth(c.input.CursorText())
-	endLen := 2 + visibleWidth(text)
+	cursorLen := 2 + terminal.VisibleWidth(c.input.CursorText())
+	endLen := 2 + terminal.VisibleWidth(text)
 	if back := endLen - cursorLen; back > 0 {
 		c.writeRaw(fmt.Sprintf("\x1b[%dD", back))
 	}
 
-	promptLen := 2 + visibleWidth(text)
+	promptLen := 2 + terminal.VisibleWidth(text)
 	width := int(c.width.Load())
 	if width > 0 && promptLen > width {
 		c.promptLines = (promptLen + width - 1) / width
@@ -1620,13 +1630,13 @@ func (c *CLI) printDisplayEntry(e displayEntry) {
 func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	switch e.typ {
 	case "user":
-		c.printLineLocked(renderUserMsg(e.content, int(c.width.Load())))
+		c.printLineLocked(terminal.RenderUserMsg(e.content, int(c.width.Load())))
 	case "assistant":
-		c.printLineLocked(renderAssistantMsg(e.content, int(c.width.Load())))
+		c.printLineLocked(terminal.RenderAssistantMsg(e.content, int(c.width.Load())))
 	case "tool":
-		c.printLineLocked(renderToolCall(e.name, e.args, e.metadata))
+		c.printLineLocked(terminal.RenderToolCall(e.name, e.args, e.metadata))
 		if e.done {
-			result := renderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, int(c.width.Load()), e.metadata)
+			result := terminal.RenderToolResult(e.name, e.args, e.result, e.success, c.toolExpanded, int(c.width.Load()), e.metadata)
 			if result != "" {
 				c.printLineLocked(result)
 			}
@@ -1635,16 +1645,16 @@ func (c *CLI) printDisplayEntryLocked(e displayEntry) {
 	case "background_process":
 		c.printLineLocked(renderBackgroundProcessCall(e.bg, e.success))
 		if e.done {
-			result := renderToolResult("background_process", "", e.result, e.success, c.toolExpanded, int(c.width.Load()), nil)
+			result := terminal.RenderToolResult("background_process", "", e.result, e.success, c.toolExpanded, int(c.width.Load()), nil)
 			if result != "" {
 				c.printLineLocked(result)
 			}
 			c.writeRaw(nl)
 		}
 	case "system":
-		c.printLineLocked(renderSystemMsg(e.content))
+		c.printLineLocked(terminal.RenderSystemMsg(e.content))
 	case "error":
-		c.printLineLocked(renderErrorMsg(e.content))
+		c.printLineLocked(terminal.RenderErrorMsg(e.content))
 	}
 }
 
@@ -1656,12 +1666,12 @@ func (c *CLI) printPermissionBlock(req *agent.PermissionRequest) {
 
 func (c *CLI) printPermissionBlockLocked(req *agent.PermissionRequest) {
 	width := c.currentWidth()
-	c.permFrame.draw(c.writeRaw, renderPermissionPrompt(req, c.permSelected, width), width)
+	c.permFrame.Draw(c.writeRaw, renderPermissionPrompt(req, c.permSelected, width), width)
 	c.permPromptLines = permissionPromptRows(req)
 }
 
 func (c *CLI) erasePermissionBlockLocked() {
-	c.permFrame.clear(c.writeRaw)
+	c.permFrame.Clear(c.writeRaw)
 	c.permPromptLines = 0
 }
 
@@ -1727,7 +1737,7 @@ func (c *CLI) submitToBackend(text string) {
 func (c *CLI) handleSubmitErrorLocked(text string, err error) {
 	c.stopAnimationLocked()
 	c.writeRaw("\r\x1b[2K")
-	c.writeRaw(renderErrorMsg(err.Error()))
+	c.writeRaw(terminal.RenderErrorMsg(err.Error()))
 	if c.input != nil && c.input.String() == "" {
 		c.input.Set(text)
 	}
@@ -1862,9 +1872,9 @@ func (c *CLI) handleSlashWhileBusy(text string) {
 	default:
 		if cmd == "/model" || cmd == "/revert" || cmd == "/fork" ||
 			cmd == "/compact" || cmd == "/exit" {
-			c.writeRaw(renderErrorMsg("cannot run this command while a turn is running"))
+			c.writeRaw(terminal.RenderErrorMsg("cannot run this command while a turn is running"))
 		} else {
-			c.writeRaw(renderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
+			c.writeRaw(terminal.RenderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
 		}
 	}
 
@@ -1892,7 +1902,7 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/new":
 		release, err := c.reserveSelection()
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return nil
 		}
 		id, err := c.scope.NewSession("primary")
@@ -1903,10 +1913,10 @@ func (c *CLI) dispatchCommand(text string) error {
 				c.setCurrentSessionID(id)
 				release()
 				c.refreshSession()
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			default: // a plain precommit error retains the source exactly as it was
 				release()
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 			}
 			return nil
 		}
@@ -1931,7 +1941,7 @@ func (c *CLI) dispatchCommand(text string) error {
 	case "/exit":
 		return ExitError{Code: 0}
 	default:
-		c.printLine(renderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
+		c.printLine(terminal.RenderErrorMsg(fmt.Sprintf("unknown command: %s", cmd)))
 	}
 	return nil
 }
@@ -1968,7 +1978,7 @@ func (c *CLI) cmdClear() {
 
 func (c *CLI) clearTerminalLocked() {
 	if c.promptLines > 1 {
-		c.writeRaw(eraseBlock(c.promptLines))
+		c.writeRaw(terminal.EraseBlock(c.promptLines))
 	} else {
 		c.writeRaw("\r\x1b[2K")
 	}
@@ -1991,7 +2001,7 @@ func (c *CLI) cmdResume(parts []string) {
 		// the source is reserved immediately before the open.
 		release, err := c.reserveSelection()
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		id := parts[1]
@@ -1999,7 +2009,7 @@ func (c *CLI) cmdResume(parts []string) {
 		if err != nil {
 			if !errors.Is(err, snapshot.ErrSessionContended) {
 				release()
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				return
 			}
 			// The user named a session another process is driving: it opens
@@ -2008,7 +2018,7 @@ func (c *CLI) cmdResume(parts []string) {
 			state, herr := c.owner.HydrateSession(id)
 			if herr != nil {
 				release()
-				c.printLine(renderErrorMsg(herr.Error()))
+				c.printLine(terminal.RenderErrorMsg(herr.Error()))
 				return
 			}
 			c.scope.SetProjectPath(state.Session.ProjectPath)
@@ -2040,11 +2050,11 @@ func (c *CLI) cmdResume(parts []string) {
 	// tried.
 	sessions, err := c.scope.SessionList("active")
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 	if len(sessions) == 0 {
-		c.printLine(renderErrorMsg("no active sessions"))
+		c.printLine(terminal.RenderErrorMsg("no active sessions"))
 		return
 	}
 
@@ -2055,7 +2065,7 @@ func (c *CLI) cmdResume(parts []string) {
 	for _, s := range sessions {
 		release, err := c.reserveSelection()
 		if err != nil {
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		summary, err := c.agent.OpenSession(s.ID)
@@ -2067,12 +2077,12 @@ func (c *CLI) cmdResume(parts []string) {
 		}
 		if !errors.Is(err, snapshot.ErrSessionContended) {
 			release()
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 			return
 		}
 		release()
 	}
-	c.printLine(renderErrorMsg("no active sessions"))
+	c.printLine(terminal.RenderErrorMsg("no active sessions"))
 }
 
 func (c *CLI) cmdContext() {
@@ -2102,12 +2112,12 @@ func (c *CLI) cmdContext() {
 
 func (c *CLI) cmdCompact() {
 	if c.busy {
-		c.printLine(renderErrorMsg("cannot compact while a turn is running"))
+		c.printLine(terminal.RenderErrorMsg("cannot compact while a turn is running"))
 		return
 	}
 	sessionID, err := c.sv().LiveCurrentOrErr()
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 
@@ -2136,7 +2146,7 @@ func (c *CLI) cmdCompact() {
 			c.mu.Unlock()
 
 			if err != nil {
-				c.printLine(renderErrorMsg(err.Error()))
+				c.printLine(terminal.RenderErrorMsg(err.Error()))
 				if idle {
 					c.printInputPrompt()
 				}
@@ -2161,27 +2171,27 @@ func (c *CLI) cmdCopy() {
 		if c.messages[i].typ == "assistant" && c.messages[i].content != "" {
 			text := c.messages[i].content
 			// OSC-52 is ordinary mainLoop output.
-			if err := writeClipboardOSC52(c.out, text); err == nil {
-				c.printLine(renderSystemMsg("copied to clipboard"))
+			if err := terminal.WriteClipboardOSC52(c.out, text); err == nil {
+				c.printLine(terminal.RenderSystemMsg("copied to clipboard"))
 				return
 			}
 			// The write failed: run the shell-out fallback in the op-group so a
 			// blocking clipboard tool cannot wedge mainLoop, and post the result to
 			// the delivery FIFO.
 			c.spawnOp(func() {
-				err := writeClipboardFallback(c.ctx, text)
+				err := terminal.WriteClipboardFallback(c.ctx, text)
 				c.enqueuePost(func() {
 					if err != nil {
-						c.printLine(renderErrorMsg(err.Error()))
+						c.printLine(terminal.RenderErrorMsg(err.Error()))
 					} else {
-						c.printLine(renderSystemMsg("copied to clipboard"))
+						c.printLine(terminal.RenderSystemMsg("copied to clipboard"))
 					}
 				})
 			})
 			return
 		}
 	}
-	c.printLine(renderErrorMsg("no assistant response to copy"))
+	c.printLine(terminal.RenderErrorMsg("no assistant response to copy"))
 }
 
 func (c *CLI) projectSwitch(targetPath string) {
@@ -2193,7 +2203,7 @@ func (c *CLI) projectSwitch(targetPath string) {
 	// cannot hold the source transitioning.
 	release, err := c.reserveSelection()
 	if err != nil {
-		c.printLine(renderErrorMsg(err.Error()))
+		c.printLine(terminal.RenderErrorMsg(err.Error()))
 		return
 	}
 	summary, err := c.scope.OpenOrCreateSession(targetPath)
@@ -2205,10 +2215,10 @@ func (c *CLI) projectSwitch(targetPath string) {
 			c.setCurrentSessionID(summary.ID)
 			release()
 			c.refreshSession()
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 		default: // a plain precommit error retains the old route and source exactly as they were
 			release()
-			c.printLine(renderErrorMsg(err.Error()))
+			c.printLine(terminal.RenderErrorMsg(err.Error()))
 		}
 		return
 	}

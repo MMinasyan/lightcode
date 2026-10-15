@@ -26,6 +26,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 	"github.com/MMinasyan/lightcode/internal/project"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/terminal"
 	"golang.org/x/term"
 )
 
@@ -545,8 +546,8 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	if !ok {
 		t.Fatal("submitInputLocked not found in cli.go")
 	}
-	if strings.Contains(body, "renderUserMsg(") {
-		t.Fatalf("submitInputLocked must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+	if strings.Contains(body, "terminal.RenderUserMsg(") {
+		t.Fatalf("submitInputLocked must not call terminal.RenderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
 	}
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
 		t.Fatalf("submitInputLocked must not append a user displayEntry locally")
@@ -556,8 +557,8 @@ func TestSubmitAndFlushDoNotRenderUserMessagesLocally(t *testing.T) {
 	if !ok {
 		t.Fatal("submitToBackend not found in cli.go")
 	}
-	if strings.Contains(body, "renderUserMsg(") {
-		t.Fatalf("submitToBackend must not call renderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
+	if strings.Contains(body, "terminal.RenderUserMsg(") {
+		t.Fatalf("submitToBackend must not call terminal.RenderUserMsg; user transcript entries arrive via EventUserMessageDisplay")
 	}
 	if strings.Contains(body, "typ:  \"user\"") || strings.Contains(body, "typ: \"user\"") {
 		t.Fatalf("submitToBackend must not append a user displayEntry locally")
@@ -573,8 +574,8 @@ func TestSubmitErrorRestoresDraftWhenInputEmpty(t *testing.T) {
 	c := &CLI{
 		out:     &buf,
 		mu:      &sync.Mutex{},
-		input:   newInputLine(),
-		history: newInputHistory(),
+		input:   terminal.NewInputLine(),
+		history: terminal.NewInputHistory(),
 	}
 
 	c.mu.Lock()
@@ -591,8 +592,8 @@ func TestSubmitErrorDoesNotOverwriteNewDraft(t *testing.T) {
 	c := &CLI{
 		out:     &buf,
 		mu:      &sync.Mutex{},
-		input:   newInputLine(),
-		history: newInputHistory(),
+		input:   terminal.NewInputLine(),
+		history: terminal.NewInputHistory(),
 	}
 	c.input.Set("new draft")
 
@@ -610,8 +611,8 @@ func TestFinishCompactDoesNotOverwriteRunningQueuedTurn(t *testing.T) {
 	c := &CLI{
 		out:        &buf,
 		mu:         &sync.Mutex{},
-		input:      newInputLine(),
-		history:    newInputHistory(),
+		input:      terminal.NewInputLine(),
+		history:    terminal.NewInputHistory(),
 		busy:       true,
 		compacting: true,
 	}
@@ -637,8 +638,8 @@ func TestFinishCompactReturnsIdleWhenNoTurnRunning(t *testing.T) {
 	c := &CLI{
 		out:        &buf,
 		mu:         &sync.Mutex{},
-		input:      newInputLine(),
-		history:    newInputHistory(),
+		input:      terminal.NewInputLine(),
+		history:    terminal.NewInputHistory(),
 		compacting: true,
 	}
 	c.state.Store(int32(stateStreaming))
@@ -1038,9 +1039,9 @@ func TestCLINavigationBlockedBySynchronousSubmitClaim(t *testing.T) {
 	// drained in order exactly as mainLoop drains them; the turn_start the
 	// submit emits stays queued behind the batch, the delayed-turn_start
 	// shape.
-	batch := []keyMsg{
-		{Rune: 'h'}, {Rune: 'i'}, {Special: keyEnter},
-		{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: keyEnter},
+	batch := []terminal.KeyMsg{
+		{Rune: 'h'}, {Rune: 'i'}, {Special: terminal.KeyEnter},
+		{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: terminal.KeyEnter},
 	}
 	for _, k := range batch {
 		c.enqueueKey(k)
@@ -1098,7 +1099,7 @@ func TestCLIArchiveDeleteDoNotReserveSelection(t *testing.T) {
 		c.agent = rec
 		victim := secondSession(t, c)
 
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		if len(rec.reserves) != 0 {
@@ -1118,7 +1119,7 @@ func TestCLIArchiveDeleteDoNotReserveSelection(t *testing.T) {
 		c.agent = rec
 		victim := secondSession(t, c)
 
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, victim), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		if len(rec.reserves) != 0 {
@@ -1138,7 +1139,7 @@ func TestCLIArchiveDeleteDoNotReserveSelection(t *testing.T) {
 		_, c, _, source := selectionCLI(t)
 		rec := &recordingReserveAdapter{AdapterService: c.agent}
 		c.agent = rec
-		c.readKeyFn = func() (keyMsg, error) { return keyMsg{Rune: 'n'}, nil }
+		c.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{Rune: 'n'}, nil }
 		dispatchSelection(t, c, "/session", "")
 
 		if len(rec.reserves) != 1 || rec.reserves[0] != source {
@@ -1164,9 +1165,9 @@ func TestCLICompactCompletionGatedBySelection(t *testing.T) {
 	driveBatch := func(t *testing.T, c *CLI, out *bytes.Buffer, adapter *blockingCompactAdapter) (source, dest string, outAfterNav string) {
 		t.Helper()
 		source = c.currentSessionID()
-		for _, k := range []keyMsg{
-			{Rune: '/'}, {Rune: 'c'}, {Rune: 'o'}, {Rune: 'm'}, {Rune: 'p'}, {Rune: 'a'}, {Rune: 'c'}, {Rune: 't'}, {Special: keyEnter},
-			{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: keyEnter},
+		for _, k := range []terminal.KeyMsg{
+			{Rune: '/'}, {Rune: 'c'}, {Rune: 'o'}, {Rune: 'm'}, {Rune: 'p'}, {Rune: 'a'}, {Rune: 'c'}, {Rune: 't'}, {Special: terminal.KeyEnter},
+			{Rune: '/'}, {Rune: 'n'}, {Rune: 'e'}, {Rune: 'w'}, {Special: terminal.KeyEnter},
 		} {
 			c.enqueueKey(k)
 		}
@@ -1311,7 +1312,7 @@ func TestCLINavigationReleasesSourceBeforeDestinationRender(t *testing.T) {
 		{
 			name: "session_new",
 			run: func(t *testing.T, c *CLI, a *agent.Agent, projectRoot string) error {
-				c.readKeyFn = func() (keyMsg, error) { return keyMsg{Rune: 'n'}, nil }
+				c.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{Rune: 'n'}, nil }
 				return c.dispatchCommand("/session")
 			},
 		},
@@ -1707,18 +1708,18 @@ func selectIndex(t *testing.T, c *CLI, id string) int {
 // menuKeysWithTail returns a key source that navigates down n items, presses
 // Enter to select the n-th item, then yields the tail keys (e.g. the 'a' or
 // 'd' menu action).
-func menuKeysWithTail(n int, tail ...keyMsg) func() (keyMsg, error) {
-	return func() (keyMsg, error) {
+func menuKeysWithTail(n int, tail ...terminal.KeyMsg) func() (terminal.KeyMsg, error) {
+	return func() (terminal.KeyMsg, error) {
 		if n > 0 {
 			n--
-			return keyMsg{Special: keyDown}, nil
+			return terminal.KeyMsg{Special: terminal.KeyDown}, nil
 		}
 		if len(tail) > 0 {
 			k := tail[0]
 			tail = tail[1:]
 			return k, nil
 		}
-		return keyMsg{Special: keyEnter}, nil
+		return terminal.KeyMsg{Special: terminal.KeyEnter}, nil
 	}
 }
 
@@ -2089,13 +2090,13 @@ func corruptSessionHistory(t *testing.T, a *agent.Agent, projectPath string) str
 
 // menuKeys returns a key source that navigates down n items and presses
 // enter, selecting the n-th item (0-based) of a menu.
-func menuKeys(n int) func() (keyMsg, error) {
-	return func() (keyMsg, error) {
+func menuKeys(n int) func() (terminal.KeyMsg, error) {
+	return func() (terminal.KeyMsg, error) {
 		if n > 0 {
 			n--
-			return keyMsg{Special: keyDown}, nil
+			return terminal.KeyMsg{Special: terminal.KeyDown}, nil
 		}
-		return keyMsg{Special: keyEnter}, nil
+		return terminal.KeyMsg{Special: terminal.KeyEnter}, nil
 	}
 }
 
@@ -2222,7 +2223,7 @@ func TestAdapterOperationParity(t *testing.T) {
 		return sb.String()
 	}
 	wails := readHost("../../app.go", "../../main.go", "../../frontend/src/App.svelte")
-	cli := readHost("cli.go", "menu.go", "input.go")
+	cli := readHost("cli.go", "menu.go", filepath.Join("..", "terminal", "input.go"))
 	acp := readHost("../acp/acp.go")
 
 	type cell struct {
@@ -2267,7 +2268,7 @@ func TestAdapterOperationParity(t *testing.T) {
 		{"acp", "submit", true, []string{`"session/prompt"`}},
 
 		{"wails", "cancel", true, []string{"func (a *App) Cancel("}},
-		{"cli", "cancel", true, []string{"cancelCurrent(", "case keyCtrlC, keyEscape:"}},
+		{"cli", "cancel", true, []string{"cancelCurrent(", "case terminal.KeyCtrlC, terminal.KeyEscape:"}},
 		{"acp", "cancel", true, []string{`"session/cancel"`}},
 
 		// Queue; permission response.
@@ -2517,7 +2518,7 @@ func TestCLIKeyReaderAbsorbsBurstWithoutBlocking(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < n; i++ {
-			c.enqueueKey(keyMsg{Rune: 'x'})
+			c.enqueueKey(terminal.KeyMsg{Rune: 'x'})
 		}
 		close(done)
 	}()
@@ -2537,7 +2538,7 @@ func TestCLIKeyReaderAbsorbsBurstWithoutBlocking(t *testing.T) {
 // TestCLINextKeyReturnsBufferedKey proves the shared key source pops keys in order.
 func TestCLINextKeyReturnsBufferedKey(t *testing.T) {
 	c := New(nil)
-	c.enqueueKey(keyMsg{Rune: 'a'})
+	c.enqueueKey(terminal.KeyMsg{Rune: 'a'})
 	k, err := c.nextKey(context.Background())
 	if err != nil || k.Rune != 'a' {
 		t.Fatalf("nextKey = (%v, %v), want rune 'a'", k, err)
@@ -2549,7 +2550,7 @@ func TestCLINextKeyReturnsBufferedKey(t *testing.T) {
 // another key.
 func TestCLIExitLatchUnwindsKeyRead(t *testing.T) {
 	c := New(nil)
-	c.enqueueKey(keyMsg{Rune: 'x'}) // a key is buffered
+	c.enqueueKey(terminal.KeyMsg{Rune: 'x'}) // a key is buffered
 	c.requestExit(ExitError{Code: 7})
 	_, err := c.nextKey(context.Background())
 	var exit interface{ ExitCode() int }
@@ -2572,7 +2573,7 @@ func TestCLIExitLatchUnwindsKeyRead(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("EOF did not set the exit latch")
 		}
-		c.enqueueKey(keyMsg{Rune: 'x'})
+		c.enqueueKey(terminal.KeyMsg{Rune: 'x'})
 		_, err := c.nextKey(context.Background())
 		var exit interface{ ExitCode() int }
 		if !errors.As(err, &exit) || exit.ExitCode() != 0 {
@@ -2883,8 +2884,8 @@ func TestCLIAnimationHasNoSpinnerGoroutine(t *testing.T) {
 // key — e.g. a buffered Enter cannot fire a revert during signal shutdown.
 func TestCLIPopKeyReportsEmptyAfterExit(t *testing.T) {
 	c := New(nil)
-	c.enqueueKey(keyMsg{Rune: 'a'})
-	c.enqueueKey(keyMsg{Rune: 'b'})
+	c.enqueueKey(terminal.KeyMsg{Rune: 'a'})
+	c.enqueueKey(terminal.KeyMsg{Rune: 'b'})
 	c.requestExit(ExitError{Code: 0})
 	if _, ok := c.popKey(); ok {
 		t.Fatal("popKey returned a buffered key after exit was requested; latch priority must gate popping")
@@ -3344,12 +3345,12 @@ func TestHandleKeyIdleInputEditing(t *testing.T) {
 	c := &CLI{
 		out:     &buf,
 		mu:      &sync.Mutex{},
-		input:   newInputLine(),
-		history: newInputHistory(),
+		input:   terminal.NewInputLine(),
+		history: terminal.NewInputHistory(),
 	}
 
 	// Rune insertion redraws prompt in idle
-	c.handleKeyIdle(keyMsg{Rune: 'a'})
+	c.handleKeyIdle(terminal.KeyMsg{Rune: 'a'})
 	if got := c.input.String(); got != "a" {
 		t.Fatalf("input = %q, want %q", got, "a")
 	}
@@ -3359,56 +3360,56 @@ func TestHandleKeyIdleInputEditing(t *testing.T) {
 
 	// Backspace
 	buf.Reset()
-	c.handleKeyIdle(keyMsg{Special: keyBackspace})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyBackspace})
 	if got := c.input.String(); got != "" {
 		t.Fatalf("input = %q, want empty after backspace", got)
 	}
 
 	// Navigation: insert "xy", move left, move home, move end
 	buf.Reset()
-	c.handleKeyIdle(keyMsg{Rune: 'x'})
-	c.handleKeyIdle(keyMsg{Rune: 'y'})
+	c.handleKeyIdle(terminal.KeyMsg{Rune: 'x'})
+	c.handleKeyIdle(terminal.KeyMsg{Rune: 'y'})
 	buf.Reset()
-	c.handleKeyIdle(keyMsg{Special: keyLeft})
-	if c.input.cursor != 1 {
-		t.Fatalf("cursor = %d, want 1 after left", c.input.cursor)
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyLeft})
+	if got := c.input.CursorText(); got != "x" {
+		t.Fatalf("cursor text = %q, want %q after left", got, "x")
 	}
-	c.handleKeyIdle(keyMsg{Special: keyHome})
-	if c.input.cursor != 0 {
-		t.Fatalf("cursor = %d, want 0 after home", c.input.cursor)
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyHome})
+	if got := c.input.CursorText(); got != "" {
+		t.Fatalf("cursor text = %q, want empty after home", got)
 	}
-	c.handleKeyIdle(keyMsg{Special: keyEnd})
-	if c.input.cursor != 2 {
-		t.Fatalf("cursor = %d, want 2 after end", c.input.cursor)
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyEnd})
+	if got := c.input.CursorText(); got != "xy" {
+		t.Fatalf("cursor text = %q, want %q after end", got, "xy")
 	}
 
 	// Delete: clear, insert "xy", move home, delete forward
 	buf.Reset()
 	c.input.Clear()
-	c.handleKeyIdle(keyMsg{Rune: 'x'})
-	c.handleKeyIdle(keyMsg{Rune: 'y'})
-	c.handleKeyIdle(keyMsg{Special: keyHome})
-	c.handleKeyIdle(keyMsg{Special: keyDelete})
+	c.handleKeyIdle(terminal.KeyMsg{Rune: 'x'})
+	c.handleKeyIdle(terminal.KeyMsg{Rune: 'y'})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyHome})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyDelete})
 	if got := c.input.String(); got != "y" {
 		t.Fatalf("input = %q, want %q after delete", got, "y")
 	}
 
 	// Right: cursor at 0 (from Home above), move right
-	c.handleKeyIdle(keyMsg{Special: keyHome})
-	c.handleKeyIdle(keyMsg{Special: keyRight})
-	if c.input.cursor != 1 {
-		t.Fatalf("cursor = %d, want 1 after right", c.input.cursor)
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyHome})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyRight})
+	if got := c.input.CursorText(); got != "y" {
+		t.Fatalf("cursor text = %q, want %q after right", got, "y")
 	}
 
 	// History: clear input first so Prev stores empty draft,
 	// then Next restores empty
 	c.input.Clear()
 	c.history.Add("prev")
-	c.handleKeyIdle(keyMsg{Special: keyUp})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyUp})
 	if got := c.input.String(); got != "prev" {
 		t.Fatalf("input = %q, want %q after up", got, "prev")
 	}
-	c.handleKeyIdle(keyMsg{Special: keyDown})
+	c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyDown})
 	if got := c.input.String(); got != "" {
 		t.Fatalf("input = %q, want empty after down", got)
 	}
@@ -3419,12 +3420,12 @@ func TestHandleKeyStreamingInputEditing(t *testing.T) {
 	c := &CLI{
 		out:     &buf,
 		mu:      &sync.Mutex{},
-		input:   newInputLine(),
-		history: newInputHistory(),
+		input:   terminal.NewInputLine(),
+		history: terminal.NewInputHistory(),
 	}
 
 	// Rune insertion does NOT redraw prompt in streaming
-	c.handleKeyStreaming(keyMsg{Rune: 'a'})
+	c.handleKeyStreaming(terminal.KeyMsg{Rune: 'a'})
 	if got := c.input.String(); got != "a" {
 		t.Fatalf("input = %q, want %q", got, "a")
 	}
@@ -3433,44 +3434,44 @@ func TestHandleKeyStreamingInputEditing(t *testing.T) {
 	}
 
 	// Backspace
-	c.handleKeyStreaming(keyMsg{Special: keyBackspace})
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyBackspace})
 	if got := c.input.String(); got != "" {
 		t.Fatalf("input = %q, want empty after backspace", got)
 	}
 
 	// Navigation
-	c.handleKeyStreaming(keyMsg{Rune: 'x'})
-	c.handleKeyStreaming(keyMsg{Rune: 'y'})
-	c.handleKeyStreaming(keyMsg{Special: keyLeft})
-	if c.input.cursor != 1 {
-		t.Fatalf("cursor = %d, want 1 after left", c.input.cursor)
+	c.handleKeyStreaming(terminal.KeyMsg{Rune: 'x'})
+	c.handleKeyStreaming(terminal.KeyMsg{Rune: 'y'})
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyLeft})
+	if got := c.input.CursorText(); got != "x" {
+		t.Fatalf("cursor text = %q, want %q after left", got, "x")
 	}
-	c.handleKeyStreaming(keyMsg{Special: keyRight})
-	if c.input.cursor != 2 {
-		t.Fatalf("cursor = %d, want 2 after right", c.input.cursor)
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyRight})
+	if got := c.input.CursorText(); got != "xy" {
+		t.Fatalf("cursor text = %q, want %q after right", got, "xy")
 	}
-	c.handleKeyStreaming(keyMsg{Special: keyHome})
-	if c.input.cursor != 0 {
-		t.Fatalf("cursor = %d, want 0 after home", c.input.cursor)
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyHome})
+	if got := c.input.CursorText(); got != "" {
+		t.Fatalf("cursor text = %q, want empty after home", got)
 	}
-	c.handleKeyStreaming(keyMsg{Special: keyDelete})
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyDelete})
 	if got := c.input.String(); got != "y" {
 		t.Fatalf("input = %q, want %q after delete", got, "y")
 	}
-	c.handleKeyStreaming(keyMsg{Special: keyEnd})
-	if c.input.cursor != 1 {
-		t.Fatalf("cursor = %d, want 1 after end", c.input.cursor)
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyEnd})
+	if got := c.input.CursorText(); got != "y" {
+		t.Fatalf("cursor text = %q, want %q after end", got, "y")
 	}
 
 	// History: clear input first so Prev stores empty draft,
 	// then Next restores empty
 	c.input.Clear()
 	c.history.Add("prev")
-	c.handleKeyStreaming(keyMsg{Special: keyUp})
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyUp})
 	if got := c.input.String(); got != "prev" {
 		t.Fatalf("input = %q, want %q after up", got, "prev")
 	}
-	c.handleKeyStreaming(keyMsg{Special: keyDown})
+	c.handleKeyStreaming(terminal.KeyMsg{Special: terminal.KeyDown})
 	if got := c.input.String(); got != "" {
 		t.Fatalf("input = %q, want empty after down", got)
 	}
@@ -3533,7 +3534,7 @@ func TestCLIPermissionStaleSaveIsSilent(t *testing.T) {
 	c.handleEvent(agent.Event{Kind: agent.EventPermissionResolved, SessionID: sid, PermReq: &agent.PermissionRequest{ID: "p1", SessionID: sid}})
 
 	out.Reset()
-	c.readKeyFn = func() (keyMsg, error) { return keyMsg{Special: keyEnter}, nil }
+	c.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{Special: terminal.KeyEnter}, nil }
 	c.showPermissionSuggestions(req)
 
 	if got := out.String(); strings.Contains(got, "no pending permission request") {
@@ -3626,7 +3627,7 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		release := make(chan struct{})
 		c := New(nil)
 		c.out = &blockingWriter{entered: entered, release: release}
-		c.readKeyFn = func() (keyMsg, error) { return keyMsg{}, nil }
+		c.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{}, nil }
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -3903,7 +3904,7 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		c := New(nil)
 		var out bytes.Buffer
 		c.out = &out
-		c.enqueueKey(keyMsg{Rune: 'k'})
+		c.enqueueKey(terminal.KeyMsg{Rune: 'k'})
 		c.enqueueEvent(agent.Event{Kind: agent.EventUserMessageDisplay, Result: "ready-event"})
 
 		started := make(chan struct{})
@@ -4055,9 +4056,9 @@ func TestCLIRunShutdownContract(t *testing.T) {
 		// The terminal exits while the suggestion menu is open: the key read
 		// reports the exit error, exactly as nextKey does once the latch is set.
 		c.requestExit(ExitError{Code: 130})
-		c.readKeyFn = func() (keyMsg, error) { return keyMsg{}, c.exitErr }
+		c.readKeyFn = func() (terminal.KeyMsg, error) { return terminal.KeyMsg{}, c.exitErr }
 
-		err := c.handleKey(keyMsg{Rune: 'p'})
+		err := c.handleKey(terminal.KeyMsg{Rune: 'p'})
 		var exit ExitError
 		if !errors.As(err, &exit) || exit.Code != 130 {
 			t.Fatalf("handleKey returned %v, want the exit error", err)
@@ -4101,24 +4102,24 @@ func TestCLIRunShutdownContract(t *testing.T) {
 
 		// Select the seeded turn, then "Fork from here"; the confirmation key
 		// read then reports the exit error.
-		keys := []keyMsg{
-			{Special: keyEnter},
-			{Special: keyDown},
-			{Special: keyEnter},
+		keys := []terminal.KeyMsg{
+			{Special: terminal.KeyEnter},
+			{Special: terminal.KeyDown},
+			{Special: terminal.KeyEnter},
 		}
 		next := 0
 		c.requestExit(ExitError{Code: 130})
-		c.readKeyFn = func() (keyMsg, error) {
+		c.readKeyFn = func() (terminal.KeyMsg, error) {
 			if next < len(keys) {
 				k := keys[next]
 				next++
 				return k, nil
 			}
-			return keyMsg{}, c.exitErr
+			return terminal.KeyMsg{}, c.exitErr
 		}
 
 		c.input.Set("/revert")
-		err = c.handleKeyIdle(keyMsg{Special: keyEnter})
+		err = c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyEnter})
 		var exit ExitError
 		if !errors.As(err, &exit) || exit.Code != 130 {
 			t.Fatalf("handleKeyIdle returned %v, want the confirmation's exit error", err)
@@ -4157,24 +4158,24 @@ func TestCLIRunShutdownContract(t *testing.T) {
 
 		// Select the seeded turn, then "Fork from here"; the confirmation key
 		// read then reports the exit error.
-		keys := []keyMsg{
-			{Special: keyEnter},
-			{Special: keyDown},
-			{Special: keyEnter},
+		keys := []terminal.KeyMsg{
+			{Special: terminal.KeyEnter},
+			{Special: terminal.KeyDown},
+			{Special: terminal.KeyEnter},
 		}
 		next := 0
 		c.requestExit(ExitError{Code: 130})
-		c.readKeyFn = func() (keyMsg, error) {
+		c.readKeyFn = func() (terminal.KeyMsg, error) {
 			if next < len(keys) {
 				k := keys[next]
 				next++
 				return k, nil
 			}
-			return keyMsg{}, c.exitErr
+			return terminal.KeyMsg{}, c.exitErr
 		}
 
 		c.input.Set("/fork")
-		err := c.handleKeyIdle(keyMsg{Special: keyEnter})
+		err := c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyEnter})
 		var exit ExitError
 		if !errors.As(err, &exit) || exit.Code != 130 {
 			t.Fatalf("handleKeyIdle returned %v, want the confirmation's exit error", err)
@@ -4244,24 +4245,24 @@ func TestCLIRunShutdownContract(t *testing.T) {
 
 		// Select the seeded turn, choose "Fork from here", and answer the
 		// code confirmation with Yes.
-		keys := []keyMsg{
-			{Special: keyEnter},
-			{Special: keyDown},
-			{Special: keyEnter},
-			{Special: keyEnter},
+		keys := []terminal.KeyMsg{
+			{Special: terminal.KeyEnter},
+			{Special: terminal.KeyDown},
+			{Special: terminal.KeyEnter},
+			{Special: terminal.KeyEnter},
 		}
 		next := 0
-		c.readKeyFn = func() (keyMsg, error) {
+		c.readKeyFn = func() (terminal.KeyMsg, error) {
 			if next < len(keys) {
 				k := keys[next]
 				next++
 				return k, nil
 			}
-			return keyMsg{}, fmt.Errorf("unexpected key read")
+			return terminal.KeyMsg{}, fmt.Errorf("unexpected key read")
 		}
 
 		c.input.Set("/fork")
-		if err := c.handleKeyIdle(keyMsg{Special: keyEnter}); err != nil {
+		if err := c.handleKeyIdle(terminal.KeyMsg{Special: terminal.KeyEnter}); err != nil {
 			t.Fatalf("handleKeyIdle: %v", err)
 		}
 
@@ -4550,7 +4551,7 @@ func (f *lifecycleOutcomeAdapter) QueueSnapshotForSession(_ string) (agent.Queue
 func newLifecycleCLI(t *testing.T, f *lifecycleOutcomeAdapter) (*CLI, *bytes.Buffer) {
 	t.Helper()
 	out := new(bytes.Buffer)
-	c := &CLI{out: out, mu: &sync.Mutex{}, input: newInputLine(), history: newInputHistory()}
+	c := &CLI{out: out, mu: &sync.Mutex{}, input: terminal.NewInputLine(), history: terminal.NewInputHistory()}
 	c.width.Store(80)
 	if f.events == nil {
 		evs := []string{}
@@ -4580,15 +4581,15 @@ func hasEventPrefix(evs []string, prefix string) bool {
 }
 
 // keySequence yields the prepared keys in order; a read past the end is an error so any unexpected menu over-read fails loudly.
-func keySequence(keys ...keyMsg) func() (keyMsg, error) {
+func keySequence(keys ...terminal.KeyMsg) func() (terminal.KeyMsg, error) {
 	next := 0
-	return func() (keyMsg, error) {
+	return func() (terminal.KeyMsg, error) {
 		if next < len(keys) {
 			k := keys[next]
 			next++
 			return k, nil
 		}
-		return keyMsg{}, errors.New("no more prepared keys")
+		return terminal.KeyMsg{}, errors.New("no more prepared keys")
 	}
 }
 
@@ -4653,7 +4654,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: committed, list: []agent.SessionSummary{{ID: "src"}}}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("src")
-		c.readKeyFn = keySequence(keyMsg{Rune: 'n'})
+		c.readKeyFn = keySequence(terminal.KeyMsg{Rune: 'n'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "dest")
@@ -4674,7 +4675,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{newID: "dest", outcome: plain, list: []agent.SessionSummary{{ID: "src"}}}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("src")
-		c.readKeyFn = keySequence(keyMsg{Rune: 'n'})
+		c.readKeyFn = keySequence(terminal.KeyMsg{Rune: 'n'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "src")
@@ -4739,12 +4740,12 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 	// fork action and confirms it: select the single seeded turn, move from
 	// "Revert code" onto "Fork from here", choose it, then accept the
 	// also-revert-code question (its Yes/No menu answers with Enter on "Yes"). Each row builds its own copy — a key source is consumed by reads.
-	forkKeys := func() func() (keyMsg, error) {
+	forkKeys := func() func() (terminal.KeyMsg, error) {
 		return keySequence(
-			keyMsg{Special: keyEnter}, // select the single seeded turn
-			keyMsg{Special: keyDown},  // Revert code -> Fork from here
-			keyMsg{Special: keyEnter}, // choose fork
-			keyMsg{Special: keyEnter}, // accept "also revert code?" (Yes is the default)
+			terminal.KeyMsg{Special: terminal.KeyEnter}, // select the single seeded turn
+			terminal.KeyMsg{Special: terminal.KeyDown},  // Revert code -> Fork from here
+			terminal.KeyMsg{Special: terminal.KeyEnter}, // choose fork
+			terminal.KeyMsg{Special: terminal.KeyEnter}, // accept "also revert code?" (Yes is the default)
 		)
 	}
 
@@ -4844,7 +4845,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a") // target b is noncurrent; the stale-safe reconciliation must preserve it exactly as a plain failure would leave it — only the rejection differs
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "a") // committed noncurrent removal preserves current — delete_committed_noncurrent_preserves_current is the same cell through the other op; both must hold per operation
@@ -4864,7 +4865,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("b") // target b IS the current session: exactly the success reconciliation runs before the rejection
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		if got, _ := c.currentSession(); got != "" {
@@ -4883,7 +4884,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a") // the nearest forbidden sibling of archive_committed_noncurrent_preserves_current above: same op and position; only the outcome class may differ in behavior — a plain failure reconciles nothing at all
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "a") // retained exactly as it was — no reconciliation ran that could have cleared or re-adopted anything
@@ -4900,7 +4901,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("b") // the nearest forbidden sibling of delete_committed_current_clears_and_rejects above: same op and position; a plain failure must NOT run the removed-current reconciliation that its committed twin does — archive_plain_current_retains_selection pins this cell through the other op, so both ops hold it independently
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "b") // still current — the deletion never ran durably and nothing may reconcile it away
@@ -4917,7 +4918,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{list: lifecycleList} // nil outcome = success; target is current — archive's own success control, mirroring delete_success_control_clears_current through the other op with its own rendered line
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		if got, _ := c.currentSession(); got != "" {
@@ -4937,7 +4938,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		if got, _ := c.currentSession(); got != "" {
@@ -4959,7 +4960,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: committed, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "a") // stale-safe reconciliation preserves a current the target is not
@@ -4976,7 +4977,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "a") // a plain precommit failure reconciles nothing — delete_committed_noncurrent_preserves_current is its forbidden sibling (same op and position, the outcome class that must not trigger it)
@@ -4993,7 +4994,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{outcome: plain, list: lifecycleList}
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("a")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "a"), terminal.KeyMsg{Rune: 'a'})
 		dispatchSelection(t, c, "/session", "")
 
 		wantCurrent(t, c, "a") // a plain precommit failure reconciles nothing — the committed row above is its forbidden sibling
@@ -5010,7 +5011,7 @@ func TestCLILifecycleCommittedOutcomes(t *testing.T) {
 		f := &lifecycleOutcomeAdapter{list: lifecycleList} // nil outcome = success; target is current
 		c, out := newLifecycleCLI(t, f)
 		c.setCurrentSessionID("b")
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, "b"), terminal.KeyMsg{Rune: 'd'})
 		dispatchSelection(t, c, "/session", "")
 
 		if got, _ := c.currentSession(); got != "" {
@@ -5098,7 +5099,7 @@ func TestCLIReturnsOnlyCodeAndForkOptions(t *testing.T) {
 	c.setCurrentSessionID(id)
 
 	// Pick the seeded turn, then cancel the action menu before choosing.
-	c.readKeyFn = keySequence(keyMsg{Special: keyEnter}, keyMsg{Special: keyEscape})
+	c.readKeyFn = keySequence(terminal.KeyMsg{Special: terminal.KeyEnter}, terminal.KeyMsg{Special: terminal.KeyEscape})
 	if err := c.dispatchCommand("/revert"); err != nil {
 		t.Fatalf("dispatchCommand(/revert): %v", err)
 	}
@@ -5136,7 +5137,7 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		c := New(ag)
 		c.out = new(bytes.Buffer)
 		c.setCurrentSessionID(id)
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), keyMsg{Rune: 'a'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), terminal.KeyMsg{Rune: 'a'})
 		sessionDir := filepath.Join(ag.Projects().SessionsRoot(project.ID), id)
 		var syncCalls int
 		atomicfs.SyncDirFunc = func(dir string) error {
@@ -5177,7 +5178,7 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		c := New(ag)
 		c.out = new(bytes.Buffer)
 		c.setCurrentSessionID(id)
-		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), keyMsg{Rune: 'd'})
+		c.readKeyFn = menuKeysWithTail(selectIndex(t, c, id), terminal.KeyMsg{Rune: 'd'})
 		sessionsRoot := ag.Projects().SessionsRoot(project.ID)
 		injected := errors.New("injected CLI delete sync failure")
 		atomicfs.SyncDirFunc = func(dir string) error {
@@ -5233,10 +5234,10 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 		t.Cleanup(func() { atomicfs.SyncDirFunc = nil })
 		c.readKeyFn = keySequence(
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyDown},
-			keyMsg{Special: keyEnter},
-			keyMsg{Special: keyEnter},
+			terminal.KeyMsg{Special: terminal.KeyEnter},
+			terminal.KeyMsg{Special: terminal.KeyDown},
+			terminal.KeyMsg{Special: terminal.KeyEnter},
+			terminal.KeyMsg{Special: terminal.KeyEnter},
 		)
 
 		if err := c.dispatchCommand("/revert"); err != nil {
@@ -5292,11 +5293,11 @@ func TestCLIRealCommittedNamespaceProducers(t *testing.T) {
 		}
 
 		c.readKeyFn = keySequence(
-			keyMsg{Special: keyDown},  // one -> two
-			keyMsg{Special: keyDown},  // two -> three
-			keyMsg{Special: keyDown},  // three -> create files (last selectable turn)
-			keyMsg{Special: keyEnter}, // pick the seeded create-files turn
-			keyMsg{Special: keyEnter}, // choose "Revert code" (first action item; no confirm on this path)
+			terminal.KeyMsg{Special: terminal.KeyDown},  // one -> two
+			terminal.KeyMsg{Special: terminal.KeyDown},  // two -> three
+			terminal.KeyMsg{Special: terminal.KeyDown},  // three -> create files (last selectable turn)
+			terminal.KeyMsg{Special: terminal.KeyEnter}, // pick the seeded create-files turn
+			terminal.KeyMsg{Special: terminal.KeyEnter}, // choose "Revert code" (first action item; no confirm on this path)
 		)
 
 		if err := c.dispatchCommand("/revert"); err != nil {

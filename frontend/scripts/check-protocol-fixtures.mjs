@@ -15,6 +15,17 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const frontendDir = dirname(scriptsDir);
 const repoDir = dirname(frontendDir);
 const generatedDir = join(frontendDir, 'src', 'generated', 'protocol');
+const projectionPath = join(frontendDir, 'src', 'client', 'projection.ts');
+const bootstrapPath = join(frontendDir, 'src', 'client', 'main.ts');
+const connectionPath = join(frontendDir, 'src', 'client', 'connection.ts');
+const readerPath = join(frontendDir, 'src', 'client', 'reader.ts');
+const sessionsPath = join(frontendDir, 'src', 'client', 'sessions.ts');
+const activityPath = join(frontendDir, 'src', 'client', 'activity.ts');
+const resultsPath = join(frontendDir, 'src', 'client', 'results.ts');
+const attemptsPath = join(frontendDir, 'src', 'client', 'attempts.ts');
+const exactJSONPath = join(frontendDir, 'src', 'client', 'exactjson.ts');
+const restorePath = join(frontendDir, 'src', 'client', 'restore.ts');
+const ambientPath = join(frontendDir, 'src', 'env.d.ts');
 const corpusPath = join(repoDir, 'protocol', 'testdata', 'protocol_contract_fixtures.json');
 const tsc = join(frontendDir, 'node_modules', '.bin', 'tsc');
 
@@ -96,13 +107,27 @@ function main() {
     lines.push('void client;');
     writeFileSync(join(workspace, 'checks.ts'), lines.join('\n') + '\n');
     // One tsc pass: the temporary project extends the repository's protocol
-    // tsconfig (the one source of compiler settings) and includes both the
-    // emitted literal checks and the full generated tree, so no second
-    // project pass is needed.
+    // tsconfig (the one source of compiler settings) and includes the emitted
+    // literal checks, the full generated tree and the target client modules
+    // over those generated types, so no second project pass is needed.
     const toPosix = (target) => relative(workspace, target).split(sep).join('/');
     writeFileSync(join(workspace, 'tsconfig.json'), JSON.stringify({
       extends: toPosix(join(frontendDir, 'tsconfig.protocol.json')),
-      include: ['checks.ts', `${toPosix(generatedDir)}/**/*.ts`],
+      include: [
+        'checks.ts',
+        `${toPosix(generatedDir)}/**/*.ts`,
+        toPosix(projectionPath),
+        toPosix(bootstrapPath),
+        toPosix(connectionPath),
+        toPosix(readerPath),
+        toPosix(sessionsPath),
+        toPosix(activityPath),
+        toPosix(resultsPath),
+        toPosix(attemptsPath),
+        toPosix(exactJSONPath),
+        toPosix(restorePath),
+        toPosix(ambientPath),
+      ],
     }, null, 2) + '\n');
 
     const result = spawnSync(tsc, ['-p', join(workspace, 'tsconfig.json')], { stdio: 'inherit' });

@@ -886,13 +886,13 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 		t.Fatalf("the child execution did not start")
 	}
 
-	script.releaseGate() // let the child run converge before the harness cancels
 	child.mu.Lock()
 	run := child.run
 	child.mu.Unlock()
 	if run == nil {
 		t.Fatalf("the child execution is not installed")
 	}
+	script.releaseGate() // let the child run converge before the harness cancels
 	cancel()
 	select {
 	case <-run.done:

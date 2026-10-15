@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agent"
 	"github.com/MMinasyan/lightcode/internal/cli"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/hostprocess"
 )
 
 //go:embed all:frontend/dist
@@ -60,7 +61,7 @@ func detachAndExit() {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.SysProcAttr = detachAttr()
+	cmd.SysProcAttr = hostprocess.DetachAttr()
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
 		os.Exit(1)

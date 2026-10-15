@@ -1,8 +1,9 @@
 // Package client connects one Go caller to an authenticated Lightcode
 // Runtime over the generated protocol: strict startup-file discovery,
-// authenticated health, and the one SSE notification stream. It imports only
-// the standard library and the generated protocol contracts; adapter
-// selection, projection state, and Runtime lifetime stay with the caller.
+// authenticated health, authenticated protocol byte requests, and the one SSE
+// notification stream. It imports only the standard library and the generated
+// protocol contracts; adapter selection, projection state, and Runtime
+// lifetime stay with the caller.
 package client
 
 import (

@@ -328,6 +328,7 @@ func TestRealRuntimeClient(t *testing.T) {
 		_, err := client.Connect(context.Background(), path)
 		assertNoRuntime(t, err)
 	})
+
 }
 
 // parkedModel is one loopback model endpoint whose first response holds until
