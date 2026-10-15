@@ -173,6 +173,12 @@ lightcode cli                   # Terminal REPL
 lightcode acp                   # JSON-RPC over stdio
 ```
 
+All three interfaces share one managed Runtime owner process. The first client starts it
+(`lightcode runtime --data-dir ~/.lightcode --config ~/.lightcode/config.json` under the hood) and
+later clients attach to the same owner. SIGINT or SIGTERM on the Runtime process is the managed
+shutdown — closing the last client is not a shutdown. `lightcode upgrade` replaces the executable,
+not the running Runtime; restart the Runtime to apply backend changes.
+
 Useful CLI commands:
 
 - `/model` — switch model
@@ -189,14 +195,23 @@ ACP clients drive Lightcode over newline-delimited JSON-RPC on stdio.
 
 #### Commands
 
-Beyond the run modes above, the binary ships utility commands: `version`, `doctor` (offline install/config diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing), `uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
+Beyond the run modes above, the binary ships utility commands: `runtime` (run the shared Runtime
+owner directly; clients start it automatically), `version`, `doctor` (offline install/config
+diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing),
+`uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
 
 #### Data locations
 
 - `~/.lightcode/config.json` — user config
 - `~/.lightcode/.env` — local API keys
+- `~/.lightcode/lightcode.db` — durable session state
+- `~/.lightcode/runtime.json` — live Runtime owner record (present only while the owner runs)
 - `~/.lightcode/projects/` — project metadata, sessions, snapshots, and project permissions
 - `~/.lightcode/cache/` — discovery and runtime caches
+
+Filesystem sessions created before the SQLite store stay under `~/.lightcode/projects/`: they are
+not migrated, not loaded, and not deleted. Their code snapshots remain separately reachable
+through the existing snapshot endpoints.
 
 ---
 

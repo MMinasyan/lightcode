@@ -16,6 +16,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
+
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
@@ -1206,5 +1208,51 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 		case <-deadline:
 			t.Fatal("no session_changed event for the created session arrived")
 		}
+	}
+}
+
+// TestDesktopHostAppOptions pins the exact options the host hands to Wails:
+// the shared window size, the Workspace-basename title, the given assets, the
+// private lifecycle hooks and the host binding, and the retained Linux WebKit
+// GPU policy — observed without opening a native window.
+func TestDesktopHostAppOptions(t *testing.T) {
+	host := New(clienthost.Options{}, filepath.Join("some", "WorkspaceDir"))
+	assets := os.DirFS(t.TempDir())
+	opts := appOptions(host, assets)
+	if opts.Width != 900 || opts.Height != 700 {
+		t.Fatalf("window size = %dx%d, want 900x700", opts.Width, opts.Height)
+	}
+	if want := "Lightcode — WorkspaceDir"; opts.Title != want {
+		t.Fatalf("title = %q, want %q", opts.Title, want)
+	}
+	if opts.AssetServer == nil || opts.AssetServer.Assets != assets {
+		t.Fatalf("AssetServer.Assets = %v, want the given filesystem", opts.AssetServer)
+	}
+	if opts.OnStartup == nil || opts.OnShutdown == nil {
+		t.Fatal("the private lifecycle hooks must be wired into the options")
+	}
+	// The wired hooks act on the supplied host: startup stores the caller's
+	// context and closes readiness (observed without waiting on the host's
+	// lifecycle), and shutdown marks that same host closed.
+	testCtx, cancelTestCtx := context.WithCancel(context.Background())
+	defer cancelTestCtx()
+	opts.OnStartup(testCtx)
+	if host.hostCtx != testCtx {
+		t.Fatalf("OnStartup stored context %v, want the supplied context", host.hostCtx)
+	}
+	select {
+	case <-host.ready:
+	default:
+		t.Fatal("OnStartup did not close the host readiness channel")
+	}
+	opts.OnShutdown(testCtx)
+	if !host.closed {
+		t.Fatal("OnShutdown did not close the host")
+	}
+	if len(opts.Bind) != 1 || opts.Bind[0] != interface{}(host) {
+		t.Fatalf("Bind = %v, want exactly the host", opts.Bind)
+	}
+	if opts.Linux == nil || opts.Linux.WebviewGpuPolicy != linux.WebviewGpuPolicyAlways {
+		t.Fatalf("Linux GPU policy = %v, want WebviewGpuPolicyAlways", opts.Linux)
 	}
 }

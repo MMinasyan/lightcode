@@ -2222,7 +2222,7 @@ func TestAdapterOperationParity(t *testing.T) {
 		}
 		return sb.String()
 	}
-	wails := readHost("../../app.go", "../../main.go", "../../frontend/src/App.svelte")
+	wails := readHost("../../app.go", "../../frontend/src/App.svelte")
 	cli := readHost("cli.go", "menu.go", filepath.Join("..", "terminal", "input.go"))
 	acp := readHost("../acp/acp.go")
 
@@ -2342,7 +2342,6 @@ func TestAdapterOperationParity(t *testing.T) {
 		{"acp", "revert_history", false, []string{`"session/revert_history"`}},
 
 		// Host shutdown trigger — and no shutdown RPC anywhere.
-		{"wails", "shutdown_trigger", true, []string{"OnShutdown: app.shutdown"}},
 		{"cli", "shutdown_trigger", true, []string{`case "/exit":`, "signal.Notify(intCh, syscall.SIGINT)", "signal.Notify(termCh, syscall.SIGTERM)"}},
 		{"acp", "shutdown_trigger", true, []string{"signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)", "!scanner.Scan()"}},
 

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -143,7 +144,12 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value") // pre-exported shell key, never managed
 		e := newOwnerEnv(t)
-		writeDotEnv(t, e.home, "MANAGED_TEST_KEY=managed-secret-value\n")
+		// A valid injected key followed by an oversized line: the scanner
+		// fails after the injection. The partial load keeps the already
+		// injected key in the managed set and never reclassifies the
+		// pre-exported shell sibling: the loaded/external distinction
+		// follows who actually set each value.
+		writeDotEnv(t, e.home, "MANAGED_TEST_KEY=managed-secret-value\nHUGE="+strings.Repeat("A", bufio.MaxScanTokenSize+1)+"\n")
 		r, _ := openConfigurationRuntimeWithEnv(t, store, e, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 

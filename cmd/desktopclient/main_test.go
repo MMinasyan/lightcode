@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -15,8 +17,21 @@ func TestDesktopClientPreviewArgParsing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseArgs: %v", err)
 		}
-		if assetsDir != defaultAssetsDir || runtimeExecutable != "" {
+		if assetsDir != "../../frontend/dist" || runtimeExecutable != "" {
 			t.Fatalf("defaults = (%q, %q)", assetsDir, runtimeExecutable)
+		}
+		// The default names the emitted layout the preview serves: the
+		// index page at the directory root with the assets directory beside
+		// it, produced by the default Wails build.
+		resolved, err := filepath.Abs(assetsDir)
+		if err != nil {
+			t.Fatalf("resolve assets dir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(resolved, "index.html")); err != nil {
+			t.Fatalf("default assets dir %q has no index.html (run the default Wails build first): %v", assetsDir, err)
+		}
+		if info, err := os.Stat(filepath.Join(resolved, "assets")); err != nil || !info.IsDir() {
+			t.Fatalf("default assets dir %q has no assets directory beside the index: %v", assetsDir, err)
 		}
 	})
 

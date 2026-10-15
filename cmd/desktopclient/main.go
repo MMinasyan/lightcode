@@ -16,8 +16,9 @@ import (
 )
 
 // defaultAssetsDir is the built target frontend relative to this preview
-// host's project directory.
-const defaultAssetsDir = "../../frontend/dist-client"
+// host's project directory: the same entry, build and asset layout the
+// default build emits and the shipped binary embeds.
+const defaultAssetsDir = "../../frontend/dist"
 
 // parseArgs parses the preview host's fixed argument surface: only
 // --assets-dir and --runtime-executable exist, and every positional or

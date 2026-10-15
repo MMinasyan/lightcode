@@ -2,7 +2,7 @@
   import { afterUpdate, createEventDispatcher } from 'svelte';
   import { renderMarkdown } from '../lib/markdown.js';
   import { settings } from '../lib/settings.js';
-  import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
+  import { BrowserOpenURL } from '../../client-bindings/wailsjs/runtime/runtime';
   import CopyMarkdown from './CopyMarkdown.svelte';
   import ToolCallBlock from './ToolCallBlock.svelte';
   export let items = [];

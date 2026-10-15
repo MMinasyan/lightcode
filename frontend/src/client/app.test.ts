@@ -21,11 +21,11 @@ vi.mock('../../client-bindings/wailsjs/go/desktopclient/Host', () => ({
 
 // The Wails runtime bridge: the assistant Markdown link action forwards the
 // exact href here instead of letting the webview navigate itself.
-vi.mock('../../wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
+vi.mock('../../client-bindings/wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
 
 import type { Hydration, Session } from '../generated/protocol/types.gen';
 import { AppVersion, Call, PickDirectory, SetTitle } from '../../client-bindings/wailsjs/go/desktopclient/Host';
-import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
+import { BrowserOpenURL } from '../../client-bindings/wailsjs/runtime/runtime';
 import { SessionReader } from './reader';
 import { AttemptLedger } from './attempts';
 

@@ -18,6 +18,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/MMinasyan/lightcode/client"
@@ -84,15 +85,25 @@ func New(opts clienthost.Options, workspace string) *Host {
 // startup and shutdown callbacks are the lifecycle hooks; they are not
 // exported bindings.
 func Run(host *Host, assets fs.FS) error {
-	return wails.Run(&options.App{
-		Title:       windowTitle(host.workspace),
-		Width:       900,
-		Height:      700,
+	return wails.Run(appOptions(host, assets))
+}
+
+// appOptions is the exact native window contract every entry runs: the
+// shared size and Workspace title, the given assets, the host's private
+// lifecycle hooks and bindings, and the retained Linux WebKit GPU policy.
+func appOptions(host *Host, assets fs.FS) *options.App {
+	return &options.App{
+		Title:  windowTitle(host.workspace),
+		Width:  900,
+		Height: 700,
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyAlways,
+		},
 		AssetServer: &assetserver.Options{Assets: assets},
 		OnStartup:   host.startup,
 		OnShutdown:  host.shutdown,
 		Bind:        []interface{}{host},
-	})
+	}
 }
 
 // windowTitle is the one shared title algorithm, matching the retained

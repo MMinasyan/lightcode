@@ -8,10 +8,10 @@ import { mount, tick, unmount } from 'svelte';
 
 // The Wails runtime bridge: the assistant Markdown link action forwards the
 // exact href here instead of letting the webview navigate itself.
-vi.mock('../../wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
+vi.mock('../../client-bindings/wailsjs/runtime/runtime', () => ({ BrowserOpenURL: vi.fn() }));
 
 import type { ConversationItem } from '../generated/protocol/types.gen';
-import { BrowserOpenURL } from '../../wailsjs/runtime/runtime';
+import { BrowserOpenURL } from '../../client-bindings/wailsjs/runtime/runtime';
 
 const items: ConversationItem[] = [
   {
