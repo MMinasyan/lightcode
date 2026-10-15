@@ -348,20 +348,33 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	c.requestExit(nil)
 }
 
-func TestCreateUnknownRemainsCapturedAcrossWorkspaceIntent(t *testing.T) {
+// One failed Create is reported only for its current captured intent; a fresh
+// explicit Workspace-selection intent composes once for the new address, and
+// an old-Workspace completion neither adopts nor publishes a stale error.
+func TestCreateFailureCapturedAddressAndExplicitWorkspaceIntent(t *testing.T) {
 	c, transport := fixture(t)
 	c.mu.Lock()
 	s := c.stampLocked()
 	c.mu.Unlock()
 	c.task(func() { c.create(s) })
 	old := receive(t, transport.requests)
+	var pending protocol.CreateSessionRequest
+	if err := json.Unmarshal(old.body, &pending); err != nil || pending.Workspace != "/workspace" {
+		t.Fatalf("pending create captured %q (%v)", pending.Workspace, err)
+	}
 	c.selectWorkspace("/workspace/../different")
 	list := receive(t, transport.requests)
 	if list.req.URL.Query().Get("workspace") != "/different" {
 		t.Fatal("Workspace did not use lexical Abs")
 	}
-	list.respond([]protocol.Session{})
+	// A child-only header list leaves no eligible root: the next request is
+	// still the Create for the captured Workspace.
+	list.respond([]protocol.Session{{SessionId: childA, ParentSessionId: pointer(rootB)}})
 	newCreate := receive(t, transport.requests)
+	var sent protocol.CreateSessionRequest
+	if err := json.Unmarshal(newCreate.body, &sent); err != nil || sent.Workspace != "/different" {
+		t.Fatalf("explicit Workspace composition create = %s (%v)", newCreate.body, err)
+	}
 	newCreate.reject(201, protocol.Session{SessionId: rootB, Workspace: "/different", AgentType: "primary"})
 	fresh := hydration(rootB, "1", nil, nil)
 	fresh.Session.Workspace = "/different"
@@ -369,17 +382,13 @@ func TestCreateUnknownRemainsCapturedAcrossWorkspaceIntent(t *testing.T) {
 	old.lost()
 	settleTasks(t, c)
 	c.mu.Lock()
-	if !c.unknownCreates["/workspace"] || c.unknownCreates["/different"] || c.rootID != rootB {
-		t.Fatal("unknown creation moved to the newly selected Workspace")
-	}
+	adopted := c.rootID == rootB
 	c.mu.Unlock()
-	c.selectWorkspace("/workspace")
-	receive(t, transport.requests).respond([]protocol.Session{})
-	settleTasks(t, c)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.rootID != "" || !c.unknownCreates["/workspace"] {
-		t.Fatal("later composition adopted/resubmitted unknown Create")
+	if !adopted {
+		t.Fatal("an old-Workspace completion or a failed intent blocked the new explicit composition")
+	}
+	if strings.Contains(outputs(c), "Outcome unknown") {
+		t.Fatal("an old-Workspace completion published a stale local error")
 	}
 }
 
@@ -505,44 +514,77 @@ func TestBareResumeSelectsNewestOpenRootAndKeepsSelectionWithoutAny(t *testing.T
 	}
 }
 
-func TestFailedNamedResumeKeepsTheAcceptedSelection(t *testing.T) {
-	c, transport := fixture(t)
-	settledReader(t, c, transport)
-	c.mu.Lock()
-	source, sourceID, workspace := c.root.id, c.rootID, c.workspace
-	c.mu.Unlock()
-	// A refused destination read keeps root, inspector and Workspace, and says so.
-	c.command("/resume missing-root")
-	receive(t, transport.requests).reject(404, protocol.Error{Code: "not_found", Message: "no such session"})
-	// The retained source is live again: its own refresh follows the failure.
-	settleAnsweringRequested(t, c, transport)
-	c.mu.Lock()
-	if c.root.id != source || c.rootID != sourceID || c.workspace != workspace || c.menu != nil {
-		t.Fatalf("failed resume changed the accepted selection: root=%q workspace=%q", c.rootID, c.workspace)
+// Failed root navigation over the actual commands and failure replies keeps
+// the accepted root, inspector and Workspace live with their resume reads and
+// reports the outcome; a superseded completion neither adopts nor prints, and
+// recall survives the failed intent.
+func TestFailedRootNavigationKeepsTheAcceptedSelection(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		fail    func(request)
+		note    string
+	}{
+		{"known rejected New", "/new", func(req request) { req.reject(409, protocol.Error{Code: "conflict", Message: "create rejected"}) }, "create rejected"},
+		{"lost New", "/new", func(req request) { req.lost() }, "Outcome unknown"},
+		{"known rejected named resume", "/resume missing-root", func(req request) { req.reject(404, protocol.Error{Code: "not_found", Message: "no such session"}) }, "no such session"},
+		{"lost named resume", "/resume missing-root", func(req request) { req.lost() }, "unexpected EOF"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, transport := fixture(t)
+			settledReader(t, c, transport)
+			c.mu.Lock()
+			source, sourceID, workspace := c.root, c.rootID, c.workspace
+			c.mu.Unlock()
+			c.command(test.command)
+			test.fail(receive(t, transport.requests))
+			// The retained source readers resume under the current selection.
+			resumed := receive(t, transport.requests)
+			if !strings.Contains(resumed.req.URL.Path, rootA+"/hydration") {
+				t.Fatalf("failed navigation did not resume the source read: %s", resumed.req.URL)
+			}
+			resumed.respond(hydration(rootA, "2", inputs(1, 1), nil))
+			settleTasks(t, c)
+			c.mu.Lock()
+			kept := c.root == source && c.rootID == sourceID && c.workspace == workspace && c.child == nil && c.childID == "" && c.menu == nil
+			c.mu.Unlock()
+			if !kept {
+				t.Fatal("failed navigation changed the accepted selection")
+			}
+			if !strings.Contains(outputs(c), test.note) {
+				t.Fatal("failed navigation hid its outcome")
+			}
+			press(c, terminal.KeyMsg{Rune: 'z'})
+			press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+			if c.draft.String() != "input 1" {
+				t.Fatalf("failed navigation cleared recall: %q", c.draft.String())
+			}
+		})
 	}
-	c.mu.Unlock()
-	if !strings.Contains(outputs(c), "no such session") {
-		t.Fatal("selection error was not reported")
-	}
-	// A superseded intent's late error is dropped with its adoption.
-	c.command("/resume also-missing")
-	parked := receive(t, transport.requests)
-	c.command("/resume " + sourceID)
-	receive(t, transport.requests).respond(hydration(sourceID, "3", nil, nil))
-	receive(t, transport.requests).respond(hydration(sourceID, "3", nil, nil))
-	parked.reject(404, protocol.Error{Code: "not_found", Message: "stale destination error"})
-	settleTasks(t, c)
-	c.mu.Lock()
-	current := c.root
-	c.mu.Unlock()
-	c.mu.Lock()
-	if c.root != current || c.rootID != sourceID {
-		t.Fatal("superseded destination error moved the selection")
-	}
-	c.mu.Unlock()
-	if strings.Contains(outputs(c), "stale destination error") {
-		t.Fatal("superseded destination error printed")
-	}
+
+	t.Run("a superseded completion neither adopts nor prints", func(t *testing.T) {
+		c, transport := fixture(t)
+		settledReader(t, c, transport)
+		c.command("/new")
+		parkedCreate := receive(t, transport.requests)
+		c.command("/resume also-missing")
+		parkedError := receive(t, transport.requests)
+		c.command("/resume " + rootB)
+		destination := receive(t, transport.requests)
+		destination.respond(hydration(rootB, "1", nil, nil))
+		receive(t, transport.requests).respond(hydration(rootB, "2", nil, nil))
+		parkedCreate.reject(201, protocol.Session{SessionId: childA, Workspace: "/workspace", AgentType: "primary"})
+		parkedError.reject(404, protocol.Error{Code: "not_found", Message: "stale destination error"})
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.rootID != rootB {
+			t.Fatal("a superseded completion adopted over newer navigation")
+		}
+		if strings.Contains(outputs(c), "stale destination error") {
+			t.Fatal("superseded destination error printed")
+		}
+	})
 }
 
 func TestSourceAgentMenuCannotPublishAfterDestinationAdoption(t *testing.T) {

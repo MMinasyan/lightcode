@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // The mounted target App over the real reader, composer and renderer with
 // faithfully shaped native call results: every received status arrives as the
-// lossless local result {status,content_type,body,invalid} and only a binding
+// lossless local result {status,body,invalid} and only a binding
 // rejection is loss. The real-stack owner (stack.test.ts) drives the actual
 // generated host surface on top of these; this file covers the view, keyboard,
 // membership, draft and repair behaviors.
@@ -126,29 +126,29 @@ function makeHydration(overrides: Partial<Hydration> = {}): Hydration {
 
 // ok models one received 200 whose JSON body every selected decoder consumes.
 function ok(data: unknown) {
-  return { status: 200, content_type: 'application/json', body: JSON.stringify(data), invalid: false };
+  return { status: 200, body: JSON.stringify(data), invalid: false };
 }
 
 // okRaw models one received 200 carrying its exact body text.
 function okRaw(body: string) {
-  return { status: 200, content_type: 'application/json', body, invalid: false };
+  return { status: 200, body, invalid: false };
 }
 
 // httpError models a RECEIVED non-2xx: the validated Error/partial body is the
 // in-band result beside its status, never a rejected promise.
 function httpError(status: number, error: unknown) {
-  return { status, content_type: 'application/json', body: JSON.stringify(error), invalid: false };
+  return { status, body: JSON.stringify(error), invalid: false };
 }
 
 // receivedInvalid models a 2xx whose body cannot be consumed: the native
 // invalid bit survives the binding before any status/body branch.
 function receivedInvalid(message: string) {
-  return { status: 200, content_type: 'application/json', body: message, invalid: true };
+  return { status: 200, body: message, invalid: true };
 }
 
 // noContent models a REAL 204 success: valid empty success at the boundary.
 function noContent() {
-  return { status: 204, content_type: 'application/json', body: '', invalid: false };
+  return { status: 204, body: '', invalid: false };
 }
 
 function fakeConnection() {
@@ -372,7 +372,7 @@ describe('initial composition', () => {
     expect(target.querySelector('.note.warn')).not.toBeNull();
   });
 
-  it('a repair during the held initial list finishes and re-reads, never leaving the app sessionless', async () => {
+  it('a repair discards a held initial list and never recomposes an absent selection', async () => {
     const connection = fakeConnection();
     connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/ws' });
     vi.mocked(sdk.GetConfiguration).mockResolvedValue(ok({
@@ -382,7 +382,7 @@ describe('initial composition', () => {
     }));
     vi.mocked(sdk.GetWarnings).mockResolvedValue(ok({ warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [] }));
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(makeHydration()));
-    // The boot list is held; a repair then completes and re-runs the selection.
+    // The boot list is held; a repair then completes while it is parked.
     let releaseList: (value: unknown) => void = () => {};
     let listCalls = 0;
     vi.mocked(sdk.ListSessions).mockImplementation(async () => {
@@ -397,35 +397,14 @@ describe('initial composition', () => {
     // Supersede the held boot list with a repair (new generation).
     connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
     connection.failureHandler?.(new Error('loss during boot'), '1');
-    await settle();
-    // Release the stale boot list AFTER the repair; its adoption must be
-    // discarded and the repair's fresh list must drive selection instead.
+    await vi.waitFor(() => expect(vi.mocked(sdk.GetConfiguration).mock.calls.length).toBeGreaterThan(1));
+    // Release the stale boot list AFTER the repair; its adoption is discarded
+    // and the ended attempt is never rescheduled by the repair.
     releaseList(ok([rootSession('root-stale', NEWER)]));
-    await vi.waitFor(() => expect(target.textContent).toContain('root1'));
-    expect(target.textContent).not.toContain('root-stale');
-  });
-
-  it('an unknown Create is reported for its address and never blind-retransmitted; a later list discovers its header', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    // First boot: no roots → Create, which the binding loses (no response).
-    vi.mocked(sdk.ListSessions).mockResolvedValue(ok([]));
-    vi.mocked(sdk.CreateSession).mockRejectedValue(new Error('create lost'));
-    const { target } = await mountAppNoWait(connection);
-    await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalled());
     await settle();
-    // Exactly one Create attempt, reported as unknown, not resent.
-    expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1);
-    expect(target.querySelector('.note.outcome')?.textContent).toContain('not retransmitted');
-    // A later repair's fresh list now reveals the created header's real ID.
-    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
-    vi.mocked(sdk.ListSessions).mockResolvedValue(ok([rootSession('created-1', NEWER)]));
-    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(makeHydration({ session: rootSession('created-1', NEWER) })));
-    // The loss arrives against the STILL-current generation '1' (installed by
-    // boot), so it drives a real repair rather than being subsumed.
-    connection.failureHandler?.(new Error('later loss'), '1');
-    await vi.waitFor(() => expect(target.textContent).toContain('created-1'), { timeout: 2000 });
-    expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1);
+    await settle();
+    expect(target.textContent).not.toContain('root-stale');
+    expect(target.textContent).toContain('no session');
   });
 
   it('creates a primary session when no open root exists', async () => {
@@ -451,7 +430,7 @@ describe('conversation rendering', () => {
     basicMocks(connection);
     const items = [
       { item_id: 'u1', kind: 'input', committed_at: '0', origin: 'user', content: [{ kind: 'text', text: 'hello user' }] },
-      { item_id: 'a1', kind: 'assistant', committed_at: '0', operation_id: 'op-a1', status: 'completed', source: 'prov/model', content: [{ kind: 'text', text: '**bold** reply' }], refusal: 'refused here', tool_calls: [{ id: 'c1', name: 'read_file', arguments: '{"path":"a.go"}', status: 'success', content: 'ok' }] },
+      { item_id: 'a1', kind: 'assistant', committed_at: '0', operation_id: 'op-a1', status: 'completed', source: 'prov/model', content: [{ kind: 'text', text: '**bold** reply' }], refusal: 'refused here', tool_calls: [{ id: 'c1', name: 'read_file', arguments: '{"path":"a.go"}', status: 'success', content: 'ok', normalized_arguments: { raw: JSON.rawJSON('9007199254740993'), huge: JSON.rawJSON('1e400') }, metadata: { note: { n: JSON.rawJSON('9007199254740993') } } }] },
       { item_id: 's1', kind: 'signal', committed_at: '0', subtype: 'interruption', content: 'stopped' },
       { item_id: 'c1', kind: 'compaction', committed_at: '0', summary: 'summary here', model: 'prov/compact' },
       { item_id: 'o1', kind: 'operation_end', committed_at: '0', operation_id: 'op-o1', status: 'failure', detail: 'failed detail' },
@@ -468,6 +447,10 @@ describe('conversation rendering', () => {
     expect(target.querySelector('strong')?.textContent).toBe('bold');
     expect(target.querySelector('.refusal')?.textContent).toContain('refused here');
     expect(target.querySelector('.tool-name')?.textContent).toBe('read_file');
+    // Exact numeric lexemes survive the normalized-argument and metadata
+    // stringify displays verbatim.
+    expect(target.textContent).toContain('9007199254740993');
+    expect(target.textContent).toContain('1e400');
     expect(target.textContent).toContain('Interrupted');
     expect(target.textContent).toContain('summary here');
     expect(target.textContent).toContain('failed detail');
@@ -485,8 +468,8 @@ describe('conversation rendering', () => {
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(makeHydration({
       conversation: {
         items: [
-          { item_id: 'u1', kind: 'input', committed_at: '0', origin: 'user', content: [{ kind: 'opaque', opaque_wire_type: 'odd', extra: { x: '<b>not html</b>' } }] },
-          { item_id: 'a1', kind: 'assistant', committed_at: '0', status: 'completed', source: 'p/m', content: [{ kind: 'text', text: '<script>window.__xss=1</script>text' }], tool_calls: [], extra: { unknown: 'field' } },
+          { item_id: 'u1', kind: 'input', committed_at: '0', origin: 'user', content: [{ kind: 'opaque', opaque_wire_type: 'odd', extra: { x: '<b>not html</b>', big: JSON.rawJSON('9007199254740993'), huge: JSON.rawJSON('1e400') } }] },
+          { item_id: 'a1', kind: 'assistant', committed_at: '0', status: 'completed', source: 'p/m', content: [{ kind: 'text', text: '<script>window.__xss=1</script>text' }], tool_calls: [], extra: { unknown: 'field', n: JSON.rawJSON('9007199254740993') } },
         ] as Hydration['conversation']['items'],
       },
     })));
@@ -495,6 +478,39 @@ describe('conversation rendering', () => {
     expect((window as unknown as { __xss?: number }).__xss).toBeUndefined();
     expect(target.textContent).toContain('[opaque odd');
     expect(target.textContent).toContain('"unknown":"field"');
+    // Part-extra and item-extra numeric lexemes stay exact.
+    expect(target.textContent).toContain('9007199254740993');
+    expect(target.textContent).toContain('1e400');
+  });
+
+  it('keeps exact lexemes through older-page reads and an unchanged Fork', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const lex = JSON.rawJSON('9007199254740993');
+    const overflow = JSON.rawJSON('1e400');
+    const opaqueInput = { ...inputItem('i-lex', 'user'), content: [{ kind: 'text' as const, text: 'hello' }, { kind: 'opaque' as const, opaque_wire_type: 'w', extra: { big: lex, huge: overflow } }] };
+    const opaqueAssistant = { item_id: 'a-lex', kind: 'assistant' as const, committed_at: '0', status: 'completed' as const, source: 'p/m', content: [{ kind: 'text' as const, text: 'answer' }], tool_calls: [], extra: { n: lex } };
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(makeHydration({
+      conversation: { items: [opaqueAssistant as Hydration['conversation']['items'][number]], older_cursor: 'p1' },
+    })));
+    vi.mocked(sdk.GetSessionHistory).mockResolvedValue(ok({ session_revision: sessionRev('1'), items: [opaqueInput], older_cursor: null }));
+    vi.mocked(sdk.ForkSession).mockResolvedValue(ok({ session: rootSession('dest1', NEWER), operation: runningOperation('caller') }));
+    const { target } = await mountApp(connection);
+    await settle();
+    (target.querySelector('[aria-label="Load older messages"]') as HTMLElement).click();
+    await vi.waitFor(() => expect(target.textContent).toContain('1e400'));
+    expect(target.textContent).toContain('9007199254740993');
+    (target.querySelector('[aria-label="Fork from input i-lex"]') as HTMLElement).click();
+    await settle();
+    const textarea = target.querySelector('[aria-label="Replacement content JSON"]') as HTMLTextAreaElement;
+    expect(textarea.value).toContain('"big": 9007199254740993');
+    expect(textarea.value).toContain('"huge": 1e400');
+    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.ForkSession).mock.calls[0][0] as string);
+    expect(body).toContain('"big": 9007199254740993');
+    expect(body).toContain('"huge": 1e400');
   });
 });
 
@@ -656,7 +672,7 @@ describe('composer', () => {
   });
 
   it('a 200 null document is never a successful Submit: the draft and attempt stay as unknown', async () => {
-    vi.mocked(sdk.SubmitSession).mockResolvedValue({ status: 200, content_type: 'application/json', body: 'null', invalid: false });
+    vi.mocked(sdk.SubmitSession).mockResolvedValue({ status: 200, body: 'null', invalid: false });
     const { target } = await mountBasic();
     typeInto(target, 'undecodable outcome');
     await settle();
@@ -1375,7 +1391,7 @@ describe('warnings and usage', () => {
             { model: 'p/m2', usage: { input_tokens: '2', cached_input_tokens: '0', output_tokens: '9007199254740992' } },
           ],
         },
-        context: { used_tokens: '123456789012345678901', context_window: 200000 },
+        context: { used_tokens: '123456789012345678901', context_window: JSON.rawJSON('200000') },
       },
     })));
     const { target } = await mountApp(connection);
@@ -1385,6 +1401,8 @@ describe('warnings and usage', () => {
     expect(target.querySelector('.tokens')?.textContent).toContain('↑ 9007199254740995');
     expect(target.querySelector('.tokens')?.textContent).toContain('↓ 9007199254740995');
     expect(target.querySelector('.context')?.textContent).toContain('123456789012345678901');
+    // The typed context consumer interprets its exact window token.
+    expect(target.querySelector('.context')?.textContent).toContain('/ 200000');
   });
 });
 
@@ -1438,7 +1456,7 @@ describe('repair', () => {
   it('a 200 null configuration document is invalid delivery and repairs without a consumer exception', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    vi.mocked(sdk.GetConfiguration).mockResolvedValueOnce({ status: 200, content_type: 'application/json', body: 'null', invalid: false });
+    vi.mocked(sdk.GetConfiguration).mockResolvedValueOnce({ status: 200, body: 'null', invalid: false });
     connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
     const opensBefore = connection.openMock.mock.calls.length;
     const { target } = await mountApp(connection);
@@ -3822,7 +3840,7 @@ describe('replacement Fork and ordered rewind', () => {
     vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
       const id = (JSON.parse(options) as { session_id: string }).session_id;
       if (id === 'child1') {
-        return ok(makeHydration({ conversation: { items: [inputItem('child-owned', 'user', 'op-child')] } }));
+        return ok(makeHydration({ conversation: { items: [{ ...inputItem('child-owned', 'user', 'op-child'), content: [{ kind: 'text' as const, text: 'hi' }, { kind: 'opaque' as const, opaque_wire_type: 'w', extra: { big: JSON.rawJSON('9007199254740993') } }] }] } }));
       }
       return ok(makeHydration({ background: [{ kind: 'child', id: 'child1' }] }));
     });
@@ -3835,6 +3853,8 @@ describe('replacement Fork and ordered rewind', () => {
     const childPane = target.querySelector('.child-pane') as HTMLElement;
     expect(childPane).not.toBeNull();
     expect(childPane.querySelector('.fork')).toBeNull();
+    // The child read keeps exact numeric lexemes.
+    expect(childPane.textContent).toContain('9007199254740993');
   });
 
   it('prefills the generated content parts and forwards the exact edited replacement text', async () => {
@@ -3890,7 +3910,7 @@ describe('replacement Fork and ordered rewind', () => {
 
   it('a 200 null Fork document is never accepted and raises no consumer exception', async () => {
     const connection = forkConnection();
-    vi.mocked(sdk.ForkSession).mockResolvedValue({ status: 200, content_type: 'application/json', body: 'null', invalid: false });
+    vi.mocked(sdk.ForkSession).mockResolvedValue({ status: 200, body: 'null', invalid: false });
     const { target } = await mountApp(connection);
     await openOwnedFork(target, false);
     await settle();
@@ -4899,152 +4919,105 @@ describe('selection-bound Fork source', () => {
 
 // --- Second correction pass regressions: per-workspace Create uncertainty, uniform archive, discovery token, busy inputs, edit tail authority ----
 
-describe('per-workspace Create uncertainty', () => {
-  it('old-A unknown Create never blocks empty B; return to A shows the note without replay', async () => {
-    const connection = fakeConnection();
-    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
-    let listCalls = 0;
-    vi.mocked(sdk.ListSessions).mockImplementation(async () => {
-      listCalls += 1;
-      return ok([]);
-    });
-    vi.mocked(sdk.CreateSession).mockRejectedValue(new Error('gone'));
-    vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration()));
-    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => ok({
-      configuration_revision: { instance_id: INSTANCE, generation: '1' },
-      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
-      agents: [], providers: [],
-    }));
-    vi.mocked(sdk.GetWarnings).mockImplementation(async () => ok({
-      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
-    }));
-    vi.mocked(sdk.ListWorkspaces).mockImplementation(async () => ok([
-      { root: '/wsA', display_name: 'A' },
-      { root: '/wsB', display_name: 'B' },
-    ]));
-    const { target } = await mountAppNoWait(connection);
-    await settle();
-    await settle();
-    // A's unknown Create is reported.
-    expect(target.textContent).toContain('Session create outcome unknown');
-    expect(target.textContent).toContain('/wsA');
-    const createCallsAfterA = vi.mocked(sdk.CreateSession).mock.calls.length;
-    expect(createCallsAfterA).toBe(1);
-    // Switch to workspace B: B is empty and gets its own Create.
-    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
-    await settle();
-    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    // B's Create is attempted independently (A's uncertainty doesn't block B).
-    expect(vi.mocked(sdk.CreateSession).mock.calls.length).toBeGreaterThan(createCallsAfterA);
-  });
+describe('composition failure outcomes', () => {
+  function compositionMocks(connection: ReturnType<typeof fakeConnection>, failure: 'known' | 'uncertain') {
+    basicMocks(connection);
+    vi.mocked(sdk.ListSessions).mockResolvedValue(ok([]));
+    if (failure === 'known') {
+      vi.mocked(sdk.CreateSession).mockResolvedValueOnce(httpError(500, { code: 'internal', message: 'create rejected' }));
+    } else {
+      vi.mocked(sdk.CreateSession).mockRejectedValueOnce(new Error('create lost'));
+    }
+  }
 
-  it('binds an initial-composition Create uncertainty to its addressed workspace when B was selected while it was parked', async () => {
-    const connection = fakeConnection();
-    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
-    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => ok({
-      configuration_revision: { instance_id: INSTANCE, generation: '1' },
-      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
-      agents: [], providers: [],
-    }));
-    vi.mocked(sdk.GetWarnings).mockImplementation(async () => ok({
-      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
-    }));
-    vi.mocked(sdk.ListSessions).mockImplementation(async () => ok([]));
-    vi.mocked(sdk.ListWorkspaces).mockImplementation(async () => ok([
-      { root: '/wsA', display_name: 'A' },
-      { root: '/wsB', display_name: 'B' },
-    ]));
-    let releaseCreate: (value: unknown) => void = () => {};
-    const parkedCreate = new Promise((_resolve, reject) => { releaseCreate = reject; });
-    vi.mocked(sdk.CreateSession)
-      .mockImplementationOnce(() => parkedCreate as never)
-      .mockResolvedValue(ok(rootSession('b-1', NEWER)));
-    vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration({ session: rootSession('b-1', NEWER) })));
-    const { target } = await mountAppNoWait(connection);
-    await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1));
-    // B is chosen while A's Create is parked; B's composition waits on it.
-    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
-    await settle();
-    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
-    await settle();
-    releaseCreate(new Error('A create lost'));
-    await settle();
-    await settle();
-    // The loss belongs to A: empty B still creates its own Session.
-    const workspaces = vi.mocked(sdk.CreateSession).mock.calls.map(
-      (call) => (JSON.parse(call[0] as string) as { body: { workspace: string } }).body.workspace,
-    );
-    expect(workspaces).toEqual(['/wsA', '/wsB']);
-    expect(target.textContent).toContain('b-1');
-    // Returning to A replays nothing: A's uncertainty is still recorded.
-    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
-    await settle();
-    (target.querySelector('[aria-label="Select workspace /wsA"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    expect(vi.mocked(sdk.CreateSession).mock.calls.length).toBe(2);
-    expect(target.textContent).toContain('Session create outcome unknown');
-    expect(target.textContent).toContain('/wsA');
-  });
+  for (const failure of ['known', 'uncertain'] as const) {
+    it(`a ${failure} composition Create ends the attempt visibly and a fresh explicit New works`, async () => {
+      const connection = fakeConnection();
+      compositionMocks(connection, failure);
+      const { target } = await mountAppNoWait(connection);
+      await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1));
+      await settle();
+      if (failure === 'known') {
+        expect(target.querySelector('.note.error')?.textContent).toContain('Session creation failed');
+      } else {
+        const note = target.querySelector('.note.outcome')?.textContent ?? '';
+        expect(note).toContain('Session create outcome unknown');
+        expect(note).toContain('/ws');
+        expect(note).toContain('not retransmitted');
+      }
+      expect(target.textContent).toContain('no session');
+      // A fresh explicit New creates and adopts its destination.
+      vi.mocked(sdk.CreateSession).mockResolvedValue(ok(rootSession('created-1', NEWER)));
+      vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
+        const id = (JSON.parse(options) as { session_id: string }).session_id;
+        return ok(makeHydration({ session: rootSession(id, NEWER) }));
+      });
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+      await settle();
+      await settle();
+      (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
+      await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(2));
+      await settle();
+      await settle();
+      expect(vi.mocked(sdk.GetSessionHydration)).toHaveBeenCalledWith('{"session_id":"created-1"}');
+      expect(target.textContent).toContain('created-1');
+    });
+  }
 
-  it('binds a picker Create uncertainty to its addressed workspace across a move', async () => {
-    const connection = fakeConnection();
-    connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '1', workspace: '/wsA' });
-    vi.mocked(sdk.GetConfiguration).mockImplementation(async () => ok({
-      configuration_revision: { instance_id: INSTANCE, generation: '1' },
-      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
-      agents: [], providers: [],
-    }));
-    vi.mocked(sdk.GetWarnings).mockImplementation(async () => ok({
-      warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [],
-    }));
-    vi.mocked(sdk.ListWorkspaces).mockImplementation(async () => ok([
-      { root: '/wsA', display_name: 'A' },
-      { root: '/wsB', display_name: 'B' },
-    ]));
-    let releaseBList: (value: unknown) => void = () => {};
-    const parkedBList = new Promise((resolve) => { releaseBList = resolve; });
-    vi.mocked(sdk.ListSessions).mockImplementation(async (options) => {
-      const workspace = (JSON.parse(options) as { query: { workspace: string } }).query.workspace;
-      if (workspace === '/wsB') return parkedBList as never;
-      return ok([rootSession('a-1', NEWER)]);
+  for (const initial of ['accepted', 'lost'] as const) {
+    it(`a stale ${initial} initial completion never adopts or publishes and the picker reports its captured address`, async () => {
+      const connection = fakeConnection();
+      basicMocks(connection);
+      vi.mocked(sdk.ListSessions).mockResolvedValue(ok([]));
+      vi.mocked(sdk.ListWorkspaces).mockResolvedValue(ok([
+        { root: '/wsB', display_name: 'B' },
+      ]));
+      let releaseInitial: (value: unknown) => void = () => {};
+      let releasePicker: (reason?: unknown) => void = () => {};
+      vi.mocked(sdk.CreateSession)
+        .mockImplementationOnce(() => new Promise((resolve) => { releaseInitial = resolve; }) as never)
+        .mockImplementationOnce(() => new Promise((_resolve, reject) => { releasePicker = reject; }) as never)
+        .mockResolvedValue(ok(rootSession('b-1', NEWER)));
+      vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
+        const id = (JSON.parse(options) as { session_id: string }).session_id;
+        return ok(makeHydration({ session: rootSession(id, NEWER) }));
+      });
+      const { target } = await mountAppNoWait(connection);
+      await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1));
+      // The picker's explicit New parks its own Create against the captured
+      // workspace.
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
+      await settle();
+      await settle();
+      (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
+      await vi.waitFor(() => expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(2));
+      // B is chosen; its composition waits behind the parked initial Create.
+      (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
+      await settle();
+      (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
+      await settle();
+      releaseInitial(initial === 'accepted' ? ok(rootSession('stale-1', NEWER)) : new Error('stale initial lost'));
+      await settle();
+      await settle();
+      // The old initial completion neither adopts nor publishes a note.
+      expect(target.textContent).not.toContain('stale-1');
+      expect(target.querySelector('.note.outcome')).toBeNull();
+      expect(target.querySelector('.note.error')).toBeNull();
+      const workspaces = vi.mocked(sdk.CreateSession).mock.calls.map(
+        (call) => (JSON.parse(call[0] as string) as { body: { workspace: string } }).body.workspace,
+      );
+      expect(workspaces).toEqual(['/ws', '/ws', '/wsB']);
+      expect(target.textContent).toContain('b-1');
+      // The stale picker outcome reports against its captured address and never
+      // adopts over the newer selection.
+      releasePicker(new Error('stale picker create lost'));
+      await settle();
+      await settle();
+      expect(target.querySelector('.note.outcome')?.textContent).toContain('/ws');
+      expect(target.textContent).toContain('b-1');
+      expect(target.textContent).not.toContain('stale-1');
     });
-    vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
-      const id = (JSON.parse(options) as { session_id: string }).session_id;
-      return ok(makeHydration({ session: id === 'b-1' ? rootSession('b-1', NEWER) : rootSession('a-1', NEWER) }));
-    });
-    let releasePickerCreate: (value: unknown) => void = () => {};
-    const parkedPickerCreate = new Promise((_resolve, reject) => { releasePickerCreate = reject; });
-    vi.mocked(sdk.CreateSession)
-      .mockImplementationOnce(() => parkedPickerCreate as never)
-      .mockResolvedValue(ok(rootSession('b-1', NEWER)));
-    const { target } = await mountApp(connection);
-    // The picker's explicit New is parked.
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
-    await settle();
-    await settle();
-    (target.querySelector('[aria-label="New session"]') as HTMLElement).click();
-    await settle();
-    expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledTimes(1);
-    // B is chosen and its composition parks in B's held list.
-    (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
-    await settle();
-    (target.querySelector('[aria-label="Select workspace /wsB"]') as HTMLElement).click();
-    await settle();
-    // The parked picker Create is lost while B is the live workspace.
-    releasePickerCreate(new Error('A picker create lost'));
-    await settle();
-    await settle();
-    releaseBList(ok([]));
-    await settle();
-    await settle();
-    const workspaces = vi.mocked(sdk.CreateSession).mock.calls.map(
-      (call) => (JSON.parse(call[0] as string) as { body: { workspace: string } }).body.workspace,
-    );
-    expect(workspaces).toEqual(['/wsA', '/wsB']);
-  });
+  }
 });
 
 describe('uniform archive→delete for both lifecycles', () => {

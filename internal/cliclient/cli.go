@@ -75,7 +75,6 @@ type CLI struct {
 	forkBoundary               *protocol.InputItem
 	forkRewind                 bool
 	attempts                   map[string]*attempt
-	unknownCreates             map[string]bool
 	menu                       *menu
 	width, promptRows          int
 	promptBelow                int
@@ -95,7 +94,7 @@ type CLI struct {
 
 func New(opts Options) *CLI {
 	return &CLI{opts: opts, workspace: opts.Workspace, draft: terminal.NewInputLine(), history: terminal.NewInputHistory(),
-		attempts: make(map[string]*attempt), unknownCreates: make(map[string]bool), width: 80,
+		attempts: make(map[string]*attempt), width: 80,
 		wake: make(chan struct{}, 1), outputs: make(chan delivery, 256), events: make(chan eventDelivery, 256),
 		keys: make(chan terminal.KeyMsg, 4096), exit: make(chan struct{})}
 }
@@ -428,8 +427,12 @@ func (c *CLI) openConnection(connCtx context.Context, cancel context.CancelFunc,
 	if repair {
 		c.report(s, terminal.RenderSystemMsg("Connection repaired — authoritative reads; missed activity is not replayed."), false)
 	}
+	// Only the initial startup lists/adopts/creates; a repair never recomposes
+	// an absent selection.
 	if rootID == "" {
-		c.compose(s)
+		if !repair {
+			c.compose(s)
+		}
 	} else {
 		c.refreshList(s, "open", false)
 	}

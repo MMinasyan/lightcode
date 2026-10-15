@@ -21,6 +21,16 @@ export function rawJSONText(value: unknown): string | null {
   return typeof candidate.rawJSON === 'string' ? candidate.rawJSON : null;
 }
 
+// Presentation-only numeric interpretation at the typed display boundaries:
+// one exact raw token becomes its ordinary Number value, and every other value
+// (including an ordinary object with a rawJSON member) is returned unchanged.
+export function presentNumber(value: unknown): unknown {
+  if (JSON.isRawJSON(value)) {
+    return Number((value as { rawJSON: string }).rawJSON);
+  }
+  return value;
+}
+
 // Local exact one-object member replacement over the exact parser: every patch
 // member replaces its raw value in the document, absent members are preserved
 // and unedited numeric lexemes survive byte-for-byte. The document never
@@ -28,13 +38,7 @@ export function rawJSONText(value: unknown): string | null {
 export function replaceObjectMembers(document: string, patch: string): string {
   const members = exactObject(document, 'document');
   const edits = exactObject(patch, 'patch');
-  let next: Record<string, unknown> = members;
-  for (const [member, value] of Object.entries(edits)) {
-    // A computed-property spread writes own data properties, so a member named
-    // `__proto__` stays ordinary data instead of hitting the prototype setter.
-    next = { ...next, [member]: value };
-  }
-  return JSON.stringify(next);
+  return JSON.stringify({ ...members, ...edits });
 }
 
 // One exact-parsed object root; a numeric raw wrapper is not a JSON object.

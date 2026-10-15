@@ -8,7 +8,7 @@
   import { AttemptLedger } from './attempts';
   import { invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
-  import { composeForkBody, composeObjectPatch } from './exactjson';
+  import { composeForkBody, composeObjectPatch, parseExactJSON, presentNumber } from './exactjson';
   import { SessionReader, okRead, failRead, sameStamp } from './reader';
   import { sortOpenRoots } from './sessions';
   import { compareConfigurationRevision, compareWarningsRevision } from './projection';
@@ -78,8 +78,6 @@
   let pickerArchived = [];
   let pickerLoading = false;
   let listToken = 0;
-  // True when initial composition is intended (startup or an explicit Workspace change).
-  let needsComposition = true;
   let forkItem = null;
   let forkSourceSession = '';
   let forkSourceStamp = null;
@@ -175,7 +173,7 @@
       input: input.toString(),
       output: output.toString(),
       used: hydration.usage.context.used_tokens,
-      window: hydration.usage.context.context_window,
+      window: presentNumber(hydration.usage.context.context_window),
     };
   }
 
@@ -207,10 +205,10 @@
     const reader = new SessionReader(
       {
         async hydration() {
-          return readOutcome(await invoke('hydration', 'GetSessionHydration', JSON.stringify({ session_id: sessionID }), JSON.parse));
+          return readOutcome(await invoke('hydration', 'GetSessionHydration', JSON.stringify({ session_id: sessionID }), parseExactJSON));
         },
         async history(_stamp, cursor) {
-          return readOutcome(await invoke('history', 'GetSessionHistory', JSON.stringify(cursor ? { session_id: sessionID, query: { cursor } } : { session_id: sessionID }), JSON.parse));
+          return readOutcome(await invoke('history', 'GetSessionHistory', JSON.stringify(cursor ? { session_id: sessionID, query: { cursor } } : { session_id: sessionID }), parseExactJSON));
         },
       },
       stampFor(sessionID, view),
@@ -302,8 +300,6 @@
         rootReader = makeReader(rootID, 'root');
         rootReader.markDirty();
         tasks.push(rootReader.currentChain());
-      } else if (needsComposition) {
-        tasks.push(ensureSelection());
       }
       if (childID) {
         childReader = makeReader(childID, 'child');
@@ -387,10 +383,8 @@
 
   // --- Composition and selection -------------------------------------------
 
-  // ONE serialized initial-selection owner; a repair that superseded its completion re-runs it.
+  // ONE serialized initial-selection owner; a superseded completion re-runs it.
   let selectionTask = null;
-  // An unknown Create is never retransmitted; the uncertainty is keyed to its captured Workspace.
-  let unknownCreateWorkspaces = new Set();
   // A superseded completion re-runs inside the same serialized owner.
   let selectionPending = false;
 
@@ -412,13 +406,9 @@
 
   // ONE Create task for a captured Workspace address; callers keep their own adoption.
   async function createSessionIn(addressed) {
-    const classified = await invoke('session create', 'CreateSession', JSON.stringify({
+    return invoke('session create', 'CreateSession', JSON.stringify({
       body: { workspace: addressed, agent_type: 'primary' },
     }), JSON.parse);
-    if (classified.kind !== 'ok' && classified.kind !== 'rejection') {
-      unknownCreateWorkspaces.add(addressed);
-    }
-    return classified;
   }
 
   async function runSelection() {
@@ -434,15 +424,8 @@
     if (!sameStamp(cap, stampFor('', 'root')())) return;
     const roots = sortOpenRoots(classified.data);
     if (roots.length > 0) {
-      // A discovered header settles the unknown-creation note for this workspace.
-      unknownCreateWorkspaces.delete(addressed);
       outcomeNote = '';
       resetRoot(roots[0].session_id);
-      return;
-    }
-    if (unknownCreateWorkspaces.has(addressed)) {
-      openError = '';
-      outcomeNote = createUnknownNote(addressed);
       return;
     }
     const created = await createSessionIn(addressed);
@@ -463,7 +446,6 @@
 
   // ONE selected-root reset; adoption, Workspace change and removal reuse it.
   function resetRoot(id) {
-    needsComposition = false;
     rootSelection += 1;
     childSelection += 1;
     rootID = id;
@@ -749,7 +731,6 @@
   async function chooseWorkspace(path) {
     if (path === workspace) return;
     resetRoot('');
-    needsComposition = true;
     workspace = path;
     closeModal('session');
     closeModal('agent');

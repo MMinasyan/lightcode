@@ -59,14 +59,14 @@ function hydration(sessionID: string, overrides: Record<string, unknown> = {}) {
 }
 
 function json(status: number, value: unknown): desktopclient.HTTPResponse {
-  return native(status, 'application/json', JSON.stringify(value), false);
+  return native(status, JSON.stringify(value), false);
 }
 
 // native supplies one scripted local result exactly as the native owner
 // returns it, including the explicit invalid-delivery bit; producer
 // validation stays at the Go response owner.
-function native(status: number, content_type: string, body: string, invalid: boolean): desktopclient.HTTPResponse {
-  return { status, content_type, body, invalid };
+function native(status: number, body: string, invalid: boolean): desktopclient.HTTPResponse {
+  return { status, body, invalid };
 }
 
 // routeState is the scripted in-memory Runtime behind the byte bridge.
@@ -80,11 +80,11 @@ interface Script {
   stop?: () => { status: number; body: unknown } | 'throw' | Delayed;
   events?: string[];
   // Scripted raw hydration responses consumed in order (e.g. an empty 200).
-  hydration?: Array<{ status: number; content_type: string; body: string; invalid: boolean }>;
+  hydration?: Array<{ status: number; body: string; invalid: boolean }>;
   // Scripted GetConfiguration results consumed in order: each waits for its own
   // gate and then answers with its outcome, so one held global read can span a
   // connection retirement.
-  configuration?: Array<{ wait: Promise<void>; outcome: { status: number; content_type: string; body: string; invalid: boolean } | 'throw' }>;
+  configuration?: Array<{ wait: Promise<void>; outcome: { status: number; body: string; invalid: boolean } | 'throw' }>;
   // A held successor Open: opens after the first await it, retiring the
   // installed connection until the test releases the new info.
   openGate?: Promise<desktopclient.ConnectionInfo>;
@@ -114,7 +114,7 @@ function bridge(script: Script = {}) {
     if (operation === 'GetSessionHydration') {
       if (script.hydration && script.hydration.length > 0) {
         const raw = script.hydration.shift()!;
-        return native(raw.status, raw.content_type, raw.body, raw.invalid);
+        return native(raw.status, raw.body, raw.invalid);
       }
       return json(200, hydration(envelope.session_id!));
     }
@@ -123,10 +123,10 @@ function bridge(script: Script = {}) {
       if (scriptedRead) {
         await scriptedRead.wait;
         if (scriptedRead.outcome === 'throw') throw new Error('native bridge: configuration lost');
-        return native(scriptedRead.outcome.status, scriptedRead.outcome.content_type, scriptedRead.outcome.body, scriptedRead.outcome.invalid);
+        return native(scriptedRead.outcome.status, scriptedRead.outcome.body, scriptedRead.outcome.invalid);
       }
       if (script.configurationRaw) {
-        return native(200, 'application/json', script.configurationRaw, false);
+        return native(200, script.configurationRaw, false);
       }
       return json(200, {
         configuration_revision: { instance_id: INSTANCE, generation: '1' },
@@ -146,7 +146,7 @@ function bridge(script: Script = {}) {
     }
     if (operation === 'GetProviderDetail') {
       if (script.providerDetailRaw) {
-        return native(200, 'application/json', script.providerDetailRaw, false);
+        return native(200, script.providerDetailRaw, false);
       }
       return json(404, { code: 'not_found', message: 'no provider detail fixture' });
     }
@@ -201,7 +201,7 @@ function bridge(script: Script = {}) {
       return json(200, { operation_id: body.operation_id, request_kind: 'compact', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'prov/m', usage: { totals: { by_model: [] } } });
     }
     if (operation === 'InterruptSession') {
-      return native(204, '', '', false);
+      return native(204, '', false);
     }
     if (operation === 'StopSession' && script.stop) {
       const outcome = script.stop();
@@ -214,7 +214,7 @@ function bridge(script: Script = {}) {
       return json(outcome.status, outcome.body);
     }
     if (operation === 'StopSession') {
-      return native(204, '', '', false);
+      return native(204, '', false);
     }
     return json(404, { code: 'not_found', message: 'no fixture for ' + operation });
   });
@@ -269,7 +269,7 @@ function configurationView(generation: string, agentName: string) {
 }
 
 function rawJSONResponse(value: unknown) {
-  return { status: 200, content_type: 'application/json', body: JSON.stringify(value), invalid: false };
+  return { status: 200, body: JSON.stringify(value), invalid: false };
 }
 
 function typeInto(target: HTMLElement, text: string) {
@@ -460,7 +460,7 @@ describe('real generated stack over the byte bridge', () => {
     // survives the binding and the actual reader repairs through the fresh
     // Open, while the event pull stays live and no blank projection is ever
     // adopted.
-    const unusable = { status: 200, content_type: 'application/json', body: unusableBody, invalid: true };
+    const unusable = { status: 200, body: unusableBody, invalid: true };
     const newerHint = JSON.stringify({
       kind: 'session_changed',
       scope: { kind: 'session', session_id: 'root1' },
@@ -486,7 +486,7 @@ describe('real generated stack over the byte bridge', () => {
       ? rawJSONResponse(configurationView('9', 'stale'))
       : variant === 'loss'
         ? ('throw' as const)
-        : { status: 200, content_type: 'application/json', body: '{not json', invalid: true };
+        : { status: 200, body: '{not json', invalid: true };
     const { target, calls, connection } = await mountReal({
       openGate,
       configuration: [
@@ -776,7 +776,7 @@ describe('the shared invocation boundary', () => {
 
   it('classifies an undecodable accepted body as invalid delivery, distinct from native-call loss', async () => {
     // The exact-text settings decoder cannot consume this valid JSON body.
-    vi.mocked(Call).mockResolvedValue(native(200, 'application/json', '{"configuration_revision":{"instance_id":"x","generation":"1"}}', false));
+    vi.mocked(Call).mockResolvedValue(native(200, '{"configuration_revision":{"instance_id":"x","generation":"1"}}', false));
     const undecodable = await invokeNative(() => handle, 'configuration', 'GetConfiguration', '{}', extractSettingsText);
     expect(undecodable.kind).toBe('invalid');
     vi.mocked(Call).mockRejectedValue(new Error('call carries a stale connection generation'));
@@ -785,7 +785,7 @@ describe('the shared invocation boundary', () => {
   });
 
   it('treats a null success document as invalid delivery beside its non-null and 204 siblings', async () => {
-    vi.mocked(Call).mockResolvedValue({ status: 200, content_type: 'application/json', body: 'null', invalid: false });
+    vi.mocked(Call).mockResolvedValue({ status: 200, body: 'null', invalid: false });
     const nulled = await invokeNative(() => handle, 'submit', 'SubmitSession', '{"session_id":"root1","body":{}}', JSON.parse);
     expect(nulled.kind).toBe('invalid');
     if (nulled.kind === 'ok') throw new Error('null document accepted as ok');
@@ -793,7 +793,7 @@ describe('the shared invocation boundary', () => {
     const accepted = await invokeNative(() => handle, 'submit', 'SubmitSession', '{"session_id":"root1","body":{}}', JSON.parse);
     expect(accepted.kind).toBe('ok');
     if (accepted.kind === 'ok') expect(accepted.data).toEqual({ disposition: 'admitted' });
-    vi.mocked(Call).mockResolvedValue({ status: 204, content_type: 'application/json', body: '', invalid: false });
+    vi.mocked(Call).mockResolvedValue({ status: 204, body: '', invalid: false });
     const empty = await invokeNative(() => handle, 'interrupt', 'InterruptSession', '{"session_id":"root1"}', JSON.parse);
     expect(empty.kind).toBe('ok');
     if (empty.kind === 'ok') expect(empty.data).toEqual({});

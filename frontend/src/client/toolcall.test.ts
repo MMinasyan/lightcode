@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 import { collapsedPreviewLines } from '../lib/uiConstants.js';
+import { parseExactJSON } from './exactjson';
 
 function multilineCall() {
   return {
@@ -164,6 +165,8 @@ describe('ToolCallBlock preview recognition (open JSON metadata)', () => {
     ['missing file op', { edit_preview_files: [{ path: 'a.go', preview: { hunks: [{ rows: [row('add', 'x')] }] } }] }],
     ['fabricated-M candidate (invalid op)', { edit_preview_files: [{ path: 'a.go', op: 'X', preview: { hunks: [{ rows: [row('add', 'x')] }] } }] }],
     ['nested null rows array', { edit_preview: { hunks: [{ rows: null }] } }],
+    ['nonfinite raw line token', parseExactJSON('{"edit_preview":{"hunks":[{"rows":[{"kind":"add","oldLine":1e400,"text":"x"}]}]}}')],
+    ['rawJSON-lookalike oldLine member', { edit_preview: { hunks: [{ rows: [row('add', 'x', { oldLine: { rawJSON: '5' } })] }] } }],
   ];
 
   for (const [name, metadata] of unrecognized) {
@@ -179,8 +182,11 @@ describe('ToolCallBlock preview recognition (open JSON metadata)', () => {
   }
 
   it('renders real single and multi-file previews with A/M/D rows, gutters and unknown members', async () => {
+    // The single-file preview carries genuine raw line tokens; the per-file
+    // previews carry ordinary numbers.
+    const rawHunks = (parseExactJSON('{"hunks":[{"rows":[{"kind":"add","newLine":5,"text":"added"},{"kind":"remove","oldLine":6,"text":"removed"},{"kind":"context","oldLine":7,"newLine":7,"text":"kept"}]}]}') as { hunks: never[] }).hunks;
     const { target } = await mountCall(callWith({
-      edit_preview: { hunks: validHunks(), unknown_member: 'kept' },
+      edit_preview: { hunks: rawHunks, unknown_member: 'kept' },
       edit_preview_files: [
         { path: 'a.go', op: 'A', preview: { hunks: validHunks() }, extra_member: 1 },
         { path: 'b.go', op: 'M', preview: { hunks: validHunks() } },
@@ -191,7 +197,11 @@ describe('ToolCallBlock preview recognition (open JSON metadata)', () => {
     expect(target.querySelectorAll('.output-block.edit-preview')).toHaveLength(4);
     const labels = [...target.querySelectorAll('.file-label')].map((n) => n.textContent?.replace(/\s+/g, ' ').trim());
     expect(labels).toEqual(['A a.go', 'M b.go', 'D c.go']);
-    // add/remove gutters render through the shared EditPreview
+    // add/remove gutters render through the shared EditPreview, including the
+    // interpreted exact raw line tokens
+    const gutters = [...target.querySelectorAll('.edit-gutter')].map((n) => n.textContent?.trim()).join(' ');
+    expect(gutters).toContain('5 +');
+    expect(gutters).toContain('6 -');
     expect(target.querySelectorAll('.edit-preview .edit-gutter.add').length).toBeGreaterThan(0);
     expect(target.querySelectorAll('.edit-preview .edit-gutter.remove').length).toBeGreaterThan(0);
     // unknown members are allowed and stay in raw metadata

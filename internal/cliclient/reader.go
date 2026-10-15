@@ -71,6 +71,7 @@ func (c *CLI) resetReadersLocked() {
 	c.child = nil
 	c.forkBoundary = nil
 	c.forkRewind = false
+	c.history.Reset(nil)
 	c.clearProgressLocked()
 }
 func (c *CLI) restampRootLocked() { c.resumeReaderLocked(c.root) }
@@ -250,6 +251,10 @@ func (c *CLI) readSession(r *sessionReader, chain *readChain) {
 		}
 		r.items, r.cursor, r.floor = nextItems, nextCursor, &nextFloor
 		r.assignmentVersion++
+		// Every accepted root range is the recall authority.
+		if r == c.root {
+			c.history.Reset(userTexts(nextItems))
+		}
 		if !older {
 			r.hydration = &next
 			if c.displayedLocked() == r {
@@ -260,6 +265,23 @@ func (c *CLI) readSession(r *sessionReader, chain *readChain) {
 		c.notifyLocked()
 		c.mu.Unlock()
 	}
+}
+
+// userTexts extracts canonical USER text for InputHistory.
+func userTexts(items []protocol.ConversationItem) []string {
+	var texts []string
+	for _, item := range items {
+		kind, _ := item.Discriminator()
+		if kind != "input" {
+			continue
+		}
+		input, err := item.AsInputItem()
+		if err != nil || input.Origin != protocol.InputOriginUser {
+			continue
+		}
+		texts = append(texts, contentText(input.Content))
+	}
+	return texts
 }
 
 func (c *CLI) bridge(s stamp, id string, cached []protocol.ConversationItem, oldest *string, next protocol.Hydration) ([]protocol.ConversationItem, *string, protocol.SessionRevision, error) {

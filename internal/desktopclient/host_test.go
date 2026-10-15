@@ -212,9 +212,6 @@ func TestDesktopHostOpenGenerationSupersession(t *testing.T) {
 	if response.Status != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", response.Status)
 	}
-	if response.ContentType != "application/json" {
-		t.Fatalf("health content type = %q, want application/json", response.ContentType)
-	}
 	if !strings.Contains(response.Body, testInstance) {
 		t.Fatalf("health body = %q, want the authenticated instance", response.Body)
 	}
@@ -1139,8 +1136,8 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("health Call: %v", err)
 	}
-	if response.Status != http.StatusOK || response.ContentType != "application/json" {
-		t.Fatalf("health response = (%d, %q)", response.Status, response.ContentType)
+	if response.Status != http.StatusOK {
+		t.Fatalf("health response status = %d", response.Status)
 	}
 	var health protocol.Health
 	if err := json.Unmarshal([]byte(response.Body), &health); err != nil {

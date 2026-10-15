@@ -2,6 +2,7 @@
   import { settings } from '../lib/settings.js';
   import { collapsedPreviewLines } from '../lib/uiConstants.js';
   import EditPreview from '../components/EditPreview.svelte';
+  import { presentNumber } from './exactjson';
   export let call = {}; // ToolCallView
 
   // Three independent expansion states: arguments, output, edit preview.
@@ -64,9 +65,13 @@
         if (row === null || typeof row !== 'object' || Array.isArray(row)) return null;
         if (row.kind !== 'context' && row.kind !== 'add' && row.kind !== 'remove') return null;
         if (typeof row.text !== 'string') return null;
-        if (!isOptionalFiniteNumber(row.oldLine)) return null;
-        if (!isOptionalFiniteNumber(row.newLine)) return null;
-        kept.push(row);
+        // Exact numeric tokens are interpreted for presentation only; the raw
+        // metadata stays untouched and a nonfinite token yields no preview.
+        const oldLine = presentNumber(row.oldLine);
+        const newLine = presentNumber(row.newLine);
+        if (!isOptionalFiniteNumber(oldLine)) return null;
+        if (!isOptionalFiniteNumber(newLine)) return null;
+        kept.push({ ...row, oldLine, newLine });
       }
       out.push({ rows: kept });
     }

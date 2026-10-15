@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientview"
+	"github.com/MMinasyan/lightcode/internal/terminal"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -163,12 +164,27 @@ func hydration(id, n string, items []protocol.ConversationItem, cursor *string) 
 	return protocol.Hydration{Session: protocol.Session{SessionId: id, Workspace: "/workspace", AgentType: "primary", Lifecycle: "open", SessionRevision: revision(n)}, SessionRevision: revision(n), ConfigurationRevision: configuration("1").ConfigurationRevision, WarningsRevision: warnings("1").WarningsRevision, Conversation: protocol.ConversationPage{Items: items, OlderCursor: cursor}, Operations: []protocol.Operation{}, Background: []protocol.BackgroundMember{}, Warnings: []protocol.Warning{}, Pending: protocol.PendingQueues{Queued: []protocol.PendingInput{}, Steering: []protocol.PendingInput{}}, Usage: protocol.UsageProjection{Context: protocol.UsageContext{UsedTokens: "0"}, Totals: protocol.UsageTotals{ByModel: []protocol.ModelUsage{}}}}
 }
 func pointer[T any](v T) *T { return &v }
+
+// inputOf is the one input-item constructor; inputs and the recall stimuli
+// reuse it instead of rebuilding InputItems per test.
+func inputOf(id, operation string, origin protocol.InputOrigin, content []protocol.ContentPart) protocol.ConversationItem {
+	var item protocol.ConversationItem
+	_ = item.FromInputItem(protocol.InputItem{Kind: "input", Origin: origin, ItemId: id, Content: content, OperationId: pointer(operation)})
+	return item
+}
+
+// imageURLPart is the one image content part the image-only recall stimulus
+// uses.
+func imageURLPart() protocol.ContentPart {
+	var part protocol.ContentPart
+	_ = part.FromImageURLPart(protocol.ImageURLPart{Kind: protocol.ImageUrl, Url: "http://img/x.png"})
+	return part
+}
+
 func inputs(start, end int) []protocol.ConversationItem {
 	var items []protocol.ConversationItem
 	for i := start; i <= end; i++ {
-		var item protocol.ConversationItem
-		_ = item.FromInputItem(protocol.InputItem{Kind: "input", Origin: "user", ItemId: fmt.Sprintf("item-%d", i), Content: textParts(fmt.Sprintf("input %d", i)), OperationId: pointer(fmt.Sprintf("operation-%d", i))})
-		items = append(items, item)
+		items = append(items, inputOf(fmt.Sprintf("item-%d", i), fmt.Sprintf("operation-%d", i), protocol.InputOriginUser, textParts(fmt.Sprintf("input %d", i))))
 	}
 	return items
 }
@@ -248,6 +264,11 @@ func TestReaderAnchoredHistory(t *testing.T) {
 				req.respond(page)
 			}
 			barrier(t, done)
+			// The loaded USER text range is recallable, older pages included.
+			press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+			if c.draft.String() != fmt.Sprintf("input %d", max(101, test.freshStart+10)) {
+				t.Fatalf("recall = %q, want the newest loaded text", c.draft.String())
+			}
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			want := ids(t, inputs(1, max(101, test.freshStart+10)))
@@ -341,18 +362,52 @@ func TestReaderNavigationSupersedesSuccessAndError(t *testing.T) {
 func TestRootResetDisposesInspectorAndSameRootIntent(t *testing.T) {
 	c, transport := fixture(t)
 	_, done := c.startReader()
-	receive(t, transport.requests).respond(hydration(rootA, "1", nil, nil))
+	// The accepted root range seeds recall from USER text inputs only: a
+	// Runtime-origin, image-only and blank inputs never enter it.
+	items := append(inputs(1, 3),
+		inputOf("runtime-1", "operation-runtime", protocol.InputOriginRuntime, textParts("runtime input")),
+		inputOf("image-1", "operation-image", protocol.InputOriginUser, []protocol.ContentPart{imageURLPart()}),
+		inputOf("blank-1", "operation-blank", protocol.InputOriginUser, textParts(" \t ")),
+	)
+	receive(t, transport.requests).respond(hydration(rootA, "1", items, nil))
 	barrier(t, done)
+	press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+	if c.draft.String() != "input 3" {
+		t.Fatalf("recall = %q, want the newest USER text input", c.draft.String())
+	}
 	c.inspectChild(childA)
-	var parked []request
+	// The inspector publishes its own USER inputs and never seeds recall; the
+	// root's stale read stays parked across the reset below.
+	var rootStale request
+	var childDone chan struct{}
 	for i := 0; i < 2; i++ {
-		parked = append(parked, receive(t, transport.requests))
+		req := receive(t, transport.requests)
+		if strings.Contains(req.req.URL.Path, childA) {
+			c.mu.Lock()
+			childDone = c.child.chain.done
+			c.mu.Unlock()
+			req.respond(hydration(childA, "1", inputs(9, 9), nil))
+		} else {
+			rootStale = req
+		}
 	}
 	c.mu.Lock()
-	oldRoot, oldChild := c.root, c.child
-	rootChain, childChain := oldRoot.chain.done, oldChild.chain.done
+	oldRoot := c.root
+	rootChain := oldRoot.chain.done
 	generation := c.selection
 	c.mu.Unlock()
+	press(c, terminal.KeyMsg{Rune: 'z'})
+	press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+	if c.draft.String() != "input 3" {
+		t.Fatalf("inspector seeded recall: %q", c.draft.String())
+	}
+	// An ordinary entered slash command joins volatile recall.
+	setDraft(c, "/help")
+	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+	press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+	if c.draft.String() != "/help" {
+		t.Fatalf("slash recall = %q", c.draft.String())
+	}
 	c.selectRoot(rootA)
 	receive(t, transport.requests).respond(hydration(rootA, "1", nil, nil))
 	fresh := receive(t, transport.requests)
@@ -362,15 +417,15 @@ func TestRootResetDisposesInspectorAndSameRootIntent(t *testing.T) {
 	newDone := newRoot.chain.done
 	c.mu.Unlock()
 	barrier(t, newDone)
-	for _, req := range parked {
-		id := rootA
-		if strings.Contains(req.req.URL.Path, childA) {
-			id = childA
-		}
-		req.respond(hydration(id, "100", inputs(1, 1), nil))
+	// The replaced root clears the previous range's recall.
+	setDraft(c, "keep")
+	press(c, terminal.KeyMsg{Special: terminal.KeyUp})
+	if c.draft.String() != "keep" {
+		t.Fatalf("root replacement kept recall: %q", c.draft.String())
 	}
+	rootStale.respond(hydration(rootA, "100", inputs(1, 1), nil))
 	barrier(t, rootChain)
-	barrier(t, childChain)
+	barrier(t, childDone)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.selection <= generation || c.root == oldRoot || c.child != nil || c.childID != "" || c.root.hydration.SessionRevision.DurableRevision != "2" {

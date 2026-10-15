@@ -235,7 +235,8 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	var item protocol.ConversationItem
 	_ = item.FromAssistantItem(a)
 	done := c.refreshReader(r)
-	receive(t, transport.requests).respond(hydration(rootA, "2", []protocol.ConversationItem{inputs(1, 1)[0], item}, nil))
+	// The empty assistant after the copyable text is skipped by /copy.
+	receive(t, transport.requests).respond(hydration(rootA, "2", []protocol.ConversationItem{inputs(1, 1)[0], item, assistant("empty", "", false)}, nil))
 	barrier(t, done)
 	screen := newScreen(80)
 	go c.writer(screen)
@@ -367,17 +368,26 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 }
 
 func TestActualClipboardRefusalAndNoLoadedAssistant(t *testing.T) {
-	for _, refusal := range []bool{false, true} {
-		t.Run(strconv.FormatBool(refusal), func(t *testing.T) {
+	empty := assistant("empty", "", false)
+	toolOnly := assistant("tool-only", "", true)
+	refusalItem := func() protocol.ConversationItem {
+		var item protocol.ConversationItem
+		_ = item.FromAssistantItem(protocol.AssistantItem{Kind: "assistant", ItemId: "refusal", Status: "completed", Source: "provider/model", Content: []protocol.ContentPart{}, ToolCalls: []protocol.ToolCallView{}, Refusal: pointer("canonical refusal")})
+		return item
+	}
+	for _, test := range []struct {
+		name string
+		tail []protocol.ConversationItem
+		want string
+	}{
+		{"no assistant", nil, ""},
+		{"empty and tool-only assistants only", []protocol.ConversationItem{empty, toolOnly}, ""},
+		{"refusal before an empty assistant", []protocol.ConversationItem{refusalItem(), empty}, base64.StdEncoding.EncodeToString([]byte("canonical refusal"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			c, transport := fixture(t)
 			_, done := c.startReader()
-			items := inputs(1, 1)
-			if refusal {
-				var item protocol.ConversationItem
-				_ = item.FromAssistantItem(protocol.AssistantItem{Kind: "assistant", ItemId: "refusal", Status: "completed", Source: "provider/model", Content: []protocol.ContentPart{}, ToolCalls: []protocol.ToolCallView{}, Refusal: pointer("canonical refusal")})
-				items = append(items, item)
-			}
-			h := hydration(rootA, "1", items, pointer("unloaded-older"))
+			h := hydration(rootA, "1", append(inputs(1, 1), test.tail...), pointer("unloaded-older"))
 			h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "message", Status: "running", AgentType: "primary", Model: "provider/model"}
 			receive(t, transport.requests).respond(h)
 			barrier(t, done)
@@ -386,15 +396,15 @@ func TestActualClipboardRefusalAndNoLoadedAssistant(t *testing.T) {
 			c.events <- eventDelivery{c.conn, scopedProgress(rootA, "active", "provisional must not be copied", false)}
 			frameContaining(t, screen, "provisional must not be copied")
 			c.command("/copy")
-			if refusal {
-				frame := frameContaining(t, screen, "\x1b]52;")
-				if !strings.Contains(frame, base64.StdEncoding.EncodeToString([]byte("canonical refusal"))) {
-					t.Fatal("refusal-only clipboard not canonical")
-				}
-			} else {
+			if test.want == "" {
 				frame := frameContaining(t, screen, "No loaded authoritative assistant")
 				if strings.Contains(frame, "\x1b]52;") {
-					t.Fatal("provisional/unloaded assistant copied")
+					t.Fatal("an absent or empty history wrote the clipboard")
+				}
+			} else {
+				frame := frameContaining(t, screen, "\x1b]52;")
+				if !strings.Contains(frame, test.want) {
+					t.Fatalf("copy did not skip the empty assistant: %q", frame)
 				}
 			}
 			transport.mu.Lock()

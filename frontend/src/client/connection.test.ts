@@ -40,7 +40,6 @@ describe('RuntimeConnection.open', () => {
     vi.mocked(NextEvent).mockImplementation(() => new Promise<string>(() => {}));
     vi.mocked(Call).mockResolvedValue({
       status: 200,
-      content_type: 'application/json',
       body: '{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}',
       invalid: false,
     });
@@ -107,7 +106,7 @@ describe('RuntimeConnection open attempts', () => {
     expect(Call).toHaveBeenCalledExactlyOnceWith('1', 'GetHealth', '{}');
 
     // The current connection handle carries "2".
-    vi.mocked(Call).mockResolvedValue({ status: 204, content_type: 'application/json', body: '', invalid: false });
+    vi.mocked(Call).mockResolvedValue({ status: 204, body: '', invalid: false });
     const current = await invokeNative(() => connection.getClient(), 'health', 'GetHealth', '{}', JSON.parse);
     expect(current.kind).toBe('ok');
     expect(Call).toHaveBeenLastCalledWith('2', 'GetHealth', '{}');
@@ -142,16 +141,19 @@ describe('RuntimeConnection pull loop', () => {
     connection.dispose();
   });
 
-  it('stops the loop on a terminal pull failure and records it', async () => {
+  it('stops the loop on a terminal pull failure and signals the failure callback', async () => {
     vi.mocked(Open).mockResolvedValue({ instance_id: '0123456789abcdef0123456789abcdef', generation: '1', workspace: '/ws' });
     vi.mocked(NextEvent).mockRejectedValue(new Error('event stream resync required'));
     const handler = vi.fn();
+    const failureHandler = vi.fn();
     const connection = new RuntimeConnection();
     connection.setEventHandler(handler);
+    connection.setFailureHandler(failureHandler);
     await connection.open();
     await vi.waitFor(() => {
-      expect(connection.lastFailure()).toBeInstanceOf(Error);
+      expect(failureHandler).toHaveBeenCalledTimes(1);
     });
+    expect(failureHandler.mock.calls[0][1]).toBe('1');
     expect(handler).not.toHaveBeenCalled();
     expect(NextEvent).toHaveBeenCalledTimes(1);
   });
@@ -161,15 +163,16 @@ describe('RuntimeConnection pull loop', () => {
     let settle: (raw: string) => void = () => {};
     vi.mocked(NextEvent).mockImplementation(() => new Promise<string>((resolve) => { settle = resolve; }));
     const handler = vi.fn();
+    const failureHandler = vi.fn();
     const connection = new RuntimeConnection();
     connection.setEventHandler(handler);
+    connection.setFailureHandler(failureHandler);
     await connection.open();
     connection.dispose();
     settle(eventDocument);
-    await vi.waitFor(() => {
-      expect(connection.isDisposed()).toBe(true);
-    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(handler).not.toHaveBeenCalled();
+    expect(failureHandler).not.toHaveBeenCalled();
     expect(NextEvent).toHaveBeenCalledTimes(1);
   });
 

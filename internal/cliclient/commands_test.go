@@ -3,6 +3,7 @@ package cliclient
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -473,40 +474,6 @@ func TestChildrenListsAndNavigationTaskMenusSuperseded(t *testing.T) {
 	}
 }
 
-func TestUnknownCreateCapturedWorkspaceNoBlindComposition(t *testing.T) {
-	c, transport := fixture(t)
-	c.mu.Lock()
-	c.rootID = ""
-	s := c.stampLocked()
-	c.mu.Unlock()
-	c.task(func() { c.compose(s) })
-	receive(t, transport.requests).respond([]protocol.Session{{SessionId: childA, ParentSessionId: pointer(rootB)}})
-	create := receive(t, transport.requests)
-	if !strings.Contains(string(create.body), "/workspace") {
-		t.Fatal("Create did not capture Workspace")
-	}
-	create.lost()
-	receive(t, transport.requests).respond([]protocol.Session{})
-	settleTasks(t, c)
-	c.task(func() { c.compose(s) })
-	receive(t, transport.requests).respond([]protocol.Session{})
-	settleTasks(t, c)
-	transport.mu.Lock()
-	count := 0
-	for _, route := range transport.calls {
-		if route == "POST /v1/sessions" {
-			count++
-		}
-	}
-	transport.mu.Unlock()
-	if count != 1 {
-		t.Fatal("unknown Create blindly resent")
-	}
-	if !strings.Contains(outputs(c), "Outcome unknown") {
-		t.Fatal("unknown Create not presented")
-	}
-}
-
 // Explicit actions form independent work from unchanged text; loss and repair
 // never form or resend work.
 func TestExplicitNewWorkIsNotRetransmission(t *testing.T) {
@@ -611,24 +578,11 @@ func TestExplicitNewWorkIsNotRetransmission(t *testing.T) {
 		c.mu.Lock()
 		c.opts.Startup = live.opts
 		c.mu.Unlock()
-		c.task(func() { c.connect(true, oldConn) })
-		// The repair installs its pump and reports completion; its
-		// authoritative read then runs on the repaired connection.
-		var out strings.Builder
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			out.WriteString(outputs(c))
-			live.mu.Lock()
-			routes := append([]string(nil), live.calls...)
-			live.mu.Unlock()
-			if strings.Contains(out.String(), "Connection repaired") && len(routes) > 0 {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the connection repair did not run")
-			}
-			time.Sleep(time.Millisecond)
-		}
+		// openConnection composes and refreshes synchronously, so one
+		// connect-completion barrier covers every repair-started read.
+		done := make(chan struct{})
+		go func() { c.connect(true, oldConn); close(done) }()
+		barrier(t, done)
 		live.mu.Lock()
 		defer live.mu.Unlock()
 		for _, route := range live.calls {
@@ -637,6 +591,46 @@ func TestExplicitNewWorkIsNotRetransmission(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A rootless passive repair keeps the selection absent and never lists or
+// creates: the ended intent is not recomposed, whatever left it rootless.
+func TestRootlessRepairNeverComposes(t *testing.T) {
+	live := liveFixture(t, false, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/v1/sessions" {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(protocol.Session{SessionId: rootB, Workspace: "/workspace", AgentType: "primary"})
+		} else {
+			_ = json.NewEncoder(w).Encode([]protocol.Session{})
+		}
+		return true
+	})
+	c, _ := fixture(t)
+	c.mu.Lock()
+	c.rootID = ""
+	oldConn := c.conn
+	c.opts.Startup = live.opts
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() { c.connect(true, oldConn); close(done) }()
+	barrier(t, done)
+	c.mu.Lock()
+	selected := c.rootID
+	c.mu.Unlock()
+	if selected != "" {
+		t.Fatalf("rootless repair adopted %q", selected)
+	}
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	for _, route := range live.calls {
+		if strings.Contains(route, "/v1/sessions") {
+			t.Fatalf("rootless repair composed or created: %s", route)
+		}
+	}
 }
 
 func TestKnownForkFailureRetainsHandledRestoreAndSourceSelection(t *testing.T) {

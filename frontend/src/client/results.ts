@@ -72,11 +72,5 @@ function rejectionMessage(error: unknown, label: string): string {
   if (typeof generated?.message === 'string' && generated.message !== '') {
     return generated.message;
   }
-  if (typeof error === 'string' && error !== '') {
-    return error;
-  }
-  if (error instanceof Error && error.message !== '') {
-    return error.message;
-  }
   return `${label}: request failed`;
 }

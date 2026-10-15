@@ -58,8 +58,7 @@ type Options struct {
 
 // Runner is one stdio bridge. It is not reusable across Run calls.
 type Runner struct {
-	opts       Options
-	operations map[string]bool
+	opts Options
 
 	input     chan []byte
 	responses chan []byte
@@ -103,17 +102,12 @@ func New(opts Options) *Runner {
 	if err != nil {
 		workspace = opts.Workspace
 	}
-	operations := make(map[string]bool)
-	for _, name := range clientops.OperationNames() {
-		operations[name] = true
-	}
 	return &Runner{
-		opts:       opts,
-		operations: operations,
-		input:      make(chan []byte, 1),
-		responses:  make(chan []byte, responseQueueSize),
-		events:     make(chan eventFrame, eventQueueSize),
-		workspace:  workspace,
+		opts:      opts,
+		input:     make(chan []byte, 1),
+		responses: make(chan []byte, responseQueueSize),
+		events:    make(chan eventFrame, eventQueueSize),
+		workspace: workspace,
 	}
 }
 
@@ -383,15 +377,27 @@ func (r *Runner) dispatch(ctx context.Context, req request) (json.RawMessage, *r
 // initialize connects through the common startup owner, subscribes to the
 // generated event stream, and describes the compatible Runtime: the native
 // server identity, the generated Health, and the exact supported invocation
-// names. It creates no Session. A repeated initialize describes the current
-// connection instead of opening a second stream.
+// names. The establishment that begins the initialized lifetime also composes
+// the one startup selection; a repeated initialize describes the current
+// connection instead of opening a second stream or composing again.
 func (r *Runner) initialize(ctx context.Context, params json.RawMessage) (json.RawMessage, *rpcError) {
 	if err := decodeParams(params, &struct{}{}); err != nil {
 		return nil, err
 	}
+	// The initialized lifetime captured before establishment decides who
+	// composes: only the first successful establishment adopts a selection.
+	r.mu.Lock()
+	firstEstablishment := !r.initialized
+	r.mu.Unlock()
 	conn, err := r.establish(ctx)
 	if err != nil {
 		return nil, &rpcError{Code: codeTransport, Message: err.Error()}
+	}
+	if firstEstablishment {
+		if rpcErr := r.composeSelection(conn); rpcErr != nil {
+			// The attempt ends here; the established transport stays available.
+			return nil, rpcErr
+		}
 	}
 	encoded, err := json.Marshal(initializeResult{
 		ServerInfo: serverInfo{Name: "lightcode", Version: version.String()},
@@ -402,6 +408,56 @@ func (r *Runner) initialize(ctx context.Context, params json.RawMessage) (json.R
 		return nil, &rpcError{Code: codeTransport, Message: fmt.Sprintf("initialize result: %v", err)}
 	}
 	return encoded, nil
+}
+
+// composeSelection composes the one startup selection in the captured
+// Workspace: the newest eligible root header, or one fresh primary Session
+// when none exists. The adopted identity and immutable Workspace ride the
+// existing connection/selection guards.
+func (r *Runner) composeSelection(conn *connection) *rpcError {
+	r.mu.Lock()
+	workspace := r.workspace
+	stamp := r.selection
+	r.mu.Unlock()
+	listParams, _ := json.Marshal(map[string]any{
+		"query": map[string]any{"workspace": workspace, "lifecycle": "open"},
+	})
+	raw, err := clientops.Call(conn.ctx, conn.client, "ListSessions", listParams)
+	if err != nil {
+		return callError(err)
+	}
+	var list []protocol.Session
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return &rpcError{Code: codeTransport, Message: fmt.Sprintf("session list: %v", err)}
+	}
+	var newest *protocol.Session
+	for i := range list {
+		candidate := &list[i]
+		if candidate.ParentSessionId != nil {
+			continue
+		}
+		if newest == nil || candidate.LastActivity.After(newest.LastActivity) ||
+			(candidate.LastActivity.Equal(newest.LastActivity) && candidate.SessionId < newest.SessionId) {
+			newest = candidate
+		}
+	}
+	if newest != nil {
+		r.adoptSelection(conn, stamp, newest.SessionId, newest.Workspace)
+		return nil
+	}
+	createParams, _ := json.Marshal(map[string]any{
+		"body": map[string]any{"workspace": workspace, "agent_type": "primary"},
+	})
+	raw, err = clientops.Call(conn.ctx, conn.client, "CreateSession", createParams)
+	if err != nil {
+		return callError(err)
+	}
+	var session protocol.Session
+	if err := json.Unmarshal(raw, &session); err != nil {
+		return &rpcError{Code: codeTransport, Message: fmt.Sprintf("session create: %v", err)}
+	}
+	r.adoptSelection(conn, stamp, session.SessionId, session.Workspace)
+	return nil
 }
 
 type initializeResult struct {
@@ -428,13 +484,10 @@ func supportedMethods() []string {
 // operation on the serving connection. The call runs under that connection
 // generation's context, so retiring the generation cancels its HTTP
 // resources and the caller receives the real transport error under its
-// original request ID; before a successful initialize every recognized
-// Runtime method fails as an unavailable transport, without backend work;
-// an unknown operation name is local invalid params.
+// original request ID; before a successful initialize every Runtime method
+// fails as an unavailable transport, without backend work. The shared
+// dispatcher owns unknown-name and envelope rejection.
 func (r *Runner) runtimeCall(operation string, params json.RawMessage) (json.RawMessage, *rpcError) {
-	if !r.operations[operation] {
-		return nil, errInvalidParams("unknown operation %q", operation)
-	}
 	conn, rpcErr := r.requireConnection()
 	if rpcErr != nil {
 		return nil, rpcErr

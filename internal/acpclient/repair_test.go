@@ -51,6 +51,12 @@ type frameFixture struct {
 	opensCh          chan struct{}
 }
 
+// SessionHeader is one generated Session header document for the startup
+// fixtures.
+func SessionHeader(id, workspace, lastActivity string) string {
+	return fmt.Sprintf(`{"session_id":%q,"workspace":%q,"agent_type":"primary","lifecycle":"open","created_at":"2026-10-01T00:00:00Z","last_activity":%q,"session_revision":{"durable_revision":"1","local_revision":"0","instance_id":%q}}`, id, workspace, lastActivity, frameInstance)
+}
+
 func newFrameFixture(t *testing.T, instance string, parkHydration bool) *frameFixture {
 	t.Helper()
 	f := &frameFixture{
@@ -83,6 +89,16 @@ func newFrameFixture(t *testing.T, instance string, parkHydration bool) *frameFi
 		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, f.instance)
 	})
 	mux.HandleFunc("/v1/events", f.serveEvents)
+	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		f.note(r)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, SessionHeader("s-startup", "/ws", "2026-10-01T00:00:00Z"))
+			return
+		}
+		fmt.Fprint(w, "[]")
+	})
 	mux.HandleFunc("/v1/sessions/s1/hydration", f.hydration("s1", "/ws/s1"))
 	mux.HandleFunc("/v1/sessions/s2/hydration", f.hydration("s2", "/ws/s2"))
 	f.server = httptest.NewServer(mux)

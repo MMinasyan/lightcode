@@ -18,7 +18,6 @@ export namespace desktopclient {
 	}
 	export class HTTPResponse {
 	    status: number;
-	    content_type: string;
 	    body: string;
 	    invalid: boolean;
 
@@ -29,7 +28,6 @@ export namespace desktopclient {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.status = source["status"];
-	        this.content_type = source["content_type"];
 	        this.body = source["body"];
 	        this.invalid = source["invalid"];
 	    }

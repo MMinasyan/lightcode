@@ -18,7 +18,6 @@ export class RuntimeConnection {
   private failureHandler: RuntimeFailureHandler = () => {};
   private openAttempt = 0;
   private disposedValue = false;
-  private failureValue: unknown = null;
 
   getInfo(): desktopclient.ConnectionInfo | null {
     return this.infoValue;
@@ -29,14 +28,6 @@ export class RuntimeConnection {
       throw new Error('runtime connection is not open');
     }
     return this.clientValue;
-  }
-
-  isDisposed(): boolean {
-    return this.disposedValue;
-  }
-
-  lastFailure(): unknown {
-    return this.failureValue;
   }
 
   setEventHandler(handler: RuntimeEventHandler): void {
@@ -70,7 +61,6 @@ export class RuntimeConnection {
       throw new Error('runtime connection open superseded');
     }
     this.infoValue = info;
-    this.failureValue = null;
     // The handle is frozen to THIS generation; a retained handle never sends a newer stamp.
     this.clientValue = Object.freeze({ generation: info.generation });
     this.pull(info);
@@ -99,7 +89,6 @@ export class RuntimeConnection {
         this.handler(event);
       } catch (error) {
         if (!this.disposedValue && this.infoValue === info) {
-          this.failureValue = error;
           this.failureHandler(error, info.generation);
         }
         return;

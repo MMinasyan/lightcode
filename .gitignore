@@ -5,4 +5,5 @@
 frontend/node_modules/
 frontend/dist/
 frontend/dist-client/
+frontend/client-bindings/wailsjs/runtime/
 frontend/package.json.md5

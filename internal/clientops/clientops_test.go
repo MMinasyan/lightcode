@@ -523,29 +523,10 @@ func TestCallRejectsForbiddenEnvelope(t *testing.T) {
 	}
 }
 
-// TestOperationNames proves the one static list is exact and returned fresh.
+// TestOperationNames proves the list is returned fresh; exact name/dispatch
+// coverage lives in the invocation-table test.
 func TestOperationNames(t *testing.T) {
-	want := []string{
-		"GetHealth", "ListSessions", "CreateSession", "DeleteSession", "ArchiveSession",
-		"ReopenSession", "SubmitSession", "CompactSession", "ForkSession", "SetSessionAgentType",
-		"InterruptSession", "StopSession", "GetSessionHydration", "GetSessionHistory",
-		"GetSessionCodeSnapshots", "RevertSessionCode", "ListWorkspaces", "ReadWorkspaceFile",
-		"GetRetainedCodeSnapshots", "RevertRetainedCode", "GetConfiguration", "ReloadConfiguration",
-		"UpdateConfigurationSettings", "SetAgentTypeModel", "ListModels", "ListProviders",
-		"CreateProvider", "GetProviderDetail", "UpdateProviderDetail", "DeleteProviderDetail",
-		"DiscoverProviderCandidates", "ConnectProvider", "DisconnectProvider", "ResetProviderField",
-		"ListProviderModels", "UpdateProviderModel", "DeleteProviderModel",
-		"DiscoverProviderModelCandidates", "ResetProviderModelField", "GetWarnings",
-	}
 	names := clientops.OperationNames()
-	if len(names) != len(want) {
-		t.Fatalf("OperationNames() returned %d names, want %d", len(names), len(want))
-	}
-	for i := range want {
-		if names[i] != want[i] {
-			t.Fatalf("OperationNames()[%d] = %q, want %q", i, names[i], want[i])
-		}
-	}
 	names[0] = "Mutated"
 	if again := clientops.OperationNames(); again[0] != "GetHealth" {
 		t.Fatalf("OperationNames() returned shared state: %q", again[0])

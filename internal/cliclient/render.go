@@ -105,6 +105,7 @@ func (c *CLI) keyLocked(key terminal.KeyMsg, id string) func() {
 		if strings.TrimSpace(text) == "" {
 			return nil
 		}
+		c.history.Add(text)
 		if strings.HasPrefix(text, "/") && c.forkBoundary == nil {
 			c.draft.Clear()
 			c.draftRevision++
@@ -118,7 +119,6 @@ func (c *CLI) keyLocked(key terminal.KeyMsg, id string) func() {
 		if err != nil {
 			return func() { c.report(s, terminal.RenderErrorMsg(err.Error()), false) }
 		}
-		c.history.Add(text)
 		return func() { c.task(func() { c.runAttempt(a.id) }) }
 	case terminal.KeyBackspace:
 		if c.draft.DeleteBack() {
@@ -345,6 +345,11 @@ func (c *CLI) copyCanonical(s stamp) {
 			text = contentText(a.Content)
 			if text == "" && a.Refusal != nil {
 				text = *a.Refusal
+			}
+			// A tool-call-only assistant carries nothing copyable; keep
+			// scanning older assistants.
+			if text == "" {
+				continue
 			}
 			found = true
 			break

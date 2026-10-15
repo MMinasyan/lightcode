@@ -13,6 +13,7 @@ import {
   extractSettingsText,
   parseExactJSON,
   parseSettingsObject,
+  presentNumber,
   rawJSONText,
   replaceObjectMembers,
   readRetainedTurnsText,
@@ -40,6 +41,20 @@ describe('parseExactJSON', () => {
 
   it('rejects malformed text through the native JSON boundary', () => {
     expect(() => parseExactJSON('{not json')).toThrow();
+  });
+});
+
+describe('presentNumber', () => {
+  it('interprets one exact raw token and leaves every other value unchanged', () => {
+    const parsed = parseExactJSON('{"n":5,"huge":1e400,"big":9007199254740993}') as Record<string, unknown>;
+    expect(presentNumber(parsed.n)).toBe(5);
+    expect(presentNumber(parsed.huge)).toBe(Infinity);
+    expect(presentNumber(parsed.big)).toBe(9007199254740992);
+    expect(presentNumber(3)).toBe(3);
+    expect(presentNumber(undefined)).toBeUndefined();
+    expect(presentNumber('7')).toBe('7');
+    const ordinary = { rawJSON: '5' };
+    expect(presentNumber(ordinary)).toBe(ordinary);
   });
 });
 

@@ -57,6 +57,22 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
 	}
 	f.handlers["/v1/events"] = f.idleEvents
+	// Startup composition defaults: an empty open-root list and one created
+	// primary Session over the selected Workspace's open-lifecycle list query.
+	// A test needing a different startup outcome replaces the handler.
+	f.handlers["/v1/sessions"] = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, acpclient.SessionHeader(startupSessionID, "/ws", "2026-10-01T00:00:00Z"))
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Query().Get("lifecycle") != "open" || r.URL.Query().Get("workspace") == "" {
+			t.Errorf("startup list = %s %s, want the selected Workspace's open lifecycle", r.Method, r.URL.RawQuery)
+		}
+		fmt.Fprint(w, "[]")
+	}
+	f.handlers["/v1/sessions/"+startupSessionID+"/hydration"] = jsonHandler(200, hydrationBody(startupSessionID, "/ws"))
 	for path, handler := range routes {
 		f.handlers[path] = handler
 	}
@@ -125,6 +141,9 @@ func (f *fixture) lastBody(t *testing.T, path string) string {
 	t.Fatalf("no request reached %s", path)
 	return ""
 }
+
+// startupSessionID names the fixture's default created startup Session.
+const startupSessionID = "s-startup"
 
 // signalEventsOpen records one opened event stream.
 func (f *fixture) signalEventsOpen() {
@@ -752,8 +771,8 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	if code := errorCode(t, b.call(t, "5", "session/select", `{"session_id":"s1"}`)); code != -32001 {
 		t.Fatalf("pre-initialize session/select = %d, want -32001", code)
 	}
-	if code := errorCode(t, b.call(t, "6", "runtime/Nope", "{}")); code != -32602 {
-		t.Fatalf("unknown operation = %d, want -32602", code)
+	if code := errorCode(t, b.call(t, "6", "runtime/Nope", "{}")); code != -32001 {
+		t.Fatalf("unknown operation before a connection = %d, want -32001", code)
 	}
 	if requests := f.total(); requests != 0 {
 		t.Fatalf("pre-initialize requests reached the Runtime: %d", requests)
@@ -808,15 +827,26 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	if f.count("/v1/events") != 1 {
 		t.Fatalf("initialize opened %d event streams, want one", f.count("/v1/events"))
 	}
+	// The one startup composition created one primary Session in the captured
+	// Workspace (the pre-initialize selection); the scripted list handler
+	// checked its query and method.
+	if got := f.lastBody(t, "/v1/sessions"); got != `{"agent_type":"primary","workspace":"/other"}` {
+		t.Fatalf("startup create body = %s", got)
+	}
 
-	// A repeated initialize describes the current connection.
+	// A repeated initialize describes the current connection and never
+	// composes or creates again.
 	before := f.count("/v1/events")
+	startupReads := f.count("/v1/sessions")
 	again := b.call(t, "11", "initialize", "")
 	if resultOf(t, again) != resultOf(t, response) {
 		t.Fatalf("repeated initialize = %s, want the current description", resultOf(t, again))
 	}
 	if f.count("/v1/events") != before {
 		t.Fatal("repeated initialize opened a second event stream")
+	}
+	if f.count("/v1/sessions") != startupReads {
+		t.Fatal("a repeated initialize composed again")
 	}
 
 	health := b.call(t, "12", "runtime/GetHealth", "")
@@ -833,47 +863,71 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 // params and received errors keep their JSON-RPC shapes.
 func TestACPSelection(t *testing.T) {
 	f := newFixture(t, map[string]http.HandlerFunc{
-		"/v1/sessions/s1/hydration": jsonHandler(200, hydrationBody("s1", "/ws/s1")),
-		"/v1/sessions/s2/hydration": jsonHandler(200, hydrationBody("s2", "/ws/s2")),
-		"/v1/sessions/s3/hydration": jsonHandler(404, `{"code":"not_found","message":"no such session"}`),
+		"/v1/sessions": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodPost {
+				t.Error("startup created a Session despite existing roots")
+			} else if r.Method != http.MethodGet || r.URL.Query().Get("lifecycle") != "open" || r.URL.Query().Get("workspace") == "" {
+				t.Errorf("startup list = %s %s, want the selected Workspace's open lifecycle", r.Method, r.URL.RawQuery)
+			}
+			fmt.Fprint(w, "["+
+				acpclient.SessionHeader("s-old", "/ws", "2026-10-01T00:00:00Z")+","+
+				acpclient.SessionHeader("s-b", "/ws", "2026-10-02T00:00:00Z")+","+
+				`{"session_id":"s-child","workspace":"/ws","agent_type":"primary","lifecycle":"open","parent_session_id":"s-old","created_at":"2026-10-01T00:00:00Z","last_activity":"2026-10-03T00:00:00Z","session_revision":{"durable_revision":"1","local_revision":"0","instance_id":"`+testInstance+`"}}`+","+
+				acpclient.SessionHeader("s-a", "/ws", "2026-10-02T00:00:00Z")+"]")
+		},
+		"/v1/sessions/s-a/hydration": jsonHandler(200, hydrationBody("s-a", "/ws")),
+		"/v1/sessions/s1/hydration":  jsonHandler(200, hydrationBody("s1", "/ws/s1")),
+		"/v1/sessions/s2/hydration":  jsonHandler(200, hydrationBody("s2", "/ws/s2")),
+		"/v1/sessions/s3/hydration":  jsonHandler(404, `{"code":"not_found","message":"no such session"}`),
 	})
 	b := startBridge(t, f, "/ws")
 	b.call(t, "1", "initialize", "")
 	f.awaitEventsOpen(t)
 
-	if result := resultOf(t, b.call(t, "2", "session/current", "")); result != "null" {
+	// The startup composition adopted the newest root by last activity and ID;
+	// an older root and a newer child header never win.
+	if result := resultOf(t, b.call(t, "2", "session/current", "")); result != hydrationBody("s-a", "/ws") {
+		t.Fatalf("startup selection = %s, want the newest root's fresh hydration", result)
+	}
+	// The local workspace operation clears the selection so the null result is
+	// observable.
+	if result := resultOf(t, b.call(t, "3", "workspace/select", `{"workspace":"/ws"}`)); result != `"/ws"` {
+		t.Fatalf("workspace/select = %s, want the normalized selection", result)
+	}
+	if result := resultOf(t, b.call(t, "4", "session/current", "")); result != "null" {
 		t.Fatalf("session/current with no selection = %s, want null", result)
 	}
 	if f.count("/v1/sessions/s1/hydration") != 0 {
 		t.Fatal("session/current without a selection performed a hydration read")
 	}
 
-	selected := b.call(t, "3", "session/select", `{"session_id":"s1"}`)
+	selected := b.call(t, "5", "session/select", `{"session_id":"s1"}`)
 	if resultOf(t, selected) != hydrationBody("s1", "/ws/s1") {
 		t.Fatalf("session/select = %s, want the exact generated hydration", resultOf(t, selected))
 	}
-	if result := resultOf(t, b.call(t, "4", "workspace/current", "")); result != `"/ws/s1"` {
+	if result := resultOf(t, b.call(t, "6", "workspace/current", "")); result != `"/ws/s1"` {
 		t.Fatalf("workspace/current after selection = %s, want the selected Session's workspace", result)
 	}
-	b.call(t, "5", "session/current", "")
+	b.call(t, "7", "session/current", "")
 	if f.count("/v1/sessions/s1/hydration") != 2 {
 		t.Fatalf("hydration reads = %d, want the selection read and one fresh current read", f.count("/v1/sessions/s1/hydration"))
 	}
 
-	if result := resultOf(t, b.call(t, "6", "workspace/select", `{"workspace":"/other"}`)); result != `"/other"` {
+	if result := resultOf(t, b.call(t, "8", "workspace/select", `{"workspace":"/other"}`)); result != `"/other"` {
 		t.Fatalf("workspace/select = %s", result)
 	}
-	if result := resultOf(t, b.call(t, "7", "session/current", "")); result != "null" {
+	if result := resultOf(t, b.call(t, "9", "session/current", "")); result != "null" {
 		t.Fatalf("session/current after clearing = %s, want null", result)
 	}
-	if result := resultOf(t, b.call(t, "8", "session/select", `{"session_id":"s2"}`)); result != hydrationBody("s2", "/ws/s2") {
+	if result := resultOf(t, b.call(t, "10", "session/select", `{"session_id":"s2"}`)); result != hydrationBody("s2", "/ws/s2") {
 		t.Fatalf("session/select s2 = %s", result)
 	}
-	if result := resultOf(t, b.call(t, "9", "workspace/current", "")); result != `"/ws/s2"` {
+	if result := resultOf(t, b.call(t, "11", "workspace/current", "")); result != `"/ws/s2"` {
 		t.Fatalf("workspace/current = %s, want the second Session's workspace", result)
 	}
 
-	rejected := b.call(t, "10", "session/select", `{"session_id":"s3"}`)
+	rejected := b.call(t, "12", "session/select", `{"session_id":"s3"}`)
 	code, message, data := errorFrame(t, rejected)
 	if code != -32000 || message != "no such session" {
 		t.Fatalf("received error = (%d, %q), want -32000 with the returned message", code, message)
@@ -986,6 +1040,10 @@ func TestACPEventsAndRepair(t *testing.T) {
 	if f.count("/v1/events") != 2 {
 		t.Fatalf("event streams opened = %d, want one repair reconnect", f.count("/v1/events"))
 	}
+	// The passive repair never composed or created again.
+	if f.count("/v1/sessions") != 2 {
+		t.Fatalf("a passive repair composed again: %d /v1/sessions reads", f.count("/v1/sessions"))
+	}
 }
 
 // TestACPNoParameterParams pins the shared local no-parameter binding: absent
@@ -1023,7 +1081,9 @@ func TestACPNoParameterParams(t *testing.T) {
 		t.Fatalf("workspace/current with null params = %d, want -32602", code)
 	}
 
-	// An initialized session/current accepts absent and {}, and rejects null.
+	// With the startup selection cleared, session/current accepts absent and
+	// {}, and rejects null.
+	b.call(t, "61", "workspace/select", `{"workspace":"/ws"}`)
 	if result := resultOf(t, b.call(t, "7", "session/current", "")); result != "null" {
 		t.Fatalf("session/current with absent params = %s, want null", result)
 	}
@@ -1336,7 +1396,15 @@ func TestACPFailedWriterEndsRun(t *testing.T) {
 // result, and the separate transport family for malformed delivery.
 func TestACPRuntimeForwarding(t *testing.T) {
 	f := newFixture(t, map[string]http.HandlerFunc{
-		"/v1/sessions":                jsonHandler(201, `{"session_id":"s1","durable_revision":"9007199254740993"}`),
+		"/v1/sessions": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodGet {
+				fmt.Fprint(w, "["+acpclient.SessionHeader("s1", "/ws", "2026-10-01T00:00:00Z")+"]")
+				return
+			}
+			w.WriteHeader(201)
+			fmt.Fprint(w, `{"session_id":"s1","durable_revision":"9007199254740993"}`)
+		},
 		"/v1/sessions/s1/revert-code": jsonHandler(409, `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","reason":"denied"}]}`),
 		"/v1/sessions/s1/hydration":   jsonHandler(500, "<html>broken</html>"),
 		"/v1/providers/discover":      jsonHandler(200, `[]`),
@@ -1377,8 +1445,12 @@ func TestACPRuntimeForwarding(t *testing.T) {
 		t.Fatalf("malformed Runtime response = %d, want the separate transport code", code)
 	}
 
+	unknownBefore := f.total()
 	if code := errorCode(t, b.call(t, "6", "runtime/NoSuchOperation", `{}`)); code != -32602 {
 		t.Fatalf("unknown operation = %d, want -32602", code)
+	}
+	if f.total() != unknownBefore {
+		t.Fatal("an unknown operation reached the Runtime")
 	}
 	if code := errorCode(t, b.call(t, "7", "runtime/CreateSession", `{"body":[]}`)); code != -32602 {
 		t.Fatalf("local envelope failure = %d, want -32602", code)
@@ -1392,5 +1464,21 @@ func TestACPRuntimeForwarding(t *testing.T) {
 	}
 	if f.count("/v1/health") != healthBefore {
 		t.Fatal("a rejected null envelope reached the Runtime")
+	}
+}
+
+// A composition failure ends that attempt through the RPC error mapping and
+// leaves the established transport available.
+func TestACPStartupCompositionFailureLeavesTransportAvailable(t *testing.T) {
+	f := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions": jsonHandler(500, `{"code":"internal","message":"list failed"}`),
+	})
+	b := startBridge(t, f, "/ws")
+	code, message, _ := errorFrame(t, b.call(t, "1", "initialize", ""))
+	if code != -32000 || message != "list failed" {
+		t.Fatalf("composition failure = (%d, %q), want the received Runtime error mapping", code, message)
+	}
+	if result := resultOf(t, b.call(t, "2", "runtime/GetHealth", "")); result != healthBody() {
+		t.Fatalf("runtime/GetHealth after a composition failure = %s", result)
 	}
 }

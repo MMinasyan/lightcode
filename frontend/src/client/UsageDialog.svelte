@@ -5,6 +5,7 @@
   // recorded usage contributes no row (absence is never displayed as zero) and
   // no child aggregation is invented.
   import { createEventDispatcher } from 'svelte';
+  import { presentNumber } from './exactjson';
   export let usage = { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } };
   const dispatch = createEventDispatcher();
   let dialog;
@@ -32,7 +33,7 @@
           </div>
         {/each}
       {/if}
-      <div class="context">Context used: {usage.context.used_tokens} / {usage.context.context_window}</div>
+      <div class="context">Context used: {usage.context.used_tokens} / {presentNumber(usage.context.context_window)}</div>
     </div>
   </div>
 </dialog>

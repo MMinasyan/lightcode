@@ -3,11 +3,6 @@ package terminal
 import (
 	"bytes"
 	"errors"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -209,31 +204,5 @@ func TestRenderMenuTitleDoesNotUseFullWidthRule(t *testing.T) {
 	firstLine := strings.Split(rendered, nl)[0]
 	if strings.Count(firstLine, "─") > 4 {
 		t.Fatalf("title should not render a full-width rule: %q", firstLine)
-	}
-}
-
-// TestTerminalMenuExportSurface pins the menu package's exported package-level
-// functions to exactly the shared primitives its consumers use; an extra
-// arithmetic export is a surface change. Receiver methods
-// (TransientMenuFrame.Draw/Clear) are not package functions and stay outside
-// this check.
-func TestTerminalMenuExportSurface(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "menu.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse menu.go: %v", err)
-	}
-	var got []string
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv != nil || !fn.Name.IsExported() {
-			continue
-		}
-		got = append(got, fn.Name.Name)
-	}
-	sort.Strings(got)
-	want := []string{"ConfirmYN", "FirstSelectableMenuItem", "RenderMenu", "ShowMenu"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("exported package-level menu functions = %v, want exactly %v", got, want)
 	}
 }

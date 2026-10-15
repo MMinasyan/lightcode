@@ -156,7 +156,9 @@ var operationNames = []string{
 	"GetWarnings",
 }
 
-// OperationNames returns a fresh copy of the supported invocation names.
+// OperationNames returns a fresh copy of the supported invocation names. It
+// is presentation-only (CLI help and the ACP advertisement); admission and
+// dispatch own unknown-name rejection, never this list.
 func OperationNames() []string {
 	return append([]string(nil), operationNames...)
 }

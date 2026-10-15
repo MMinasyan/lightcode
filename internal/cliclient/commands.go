@@ -291,35 +291,20 @@ func (c *CLI) compose(s stamp) {
 		c.mu.Unlock()
 		return
 	}
-	unknown := c.unknownCreates[s.workspace]
 	c.mu.Unlock()
-	if unknown {
-		c.report(s, terminal.RenderWarningMsg("Outcome unknown: prior CreateSession in this Workspace; inspect /session before creating again."), false)
-		return
-	}
 	c.create(s)
 }
 func (c *CLI) create(s stamp) {
 	var session protocol.Session
 	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentType: "primary", Workspace: s.workspace}, nil, &session)
-	c.mu.Lock()
-	if err != nil && !knownError(err) {
-		c.unknownCreates[s.workspace] = true
+	if err == nil {
+		c.adoptRoot(s, session.Workspace, session.SessionId)
+		c.report(s, resultText(raw, err), true)
+		return
 	}
-	current := c.currentLocked(s)
-	if err == nil && current {
-		c.resetReadersLocked()
-		c.rootID = session.SessionId
-		c.childID = ""
-		c.root = c.newReaderLocked(c.rootID)
-		c.kickReaderLocked(c.root)
-		c.notifyLocked()
-	}
-	c.mu.Unlock()
-	c.report(s, resultText(raw, err), true)
-	if err != nil && current {
-		c.refreshList(s, "open", false)
-	}
+	// A current failure keeps the accepted source live and visible; a
+	// superseded one neither adopts nor publishes.
+	c.navigationReport(s, resultText(raw, err))
 }
 
 func (c *CLI) refreshList(s stamp, lifecycle string, show bool) {
@@ -657,11 +642,7 @@ func (c *CLI) command(text string) {
 		c.task(func() { c.refreshList(s, "open", true) })
 	case "/new":
 		c.mu.Lock()
-		c.navigationLocked()
-		c.resetReadersLocked()
-		c.rootID = ""
-		c.childID = ""
-		s = c.stampLocked()
+		s = c.beginNavigationLocked()
 		c.mu.Unlock()
 		c.task(func() { c.create(s) })
 	case "/resume":
