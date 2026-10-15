@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"sort"
@@ -37,36 +36,10 @@ type modelRow struct {
 	Source          protocol.ModelSource `json:"source"`
 }
 
-// RunModels lists models from one published configuration without owning Runtime work.
-// Syntactic usage errors precede startup; provider validation uses that same read.
-func RunModels(ctx context.Context, opts Options, args []string, out, diagnostics io.Writer) error {
-	var all, asJSON bool
-	fs := flag.NewFlagSet("models", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.BoolVar(&all, "all", false, "include hidden and incomplete models")
-	fs.BoolVar(&asJSON, "json", false, "print JSON")
-	if err := fs.Parse(args); err != nil {
-		return &UsageError{Message: err.Error()}
-	}
-	var positionals []string
-	for _, arg := range fs.Args() {
-		switch arg {
-		case "--all", "-all":
-			all = true
-		case "--json", "-json":
-			asJSON = true
-		default:
-			positionals = append(positionals, arg)
-		}
-	}
-	if len(positionals) > 1 {
-		return &UsageError{Message: fmt.Sprintf("unexpected argument %q", positionals[1])}
-	}
-	provider := ""
-	if len(positionals) == 1 {
-		provider = positionals[0]
-	}
-
+// RunModels lists models from one published configuration without owning
+// Runtime work. Argument parsing belongs to the caller; provider validation
+// uses the same configuration read.
+func RunModels(ctx context.Context, opts Options, provider string, all, asJSON bool, out, diagnostics io.Writer) error {
 	c, err := Connect(ctx, opts)
 	if err != nil {
 		return err

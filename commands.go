@@ -269,22 +269,7 @@ func init() {
 				return fs
 			},
 			run: func(fs *flag.FlagSet, args []string) error {
-				// The utility parses its own arguments: forward the
-				// already parsed true flags, then an explicit terminator,
-				// then the untouched remainder so the second flag parse
-				// cannot reinterpret operands such as `--json=true`.
-				// Bare trailing --all/--json stay operands here and are
-				// folded by the utility's own remainder scan.
-				argv := make([]string, 0, fs.NArg()+3)
-				if modelsAll {
-					argv = append(argv, "--all")
-				}
-				if modelsJSON {
-					argv = append(argv, "--json")
-				}
-				argv = append(argv, "--")
-				argv = append(argv, fs.Args()...)
-				return runModels(argv)
+				return runModels(fs.Args())
 			},
 		},
 		{
@@ -599,11 +584,33 @@ func runUninstall(purge, yes, dryRun bool) error {
 }
 
 // runModels lists models through the shared startup owner and the published
-// configuration projection. The utility's usage errors are translated into
-// the root's usageErrorf so dispatch prints the usage diagnostic instead of
-// silently applying the utility's own exit code.
-func runModels(args []string) error {
-	err := clienthost.RunModels(context.Background(), clienthost.Options{}, args, outW, errW)
+// configuration projection. raw is everything after the parsed flags; the
+// flag package stops parsing at the first positional, so bare --all/--json
+// given after an operand arrive here and are folded back into their flags.
+// The utility's usage errors are translated into the root's usageErrorf so
+// dispatch prints the usage diagnostic instead of silently applying the
+// utility's own exit code.
+func runModels(raw []string) error {
+	all, asJSON := modelsAll, modelsJSON
+	var positionals []string
+	for _, a := range raw {
+		switch a {
+		case "--all", "-all":
+			all = true
+		case "--json", "-json":
+			asJSON = true
+		default:
+			positionals = append(positionals, a)
+		}
+	}
+	provider := ""
+	if len(positionals) > 1 {
+		return usageErrorf("unexpected argument %q", positionals[1])
+	}
+	if len(positionals) == 1 {
+		provider = positionals[0]
+	}
+	err := clienthost.RunModels(context.Background(), clienthost.Options{}, provider, all, asJSON, outW, errW)
 	var usage *clienthost.UsageError
 	if errors.As(err, &usage) {
 		return usageErrorf("%s", usage.Message)

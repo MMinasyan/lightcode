@@ -106,34 +106,31 @@ func TestRunModelsRetainedOutput(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		view        protocol.ConfigurationView
-		args        []string
+		provider    string
+		all, asJSON bool
 		stdout      string
 		diagnostics string
 		usage       string
 	}{
-		{"default", base, nil, "modeltest/vis\t8192\t1024\tdefault\n", "", ""},
-		{"all", base, []string{"--all"}, "modeltest/hid\t16384\t0\thidden\nmodeltest/inc\t0\t0\tincomplete\nmodeltest/vis\t8192\t1024\tdefault\n", "", ""},
-		{"filter", noPrimary, []string{"modeltest"}, "modeltest/vis\t8192\t1024\t-\n", "", ""},
-		{"unfiltered", noPrimary, nil, "modeltest/vis\t8192\t1024\t-\nother/m\t4096\t0\t-\n", "", ""},
-		{"unknown provider", base, []string{"nosuch"}, "", "", `unknown provider "nosuch" (known: modeltest, disc, allinc)`},
-		{"disconnected", base, []string{"disc"}, "", "provider \"disc\" is not connected - connect it in Settings first\n", ""},
-		{"disconnected all", base, []string{"disc", "--all"}, "", "provider \"disc\" is not connected - connect it in Settings first\n", ""},
-		{"all incomplete disconnected", base, []string{"allinc"}, "", "provider \"allinc\" is not connected - connect it in Settings first\n", ""},
-		{"provider no visible", hiddenOnly, []string{"hiddenonly"}, "", "no visible models for \"hiddenonly\" - rerun with --all\n", ""},
-		{"hidden incomplete markers", hiddenOnly, []string{"hiddenonly", "--all"}, "hiddenonly/h\t8192\t0\thidden\nhiddenonly/hi\t0\t0\thidden,incomplete\n", "", ""},
-		{"global no visible", hiddenOnly, nil, "", "no visible models - rerun with --all\n", ""},
-		{"global disconnected", protocol.ConfigurationView{}, nil, "", "no models available - connect a provider in Settings first\n", ""},
-		{"empty json", protocol.ConfigurationView{}, []string{"--json"}, "[]\n", "no models available - connect a provider in Settings first\n", ""},
-		{"json golden", base, []string{"--json"}, jsonGolden, "", ""},
-		{"leading flags", base, []string{"-json", "--all=false", "modeltest"}, jsonGolden, "", ""},
-		{"trailing flags", base, []string{"modeltest", "-json"}, jsonGolden, "", ""},
-		{"end flags retained", base, []string{"--", "modeltest", "--json"}, jsonGolden, "", ""},
-		{"trailing unknown is provider", base, []string{"--", "--unknown"}, "", "", `unknown provider "--unknown" (known: modeltest, disc, allinc)`},
+		{"default", base, "", false, false, "modeltest/vis\t8192\t1024\tdefault\n", "", ""},
+		{"all", base, "", true, false, "modeltest/hid\t16384\t0\thidden\nmodeltest/inc\t0\t0\tincomplete\nmodeltest/vis\t8192\t1024\tdefault\n", "", ""},
+		{"filter", noPrimary, "modeltest", false, false, "modeltest/vis\t8192\t1024\t-\n", "", ""},
+		{"unfiltered", noPrimary, "", false, false, "modeltest/vis\t8192\t1024\t-\nother/m\t4096\t0\t-\n", "", ""},
+		{"unknown provider", base, "nosuch", false, false, "", "", `unknown provider "nosuch" (known: modeltest, disc, allinc)`},
+		{"disconnected", base, "disc", false, false, "", "provider \"disc\" is not connected - connect it in Settings first\n", ""},
+		{"disconnected all", base, "disc", true, false, "", "provider \"disc\" is not connected - connect it in Settings first\n", ""},
+		{"all incomplete disconnected", base, "allinc", false, false, "", "provider \"allinc\" is not connected - connect it in Settings first\n", ""},
+		{"provider no visible", hiddenOnly, "hiddenonly", false, false, "", "no visible models for \"hiddenonly\" - rerun with --all\n", ""},
+		{"hidden incomplete markers", hiddenOnly, "hiddenonly", true, false, "hiddenonly/h\t8192\t0\thidden\nhiddenonly/hi\t0\t0\thidden,incomplete\n", "", ""},
+		{"global no visible", hiddenOnly, "", false, false, "", "no visible models - rerun with --all\n", ""},
+		{"global disconnected", protocol.ConfigurationView{}, "", false, false, "", "no models available - connect a provider in Settings first\n", ""},
+		{"empty json", protocol.ConfigurationView{}, "", false, true, "[]\n", "no models available - connect a provider in Settings first\n", ""},
+		{"json golden", base, "", false, true, jsonGolden, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := modelsConfiguration(t, tc.view)
 			var out, diagnostics bytes.Buffer
-			err := clienthost.RunModels(context.Background(), opts, tc.args, &out, &diagnostics)
+			err := clienthost.RunModels(context.Background(), opts, tc.provider, tc.all, tc.asJSON, &out, &diagnostics)
 			if tc.usage != "" {
 				var usage *clienthost.UsageError
 				if !errors.As(err, &usage) || usage.ExitCode() != 2 || usage.Error() != tc.usage {
@@ -162,17 +159,17 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 		},
 	}
 	for _, tc := range []struct {
-		name string
-		args []string
-		want string
+		name        string
+		all, asJSON bool
+		want        string
 	}{
-		{"hidden provider filtered", nil, "fallback/z/slash\t100\t0\t-\n"},
-		{"all markers", []string{"--all"}, "fallback/z/slash\t100\t0\t-\nhidden/org/m\t9007199254740993\t0\tdefault,hidden\n"},
-		{"json costs names and flags", []string{"--all", "--json"}, `[{"ref":"fallback/z/slash","provider":"fallback","providerName":"fallback","model":"z/slash","displayName":"z/slash","contextWindow":100,"maxOutputTokens":0,"cost":{"input":0},"hidden":false,"providerHidden":false,"incomplete":false,"default":false,"source":"builtin"},{"ref":"hidden/org/m","provider":"hidden","providerName":"Hidden Provider","model":"org/m","displayName":"Named Model","contextWindow":9007199254740993,"maxOutputTokens":0,"cost":{"cache_read":0,"cache_write":4.75,"input":1.25,"output":2.5},"hidden":true,"providerHidden":true,"incomplete":false,"default":true,"source":"discovery"}]` + "\n"},
+		{"hidden provider filtered", false, false, "fallback/z/slash\t100\t0\t-\n"},
+		{"all markers", true, false, "fallback/z/slash\t100\t0\t-\nhidden/org/m\t9007199254740993\t0\tdefault,hidden\n"},
+		{"json costs names and flags", true, true, `[{"ref":"fallback/z/slash","provider":"fallback","providerName":"fallback","model":"z/slash","displayName":"z/slash","contextWindow":100,"maxOutputTokens":0,"cost":{"input":0},"hidden":false,"providerHidden":false,"incomplete":false,"default":false,"source":"builtin"},{"ref":"hidden/org/m","provider":"hidden","providerName":"Hidden Provider","model":"org/m","displayName":"Named Model","contextWindow":9007199254740993,"maxOutputTokens":0,"cost":{"cache_read":0,"cache_write":4.75,"input":1.25,"output":2.5},"hidden":true,"providerHidden":true,"incomplete":false,"default":true,"source":"discovery"}]` + "\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, diagnostics bytes.Buffer
-			if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), tc.args, &out, &diagnostics); err != nil {
+			if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", tc.all, tc.asJSON, &out, &diagnostics); err != nil {
 				t.Fatal(err)
 			}
 			if out.String() != tc.want || diagnostics.Len() != 0 {
@@ -182,7 +179,7 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 	}
 	view.Providers[0].Models[0].Incomplete = true
 	var allOut bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), []string{"hidden", "--all"}, &allOut, io.Discard); err != nil {
+	if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "hidden", true, false, &allOut, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if allOut.String() != "hidden/org/m\t9007199254740993\t0\tdefault,hidden,incomplete\n" {
@@ -191,7 +188,7 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 	for _, agents := range [][]protocol.Agent{nil, {{Name: "primary"}}, {{Name: "secondary", Model: "fallback/z/slash"}}} {
 		view.Agents = agents
 		var out bytes.Buffer
-		if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), nil, &out, io.Discard); err != nil {
+		if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", false, false, &out, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 		if out.String() != "fallback/z/slash\t100\t0\t-\n" {
@@ -210,14 +207,14 @@ func TestRunModelsOpaqueOverflowFieldsRenders(t *testing.T) {
 	raw := `{"configuration_revision":{"instance_id":"` + strings.Repeat("a", 32) + `","generation":"1"},"settings":{},"agents":[{"name":"primary","model":"prov/m"}],"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","name":"M","context_window":4096,"source":"user","extra_body":{"n":9007199254740993},"options":{"big":1e400}}]}]}`
 	opts := modelsEndpoint(t, http.StatusOK, []byte(raw))
 	var out, diagnostics bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), opts, nil, &out, &diagnostics); err != nil {
+	if err := clienthost.RunModels(context.Background(), opts, "", false, false, &out, &diagnostics); err != nil {
 		t.Fatalf("RunModels: %v", err)
 	}
 	if out.String() != "prov/m\t4096\t0\tdefault\n" {
 		t.Fatalf("stdout=%q diagnostics=%q, want the retained row despite opaque overflow fields", out.String(), diagnostics.String())
 	}
 	var jsonOut bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(raw)), []string{"--json"}, &jsonOut, io.Discard); err != nil {
+	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(raw)), "", false, true, &jsonOut, io.Discard); err != nil {
 		t.Fatalf("RunModels --json: %v", err)
 	}
 	if jsonOut.String() != `[{"ref":"prov/m","provider":"prov","providerName":"prov","model":"m","displayName":"M","contextWindow":4096,"maxOutputTokens":0,"hidden":false,"providerHidden":false,"incomplete":false,"default":true,"source":"user"}]`+"\n" {
@@ -225,49 +222,24 @@ func TestRunModelsOpaqueOverflowFieldsRenders(t *testing.T) {
 	}
 }
 
-func TestRunModelsUsageBeforeStartup(t *testing.T) {
-	// A missing executable would be an ordinary startup error if parsing connected.
-	opts := clienthost.Options{DataDir: t.TempDir(), Executable: "/does-not-exist"}
-	for _, tc := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"p1", "p2"}, `unexpected argument "p2"`},
-		{[]string{"--unknown"}, "flag provided but not defined: -unknown"},
-		{[]string{"--all=invalid"}, "invalid boolean value"},
-		{[]string{"p1", "--all=false"}, `unexpected argument "--all=false"`},
-	} {
-		var out, diagnostics bytes.Buffer
-		err := clienthost.RunModels(context.Background(), opts, tc.args, &out, &diagnostics)
-		var usage *clienthost.UsageError
-		if !errors.As(err, &usage) || usage.ExitCode() != 2 || !strings.Contains(usage.Error(), tc.want) || out.Len() != 0 || diagnostics.Len() != 0 {
-			t.Fatalf("args %v: error=%v stdout=%q diagnostics=%q", tc.args, err, out.String(), diagnostics.String())
-		}
-	}
-	entries, err := os.ReadDir(opts.DataDir)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("usage changed startup directory: %v, %v", entries, err)
-	}
-}
-
 func TestRunModelsFailures(t *testing.T) {
 	t.Run("configuration error", func(t *testing.T) {
 		var out, diagnostics bytes.Buffer
-		err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNotFound, []byte(`{"code":"not_found","message":"no configuration"}`)), nil, &out, &diagnostics)
+		err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNotFound, []byte(`{"code":"not_found","message":"no configuration"}`)), "", false, false, &out, &diagnostics)
 		var response *clientops.ResponseError
 		if !errors.As(err, &response) || response.Status != http.StatusNotFound || err.Error() != "no configuration" || out.Len() != 0 || diagnostics.Len() != 0 {
 			t.Fatalf("error=%v; stdout=%q diagnostics=%q", err, out.String(), diagnostics.String())
 		}
 	})
 	var malformedOut bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(`{"providers":`)), nil, &malformedOut, io.Discard); err == nil || malformedOut.Len() != 0 {
+	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(`{"providers":`)), "", false, false, &malformedOut, io.Discard); err == nil || malformedOut.Len() != 0 {
 		t.Fatalf("malformed success: error=%v output=%q", err, malformedOut.String())
 	}
-	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNoContent, nil), nil, io.Discard, io.Discard); err == nil {
+	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNoContent, nil), "", false, false, io.Discard, io.Discard); err == nil {
 		t.Fatal("missing configuration body reported success")
 	}
 	var out bytes.Buffer
-	err := clienthost.RunModels(context.Background(), clienthost.Options{DataDir: t.TempDir(), Executable: "/does-not-exist"}, nil, &out, io.Discard)
+	err := clienthost.RunModels(context.Background(), clienthost.Options{DataDir: t.TempDir(), Executable: "/does-not-exist"}, "", false, false, &out, io.Discard)
 	var usage *clienthost.UsageError
 	if err == nil || errors.As(err, &usage) || !strings.Contains(err.Error(), "start runtime contender") || out.Len() != 0 {
 		t.Fatalf("startup error=%v output=%q", err, out.String())

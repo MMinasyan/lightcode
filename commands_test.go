@@ -1454,14 +1454,13 @@ func TestDispatchRuntimeUsage(t *testing.T) {
 	}
 }
 
-// TestDispatchModelsUtilityRouting pins the root-to-utility routing at the
-// dispatch layer for the rows that need no configuration read: the parsed
-// utility argv keeps already-parsed operands behind an explicit terminator,
-// and the utility's UsageError is translated into the root's usageErrorf so
-// dispatch prints the usage diagnostic instead of silently applying the
-// utility's exit code.
+// TestDispatchModelsUtilityRouting pins the root's models argument checks at
+// the dispatch layer for the rows that need no configuration read: the
+// remainder fold keeps bare trailing flags out of the operand list, and the
+// zero/one provider check reports an extra operand through the root's
+// usageErrorf so dispatch prints the usage diagnostic with exit code 2.
 func TestDispatchModelsUtilityRouting(t *testing.T) {
-	t.Run("two positionals exit 2 through the utility error adapter", func(t *testing.T) {
+	t.Run("two positionals exit 2 as a usage error", func(t *testing.T) {
 		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "p1", "p2"})
 		if code != 2 || stdout != "" {
 			t.Fatalf("exit=%d stdout=%q", code, stdout)
@@ -1474,10 +1473,10 @@ func TestDispatchModelsUtilityRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("terminator keeps operands out of the second flag parse", func(t *testing.T) {
-		// The registry forwards already-parsed operands behind `--`; a
-		// second positionals violation proves the separator reached the
-		// utility intact instead of re-parsing operands as flags.
+	t.Run("terminator keeps operands out of the flag parse", func(t *testing.T) {
+		// The root flag parse stops at `--`; a second positionals
+		// violation proves the terminated operands reached the provider
+		// check instead of being parsed as flags.
 		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "--", "p1", "p2"})
 		if code != 2 || stdout != "" {
 			t.Fatalf("exit=%d stdout=%q", code, stdout)
