@@ -8,7 +8,6 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.50
 	github.com/oapi-codegen/runtime v1.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
-	github.com/sashabaranov/go-openai v1.41.2
 	github.com/wailsapp/wails/v2 v2.12.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0

@@ -20,9 +20,7 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tracker := NewFileTracker()
-	read := NewReadFileAtRoot(config.ToolsConfig{ReadMaxLines: 500}, tracker, root)
-	out, err := read.Execute(context.Background(), map[string]any{"path": "existing.txt"})
+	out, err := execRead(t, root, "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": "existing.txt"})
 	if err != nil {
 		t.Fatalf("read_file: %v", err)
 	}
@@ -30,8 +28,7 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 		t.Fatalf("read output = %q, want root file content", out)
 	}
 
-	edit := NewEditFileAtRoot(tracker, config.ToolsConfig{}, root)
-	if _, err := edit.Execute(context.Background(), map[string]any{
+	if _, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
 		"path":       "existing.txt",
 		"old_string": "old",
 		"new_string": "new",
@@ -42,8 +39,7 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 		t.Fatalf("root existing.txt = %q, %v; want edited root file", got, err)
 	}
 
-	write := NewWriteFileAtRoot(nil, config.ToolsConfig{}, root)
-	if _, err := write.Execute(context.Background(), map[string]any{"path": "created.txt", "content": "created"}); err != nil {
+	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"path": "created.txt", "content": "created"}); err != nil {
 		t.Fatalf("write_file: %v", err)
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "created.txt")); err != nil || string(got) != "created" {
@@ -59,8 +55,7 @@ func TestRunCommandUsesWorkspaceRoot(t *testing.T) {
 	other := t.TempDir()
 	t.Chdir(other)
 
-	cmd := NewRunCommandAtRoot(config.ToolsConfig{CommandTimeout: 2}, t.TempDir(), root, nil)
-	out, err := cmd.Execute(context.Background(), map[string]any{"command": "pwd"})
+	out, err := RunForegroundCommand(context.Background(), "pwd", root, 2, 15360, 5000, t.TempDir(), os.Environ())
 	if err != nil {
 		t.Fatalf("run_command: %v", err)
 	}

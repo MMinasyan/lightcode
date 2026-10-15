@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -28,7 +27,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+				_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 				return err
 			},
 		},
@@ -40,7 +39,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+					_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 					return err
 				})
 			},
@@ -51,7 +50,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+				_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 				return err
 			},
 		},
@@ -61,7 +60,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -72,7 +71,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+					_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"path": path, "content": "after"})
 					return err
 				})
 			},
@@ -83,7 +82,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -93,7 +92,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -109,7 +108,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
 						"path":       path,
 						"old_string": "before",
 						"new_string": "after",
@@ -124,7 +123,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -154,7 +153,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -165,7 +164,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			},
 			run: func(store *recordingNonRegularSnapshotStore, path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+					_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 					return err
 				})
 			},
@@ -176,7 +175,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -192,7 +191,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			},
 			run: func(store *recordingNonRegularSnapshotStore, path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{
 						"path":       path,
 						"old_string": "before",
 						"new_string": "after",
@@ -207,7 +206,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -227,7 +226,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 
 func TestMissingWriteFileStillCreatesNewFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new.txt")
-	result, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	result, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
 		"path":    path,
 		"content": "created",
 	})
@@ -406,41 +405,23 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 		}
 	}
 
-	preTrack := func(t *testing.T, tracker *FileTracker, path string) {
-		t.Helper()
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tracker.TrackIdentity(path, 0, 500, FileIdentityFromFileInfoAndData(info, data))
-	}
-
 	t.Run("read_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(
-			context.Background(), map[string]any{"path": hardlinked})
+		_, err := execRead(t, filepath.Dir(hardlinked), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": hardlinked})
 		assertHardlinkRefusal(t, err)
 	})
 
 	t.Run("write_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		_, err := execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1},
+			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)
 	})
 
 	t.Run("edit_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{
+		_, err := execEdit(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1},
+			map[string]any{
 				"path":       hardlinked,
 				"old_string": "outside-content",
 				"new_string": "tampered",
@@ -460,10 +441,8 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 		if turn := store.BeginTurn(); turn != 1 {
 			t.Fatalf("BeginTurn = %d, want 1", turn)
 		}
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err = NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		_, err = execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, store,
+			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)
 	})
 }

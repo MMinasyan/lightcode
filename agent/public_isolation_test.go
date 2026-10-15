@@ -159,6 +159,14 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != permissionPkg && imp != safefsPkg && imp != pathutilPkg && !std[imp] {
 				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+permissionPkg+", "+safefsPkg+", and "+pathutilPkg+" helpers, never "+legacyAgent+", "+storagePkg+", any concrete plugin under "+pluginsPkg+", or the SQLite driver")
 			}
+		case "internal/catalog":
+			if imp != modelPkg && imp != atomicfsPkg && !std[imp] {
+				problems = append(problems, rel+": internal/catalog imports "+imp+"; the catalog may import only the standard library, "+atomicfsPkg+", and the public "+modelPkg+" identity it forwards")
+			}
+		case "internal/agents":
+			if imp != modelPkg && imp != atomicfsPkg && !std[imp] {
+				problems = append(problems, rel+": internal/agents imports "+imp+"; the agents definitions may import only the standard library, "+atomicfsPkg+", and the public "+modelPkg+" identity parsing")
+			}
 		case "internal/storage":
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {
 				problems = append(problems, rel+": internal/storage imports "+imp+"; internal/storage may import only the standard library, "+harnessPkg+", and "+sqliteDriverPkg)
@@ -431,6 +439,23 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	} {
 		if problems := checkTrackedGoFile(rel, []string{publicModule + "/internal/toolargs"}, std); len(problems) != 1 {
 			t.Errorf("%s importing the shared tool-argument decoder: %d problems, want 1: %v", rel, len(problems), problems)
+		}
+	}
+	// The retained catalog and agents helpers carry the one allowed edge
+	// into the public model identity; the foundation layers above model,
+	// the target runtime, storage, the driver and the plugin tree are the
+	// nearest forbidden siblings and never enter them.
+	if problems := checkTrackedGoFile("internal/catalog/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/internal/atomicfs"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/catalog imports flagged: %v", problems)
+	}
+	if problems := checkTrackedGoFile("internal/agents/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/internal/atomicfs"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/agents imports flagged: %v", problems)
+	}
+	for _, rel := range []string{"internal/catalog/x.go", "internal/agents/x.go"} {
+		for _, imp := range []string{publicModule + "/agent", publicModule + "/harness", publicModule + "/runtime", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins"} {
+			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
+				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
+			}
 		}
 	}
 	// The runtime target layer consumes the public model, harness, and

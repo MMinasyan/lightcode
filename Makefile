@@ -17,12 +17,12 @@ test-race:
 	go test -race ./...
 
 test-integration:
-	go test -tags=integration -race ./...
+	go test -race -tags webkit2_41 ./runtime ./internal/desktopclient
 
 bench:
 	go test -bench=. -benchmem ./...
 
-PKG ?= ./internal/provider
+PKG ?= ./model
 
 fuzz-short:
 	go test $(PKG) -fuzz=. -fuzztime=30s

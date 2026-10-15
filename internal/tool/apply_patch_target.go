@@ -7,8 +7,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 )
 
-const applyPatchReceiptParam = "_lightcode_apply_patch_receipt"
-
 type applyPatchTargetRole string
 
 const (
@@ -25,36 +23,6 @@ type applyPatchTarget struct {
 	CanonicalPath string
 	Role          applyPatchTargetRole
 	Destination   bool
-}
-
-// applyPatchReceiptValue is the harness-internal approval receipt carried
-// from authorization into execution: the approved canonical targets, the
-// patch parsed exactly once during authorization preparation, and the
-// write-dir witness with its canonical boundary that the execution closure
-// revalidates.
-type applyPatchReceiptValue struct {
-	targets           []applyPatchTarget
-	parsed            *patch
-	writeDir          string
-	writeDirCanonical string
-	rootCanonical     string
-}
-
-func (applyPatchReceiptValue) String() string { return "<internal apply_patch approval>" }
-
-func (applyPatchReceiptValue) GoString() string { return "applyPatchReceiptValue{}" }
-
-func resolveApplyPatchTargetsWithOptions(root string, params map[string]any, opts CapabilityOptions) (*patch, []applyPatchTarget, error) {
-	input, _ := params["input"].(string)
-	p, err := parsePatch(input)
-	if err != nil {
-		return nil, nil, err
-	}
-	targets, err := resolveApplyPatchTargetsFromParsed(root, p, opts)
-	if err != nil {
-		return nil, nil, err
-	}
-	return p, targets, nil
 }
 
 // resolveApplyPatchTargetsFromParsed resolves every op (and Move
@@ -122,59 +90,6 @@ func resolveApplyPatchTarget(root, path string, role applyPatchTargetRole, desti
 		Role:          role,
 		Destination:   destination,
 	}, nil
-}
-
-func applyPatchDisplayFiles(targets []applyPatchTarget) []string {
-	if len(targets) == 0 {
-		return nil
-	}
-	files := make([]string, 0, len(targets))
-	for _, target := range targets {
-		files = append(files, target.AbsPath)
-	}
-	return files
-}
-
-func applyPatchCanonicalFiles(targets []applyPatchTarget) []string {
-	if len(targets) == 0 {
-		return nil
-	}
-	files := make([]string, 0, len(targets))
-	for _, target := range targets {
-		files = append(files, target.CanonicalPath)
-	}
-	return files
-}
-
-// withApplyPatchReceipt injects the internal approval receipt: the approved
-// canonical targets, the patch parsed exactly once during authorization
-// preparation, and the write-dir witness with its canonical boundary.
-// Execution revalidates its fresh canonical resolution against the approved
-// list; no private receipt can survive into executable authority from
-// model-supplied arguments because normalization strips `_lightcode_`
-// fields and the receipt value is only satisfiable by this internal type.
-func withApplyPatchReceipt(params map[string]any, targets []applyPatchTarget, parsed *patch, writeDir, writeDirCanonical, rootCanonical string) map[string]any {
-	next := withoutApplyPatchReceipt(params)
-	copied := make([]applyPatchTarget, len(targets))
-	copy(copied, targets)
-	next[applyPatchReceiptParam] = applyPatchReceiptValue{targets: copied, parsed: parsed, writeDir: writeDir, writeDirCanonical: writeDirCanonical, rootCanonical: rootCanonical}
-	return next
-}
-
-func withoutApplyPatchReceipt(params map[string]any) map[string]any {
-	next := make(map[string]any, len(params)+1)
-	for k, v := range params {
-		if k == applyPatchReceiptParam {
-			continue
-		}
-		next[k] = v
-	}
-	return next
-}
-
-func applyPatchReceiptFromParams(params map[string]any) (applyPatchReceiptValue, bool) {
-	receipt, ok := params[applyPatchReceiptParam].(applyPatchReceiptValue)
-	return receipt, ok
 }
 
 // compareApplyPatchTargets refuses any change between the approved target

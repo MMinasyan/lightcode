@@ -187,18 +187,18 @@ func assertJSONEqual(t *testing.T, got json.RawMessage, want any) {
 
 // TestRunCommandDescriptionsAndSchemasMatchRetained pins both run_command
 // surfaces to the retained texts: the ordinary Agent receives the complete
-// legacy description with the background bullets and the readonly Agent
-// receives the retained readonly description; both share the retained schema.
+// description with the background bullets and the readonly Agent receives
+// the retained readonly description; both share the retained schema. The
+// plugin's own retained literals are the oracle.
 func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
-	legacy := &tool.RunCommand{}
 	ordinary, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("describe ordinary: %v", err)
 	}
-	if ordinary.Definition.Description != legacy.Description() {
-		t.Errorf("ordinary description = %q, want the retained legacy description %q", ordinary.Definition.Description, legacy.Description())
+	if ordinary.Definition.Description != runCommandDescription {
+		t.Errorf("ordinary description = %q, want the retained description %q", ordinary.Definition.Description, runCommandDescription)
 	}
-	assertJSONEqual(t, ordinary.Definition.Parameters, legacy.ParametersSchema())
+	assertJSONEqual(t, ordinary.Definition.Parameters, json.RawMessage(runCommandParameters))
 
 	readonly, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{Readonly: true}, harness.SessionIdentity{})
 	if err != nil {
@@ -207,25 +207,23 @@ func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
 	if readonly.Definition.Description != tool.ReadOnlyRunCommandDescription {
 		t.Errorf("readonly description = %q, want the retained readonly description", readonly.Definition.Description)
 	}
-	legacyReadonly := tool.NewReadOnlyRunCommand(legacy)
-	assertJSONEqual(t, readonly.Definition.Parameters, legacyReadonly.ParametersSchema())
+	assertJSONEqual(t, readonly.Definition.Parameters, json.RawMessage(runCommandParameters))
 	if !ordinary.Available || !readonly.Available {
 		t.Errorf("availability ordinary/readonly = %v/%v, want both available", ordinary.Available, readonly.Available)
 	}
 }
 
 // TestProcessDescriptionAndSchemaMatchRetained pins the process tool's
-// model-visible surface to the retained legacy description and schema.
+// model-visible surface to the retained description and schema literals.
 func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
-	legacy := &tool.ProcessTool{}
 	got, err := processTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("describe process: %v", err)
 	}
-	if got.Definition.Description != legacy.Description() {
-		t.Errorf("process description = %q, want the retained legacy description %q", got.Definition.Description, legacy.Description())
+	if got.Definition.Description != processDescription {
+		t.Errorf("process description = %q, want the retained description %q", got.Definition.Description, processDescription)
 	}
-	assertJSONEqual(t, got.Definition.Parameters, legacy.ParametersSchema())
+	assertJSONEqual(t, got.Definition.Parameters, json.RawMessage(processParameters))
 	if got.Definition.Name != "process" || !got.Available || got.DefaultHidden {
 		t.Errorf("process definition = %+v, want name process, available, not hidden", got)
 	}

@@ -1,32 +1,30 @@
 package tool
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
 )
 
-func TestApplyPatchDisplayMetadataEmitsEditPreviewFiles(t *testing.T) {
+func TestApplyPatchPreviewMetadataEmitsEditPreviewFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("alpha\nBEFORE\nbeta"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	store := &applyPatchStore{turn: 1}
-	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
-
-	input := applyPatchInput(t, "*** Add File: new.txt\n+hi\n*** Update File: x.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta\n*** Delete File: a.txt")
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("bye"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tool.Execute(context.Background(), map[string]any{"input": input}); err != nil {
+	store := &applyPatchStore{turn: 1}
+
+	input := applyPatchInput(t, "*** Add File: new.txt\n+hi\n*** Update File: x.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta\n*** Delete File: a.txt")
+	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
+	if err != nil {
 		t.Fatalf("Execute err = %v", err)
 	}
 
-	md := tool.DisplayMetadata(context.Background(), nil, "")
+	md := ApplyPatchPreviewMetadata(res.Previews)
 	files, ok := editpreview.FilesFromMetadata(md)
 	if !ok {
 		t.Fatalf("edit_preview_files not present in metadata: %+v", md)
@@ -65,20 +63,20 @@ func TestApplyPatchDisplayMetadataEmitsEditPreviewFiles(t *testing.T) {
 	}
 }
 
-func TestApplyPatchDisplayMetadataMoveTwoEntries(t *testing.T) {
+func TestApplyPatchPreviewMetadataMoveTwoEntries(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "old.go"), []byte("a\nB\nc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	store := &applyPatchStore{turn: 1}
-	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
 
 	input := applyPatchInput(t, "*** Update File: old.go\n*** Move to: new.go\n@@\n a\n-B\n+B2\n c")
-	if _, err := tool.Execute(context.Background(), map[string]any{"input": input}); err != nil {
+	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
+	if err != nil {
 		t.Fatalf("Execute err = %v", err)
 	}
 
-	md := tool.DisplayMetadata(context.Background(), nil, "")
+	md := ApplyPatchPreviewMetadata(res.Previews)
 	files, ok := editpreview.FilesFromMetadata(md)
 	if !ok {
 		t.Fatalf("edit_preview_files not present: %+v", md)
@@ -94,34 +92,17 @@ func TestApplyPatchDisplayMetadataMoveTwoEntries(t *testing.T) {
 	}
 }
 
-func TestApplyPatchDisplayMetadataClearsStash(t *testing.T) {
+func TestApplyPatchFailureEmitsNoPreviewMetadata(t *testing.T) {
 	dir := t.TempDir()
 	store := &applyPatchStore{turn: 1}
-	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
-
-	input := applyPatchInput(t, "*** Add File: first.txt\n+hi")
-	if _, err := tool.Execute(context.Background(), map[string]any{"input": input}); err != nil {
-		t.Fatal(err)
-	}
-	if md := tool.DisplayMetadata(context.Background(), nil, ""); md == nil {
-		t.Fatal("first DisplayMetadata = nil, want metadata")
-	}
-	if md := tool.DisplayMetadata(context.Background(), nil, ""); md != nil {
-		t.Fatalf("second DisplayMetadata = %+v, want nil (stash cleared)", md)
-	}
-}
-
-func TestApplyPatchDisplayMetadataFailureNil(t *testing.T) {
-	dir := t.TempDir()
-	store := &applyPatchStore{turn: 1}
-	tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, dir)
 
 	input := applyPatchInput(t, "*** Delete File: ghost.txt")
-	if _, err := tool.Execute(context.Background(), map[string]any{"input": input}); err == nil {
+	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
+	if err == nil {
 		t.Fatal("Execute err = nil, want non-nil for delete-of-missing")
 	}
-	if md := tool.DisplayMetadata(context.Background(), nil, ""); md != nil {
-		t.Fatalf("DisplayMetadata after failure = %+v, want nil", md)
+	if md := ApplyPatchPreviewMetadata(res.Previews); md != nil {
+		t.Fatalf("metadata after failure = %+v, want nil", md)
 	}
 }
 

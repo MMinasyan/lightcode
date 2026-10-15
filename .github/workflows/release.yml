@@ -115,7 +115,7 @@ jobs:
         run: LIGHTCODE_RELEASE_TAG="$TAG" go test ./internal/selfupdate -run TestFloorWithinReleaseTag -v
 
       - name: Fuzz seed corpus
-        run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
+        run: go test -tags webkit2_41 -run=Fuzz ./model/... ./internal/catalog/...
 
       - name: Frontend tests
         run: cd frontend && npm run test

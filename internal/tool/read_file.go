@@ -2,74 +2,12 @@ package tool
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/MMinasyan/lightcode/internal/config"
 )
-
-// ReadFile implements the read_file tool with line-numbered output,
-// pagination, byte caps, binary detection, mtime tracking, and
-// re-read deduplication.
-type ReadFile struct {
-	cfg           config.ToolsConfig
-	tracker       *FileTracker
-	workspaceRoot string
-}
-
-// NewReadFile creates a ReadFile tool with the given config and tracker.
-func NewReadFile(cfg config.ToolsConfig, tracker *FileTracker) *ReadFile {
-	return &ReadFile{cfg: cfg, tracker: tracker}
-}
-
-func NewReadFileAtRoot(cfg config.ToolsConfig, tracker *FileTracker, workspaceRoot string) *ReadFile {
-	return &ReadFile{cfg: cfg, tracker: tracker, workspaceRoot: workspaceRoot}
-}
-
-func (r *ReadFile) SetToolsConfig(cfg config.ToolsConfig) { r.cfg = cfg }
-
-func (r *ReadFile) Name() string { return "read_file" }
-
-func (r *ReadFile) Description() string {
-	return `Reads a file from disk with line numbers.
-- Results are returned with line numbers: each line is prefixed with its number and a tab (e.g. "1\tpackage main"). Line numbers start at 1.
-- By default reads the first 500 lines. When you already know which part of the file you need, use offset and limit to read only that part.
-- If you read a file that has not changed since the last time you read it, the tool returns a short notice instead of the full content. The earlier read in this conversation is still current.
-- Do not use cat, head, tail, or sed via run_command to read files. Use this tool.`
-}
-
-func (r *ReadFile) ParametersSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"path": map[string]any{
-				"type":        "string",
-				"description": "Absolute or relative path to the file to read.",
-			},
-			"offset": map[string]any{
-				"type":        "integer",
-				"description": "1-indexed line number to start reading from.",
-			},
-			"limit": map[string]any{
-				"type":        "integer",
-				"description": "Maximum number of lines to read.",
-			},
-		},
-		"required": []string{"path"},
-	}
-}
-
-func (r *ReadFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	prepared, err := prepareReadCall(r.workspaceRoot, r.cfg, r.tracker, params)
-	if err != nil {
-		return "", err
-	}
-	return prepared.Execute(context.Background())
-}
 
 // formatReadOutput renders the line-numbered window for the requested
 // offset/limit. Read windows are clamped to the remaining lines before any

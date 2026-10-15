@@ -3,16 +3,12 @@ package agents
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/model"
 )
-
-const emptyAgentsTemplate = "{}\n"
 
 var allowedTools = func() map[string]struct{} {
 	out := make(map[string]struct{}, len(StandardTools))
@@ -30,23 +26,6 @@ func PathForConfig(configPath string) string {
 type Config struct {
 	defs     map[string]Definition
 	warnings []Warning
-}
-
-func Load(path string) (*Config, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if _, err := atomicfs.CreateExclusive(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
-			return nil, fmt.Errorf("create agents %s: %w", path, err)
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read agents %s: %w", path, err)
-	}
-	cfg, err := Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse agents %s: %w", path, err)
-	}
-	return cfg, nil
 }
 
 // Parse loads the legacy on-disk shape: custom tool names must be members
@@ -253,7 +232,7 @@ func (c *Config) applyBuiltinOverlay(name string, def Definition) {
 	if def.Model == "" {
 		return
 	}
-	if _, err := coremodel.Parse(def.Model); err != nil {
+	if _, err := model.Parse(def.Model); err != nil {
 		c.warnings = append(c.warnings, Warning{
 			Kind:    "invalid_builtin_model",
 			Name:    name,
@@ -328,68 +307,12 @@ func applyDefinition(out *Resolved, def Definition) {
 	}
 }
 
-func WriteModel(path, name, ref string) error {
-	if ref != "" {
-		if _, err := coremodel.Parse(ref); err != nil {
-			return err
-		}
-	}
-	root, err := readRoot(path)
-	if err != nil {
-		return err
-	}
-	raw, ok := root[name]
-	if !ok {
-		raw = map[string]any{}
-		root[name] = raw
-	}
-	entry, ok := raw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("agents.%s must be an object", name)
-	}
-	if ref == "" {
-		delete(entry, "model")
-	} else {
-		entry["model"] = ref
-	}
-	return writeAtomic(path, root)
-}
-
-func readRoot(path string) (map[string]any, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if _, err := atomicfs.CreateExclusive(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
-			return nil, fmt.Errorf("create agents %s: %w", path, err)
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("parse agents %s: %w", path, err)
-	}
-	if root == nil {
-		root = map[string]any{}
-	}
-	return root, nil
-}
-
-func writeAtomic(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return atomicfs.Write(path, data, 0o600)
-}
-
 func validateCustom(name string, def Definition, target bool, declaredCapabilities, declaredTools map[string]struct{}) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is empty")
 	}
 	if def.Model != "" {
-		if _, err := coremodel.Parse(def.Model); err != nil {
+		if _, err := model.Parse(def.Model); err != nil {
 			return fmt.Errorf("model must be a provider-prefixed string: %w", err)
 		}
 	}

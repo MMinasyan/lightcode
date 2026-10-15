@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/config"
 )
 
@@ -41,21 +40,6 @@ func TestFirstRunCreationPreservesExistingFiles(t *testing.T) {
 		after, _ := os.ReadFile(path)
 		if string(after) != string(marked) {
 			t.Fatal("existing config.json was overwritten on second Load")
-		}
-	})
-
-	t.Run("first_run_refuses_overwrite/agents", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "agents.json")
-		if _, err := agents.Load(path); err != nil {
-			t.Fatalf("initial Load: %v", err)
-		}
-		marked := markPreserved(t, path)
-		if _, err := agents.Load(path); err != nil {
-			t.Fatalf("reload: %v", err)
-		}
-		after, _ := os.ReadFile(path)
-		if string(after) != string(marked) {
-			t.Fatal("existing agents.json was overwritten on second Load")
 		}
 	})
 

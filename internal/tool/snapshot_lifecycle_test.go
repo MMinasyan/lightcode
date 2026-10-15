@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
@@ -44,7 +42,6 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 			root := t.TempDir()
 			path := snapshotLifecycleFile(t, root, "file.txt", "before")
 			store := newSnapshotLifecycleStore(t, root)
-			tracker := snapshotLifecycleTracker(t, path)
 			wrapped := &mutatingTransactionalSnapshotStore{
 				Store: store,
 				mutate: func() {
@@ -52,7 +49,7 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 				},
 			}
 
-			_, err := NewWriteFileWithSnapshot(wrapped, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+			_, err := execWrite(t, root, "", "", CapabilityOptions{}, wrapped, map[string]any{
 				"path":    path,
 				"content": "after",
 			})
@@ -77,9 +74,8 @@ func TestEditFileDiscardsSnapshotWhenEditFailsBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t, root)
-	tracker := snapshotLifecycleTracker(t, path)
 
-	_, err := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
 		"old_string": "missing",
 		"new_string": "after",
@@ -102,7 +98,6 @@ func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t, root)
-	tracker := snapshotLifecycleTracker(t, path)
 	wrapped := &mutatingTransactionalSnapshotStore{
 		Store: store,
 		mutate: func() {
@@ -115,7 +110,7 @@ func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 		},
 	}
 
-	_, err := NewEditFileWithSnapshot(wrapped, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	_, err := execEdit(t, root, "", "", CapabilityOptions{}, wrapped, map[string]any{
 		"path":       path,
 		"old_string": "external",
 		"new_string": "after",
@@ -139,15 +134,14 @@ func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) 
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t, root)
-	tracker := snapshotLifecycleTracker(t, path)
 
-	if _, err := NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
 		"content": "after",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewEditFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
 		"old_string": "missing",
 		"new_string": "other",
@@ -169,15 +163,14 @@ func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t, root)
-	tool := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{})
 
-	if _, err := tool.Execute(context.Background(), map[string]any{
+	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
 		"content": "first",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tool.Execute(context.Background(), map[string]any{
+	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
 		"content": "second",
 	}); err != nil {
@@ -195,7 +188,7 @@ func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
 		t.Fatalf("RevertCode restored = %v, want none", affected.Restored)
 	}
 	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != path {
-		t.Fatalf("RevertCode skipped = %+v, want skipped %s", affected.Skipped, path)
+		t.Fatalf("RevertCode skipped = %+v, want skipped %s", affected, path)
 	}
 	assertFileContent(t, path, "first")
 }
@@ -209,11 +202,10 @@ func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
 		releaseFirstRecord: make(chan struct{}),
 		secondLockAttempt:  make(chan struct{}),
 	}
-	tool := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{})
 
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := tool.Execute(context.Background(), map[string]any{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 			"path":    path,
 			"content": "first",
 		})
@@ -223,7 +215,7 @@ func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
 	<-store.firstRecordStarted
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := tool.Execute(context.Background(), map[string]any{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 			"path":    path,
 			"content": "second",
 		})
@@ -274,9 +266,9 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 	}{
 		{
 			name: "immediate_write",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
 				t.Helper()
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":    path,
 					"content": "after",
 				})
@@ -285,9 +277,9 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 		},
 		{
 			name: "immediate_edit",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
 				t.Helper()
-				_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -299,9 +291,8 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 			name: "apply_patch",
 			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
 				t.Helper()
-				tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, root)
 				input := applyPatchInput(t, "*** Update File: file.txt\n@@\n-before\n+after")
-				_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+				_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
 				return err
 			},
 		},
@@ -344,9 +335,9 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 	}{
 		{
 			name: "immediate_write_create",
-			run: func(t *testing.T, _ string, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
 				t.Helper()
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":    path,
 					"content": "after",
 				})
@@ -357,9 +348,8 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 			name: "apply_patch_add",
 			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
 				t.Helper()
-				tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, root)
 				input := applyPatchInput(t, "*** Add File: created.txt\n+after")
-				_, err := runApplyPatch(t, tool, map[string]any{"input": input})
+				_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
 				return err
 			},
 		},
@@ -453,8 +443,8 @@ func withMutationFailure(t *testing.T, target string, step mutationFailureStep) 
 	target = filepath.Clean(target)
 	prevWrite := openWriteTargetForMutationFunc
 	prevExisting := openExistingMutationFile
-	openWriteTargetForMutationFunc = func(absPath string, tracker *FileTracker) (mutationFile, bool, bool, error) {
-		f, existed, started, err := prevWrite(absPath, tracker)
+	openWriteTargetForMutationFunc = func(absPath string) (mutationFile, bool, bool, error) {
+		f, existed, started, err := prevWrite(absPath)
 		if err == nil && filepath.Clean(absPath) == target {
 			f = &failingMutationFile{mutationFile: f, step: step}
 		}
@@ -548,13 +538,4 @@ func snapshotLifecycleFile(t *testing.T, root, name, content string) string {
 		t.Fatal(err)
 	}
 	return path
-}
-
-func snapshotLifecycleTracker(t *testing.T, path string) *FileTracker {
-	t.Helper()
-	tracker := NewFileTracker()
-	if _, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, tracker).Execute(context.Background(), map[string]any{"path": path}); err != nil {
-		t.Fatal(err)
-	}
-	return tracker
 }

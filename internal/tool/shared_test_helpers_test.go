@@ -1,9 +1,32 @@
 package tool
 
 import (
+	"context"
 	"os"
 	"testing"
 )
+
+// execPatch runs one apply_patch through the exported Normalize* + Prepare*
+// entries and returns the structured execution result.
+func execPatch(t *testing.T, root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (PreparedPatchResult, error) {
+	t.Helper()
+	if rootCanonical == "" {
+		var err error
+		rootCanonical, err = bindWorkspaceRoot(root)
+		if err != nil {
+			return PreparedPatchResult{}, err
+		}
+	}
+	norm, err := NormalizePatchArgs(args)
+	if err != nil {
+		return PreparedPatchResult{}, err
+	}
+	call, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, opts, store, norm)
+	if err != nil {
+		return PreparedPatchResult{}, err
+	}
+	return call.Execute(context.Background())
+}
 
 // Shared, non-staging test fixtures recovered from the deleted staging executor
 // test file. These are used across the immediate-path tool test suites
