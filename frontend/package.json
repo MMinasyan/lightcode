@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:client": "vite build --config vite.client.config.js",
+    "build:client": "vite build",
     "test": "vitest run",
     "test:watch": "vitest",
     "generate-protocol": "openapi-ts",

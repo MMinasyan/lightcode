@@ -2,18 +2,20 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
+	"syscall"
 
-	"github.com/MMinasyan/lightcode/internal/agent"
+	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/doctor"
 	"github.com/MMinasyan/lightcode/internal/selfupdate"
@@ -92,6 +94,8 @@ var (
 	modelsAll       bool
 	modelsJSON      bool
 	configPathOnly  bool
+	runtimeDataDir  string
+	runtimeConfig   string
 )
 
 // commands is filled in init: the help entry's closure walks the registry
@@ -131,6 +135,30 @@ func init() {
 					return err
 				}
 				return runACP()
+			},
+		},
+		{
+			name:    "runtime",
+			summary: "run the shared runtime owner",
+			flags: func() *flag.FlagSet {
+				fs := newFlagSet("runtime")
+				fs.StringVar(&runtimeDataDir, "data-dir", "", "runtime data directory")
+				fs.StringVar(&runtimeConfig, "config", "", "config file path")
+				return fs
+			},
+			run: func(fs *flag.FlagSet, args []string) error {
+				if err := checkNoArgs(fs); err != nil {
+					return err
+				}
+				if runtimeDataDir == "" {
+					return usageErrorf("missing required flag --data-dir")
+				}
+				if runtimeConfig == "" {
+					return usageErrorf("missing required flag --config")
+				}
+				ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				return runRuntime(ctx, runtimeDataDir, runtimeConfig)
 			},
 		},
 		{
@@ -241,29 +269,22 @@ func init() {
 				return fs
 			},
 			run: func(fs *flag.FlagSet, args []string) error {
-				// The flag package stops parsing at the first positional;
-				// fold trailing flags back so `models <provider> --all`
-				// works like `models --all <provider>`.
-				var positionals []string
-				for _, a := range fs.Args() {
-					switch a {
-					case "--all", "-all":
-						modelsAll = true
-					case "--json", "-json":
-						modelsJSON = true
-					default:
-						positionals = append(positionals, a)
-					}
+				// The utility parses its own arguments: forward the
+				// already parsed true flags, then an explicit terminator,
+				// then the untouched remainder so the second flag parse
+				// cannot reinterpret operands such as `--json=true`.
+				// Bare trailing --all/--json stay operands here and are
+				// folded by the utility's own remainder scan.
+				argv := make([]string, 0, fs.NArg()+3)
+				if modelsAll {
+					argv = append(argv, "--all")
 				}
-				provider := ""
-				switch len(positionals) {
-				case 0:
-				case 1:
-					provider = positionals[0]
-				default:
-					return usageErrorf("unexpected argument %q", positionals[1])
+				if modelsJSON {
+					argv = append(argv, "--json")
 				}
-				return runModels(provider, modelsAll, modelsJSON)
+				argv = append(argv, "--")
+				argv = append(argv, fs.Args()...)
+				return runModels(argv)
 			},
 		},
 		{
@@ -432,7 +453,7 @@ func runUpgrade(raw []string) error {
 	if err := selfupdate.Replace(staged, targetPath); err != nil {
 		return err
 	}
-	fmt.Fprintf(errW, "upgraded %s -> %s; takes effect the next time lightcode starts.\n", version.String(), target)
+	fmt.Fprintf(errW, "upgraded %s -> %s; restart the Runtime to apply backend changes.\n", version.String(), target)
 	return nil
 }
 
@@ -577,111 +598,17 @@ func runUninstall(purge, yes, dryRun bool) error {
 	return nil
 }
 
-// runModels lists models through the same agent bootstrap as every
-// cli/GUI start (it may refresh a stale discovery cache and auto-create
-// the config templates on first run — doctor and config are the
-// zero-write commands). The handler filters Incomplete entries from the
-// default view itself: ModelList() resolves refs via LookupOrIncomplete
-// and filters hidden only.
-func runModels(provider string, all, asJSON bool) error {
-	svc, err := buildAgent()
-	if err != nil {
-		return err
+// runModels lists models through the shared startup owner and the published
+// configuration projection. The utility's usage errors are translated into
+// the root's usageErrorf so dispatch prints the usage diagnostic instead of
+// silently applying the utility's own exit code.
+func runModels(args []string) error {
+	err := clienthost.RunModels(context.Background(), clienthost.Options{}, args, outW, errW)
+	var usage *clienthost.UsageError
+	if errors.As(err, &usage) {
+		return usageErrorf("%s", usage.Message)
 	}
-
-	var rows []agent.ModelListEntry
-	if all {
-		rows = svc.AllModelList()
-	} else {
-		for _, row := range svc.ModelList() {
-			if row.Incomplete {
-				continue
-			}
-			rows = append(rows, row)
-		}
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Ref < rows[j].Ref })
-
-	hint := ""
-	if provider != "" {
-		// Validate against ProviderList: the filtered rows cannot
-		// distinguish an unknown provider from a known-but-disconnected
-		// one.
-		var match *agent.ProviderStatus
-		var known []string
-		for _, p := range svc.ProviderList() {
-			known = append(known, p.ID)
-			if p.ID == provider {
-				m := p
-				match = &m
-			}
-		}
-		if match == nil {
-			return usageErrorf("unknown provider %q (known: %s)", provider, strings.Join(known, ", "))
-		}
-		filtered := rows[:0]
-		for _, row := range rows {
-			if row.Provider == provider {
-				filtered = append(filtered, row)
-			}
-		}
-		rows = filtered
-		switch {
-		case !match.Connected:
-			rows = nil
-			hint = fmt.Sprintf("provider %q is not connected - connect it in Settings first", provider)
-		case len(rows) == 0:
-			hint = fmt.Sprintf("no visible models for %q - rerun with --all", provider)
-		}
-	} else if len(rows) == 0 {
-		anyConnected := false
-		for _, p := range svc.ProviderList() {
-			if p.Connected {
-				anyConnected = true
-				break
-			}
-		}
-		if anyConnected {
-			hint = "no visible models - rerun with --all"
-		} else {
-			hint = "no models available - connect a provider in Settings first"
-		}
-	}
-
-	if hint != "" {
-		fmt.Fprintln(errW, hint)
-	}
-	if asJSON {
-		// Always valid JSON on stdout: an empty result is [], never
-		// empty bytes.
-		if rows == nil {
-			rows = []agent.ModelListEntry{}
-		}
-		b, err := json.Marshal(rows)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(outW, string(b))
-		return nil
-	}
-	for _, row := range rows {
-		var markers []string
-		if row.Default {
-			markers = append(markers, "default")
-		}
-		if row.Hidden {
-			markers = append(markers, "hidden")
-		}
-		if row.Incomplete {
-			markers = append(markers, "incomplete")
-		}
-		marker := "-"
-		if len(markers) > 0 {
-			marker = strings.Join(markers, ",")
-		}
-		fmt.Fprintf(outW, "%s\t%d\t%d\t%s\n", row.Ref, row.ContextWindow, row.MaxOutputTokens, marker)
-	}
-	return nil
+	return err
 }
 
 // runConfig prints the raw config bytes (cat semantics — pipes stay

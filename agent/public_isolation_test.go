@@ -35,6 +35,7 @@ const (
 	wailsRuntimePkg = "github.com/wailsapp/wails/v2/pkg/runtime"
 	wailsOptionsPkg = "github.com/wailsapp/wails/v2/pkg/options"
 	wailsAssetPkg   = "github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsLinuxPkg   = "github.com/wailsapp/wails/v2/pkg/options/linux"
 )
 
 // TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages plus the tiktoken encoder of its conversation token estimator; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model, harness, and protocol packages plus the retained internal config, agents, catalog, atomicfs, prompt, and adaptation helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; the internal/plugins/sqlite plugin imports only the standard library plus the public runtime and harness contracts and the internal/storage backend it declares; the internal/plugins/adaptation plugin imports only the standard library plus the public runtime and model contracts and the internal/adaptation binding table it resolves; the plugins/jobs package imports only the standard library plus the public runtime and harness contracts and the internal/cmdoutput capture helper it composes, and stays one package without subpackages; the internal/plugins/tasks plugin imports only the standard library plus the public model, harness, and runtime contracts and the internal/toolargs argument decoder; the internal/toolargs argument decoder imports only the standard library and is consumed only by the internal/plugins/tools, tasks, and lsp plugins; the internal/plugins/builtin package imports only the standard library plus the public runtime contract and the six sibling plugins it registers; the generated protocol package imports only the standard library plus the oapi-codegen runtime helper its generated parameter binding needs, and the runtime's protocol import is the one permitted consumption edge of the generated contracts; the client wrapper imports only the standard library plus those generated protocol contracts; the shared terminal presentation package imports only the standard library plus the retained edit-preview helper, and the host process helper imports only the standard library; every other tracked production file imports none of these packages, not the SQLite driver, not the target runtime or its concrete plugins — including the public plugins/ tree — and no root, legacy, or adapter file imports the protocol contracts before their owning step, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
@@ -101,6 +102,9 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		cliclientPkg   = publicModule + "/internal/cliclient"
 		hostprocessPkg = publicModule + "/internal/hostprocess"
 		versionPkg     = publicModule + "/internal/version"
+		doctorPkg      = publicModule + "/internal/doctor"
+		selfupdatePkg  = publicModule + "/internal/selfupdate"
+		builtinPkg     = publicModule + "/internal/plugins/builtin"
 	)
 	var problems []string
 	dir := path.Dir(rel)
@@ -116,6 +120,28 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		return []string{rel + ": plugins/jobs must remain one package without subpackages"}
 	}
 	for _, imp := range imports {
+		// Exact roles for the active root entry files: the root entry
+		// composes the shipped clients, the command dispatcher reaches the
+		// shared startup helper and its independent utilities, and the
+		// runtime command alone composes the production Runtime owner over
+		// the public runtime contract and the shipped plugin set.
+		switch rel {
+		case "main.go":
+			if imp != clienthostPkg && imp != desktopPkg && imp != cliclientPkg && imp != acpclientPkg && !std[imp] {
+				problems = append(problems, rel+": main.go imports "+imp+"; the root entry may import only the standard library and "+clienthostPkg+", "+desktopPkg+", "+cliclientPkg+", and "+acpclientPkg)
+			}
+			continue
+		case "commands.go":
+			if imp != clienthostPkg && imp != configPkg && imp != doctorPkg && imp != selfupdatePkg && imp != versionPkg && !std[imp] {
+				problems = append(problems, rel+": commands.go imports "+imp+"; the command dispatcher may import only the standard library and "+clienthostPkg+", "+configPkg+", "+doctorPkg+", "+selfupdatePkg+", and "+versionPkg)
+			}
+			continue
+		case "runtime_command.go":
+			if imp != runtimePkg && imp != builtinPkg && !std[imp] {
+				problems = append(problems, rel+": runtime_command.go imports "+imp+"; the runtime command may import only the standard library, "+runtimePkg+", and "+builtinPkg)
+			}
+			continue
+		}
 		switch dir {
 		case "model":
 			if !std[imp] {
@@ -210,7 +236,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			}
 		case "internal/desktopclient":
 			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != clientopsPkg && imp != versionPkg &&
-				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && !std[imp] {
+				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && imp != wailsLinuxPkg && !std[imp] {
 				problems = append(problems, rel+": internal/desktopclient imports "+imp+"; the desktop host may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", the Wails framework, and the native version helper")
 			}
 		case "cmd/desktopclient":
@@ -667,7 +693,7 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 	// Root files, legacy adapters, and other sibling target hosts cannot reach
 	// the typed invocation helper; shared startup and the desktop host may use
 	// it, but none of them can reach the ACP bridge.
-	for _, rel := range []string{"main.go", "app.go", "internal/acp/x.go", "internal/cli/x.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
+	for _, rel := range []string{"rootmisc.go", "app.go", "internal/acp/x.go", "internal/cli/x.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
 		for _, imp := range []string{publicModule + "/internal/clientops", publicModule + "/internal/acpclient"} {
 			if imp == publicModule+"/internal/clientops" && (rel == "internal/clienthost/x.go" || rel == "internal/desktopclient/x.go") {
 				continue
@@ -688,7 +714,7 @@ func TestDependencyRulesDesktopHostIsolation(t *testing.T) {
 		"bytes", "context", "encoding/json", "errors", "fmt", "io/fs", "path/filepath", "strconv", "strings", "sync",
 		publicModule + "/client", publicModule + "/protocol", publicModule + "/internal/clienthost",
 		publicModule + "/internal/clientops", publicModule + "/internal/version",
-		wailsPkg, wailsRuntimePkg, wailsOptionsPkg, wailsAssetPkg,
+		wailsPkg, wailsRuntimePkg, wailsOptionsPkg, wailsAssetPkg, wailsLinuxPkg,
 	}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/desktopclient imports flagged: %v", problems)
 	}
@@ -719,7 +745,7 @@ func TestDependencyRulesCliclientIsolation(t *testing.T) {
 			t.Errorf("forbidden %s: %v", imp, problems)
 		}
 	}
-	for _, rel := range []string{"main.go", "app.go", "commands.go", "internal/cli/x.go", "internal/acp/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/desktopclient/x.go", "internal/acpclient/x.go", "internal/cliclient/sub/x.go", "cmd/desktopclient/x.go"} {
+	for _, rel := range []string{"rootmisc.go", "app.go", "commands.go", "internal/cli/x.go", "internal/acp/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/desktopclient/x.go", "internal/acpclient/x.go", "internal/cliclient/sub/x.go", "cmd/desktopclient/x.go"} {
 		if problems := checkTrackedGoFile(rel, []string{publicModule + "/internal/cliclient"}, std); len(problems) != 1 {
 			t.Errorf("reverse %s: %v", rel, problems)
 		}
@@ -755,10 +781,96 @@ func TestDependencyRulesDesktopClientEntryIsolation(t *testing.T) {
 	}
 }
 
+// TestDependencyRulesRootEntryRoles enforces the active root entry files'
+// exact import roles: the root entry composes the shipped clients, the
+// dispatcher reaches the shared startup helper and its independent
+// utilities, and the runtime command alone holds the Runtime composition
+// exception over the public runtime contract and the shipped plugins. The
+// nearest wrong roles, an arbitrary root file, and adapter edges into the
+// Runtime, plugins and storage stay rejected exactly once.
+func TestDependencyRulesRootEntryRoles(t *testing.T) {
+	std := standardLibraryImports(t)
+	if problems := checkTrackedGoFile("main.go", []string{
+		"context", "embed", "errors", "fmt", "log/slog", "os", "path/filepath",
+		publicModule + "/internal/clienthost", publicModule + "/internal/desktopclient",
+		publicModule + "/internal/cliclient", publicModule + "/internal/acpclient",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed main.go imports flagged: %v", problems)
+	}
+	if problems := checkTrackedGoFile("commands.go", []string{
+		"bufio", "context", "encoding/json", "errors", "flag", "fmt", "io", "os", "os/signal",
+		"path/filepath", "runtime", "strings", "syscall",
+		publicModule + "/internal/clienthost", publicModule + "/internal/config",
+		publicModule + "/internal/doctor", publicModule + "/internal/selfupdate",
+		publicModule + "/internal/version",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed commands.go imports flagged: %v", problems)
+	}
+	if problems := checkTrackedGoFile("runtime_command.go", []string{
+		"context", "errors", "path/filepath",
+		publicModule + "/runtime", publicModule + "/internal/plugins/builtin",
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed runtime_command.go imports flagged: %v", problems)
+	}
+	for _, row := range []struct{ rel, imp string }{
+		// The Runtime composition exception belongs only to the runtime
+		// command, and no active entry file reaches a legacy owner or the
+		// direct model, Harness, storage or SQLite-driver edges.
+		{"main.go", publicModule + "/runtime"},
+		{"main.go", publicModule + "/internal/plugins/builtin"},
+		{"main.go", publicModule + "/internal/config"},
+		{"main.go", publicModule + "/model"},
+		{"main.go", publicModule + "/harness"},
+		{"main.go", publicModule + "/internal/storage"},
+		{"main.go", sqliteDriverPkg},
+		{"main.go", publicModule + "/internal/agent"},
+		{"main.go", publicModule + "/internal/cli"},
+		{"main.go", publicModule + "/internal/acp"},
+		{"commands.go", publicModule + "/internal/desktopclient"},
+		{"commands.go", publicModule + "/internal/cliclient"},
+		{"commands.go", publicModule + "/internal/acpclient"},
+		{"commands.go", publicModule + "/runtime"},
+		{"commands.go", publicModule + "/internal/plugins/builtin"},
+		{"commands.go", publicModule + "/internal/agent"},
+		{"commands.go", publicModule + "/internal/cli"},
+		{"commands.go", publicModule + "/internal/acp"},
+		{"commands.go", publicModule + "/harness"},
+		{"commands.go", sqliteDriverPkg},
+		{"runtime_command.go", publicModule + "/internal/clienthost"},
+		{"runtime_command.go", publicModule + "/internal/cliclient"},
+		{"runtime_command.go", publicModule + "/internal/desktopclient"},
+		{"runtime_command.go", publicModule + "/internal/acpclient"},
+		{"runtime_command.go", publicModule + "/internal/config"},
+		{"runtime_command.go", publicModule + "/internal/doctor"},
+		{"runtime_command.go", publicModule + "/model"},
+		{"runtime_command.go", publicModule + "/harness"},
+		{"runtime_command.go", publicModule + "/internal/storage"},
+		{"runtime_command.go", sqliteDriverPkg},
+		{"runtime_command.go", publicModule + "/internal/agent"},
+		{"runtime_command.go", publicModule + "/internal/cli"},
+		{"runtime_command.go", publicModule + "/internal/acp"},
+		// A new arbitrary root file keeps the generic fallback: no role and
+		// no reserved edge.
+		{"rootmisc.go", publicModule + "/runtime"},
+		{"rootmisc.go", publicModule + "/internal/clienthost"},
+		{"rootmisc.go", publicModule + "/internal/plugins/builtin"},
+		{"rootmisc.go", publicModule + "/internal/storage"},
+		// Legacy adapters keep their edges out of the Runtime, its plugins
+		// and storage.
+		{"internal/acp/x.go", publicModule + "/runtime"},
+		{"internal/cli/x.go", publicModule + "/internal/plugins/builtin"},
+		{"internal/acp/x.go", publicModule + "/internal/storage"},
+	} {
+		if problems := checkTrackedGoFile(row.rel, []string{row.imp}, std); len(problems) != 1 {
+			t.Errorf("%s importing %q: %d problems, want 1: %v", row.rel, row.imp, len(problems), problems)
+		}
+	}
+}
+
 // TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor), root files, and arbitrary internal/ paths are ordinary production files whose imports of any foundation package or the SQLite driver are reported, and internal/storage subpackages are rejected like public-package ones.
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "main.go", "internal/anything/x.go", "cmd/desktopclient/sub/x.go"} {
+	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "rootmisc.go", "internal/anything/x.go", "cmd/desktopclient/sub/x.go"} {
 		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", publicModule + "/internal/clientview", publicModule + "/internal/clientops", publicModule + "/internal/acpclient", publicModule + "/internal/cliclient", publicModule + "/internal/desktopclient", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)

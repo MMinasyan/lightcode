@@ -5,9 +5,9 @@ import { fileURLToPath } from 'node:url';
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 // An optional first argument names the models file to normalize, resolved
 // from the caller's working directory (the target build hook runs from its
-// project's build/bin). Without one, the shipped root models file is used.
+// project's build/bin). Without one, the shipped target models file is used.
 const files = [
-  process.argv[2] ? resolve(process.cwd(), process.argv[2]) : join(scriptDir, '..', 'wailsjs', 'go', 'models.ts'),
+  process.argv[2] ? resolve(process.cwd(), process.argv[2]) : join(scriptDir, '..', 'client-bindings', 'wailsjs', 'go', 'models.ts'),
 ];
 
 for (const file of files) {
