@@ -39,6 +39,9 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 			t.Fatalf("X-Test-Header = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// One successful shape: the valid document may be followed by JSON
+		// whitespace (space, tab, CR, LF). Non-whitespace trailing data is
+		// rejected by the bounded-failure rows.
 		_, _ = w.Write([]byte(`{
 			"data": [
 				{
@@ -59,7 +62,7 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 					"max_output_tokens": 4096
 				}
 			]
-		}`))
+		}` + " \t\r\n"))
 	}))
 	defer server.Close()
 

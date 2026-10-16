@@ -74,17 +74,6 @@ jobs:
     needs: test
     if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.26'
-
-      - name: Install Wails native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
-
       - name: Require passing tests
         # The gate reports the executed test job's result only: failure,
         # cancellation or skipped tests cannot become green here.

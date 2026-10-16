@@ -1122,3 +1122,15 @@ func TestRevertSkipBlocksOlderSnapshotForSameFile(t *testing.T) {
 		t.Fatalf("snapshot dirs = %v, want [1 2]", got)
 	}
 }
+
+// copyFile seeds a snapshot preimage by hand in this package's tests: it
+// copies a source file into an entry's original/ path exactly as capture
+// does. It lives here because no production caller remains.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	return copyFromFile(in, dst)
+}

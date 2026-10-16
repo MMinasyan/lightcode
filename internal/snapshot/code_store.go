@@ -625,15 +625,6 @@ func hashBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	return copyFromFile(in, dst)
-}
-
 func copyFromFile(in *os.File, dst string) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
