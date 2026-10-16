@@ -83,7 +83,7 @@ func TestDispatchHelpForms(t *testing.T) {
 			"Usage: lightcode [command]",
 			"desktop", "cli", "acp", "runtime", "help",
 			"(default)",
-			"Exit codes: 0 success, 1 failure, 2 usage error.",
+			"Exit codes: 0 success, 1 failure, 2 usage error; the terminal client exits 130 when a signal terminates it.",
 		} {
 			if !strings.Contains(stdout, want) {
 				t.Fatalf("%v: stdout missing %q:\n%s", argv, want, stdout)
