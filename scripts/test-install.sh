@@ -35,6 +35,22 @@ assert_equal_file() {
     [ "$actual" = "$expected" ] || fail "unexpected content in $file: $actual"
 }
 
+assert_mode() {
+    file=$1
+    expected=$2
+    actual=$(stat -c '%a' "$file")
+    [ "$actual" = "$expected" ] || fail "unexpected mode on $file: $actual (want $expected)"
+}
+
+assert_no_staging_residue() {
+    dir=$1
+    for candidate in "$dir"/.lightcode.tmp.*; do
+        if [ -e "$candidate" ]; then
+            fail "temporary staging file left behind: $candidate"
+        fi
+    done
+}
+
 make_release() {
     dir=$1
     binary_content=${2:-'#!/bin/sh
@@ -118,6 +134,29 @@ case "$1" in
 esac
 EOF
     chmod 755 "$dir/id"
+
+    host_cp=$(command -v cp) || fail "missing host command for shim: cp"
+    host_mv=$(command -v mv) || fail "missing host command for shim: mv"
+
+    cat >"$dir/cp" <<EOF
+#!/bin/sh
+if [ "\${LIGHTCODE_TEST_CP_FAIL:-}" = 1 ]; then
+  for dest do :; done
+  printf '%s' partial-write >"\$dest"
+  exit 1
+fi
+exec "$host_cp" "\$@"
+EOF
+    chmod 755 "$dir/cp"
+
+    cat >"$dir/mv" <<EOF
+#!/bin/sh
+if [ "\${LIGHTCODE_TEST_MV_FAIL:-}" = 1 ]; then
+  exit 1
+fi
+exec "$host_mv" "\$@"
+EOF
+    chmod 755 "$dir/mv"
 
     cat >"$dir/sudo" <<'EOF'
 #!/bin/sh
@@ -262,6 +301,48 @@ run_expect_failure() {
     fi
 }
 
+# Runs the repository make install recipe from a temporary source tree. The
+# root makefile supplies the recipe under test; a temporary companion file,
+# read after it, overrides only the build prerequisite with a no-op. An empty
+# prefix argument lets the makefile choose its default under the temporary HOME.
+run_make_install() {
+    out=$1
+    prefix=$2
+    shift 2
+    if [ -n "$prefix" ]; then
+        set -- "$@" make -f "$root_dir/Makefile" -f "$make_companion" "PREFIX=$prefix" install
+    else
+        set -- "$@" make -f "$root_dir/Makefile" -f "$make_companion" install
+    fi
+    (
+        PATH="$shim_dir:$PATH"
+        HOME="$make_home"
+        export PATH HOME
+        cd "$make_source_tree"
+        "$@"
+    ) >"$out" 2>&1
+}
+
+run_make_expect_success() {
+    out=$1
+    prefix=$2
+    shift 2
+    if ! run_make_install "$out" "$prefix" "$@"; then
+        cat "$out" >&2 || true
+        fail "expected make install success"
+    fi
+}
+
+run_make_expect_failure() {
+    out=$1
+    prefix=$2
+    shift 2
+    if run_make_install "$out" "$prefix" "$@"; then
+        cat "$out" >&2 || true
+        fail "expected make install failure"
+    fi
+}
+
 sh -n "$installer"
 
 test_root=$(mktemp -d)
@@ -286,8 +367,13 @@ mkdir -p "$release_dir"
 cp "$installer" "$release_dir/install.sh"
 make_release "$release_dir"
 
+printf 'old-binary' >"$install_dir/lightcode"
+chmod 700 "$install_dir/lightcode"
 run_expect_success "$test_root/success.out" env LIGHTCODE_TEST_LDD_MODE=ok
 [ -x "$install_dir/lightcode" ] || fail "installed lightcode is missing or not executable"
+cmp "$install_dir/lightcode" "$release_dir/pkg/lightcode" >/dev/null || fail "installed binary does not match the release binary"
+assert_mode "$install_dir/lightcode" 755
+assert_no_staging_residue "$install_dir"
 assert_file_contains "$test_root/success.out" "Installed Lightcode"
 [ ! -e "$home_dir/.lightcode/config.json" ] || fail "installer wrote config.json"
 [ ! -e "$home_dir/.lightcode/.env" ] || fail "installer wrote .env"
@@ -301,6 +387,22 @@ run_expect_failure "$test_root/privileged-copy-fail.out" env LIGHTCODE_TEST_LDD_
 chmod 755 "$privileged_dir"
 assert_equal_file "$privileged_dir/lightcode" "old-binary"
 install_dir=$test_root/bin
+
+printf 'old-binary' >"$install_dir/lightcode"
+chmod 700 "$install_dir/lightcode"
+run_expect_failure "$test_root/writable-copy-fail.out" env LIGHTCODE_TEST_LDD_MODE=ok LIGHTCODE_TEST_CP_FAIL=1
+assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_mode "$install_dir/lightcode" 700
+assert_file_contains "$test_root/writable-copy-fail.out" "could not copy binary into"
+assert_no_staging_residue "$install_dir"
+
+printf 'old-binary' >"$install_dir/lightcode"
+chmod 700 "$install_dir/lightcode"
+run_expect_failure "$test_root/writable-move-fail.out" env LIGHTCODE_TEST_LDD_MODE=ok LIGHTCODE_TEST_MV_FAIL=1
+assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_mode "$install_dir/lightcode" 700
+assert_file_contains "$test_root/writable-move-fail.out" "could not move binary into place"
+assert_no_staging_residue "$install_dir"
 
 printf 'old-binary' >"$install_dir/lightcode"
 echo "bad checksum lightcode-linux-amd64.tar.gz" >"$release_dir/SHA256SUMS"
@@ -392,5 +494,45 @@ assert_file_contains "$test_root/arch.out" "unsupported architecture"
 log_file=$test_root/help.out
 sh "$installer" --help >"$log_file"
 assert_file_contains "$log_file" "LIGHTCODE_INSTALL_DIR"
+
+make_source_tree=$test_root/make-src
+make_companion=$test_root/make-companion.mk
+make_home=$test_root/make-home
+mkdir -p "$make_source_tree/build/bin" "$make_home"
+printf '%s' 'make-fixture-binary' >"$make_source_tree/build/bin/lightcode"
+chmod 644 "$make_source_tree/build/bin/lightcode"
+printf 'build:\n\t@:\n' >"$make_companion"
+
+make_copy_fail_prefix=$test_root/make-copy-fail
+mkdir -p "$make_copy_fail_prefix/bin"
+printf 'old-binary' >"$make_copy_fail_prefix/bin/lightcode"
+chmod 700 "$make_copy_fail_prefix/bin/lightcode"
+run_make_expect_failure "$test_root/make-copy-fail.out" "$make_copy_fail_prefix" env LIGHTCODE_TEST_CP_FAIL=1
+assert_equal_file "$make_copy_fail_prefix/bin/lightcode" "old-binary"
+assert_mode "$make_copy_fail_prefix/bin/lightcode" 700
+assert_no_staging_residue "$make_copy_fail_prefix/bin"
+
+make_move_fail_prefix=$test_root/make-move-fail
+mkdir -p "$make_move_fail_prefix/bin"
+printf 'old-binary' >"$make_move_fail_prefix/bin/lightcode"
+chmod 700 "$make_move_fail_prefix/bin/lightcode"
+run_make_expect_failure "$test_root/make-move-fail.out" "$make_move_fail_prefix" env LIGHTCODE_TEST_MV_FAIL=1
+assert_equal_file "$make_move_fail_prefix/bin/lightcode" "old-binary"
+assert_mode "$make_move_fail_prefix/bin/lightcode" 700
+assert_no_staging_residue "$make_move_fail_prefix/bin"
+
+mkdir -p "$make_home/.local/bin"
+printf 'old-binary' >"$make_home/.local/bin/lightcode"
+chmod 700 "$make_home/.local/bin/lightcode"
+run_make_expect_success "$test_root/make-default.out" ""
+assert_equal_file "$make_home/.local/bin/lightcode" "make-fixture-binary"
+assert_mode "$make_home/.local/bin/lightcode" 755
+assert_no_staging_residue "$make_home/.local/bin"
+
+spaced_prefix="$test_root/prefix with space"
+run_make_expect_success "$test_root/make-spaced.out" "$spaced_prefix"
+assert_equal_file "$spaced_prefix/bin/lightcode" "make-fixture-binary"
+assert_mode "$spaced_prefix/bin/lightcode" 755
+assert_no_staging_residue "$spaced_prefix/bin"
 
 printf 'installer tests passed\n'
