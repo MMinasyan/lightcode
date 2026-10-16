@@ -104,6 +104,14 @@ func (inst *instance) start(ctx context.Context) (chan struct{}, error) {
 	readyCh := inst.readyCh
 	inst.mu.Unlock()
 
+	// The supplied start context is already done: refuse the attempt before
+	// binary resolution, pipes or spawn, so no process is created for a launch
+	// that cannot complete. endAttempt leaves the instance claimable.
+	if err := ctx.Err(); err != nil {
+		inst.endAttempt(readyCh)
+		return nil, err
+	}
+
 	binary := server.ResolveBinary(inst.home, inst.def)
 	if binary == "" {
 		inst.endAttempt(readyCh)

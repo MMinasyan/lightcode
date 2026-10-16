@@ -54,9 +54,10 @@ func TestManagerInstallThreadsContext(t *testing.T) {
 
 // TestRestartDerivesFromInstanceLifetime pins the restart lifetime rule for
 // the idle/shutdown restart: a retired instance whose lifetime was canceled
-// fails its restart instead of resurrecting the server from Background. The
-// doomed restart's process dies before the server script can log a launch,
-// so the launch log stays at the initial launch.
+// cannot be resurrected from Background, because its launch context derives
+// from the lifetime and is already done. start() refuses it at the pre-spawn
+// check before any process is created, so the launch log stays at the initial
+// launch.
 func TestRestartDerivesFromInstanceLifetime(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	lifetime, cancel := context.WithCancel(context.Background())

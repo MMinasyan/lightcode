@@ -737,3 +737,41 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 		t.Fatal("shutdown replaced the newer attempt's procDone")
 	}
 }
+
+// TestStartWithCancelledContextLaunchesNothing proves the pre-spawn guard: a
+// start whose supplied context is already cancelled refuses the attempt
+// before binary resolution, pipes or spawn, ends it so the instance stays
+// claimable, and returns the context error. The startProbe seam counts
+// successful cmd.Start invocations, so the count does not depend on whether
+// the child writes its launch log before it is killed.
+func TestStartWithCancelledContextLaunchesNothing(t *testing.T) {
+	var starts atomic.Int64
+	oldProbe := startProbe
+	startProbe = func() { starts.Add(1) }
+	t.Cleanup(func() { startProbe = oldProbe })
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := inst.start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start with a cancelled context: error = %v, want context.Canceled", err)
+	}
+	if n := starts.Load(); n != 0 {
+		t.Fatalf("successful cmd.Start invocations = %d, want 0", n)
+	}
+	if n := countLaunches(log); n != 0 {
+		t.Fatalf("server processes launched = %d, want 0", n)
+	}
+
+	// The refused attempt ended the launch it claimed, so the instance is
+	// claimable again: a live start still works.
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady after the refused attempt: %v", err)
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched = %d, want 1 after the live start", n)
+	}
+}
