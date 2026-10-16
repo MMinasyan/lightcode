@@ -450,6 +450,19 @@ func TestDispatchUpgradeCheck(t *testing.T) {
 		}
 	})
 
+	t.Run("ordering beyond machine integers still decides", func(t *testing.T) {
+		setVersion(t, "v1.0.0", "")
+		setLatestEndpoint(t, "v18446744073709551615.0.0")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		want := "current: v1.0.0, latest: v18446744073709551615.0.0 (update available; run: lightcode upgrade)\n"
+		if stdout != want {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	})
+
 	t.Run("json golden", func(t *testing.T) {
 		setVersion(t, "v0.0.3", "abc1234")
 		setLatestEndpoint(t, "v0.0.4")

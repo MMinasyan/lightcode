@@ -339,6 +339,9 @@ func TestCheckStatusPrecedence(t *testing.T) {
 		{"dev build", "dev", "v0.0.4", StatusDevBuild, false, true},
 		{"below floor beats comparison", "v0.0.3", "v0.0.2", StatusBelowFloor, false, false},
 		{"below floor beats dev", "dev", "v0.0.2", StatusBelowFloor, false, false},
+		// Ordering past the machine integer range decides the upgrade status.
+		{"update available beyond machine integers", "v1.0.0", "v18446744073709551615.0.0", StatusUpdateAvailable, true, true},
+		{"current beyond machine integers newer than latest", "v18446744073709551615.0.0", "v1.0.0", StatusUpToDate, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
