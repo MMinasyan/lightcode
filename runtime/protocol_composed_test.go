@@ -1257,3 +1257,441 @@ func composedGenerationAfter(t *testing.T, got, before string) bool {
 	}
 	return g > b
 }
+
+// The held-operation command environment boundary: the same real production
+// composition and mounted generated client, focused on one admitted command
+// whose environment is constructed only after a gated model request lets the
+// configuration change land. The preparation-time external binding, the
+// renamed current binding, and a separately connected managed key must all
+// stay out of the shipped foreground and background children while an
+// unrelated external sibling stays in, the admitted capture and request
+// selection stay frozen, and the reloaded command denial governs only later
+// admissions.
+
+const (
+	heldOldKeyEnv    = "COMPOSED_HELD_OLD"
+	heldNewKeyEnv    = "COMPOSED_HELD_NEW"
+	heldManagedKey   = "COMPOSED_HELD_MANAGED"
+	heldSiblingEnv   = "COMPOSED_HELD_SIB"
+	heldOldKeyValue  = "sk-held-old-1"
+	heldNewKeyValue  = "sk-held-new-1"
+	heldManagedValue = "sk-held-managed-1"
+	heldSiblingValue = "held-sibling-value"
+	// heldInputText is the fixture's unique held input: it names the turn,
+	// and a request belongs to that turn exactly when the conversation's
+	// last user input is this text.
+	heldInputText = "hold the command"
+	// heldEnvWant is the child's synthetic presence flags: only presence
+	// flags may reach any assertion body, never a credential value.
+	heldEnvWant = "old= new= managed= sib=1"
+)
+
+// heldConfigDocument is the held rows' provider set: the model provider's
+// binding names apiKeyEnv, the connectable provider names the separately
+// managed key, and denyCommands adds the reloaded command denial.
+func heldConfigDocument(modelEndpoint, apiKeyEnv string, denyCommands bool) string {
+	permissions := ""
+	if denyCommands {
+		permissions = `,
+  "permissions": {"rules": [{"permission": "command.run", "target": "*", "access": "deny"}]}`
+	}
+	return `{
+  "providers": {
+    "prov": {"transport": {"base_url": "` + modelEndpoint + `", "api_key_env": "` + apiKeyEnv + `"}, "discovery": false, "models": {"m": {"name": "M", "context_window": 262144}, "m2": {"name": "M2", "context_window": 262144}}},
+    "connprov": {"transport": {"base_url": "https://held-conn.test/v1", "api_key_env": "` + heldManagedKey + `"}, "discovery": false, "models": {"cm": {"name": "CM", "context_window": 8192}}}
+  }` + permissions + `
+}`
+}
+
+// The agent roster before and after the held Operation's preparation: the
+// later publication selects the other usable model.
+const (
+	heldAgentsMain       = `{"main": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"]}}`
+	heldAgentsRetargeted = `{"main": {"model": "prov/m2", "system_prompt": "simple", "tools": ["run_command"]}}`
+)
+
+// heldRequestSelection is one model request's recorded ownership and
+// selection comparisons: booleans only, never a model credential. heldInput
+// reports that the request's conversation last user input is the fixture's
+// unique held input — the sole ownership tag, never the selection values.
+type heldRequestSelection struct {
+	heldInput bool
+	oldModel  bool
+	oldAuth   bool
+}
+
+// heldModelServer is the held rows' scripted model endpoint: its first
+// request parks at an arrival/release gate so the configuration changes land
+// after admission and opener capture but before the command environment is
+// ever constructed, and every request records only boolean comparisons of its
+// model and authorization selection against the preparation-time values.
+type heldModelServer struct {
+	*httptest.Server
+	arrived        chan struct{}
+	release        func()
+	background     bool
+	releaseChannel chan struct{}
+
+	mu       sync.Mutex
+	records  []heldRequestSelection
+	canceled bool
+}
+
+func newHeldModelServer(t *testing.T, background bool) *heldModelServer {
+	t.Helper()
+	s := &heldModelServer{
+		arrived:        make(chan struct{}),
+		releaseChannel: make(chan struct{}),
+		background:     background,
+	}
+	s.release = sync.OnceFunc(func() { close(s.releaseChannel) })
+	t.Cleanup(s.release)
+	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func (s *heldModelServer) serve(w http.ResponseWriter, r *http.Request) {
+	raw, _ := io.ReadAll(r.Body)
+	body := string(raw)
+	var request struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(raw, &request)
+	s.mu.Lock()
+	// The wire model is the transport's own model name; the later
+	// publication selects "m2", so "m" is the preparation-time selection.
+	// Ownership is the conversation's last user input: the held input's
+	// requests — one or two, depending on how the Job completion steers the
+	// conversation boundary — are tagged here, before any selection is read.
+	s.records = append(s.records, heldRequestSelection{
+		heldInput: composedWireUserText(body) == heldInputText,
+		oldModel:  request.Model == "m",
+		oldAuth:   r.Header.Get("Authorization") == "Bearer "+heldOldKeyValue,
+	})
+	gate := len(s.records) == 1
+	s.mu.Unlock()
+	if gate {
+		close(s.arrived)
+		select {
+		case <-s.releaseChannel:
+		case <-r.Context().Done():
+			s.mu.Lock()
+			s.canceled = true
+			s.mu.Unlock()
+			return
+		}
+	}
+	if composedWireRole(body) == "tool" {
+		composedWireTextTurn(w, "done")
+		return
+	}
+	switch composedWireUserText(body) {
+	case heldInputText:
+		composedWireToolCallTurn(w, "call-held", "run_command", s.heldCommandArgs())
+	case "probe the denial":
+		composedWireToolCallTurn(w, "call-deny", "run_command", `{"command":"touch held-deny-marker"}`)
+	default:
+		composedWireTextTurn(w, "done")
+	}
+}
+
+// heldCommandArgs is the one command every held child runs: it prints
+// synthetic presence flags for the four environment identities and no value.
+func (s *heldModelServer) heldCommandArgs() string {
+	command := `printf 'old=%s new=%s managed=%s sib=%s' "${` + heldOldKeyEnv + `:+1}" "${` + heldNewKeyEnv + `:+1}" "${` + heldManagedKey + `:+1}" "${` + heldSiblingEnv + `:+1}"`
+	if s.background {
+		return fmt.Sprintf(`{"command":%s,"background":true}`, strconv.Quote(command))
+	}
+	return fmt.Sprintf(`{"command":%s}`, strconv.Quote(command))
+}
+
+func (s *heldModelServer) selections() []heldRequestSelection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]heldRequestSelection(nil), s.records...)
+}
+
+func (s *heldModelServer) wasCanceled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canceled
+}
+
+// heldOperationExecution reads one admitted Operation's captured execution
+// section from the retained store's register — the same durable record every
+// reader sees, with no test-only access.
+func heldOperationExecution(t *testing.T, store harness.Storage, sessionID, operationID string) json.RawMessage {
+	t.Helper()
+	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{
+		SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID,
+	})
+	if err != nil {
+		t.Fatalf("ReadRegister(%s, %s): %v", sessionID, operationID, err)
+	}
+	var payload struct {
+		Admission struct {
+			Execution json.RawMessage `json:"execution"`
+		} `json:"admission"`
+	}
+	if err := json.Unmarshal(reg.Payload, &payload); err != nil {
+		t.Fatalf("decode operation register: %v", err)
+	}
+	if len(payload.Admission.Execution) == 0 {
+		t.Fatalf("operation register %s/%s carries no captured execution", sessionID, operationID)
+	}
+	return payload.Admission.Execution
+}
+
+// TestProtocolComposedHeldCommandEnvironment proves the child environment
+// boundary on the shipped foreground and background command children: while
+// one admitted Operation is held before its command environment exists, its
+// provider binding is renamed to another external key, a separate managed
+// key is connected, and the changed configuration is published with a command
+// denial. The held child sees none of the three credential names and still
+// sees the unrelated external sibling; the admitted capture and request
+// selection stay the preparation-time ones; the denial stops only the later
+// probe; and the parent values and external-key write rules stay intact.
+func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
+	run := func(t *testing.T, background bool) {
+		ctx := context.Background()
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		isolateBundledCredentials(t)
+		t.Setenv(heldOldKeyEnv, heldOldKeyValue)
+		t.Setenv(heldNewKeyEnv, heldNewKeyValue)
+		t.Setenv(heldSiblingEnv, heldSiblingValue)
+		composedReserveEnv(t, heldManagedKey)
+
+		model := newHeldModelServer(t, background)
+		dataDir := t.TempDir()
+		configPath := filepath.Join(dataDir, "config.json")
+		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
+		agentsPath := agents.PathForConfig(configPath)
+		composedWriteFile(t, agentsPath, heldAgentsMain)
+
+		store := storage.NewMemory()
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []runtime.Plugin{
+			composedMemoryStorage(store), tools.Plugin(), jobs.Plugin(),
+		}})
+		if err != nil {
+			t.Fatalf("runtime.Open: %v", err)
+		}
+		defer func() { _ = r.Close(ctx) }()
+		ps, err := r.OpenProtocol(ctx)
+		if err != nil {
+			t.Fatalf("OpenProtocol: %v", err)
+		}
+		record := filepath.Join(t.TempDir(), "discovery.json")
+		if err := ps.PublishDiscovery(record); err != nil {
+			t.Fatalf("PublishDiscovery: %v", err)
+		}
+		c, err := client.Connect(ctx, record)
+		if err != nil {
+			t.Fatalf("client.Connect: %v", err)
+		}
+
+		ws := filepath.Join(home, "held-ws")
+		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentType: "main"})
+		if err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if created.JSON201 == nil {
+			t.Fatalf("CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
+		}
+		sessionID := created.JSON201.SessionId
+		if err := os.MkdirAll(ws, 0o700); err != nil {
+			t.Fatalf("mkdir workspace: %v", err)
+		}
+
+		// The held turn admits, its opener captures, and only then does the
+		// model request park at the gate — before any command environment.
+		composedSubmit(t, c, sessionID, "op-held", heldInputText)
+		select {
+		case <-model.arrived:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the held turn's model request never arrived")
+		}
+		preReload, err := c.GetConfigurationWithResponse(ctx)
+		if err != nil || preReload.JSON200 == nil {
+			t.Fatalf("GetConfiguration before the hold = (%v, status %d)", err, preReload.HTTPResponse.StatusCode)
+		}
+		heldBefore := heldOperationExecution(t, store, sessionID, "op-held")
+
+		// While the request is parked: rename the provider binding from the
+		// external OLD key to the external NEW one, retarget the agent model,
+		// connect the separate managed key through the generated operation,
+		// and publish the changed configuration — whose command policy denies
+		// every later command.
+		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldNewKeyEnv, true))
+		composedWriteFile(t, agentsPath, heldAgentsRetargeted)
+		connectKey := heldManagedValue
+		connected, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "connprov"}, protocol.ConnectRequest{ApiKey: &connectKey})
+		if err != nil {
+			t.Fatalf("ConnectProvider: %v", err)
+		}
+		if connected.JSON200 == nil || connected.JSON200.Result == nil || connected.JSON200.Result.KeySource != protocol.Managed {
+			t.Fatalf("connect response = %+v, want the separately managed key", connected.JSON200)
+		}
+		reloaded, err := c.ReloadConfigurationWithResponse(ctx)
+		if err != nil {
+			t.Fatalf("ReloadConfiguration: %v", err)
+		}
+		if reloaded.JSON200 == nil {
+			t.Fatalf("ReloadConfiguration = status %d: %s", reloaded.HTTPResponse.StatusCode, reloaded.Body)
+		}
+
+		// The admitted capture is still the original one: nothing
+		// recaptured the running Operation from the new configuration, and
+		// its revision stays the pre-reload generation.
+		heldAfter := heldOperationExecution(t, store, sessionID, "op-held")
+		if string(heldAfter) != string(heldBefore) {
+			t.Fatal("the captured execution changed across the configuration reload")
+		}
+		var capture struct {
+			ConfigurationRevision string `json:"configuration_revision"`
+			Model                 struct {
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+			} `json:"model"`
+		}
+		if err := json.Unmarshal(heldBefore, &capture); err != nil {
+			t.Fatalf("decode captured execution: %v", err)
+		}
+		if capture.Model.Provider != "prov" || capture.Model.Model != "m" {
+			t.Fatalf("captured model = %q/%q, want the preparation-time selection", capture.Model.Provider, capture.Model.Model)
+		}
+		if capture.ConfigurationRevision != preReload.JSON200.ConfigurationRevision.Generation {
+			t.Fatalf("captured revision = %q, want the pre-reload generation %q", capture.ConfigurationRevision, preReload.JSON200.ConfigurationRevision.Generation)
+		}
+
+		// Release the parked request: the admitted command runs and builds
+		// its child environment from the live exclusion service.
+		model.release()
+		h := composedAwaitOp(t, c, sessionID, "op-held", protocol.OperationStatusSuccess)
+		if string(heldOperationExecution(t, store, sessionID, "op-held")) != string(heldBefore) {
+			t.Fatal("the captured execution changed across the held Operation's run")
+		}
+
+		// Every request the held input issued followed the preparation-time
+		// model and credential: boolean comparisons only, never a credential
+		// value. Ownership is the recorded held-input tag alone — never the
+		// selection values, which would hide a wrongly selected request —
+		// and the held input legitimately owns one request or two: a quickly
+		// finished Job can steer the conversation boundary so the successor
+		// admission issues the follow-up under the new capture. At least one
+		// held-input request must exist, and every one of them is checked.
+		heldRequests := 0
+		for i, rec := range model.selections() {
+			if !rec.heldInput {
+				continue
+			}
+			heldRequests++
+			if !rec.oldModel || !rec.oldAuth {
+				t.Fatalf("held-input request %d selection = (model %t, auth %t), want the captured model and the preparation-time credential", i, rec.oldModel, rec.oldAuth)
+			}
+		}
+		if heldRequests == 0 {
+			t.Fatal("no recorded model request carried the held input")
+		}
+		if model.wasCanceled() {
+			t.Fatal("the parked model request was canceled during the hold")
+		}
+
+		// The child saw neither the preparation-time external binding, nor
+		// the renamed current one, nor the separately managed key, and still
+		// saw the unrelated external sibling.
+		if background {
+			h = composedAwaitQuiet(t, c, sessionID, 0)
+			flags := ""
+			for _, item := range h.Conversation.Items {
+				if composedItemKind(t, item) != "input" {
+					continue
+				}
+				input, err := item.AsInputItem()
+				if err != nil {
+					t.Fatalf("input item: %v", err)
+				}
+				text := composedItemText(t, input)
+				if input.Origin == protocol.InputOriginRuntime && strings.Contains(text, "old=") {
+					flags = text
+				}
+			}
+			if flags == "" {
+				t.Fatal("no background completion carried the child's presence flags")
+			}
+			if !strings.Contains(flags, heldEnvWant) {
+				t.Fatalf("background child presence flags = %q, want %q", flags, heldEnvWant)
+			}
+		} else {
+			assistant := composedAssistantOf(t, h.Conversation.Items, "op-held")
+			if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Content == nil {
+				t.Fatalf("held command tool calls = %+v, want one result", assistant.ToolCalls)
+			}
+			if *assistant.ToolCalls[0].Content != heldEnvWant {
+				t.Fatalf("foreground child presence flags = %q, want %q", *assistant.ToolCalls[0].Content, heldEnvWant)
+			}
+		}
+
+		// The reloaded policy denies later commands; the already-admitted
+		// command above ran under its original allow policy.
+		composedSubmit(t, c, sessionID, "op-deny", "probe the denial")
+		h = composedAwaitOp(t, c, sessionID, "op-deny", protocol.OperationStatusSuccess)
+		probe := composedAssistantOf(t, h.Conversation.Items, "op-deny")
+		if len(probe.ToolCalls) != 1 || probe.ToolCalls[0].Status == nil || *probe.ToolCalls[0].Status != protocol.ToolCallStatusDenied {
+			t.Fatalf("probe tool calls = %+v, want the denied command under the new permissions", probe.ToolCalls)
+		}
+		if _, err := os.Stat(filepath.Join(ws, "held-deny-marker")); !os.IsNotExist(err) {
+			t.Fatalf("the denied probe started its command (%v)", err)
+		}
+
+		// The parent shell keeps every external value untouched and
+		// unmanaged: a supplied-key write to the renamed binding still
+		// refuses and leaves the external classification standing.
+		for _, row := range []struct{ name, want string }{
+			{heldOldKeyEnv, heldOldKeyValue},
+			{heldNewKeyEnv, heldNewKeyValue},
+			{heldSiblingEnv, heldSiblingValue},
+		} {
+			if got := os.Getenv(row.name); got != row.want {
+				t.Fatalf("parent %s preserved = %t, want the external value untouched", row.name, got == row.want)
+			}
+		}
+		supplied := "sk-held-supplied-1"
+		refused, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "prov"}, protocol.ConnectRequest{ApiKey: &supplied})
+		if err != nil {
+			t.Fatalf("ConnectProvider(prov): %v", err)
+		}
+		if refused.JSONDefault == nil {
+			t.Fatalf("supplied-key connect on the external binding = status %d, want the typed refusal", refused.HTTPResponse.StatusCode)
+		}
+		if os.Getenv(heldNewKeyEnv) != heldNewKeyValue {
+			t.Fatal("the refused supplied-key write changed the parent external value")
+		}
+		providers, err := c.ListProvidersWithResponse(ctx)
+		if err != nil {
+			t.Fatalf("ListProviders: %v", err)
+		}
+		if providers.JSON200 == nil {
+			t.Fatalf("ListProviders = status %d: %s", providers.HTTPResponse.StatusCode, providers.Body)
+		}
+		unmanaged := false
+		for _, provider := range providers.JSON200.Providers {
+			if provider.Id == "prov" && provider.KeySource == protocol.External {
+				unmanaged = true
+			}
+		}
+		if !unmanaged {
+			t.Fatal("the renamed binding left the external classification after the refused write")
+		}
+
+		// Every background member already settled above; the managed
+		// shutdown joins the rest through the existing cleanup path.
+		if err := r.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+
+	t.Run("foreground", func(t *testing.T) { run(t, false) })
+	t.Run("background", func(t *testing.T) { run(t, true) })
+}

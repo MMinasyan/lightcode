@@ -221,10 +221,23 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	artifacts := newArtifactIntervals()
 	// The call-time subprocess environment producer exists only when the
 	// retained manager exists; without it no manager is constructed on
-	// demand and every cooperative command fails.
+	// demand and every cooperative command fails. Each request takes one
+	// current configuration pointer solely to obtain the Runtime's provider
+	// credential names and excludes them from the managed-filtered
+	// environment: a live credential exclusion service, ready because the
+	// initial publication above always precedes any prepared command.
 	var subprocessEnv func() []string
 	if managedEnv != nil {
-		subprocessEnv = managedEnv.SubprocessEnv
+		subprocessEnv = func() []string {
+			env := managedEnv.SubprocessEnv()
+			var names []string
+			for _, prov := range configService.current().catalog.Providers {
+				if prov != nil && prov.Transport.APIKeyEnv != "" {
+					names = append(names, prov.Transport.APIKeyEnv)
+				}
+			}
+			return config.EnvWithoutKeys(env, names)
+		}
 	}
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: storage,
