@@ -18,7 +18,6 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/pkoukk/tiktoken-go"
 )
 
 // Native compaction rows over the real preparation: the compaction observer
@@ -44,12 +43,12 @@ const compactObservationAgentsDocument = `{
 	"compact": {"model": "prov/k"}
 }`
 
-// compactNativeTokens counts one text's cl100k_base tokens: the sizing unit
-// of the test-local estimator rule.
-func compactNativeTokens(t *testing.T, enc *tiktoken.Tiktoken, text string) int {
-	t.Helper()
-	return len(enc.Encode(text, nil, nil))
-}
+// compactFillerRepeats sizes the overflow input. The repeated unit's pinned
+// cl100k_base cost over the bundled data is 8194 tokens for these repetitions
+// — 4096 repetitions cost only 4098 — comfortably past the 4096-token trigger
+// threshold of the configured window (8192) minus reserve (4096). The
+// post-compaction projection stays far below it.
+const compactFillerRepeats = 8192
 
 // TestCompactLifecycleNativeCompactionObservation keeps the Runtime observer
 // oracle through the native pipeline: a sized overflowing admission triggers
@@ -69,18 +68,10 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		ctx := context.Background()
-		enc, err := tiktoken.GetEncoding("cl100k_base")
-		if err != nil {
-			t.Fatalf("cl100k_base: %v", err)
-		}
 		// The overflow input exceeds the window minus the reserve, while the
 		// post-compaction projection — the composed prompt plus the summary —
 		// fits.
-		repeats := 1
-		for compactNativeTokens(t, enc, strings.Repeat("filler ", repeats)) < 4500 {
-			repeats *= 2
-		}
-		overflowInput := strings.Repeat("filler ", repeats)
+		overflowInput := strings.Repeat("filler ", compactFillerRepeats)
 
 		e.server.setScript(func(_ context.Context, body string) []string {
 			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
