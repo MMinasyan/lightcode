@@ -247,10 +247,6 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && imp != wailsLinuxPkg && !std[imp] {
 				problems = append(problems, rel+": internal/desktopclient imports "+imp+"; the desktop host may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", the Wails framework, and the native version helper")
 			}
-		case "cmd/desktopclient":
-			if imp != desktopPkg && imp != clienthostPkg && imp != wailsPkg && !std[imp] {
-				problems = append(problems, rel+": cmd/desktopclient imports "+imp+"; the preview entry may import only the standard library, the desktop host it runs, the shared startup helper its constructor inputs come from, and the Wails root package")
-			}
 		default:
 			if imp == clienthostPkg || imp == clientviewPkg || imp == clientopsPkg || imp == acpclientPkg || imp == desktopPkg || imp == cliclientPkg {
 				problems = append(problems, rel+": production file imports "+imp+"; the shared startup, scalar projection, and typed invocation helpers and the desktop host and ACP bridge are reserved for their exact target consumers, and no legacy, root, or adapter file may start a Runtime or adopt target view or invocation rules before the coordinated cutover")
@@ -268,7 +264,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 // TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go", "cmd/desktopclient/x.go"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
@@ -731,8 +727,9 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 }
 
 // TestDependencyRulesDesktopHostIsolation enforces the native desktop host's
-// exact allowlist. The reverse edge and the preview entry consumer are covered
-// by the directory matrix and the entry row.
+// exact allowlist. The reverse edge and the deleted preview entry's exact and
+// subdirectory paths are covered by the directory matrix and the generic
+// fallback rows.
 func TestDependencyRulesDesktopHostIsolation(t *testing.T) {
 	std := standardLibraryImports(t)
 	if problems := checkTrackedGoFile("internal/desktopclient/x.go", []string{
@@ -773,35 +770,6 @@ func TestDependencyRulesCliclientIsolation(t *testing.T) {
 	for _, rel := range []string{"rootmisc.go", "app.go", "commands.go", "internal/cli/x.go", "internal/acp/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/desktopclient/x.go", "internal/acpclient/x.go", "internal/cliclient/sub/x.go", "cmd/desktopclient/x.go"} {
 		if problems := checkTrackedGoFile(rel, []string{publicModule + "/internal/cliclient"}, std); len(problems) != 1 {
 			t.Errorf("reverse %s: %v", rel, problems)
-		}
-	}
-}
-
-// TestDependencyRulesDesktopClientEntryIsolation enforces the preview entry's
-// exact import surface.
-func TestDependencyRulesDesktopClientEntryIsolation(t *testing.T) {
-	std := standardLibraryImports(t)
-	if problems := checkTrackedGoFile("cmd/desktopclient/x.go", []string{
-		"fmt", "os", "path/filepath",
-		publicModule + "/internal/desktopclient", publicModule + "/internal/clienthost", wailsPkg,
-	}, std); len(problems) != 0 {
-		t.Errorf("allowed cmd/desktopclient imports flagged: %v", problems)
-	}
-	for _, imp := range []string{
-		publicModule + "/client", publicModule + "/internal/clientview", publicModule + "/internal/config",
-		publicModule + "/internal/terminal", publicModule + "/internal/version", publicModule + "/internal/hostprocess",
-		publicModule + "/internal/agent", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite",
-		tiktokenPkg, sqliteDriverPkg, wailsRuntimePkg,
-	} {
-		if problems := checkTrackedGoFile("cmd/desktopclient/x.go", []string{imp}, std); len(problems) != 1 {
-			t.Errorf("cmd/desktopclient importing %q: %d problems, want 1: %v", imp, len(problems), problems)
-		}
-	}
-	// The entry row covers the exact directory only: a subdirectory file is an
-	// ordinary production file and cannot import the target host or startup.
-	for _, imp := range []string{publicModule + "/internal/desktopclient", publicModule + "/internal/clienthost"} {
-		if problems := checkTrackedGoFile("cmd/desktopclient/sub/x.go", []string{imp}, std); len(problems) != 1 {
-			t.Errorf("cmd/desktopclient/sub importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
 }
@@ -895,7 +863,7 @@ func TestDependencyRulesRootEntryRoles(t *testing.T) {
 // TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor), root files, and arbitrary internal/ paths are ordinary production files whose imports of any foundation package or the SQLite driver are reported, and internal/storage subpackages are rejected like public-package ones.
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "rootmisc.go", "internal/anything/x.go", "cmd/desktopclient/sub/x.go"} {
+	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "rootmisc.go", "internal/anything/x.go", "cmd/desktopclient/x.go", "cmd/desktopclient/sub/x.go"} {
 		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", publicModule + "/internal/clientview", publicModule + "/internal/clientops", publicModule + "/internal/acpclient", publicModule + "/internal/cliclient", publicModule + "/internal/desktopclient", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
