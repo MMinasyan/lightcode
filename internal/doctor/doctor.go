@@ -121,22 +121,20 @@ func Run(p Params) (Report, bool) {
 	return summarize(checks), !anyConnected
 }
 
-// dataChecks runs the data-dir group and returns the parsed config (nil when
-// absent or unparseable) and the .env key names, each mapped to whether its
-// value is non-empty.
+// dataChecks runs the data-dir group and returns the parsed config and agent
+// definitions (nil when absent or unparseable) and the .env key names, each
+// mapped to whether its value is non-empty. The directory's own diagnostic
+// never gates the config/agents/.env checks: the resolved ConfigPath may
+// point outside the default data directory.
 func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, *agentcfg.Config, map[string]bool) {
 	dotenvKeys := map[string]bool{}
 
 	info, err := os.Lstat(dataDir)
-	if os.IsNotExist(err) {
-		add("data", "dir", StatusOK, "not created yet (created on first run)")
-		return nil, nil, dotenvKeys
-	}
-	if err != nil {
-		add("data", "dir", StatusFail, err.Error())
-		return nil, nil, dotenvKeys
-	}
 	switch {
+	case os.IsNotExist(err):
+		add("data", "dir", StatusOK, "not created yet (created on first run)")
+	case err != nil:
+		add("data", "dir", StatusFail, err.Error())
 	case info.Mode()&os.ModeSymlink != 0:
 		add("data", "dir", StatusWarn, dataDir+" is a symlink")
 	case !info.IsDir():
