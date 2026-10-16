@@ -116,14 +116,118 @@ func TestFreshHome(t *testing.T) {
 	if c.Status != StatusOK || c.Detail != "not created yet (created on first run)" {
 		t.Fatalf("data/dir = %+v", c)
 	}
-	for _, check := range report.Checks {
-		if check.Group == "data" && check.Name != "dir" {
-			t.Fatalf("data group not skipped on absent dir: %+v", check)
+	for name, want := range map[string]string{
+		"config": "config.json: not created yet (created on first run)",
+		"agents": "agents.json: not created yet (created on first run)",
+		"env":    ".env: not created yet (created on first run)",
+	} {
+		if got := find(t, report, "data", name); got.Status != StatusOK || got.Detail != want {
+			t.Fatalf("data/%s = %+v, want %q", name, got, want)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(home, ".lightcode")); !os.IsNotExist(err) {
 		t.Fatal("doctor created the data dir")
 	}
+}
+
+// TestExternalConfigDiagnosedWithoutDataDir pins that the addressed config
+// path, not the default data directory, governs the read-only diagnosis: an
+// external config.json (and its adjacent agents.json) drives the
+// config/agents/provider/model checks while HOME/.lightcode stays absent.
+func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
+	writeExternal := func(t *testing.T, dir, name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("existing config and agents", func(t *testing.T) {
+		home := t.TempDir()
+		external := t.TempDir()
+		configPath := writeExternal(t, external, "config.json", keyedProviderConfig)
+		agentsPath := writeExternal(t, external, "agents.json", `{"primary": {"model": "keyedtest/m1"}}`)
+		p := params(home)
+		p.ConfigPath = configPath
+		p.LookupEnv = func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
+		externalBefore := snapshotTree(t, external)
+		report, noProviders := run(t, p)
+		if !reflect.DeepEqual(externalBefore, snapshotTree(t, external)) {
+			t.Fatal("doctor wrote to the addressed external directory")
+		}
+		if c := find(t, report, "data", "dir"); c.Status != StatusOK || c.Detail != "not created yet (created on first run)" {
+			t.Fatalf("data/dir = %+v", c)
+		}
+		if c := find(t, report, "data", "config"); c.Status != StatusOK || c.Detail != configPath {
+			t.Fatalf("data/config = %+v, want the addressed external path", c)
+		}
+		if c := find(t, report, "data", "agents"); c.Status != StatusOK || c.Detail != agentsPath {
+			t.Fatalf("data/agents = %+v, want the addressed adjacent path", c)
+		}
+		if c := find(t, report, "providers", "keyedtest"); c.Status != StatusOK || c.Detail != "key external, connected, 1 usable models" {
+			t.Fatalf("providers/keyedtest = %+v, want the external config's provider diagnosed", c)
+		}
+		if c := find(t, report, "setup", "model"); c.Status != StatusOK || c.Detail != "keyedtest/m1" {
+			t.Fatalf("setup/model = %+v, want the external agents.json model diagnosed", c)
+		}
+		if noProviders {
+			t.Fatal("a connected external provider must clear the fresh-install hint")
+		}
+		if report.Failures != 0 {
+			t.Fatalf("external config has failures: %+v", report.Checks)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".lightcode")); !os.IsNotExist(err) {
+			t.Fatal("doctor created the data dir")
+		}
+	})
+
+	t.Run("invalid config fails", func(t *testing.T) {
+		p := params(t.TempDir())
+		p.ConfigPath = writeExternal(t, t.TempDir(), "config.json", `{not json`)
+		report, _ := run(t, p)
+		if c := find(t, report, "data", "config"); c.Status != StatusFail {
+			t.Fatalf("data/config = %+v, want the addressed external file's parse failure", c)
+		}
+		if report.Failures == 0 {
+			t.Fatal("an invalid external config must count as a failure")
+		}
+	})
+
+	t.Run("missing config and agents report not created", func(t *testing.T) {
+		p := params(t.TempDir())
+		p.ConfigPath = filepath.Join(t.TempDir(), "config.json")
+		report, _ := run(t, p)
+		if c := find(t, report, "data", "config"); c.Status != StatusOK || c.Detail != "config.json: not created yet (created on first run)" {
+			t.Fatalf("data/config = %+v", c)
+		}
+		if c := find(t, report, "data", "agents"); c.Status != StatusOK || c.Detail != "agents.json: not created yet (created on first run)" {
+			t.Fatalf("data/agents = %+v", c)
+		}
+		if report.Failures != 0 {
+			t.Fatalf("missing external files must not fail: %+v", report.Checks)
+		}
+	})
+
+	t.Run("directory error keeps its own diagnostic", func(t *testing.T) {
+		// HOME exists as a regular file, so Lstat(home/.lightcode) fails
+		// with ENOTDIR. The dir diagnostic must report that error and the
+		// addressed external config must still be diagnosed.
+		homeFile := filepath.Join(t.TempDir(), "home")
+		if err := os.WriteFile(homeFile, []byte("not a directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p := params(homeFile)
+		p.ConfigPath = writeExternal(t, t.TempDir(), "config.json", keyedProviderConfig)
+		report, _ := run(t, p)
+		if c := find(t, report, "data", "dir"); c.Status != StatusFail {
+			t.Fatalf("data/dir = %+v, want the Lstat error as FAIL", c)
+		}
+		if c := find(t, report, "data", "config"); c.Status != StatusOK || c.Detail != p.ConfigPath {
+			t.Fatalf("data/config = %+v, want the addressed config diagnosed despite the dir error", c)
+		}
+	})
 }
 
 func TestMissingConfigReportedNotCreated(t *testing.T) {

@@ -48,7 +48,7 @@ jobs:
         run: go test -race -tags webkit2_41 ./...
 
       - name: Fuzz seed corpus
-        run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
+        run: go test -tags webkit2_41 -run=Fuzz ./model/... ./internal/catalog/...
 
       - name: Install lint tools
         run: |
@@ -71,20 +71,14 @@ jobs:
 
   integration:
     runs-on: ubuntu-24.04
+    needs: test
+    if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.26'
-
-      - name: Install Wails native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
-
-      - name: Integration tests
-        # Integration-tagged tests are selected by name: every such test
-        # under ./internal/ must be named TestIntegration*, because
-        # -run TestIntegration is the only thing that picks them up.
-        run: go test -race -tags integration,webkit2_41 -run TestIntegration ./internal/...
+      - name: Require passing tests
+        # The gate reports the executed test job's result only: failure,
+        # cancellation or skipped tests cannot become green here.
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "test job result is '${{ needs.test.result }}', want success"
+            exit 1
+          fi

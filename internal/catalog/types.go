@@ -1,17 +1,17 @@
 // Package catalog builds and validates Lightcode's provider/model catalog.
 package catalog
 
-import "github.com/MMinasyan/lightcode/internal/engine/coremodel"
+import "github.com/MMinasyan/lightcode/model"
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
-var ErrInvalidModelRef = coremodel.ErrInvalidModelRef
+var ErrInvalidModelRef = model.ErrInvalidModelRef
 
 // ModelRef is the canonical internal identity of a model.
-type ModelRef = coremodel.ModelRef
+type ModelRef = model.ModelRef
 
 // ParseModelRef parses a provider-prefixed model reference.
 func ParseModelRef(s string) (ModelRef, error) {
-	return coremodel.Parse(s)
+	return model.Parse(s)
 }
 
 // SystemRole is the request role used for the system prompt.

@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -53,41 +52,6 @@ const ReadOnlyRunCommandDescription = `Executes a read-only shell command and re
 - Do not use this tool to read file contents — use read_file.`
 
 const ReadOnlyRunCommandRejected = "You are a read-only agent, so `run_command` only accepts a fixed allowlist of read-only commands, and this command is not allowed. Commands outside the list are rejected even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, and read-only git/rg/find."
-
-// ReadOnlyRunCommand wraps RunCommand and restricts commands to a
-// whitelist of non-destructive operations (ls, cat, grep, git log, etc.).
-type ReadOnlyRunCommand struct {
-	inner *RunCommand
-}
-
-// NewReadOnlyRunCommand creates a read-only command tool.
-func NewReadOnlyRunCommand(inner *RunCommand) *ReadOnlyRunCommand {
-	return &ReadOnlyRunCommand{inner: inner}
-}
-
-func (*ReadOnlyRunCommand) Name() string { return "run_command" }
-func (*ReadOnlyRunCommand) Description() string {
-	return ReadOnlyRunCommandDescription
-}
-func (r *ReadOnlyRunCommand) ParametersSchema() map[string]any {
-	return r.inner.ParametersSchema()
-}
-
-func (r *ReadOnlyRunCommand) Execute(ctx context.Context, params map[string]any) (string, error) {
-	command, _ := params["command"].(string)
-	safeCommand, err := ReadOnlyCommand(command)
-	if err != nil {
-		return "", fmt.Errorf("%s", ReadOnlyRunCommandRejected)
-	}
-	cleanParams := map[string]any{"command": safeCommand}
-	if background, _ := params["background"].(bool); background {
-		cleanParams["background"] = true
-		if timeout, ok := params["timeout"]; ok {
-			cleanParams["timeout"] = timeout
-		}
-	}
-	return r.inner.Execute(ctx, cleanParams)
-}
 
 func isReadOnlyCommand(command string) bool {
 	_, err := ReadOnlyCommand(command)

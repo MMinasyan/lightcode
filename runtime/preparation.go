@@ -151,11 +151,12 @@ type preparation struct {
 	// without artifact ownership.
 	artifacts *artifactIntervals
 
-	// subprocessEnv is the Runtime's live managed-environment producer,
-	// supplied only when the retained manager exists; nil leaves every
-	// prepared command without an environment producer and the cooperative
-	// command fails. It is invoked at each process start, never at
-	// preparation.
+	// subprocessEnv is the Runtime's live subprocess-environment producer —
+	// the managed-environment snapshot with the current provider credential
+	// names excluded — supplied only when the retained manager exists; nil
+	// leaves every prepared command without an environment producer and the
+	// cooperative command fails. It is invoked at each process start, never
+	// at preparation.
 	subprocessEnv func() []string
 }
 
@@ -500,7 +501,15 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	}
 	workspace := req.Session.Identity.Workspace
 	policy := snapshot.permissionPolicy(workspace)
-	return capture, p.concreteOpener(transport, compactTransport, policy, workspace, tools), nil
+	// The prepared opener carries only the preparation-time credential
+	// names, never their values: the ToolContext's fixed callback filters
+	// those names from the live producer's snapshot, so a binding renamed or
+	// removed after this preparation still cannot reach a command child.
+	credentialNames := make([]string, 0, len(sel.credentials))
+	for name := range sel.credentials {
+		credentialNames = append(credentialNames, name)
+	}
+	return capture, p.concreteOpener(transport, compactTransport, policy, workspace, tools, credentialNames), nil
 }
 
 // outputReserve applies the retained reserve rule: the catalog entry's
@@ -652,10 +661,14 @@ func wireDebugDir(home string) string {
 // exactly one physical attempt — Model over the conversation transport and
 // CompactModel over the effective compact transport, the same construction
 // over the one shared transport when the compact model is the conversation
-// model. The shared advertisement
+// model. The ToolContext's environment callback is the preparation's fixed
+// wrapper over the Runtime's live producer: it filters the captured
+// credential names from every snapshot it returns, never rereads the
+// selected execution policy, and keeps the nil producer and nil snapshot
+// fail-closed shapes unchanged. The shared advertisement
 // gate rejects unknown names before dispatch; retry classification, selected
 // argument hooks, and scope disposal belong to the shared machinery.
-func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, policy harness.PermissionPolicy, workspace string, advertised []model.ToolDefinition) openExecution {
+func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, policy harness.PermissionPolicy, workspace string, advertised []model.ToolDefinition, credentialNames []string) openExecution {
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection) (harness.Execution, error) {
 		table := make(map[string]Tool, len(advertised))
 		for _, definition := range advertised {
@@ -665,13 +678,24 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			}
 			table[definition.Name] = tool
 		}
+		subprocessEnv := p.subprocessEnv
+		if subprocessEnv != nil {
+			base := subprocessEnv
+			subprocessEnv = func() []string {
+				env := base()
+				if env == nil {
+					return nil
+				}
+				return config.EnvWithoutKeys(env, credentialNames)
+			}
+		}
 		tc := ToolContext{
 			Workspace:     workspace,
 			AdmittedEntry: admission.AdmittedEntry,
 			Invocation:    sel.invocation,
 			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 			Background:    p.background,
-			SubprocessEnv: p.subprocessEnv,
+			SubprocessEnv: subprocessEnv,
 		}
 		return harness.Execution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {

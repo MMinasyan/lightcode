@@ -1,4 +1,4 @@
-PREFIX ?= ~/.local
+PREFIX ?= $(HOME)/.local
 
 # VERSION stays "dev" for source builds (an exact vX.Y.Z stamps a release
 # build; used when testing upgrade flows). COMMIT is best-effort.
@@ -17,12 +17,12 @@ test-race:
 	go test -race ./...
 
 test-integration:
-	go test -tags=integration -race ./...
+	go test -race -tags webkit2_41 ./runtime ./internal/desktopclient
 
 bench:
 	go test -bench=. -benchmem ./...
 
-PKG ?= ./internal/provider
+PKG ?= ./model
 
 fuzz-short:
 	go test $(PKG) -fuzz=. -fuzztime=30s
@@ -45,9 +45,13 @@ lint: install-lint-tools
 	$(GOBIN)/ineffassign ./...
 
 install: build
-	mkdir -p $(PREFIX)/bin
-	rm -f $(PREFIX)/bin/lightcode
-	cp build/bin/lightcode $(PREFIX)/bin/lightcode
+	dest="$(PREFIX)/bin"; \
+	mkdir -p "$$dest" || exit 1; \
+	tmp=$$(mktemp "$$dest/.lightcode.tmp.XXXXXX") || exit 1; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	cp build/bin/lightcode "$$tmp" || exit 1; \
+	chmod 755 "$$tmp" || exit 1; \
+	mv "$$tmp" "$$dest/lightcode" || exit 1
 
 uninstall:
 	rm -f $(PREFIX)/bin/lightcode

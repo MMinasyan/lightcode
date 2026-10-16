@@ -29,6 +29,40 @@ const tiktokenPkg = "github.com/pkoukk/tiktoken-go"
 // and client.
 const oapiRuntimePkg = "github.com/oapi-codegen/runtime"
 
+// retiredPackageRoots is the one uniform rejection rule for the retired legacy
+// package roots selected by this modernization: no tracked production file may
+// live under one of these internal package trees or import one. The list is not
+// a census of every historical directory name; the generic role rules still
+// reject arbitrary new packages that try to compose owner or client
+// authorities. Matching is on complete path segments, so the retained
+// internal/agents, internal/acpclient and internal/cliclient packages are never
+// confused with their retired neighbours, and the public model, agent and
+// client packages never match.
+var retiredPackageRoots = []string{
+	"internal/agent",
+	"internal/engine",
+	"internal/provider",
+	"internal/process",
+	"internal/compact",
+	"internal/cli",
+	"internal/acp",
+	"internal/project",
+	"internal/permission",
+	"internal/memory",
+}
+
+// retiredRoot reports the retired legacy package tree that one module-relative
+// directory path or module-relative import suffix lives under or names, or ""
+// when it names no retired tree.
+func retiredRoot(p string) string {
+	for _, root := range retiredPackageRoots {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return root
+		}
+	}
+	return ""
+}
+
 // The Wails framework packages the native desktop host is allowed to reach.
 const (
 	wailsPkg        = "github.com/wailsapp/wails/v2"
@@ -38,7 +72,15 @@ const (
 	wailsLinuxPkg   = "github.com/wailsapp/wails/v2/pkg/options/linux"
 )
 
-// TestPublicFoundationDependencyIsolation enforces the pre-cutover dependency baseline over the authoritative complete set of Git-tracked non-test Go files: the model package imports only the standard library; the agent package imports only the standard library and the public model package; the harness package is direct-test-only and imports only the standard library plus the public model and agent packages plus the tiktoken encoder of its conversation token estimator; internal/storage is direct-test-only, imports only the standard library plus the public harness contract plus the SQLite driver it implements the contract with, and stays one package without backend subpackages; the runtime package is direct-test-only and imports only the standard library plus the public model, harness, and protocol packages plus the retained internal config, agents, catalog, atomicfs, prompt, and adaptation helpers, never internal/agent, internal/storage, any concrete plugin under internal/plugins, or the SQLite driver; the internal/plugins/sqlite plugin imports only the standard library plus the public runtime and harness contracts and the internal/storage backend it declares; the internal/plugins/adaptation plugin imports only the standard library plus the public runtime and model contracts and the internal/adaptation binding table it resolves; the plugins/jobs package imports only the standard library plus the public runtime and harness contracts and the internal/cmdoutput capture helper it composes, and stays one package without subpackages; the internal/plugins/tasks plugin imports only the standard library plus the public model, harness, and runtime contracts and the internal/toolargs argument decoder; the internal/toolargs argument decoder imports only the standard library and is consumed only by the internal/plugins/tools, tasks, and lsp plugins; the internal/plugins/builtin package imports only the standard library plus the public runtime contract and the six sibling plugins it registers; the generated protocol package imports only the standard library plus the oapi-codegen runtime helper its generated parameter binding needs, and the runtime's protocol import is the one permitted consumption edge of the generated contracts; the client wrapper imports only the standard library plus those generated protocol contracts; the shared terminal presentation package imports only the standard library plus the retained edit-preview helper, and the host process helper imports only the standard library; every other tracked production file imports none of these packages, not the SQLite driver, not the target runtime or its concrete plugins — including the public plugins/ tree — and no root, legacy, or adapter file imports the protocol contracts before their owning step, whatever its directory name is. Test files are exempt in every directory — external-package test files are exactly where direct and composition tests of the new packages live — and untracked or ignored files never gate the guard. When a later phase adds a new target package that must consume model, agent, or harness, it extends the allowlist for its own package only; existing root and internal/ production packages stay forbidden until their owning cutover or deletion phase.
+// TestPublicFoundationDependencyIsolation applies the one dependency baseline
+// to the authoritative complete set of Git-tracked non-test Go files: every
+// removed legacy package tree is rejected uniformly (a file living under one or
+// importing one, before any role handling), and each retained package is pinned
+// to the imports its role allows — the public model/agent/harness foundation,
+// the runtime owner and its retained helpers, the shipped plugins, the client
+// hosts, the generated contracts, and the independent utilities. The tracked
+// set must hold both public packages, every problem is reported as its own
+// error, and no file-set shortcut may skip a tracked path.
 func TestPublicFoundationDependencyIsolation(t *testing.T) {
 	root := moduleRoot(t)
 	std := standardLibraryImports(t)
@@ -77,14 +119,12 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		snapshotPkg    = publicModule + "/internal/snapshot"
 		editprePkg     = publicModule + "/internal/editpreview"
 		pathutilPkg    = publicModule + "/internal/pathutil"
-		permissionPkg  = publicModule + "/internal/permission"
 		safefsPkg      = publicModule + "/internal/safefs"
 		agentsPkg      = publicModule + "/internal/agents"
 		catalogPkg     = publicModule + "/internal/catalog"
 		atomicfsPkg    = publicModule + "/internal/atomicfs"
 		promptPkg      = publicModule + "/internal/prompt"
 		adaptationPkg  = publicModule + "/internal/adaptation"
-		legacyAgent    = publicModule + "/internal/agent"
 		pluginsPkg     = publicModule + "/internal/plugins"
 		shellparsePkg  = publicModule + "/internal/shellparse"
 		lspPkg         = publicModule + "/internal/lsp"
@@ -108,6 +148,18 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	)
 	var problems []string
 	dir := path.Dir(rel)
+	// Two disjoint checks share the retired-tree rule. The source-path check
+	// runs before any role handling and rejects a tracked production file that
+	// lives under a retired package tree, exactly like the subpackage guards
+	// below: no file in a retired tree is ever classified. The import check
+	// lives in the per-import loop, so a retired import is reported once and
+	// independent violations of other imports still surface. Both trim or
+	// bound on the module path / segment boundaries, so the retained
+	// internal/agents, internal/acpclient and internal/cliclient packages stay
+	// unaffected.
+	if root := retiredRoot(dir); root != "" {
+		return []string{rel + ": the " + root + " package tree is retired; no tracked production file may live under it"}
+	}
 	if dir != "model" && dir != "agent" && dir != "harness" &&
 		(strings.HasPrefix(dir, "model/") || strings.HasPrefix(dir, "agent/") || strings.HasPrefix(dir, "harness/")) {
 		pkg := dir[:strings.IndexByte(dir, '/')]
@@ -120,6 +172,16 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		return []string{rel + ": plugins/jobs must remain one package without subpackages"}
 	}
 	for _, imp := range imports {
+		// The retired-tree import classification runs before exact roles: one
+		// problem per offending import, and that import never enters role
+		// handling, so independent violations of the file's other imports
+		// still surface.
+		if strings.HasPrefix(imp, publicModule+"/") {
+			if root := retiredRoot(strings.TrimPrefix(imp, publicModule+"/")); root != "" {
+				problems = append(problems, rel+": imports "+imp+"; the "+root+" package tree is retired and may not be imported by any production file")
+				continue
+			}
+		}
 		// Exact roles for the active root entry files: the root entry
 		// composes the shipped clients, the command dispatcher reaches the
 		// shared startup helper and its independent utilities, and the
@@ -156,8 +218,16 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", "+agentPkg+", and "+tiktokenPkg)
 			}
 		case "runtime":
-			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != permissionPkg && imp != safefsPkg && imp != pathutilPkg && !std[imp] {
-				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+permissionPkg+", "+safefsPkg+", and "+pathutilPkg+" helpers, never "+legacyAgent+", "+storagePkg+", any concrete plugin under "+pluginsPkg+", or the SQLite driver")
+			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && !std[imp] {
+				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+safefsPkg+", and "+pathutilPkg+" helpers, never "+storagePkg+", any concrete plugin under "+pluginsPkg+", or the SQLite driver")
+			}
+		case "internal/catalog":
+			if imp != modelPkg && imp != atomicfsPkg && !std[imp] {
+				problems = append(problems, rel+": internal/catalog imports "+imp+"; the catalog may import only the standard library, "+atomicfsPkg+", and the public "+modelPkg+" identity it forwards")
+			}
+		case "internal/agents":
+			if imp != modelPkg && !std[imp] {
+				problems = append(problems, rel+": internal/agents imports "+imp+"; the agents definitions may import only the standard library and the public "+modelPkg+" identity parsing")
 			}
 		case "internal/storage":
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {
@@ -239,10 +309,6 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				imp != wailsPkg && imp != wailsRuntimePkg && imp != wailsOptionsPkg && imp != wailsAssetPkg && imp != wailsLinuxPkg && !std[imp] {
 				problems = append(problems, rel+": internal/desktopclient imports "+imp+"; the desktop host may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", the Wails framework, and the native version helper")
 			}
-		case "cmd/desktopclient":
-			if imp != desktopPkg && imp != clienthostPkg && imp != wailsPkg && !std[imp] {
-				problems = append(problems, rel+": cmd/desktopclient imports "+imp+"; the preview entry may import only the standard library, the desktop host it runs, the shared startup helper its constructor inputs come from, and the Wails root package")
-			}
 		default:
 			if imp == clienthostPkg || imp == clientviewPkg || imp == clientopsPkg || imp == acpclientPkg || imp == desktopPkg || imp == cliclientPkg {
 				problems = append(problems, rel+": production file imports "+imp+"; the shared startup, scalar projection, and typed invocation helpers and the desktop host and ACP bridge are reserved for their exact target consumers, and no legacy, root, or adapter file may start a Runtime or adopt target view or invocation rules before the coordinated cutover")
@@ -260,7 +326,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 // TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go", "cmd/desktopclient/x.go"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
@@ -433,23 +499,36 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("%s importing the shared tool-argument decoder: %d problems, want 1: %v", rel, len(problems), problems)
 		}
 	}
+	// The retained catalog and agents helpers carry the one allowed edge
+	// into the public model identity; the catalog keeps its atomic file
+	// helper, the agents definitions do not; the foundation layers above
+	// model, the target runtime, storage, the driver and the plugin tree
+	// are the nearest forbidden siblings and never enter them.
+	if problems := checkTrackedGoFile("internal/catalog/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/internal/atomicfs"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/catalog imports flagged: %v", problems)
+	}
+	if problems := checkTrackedGoFile("internal/agents/x.go", []string{"fmt", "encoding/json", publicModule + "/model"}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/agents imports flagged: %v", problems)
+	}
+	for _, rel := range []string{"internal/catalog/x.go", "internal/agents/x.go"} {
+		for _, imp := range []string{publicModule + "/agent", publicModule + "/harness", publicModule + "/runtime", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins"} {
+			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
+				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
+			}
+		}
+	}
+	if problems := checkTrackedGoFile("internal/agents/x.go", []string{publicModule + "/internal/atomicfs"}, std); len(problems) != 1 {
+		t.Errorf("internal/agents importing the atomic file helper: %d problems, want 1: %v", len(problems), problems)
+	}
 	// The runtime target layer consumes the public model, harness, and
 	// protocol contracts and the retained internal configuration, snapshot,
-	// permission, safefs and path helpers only; the legacy owner, durable
-	// storage, concrete plugins, the public agent package and the driver
-	// never enter it.
-	if problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/config", publicModule + "/internal/agents", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/internal/prompt", publicModule + "/internal/adaptation", publicModule + "/internal/snapshot", publicModule + "/internal/permission", publicModule + "/internal/safefs", publicModule + "/internal/pathutil"}, std); len(problems) != 0 {
+	// safefs and path helpers only; the removed legacy trees (already
+	// rejected uniformly above), durable storage, concrete plugins, the
+	// public agent package and the driver never enter it.
+	if problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/config", publicModule + "/internal/agents", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/internal/prompt", publicModule + "/internal/adaptation", publicModule + "/internal/snapshot", publicModule + "/internal/safefs", publicModule + "/internal/pathutil"}, std); len(problems) != 0 {
 		t.Errorf("allowed runtime imports flagged: %v", problems)
 	}
 	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tasks"} {
-		if problems := checkTrackedGoFile("runtime/x.go", []string{imp}, std); len(problems) != 1 {
-			t.Errorf("runtime importing %q: %d problems, want 1: %v", imp, len(problems), problems)
-		}
-	}
-	// The deferred target packages never enter the runtime: internal/project
-	// and internal/provider keep their own consumers until their owning
-	// cutover or deletion phase.
-	for _, imp := range []string{publicModule + "/internal/project", publicModule + "/internal/provider"} {
 		if problems := checkTrackedGoFile("runtime/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("runtime importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
@@ -548,18 +627,14 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			t.Errorf("internal/hostprocess importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// Legacy, root, and adapter production files never reach into the target
-	// runtime, its concrete plugins, or the protocol contracts.
+	// Root and retained helper files cannot reach the Runtime, concrete plugins,
+	// or protocol contracts outside their declared roles.
 	for _, row := range []struct{ rel, imp string }{
-		{"internal/agent/x.go", publicModule + "/runtime"},
 		{"main.go", publicModule + "/runtime"},
 		{"app.go", publicModule + "/runtime"},
-		{"internal/acp/x.go", publicModule + "/runtime"},
 		{"internal/config/x.go", publicModule + "/runtime"},
-		{"internal/agent/x.go", publicModule + "/protocol"},
 		{"main.go", publicModule + "/protocol"},
 		{"app.go", publicModule + "/protocol"},
-		{"internal/acp/x.go", publicModule + "/protocol"},
 		{"internal/config/x.go", publicModule + "/protocol"},
 		{"internal/anything/x.go", publicModule + "/internal/plugins/sqlite"},
 		{"internal/anything/x.go", publicModule + "/internal/plugins"},
@@ -585,6 +660,61 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	} {
 		if problems := checkTrackedGoFile(row.rel, []string{row.imp}, std); len(problems) != 1 {
 			t.Errorf("%s importing %q: %d problems, want 1: %v", row.rel, row.imp, len(problems), problems)
+		}
+	}
+}
+
+// TestDependencyRulesRejectRetiredPackages exercises the one uniform rule for
+// the selected retired package roots. The expected root list is literal on
+// purpose: it is independent of the implementation's own table, so a deleted or
+// misspelled retiredPackageRoots entry fails here. Every root must refuse one
+// generic bare import and one file that lives under its own source path; the
+// subpath branch and the mixed allowed/forbidden reporting are exercised once
+// with one representative root; and the real retained neighbour source paths
+// (internal/agents, internal/acpclient, internal/cliclient) are never treated as
+// retired by the segment-bounded matching.
+func TestDependencyRulesRejectRetiredPackages(t *testing.T) {
+	std := standardLibraryImports(t)
+	for _, root := range []string{
+		"internal/agent",
+		"internal/engine",
+		"internal/provider",
+		"internal/process",
+		"internal/compact",
+		"internal/cli",
+		"internal/acp",
+		"internal/project",
+		"internal/permission",
+		"internal/memory",
+	} {
+		imp := publicModule + "/" + root
+		if problems := checkTrackedGoFile("internal/anything/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("generic file importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+		if problems := checkTrackedGoFile(root+"/x.go", []string{"fmt"}, std); len(problems) != 1 {
+			t.Errorf("file under %s: %d problems, want 1: %v", root, len(problems), problems)
+		}
+	}
+	// One representative root covers the subpath branch and the mixed rows:
+	// beside an allowed import the refusal is exactly one problem, and beside a
+	// forbidden import (main.go may import fmt but not the public model
+	// package) both offending imports surface.
+	const representative = "internal/agent"
+	rep := publicModule + "/" + representative
+	if problems := checkTrackedGoFile("internal/anything/x.go", []string{rep + "/sub/deep"}, std); len(problems) != 1 {
+		t.Errorf("generic file importing %q subpackage: %d problems, want 1: %v", rep, len(problems), problems)
+	}
+	if problems := checkTrackedGoFile("main.go", []string{rep, "fmt"}, std); len(problems) != 1 {
+		t.Errorf("main.go importing %q beside an allowed import: %d problems, want 1: %v", rep, len(problems), problems)
+	}
+	if problems := checkTrackedGoFile("main.go", []string{rep, publicModule + "/model"}, std); len(problems) != 2 {
+		t.Errorf("main.go importing %q beside the forbidden model package: %d problems, want 2: %v", rep, len(problems), problems)
+	}
+	// Segment boundaries: none of the real retained neighbour source paths is
+	// caught by the segment-bounded matching.
+	for _, rel := range []string{"internal/agents/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go"} {
+		if problems := checkTrackedGoFile(rel, []string{"fmt"}, std); len(problems) != 0 {
+			t.Errorf("%s wrongly treated as a retired tree: %v", rel, problems)
 		}
 	}
 }
@@ -690,10 +820,10 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 			t.Errorf("internal/acpclient importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// Root files, legacy adapters, and other sibling target hosts cannot reach
+	// Root files and other sibling client hosts cannot reach
 	// the typed invocation helper; shared startup and the desktop host may use
 	// it, but none of them can reach the ACP bridge.
-	for _, rel := range []string{"rootmisc.go", "app.go", "internal/acp/x.go", "internal/cli/x.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
+	for _, rel := range []string{"rootmisc.go", "app.go", "internal/clienthost/x.go", "internal/desktopclient/x.go", "internal/clientview/x.go"} {
 		for _, imp := range []string{publicModule + "/internal/clientops", publicModule + "/internal/acpclient"} {
 			if imp == publicModule+"/internal/clientops" && (rel == "internal/clienthost/x.go" || rel == "internal/desktopclient/x.go") {
 				continue
@@ -706,8 +836,9 @@ func TestDependencyRulesACPClientIsolation(t *testing.T) {
 }
 
 // TestDependencyRulesDesktopHostIsolation enforces the native desktop host's
-// exact allowlist. The reverse edge and the preview entry consumer are covered
-// by the directory matrix and the entry row.
+// exact allowlist. The reverse edge and the deleted preview entry's exact and
+// subdirectory paths are covered by the directory matrix and the generic
+// fallback rows.
 func TestDependencyRulesDesktopHostIsolation(t *testing.T) {
 	std := standardLibraryImports(t)
 	if problems := checkTrackedGoFile("internal/desktopclient/x.go", []string{
@@ -745,38 +876,9 @@ func TestDependencyRulesCliclientIsolation(t *testing.T) {
 			t.Errorf("forbidden %s: %v", imp, problems)
 		}
 	}
-	for _, rel := range []string{"rootmisc.go", "app.go", "commands.go", "internal/cli/x.go", "internal/acp/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/desktopclient/x.go", "internal/acpclient/x.go", "internal/cliclient/sub/x.go", "cmd/desktopclient/x.go"} {
+	for _, rel := range []string{"rootmisc.go", "app.go", "commands.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/desktopclient/x.go", "internal/acpclient/x.go", "internal/cliclient/sub/x.go", "cmd/desktopclient/x.go"} {
 		if problems := checkTrackedGoFile(rel, []string{publicModule + "/internal/cliclient"}, std); len(problems) != 1 {
 			t.Errorf("reverse %s: %v", rel, problems)
-		}
-	}
-}
-
-// TestDependencyRulesDesktopClientEntryIsolation enforces the preview entry's
-// exact import surface.
-func TestDependencyRulesDesktopClientEntryIsolation(t *testing.T) {
-	std := standardLibraryImports(t)
-	if problems := checkTrackedGoFile("cmd/desktopclient/x.go", []string{
-		"fmt", "os", "path/filepath",
-		publicModule + "/internal/desktopclient", publicModule + "/internal/clienthost", wailsPkg,
-	}, std); len(problems) != 0 {
-		t.Errorf("allowed cmd/desktopclient imports flagged: %v", problems)
-	}
-	for _, imp := range []string{
-		publicModule + "/client", publicModule + "/internal/clientview", publicModule + "/internal/config",
-		publicModule + "/internal/terminal", publicModule + "/internal/version", publicModule + "/internal/hostprocess",
-		publicModule + "/internal/agent", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite",
-		tiktokenPkg, sqliteDriverPkg, wailsRuntimePkg,
-	} {
-		if problems := checkTrackedGoFile("cmd/desktopclient/x.go", []string{imp}, std); len(problems) != 1 {
-			t.Errorf("cmd/desktopclient importing %q: %d problems, want 1: %v", imp, len(problems), problems)
-		}
-	}
-	// The entry row covers the exact directory only: a subdirectory file is an
-	// ordinary production file and cannot import the target host or startup.
-	for _, imp := range []string{publicModule + "/internal/desktopclient", publicModule + "/internal/clienthost"} {
-		if problems := checkTrackedGoFile("cmd/desktopclient/sub/x.go", []string{imp}, std); len(problems) != 1 {
-			t.Errorf("cmd/desktopclient/sub importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
 }
@@ -814,8 +916,9 @@ func TestDependencyRulesRootEntryRoles(t *testing.T) {
 	}
 	for _, row := range []struct{ rel, imp string }{
 		// The Runtime composition exception belongs only to the runtime
-		// command, and no active entry file reaches a legacy owner or the
-		// direct model, Harness, storage or SQLite-driver edges.
+		// command, and no active entry file reaches the direct model,
+		// Harness, storage or SQLite-driver edges; removed owners are
+		// rejected by the retired-source guard before role handling.
 		{"main.go", publicModule + "/runtime"},
 		{"main.go", publicModule + "/internal/plugins/builtin"},
 		{"main.go", publicModule + "/internal/config"},
@@ -855,11 +958,6 @@ func TestDependencyRulesRootEntryRoles(t *testing.T) {
 		{"rootmisc.go", publicModule + "/internal/clienthost"},
 		{"rootmisc.go", publicModule + "/internal/plugins/builtin"},
 		{"rootmisc.go", publicModule + "/internal/storage"},
-		// Legacy adapters keep their edges out of the Runtime, its plugins
-		// and storage.
-		{"internal/acp/x.go", publicModule + "/runtime"},
-		{"internal/cli/x.go", publicModule + "/internal/plugins/builtin"},
-		{"internal/acp/x.go", publicModule + "/internal/storage"},
 	} {
 		if problems := checkTrackedGoFile(row.rel, []string{row.imp}, std); len(problems) != 1 {
 			t.Errorf("%s importing %q: %d problems, want 1: %v", row.rel, row.imp, len(problems), problems)
@@ -870,7 +968,7 @@ func TestDependencyRulesRootEntryRoles(t *testing.T) {
 // TestDependencyRulesCheckEveryTrackedDirectory proves the file-set contract has no directory-name skipping: tracked-looking paths under previously-skipped names (.hidden, _underscore, frontend, node_modules, vendor), root files, and arbitrary internal/ paths are ordinary production files whose imports of any foundation package or the SQLite driver are reported, and internal/storage subpackages are rejected like public-package ones.
 func TestDependencyRulesCheckEveryTrackedDirectory(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "rootmisc.go", "internal/anything/x.go", "cmd/desktopclient/sub/x.go"} {
+	for _, rel := range []string{".hidden/pkg/x.go", "_scaffold/pkg/x.go", "frontend/bindata.go", "node_modules/pkg/x.go", "vendor/pkg/x.go", "rootmisc.go", "internal/anything/x.go", "cmd/desktopclient/x.go", "cmd/desktopclient/sub/x.go"} {
 		for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/harness", publicModule + "/internal/storage", publicModule + "/runtime", publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/adaptation", publicModule + "/internal/plugins/lsp", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/internal/toolargs", publicModule + "/protocol", publicModule + "/internal/clienthost", publicModule + "/internal/clientview", publicModule + "/internal/clientops", publicModule + "/internal/acpclient", publicModule + "/internal/cliclient", publicModule + "/internal/desktopclient", sqliteDriverPkg} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("tracked %q importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)

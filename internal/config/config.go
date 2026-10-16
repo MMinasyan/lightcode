@@ -16,11 +16,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
-
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 // ErrMissingEnvVar is returned (wrapped) when a provider's API key environment
@@ -49,30 +45,12 @@ func ResolvePath() (string, error) {
 	return ConfigPath()
 }
 
-// emptyConfigTemplate is written to ~/.lightcode/config.json the first time
-// Lightcode runs. It is a valid but empty skeleton.
-const emptyConfigTemplate = `{
-  "providers": {}
-}
-`
-
 // SessionConfig governs the session lifecycle sweep. Defaults: auto_archive
 // on, 7 days → archived, +7 days → deleted.
 type SessionConfig struct {
 	AutoArchive            bool `json:"auto_archive"`
 	ArchiveAfterDays       int  `json:"archive_after_days"`
 	DeleteAfterArchiveDays int  `json:"delete_after_archive_days"`
-}
-
-// CompactionConfig controls context lifecycle management.
-type CompactionConfig struct {
-	Enabled      bool    `json:"enabled"`
-	ThresholdPct float64 `json:"threshold_pct"`
-}
-
-// SubagentsConfig controls subagent orchestration.
-type SubagentsConfig struct {
-	MaxConcurrent int `json:"max_concurrent,omitempty"`
 }
 
 // ToolsConfig holds limits and timeouts for built-in tools.
@@ -84,26 +62,12 @@ type ToolsConfig struct {
 	MaxBackgroundProcesses int `json:"max_background_processes"`
 }
 
-func defaultToolsConfig() ToolsConfig {
-	return ToolsConfig{
-		MaxOutputBytes:         15360,
-		ReadMaxLines:           500,
-		ReadLineMaxChars:       5000,
-		CommandTimeout:         120,
-		MaxBackgroundProcesses: 10,
-	}
-}
-
-// Config is the full config file. Providers are retained as raw JSON-ish data
-// so config consumers can round-trip the section, but catalog.Loader is the
-// only code that interprets provider/model metadata.
+// Config is the decoded config file. Providers are retained as raw JSON-ish
+// data so config consumers can round-trip the section, but catalog.Loader is
+// the only code that interprets provider/model metadata.
 type Config struct {
-	Providers   map[string]any   `json:"providers,omitempty"`
-	Sessions    SessionConfig    `json:"sessions"`
-	Compaction  CompactionConfig `json:"compaction,omitempty"`
-	Subagents   SubagentsConfig  `json:"subagents,omitempty"`
-	Permissions permission.Rules `json:"permissions,omitempty"`
-	Tools       ToolsConfig      `json:"tools,omitempty"`
+	Providers map[string]any `json:"providers,omitempty"`
+	Sessions  SessionConfig  `json:"sessions"`
 }
 
 // rawSessionConfig is used to detect which sessions fields were present in the
@@ -177,117 +141,27 @@ func checkSweepDays(days int, field string) error {
 	return fmt.Errorf("sessions.%s: %d days overflows the 24-hour duration conversion", field, days)
 }
 
-type rawCompactionConfig struct {
-	Enabled      *bool    `json:"enabled"`
-	ThresholdPct *float64 `json:"threshold_pct"`
-}
-
-func defaultCompactionConfig() CompactionConfig {
-	return CompactionConfig{
-		Enabled:      true,
-		ThresholdPct: 0.90,
-	}
-}
-
-// Load reads and parses the config file at path. If the file does not exist,
-// Load creates it with an empty skeleton (a valid config with no
-// provider model) and parses that. Old provider catalog shapes are rejected
-// with explicit cutover errors; no migration is attempted.
-func Load(path string) (*Config, error) {
-	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		if _, err := atomicfs.CreateExclusive(path, []byte(emptyConfigTemplate), 0o600); err != nil {
-			return nil, fmt.Errorf("create config %s: %w", path, err)
-		}
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
-	}
-	c, err := Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
-	}
-	return c, nil
-}
-
-// Parse parses and validates config bytes without touching the filesystem.
-// It accepts the empty first-run skeleton and rejects the same old provider
-// catalog shapes Load rejects.
+// Parse parses and validates one config document without touching the
+// filesystem: a single UseNumber decode keeps provider numbers exact and
+// rejects trailing whole-document data, and the sessions member is decoded
+// through the shared ParseSessions contract with its validation errors
+// propagated. Provider raw shape is validated at the catalog, not here.
 func Parse(data []byte) (*Config, error) {
-	if err := rejectOldShape(data); err != nil {
+	var doc struct {
+		Providers map[string]any  `json:"providers"`
+		Sessions  json.RawMessage `json:"sessions"`
+	}
+	if err := decodeJSONUseNumber(data, &doc); err != nil {
 		return nil, err
 	}
-
-	var c Config
-	if err := decodeJSONUseNumber(data, &c); err != nil {
+	sessions, err := ParseSessions(doc.Sessions)
+	if err != nil {
 		return nil, err
 	}
-	if c.Providers == nil {
-		c.Providers = map[string]any{}
+	if doc.Providers == nil {
+		doc.Providers = map[string]any{}
 	}
-
-	type rawSubagentsConfig struct {
-		MaxConcurrent *int `json:"max_concurrent"`
-	}
-
-	var raw struct {
-		Sessions   *rawSessionConfig    `json:"sessions"`
-		Compaction *rawCompactionConfig `json:"compaction"`
-		Subagents  *rawSubagentsConfig  `json:"subagents"`
-	}
-	_ = json.Unmarshal(data, &raw)
-
-	c.Sessions, _ = sessionsFromRaw(raw.Sessions)
-
-	c.Compaction = defaultCompactionConfig()
-	if raw.Compaction != nil {
-		if raw.Compaction.Enabled != nil {
-			c.Compaction.Enabled = *raw.Compaction.Enabled
-		}
-		if raw.Compaction.ThresholdPct != nil {
-			c.Compaction.ThresholdPct = *raw.Compaction.ThresholdPct
-		}
-	}
-
-	c.Subagents = SubagentsConfig{MaxConcurrent: 4}
-	if raw.Subagents != nil {
-		if raw.Subagents.MaxConcurrent != nil {
-			c.Subagents.MaxConcurrent = *raw.Subagents.MaxConcurrent
-		}
-	}
-
-	type rawToolsConfig struct {
-		MaxOutputBytes         *int `json:"max_output_bytes"`
-		ReadMaxLines           *int `json:"read_max_lines"`
-		ReadLineMaxChars       *int `json:"read_line_max_chars"`
-		CommandTimeout         *int `json:"command_timeout"`
-		MaxBackgroundProcesses *int `json:"max_background_processes"`
-	}
-	var rawToolsRoot struct {
-		Tools *rawToolsConfig `json:"tools"`
-	}
-	_ = json.Unmarshal(data, &rawToolsRoot)
-	c.Tools = defaultToolsConfig()
-	if rawToolsRoot.Tools != nil {
-		if rawToolsRoot.Tools.MaxOutputBytes != nil {
-			c.Tools.MaxOutputBytes = *rawToolsRoot.Tools.MaxOutputBytes
-		}
-		if rawToolsRoot.Tools.ReadMaxLines != nil {
-			c.Tools.ReadMaxLines = *rawToolsRoot.Tools.ReadMaxLines
-		}
-		if rawToolsRoot.Tools.ReadLineMaxChars != nil {
-			c.Tools.ReadLineMaxChars = *rawToolsRoot.Tools.ReadLineMaxChars
-		}
-		if rawToolsRoot.Tools.CommandTimeout != nil {
-			c.Tools.CommandTimeout = *rawToolsRoot.Tools.CommandTimeout
-		}
-		if rawToolsRoot.Tools.MaxBackgroundProcesses != nil {
-			c.Tools.MaxBackgroundProcesses = *rawToolsRoot.Tools.MaxBackgroundProcesses
-		}
-	}
-
-	return &c, nil
+	return &Config{Providers: doc.Providers, Sessions: sessions}, nil
 }
 
 func decodeJSONUseNumber(data []byte, target any) error {
@@ -304,53 +178,4 @@ func decodeJSONUseNumber(data []byte, target any) error {
 		return err
 	}
 	return nil
-}
-
-func rejectOldShape(data []byte) error {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil
-	}
-
-	if raw, ok := root["compaction"]; ok {
-		var compaction map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &compaction); err == nil && compaction != nil {
-			if _, exists := compaction["summarizer_provider"]; exists {
-				return fmt.Errorf("compaction.summarizer_provider is no longer supported; compaction model selection now lives in agents.json")
-			}
-		}
-	}
-
-	if raw, ok := root["subagents"]; ok {
-		var subagents map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &subagents); err == nil && subagents != nil {
-			if _, exists := subagents["provider"]; exists {
-				return fmt.Errorf("subagents.provider is no longer supported; task agent model selection now lives in agents.json")
-			}
-		}
-	}
-
-	if raw, ok := root["providers"]; ok {
-		var providers map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &providers); err == nil {
-			for providerID, providerRaw := range providers {
-				var provider map[string]json.RawMessage
-				if err := json.Unmarshal(providerRaw, &provider); err != nil || provider == nil {
-					continue
-				}
-				if _, exists := provider["context_windows"]; exists {
-					return fmt.Errorf("providers.%s.context_windows is no longer supported; put context_window on each model entry", providerID)
-				}
-				if modelsRaw, exists := provider["models"]; exists && !isJSONObject(modelsRaw) {
-					return fmt.Errorf("providers.%s.models must be an object keyed by model id, not the old array shape", providerID)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func isJSONObject(raw json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(raw))
-	return strings.HasPrefix(trimmed, "{")
 }

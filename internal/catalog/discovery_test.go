@@ -39,6 +39,9 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 			t.Fatalf("X-Test-Header = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// One successful shape: the valid document may be followed by JSON
+		// whitespace (space, tab, CR, LF). Non-whitespace trailing data is
+		// rejected by the bounded-failure rows.
 		_, _ = w.Write([]byte(`{
 			"data": [
 				{
@@ -59,7 +62,7 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 					"max_output_tokens": 4096
 				}
 			]
-		}`))
+		}` + " \t\r\n"))
 	}))
 	defer server.Close()
 
@@ -107,6 +110,9 @@ func TestFetchDiscoveryReturnsBoundedFailures(t *testing.T) {
 		{name: "auth", statusCode: http.StatusUnauthorized, body: `{}`, wantError: "auth failed for discovery on test"},
 		{name: "malformed_json", statusCode: http.StatusOK, body: `{not json`, wantError: "parse discovery response"},
 		{name: "empty_data", statusCode: http.StatusOK, body: `{"data": []}`, wantError: "returned no models"},
+		{name: "empty_body", statusCode: http.StatusOK, body: ``, wantError: "parse discovery response"},
+		{name: "trailing_value", statusCode: http.StatusOK, body: `{"data":[{"id":"m","context_length":8}]}{"data":[]}`, wantError: "unexpected trailing data"},
+		{name: "trailing_garbage", statusCode: http.StatusOK, body: `{"data":[{"id":"m","context_length":8}]}xx`, wantError: "unexpected trailing data"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,6 +128,89 @@ func TestFetchDiscoveryReturnsBoundedFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// sizedDiscoveryBody returns one valid discovery document padded through an
+// ignored member to the exact requested byte length.
+func sizedDiscoveryBody(total int) string {
+	const prefix = `{"data":[{"id":"padded","context_length":8,"pad":"`
+	const suffix = `"}]}`
+	pad := total - len(prefix) - len(suffix)
+	if pad < 0 {
+		panic("sizedDiscoveryBody: requested length below the document skeleton")
+	}
+	return prefix + strings.Repeat("x", pad) + suffix
+}
+
+// discoveryRoundTripFunc is the private transport stub for the response
+// framing a real server cannot produce: a body longer than the advertised
+// Content-Length, so the leaf's byte limit cannot hide behind the header.
+type discoveryRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f discoveryRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestFetchDiscoveryBoundsResponseBytes pins the one bounded response domain:
+// a complete valid document at the exact maximum succeeds, and one byte more
+// fails whether Content-Length is correct, absent, or misleading. The limit
+// counts the bytes the transport delivers; no header is consulted.
+func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
+	exact := sizedDiscoveryBody(maxDiscoveryResponseBytes)
+	oversized := sizedDiscoveryBody(maxDiscoveryResponseBytes + 1)
+	fetch := func(t *testing.T, client *http.Client, baseURL string) error {
+		t.Helper()
+		_, err := FetchDiscovery(context.Background(), client, &Provider{ID: "test", Transport: Transport{BaseURL: baseURL}})
+		return err
+	}
+
+	t.Run("exact_limit_document_succeeds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, exact)
+		}))
+		defer server.Close()
+		discovered, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}})
+		if err != nil {
+			t.Fatalf("FetchDiscovery at the exact limit: %v", err)
+		}
+		entry := discovered.Models["padded"]
+		if entry.ContextWindow != 8 {
+			t.Fatalf("padded model = %#v, want the padded document's own projection", entry)
+		}
+	})
+
+	t.Run("over_limit_known_length", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(oversized)))
+			_, _ = io.WriteString(w, oversized)
+		}))
+		defer server.Close()
+		if err := fetch(t, server.Client(), server.URL+"/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
+			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
+		}
+	})
+
+	t.Run("over_limit_chunked", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, oversized)
+		}))
+		defer server.Close()
+		if err := fetch(t, server.Client(), server.URL+"/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
+			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
+		}
+	})
+
+	t.Run("over_limit_misleading_length", func(t *testing.T) {
+		client := &http.Client{Transport: discoveryRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/json"}},
+				ContentLength: 10,
+				Body:          io.NopCloser(strings.NewReader(oversized)),
+			}, nil
+		})}
+		if err := fetch(t, client, "https://bounds.test/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
+			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal despite the misleading length", err)
+		}
+	})
 }
 
 func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {

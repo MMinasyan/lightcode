@@ -79,22 +79,15 @@ func consumedIntAtUse(args map[string]any, key string) int {
 }
 
 // approvedBinding is the canonical witness carried from authorization: the
-// approved canonical target path and the lexical write-dir witness (empty
-// when the call reaches preparation without a binding, e.g. direct legacy
-// Execute calls), plus the canonical Workspace root witness and the
-// canonical write-dir boundary bound at authorization so inner preparation
-// compares against them instead of re-binding fresh ones after approval;
-// an empty witness falls back to the legacy re-bind from its lexical input.
+// lexical write-dir witness (empty when unconstrained), plus the canonical
+// Workspace root witness and the canonical write-dir boundary bound at
+// authorization so inner preparation compares against them instead of
+// re-binding fresh ones after approval; an empty witness falls back to a
+// fresh resolution from its lexical input.
 type approvedBinding struct {
-	canonical         string
 	writeDir          string
 	rootCanonical     string
 	writeDirCanonical string
-}
-
-func approvedBindingFromParams(params map[string]any) approvedBinding {
-	v, _ := params[canonicalPathParam].(canonicalPathValue)
-	return approvedBinding{canonical: v.path, writeDir: v.writeDir, rootCanonical: v.root}
 }
 
 // canonicalBinding is the resolved target binding one preparation step
@@ -121,10 +114,9 @@ func bindWriteDir(root, toolName, writeDir string) (string, error) {
 }
 
 // bindCanonicalTarget resolves one call's display path from the bound root,
-// refuses any canonical change against the approved witness, applies the
-// write-dir check, and binds the canonical write-dir boundary — the
-// authorization-time witness when bound, else a fresh resolution from the
-// lexical witness (the legacy receipt flow).
+// applies the write-dir check, and binds the canonical write-dir boundary —
+// the authorization-time witness when bound, else a fresh resolution from
+// the lexical witness.
 func bindCanonicalTarget(root, toolName, path string, approved approvedBinding) (canonicalBinding, error) {
 	displayAbs, err := fileDisplayAbsPathAtRoot(root, path)
 	if err != nil {
@@ -133,9 +125,6 @@ func bindCanonicalTarget(root, toolName, path string, approved approvedBinding) 
 	resolved, err := pathutil.ResolveFilePathFrom(root, path)
 	if err != nil {
 		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, err)
-	}
-	if approved.canonical != "" && resolved.CanonicalPath != approved.canonical {
-		return canonicalBinding{}, fmt.Errorf("%s: resolve path: %w", toolName, canonicalChangedError(approved.canonical, resolved.CanonicalPath))
 	}
 	if err := checkWriteDirTarget(root, toolName, resolved.CanonicalPath, CapabilityOptions{WriteDir: approved.writeDir}); err != nil {
 		return canonicalBinding{}, err
@@ -148,6 +137,19 @@ func bindCanonicalTarget(root, toolName, path string, approved approvedBinding) 
 		}
 	}
 	return canonicalBinding{displayAbs: displayAbs, canonical: resolved.CanonicalPath, writeDirCanonical: writeDirCanonical, leafExists: resolved.LeafExists}, nil
+}
+
+// fileDisplayAbsPathAtRoot resolves one call's display path from the bound
+// root.
+func fileDisplayAbsPathAtRoot(root, path string) (string, error) {
+	if root != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(root, path)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return absPath, nil
 }
 
 // bindWorkspaceRoot resolves the lexical Workspace root to its canonical
@@ -235,23 +237,12 @@ func (b boundCall) revalidateWriteDir() error {
 	return nil
 }
 
-// prepareReadCall is the legacy read_file entry: retained lenient argument
-// parsing, then canonical preparation with the authorization binding.
-func prepareReadCall(root string, cfg config.ToolsConfig, tracker *FileTracker, params map[string]any) (*PreparedCall, error) {
-	approved := approvedBindingFromParams(params)
-	args, err := normalizeReadArgsLegacy(params, cfg.ReadMaxLines)
-	if err != nil {
-		return nil, err
-	}
-	return prepareRead(root, cfg, tracker, args, approved)
-}
-
 // prepareRead binds read_file's canonical targets and builds its execution
 // closure. Preparation resolves the canonical path and observes whether the
 // leaf exists; when it does not, the parent directory is bound as a second
 // declared target for the authorized suggestion listing. No content read
 // happens here.
-func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
+func prepareRead(root string, cfg config.ToolsConfig, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
 	path, _ := args["path"].(string)
 	rootCanonical := approved.rootCanonical
 	if rootCanonical == "" {
@@ -313,7 +304,6 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 		if err != nil {
 			return "", fmt.Errorf("read_file: %w", err)
 		}
-		identity := FileIdentityFromFileInfoAndData(info, data)
 
 		// The canonical-integer json.Number arguments parse at their point
 		// of use: preparation bound targets only and performs no
@@ -321,22 +311,9 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 		offset := consumedIntAtUse(args, "offset")
 		limit := consumedIntAtUse(args, "limit")
 
-		// Deduplication check.
-		if tracker != nil {
-			if dup, _ := tracker.IsDuplicateIdentity(binding.canonical, offset, limit, identity); dup {
-				tracker.TrackIdentity(binding.canonical, offset, limit, identity)
-				return "File unchanged since last read. The content from the earlier read in this conversation is still current.", nil
-			}
-		}
-
 		// Binary detection.
 		if isBinary(data) {
 			return "", fmt.Errorf("read_file: %s appears to be a binary file", path)
-		}
-
-		// Track the read for mtime enforcement.
-		if tracker != nil {
-			tracker.TrackIdentity(binding.canonical, offset, limit, identity)
 		}
 
 		result, totalLines := formatReadOutput(data, offset, limit, cfg.MaxOutputBytes, cfg.ReadLineMaxChars)
@@ -367,12 +344,11 @@ func prepareRead(root string, cfg config.ToolsConfig, tracker *FileTracker, args
 // The caller supplies already-normalized arguments (NormalizeReadArgs) and
 // the canonical Workspace root witness bound at authorization, which
 // preparation binds instead of re-resolving the lexical root; the lexical
-// root remains the re-resolution input. Target reads run on the
-// nil-tracker path and always return the bounded requested content.
-// Preparation binds the canonical file target plus the parent directory
-// when the leaf is missing.
+// root remains the re-resolution input. Target reads always return the
+// bounded requested content. Preparation binds the canonical file target
+// plus the parent directory when the leaf is missing.
 func PrepareReadCall(root, rootCanonical string, cfg config.ToolsConfig, args map[string]any) (*PreparedCall, error) {
-	return prepareRead(root, cfg, nil, args, approvedBinding{rootCanonical: rootCanonical})
+	return prepareRead(root, cfg, args, approvedBinding{rootCanonical: rootCanonical})
 }
 
 // suggestFromBoundDirectory lists the bound parent directory through its
@@ -401,24 +377,12 @@ func suggestFromBoundDirectory(parent readTarget, displayPath string) string {
 	return formatFileSuggestions(displayPath, filepath.Base(parent.displayPath), suggestions)
 }
 
-// prepareWriteCall is the legacy write_file entry: retained lenient
-// argument parsing, then canonical preparation with the snapshot store
-// bound into the closure.
-func prepareWriteCall(root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (*PreparedCall, error) {
-	approved := approvedBindingFromParams(params)
-	args, err := normalizePathArgsLegacy(params, "write_file")
-	if err != nil {
-		return nil, err
-	}
-	return prepareWrite(root, store, tracker, args, approved)
-}
-
 // prepareWrite binds write_file's canonical target and builds its execution
 // closure. Preparation performs path/stat/canonicalization and the write-dir
 // check only; the precondition/preimage reads, required parent creation and
 // the write itself run inside the closure as part of the single declared
 // file.write target.
-func prepareWrite(root string, store SnapshotStore, tracker *FileTracker, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
+func prepareWrite(root string, store SnapshotStore, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
 	rootCanonical := approved.rootCanonical
@@ -443,11 +407,7 @@ func prepareWrite(root string, store SnapshotStore, tracker *FileTracker, args m
 		if err := bound.revalidate(); err != nil {
 			return "", fmt.Errorf("write_file: resolve path: %w", err)
 		}
-		if store != nil {
-			return writeWithSnapshotBookkeeping(bound, store, tracker, binding.displayAbs, binding.canonical, content, path)
-		}
-		res, _, err := writeMutation(binding.canonical, tracker, content, path)
-		return res, err
+		return writeWithSnapshotBookkeeping(bound, store, binding.displayAbs, binding.canonical, content, path)
 	}
 
 	return &PreparedCall{
@@ -458,8 +418,8 @@ func prepareWrite(root string, store SnapshotStore, tracker *FileTracker, args m
 
 // writeMutation opens the write target (creating required parents), replaces
 // its content, and reports whether a mutation may have started.
-func writeMutation(canonical string, tracker *FileTracker, content, displayPath string) (string, bool, error) {
-	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(canonical, tracker)
+func writeMutation(canonical string, content, displayPath string) (string, bool, error) {
+	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(canonical)
 	if err != nil {
 		return "", mutationStarted, fmt.Errorf("write_file: %w", err)
 	}
@@ -488,8 +448,8 @@ func writeMutation(canonical string, tracker *FileTracker, content, displayPath 
 // snapshot transaction: preflight, capture, the post-snapshot binding
 // revalidation, and the discard-before-mutation / retain-after-mutation
 // failure behavior.
-func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker *FileTracker, displayAbs, canonical, content, displayPath string) (string, error) {
-	if err := preflightWriteSnapshotTarget(canonical, tracker); err != nil {
+func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, displayAbs, canonical, content, displayPath string) (string, error) {
+	if err := preflightWriteSnapshotTarget(canonical); err != nil {
 		return "", err
 	}
 	snapshot, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbs, canonical)
@@ -508,7 +468,7 @@ func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker 
 		}
 		return "", err
 	}
-	res, mutationStarted, err := writeMutation(canonical, tracker, content, displayPath)
+	res, mutationStarted, err := writeMutation(canonical, content, displayPath)
 	if err != nil {
 		if !mutationStarted {
 			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
@@ -534,19 +494,7 @@ func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker 
 // instead of re-resolving them; the lexical root and write-dir remain the
 // re-resolution inputs.
 func PrepareWriteCall(root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
-	return prepareWrite(root, store, nil, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
-}
-
-// prepareEditCall is the legacy edit_file entry: retained lenient argument
-// parsing, then canonical preparation with the snapshot store bound into
-// the closure.
-func prepareEditCall(root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (*PreparedCall, error) {
-	approved := approvedBindingFromParams(params)
-	args, err := normalizePathArgsLegacy(params, "edit_file")
-	if err != nil {
-		return nil, err
-	}
-	return prepareEdit(root, store, tracker, args, approved)
+	return prepareWrite(root, store, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
 }
 
 // prepareEdit binds edit_file's canonical target and builds its execution
@@ -554,7 +502,7 @@ func prepareEditCall(root string, store SnapshotStore, tracker *FileTracker, par
 // check only; the current-content read, old_string validation and the
 // mutation run inside the closure as part of the single declared file.write
 // target.
-func prepareEdit(root string, store SnapshotStore, tracker *FileTracker, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
+func prepareEdit(root string, store SnapshotStore, args map[string]any, approved approvedBinding) (*PreparedCall, error) {
 	path, _ := args["path"].(string)
 	oldString, _ := args["old_string"].(string)
 	newString, _ := args["new_string"].(string)
@@ -581,14 +529,7 @@ func prepareEdit(root string, store SnapshotStore, tracker *FileTracker, args ma
 		if err := bound.revalidate(); err != nil {
 			return "", fmt.Errorf("edit_file: resolve path: %w", err)
 		}
-		if store != nil {
-			return editWithSnapshotBookkeeping(bound, store, tracker, binding.displayAbs, binding.canonical, path, oldString, newString, replaceAll)
-		}
-		res, _, err := editMutation(binding.canonical, tracker, path, oldString, newString, replaceAll)
-		if err != nil {
-			return "", err
-		}
-		return res.Result, nil
+		return editWithSnapshotBookkeeping(bound, store, binding.displayAbs, binding.canonical, path, oldString, newString, replaceAll)
 	}
 
 	return &PreparedCall{
@@ -599,7 +540,7 @@ func prepareEdit(root string, store SnapshotStore, tracker *FileTracker, args ma
 
 // editMutation validates the edit against current file content and applies
 // it; mutationStarted reports whether bytes may have landed.
-func editMutation(canonical string, tracker *FileTracker, displayPath, oldString, newString string, replaceAll bool) (*editResult, bool, error) {
+func editMutation(canonical string, displayPath, oldString, newString string, replaceAll bool) (*editResult, bool, error) {
 	if oldString == "" {
 		return nil, false, fmt.Errorf("edit_file: old_string must not be empty")
 	}
@@ -660,8 +601,8 @@ func editMutation(canonical string, tracker *FileTracker, displayPath, oldString
 // editWithSnapshotBookkeeping wraps editMutation with the retained snapshot
 // transaction: preflight, capture, the post-snapshot binding revalidation,
 // and the discard-before-mutation / retain-after-mutation failure behavior.
-func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker *FileTracker, displayAbs, canonical, displayPath, oldString, newString string, replaceAll bool) (string, error) {
-	if err := preflightEditSnapshotTarget(canonical, tracker); err != nil {
+func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, displayAbs, canonical, displayPath, oldString, newString string, replaceAll bool) (string, error) {
+	if err := preflightEditSnapshotTarget(canonical); err != nil {
 		return "", err
 	}
 	snapshot, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbs, canonical)
@@ -680,7 +621,7 @@ func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker *
 		}
 		return "", err
 	}
-	res, mutationStarted, err := editMutation(canonical, tracker, displayPath, oldString, newString, replaceAll)
+	res, mutationStarted, err := editMutation(canonical, displayPath, oldString, newString, replaceAll)
 	if err != nil {
 		if !mutationStarted {
 			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
@@ -706,34 +647,7 @@ func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, tracker *
 // instead of re-resolving them; the lexical root and write-dir remain the
 // re-resolution inputs.
 func PrepareEditCall(root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (*PreparedCall, error) {
-	return prepareEdit(root, store, nil, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
-}
-
-// preparePatchCall is the legacy apply_patch entry. With an approval
-// receipt, the patch parsed exactly once during authorization, the approved
-// target list, the write-dir witness with its canonical boundary and the
-// canonical Workspace root witness bound at authorization ride the receipt;
-// without one, the patch is parsed once here, the freshly resolved plan is
-// authoritative, and the root is bound at effect entry. Normalization
-// strips model-supplied `_lightcode_` fields, so a private receipt can
-// never survive into executable authority from model arguments.
-func preparePatchCall(root string, params map[string]any) (*patch, []applyPatchTarget, string, string, string, error) {
-	if receipt, ok := applyPatchReceiptFromParams(params); ok {
-		return receipt.parsed, receipt.targets, receipt.writeDir, receipt.writeDirCanonical, receipt.rootCanonical, nil
-	}
-	args, err := NormalizePatchArgs(params)
-	if err != nil {
-		return nil, nil, "", "", "", err
-	}
-	p, targets, err := preparePatchFromArgs(root, args, "")
-	if err != nil {
-		return nil, nil, "", "", "", err
-	}
-	rootCanonical, err := bindWorkspaceRoot(root)
-	if err != nil {
-		return nil, nil, "", "", "", fmt.Errorf("apply_patch: resolve workspace root: %w", err)
-	}
-	return p, targets, "", "", rootCanonical, nil
+	return prepareEdit(root, store, args, approvedBinding{rootCanonical: rootCanonical, writeDir: opts.WriteDir, writeDirCanonical: writeDirCanonical})
 }
 
 // preparePatchFromArgs parses the V4A patch exactly once and resolves every
@@ -777,7 +691,7 @@ func PreparePatchCall(root, rootCanonical, writeDirCanonical string, opts Capabi
 	}
 	writeDir := opts.WriteDir
 	execute := func(_ context.Context) (PreparedPatchResult, error) {
-		result, previews, err := executeParsedPatch(root, rootCanonical, store, nil, p, targets, writeDir, writeDirCanonical)
+		result, previews, err := executeParsedPatch(root, rootCanonical, store, p, targets, writeDir, writeDirCanonical)
 		return PreparedPatchResult{Result: result, Previews: previews}, err
 	}
 	return &PreparedPatchCall{Targets: displayTargets, Execute: execute}, nil

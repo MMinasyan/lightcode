@@ -1,11 +1,13 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"net/http"
@@ -20,6 +22,11 @@ import (
 )
 
 const discoveryCacheTTL = 24 * time.Hour
+
+// maxDiscoveryResponseBytes bounds one successful discovery response body:
+// the complete decoded document must fit inside it. The count is the bytes
+// the transport delivers, whatever any Content-Length header claims.
+const maxDiscoveryResponseBytes = 16 << 20
 
 // RawDiscoveredModel is one provider-supplied model object from /v1/models.
 type RawDiscoveredModel map[string]any
@@ -256,11 +263,27 @@ func FetchDiscovery(ctx context.Context, client *http.Client, provider *Provider
 		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned HTTP %d", provider.ID, resp.StatusCode)
 	}
 
+	// The complete successful body is bounded: read at most the maximum plus
+	// one and reject before decoding, then decode exactly one complete
+	// document. The count is the bytes the transport delivers — the
+	// Content-Length header is never consulted and transport decompression
+	// is unchanged.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryResponseBytes+1))
+	if err != nil {
+		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: %w", provider.ID, err)
+	}
+	if len(body) > maxDiscoveryResponseBytes {
+		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned a body over the %d-byte maximum", provider.ID, maxDiscoveryResponseBytes)
+	}
 	var parsed discoveryResponse
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if err := decoder.Decode(&parsed); err != nil {
 		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: %w", provider.ID, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: unexpected trailing data", provider.ID)
 	}
 	if len(parsed.Data) == 0 {
 		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned no models", provider.ID)

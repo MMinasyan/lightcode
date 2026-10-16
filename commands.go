@@ -812,5 +812,5 @@ func renderTopHelp(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Use 'lightcode help <command>' or 'lightcode <command> -h' for command help.")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Exit codes: 0 success, 1 failure, 2 usage error.")
+	fmt.Fprintln(w, "Exit codes: 0 success, 1 failure, 2 usage error; the terminal client exits 130 when a signal terminates it.")
 }

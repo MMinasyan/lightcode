@@ -12,9 +12,32 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
-	"github.com/MMinasyan/lightcode/internal/compact"
 	"github.com/MMinasyan/lightcode/model"
 )
+
+// retainedSummarizerPrompt is the compact built-in's retained summarizer
+// prompt, pinned here as an independent literal of the resolved compact
+// definition.
+const retainedSummarizerPrompt = `You are summarizing a coding agent conversation so the agent can continue working with reduced context. Your summary must preserve everything the agent needs to continue without re-reading files or re-asking the user.
+
+Produce a summary with these sections:
+
+## Goal
+What the user asked for, in their words. Include exact quotes of key instructions.
+
+## Files
+Which files were read, created, or modified. For modified files: what changed and why.
+
+## Current state
+What has been done so far. What works, what doesn't.
+
+## Unfinished work
+Tasks started but not completed. Errors not yet resolved. Things the agent said it would do next.
+
+## Decisions
+Choices the user made or confirmed. Constraints they stated. Things they rejected.
+
+Be specific — include file paths, function names, error messages, line numbers. Do not generalize. If the user said "don't use React," write that exactly, not "user has framework preferences."`
 
 // Compaction-capture fixtures: the concrete preparation must populate the
 // capture's conversation window, output reserve and compact configuration
@@ -243,8 +266,8 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			if capture.Compact.OutputReserve != tc.wantCompReserve {
 				t.Fatalf("capture Compact.OutputReserve = %d, want %d", capture.Compact.OutputReserve, tc.wantCompReserve)
 			}
-			if capture.Compact.SystemPrompt != compact.DefaultSummarizerPrompt {
-				t.Fatalf("capture Compact.SystemPrompt = %q, want the compact type's Prompt", capture.Compact.SystemPrompt)
+			if capture.Compact.SystemPrompt != retainedSummarizerPrompt {
+				t.Fatalf("capture Compact.SystemPrompt = %q, want the compact type's retained prompt", capture.Compact.SystemPrompt)
 			}
 		})
 	}

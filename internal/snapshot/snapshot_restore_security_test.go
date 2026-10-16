@@ -11,13 +11,11 @@ import (
 
 func TestRevertSkipsCreatedDirectoryLeavesWithoutRecordedIdentity(t *testing.T) {
 	t.Run("empty directory is preserved", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		createdPath := filepath.Join(projectDir, "created-dir")
-		turn := store.BeginTurn()
-		if err := store.Snapshot(turn, createdPath); err != nil {
-			t.Fatal(err)
-		}
+		const turn = 1
+		snapshotEntry(t, store, turn, createdPath, createdPath)
 		if err := os.Mkdir(createdPath, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -38,14 +36,12 @@ func TestRevertSkipsCreatedDirectoryLeavesWithoutRecordedIdentity(t *testing.T) 
 	})
 
 	t.Run("non-empty directory is preserved", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		createdPath := filepath.Join(projectDir, "created-dir")
 		childPath := filepath.Join(createdPath, "child.txt")
-		turn := store.BeginTurn()
-		if err := store.Snapshot(turn, createdPath); err != nil {
-			t.Fatal(err)
-		}
+		const turn = 1
+		snapshotEntry(t, store, turn, createdPath, createdPath)
 		if err := os.Mkdir(createdPath, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -74,7 +70,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 	// legacy snapshots carry no capture-time canonical witness, so the
 	// restore cannot prove the current path matches what was observed-as-missing.
 	t.Run("hash match still refuses", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(projectDir, "sub"), 0o755); err != nil {
 			t.Fatal(err)
@@ -84,16 +80,12 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 		if err := os.WriteFile(cleanPath, []byte("created"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		turn := store.BeginTurn()
 		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(dirtyPath)))
 		if err := os.MkdirAll(entryDir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: dirtyPath, Existed: false}); err != nil {
 			t.Fatal(err)
-		}
-		if turn != 1 {
-			t.Fatalf("turn = %d, want 1", turn)
 		}
 
 		_, err := store.RevertCode(0)
@@ -109,7 +101,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 	})
 
 	t.Run("hash mismatch refuses", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(projectDir, "sub"), 0o755); err != nil {
 			t.Fatal(err)
@@ -120,16 +112,12 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 		if err := os.WriteFile(victimClean, []byte("victim"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		turn := store.BeginTurn()
 		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(otherClean)))
 		if err := os.MkdirAll(entryDir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		if err := writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: victimDirty, Existed: false}); err != nil {
 			t.Fatal(err)
-		}
-		if turn != 1 {
-			t.Fatalf("turn = %d, want 1", turn)
 		}
 
 		affected, err := store.RevertCode(0)
@@ -147,7 +135,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 
 func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 	t.Run("symlink parent still points to original target", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		realDir := filepath.Join(projectDir, "real")
 		if err := os.Mkdir(realDir, 0o755); err != nil {
@@ -180,7 +168,7 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 	})
 
 	t.Run("symlink parent repointed elsewhere", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		realDir := filepath.Join(projectDir, "real")
 		secretDir := filepath.Join(projectDir, "secret")
@@ -227,9 +215,8 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 	})
 }
 
-func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *Store, requested, canonical string) {
+func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *CodeStore, requested, canonical string) {
 	t.Helper()
-	turn := store.BeginTurn()
 	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(canonical))
 	if err := os.MkdirAll(entryDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -244,9 +231,6 @@ func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *Store, requeste
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if turn != 1 {
-		t.Fatalf("turn = %d, want 1", turn)
-	}
 }
 
 // Legacy Existed:false snapshots (no meta.CanonicalPath) must be refused
@@ -254,13 +238,12 @@ func writeLegacySnapshotForMissingLeafProof(t *testing.T, store *Store, requeste
 // restore cannot prove the current path matches what was observed-as-missing.
 func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 	t.Run("file present at OriginalPath", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		createdPath := filepath.Join(projectDir, "victim.txt")
 		if err := os.WriteFile(createdPath, []byte("victim-content"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		turn := store.BeginTurn()
 		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(createdPath)))
 		if err := os.MkdirAll(entryDir, 0o700); err != nil {
 			t.Fatal(err)
@@ -268,9 +251,6 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 		if err := writeJSON(filepath.Join(entryDir, "meta.json"),
 			SnapshotMeta{OriginalPath: createdPath, Existed: false}); err != nil {
 			t.Fatal(err)
-		}
-		if turn != 1 {
-			t.Fatalf("turn = %d, want 1", turn)
 		}
 
 		_, err := store.RevertCode(0)
@@ -286,10 +266,9 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 	})
 
 	t.Run("target absent at OriginalPath", func(t *testing.T) {
-		store := newTestStore(t)
+		store := newTestCodeGroup(t)
 		projectDir := t.TempDir()
 		absentPath := filepath.Join(projectDir, "absent.txt")
-		turn := store.BeginTurn()
 		entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(absentPath)))
 		if err := os.MkdirAll(entryDir, 0o700); err != nil {
 			t.Fatal(err)
@@ -297,9 +276,6 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 		if err := writeJSON(filepath.Join(entryDir, "meta.json"),
 			SnapshotMeta{OriginalPath: absentPath, Existed: false}); err != nil {
 			t.Fatal(err)
-		}
-		if turn != 1 {
-			t.Fatalf("turn = %d, want 1", turn)
 		}
 
 		_, err := store.RevertCode(0)
@@ -316,14 +292,14 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 // outside-boundary inode must be refused by restore so the FD-acquisition
 // nlink check stops the mutation before it crosses the project boundary.
 func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
-	store := newTestStore(t)
+	store := newTestCodeGroup(t)
 	projectDir := t.TempDir()
 	target := filepath.Join(projectDir, "target.txt")
 	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	turn := store.BeginTurn()
+	const turn = 1
 	entryID := snapshotEntry(t, store, turn, target, target)
 
 	// Replace target with a hardlink to an outside-boundary file.
@@ -356,11 +332,11 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
 // regular-file leaf. This closes the created-file delete branch, which does
 // not go through restoreFile's OpenForWrite nlink check.
 func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
-	store := newTestStore(t)
+	store := newTestCodeGroup(t)
 	projectDir := t.TempDir()
 	createdPath := filepath.Join(projectDir, "created.txt")
 
-	turn := store.BeginTurn()
+	const turn = 1
 	entryID := snapshotEntry(t, store, turn, createdPath, createdPath)
 
 	outside := filepath.Join(t.TempDir(), "outside.txt")
@@ -389,11 +365,11 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
 }
 
 func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
-	store := newTestStore(t)
+	store := newTestCodeGroup(t)
 	projectDir := t.TempDir()
 	createdPath := filepath.Join(projectDir, "created-link")
 
-	turn := store.BeginTurn()
+	const turn = 1
 	entryID := snapshotEntry(t, store, turn, createdPath, createdPath)
 
 	target := filepath.Join(t.TempDir(), "outside-target.txt")
@@ -435,7 +411,7 @@ func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.
 // CanonicalPath must be refused because hashString(new path) no longer
 // matches the on-disk entry directory name.
 func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
-	store := newTestStore(t)
+	store := newTestCodeGroup(t)
 	projectDir := t.TempDir()
 	originalPath := filepath.Join(projectDir, "created.txt")
 	victimPath := filepath.Join(projectDir, "victim.txt")
@@ -443,11 +419,9 @@ func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, originalPath); err != nil {
-		t.Fatal(err)
-	}
-	// store.Snapshot writes meta with CanonicalPath=originalPath, entryDir=hashString(originalPath).
+	const turn = 1
+	snapshotEntry(t, store, turn, originalPath, originalPath)
+	// The capture writes meta with CanonicalPath=originalPath, entryDir=hashString(originalPath).
 	// Tamper meta.json to redirect CanonicalPath (and OriginalPath) to victimPath.
 	entryDir := filepath.Join(store.snapshotsDir, "1", hashString(filepath.Clean(originalPath)))
 	if _, err := os.Stat(entryDir); err != nil {
@@ -474,7 +448,7 @@ func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
 // matches the on-disk entry directory name. Symmetric with the modern delete
 // binding in TestPR11Closure_ModernDeleteBoundToEntryID.
 func TestPR11Closure_ModernRestoreBoundToEntryID(t *testing.T) {
-	store := newTestStore(t)
+	store := newTestCodeGroup(t)
 	projectDir := t.TempDir()
 	originalPath := filepath.Join(projectDir, "original.txt")
 	victimPath := filepath.Join(projectDir, "victim.txt")
@@ -485,10 +459,8 @@ func TestPR11Closure_ModernRestoreBoundToEntryID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turn := store.BeginTurn()
-	if err := store.Snapshot(turn, originalPath); err != nil {
-		t.Fatal(err)
-	}
+	const turn = 1
+	snapshotEntry(t, store, turn, originalPath, originalPath)
 	// Snapshot names the entry dir after hashString(EvalSymlinks(canonicalPath)),
 	// so resolve symlinks before hashing in case TMPDIR itself is symlinked.
 	realOriginal, err := filepath.EvalSymlinks(originalPath)

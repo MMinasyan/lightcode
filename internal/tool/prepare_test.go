@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/permission"
 )
 
 func TestPrepareReadBindsParentDirectoryOnlyWhenLeafMissing(t *testing.T) {
@@ -305,54 +304,28 @@ func TestNormalizeWriteEditArgsStrictConsumedFields(t *testing.T) {
 	}
 }
 
-func TestLegacyFileToolsKeepLenientArgumentParsing(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "lines.txt")
-	if err := os.WriteFile(path, []byte("one\ntwo\nthree"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	tool := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, nil)
-
-	// Fractional offset truncates under the retained lenient legacy parsing.
-	result, err := tool.Execute(context.Background(), map[string]any{"path": path, "offset": 1.5})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if !strings.HasPrefix(result, "1\tone") {
-		t.Fatalf("Execute result = %q, want read from truncated offset 1", result)
-	}
-	// Wrong-typed offset keeps its retained default instead of erroring.
-	result, err = tool.Execute(context.Background(), map[string]any{"path": path, "offset": "3"})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if !strings.HasPrefix(result, "1\tone") {
-		t.Fatalf("Execute result = %q, want read from default offset 1", result)
-	}
-
-	// Lenient write_file: missing content keeps its retained empty write.
-	if _, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": filepath.Join(dir, "empty.txt")}); err != nil {
-		t.Fatalf("write_file error = %v", err)
-	}
-	assertFileContent(t, filepath.Join(dir, "empty.txt"), "")
-}
-
 func TestNormalizeArgsStripsPrivateFieldsAndRetainsUnrelated(t *testing.T) {
+	// Locally defined private-field literals stand in for model-supplied
+	// private `_lightcode_` fields of every retired receipt shape.
+	const (
+		privateCanonicalPath = "_lightcode_canonical_path"
+		privatePatchReceipt  = "_lightcode_apply_patch_receipt"
+	)
 	args, err := NormalizeWriteArgs(map[string]any{
 		"path":                            "a.txt",
 		"content":                         "x",
-		canonicalPathParam:                "/forged/canonical",
-		applyPatchReceiptParam:            map[string]any{"forged": true},
+		privateCanonicalPath:              "/forged/canonical",
+		privatePatchReceipt:               map[string]any{"forged": true},
 		"_lightcode_apply_patch_receipt2": "forged",
 		"unrelated_metadata":              "kept",
 	})
 	if err != nil {
 		t.Fatalf("NormalizeWriteArgs error = %v", err)
 	}
-	if _, forged := args[canonicalPathParam]; forged {
+	if _, forged := args[privateCanonicalPath]; forged {
 		t.Fatal("normalized args retained the private canonical path field")
 	}
-	if _, forged := args[applyPatchReceiptParam]; forged {
+	if _, forged := args[privatePatchReceipt]; forged {
 		t.Fatal("normalized args retained the private apply_patch receipt field")
 	}
 	if args["unrelated_metadata"] != "kept" {
@@ -1150,25 +1123,6 @@ func TestPreparePatchRevalidatesWriteDirWitness(t *testing.T) {
 		assertFileContent(t, f.target, "x")
 	})
 
-	// The approval receipt binds the canonical write-dir at authorization;
-	// repointing the symlink inside the approval callback must fail the
-	// same binding-change refusal at execution.
-	t.Run("receipt", func(t *testing.T) {
-		f := newPatchWriteDirWitnessFixture(t)
-		store := &applyPatchStore{turn: 1}
-		tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, f.root)
-		check := rulesCheck(f.root, permission.Rules{Ask: []string{"**"}})
-		ask := func(_ context.Context, _ permission.Request) permission.ResponseAction {
-			f.flip()
-			return permission.ResponseAllow
-		}
-		wrapped := WrapWithPermissionAtRootWithOptions(tool, f.root, check, ask, CapabilityOptions{WriteDir: f.wd})
-		_, err := wrapped.Execute(context.Background(), map[string]any{"input": patchWriteDirWitnessInput(t, f.target)})
-		if err == nil || !strings.Contains(err.Error(), "approved canonical write_dir changed") {
-			t.Fatalf("Execute error = %v, want write-dir canonical change refusal through the receipt", err)
-		}
-		assertFileContent(t, f.target, "x")
-	})
 }
 
 func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
@@ -1238,118 +1192,4 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 		t.Fatalf("Execute error = %v", err)
 	}
 	assertFileContent(t, filepath.Join(inside, "a.txt"), "fixed")
-}
-
-// TestFileToolsRootWitnessSurvivesApproval repoints the Workspace root
-// symlink inside the approval callback: the authorization-time root
-// witness must make the inner preparation fail on change instead of
-// re-binding a fresh root, with no execution and no mutation.
-func TestFileToolsRootWitnessSurvivesApproval(t *testing.T) {
-	base := t.TempDir()
-	realA := filepath.Join(base, "realA")
-	realB := filepath.Join(base, "realB")
-	for _, dir := range []string{realA, realB} {
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(realA, "f.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	root := filepath.Join(base, "w")
-	if err := os.Symlink(realA, root); err != nil {
-		t.Fatal(err)
-	}
-
-	// reset makes every subtest self-contained: an earlier subtest's
-	// approval callback repoints the root symlink and may mutate the
-	// fixture file, so each subtest re-binds w -> realA, restores the
-	// fixture content and clears any residue in realB.
-	reset := func() {
-		t.Helper()
-		if err := os.Remove(root); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(realA, root); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(realA, "f.txt"), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Remove(filepath.Join(realB, "f.txt")); err != nil && !os.IsNotExist(err) {
-			t.Fatal(err)
-		}
-	}
-	flipRoot := func() {
-		if err := os.Remove(root); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(realB, root); err != nil {
-			t.Fatal(err)
-		}
-	}
-	askAll := func(t *testing.T, hook func()) (CheckFunc, AskFunc) {
-		check := rulesCheck(base, permission.Rules{Ask: []string{"**"}})
-		ask := func(_ context.Context, req permission.Request) permission.ResponseAction {
-			hook()
-			return permission.ResponseAllow
-		}
-		return check, ask
-	}
-
-	t.Run("write_file", func(t *testing.T) {
-		store := &applyPatchStore{turn: 1}
-		reset()
-
-		tool := NewWriteFileWithSnapshotAtRoot(store, nil, config.ToolsConfig{}, root)
-		check, ask := askAll(t, flipRoot)
-		wrapped := WrapWithPermissionAtRootWithOptions(tool, root, check, ask, CapabilityOptions{})
-
-		_, err := wrapped.Execute(context.Background(), map[string]any{
-			"path":    filepath.Join(realA, "f.txt"),
-			"content": "y",
-		})
-		if err == nil || !strings.Contains(err.Error(), "workspace root changed") {
-			t.Fatalf("Execute error = %v, want root witness change refusal after approval", err)
-		}
-		assertFileContent(t, filepath.Join(realA, "f.txt"), "x")
-		if _, err := os.Stat(filepath.Join(realB, "f.txt")); !os.IsNotExist(err) {
-			t.Fatalf("realB f.txt stat err = %v, want absent (no execution)", err)
-		}
-	})
-
-	t.Run("edit_file", func(t *testing.T) {
-		store := &applyPatchStore{turn: 1}
-		reset()
-
-		tool := NewEditFileWithSnapshotAtRoot(store, nil, config.ToolsConfig{}, root)
-		check, ask := askAll(t, flipRoot)
-		wrapped := WrapWithPermissionAtRootWithOptions(tool, root, check, ask, CapabilityOptions{})
-
-		_, err := wrapped.Execute(context.Background(), map[string]any{
-			"path":       filepath.Join(realA, "f.txt"),
-			"old_string": "x",
-			"new_string": "y",
-		})
-		if err == nil || !strings.Contains(err.Error(), "workspace root changed") {
-			t.Fatalf("Execute error = %v, want root witness change refusal after approval", err)
-		}
-		assertFileContent(t, filepath.Join(realA, "f.txt"), "x")
-	})
-
-	t.Run("apply_patch", func(t *testing.T) {
-		store := &applyPatchStore{turn: 1}
-		reset()
-
-		tool := NewApplyPatchWithSnapshotAtRoot(store, NewFileTracker(), config.ToolsConfig{}, root)
-		check, ask := askAll(t, flipRoot)
-		wrapped := WrapWithPermissionAtRoot(tool, root, check, ask)
-
-		input := applyPatchInput(t, "*** Update File: "+filepath.Join(realA, "f.txt")+"\n@@\n-x\n+patched")
-		_, err := wrapped.Execute(context.Background(), map[string]any{"input": input})
-		if err == nil || !strings.Contains(err.Error(), "workspace root changed") {
-			t.Fatalf("Execute error = %v, want root witness change refusal after approval", err)
-		}
-		assertFileContent(t, filepath.Join(realA, "f.txt"), "x")
-	})
 }

@@ -1,9 +1,65 @@
 package tool
 
 import (
+	"context"
 	"os"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
+
+// testCodeGroupStore adapts one real snapshot.CodeStore to the shared
+// SnapshotStore interface in the same private group-adapter shape the
+// production tools plugin uses around a per-call code group: the group's
+// single turn is explicit test identity, and Snapshot delegates to the
+// resolved-entry capture.
+type testCodeGroupStore struct {
+	*snapshot.CodeStore
+	turn int
+}
+
+// CurrentTurn pins the group's single explicit test turn.
+func (s testCodeGroupStore) CurrentTurn() int { return s.turn }
+
+// Snapshot satisfies the plain SnapshotStore surface through the resolved
+// entry capture.
+func (s testCodeGroupStore) Snapshot(turn int, absPath string) error {
+	_, _, err := s.SnapshotResolvedEntry(turn, absPath, absPath)
+	return err
+}
+
+// newCodeGroupStore opens one real artifact code group at the test's explicit
+// directory and turn identity.
+func newCodeGroupStore(t *testing.T, groupDir string, turn int) testCodeGroupStore {
+	t.Helper()
+	store, err := snapshot.OpenCodeStore(groupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testCodeGroupStore{CodeStore: store, turn: turn}
+}
+
+// execPatch runs one apply_patch through the exported Normalize* + Prepare*
+// entries and returns the structured execution result.
+func execPatch(t *testing.T, root, rootCanonical, writeDirCanonical string, opts CapabilityOptions, store SnapshotStore, args map[string]any) (PreparedPatchResult, error) {
+	t.Helper()
+	if rootCanonical == "" {
+		var err error
+		rootCanonical, err = bindWorkspaceRoot(root)
+		if err != nil {
+			return PreparedPatchResult{}, err
+		}
+	}
+	norm, err := NormalizePatchArgs(args)
+	if err != nil {
+		return PreparedPatchResult{}, err
+	}
+	call, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, opts, store, norm)
+	if err != nil {
+		return PreparedPatchResult{}, err
+	}
+	return call.Execute(context.Background())
+}
 
 // Shared, non-staging test fixtures recovered from the deleted staging executor
 // test file. These are used across the immediate-path tool test suites

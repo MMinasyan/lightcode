@@ -1,14 +1,35 @@
 package agents
 
 import (
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/MMinasyan/lightcode/internal/compact"
 )
+
+// retainedSummarizerPrompt is the compact built-in's retained summarizer
+// prompt, pinned here as an independent literal of the resolved compact
+// definition.
+const retainedSummarizerPrompt = `You are summarizing a coding agent conversation so the agent can continue working with reduced context. Your summary must preserve everything the agent needs to continue without re-reading files or re-asking the user.
+
+Produce a summary with these sections:
+
+## Goal
+What the user asked for, in their words. Include exact quotes of key instructions.
+
+## Files
+Which files were read, created, or modified. For modified files: what changed and why.
+
+## Current state
+What has been done so far. What works, what doesn't.
+
+## Unfinished work
+Tasks started but not completed. Errors not yet resolved. Things the agent said it would do next.
+
+## Decisions
+Choices the user made or confirmed. Constraints they stated. Things they rejected.
+
+Be specific — include file paths, function names, error messages, line numbers. Do not generalize. If the user said "don't use React," write that exactly, not "user has framework preferences."`
 
 func TestResolveBuiltinsInheritThroughPrimary(t *testing.T) {
 	cfg, err := Parse([]byte(`{"primary":{"model":"test/base-model"},"secondary":{"model":"test/secondary-model"}}`))
@@ -190,7 +211,7 @@ func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve(compact): %v", err)
 	}
-	if compactAgent.SystemPrompt != SystemPromptNone || compactAgent.Prompt != compact.DefaultSummarizerPrompt {
+	if compactAgent.SystemPrompt != SystemPromptNone || compactAgent.Prompt != retainedSummarizerPrompt {
 		t.Fatalf("compact prompt = system:%q body:%q", compactAgent.SystemPrompt, compactAgent.Prompt)
 	}
 	if len(compactAgent.Tools) != 0 || compactAgent.LSP || !compactAgent.Readonly || compactAgent.Subagent {
@@ -303,56 +324,11 @@ func TestBuiltinNameWinsOverUserLockedFields(t *testing.T) {
 	}
 }
 
-func TestLoadMissingFileCreatesSkeletonAndBuiltins(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config-dir", "agents.json")
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load missing: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read created agents.json: %v", err)
-	}
-	if string(data) != emptyAgentsTemplate {
-		t.Fatalf("created agents.json = %q, want skeleton", data)
-	}
-	all := cfg.All()
-	if len(all) < len(builtinOrder) {
-		t.Fatalf("All returned %d types, want at least builtins", len(all))
-	}
-	if all[0].Name != "primary" || all[len(builtinOrder)-1].Name != "compact" {
-		t.Fatalf("builtin order = %v", namesOf(all[:len(builtinOrder)]))
-	}
-}
-
 func TestPathForConfigUsesConfigDirectory(t *testing.T) {
 	got := PathForConfig(filepath.Join("/tmp", "lightcode-test", "config.json"))
 	want := filepath.Join("/tmp", "lightcode-test", "agents.json")
 	if got != want {
 		t.Fatalf("PathForConfig = %q, want %q", got, want)
-	}
-}
-
-func TestWriteModelUpdatesAgentsJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agents.json")
-	if err := os.WriteFile(path, []byte(`{"custom":{"tools":["read_file"]}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteModel(path, "primary", "test/new-model"); err != nil {
-		t.Fatalf("WriteModel primary: %v", err)
-	}
-	if err := WriteModel(path, "custom", "test/custom-model"); err != nil {
-		t.Fatalf("WriteModel custom: %v", err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load after WriteModel: %v", err)
-	}
-	primary, _ := cfg.Resolve("primary")
-	custom, _ := cfg.Resolve("custom")
-	if primary.Model != "test/new-model" || custom.Model != "test/custom-model" {
-		t.Fatalf("models after write = primary:%q custom:%q", primary.Model, custom.Model)
 	}
 }
 

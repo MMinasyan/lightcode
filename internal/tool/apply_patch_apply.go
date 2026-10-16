@@ -11,19 +11,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/safefs"
 )
 
-// applyPatchApplyAtRoot is the params-map entry the legacy wrapper uses: it
-// extracts the parsed patch, approved targets and the canonical Workspace
-// root witness from the approval receipt (parsing the V4A text and binding
-// the root only when no receipt is present), then runs the shared execution
-// body.
-func applyPatchApplyAtRoot(root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (string, []AppliedFilePreview, error) {
-	p, approved, writeDir, writeDirCanonical, rootCanonical, err := preparePatchCall(root, params)
-	if err != nil {
-		return "", nil, err
-	}
-	return executeParsedPatch(root, rootCanonical, store, tracker, p, approved, writeDir, writeDirCanonical)
-}
-
 // executeParsedPatch is the shared apply engine for an already-parsed patch
 // and its prepared targets. The flow is validate-first all-or-nothing:
 // the bound canonical Workspace root, the bound canonical write-dir
@@ -41,7 +28,7 @@ func applyPatchApplyAtRoot(root string, store SnapshotStore, tracker *FileTracke
 // renderers do not need post-write disk reads. Read-after-apply is not
 // viable for updates, deletes, or moves. A nil approved list means the
 // freshly resolved plan is authoritative.
-func executeParsedPatch(root, rootCanonical string, store SnapshotStore, tracker *FileTracker, p *patch, approved []applyPatchTarget, writeDir, writeDirCanonical string) (string, []AppliedFilePreview, error) {
+func executeParsedPatch(root, rootCanonical string, store SnapshotStore, p *patch, approved []applyPatchTarget, writeDir, writeDirCanonical string) (string, []AppliedFilePreview, error) {
 	// Revalidate the bound root, the canonical write-dir boundary and every
 	// target before content access; the per-op checks rerun where the apply
 	// safety requires.
@@ -73,7 +60,7 @@ func executeParsedPatch(root, rootCanonical string, store SnapshotStore, tracker
 	committed := make([]appliedOp, 0, len(plans))
 	for i := range plans {
 		pl := &plans[i]
-		preview, err := applyOne(pl, store, tracker, &committed)
+		preview, err := applyOne(pl, store, &committed)
 		if err != nil {
 			return "", nil, err
 		}
@@ -366,14 +353,14 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 // A/M/D list. committed is the running list of ops that have already landed on
 // disk; applyOne appends to it on success and reads it for partial-failure
 // summaries.
-func applyOne(pl *applyPlan, store SnapshotStore, tracker *FileTracker, committed *[]appliedOp) ([]AppliedFilePreview, error) {
+func applyOne(pl *applyPlan, store SnapshotStore, committed *[]appliedOp) ([]AppliedFilePreview, error) {
 	if err := revalidateApplyPlan(pl); err != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 	}
 
 	// Move: write the destination first (so it lands), then snapshot + delete the source.
 	if pl.op.movePath != "" {
-		if err := writeWithSnapshot(store, pl.moveDisplay, pl.moveCanonical, pl.newContent, true, tracker); err != nil {
+		if err := writeWithSnapshot(store, pl.moveDisplay, pl.moveCanonical, pl.newContent, true); err != nil {
 			return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.movePath})
@@ -383,7 +370,7 @@ func applyOne(pl *applyPlan, store SnapshotStore, tracker *FileTracker, committe
 	}
 
 	// Now the original-path mutation (Add / Update / Delete), tracked separately for Move.
-	origErr := applyOriginalMutation(pl, store, tracker, committed)
+	origErr := applyOriginalMutation(pl, store, committed)
 	if origErr != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + origErr.Error()}
 	}
@@ -458,7 +445,7 @@ func buildOpPreviews(pl *applyPlan) []AppliedFilePreview {
 	return nil
 }
 
-func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTracker, committed *[]appliedOp) error {
+func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appliedOp) error {
 	if pl.moveCanonical != "" {
 		// For Move the source-path delete is the original-path mutation; the
 		// kind is "D" of the source.
@@ -471,12 +458,12 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTrac
 
 	switch pl.op.kind {
 	case opAdd:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true, tracker); err != nil {
+		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "A", path: pl.op.path})
 	case opUpdate:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false, tracker); err != nil {
+		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.path})
@@ -495,7 +482,7 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTrac
 // exclusive-create guarantee: if the path was validated to not exist and
 // OpenForWrite reports it now does (concurrent create between validate and
 // apply), the write is refused.
-func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, content string, forNew bool, tracker *FileTracker) error {
+func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, content string, forNew bool) error {
 	var snap snapshotEntry
 	hasSnap := false
 	if store != nil {
@@ -508,7 +495,7 @@ func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, conte
 		defer releaseSnapshotMutation(snap)
 	}
 
-	f, existed, _, err := openWriteTargetForMutation(canonicalPath, tracker)
+	f, existed, _, err := openWriteTargetForMutation(canonicalPath)
 	if err != nil {
 		if hasSnap {
 			_ = discardUnmutatedSnapshot(snap)

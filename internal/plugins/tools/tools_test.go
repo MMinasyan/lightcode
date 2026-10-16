@@ -185,20 +185,76 @@ func assertJSONEqual(t *testing.T, got json.RawMessage, want any) {
 	}
 }
 
+// wantRunCommandDescription is the independent golden fixture for the
+// ordinary run_command description, verified against the retained value. It
+// is deliberately a test-local literal rather than the production constant,
+// so drift in descriptions.go fails this test.
+const wantRunCommandDescription = `Executes a shell command and returns combined stdout and stderr.
+- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
+- Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
+- For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
+- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
+
+// wantRunCommandParameters is the independent golden fixture for the one
+// run_command schema the ordinary and readonly surfaces share.
+const wantRunCommandParameters = `{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The shell command to execute."
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Timeout in seconds for this command. Overrides the default."
+    },
+    "background": {
+      "type": "boolean",
+      "description": "If true, run the command in the background and return immediately with a process ID."
+    }
+  },
+  "required": ["command"]
+}`
+
+// wantProcessDescription and wantProcessParameters are the independent golden
+// fixtures for the process tool's model-visible surface, verified against the
+// retained values. They are deliberately test-local literals rather than the
+// production constants, so drift in descriptions.go fails these tests.
+const wantProcessDescription = "Manage background processes started by run_command with background=true.\n" +
+	"\t- Use action \"read\" with id to read the output of a running background process.\n" +
+	"\t- Use action \"kill\" with id to terminate a background process.\n" +
+	"\t- Use action \"list\" to list background processes in the current session and their status."
+
+const wantProcessParameters = `{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "description": "Action to perform: \"read\" to get output, \"kill\" to terminate, \"list\" to list processes in the current session."
+    },
+    "id": {
+      "type": "string",
+      "description": "Process ID returned by run_command with background=true."
+    }
+  },
+  "required": ["action"]
+}`
+
 // TestRunCommandDescriptionsAndSchemasMatchRetained pins both run_command
 // surfaces to the retained texts: the ordinary Agent receives the complete
-// legacy description with the background bullets and the readonly Agent
-// receives the retained readonly description; both share the retained schema.
+// description with the background bullets and the readonly Agent receives
+// the retained readonly description; both share the retained schema. The
+// expectations are independent test-local fixtures, not the production
+// constants.
 func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
-	legacy := &tool.RunCommand{}
 	ordinary, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("describe ordinary: %v", err)
 	}
-	if ordinary.Definition.Description != legacy.Description() {
-		t.Errorf("ordinary description = %q, want the retained legacy description %q", ordinary.Definition.Description, legacy.Description())
+	if ordinary.Definition.Description != wantRunCommandDescription {
+		t.Errorf("ordinary description = %q, want the retained description %q", ordinary.Definition.Description, wantRunCommandDescription)
 	}
-	assertJSONEqual(t, ordinary.Definition.Parameters, legacy.ParametersSchema())
+	assertJSONEqual(t, ordinary.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
 
 	readonly, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{Readonly: true}, harness.SessionIdentity{})
 	if err != nil {
@@ -207,25 +263,23 @@ func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
 	if readonly.Definition.Description != tool.ReadOnlyRunCommandDescription {
 		t.Errorf("readonly description = %q, want the retained readonly description", readonly.Definition.Description)
 	}
-	legacyReadonly := tool.NewReadOnlyRunCommand(legacy)
-	assertJSONEqual(t, readonly.Definition.Parameters, legacyReadonly.ParametersSchema())
+	assertJSONEqual(t, readonly.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
 	if !ordinary.Available || !readonly.Available {
 		t.Errorf("availability ordinary/readonly = %v/%v, want both available", ordinary.Available, readonly.Available)
 	}
 }
 
 // TestProcessDescriptionAndSchemaMatchRetained pins the process tool's
-// model-visible surface to the retained legacy description and schema.
+// model-visible surface to the independent test-local fixtures.
 func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
-	legacy := &tool.ProcessTool{}
 	got, err := processTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("describe process: %v", err)
 	}
-	if got.Definition.Description != legacy.Description() {
-		t.Errorf("process description = %q, want the retained legacy description %q", got.Definition.Description, legacy.Description())
+	if got.Definition.Description != wantProcessDescription {
+		t.Errorf("process description = %q, want the retained description %q", got.Definition.Description, wantProcessDescription)
 	}
-	assertJSONEqual(t, got.Definition.Parameters, legacy.ParametersSchema())
+	assertJSONEqual(t, got.Definition.Parameters, json.RawMessage(wantProcessParameters))
 	if got.Definition.Name != "process" || !got.Available || got.DefaultHidden {
 		t.Errorf("process definition = %+v, want name process, available, not hidden", got)
 	}

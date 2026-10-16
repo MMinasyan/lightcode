@@ -83,7 +83,7 @@ func TestDispatchHelpForms(t *testing.T) {
 			"Usage: lightcode [command]",
 			"desktop", "cli", "acp", "runtime", "help",
 			"(default)",
-			"Exit codes: 0 success, 1 failure, 2 usage error.",
+			"Exit codes: 0 success, 1 failure, 2 usage error; the terminal client exits 130 when a signal terminates it.",
 		} {
 			if !strings.Contains(stdout, want) {
 				t.Fatalf("%v: stdout missing %q:\n%s", argv, want, stdout)
@@ -447,6 +447,19 @@ func TestDispatchUpgradeCheck(t *testing.T) {
 		_, code, stdout, _ := capture(t, []string{"lightcode", "upgrade", "--check"})
 		if code != 0 || stdout != "current: v0.0.3, latest: v0.0.2 (not selfupdate-capable; use the installer)\n" {
 			t.Fatalf("exit=%d stdout=%q", code, stdout)
+		}
+	})
+
+	t.Run("ordering beyond machine integers still decides", func(t *testing.T) {
+		setVersion(t, "v1.0.0", "")
+		setLatestEndpoint(t, "v18446744073709551615.0.0")
+		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		want := "current: v1.0.0, latest: v18446744073709551615.0.0 (update available; run: lightcode upgrade)\n"
+		if stdout != want {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
 		}
 	})
 

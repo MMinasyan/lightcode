@@ -83,8 +83,13 @@ type ToolContext struct {
 	// SubprocessEnv is invoked at each concrete process start — foreground
 	// Execute and the admitted Jobs start handoff alike — and returns the
 	// exact environment slice that process runs with: the live ambient
-	// environment filtered by the Runtime's current managed-key set. A nil
-	// callback fails the cooperative command; there is no ambient fallback.
+	// environment with the Runtime's live credential exclusion applied (the
+	// current managed-key set and provider credential names, together with
+	// the preparation-time captured names). It is that live exclusion
+	// service only, never a promise to reread the selected execution policy:
+	// the model, prompt, tools, permissions and configuration revision stay
+	// the admission's frozen capture. A nil callback fails the cooperative
+	// command; there is no ambient fallback.
 	SubprocessEnv func() []string
 }
 
