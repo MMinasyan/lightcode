@@ -7,8 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
 func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
@@ -41,9 +39,9 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			path := snapshotLifecycleFile(t, root, "file.txt", "before")
-			store := newSnapshotLifecycleStore(t, root)
+			store := newSnapshotLifecycleStore(t)
 			wrapped := &mutatingTransactionalSnapshotStore{
-				Store: store,
+				testCodeGroupStore: store,
 				mutate: func() {
 					tc.mutate(t, path)
 				},
@@ -73,7 +71,7 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 func TestEditFileDiscardsSnapshotWhenEditFailsBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
-	store := newSnapshotLifecycleStore(t, root)
+	store := newSnapshotLifecycleStore(t)
 
 	_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
@@ -97,9 +95,9 @@ func TestEditFileDiscardsSnapshotWhenEditFailsBeforeMutation(t *testing.T) {
 func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
-	store := newSnapshotLifecycleStore(t, root)
+	store := newSnapshotLifecycleStore(t)
 	wrapped := &mutatingTransactionalSnapshotStore{
-		Store: store,
+		testCodeGroupStore: store,
 		mutate: func() {
 			if err := os.Remove(path); err != nil {
 				t.Fatal(err)
@@ -133,7 +131,7 @@ func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
-	store := newSnapshotLifecycleStore(t, root)
+	store := newSnapshotLifecycleStore(t)
 
 	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
@@ -162,7 +160,7 @@ func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) 
 func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
-	store := newSnapshotLifecycleStore(t, root)
+	store := newSnapshotLifecycleStore(t)
 
 	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
@@ -197,7 +195,7 @@ func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := &blockingRecordSnapshotStore{
-		Store:              newSnapshotLifecycleStore(t, root),
+		testCodeGroupStore: newSnapshotLifecycleStore(t),
 		firstRecordStarted: make(chan struct{}),
 		releaseFirstRecord: make(chan struct{}),
 		secondLockAttempt:  make(chan struct{}),
@@ -262,11 +260,11 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 	steps := []mutationFailureStep{failAfterTruncate, failAfterWrite, failAfterSync}
 	cases := []struct {
 		name string
-		run  func(t *testing.T, root, path string, store *snapshot.Store) error
+		run  func(t *testing.T, root, path string, store testCodeGroupStore) error
 	}{
 		{
 			name: "immediate_write",
-			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store testCodeGroupStore) error {
 				t.Helper()
 				_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":    path,
@@ -277,7 +275,7 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 		},
 		{
 			name: "immediate_edit",
-			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store testCodeGroupStore) error {
 				t.Helper()
 				_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":       path,
@@ -289,7 +287,7 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 		},
 		{
 			name: "apply_patch",
-			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, _ string, store testCodeGroupStore) error {
 				t.Helper()
 				input := applyPatchInput(t, "*** Update File: file.txt\n@@\n-before\n+after")
 				_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -303,7 +301,7 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 			t.Run(fmt.Sprintf("%s_%s", tc.name, step), func(t *testing.T) {
 				root := t.TempDir()
 				path := snapshotLifecycleFile(t, root, "file.txt", "before")
-				store := newSnapshotLifecycleStore(t, root)
+				store := newSnapshotLifecycleStore(t)
 				withMutationFailure(t, path, step)
 
 				err := tc.run(t, root, path, store)
@@ -331,11 +329,11 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 	steps := []mutationFailureStep{failAfterTruncate, failAfterWrite, failAfterSync}
 	cases := []struct {
 		name string
-		run  func(t *testing.T, root, path string, store *snapshot.Store) error
+		run  func(t *testing.T, root, path string, store testCodeGroupStore) error
 	}{
 		{
 			name: "immediate_write_create",
-			run: func(t *testing.T, root, path string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, path string, store testCodeGroupStore) error {
 				t.Helper()
 				_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 					"path":    path,
@@ -346,7 +344,7 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 		},
 		{
 			name: "apply_patch_add",
-			run: func(t *testing.T, root, _ string, store *snapshot.Store) error {
+			run: func(t *testing.T, root, _ string, store testCodeGroupStore) error {
 				t.Helper()
 				input := applyPatchInput(t, "*** Add File: created.txt\n+after")
 				_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -360,7 +358,7 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 			t.Run(fmt.Sprintf("%s_%s", tc.name, step), func(t *testing.T) {
 				root := t.TempDir()
 				path := filepath.Join(root, "created.txt")
-				store := newSnapshotLifecycleStore(t, root)
+				store := newSnapshotLifecycleStore(t)
 				withMutationFailure(t, path, step)
 
 				err := tc.run(t, root, path, store)
@@ -464,12 +462,12 @@ func withMutationFailure(t *testing.T, target string, step mutationFailureStep) 
 }
 
 type mutatingTransactionalSnapshotStore struct {
-	*snapshot.Store
+	testCodeGroupStore
 	mutate func()
 }
 
 func (s *mutatingTransactionalSnapshotStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
-	entryID, created, err := s.Store.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	entryID, created, err := s.testCodeGroupStore.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
 	if err == nil && s.mutate != nil {
 		mutate := s.mutate
 		s.mutate = nil
@@ -479,7 +477,7 @@ func (s *mutatingTransactionalSnapshotStore) SnapshotResolvedEntry(turn int, ori
 }
 
 type blockingRecordSnapshotStore struct {
-	*snapshot.Store
+	testCodeGroupStore
 	mu                 sync.Mutex
 	records            int
 	lockAttempts       int
@@ -497,7 +495,7 @@ func (s *blockingRecordSnapshotStore) LockSnapshotMutation(turn int, entryID str
 	if attempt == 2 {
 		close(s.secondLockAttempt)
 	}
-	return s.Store.LockSnapshotMutation(turn, entryID)
+	return s.testCodeGroupStore.LockSnapshotMutation(turn, entryID)
 }
 
 func (s *blockingRecordSnapshotStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
@@ -510,22 +508,14 @@ func (s *blockingRecordSnapshotStore) RecordSnapshotContent(turn int, entryID st
 		close(s.firstRecordStarted)
 		<-s.releaseFirstRecord
 	}
-	return s.Store.RecordSnapshotContent(turn, entryID, content)
+	return s.testCodeGroupStore.RecordSnapshotContent(turn, entryID, content)
 }
 
-func newSnapshotLifecycleStore(t *testing.T, projectRoot string) *snapshot.Store {
+// newSnapshotLifecycleStore opens one real artifact code group with explicit
+// group and turn identity for the snapshot-lifecycle rows.
+func newSnapshotLifecycleStore(t *testing.T) testCodeGroupStore {
 	t.Helper()
-	store, err := snapshot.NewForSessionsRoot(t.TempDir(), "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.BeginNewSession(projectRoot); err != nil {
-		t.Fatal(err)
-	}
-	if turn := store.BeginTurn(); turn != 1 {
-		t.Fatalf("BeginTurn = %d, want 1", turn)
-	}
-	return store
+	return newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 1)
 }
 
 func snapshotLifecycleFile(t *testing.T, root, name, content string) string {

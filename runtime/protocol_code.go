@@ -16,7 +16,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/permission"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -259,6 +258,17 @@ func isLegacySessionID(id string) bool {
 	return true
 }
 
+// retainedCodeProof is the one old metadata shape this reader interprets:
+// exactly the id, project_path and project_hash members under their existing
+// JSON names. Those three fields must match the explicit old ID and the
+// normalized Workspace proof; every other old metadata member is irrelevant
+// to this reader and is not interpreted as Session, model or lifecycle truth.
+type retainedCodeProof struct {
+	ID          string `json:"id"`
+	ProjectPath string `json:"project_path"`
+	ProjectHash string `json:"project_hash"`
+}
+
 // retainedSessionDir proves one pre-cutover snapshot-only Session directory:
 // the exact 8-hex ID, the normalized workspace root, the deterministic
 // p-<full sha256> project directory, and an existing meta whose ID,
@@ -297,7 +307,7 @@ func (r *Runtime) retainedSessionDir(workspace, legacyID string) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("read legacy session meta %s: %w", metaPath, err)
 	}
-	var meta snapshot.SessionMeta
+	var meta retainedCodeProof
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return "", fmt.Errorf("legacy session meta %s is malformed: %v: %w", metaPath, err, harness.ErrInvalid)
 	}
@@ -453,8 +463,53 @@ func viewerCanonicalTarget(workspace, path string) (string, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("viewer path %s is outside workspace %s: %w", path, workspace, harness.ErrInvalid)
 	}
-	if permission.IsSensitivePath(canonicalPath) {
+	if isSensitivePath(canonicalPath) {
 		return "", fmt.Errorf("viewer path %s is a sensitive name: %w", canonicalPath, harness.ErrInvalid)
 	}
 	return canonicalPath, nil
+}
+
+// sensitiveNames and sensitiveGlobs are the viewer's sensitive-name
+// basename and pattern data.
+var sensitiveNames = map[string]bool{
+	".env":       true,
+	".netrc":     true,
+	".npmrc":     true,
+	".pypirc":    true,
+	"id_rsa":     true,
+	"id_ed25519": true,
+	"id_ecdsa":   true,
+	"id_dsa":     true,
+}
+
+var sensitiveGlobs = []string{
+	".env.*",
+	"*.pem",
+	"*.key",
+	"*.p12",
+	"*.pfx",
+	"*.keystore",
+	"*.jks",
+	"id_rsa.*",
+	"id_ed25519.*",
+	"id_ecdsa.*",
+	"id_dsa.*",
+	"credentials*.json",
+	"credentials*.yaml",
+	"credentials*.yml",
+}
+
+// isSensitivePath is the viewer's sensitive-name boundary: a sensitive
+// basename or pattern refuses the leaf in the contained viewer.
+func isSensitivePath(path string) bool {
+	base := filepath.Base(path)
+	if sensitiveNames[base] {
+		return true
+	}
+	for _, g := range sensitiveGlobs {
+		if matched, _ := filepath.Match(g, base); matched {
+			return true
+		}
+	}
+	return false
 }

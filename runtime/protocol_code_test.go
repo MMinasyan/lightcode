@@ -1143,12 +1143,14 @@ func seedRetainedSession(t *testing.T, home, workspace, legacyID string) string 
 	sum := sha256.Sum256([]byte(normalized))
 	hash := hex.EncodeToString(sum[:])
 	dir := filepath.Join(home, ".lightcode", "projects", "p-"+hash, "sessions", legacyID)
-	writeRetainedJSON(t, filepath.Join(dir, "meta.json"), snapshot.SessionMeta{
-		ID:          legacyID,
-		CreatedAt:   "2026-01-01T00:00:00Z",
-		ProjectPath: normalized,
-		ProjectHash: hash[:16],
-		State:       snapshot.StateActive,
+	// The fixture seeds the three proof fields and ordinary extra metadata;
+	// the reader interprets only the proof fields.
+	writeRetainedJSON(t, filepath.Join(dir, "meta.json"), map[string]any{
+		"id":           legacyID,
+		"created_at":   "2026-01-01T00:00:00Z",
+		"project_path": normalized,
+		"project_hash": hash[:16],
+		"state":        "active",
 	})
 	writeServiceFile(t, filepath.Join(dir, "turns", "1", "messages.jsonl"), retainedConversationCanary)
 	writeServiceFile(t, filepath.Join(dir, "claims", "claim.json"), retainedClaimCanary)
@@ -1164,18 +1166,18 @@ func writeRetainedJSON(t *testing.T, path string, value any) {
 	writeServiceFile(t, path, string(data))
 }
 
-func rewriteRetainedMeta(t *testing.T, sessionDir string, edit func(*snapshot.SessionMeta)) {
+func rewriteRetainedMeta(t *testing.T, sessionDir string, edit func(map[string]any)) {
 	t.Helper()
 	path := filepath.Join(sessionDir, "meta.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read meta: %v", err)
 	}
-	var meta snapshot.SessionMeta
+	var meta map[string]any
 	if err := json.Unmarshal(data, &meta); err != nil {
 		t.Fatalf("decode meta: %v", err)
 	}
-	edit(&meta)
+	edit(meta)
 	writeRetainedJSON(t, path, meta)
 }
 
@@ -1261,11 +1263,11 @@ func TestRetainedCodeSnapshotsProof(t *testing.T) {
 
 		for _, tc := range []struct {
 			name string
-			edit func(*snapshot.SessionMeta)
+			edit func(map[string]any)
 		}{
-			{"wrong id", func(m *snapshot.SessionMeta) { m.ID = "deadbeee" }},
-			{"wrong project path", func(m *snapshot.SessionMeta) { m.ProjectPath = filepath.Join(workspace, "other") }},
-			{"wrong hash prefix", func(m *snapshot.SessionMeta) { m.ProjectHash = "0000000000000000" }},
+			{"wrong id", func(m map[string]any) { m["id"] = "deadbeee" }},
+			{"wrong project path", func(m map[string]any) { m["project_path"] = filepath.Join(workspace, "other") }},
+			{"wrong hash prefix", func(m map[string]any) { m["project_hash"] = "0000000000000000" }},
 		} {
 			metaPath := filepath.Join(sessionDir, "meta.json")
 			original, err := os.ReadFile(metaPath)
@@ -1303,7 +1305,7 @@ func TestRetainedCodeSnapshotsProof(t *testing.T) {
 			"created_at":           "2026-01-01T00:00:00Z",
 			"project_path":         normalized,
 			"project_hash":         hash[:16],
-			"state":                snapshot.StateActive,
+			"state":                "active",
 			"legacy_ignored_field": strings.Repeat("x", (1<<20)+1),
 		})
 		if err != nil {
@@ -1681,6 +1683,36 @@ func TestWorkspaceFileReadRefusals(t *testing.T) {
 			t.Fatalf("missing read = %v, want harness.ErrNotFound", err)
 		}
 	})
+}
+
+// TestViewerSensitivePath proves the viewer helper's sensitive-name
+// basename and glob data, moved with the helper into this owner.
+func TestViewerSensitivePath(t *testing.T) {
+	sensitive := []string{
+		"/home/user/.env",
+		"/home/user/.netrc",
+		"/home/user/.ssh/id_rsa",
+		"/home/user/cert.pem",
+		"/home/user/key.key",
+		"/home/user/credentials.json",
+		"/home/user/credentials.yaml",
+	}
+	for _, p := range sensitive {
+		if !isSensitivePath(p) {
+			t.Fatalf("isSensitivePath(%q) = false, want true", p)
+		}
+	}
+
+	normal := []string{
+		"/home/user/README.md",
+		"/home/user/main.go",
+		"/home/user/.gitignore",
+	}
+	for _, p := range normal {
+		if isSensitivePath(p) {
+			t.Fatalf("isSensitivePath(%q) = true, want false", p)
+		}
+	}
 }
 
 // TestWorkspaceFileReadPrefixRule proves the exact read-prefix rule: 1 MiB of

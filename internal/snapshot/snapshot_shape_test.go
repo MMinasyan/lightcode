@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -53,12 +54,13 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := newTestStore(t)
+			store := newTestCodeGroup(t)
 			target := tc.target(t)
-			turn := store.BeginTurn()
+			const turn = 1
 
 			err := runSnapshotShapeWithTimeout(func() error {
-				return store.SnapshotResolved(turn, target, target)
+				_, _, err := store.SnapshotResolvedEntry(turn, target, target)
+				return err
 			})
 			if err == nil {
 				t.Fatalf("SnapshotResolved(%s) succeeded, want non-regular target refusal", tc.name)
@@ -72,7 +74,7 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 			}
 
 			entries, readErr := os.ReadDir(filepath.Join(store.snapshotsDir, "1"))
-			if readErr != nil {
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				t.Fatal(readErr)
 			}
 			if len(entries) != 0 {
@@ -88,20 +90,20 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 }
 
 func TestSnapshotResolvedStillAllowsMissingAndRegularTargets(t *testing.T) {
-	store := newTestStore(t)
-	turn := store.BeginTurn()
+	store := newTestCodeGroup(t)
+	const turn = 1
 
 	missing := filepath.Join(t.TempDir(), "new-file.txt")
-	if err := store.SnapshotResolved(turn, missing, missing); err != nil {
-		t.Fatalf("SnapshotResolved missing target error = %v", err)
+	if _, _, err := store.SnapshotResolvedEntry(turn, missing, missing); err != nil {
+		t.Fatalf("SnapshotResolvedEntry missing target error = %v", err)
 	}
 
 	regular := filepath.Join(t.TempDir(), "regular.txt")
 	if err := os.WriteFile(regular, []byte("before"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SnapshotResolved(turn, regular, regular); err != nil {
-		t.Fatalf("SnapshotResolved regular target error = %v", err)
+	if _, _, err := store.SnapshotResolvedEntry(turn, regular, regular); err != nil {
+		t.Fatalf("SnapshotResolvedEntry regular target error = %v", err)
 	}
 }
 

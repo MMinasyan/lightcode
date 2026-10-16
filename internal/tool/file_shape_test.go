@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"golang.org/x/sys/unix"
 )
 
@@ -431,17 +430,8 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 
 	t.Run("snapshot_capture", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		store, err := snapshot.NewForSessionsRoot(t.TempDir(), "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := store.BeginNewSession(t.TempDir()); err != nil {
-			t.Fatal(err)
-		}
-		if turn := store.BeginTurn(); turn != 1 {
-			t.Fatalf("BeginTurn = %d, want 1", turn)
-		}
-		_, err = execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, store,
+		store := newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 1)
+		_, err := execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, store,
 			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)
 	})
