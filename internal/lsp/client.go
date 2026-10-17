@@ -20,12 +20,12 @@ func NewClient(mgr *Manager) *Client {
 }
 
 // WorkspaceSymbol fans one query out over every mapped instance. Each
-// readiness, call or decode failure is collected and reported as that
-// server's diagnostic; an instance that decoded any reply — including a valid
-// empty one — counts as responding. When no instance exists, or no instance
-// answered successfully, the collected failures are the returned error. A
-// successful reply yields the merged, deduplicated symbols with the
-// failed-server diagnostics appended.
+// readiness, call or decode failure is collected; an instance that decoded
+// any reply — including a valid empty one — counts as responding. When no
+// instance exists, or no instance answered successfully, the collected
+// failures are the returned error. A successful reply yields the merged,
+// deduplicated symbols (or, for a valid empty reply, the no-symbols text),
+// with unavailable or failed servers simply omitted.
 func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, error) {
 	instances := c.mgr.AllInstances()
 	if len(instances) == 0 {
@@ -47,8 +47,8 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 		if err := inst.waitReady(ctx); err != nil {
 			// An observed caller cancellation returns the symbols collected
 			// so far with the cancellation error instead of swallowing it;
-			// an unavailable server without cancellation contributes its
-			// failure diagnostic.
+			// without cancellation the failure is collected for the
+			// all-failed outcome.
 			if ctx.Err() != nil {
 				return formatSymbols(all), ctx.Err()
 			}
@@ -92,10 +92,6 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 	} else {
 		b.WriteString(formatSymbols(all))
 	}
-	for _, failure := range failures {
-		b.WriteString("\n")
-		b.WriteString(failure)
-	}
 	return b.String(), nil
 }
 
@@ -127,9 +123,9 @@ func formatSymbols(all []protocol.SymbolInformation) string {
 // GetDiagnosticsCanonical is the one diagnostics read: it groups the paths by
 // serving instance, synchronizes every group through the canonical no-follow
 // read — a replaced symlink leaf and non-regular or hardlinked files are
-// refused, and no substituted content is ever sent — and samples only the
-// successfully synchronized paths. Unsupported paths, readiness failures and
-// document-open refusals become per-file could-not-check diagnostics: when
+// refused, and no substituted content is ever sent — and renders every grouped
+// path's diagnostic cache. Unsupported paths, readiness failures and
+// document-open refusals become per-file could-not-check diagnostics; when
 // none synchronizes, those collected failures are the ordinary error, returned
 // without the sample wait, and only an entirely empty collection (no path at
 // all) falls back to the plain unavailability text. Otherwise the result is
@@ -137,9 +133,8 @@ func formatSymbols(all []protocol.SymbolInformation) string {
 // latest edit.
 func (c *Client) GetDiagnosticsCanonical(ctx context.Context, paths []string) (string, error) {
 	type serverPaths struct {
-		inst   *instance
-		paths  []string
-		synced []string
+		inst  *instance
+		paths []string
 	}
 	groups := make(map[string]*serverPaths)
 	var refused []string
@@ -170,7 +165,6 @@ func (c *Client) GetDiagnosticsCanonical(ctx context.Context, paths []string) (s
 				refused = append(refused, fmt.Sprintf("%s: %v", p, err))
 				continue
 			}
-			g.synced = append(g.synced, p)
 			synced++
 		}
 	}
@@ -203,7 +197,7 @@ func (c *Client) GetDiagnosticsCanonical(ctx context.Context, paths []string) (s
 	var b strings.Builder
 	totalErrors := 0
 	for _, g := range groups {
-		for _, p := range g.synced {
+		for _, p := range g.paths {
 			if totalErrors >= 50 {
 				break
 			}

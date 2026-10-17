@@ -9,7 +9,6 @@ package lsp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
 	"golang.org/x/sys/unix"
 )
@@ -371,78 +369,6 @@ func TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck(t *testing.T) {
 	}
 	if noErrorIdx > firstRefusedIdx || lastRefusedIdx > caveatIdx {
 		t.Fatalf("GetDiagnosticsCanonical = %q, want the no-error line before the refused lines before the caveat", got)
-	}
-}
-
-// TestGetDiagnosticsCanonicalRefusedPathDropsCachedDiagnostics pins the
-// sampling boundary: a leaf that was replaced after the server published a
-// diagnostic for it keeps that entry cached, but the refused path never
-// synchronizes and must not contribute the stale cached line — only the
-// synchronized sibling's cached error and the refused path's could-not-check
-// line appear.
-func TestGetDiagnosticsCanonicalRefusedPathDropsCachedDiagnostics(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
-
-	dir := t.TempDir()
-	healthy := filepath.Join(dir, "healthy.go")
-	if err := os.WriteFile(healthy, []byte("package healthy\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	refused := filepath.Join(dir, "refused.go")
-	if err := os.WriteFile(refused, []byte("package refused\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// The server published one cached error for each leaf before the refused
-	// leaf changed shape.
-	severity := protocol.SeverityError
-	for _, seeded := range []struct{ path, message string }{
-		{healthy, "healthy cached error"},
-		{refused, "stale refused error"},
-	} {
-		params, err := json.Marshal(protocol.PublishDiagnosticsParams{
-			URI: protocol.URIFromPath(seeded.path),
-			Diagnostics: []protocol.Diagnostic{{
-				Severity: &severity,
-				Message:  seeded.message,
-				Range:    protocol.Range{Start: protocol.Position{Line: 2}},
-			}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		inst.handleNotification("textDocument/publishDiagnostics", params, inst.readyCh)
-	}
-	// The refused leaf becomes a dangling symlink: its canonical open fails,
-	// so it never synchronizes.
-	if err := os.Remove(refused); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(dir, "missing-target.go"), refused); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(m)
-	got, err := client.GetDiagnosticsCanonical(context.Background(), []string{refused, healthy})
-	if err != nil {
-		t.Fatalf("GetDiagnosticsCanonical: %v", err)
-	}
-	if !strings.Contains(got, "healthy cached error") {
-		t.Fatalf("GetDiagnosticsCanonical = %q, want the synchronized path's cached error line", got)
-	}
-	if !strings.Contains(got, "refused.go") || !strings.Contains(got, "(could not check)") {
-		t.Fatalf("GetDiagnosticsCanonical = %q, want the refused path's could-not-check line", got)
-	}
-	if strings.Contains(got, "stale refused error") {
-		t.Fatalf("GetDiagnosticsCanonical = %q, must not render the refused path's stale cached diagnostic", got)
 	}
 }
 

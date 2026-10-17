@@ -694,33 +694,11 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	store := emptyStore(t)
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
 	defer cancel()
-	h.deps.Jobs = stubJobStopper{}
 	session := createSession(t, h)
-
-	// The public job registration reserves the completion identity; the
-	// producer runs only after the cancel selects the closed delivery path.
-	start := make(chan struct{})
-	produced := make(chan error, 1)
-	if err := h.StartJob(context.Background(), session, jobFixtureID, func(_ context.Context, completionID string) error {
-		go func() {
-			<-start
-			produced <- h.DeliverBackgroundCompletion(context.Background(), session, completionID, "job done")
-		}()
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
-	}
 	c := cachedCoordinator(t, h, session)
-	var member *backgroundMember
-	c.mu.Lock()
-	for _, m := range c.group.members {
-		if m.kind == memberJob && m.id == jobFixtureID {
-			member = m
-		}
-	}
-	c.mu.Unlock()
-	if member == nil {
-		t.Fatalf("the Job's member is missing after StartJob")
+	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
 	}
 
 	// The closed delivery's signal insert fails before any durable write with
@@ -753,7 +731,10 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	}
 
 	cancel() // the not-receivable parent selects the closed delivery path
-	close(start)
+	produced := make(chan error, 1)
+	go func() {
+		produced <- h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "job done")
+	}()
 	<-parked
 	select {
 	case <-member.done:

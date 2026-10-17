@@ -28,11 +28,11 @@ var localEncoding = sync.OnceValues(func() (*tiktoken.Tiktoken, error) {
 
 // newLocalEncoding constructs the pinned tiktoken-go cl100k_base encoding from
 // one rank table. Every nonempty line must be exactly one nonempty base64
-// token and one non-negative decimal rank, and token and rank identities must
-// each be unique; anything else is rejected instead of partially loaded.
+// token and one non-negative decimal rank, and token identities must be
+// unique; a duplicate rank identity is rejected by NewCoreBPE's reverse-map
+// size check. Anything else is rejected instead of partially loaded.
 func newLocalEncoding(data []byte) (*tiktoken.Tiktoken, error) {
 	ranks := make(map[string]int)
-	rankOwners := make(map[int]string)
 	for index, line := range strings.Split(string(data), "\n") {
 		if line == "" {
 			continue
@@ -55,11 +55,7 @@ func newLocalEncoding(data []byte) (*tiktoken.Tiktoken, error) {
 		if _, duplicate := ranks[string(token)]; duplicate {
 			return nil, fmt.Errorf("rank line %d: duplicate token %q", index+1, tokenText)
 		}
-		if owner, duplicate := rankOwners[rank]; duplicate {
-			return nil, fmt.Errorf("rank line %d: rank %d already identifies %q", index+1, rank, owner)
-		}
 		ranks[string(token)] = rank
-		rankOwners[rank] = string(token)
 	}
 	if len(ranks) == 0 {
 		return nil, errors.New("empty rank table")
