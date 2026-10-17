@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -679,6 +680,104 @@ func TestClosedDeliveryCommitsBeforeDoneCloses(t *testing.T) {
 	if len(signals) != 1 || signals[0].RelatedMember == nil || signals[0].RelatedMember.Kind != "job" ||
 		signals[0].RelatedMember.ID != jobFixtureID || signals[0].Content != "durable first" {
 		t.Fatalf("committed signal = %+v, want the job-member completion", signals)
+	}
+}
+
+// TestClosedDeliveryFailureRetainedBeforeMemberFinish proves the shutdown
+// ordering contract of a failed closed delivery: the storage failure is
+// retained before the member finish can release a joiner. A controlled
+// observer barrier parks the producer after the member's done channel has
+// closed, and the public Wait must already return the original storage error
+// through that interval. Without retention before the finish the same
+// interval reports success.
+func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
+	store := emptyStore(t)
+	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
+	defer cancel()
+	h.deps.Jobs = stubJobStopper{}
+	session := createSession(t, h)
+
+	// The public job registration reserves the completion identity; the
+	// producer runs only after the cancel selects the closed delivery path.
+	start := make(chan struct{})
+	produced := make(chan error, 1)
+	if err := h.StartJob(context.Background(), session, jobFixtureID, func(_ context.Context, completionID string) error {
+		go func() {
+			<-start
+			produced <- h.DeliverBackgroundCompletion(context.Background(), session, completionID, "job done")
+		}()
+		return nil
+	}); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	c := cachedCoordinator(t, h, session)
+	var member *backgroundMember
+	c.mu.Lock()
+	for _, m := range c.group.members {
+		if m.kind == memberJob && m.id == jobFixtureID {
+			member = m
+		}
+	}
+	c.mu.Unlock()
+	if member == nil {
+		t.Fatalf("the Job's member is missing after StartJob")
+	}
+
+	// The closed delivery's signal insert fails before any durable write with
+	// a storage-class error.
+	store.entryHook = func(draft EntryDraft) error {
+		if draft.Kind == EntrySignal {
+			return fmt.Errorf("%w: injected storage failure", ErrStorage)
+		}
+		return nil
+	}
+
+	// The barrier parks the producer inside the member finish's Job-scoped
+	// invalidation — after done closed — without injecting the failure latch
+	// or altering state; only the Job's own invalidation is gated.
+	parked := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+	finished := 0
+	h.deps.Observe = func(fact HarnessFact) {
+		if fact.Kind != FactInvalidation || fact.JobID != jobFixtureID {
+			return
+		}
+		finished++
+		select {
+		case parked <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+
+	cancel() // the not-receivable parent selects the closed delivery path
+	close(start)
+	<-parked
+	select {
+	case <-member.done:
+	default:
+		t.Fatalf("the member finish invalidation fired before done closed")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	if err := h.Wait(waitCtx); !errors.Is(err, ErrStorage) || !strings.Contains(err.Error(), "injected storage failure") {
+		t.Fatalf("Wait while the failed delivery is parked after member finish = %v, want the retained storage failure", err)
+	}
+
+	release()
+	if err := <-produced; !errors.Is(err, ErrStorage) {
+		t.Fatalf("closed delivery = %v, want the storage class", err)
+	}
+	c.mu.Lock()
+	_, present := c.group.members[member.completionID]
+	c.mu.Unlock()
+	if present {
+		t.Fatalf("the member survived its finish")
+	}
+	if finished != 1 {
+		t.Fatalf("the Job's finish invalidation fired %d time(s), want exactly once", finished)
 	}
 }
 

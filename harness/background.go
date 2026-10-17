@@ -171,9 +171,15 @@ func backgroundDeliveryPriority(h *Harness, c *coordinator, item *pendingMessage
 // mode: a not-receivable parent commits the durable background_completion
 // signal entry; a receivable active parent steers the completion into the
 // running Operation; a receivable idle parent admits it as an Operation under
-// the completion identity. The claimed member finishes only after the
-// delivery attempt, so a successful closed record commits before the member
-// is marked terminal; a second delivery is a no-op.
+// the completion identity. A delivery failure is retained through the Harness
+// storage latch before the claimed member finishes, so a joiner released by
+// the member finish observes the retained error; the claimed member still
+// finishes only after the delivery attempt, so a successful closed record
+// commits before the member is marked terminal, and a second delivery is a
+// no-op. Delivery is one attempt with no retry and no fallback write, and an
+// exited Job is removed after its callback: a process read cannot recover a
+// failed post-exit delivery's completion itself; the child's history is
+// separate evidence.
 func (h *Harness) DeliverBackgroundCompletion(ctx context.Context, sessionID, completionID, content string) error {
 	if content == "" {
 		return invalidInput("background completion content must be non-empty")
@@ -191,10 +197,10 @@ func (h *Harness) DeliverBackgroundCompletion(ctx context.Context, sessionID, co
 		return nil
 	}
 	err := h.deliverBackgroundCompletion(ctx, cached, member, content)
-	h.finishBackgroundMember(cached, member)
 	if err != nil {
 		h.recordStorageFailure(err)
 	}
+	h.finishBackgroundMember(cached, member)
 	return err
 }
 
