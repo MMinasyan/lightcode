@@ -13,7 +13,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/pkoukk/tiktoken-go"
 )
 
 // publicFactSink is the external suite's synchronous passive observer.
@@ -127,6 +126,23 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 	}
 }
 
+// publicChildSummary is the child fixture's projected summary turn: its
+// message text and its pinned cl100k_base cost below describe the same
+// literal.
+const publicChildSummary = "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]"
+
+// publicFixtureTokens pins the cl100k_base cost of every literal this fixture
+// sizes with, over the bundled tokenizer data. The estimator below adds the
+// flat +4 per message, so the fixture window is the exact cost of the
+// assembled request minus one token.
+var publicFixtureTokens = map[string]int{
+	"system":                      1,
+	strings.Repeat("seed ", 80):   81,
+	"child answer":                2,
+	publicChildSummary:            17,
+	strings.Repeat("word ", 4000): 4001,
+}
+
 // TestPublicLaunchChildSessionAutomaticCompaction retains the launched-child
 // trigger oracle on both stores and extends it with the frozen-checkpoint
 // steering row: the child's actual compact request parks inside the
@@ -140,17 +156,20 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx, cancel := context.WithCancel(context.Background())
 		sink := &publicFactSink{}
-		enc, err := tiktoken.GetEncoding("cl100k_base")
-		if err != nil {
-			t.Fatal(err)
+		fixtureTokens := func(text string) int {
+			tokens, ok := publicFixtureTokens[text]
+			if !ok {
+				t.Fatalf("no pinned token vector for fixture text %q", text)
+			}
+			return tokens
 		}
 		estimate := func(messages []model.Message) int {
 			total := 0
 			for _, message := range messages {
-				total += len(enc.Encode(message.TextContent(), nil, nil)) + 4
+				total += fixtureTokens(message.TextContent()) + 4
 				for _, call := range message.ToolCalls {
-					total += len(enc.Encode(call.Name, nil, nil))
-					total += len(enc.Encode(string(call.Arguments), nil, nil))
+					total += fixtureTokens(call.Name)
+					total += fixtureTokens(string(call.Arguments))
 				}
 			}
 			return total
@@ -300,7 +319,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		mu.Unlock()
 		if fits := estimate([]model.Message{
 			firstRequest.Messages[0],
-			{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]"}}},
+			{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: publicChildSummary}}},
 		}) + reserve; fits > window {
 			t.Fatalf("summary request %d does not fit overflowing window %d", fits, window)
 		}
@@ -364,7 +383,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			}
 		}
 		got := texts(rebuilt)
-		if rebuiltCalls != 1 || len(got) != 2 || got[1] != "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]" || rebuilt.Messages[1].Source != compactRef {
+		if rebuiltCalls != 1 || len(got) != 2 || got[1] != publicChildSummary || rebuilt.Messages[1].Source != compactRef {
 			t.Fatalf("child rebuilt calls/projection = %d/%q", rebuiltCalls, got)
 		}
 		successorGot := texts(successor)

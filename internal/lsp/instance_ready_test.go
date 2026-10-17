@@ -535,13 +535,12 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 	}
 }
 
-// TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite proves the
-// retained-instance terminal admission on openFile: after permanent close wins
-// on a ready instance, openFile must return the unavailable error before
-// reading the file or sending didOpen — no protocol write reaches the server.
-// It fails with the pre-fix openFile, which reads the file and sends didOpen
-// over the still-live connection.
-func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
+// TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite proves
+// the retained-instance terminal admission on the canonical open: after
+// permanent close wins on a ready instance, openFileCanonical must return the
+// unavailable error before reading the file or sending didOpen — no protocol
+// write reaches the server.
+func TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
@@ -555,8 +554,8 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := inst.openFile(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("openFile after permanent close = %v, want the unavailable error", err)
+	if err := inst.openFileCanonical(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("openFileCanonical after permanent close = %v, want the unavailable error", err)
 	}
 	// No protocol write: the server saw the startup initialize/initialized
 	// requests but never a didOpen.
@@ -565,7 +564,7 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 		t.Fatalf("read requests log: %v", err)
 	}
 	if strings.Contains(string(data), "textDocument/didOpen") {
-		t.Fatal("openFile after permanent close sent didOpen to the server")
+		t.Fatal("openFileCanonical after permanent close sent didOpen to the server")
 	}
 }
 
@@ -735,5 +734,43 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 	}
 	if procDone != fresh {
 		t.Fatal("shutdown replaced the newer attempt's procDone")
+	}
+}
+
+// TestStartWithCancelledContextLaunchesNothing proves the pre-spawn guard: a
+// start whose supplied context is already cancelled refuses the attempt
+// before binary resolution, pipes or spawn, ends it so the instance stays
+// claimable, and returns the context error. The startProbe seam counts
+// successful cmd.Start invocations, so the count does not depend on whether
+// the child writes its launch log before it is killed.
+func TestStartWithCancelledContextLaunchesNothing(t *testing.T) {
+	var starts atomic.Int64
+	oldProbe := startProbe
+	startProbe = func() { starts.Add(1) }
+	t.Cleanup(func() { startProbe = oldProbe })
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := inst.start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start with a cancelled context: error = %v, want context.Canceled", err)
+	}
+	if n := starts.Load(); n != 0 {
+		t.Fatalf("successful cmd.Start invocations = %d, want 0", n)
+	}
+	if n := countLaunches(log); n != 0 {
+		t.Fatalf("server processes launched = %d, want 0", n)
+	}
+
+	// The refused attempt ended the launch it claimed, so the instance is
+	// claimable again: a live start still works.
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady after the refused attempt: %v", err)
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched = %d, want 1 after the live start", n)
 	}
 }

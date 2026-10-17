@@ -52,8 +52,9 @@ const (
 
 	// diagnosticsDescription says the tool checks the files changed by this
 	// Session — every call recomputes the candidates, there is no
-	// since-the-previous-query cursor.
-	diagnosticsDescription = "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)."
+	// since-the-previous-query cursor — and reports an asynchronous cache
+	// sample rather than proof that analysis of the latest edit finished.
+	diagnosticsDescription = "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings). Diagnostics are asynchronous and may not reflect the latest edit."
 	diagnosticsParameters  = `{"type":"object","properties":{}}`
 
 	workspaceSymbolDescription = "Search for symbols by name across the project. Returns matching functions, types, variables, etc. with their file locations."
@@ -333,9 +334,9 @@ func (t diagnosticsTool) Prepare(_ context.Context, tc runtime.ToolContext, call
 	return t.inst.prepareLSP(tc, call, func(ctx context.Context, client *lsp.Client, canonicalRoot string) harness.ToolOutcome {
 		paths, err := snapshot.ListChangedFiles(t.inst.dataDir, tc.AdmittedEntry.SessionID)
 		if err != nil {
-			// The retained listing-error content, settled as success with
-			// the cap applied; a listing error discards all partial data.
-			return toolOutcome(call.ID, ctx, "error: could not list changed files", nil)
+			// The enumeration failure is the outcome: its actual error,
+			// capped like every other ordinary error.
+			return toolOutcome(call.ID, ctx, "", err)
 		}
 		paths = filterInsideRoot(paths, canonicalRoot)
 		if len(paths) == 0 {
@@ -359,8 +360,8 @@ func filterInsideRoot(paths []string, canonicalRoot string) []string {
 	return filtered
 }
 
-// workspaceSymbolTool is the workspace_symbol export: the legacy description,
-// schema and outcomes over the shared detection.
+// workspaceSymbolTool is the workspace_symbol export: the retained
+// description, schema and outcomes over the shared detection.
 type workspaceSymbolTool struct{ inst *instance }
 
 func (workspaceSymbolTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
@@ -374,17 +375,20 @@ func (workspaceSymbolTool) describe(_ runtime.Invocation, _ runtime.ToolConstrai
 	}, nil
 }
 
-// validateQueryArgs consumes the tool's one argument: absent, null and
-// wrong-typed query values are argument-validation errors; a present empty
-// string passes normalization and is rejected at execution with the
-// retained text.
+// validateQueryArgs consumes the tool's one argument: exactly one present,
+// non-empty string. Absent, null, wrong-typed and empty query values are
+// argument-validation errors; there is no trimming or whitespace policy.
 func validateQueryArgs(args map[string]any) error {
 	v, present := args["query"]
 	if !present || v == nil {
 		return errors.New("workspace_symbol: query is required")
 	}
-	if _, ok := v.(string); !ok {
+	s, ok := v.(string)
+	if !ok {
 		return errors.New("workspace_symbol: query must be a string")
+	}
+	if s == "" {
+		return errors.New("workspace_symbol: query is required")
 	}
 	return nil
 }
@@ -398,11 +402,11 @@ func (t workspaceSymbolTool) Prepare(_ context.Context, tc runtime.ToolContext, 
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
+	if err := validateQueryArgs(args); err != nil {
+		return immediateError(call.ID, err)
+	}
 	query, _ := args["query"].(string)
 	return t.inst.prepareLSP(tc, call, func(ctx context.Context, client *lsp.Client, _ string) harness.ToolOutcome {
-		if query == "" {
-			return toolOutcome(call.ID, ctx, "error: query is required", nil)
-		}
 		content, err := client.WorkspaceSymbol(ctx, query)
 		return toolOutcome(call.ID, ctx, content, err)
 	})

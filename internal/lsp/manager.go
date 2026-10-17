@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
@@ -17,7 +16,6 @@ type Manager struct {
 	projectRoot string
 	home        string
 	onWarning   func(kind, message string)
-	onSignal    func(content string)
 	// closed is set by ShutdownAll so a server still starting during shutdown is
 	// torn down instead of registered after the shutdown snapshot.
 	closed bool
@@ -35,12 +33,6 @@ func (m *Manager) SetWarningHandler(fn func(kind, message string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onWarning = fn
-}
-
-func (m *Manager) SetSignalHandler(fn func(content string)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.onSignal = fn
 }
 
 func (m *Manager) Detect(ctx context.Context) {
@@ -87,10 +79,6 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 		if err := m.install(ctx, def); err != nil {
 			m.emitWarning("lsp_install_failed",
 				fmt.Sprintf("Failed to install %s language server: %v", def.Name, err))
-			m.emitSignal(fmt.Sprintf("The %s language server could not be installed (%v). "+
-				"LSP tools (diagnostics, go_to_definition, find_references, hover, go_to_implementation) "+
-				"will not work for %s files. Use read_file and run_command (grep) instead.",
-				def.Name, err, strings.Join(def.Extensions, ", ")))
 			return
 		}
 		binary = server.ResolveBinary(m.home, def)
@@ -104,9 +92,6 @@ func (m *Manager) startServer(ctx context.Context, def *server.Definition) {
 	inst := newInstance(def, m.projectRoot, m.home, ctx, func(name string) {
 		m.emitWarning("lsp_server_unavailable",
 			fmt.Sprintf("Language server %s has crashed repeatedly and is unavailable.", name))
-		m.emitSignal(fmt.Sprintf("The %s language server is unavailable due to repeated crashes. "+
-			"LSP tools will not work for %s files. Use read_file and run_command (grep) instead.",
-			name, strings.Join(def.Extensions, ", ")))
 	})
 
 	m.mu.Lock()
@@ -209,14 +194,5 @@ func (m *Manager) emitWarning(kind, message string) {
 	m.mu.Unlock()
 	if fn != nil {
 		fn(kind, message)
-	}
-}
-
-func (m *Manager) emitSignal(content string) {
-	m.mu.Lock()
-	fn := m.onSignal
-	m.mu.Unlock()
-	if fn != nil {
-		fn(content)
 	}
 }

@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -18,10 +19,17 @@ func NewClient(mgr *Manager) *Client {
 	return &Client{mgr: mgr}
 }
 
+// WorkspaceSymbol fans one query out over every mapped instance. Each
+// readiness, call or decode failure is collected; an instance that decoded
+// any reply — including a valid empty one — counts as responding. When no
+// instance exists, or no instance answered successfully, the collected
+// failures are the returned error. A successful reply yields the merged,
+// deduplicated symbols (or, for a valid empty reply, the no-symbols text),
+// with unavailable or failed servers simply omitted.
 func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, error) {
 	instances := c.mgr.AllInstances()
 	if len(instances) == 0 {
-		return "No language servers available.", nil
+		return "", errors.New("No language servers available.")
 	}
 
 	params := protocol.WorkspaceSymbolParams{Query: query}
@@ -32,16 +40,19 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 	}
 	seen := make(map[key]bool)
 	var all []protocol.SymbolInformation
+	var failures []string
+	replied := 0
 
 	for _, inst := range instances {
 		if err := inst.waitReady(ctx); err != nil {
 			// An observed caller cancellation returns the symbols collected
 			// so far with the cancellation error instead of swallowing it;
-			// an unavailable server without cancellation keeps its ordinary
-			// omission.
+			// without cancellation the failure is collected for the
+			// all-failed outcome.
 			if ctx.Err() != nil {
 				return formatSymbols(all), ctx.Err()
 			}
+			failures = append(failures, fmt.Sprintf("%s: %v", inst.def.Name, err))
 			continue
 		}
 		result, err := inst.call(ctx, "workspace/symbol", params)
@@ -49,12 +60,15 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 			if ctx.Err() != nil {
 				return formatSymbols(all), ctx.Err()
 			}
+			failures = append(failures, fmt.Sprintf("%s: %v", inst.def.Name, err))
 			continue
 		}
 		var syms []protocol.SymbolInformation
 		if err := json.Unmarshal(result, &syms); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", inst.def.Name, err))
 			continue
 		}
+		replied++
 		for _, s := range syms {
 			k := key{s.Name, s.Location.URI, s.Location.Range.Start.Line}
 			if seen[k] {
@@ -65,10 +79,20 @@ func (c *Client) WorkspaceSymbol(ctx context.Context, query string) (string, err
 		}
 	}
 
-	if len(all) == 0 {
-		return "No symbols found.", nil
+	if replied == 0 {
+		return "", errors.New(strings.Join(failures, "; "))
 	}
-	return formatSymbols(all), nil
+
+	var b strings.Builder
+	if len(all) == 0 {
+		// Only the responding servers can speak for their own results: an
+		// empty successful subset is not evidence that unavailable servers
+		// found nothing.
+		b.WriteString("No symbols were reported by the responding language servers.")
+	} else {
+		b.WriteString(formatSymbols(all))
+	}
+	return b.String(), nil
 }
 
 // formatSymbols is the shared symbol formatting: the 20-symbol cap and the
@@ -96,37 +120,29 @@ func formatSymbols(all []protocol.SymbolInformation) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// diagOpener opens one path's document for the sync: the legacy reader reads
-// with os.ReadFile, the canonical reader through safefs.
-type diagOpener func(ctx context.Context, inst *instance, path string) error
-
-func (c *Client) GetDiagnostics(ctx context.Context, paths []string) (string, error) {
-	return c.getDiagnostics(ctx, paths, func(ctx context.Context, inst *instance, path string) error {
-		return inst.openFile(ctx, path)
-	})
-}
-
-// GetDiagnosticsCanonical shares the query/formatting/sync body with
-// GetDiagnostics and differs only in the per-file content read: the no-follow
-// safefs open refuses a replaced symlink leaf and non-regular or hardlinked
-// files, and no substituted content is ever sent — a failed read reports the
-// retained could-not-check line.
+// GetDiagnosticsCanonical is the one diagnostics read: it groups the paths by
+// serving instance, synchronizes every group through the canonical no-follow
+// read — a replaced symlink leaf and non-regular or hardlinked files are
+// refused, and no substituted content is ever sent — and renders every grouped
+// path's diagnostic cache. Unsupported paths, readiness failures and
+// document-open refusals become per-file could-not-check diagnostics; when
+// none synchronizes, those collected failures are the ordinary error, returned
+// without the sample wait, and only an entirely empty collection (no path at
+// all) falls back to the plain unavailability text. Otherwise the result is
+// explicitly an asynchronous cache sample that never certifies analysis of the
+// latest edit.
 func (c *Client) GetDiagnosticsCanonical(ctx context.Context, paths []string) (string, error) {
-	return c.getDiagnostics(ctx, paths, func(ctx context.Context, inst *instance, path string) error {
-		return inst.openFileCanonical(ctx, path)
-	})
-}
-
-func (c *Client) getDiagnostics(ctx context.Context, paths []string, open diagOpener) (string, error) {
 	type serverPaths struct {
 		inst  *instance
 		paths []string
 	}
 	groups := make(map[string]*serverPaths)
+	var refused []string
 
 	for _, p := range paths {
 		inst := c.mgr.ForFile(p)
 		if inst == nil {
+			refused = append(refused, fmt.Sprintf("%s: no language server for this file", p))
 			continue
 		}
 		key := inst.def.Name
@@ -136,25 +152,37 @@ func (c *Client) getDiagnostics(ctx context.Context, paths []string, open diagOp
 		groups[key].paths = append(groups[key].paths, p)
 	}
 
-	if len(groups) == 0 {
-		return "No language servers available for the modified files.", nil
-	}
-
-	var openErrors []string
+	synced := 0
 	for _, g := range groups {
 		if err := g.inst.waitReady(ctx); err != nil {
+			for _, p := range g.paths {
+				refused = append(refused, fmt.Sprintf("%s: %v", p, err))
+			}
 			continue
 		}
 		for _, p := range g.paths {
-			if err := open(ctx, g.inst, p); err != nil {
-				openErrors = append(openErrors, fmt.Sprintf("%s: %v", p, err))
+			if err := g.inst.openFileCanonical(ctx, p); err != nil {
+				refused = append(refused, fmt.Sprintf("%s: %v", p, err))
+				continue
 			}
+			synced++
 		}
 	}
 
-	var b strings.Builder
-	for _, e := range openErrors {
-		fmt.Fprintf(&b, "%s (could not check)\n", e)
+	if synced == 0 {
+		// Nothing was synchronized, so there is nothing to sample: the
+		// collected per-file failures are the outcome. An observed caller
+		// cancellation still returns its error with the accumulated bounded
+		// partial content, and an empty collection falls back to the plain
+		// unavailability text.
+		partial := couldNotCheckContent(refused)
+		if err := ctx.Err(); err != nil {
+			return partial, err
+		}
+		if partial == "" {
+			return "", errors.New("No language servers available for the modified files.")
+		}
+		return "", errors.New(partial)
 	}
 
 	select {
@@ -163,9 +191,10 @@ func (c *Client) getDiagnostics(ctx context.Context, paths []string, open diagOp
 		// The observed caller cancellation returns the could-not-check
 		// content accumulated so far with the cancellation error instead of
 		// swallowing it.
-		return strings.TrimRight(b.String(), "\n"), ctx.Err()
+		return couldNotCheckContent(refused), ctx.Err()
 	}
 
+	var b strings.Builder
 	totalErrors := 0
 	for _, g := range groups {
 		for _, p := range g.paths {
@@ -188,9 +217,28 @@ func (c *Client) getDiagnostics(ctx context.Context, paths []string, open diagOp
 			}
 		}
 	}
-
-	if b.Len() == 0 {
-		return "No errors found.", nil
+	if totalErrors == 0 {
+		b.WriteString("No error diagnostics are currently reported for the synchronized files.\n")
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	if len(refused) > 0 {
+		b.WriteString(couldNotCheckLines(refused))
+	}
+	b.WriteString("Diagnostics are asynchronous and may not reflect the latest edit.")
+	return b.String(), nil
+}
+
+// couldNotCheckLines renders the per-file refused-path diagnostics: one
+// "path: error (could not check)" line each.
+func couldNotCheckLines(refused []string) string {
+	var b strings.Builder
+	for _, r := range refused {
+		fmt.Fprintf(&b, "%s (could not check)\n", r)
+	}
+	return b.String()
+}
+
+// couldNotCheckContent is the same rendering without the trailing newline,
+// the shape error and interrupted outcomes carry.
+func couldNotCheckContent(refused []string) string {
+	return strings.TrimRight(couldNotCheckLines(refused), "\n")
 }

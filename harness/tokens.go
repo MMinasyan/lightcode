@@ -1,51 +1,94 @@
 package harness
 
 import (
+	_ "embed"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/pkoukk/tiktoken-go"
 )
 
-// loadEncoding is the one encoding-acquisition seam: a plain function so a
-// failed acquisition is retried on the next estimate instead of latching.
-// Tests override it to force the characters/3 fallback deterministically.
-var loadEncoding = func() (*tiktoken.Tiktoken, error) {
-	return tiktoken.GetEncoding("cl100k_base")
-}
+// cl100kBaseData is the bundled cl100k_base mergeable-rank table; see
+// data/LICENSE for its notice.
+//
+//go:embed data/cl100k_base.tiktoken
+var cl100kBaseData []byte
 
-// cachedEncoderMu guards the cached encoder, and cachedEncoder holds the one
-// successfully loaded cl100k_base encoding — tiktoken-go caches nothing and
-// a per-call acquisition costs tens of milliseconds on every token estimate.
-var (
-	cachedEncoderMu sync.Mutex
-	cachedEncoder   *tiktoken.Tiktoken
-)
+// localEncoding memoizes the cl100k_base construction over the bundled data.
+// The data is fixed at build time, so a failed construction cannot repair
+// itself during a process lifetime: success and failure are both latched.
+var localEncoding = sync.OnceValues(func() (*tiktoken.Tiktoken, error) {
+	return newLocalEncoding(cl100kBaseData)
+})
 
-// cachedEncoding returns the process's encoder: a cache hit returns it, a
-// miss consults the seam and latches only its success — a failed load
-// returns its error without caching and is retried on the next estimate.
-func cachedEncoding() (*tiktoken.Tiktoken, error) {
-	cachedEncoderMu.Lock()
-	defer cachedEncoderMu.Unlock()
-	if cachedEncoder != nil {
-		return cachedEncoder, nil
+// newLocalEncoding constructs the pinned tiktoken-go cl100k_base encoding from
+// one rank table. Every nonempty line must be exactly one nonempty base64
+// token and one non-negative decimal rank, and token identities must be
+// unique; a duplicate rank identity is rejected by NewCoreBPE's reverse-map
+// size check. Anything else is rejected instead of partially loaded.
+func newLocalEncoding(data []byte) (*tiktoken.Tiktoken, error) {
+	ranks := make(map[string]int)
+	for index, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		tokenText, rankText, paired := strings.Cut(line, " ")
+		if !paired || tokenText == "" || rankText == "" || strings.Contains(rankText, " ") {
+			return nil, fmt.Errorf("malformed rank line %d", index+1)
+		}
+		token, err := base64.StdEncoding.DecodeString(tokenText)
+		if err != nil {
+			return nil, fmt.Errorf("rank line %d: %w", index+1, err)
+		}
+		if len(token) == 0 {
+			return nil, fmt.Errorf("rank line %d: empty token", index+1)
+		}
+		rank, err := strconv.Atoi(rankText)
+		if err != nil || rank < 0 {
+			return nil, fmt.Errorf("rank line %d: invalid rank %q", index+1, rankText)
+		}
+		if _, duplicate := ranks[string(token)]; duplicate {
+			return nil, fmt.Errorf("rank line %d: duplicate token %q", index+1, tokenText)
+		}
+		ranks[string(token)] = rank
 	}
-	enc, err := loadEncoding()
+	if len(ranks) == 0 {
+		return nil, errors.New("empty rank table")
+	}
+	encoding := &tiktoken.Encoding{
+		Name:           tiktoken.MODEL_CL100K_BASE,
+		PatStr:         `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`,
+		MergeableRanks: ranks,
+		SpecialTokens: map[string]int{
+			tiktoken.ENDOFTEXT:   100257,
+			tiktoken.FIM_PREFIX:  100258,
+			tiktoken.FIM_MIDDLE:  100259,
+			tiktoken.FIM_SUFFIX:  100260,
+			tiktoken.ENDOFPROMPT: 100276,
+		},
+	}
+	bpe, err := tiktoken.NewCoreBPE(encoding.MergeableRanks, encoding.SpecialTokens, encoding.PatStr)
 	if err != nil {
 		return nil, err
 	}
-	cachedEncoder = enc
-	return enc, nil
+	specialTokensSet := make(map[string]any, len(encoding.SpecialTokens))
+	for token := range encoding.SpecialTokens {
+		specialTokensSet[token] = true
+	}
+	return tiktoken.NewTiktoken(bpe, encoding, specialTokensSet), nil
 }
 
-// estimateTokens estimates the token count of the assembled context using
-// cl100k_base, falling back to characters/3 when the encoder is unavailable.
-// Per message: the message's text content plus each tool call's name and
-// arguments, plus 4. The system prompt is estimated as plain text.
-func estimateTokens(systemPrompt string, messages []model.Message) int {
-	enc, err := cachedEncoding()
-	if err != nil {
+// estimateTokensWithEncoding owns the token arithmetic over one encoder: per
+// message, the message's text content plus each tool call's name and raw
+// arguments, plus 4; the system prompt is estimated as plain text. A nil
+// encoder selects the characters/3 fallback over the same accumulated text.
+func estimateTokensWithEncoding(systemPrompt string, messages []model.Message, enc *tiktoken.Tiktoken) int {
+	if enc == nil {
 		chars := len(systemPrompt)
 		for _, m := range messages {
 			chars += len(m.TextContent())
@@ -65,4 +108,12 @@ func estimateTokens(systemPrompt string, messages []model.Message) int {
 		total += 4 // per-message overhead (role, separators)
 	}
 	return total
+}
+
+// estimateTokens estimates the token count of the assembled context with the
+// local cl100k_base encoding; a construction failure yields a nil encoder,
+// which selects the characters/3 fallback.
+func estimateTokens(systemPrompt string, messages []model.Message) int {
+	enc, _ := localEncoding()
+	return estimateTokensWithEncoding(systemPrompt, messages, enc)
 }

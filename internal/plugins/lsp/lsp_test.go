@@ -30,15 +30,20 @@ import (
 
 // fakeServerTemplate is a minimal LSP server over stdio that logs every
 // launch and request as "method uri" lines. {{LOG}} is the log path, {{DELAY}}
-// the initialize delay in seconds (holds detection), and {{CRASH}} a crash
+// the initialize delay in seconds (holds detection), {{CRASH}} a crash
 // mode ("1" exits after initialize, before readiness — the crash loop drives
-// the instance into the terminal failed state).
+// the instance into the terminal failed state), {{BAD_SYMBOL}} a mode ("1")
+// whose workspace/symbol reply is a JSON value that cannot decode into the
+// symbol array, and {{EMPTY_SYMBOL}} a mode ("1") whose workspace/symbol reply
+// is a valid empty symbol list.
 const fakeServerTemplate = `#!/usr/bin/env python3
 import json, sys, time
 
 log = "{{LOG}}"
 init_delay = {{DELAY}}
 crash = "{{CRASH}}"
+bad_symbol = "{{BAD_SYMBOL}}"
+empty_symbol = "{{EMPTY_SYMBOL}}"
 
 def send(obj):
     data = json.dumps(obj, separators=(",", ":")).encode()
@@ -79,9 +84,14 @@ while True:
             sys.exit(1)
         send({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": 0, "value": {"kind": "end"}}})
     elif method == "workspace/symbol":
-        send({"jsonrpc": "2.0", "id": body["id"], "result": [
-            {"name": "Foo", "kind": 12, "location": {"uri": "file:///w/foo.go", "range": {"start": {"line": 3}}}}
-        ]})
+        if bad_symbol:
+            send({"jsonrpc": "2.0", "id": body["id"], "result": "invalid"})
+        elif empty_symbol:
+            send({"jsonrpc": "2.0", "id": body["id"], "result": []})
+        else:
+            send({"jsonrpc": "2.0", "id": body["id"], "result": [
+                {"name": "Foo", "kind": 12, "location": {"uri": "file:///w/foo.go", "range": {"start": {"line": 3}}}}
+            ]})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": body["id"], "result": None})
     elif method == "exit":
@@ -138,14 +148,16 @@ func (s *managerSpy) home() string {
 func fakeServerHome(t *testing.T, initDelay float64) (home, requests string) {
 	t.Helper()
 	home = t.TempDir()
-	requests = plantServer(t, home, "gopls", "gopls", initDelay, "")
+	requests = plantServer(t, home, "gopls", "gopls", initDelay, "", "", "")
 	return home, requests
 }
 
 // plantServer plants one fake server binary at the definition's cache
 // directory (home/.cache/lightcode/lsp/<dirName>/<binaryName>) and returns
-// its request-log path.
-func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float64, crash string) string {
+// its request-log path. crash selects the crash mode; badSymbol the invalid
+// workspace/symbol reply mode and emptySymbol the valid empty one; empty
+// values disable each.
+func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float64, crash, badSymbol, emptySymbol string) string {
 	t.Helper()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", dirName)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -155,6 +167,8 @@ func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float
 	script := strings.ReplaceAll(fakeServerTemplate, "{{LOG}}", requests)
 	script = strings.ReplaceAll(script, "{{DELAY}}", fmt.Sprintf("%g", initDelay))
 	script = strings.ReplaceAll(script, "{{CRASH}}", crash)
+	script = strings.ReplaceAll(script, "{{BAD_SYMBOL}}", badSymbol)
+	script = strings.ReplaceAll(script, "{{EMPTY_SYMBOL}}", emptySymbol)
 	if err := os.WriteFile(filepath.Join(cacheDir, binaryName), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -386,8 +400,8 @@ func TestDetectionOnceIncludingEmptyMap(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"x"}`))
 		outcome := prepared.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No language servers available." {
-			t.Fatalf("call %d = %+v, want the retained zero-instance content", i+1, outcome.Result)
+		if outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available." {
+			t.Fatalf("call %d = %+v, want the zero-instance unavailability error", i+1, outcome.Result)
 		}
 	}
 	if n := spy.count(); n != 1 {
@@ -469,8 +483,9 @@ func TestDetectionUnderCanceledRuntimeYieldsNoUsableServers(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 		outcome := prepared.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No language servers available for the modified files." {
-			t.Fatalf("call %d under the canceled lifetime = %+v, want the no-usable-servers content", i+1, outcome.Result)
+		refused := filepath.Join(workspace, "a.go") + ": no language server for this file (could not check)"
+		if outcome.Result.Status != model.ResultError || outcome.Result.Content != refused {
+			t.Fatalf("call %d under the canceled lifetime = %+v, want the per-path could-not-check error", i+1, outcome.Result)
 		}
 	}
 	if n := logCount(t, requests, "textDocument/didOpen"); n != 0 {
@@ -798,20 +813,32 @@ func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 	}
 }
 
-// TestDiagnosticsListingErrorRetainedText: a listing error settles as the
-// retained content with success status.
-func TestDiagnosticsListingErrorRetainedText(t *testing.T) {
+// TestDiagnosticsListingFailureIsError: a valid Session identity whose
+// enumeration really fails settles as an error carrying that failure — never
+// a successful text line that reads as a clean query.
+func TestDiagnosticsListingFailureIsError(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	spy := &managerSpy{}
 	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
+	// The valid Session identity's session path is a regular file: the
+	// enumeration fails for real.
+	if err := os.MkdirAll(filepath.Join(dataDir, "code"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "code", pluginSessionID), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	diag, _ := pluginUnderTest(t, dataDir)
 	workspace := markerWorkspace(t)
 
-	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: "not-a-valid-session-id"}}, toolCall("c", "diagnostics", `{}`))
+	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "error: could not list changed files" {
-		t.Fatalf("listing error = %+v, want the retained content with success status", outcome.Result)
+	if outcome.Result.Status != model.ResultError {
+		t.Fatalf("listing failure = %+v, want an error outcome carrying the enumeration failure", outcome.Result)
+	}
+	if !strings.Contains(outcome.Result.Content, "not a directory") {
+		t.Fatalf("listing failure content = %q, want the actual enumeration error", outcome.Result.Content)
 	}
 }
 
@@ -832,19 +859,72 @@ func TestDiagnosticsNoFiles(t *testing.T) {
 	}
 }
 
-// TestWorkspaceSymbolEmptyQueryRetainedText.
-func TestWorkspaceSymbolEmptyQueryRetainedText(t *testing.T) {
+// TestWorkspaceSymbolEmptyQueryRejected: a present empty query is an
+// argument-validation error at Normalize, and a direct Prepare of the same
+// input is the immediate validation error before any service start.
+func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
+	symbol := workspaceSymbolTool{inst: &instance{}}
+	if _, err := symbol.Normalize(runtime.ToolContext{}, toolCall("c", "workspace_symbol", `{"query":""}`)); err == nil {
+		t.Fatal("workspace_symbol Normalize(empty query) = nil error, want an argument-validation error")
+	}
+
 	fakeHome, _ := fakeServerHome(t, 0)
 	spy := &managerSpy{}
 	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
+	_, symbolTool := pluginUnderTest(t, dataDir)
+	workspace := markerWorkspace(t)
+
+	prepared := symbolTool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":""}`))
+	if prepared.Immediate == nil || prepared.Immediate.Result.Status != model.ResultError {
+		t.Fatalf("empty-query preparation = %+v, want the immediate validation error", prepared)
+	}
+	if prepared.Execute != nil {
+		t.Fatal("the invalid-query preparation carries an executor")
+	}
+	if n := spy.count(); n != 0 {
+		t.Fatalf("workspace managers constructed = %d, want 0: an invalid query starts nothing", n)
+	}
+}
+
+// TestWorkspaceSymbolAllFailedIsError: a server whose workspace/symbol reply
+// cannot be decoded contributes no symbols and must not surface as a clean
+// no-symbols result.
+func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
+	home := t.TempDir()
+	plantServer(t, home, "gopls", "gopls", 0, "", "1", "")
+	spy := &managerSpy{}
+	spy.install(t, home)
+	dataDir := t.TempDir()
 	_, symbol := pluginUnderTest(t, dataDir)
 	workspace := markerWorkspace(t)
 
-	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":""}`))
+	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "error: query is required" {
-		t.Fatalf("empty query = %+v, want the retained rejection with success status", outcome.Result)
+	if outcome.Result.Status != model.ResultError {
+		t.Fatalf("undecodable symbol reply = %+v, want an error outcome carrying the failure", outcome.Result)
+	}
+}
+
+// TestWorkspaceSymbolEmptyReplyIsSuccessful: a valid empty symbol list is a
+// successful reply — a lone empty responder yields the success outcome with
+// the responding-servers text, never the all-failed unavailability error.
+func TestWorkspaceSymbolEmptyReplyIsSuccessful(t *testing.T) {
+	home := t.TempDir()
+	plantServer(t, home, "gopls", "gopls", 0, "", "", "1")
+	spy := &managerSpy{}
+	spy.install(t, home)
+	dataDir := t.TempDir()
+	_, symbol := pluginUnderTest(t, dataDir)
+	workspace := markerWorkspace(t)
+
+	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
+	outcome := prepared.Execute(context.Background())
+	if outcome.Result.Status != model.ResultSuccess {
+		t.Fatalf("empty symbol reply = %+v, want the success outcome for a responding server", outcome.Result)
+	}
+	if !strings.Contains(outcome.Result.Content, "No symbols were reported by the responding language servers.") {
+		t.Fatalf("empty symbol reply content = %q, want the responding-servers text", outcome.Result.Content)
 	}
 }
 
@@ -875,13 +955,10 @@ func TestNormalizeContracts(t *testing.T) {
 	if !strings.Contains(string(got), `"query":"x"`) || !strings.Contains(string(got), `"other":"kept"`) || strings.Contains(string(got), "_lightcode_") {
 		t.Fatalf("workspace_symbol normalized = %s", got)
 	}
-	for _, bad := range []string{`{}`, `{"query":null}`, `{"query":5}`, `{"query":["x"]}`} {
+	for _, bad := range []string{`{}`, `{"query":null}`, `{"query":5}`, `{"query":["x"]}`, `{"query":""}`} {
 		if _, err := symbol.Normalize(tc, toolCall("c", "workspace_symbol", bad)); err == nil {
 			t.Errorf("workspace_symbol Normalize(%q) = nil error, want an argument-validation error", bad)
 		}
-	}
-	if _, err := symbol.Normalize(tc, toolCall("c", "workspace_symbol", `{"query":""}`)); err != nil {
-		t.Fatalf("workspace_symbol Normalize empty string: %v", err)
 	}
 }
 
@@ -892,7 +969,7 @@ func TestDescriptionsAndPreparationShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("diagnostics describe: %v", err)
 	}
-	if diagDesc.Definition.Description != "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)." {
+	if diagDesc.Definition.Description != "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings). Diagnostics are asynchronous and may not reflect the latest edit." {
 		t.Fatalf("diagnostics description = %q", diagDesc.Definition.Description)
 	}
 	if diagDesc.Definition.Name != "diagnostics" || !diagDesc.Available {
@@ -919,8 +996,14 @@ func TestDescriptionsAndPreparationShape(t *testing.T) {
 
 	dataDir := t.TempDir()
 	workspace := markerWorkspace(t)
-	for _, tool := range []runtime.Tool{diagnosticsTool{inst: &instance{dataDir: dataDir}}, workspaceSymbolTool{inst: &instance{dataDir: dataDir}}} {
-		prepared := tool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
+	for i, tool := range []runtime.Tool{diagnosticsTool{inst: &instance{dataDir: dataDir}}, workspaceSymbolTool{inst: &instance{dataDir: dataDir}}} {
+		args := `{}`
+		if i == 1 {
+			// The symbol tool's required query: an absent one is the
+			// immediate validation error, not a preparation shape.
+			args = `{"query":"x"}`
+		}
+		prepared := tool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", args))
 		if len(prepared.Permissions) != 1 {
 			t.Fatalf("permissions = %+v, want exactly one pair", prepared.Permissions)
 		}
@@ -981,8 +1064,9 @@ func TestContentCap(t *testing.T) {
 
 // TestDiagnosticsBulkReadFailuresStayBounded proves the bulk-failure row: a
 // session group with ~1000 unreadable canonical paths (dangling symlink
-// leaves) settles success with could-not-check lines capped at the 15360-byte
-// bound by the truncation marker — bounded partial output under bulk failure.
+// leaves) refuses every leaf, so none synchronizes and the collected
+// could-not-check failure is the error outcome, capped at the 15360-byte bound
+// by the truncation marker — bounded content through the all-failed error path.
 func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	spy := &managerSpy{}
@@ -1002,8 +1086,8 @@ func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("bulk-failure diagnostics = %+v, want success", outcome.Result)
+	if outcome.Result.Status != model.ResultError {
+		t.Fatalf("bulk-failure diagnostics = %+v, want the all-failed error outcome", outcome.Result)
 	}
 	content := outcome.Result.Content
 	if len(content) > 15360 {
@@ -1052,11 +1136,11 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 	// The tool execution registers the workspace, installs the reporter, and
 	// starts detection: with no resolvable binary anywhere the detected
 	// servers fail their installations and the manager reports each through
-	// the installed callback — the retained no-server response proves
-	// detection completed, so the reports are not racing a later goroutine.
+	// the installed callback — the zero-instance error proves detection
+	// completed, so the reports are not racing a later goroutine.
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
-	if outcome := prepared.Execute(context.Background()); outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No language servers available." {
-		t.Fatalf("missing-server query = %+v, want the cold no-server response after detection", outcome.Result)
+	if outcome := prepared.Execute(context.Background()); outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available." {
+		t.Fatalf("missing-server query = %+v, want the cold no-server error after detection", outcome.Result)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {

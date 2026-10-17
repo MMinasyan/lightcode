@@ -104,6 +104,14 @@ func (inst *instance) start(ctx context.Context) (chan struct{}, error) {
 	readyCh := inst.readyCh
 	inst.mu.Unlock()
 
+	// The supplied start context is already done: refuse the attempt before
+	// binary resolution, pipes or spawn, so no process is created for a launch
+	// that cannot complete. endAttempt leaves the instance claimable.
+	if err := ctx.Err(); err != nil {
+		inst.endAttempt(readyCh)
+		return nil, err
+	}
+
 	binary := server.ResolveBinary(inst.home, inst.def)
 	if binary == "" {
 		inst.endAttempt(readyCh)
@@ -482,11 +490,6 @@ func (inst *instance) call(ctx context.Context, method string, params any) (json
 	return result, nil
 }
 
-// openFile opens one document with the legacy read path (os.ReadFile).
-func (inst *instance) openFile(ctx context.Context, absPath string) error {
-	return inst.openFileWith(ctx, absPath, os.ReadFile)
-}
-
 // readCanonicalFile reads path through safefs.OpenExisting and its returned
 // descriptor: the no-follow open refuses a replaced symlink leaf and
 // non-regular or hardlinked files, so no substituted content can ever be
@@ -500,17 +503,10 @@ func readCanonicalFile(path string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-// openFileCanonical opens one document through the canonical read path; it
-// shares the terminal admission check and the didOpen/didChange sync with
-// openFile and differs only in the content reader.
+// openFileCanonical is the one document-sync body: the terminal admission
+// check for the retained instance handle, the canonical content read, and the
+// didOpen/didChange versioned sync.
 func (inst *instance) openFileCanonical(ctx context.Context, absPath string) error {
-	return inst.openFileWith(ctx, absPath, readCanonicalFile)
-}
-
-// openFileWith is the one document-sync body: the terminal admission check
-// for the retained instance handle, the content read through the supplied
-// reader, and the didOpen/didChange versioned sync.
-func (inst *instance) openFileWith(ctx context.Context, absPath string, read func(string) ([]byte, error)) error {
 	inst.mu.Lock()
 	ver := inst.openedVer[absPath]
 	rpc := inst.rpc
@@ -525,7 +521,7 @@ func (inst *instance) openFileWith(ctx context.Context, absPath string, read fun
 		return fmt.Errorf("%s is unavailable", inst.def.Name)
 	}
 
-	content, err := read(absPath)
+	content, err := readCanonicalFile(absPath)
 	if err != nil {
 		return err
 	}
