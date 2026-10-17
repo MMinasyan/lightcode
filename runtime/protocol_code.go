@@ -2,8 +2,6 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
@@ -261,8 +260,9 @@ type retainedCodeProof struct {
 
 // retainedSessionDir proves one pre-cutover snapshot-only Session directory:
 // the exact 8-hex ID, the normalized workspace root, the deterministic
-// p-<full sha256> project directory, and an existing meta whose ID,
-// ProjectPath, and recorded 16-hex project-hash prefix all match. Missing or
+// p-<full sha256> workspace storage key (the same key the permission record
+// directory uses), and an existing meta whose ID, ProjectPath, and recorded
+// 16-hex project-hash prefix all match. Missing or
 // mismatched proof fails before any snapshot read. The proof reads the
 // complete regular meta file as one JSON document through the no-follow
 // directory and regular-FD helpers and never loads turns, messages, claims,
@@ -279,9 +279,15 @@ func (r *Runtime) retainedSessionDir(workspace, legacyID string) (string, error)
 		return "", fmt.Errorf("normalize workspace: %v: %w", err, harness.ErrInvalid)
 	}
 	normalized = filepath.Clean(normalized)
-	sum := sha256.Sum256([]byte(normalized))
-	hash := hex.EncodeToString(sum[:])
-	sessionDir := filepath.Join(r.config.loader.Home(), ".lightcode", "projects", "p-"+hash, "sessions", legacyID)
+	dirID, err := config.WorkspacePermissionDirID(normalized)
+	if err != nil {
+		return "", fmt.Errorf("derive workspace storage key: %v: %w", err, harness.ErrInvalid)
+	}
+	// The meta proof records the 16-hex digest prefix of the same storage key
+	// the directory is derived from, so the proof and the location can never
+	// disagree about the workspace identity.
+	hashPrefix := strings.TrimPrefix(dirID, "p-")[:16]
+	sessionDir := filepath.Join(r.config.loader.Home(), ".lightcode", "projects", dirID, "sessions", legacyID)
 	dir, err := safefs.OpenDirectory(sessionDir)
 	if err != nil {
 		return "", noFollowOpenError("legacy session directory", sessionDir, err)
@@ -301,7 +307,7 @@ func (r *Runtime) retainedSessionDir(workspace, legacyID string) (string, error)
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return "", fmt.Errorf("legacy session meta %s is malformed: %v: %w", metaPath, err, harness.ErrInvalid)
 	}
-	if meta.ID != legacyID || meta.ProjectPath != normalized || meta.ProjectHash != hash[:16] {
+	if meta.ID != legacyID || meta.ProjectPath != normalized || meta.ProjectHash != hashPrefix {
 		return "", fmt.Errorf("legacy session meta %s does not prove id, workspace and project hash for the requested root: %w", metaPath, harness.ErrInvalid)
 	}
 	return sessionDir, nil

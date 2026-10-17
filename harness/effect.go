@@ -25,9 +25,10 @@ const interruptedToolResultContent = "Tool call interrupted."
 // maps onto.
 const invalidToolResultContent = "Tool call failed internal validation."
 
-// permissionDeniedToolResultContent is the contract-fixed model-visible
-// content of every Harness policy denial.
-const permissionDeniedToolResultContent = "Permission denied."
+// PermissionDeniedContent is the contract-fixed model-visible content of
+// every Harness policy denial; plugins that settle their own denial results
+// carry the same published string.
+const PermissionDeniedContent = "Permission denied."
 
 // maxToolDiagnosticBytes bounds one Harness-produced validation diagnostic
 // carried in a tool-result content.
@@ -959,12 +960,12 @@ func toolCallAllowed(policy PermissionPolicy, capture ExecutionCapture, plan Pre
 			return false
 		}
 		switch req.Permission {
-		case permissionFileRead:
+		case PermissionFileRead:
 			hasFile = true
-		case permissionFileWrite:
+		case PermissionFileWrite:
 			hasFile, hasWrite = true, true
 		}
-		if (req.Permission == permissionFileRead || req.Permission == permissionFileWrite) && !canonicalPathValue(req.Target) {
+		if (req.Permission == PermissionFileRead || req.Permission == PermissionFileWrite) && !canonicalPathValue(req.Target) {
 			return false
 		}
 	}
@@ -980,7 +981,7 @@ func toolCallAllowed(policy PermissionPolicy, capture ExecutionCapture, plan Pre
 				return false
 			}
 			for _, req := range plan.Permissions {
-				if req.Permission == permissionFileWrite && !containsPath(plan.CanonicalWriteDir, req.Target) {
+				if req.Permission == PermissionFileWrite && !containsPath(plan.CanonicalWriteDir, req.Target) {
 					return false
 				}
 			}
@@ -1051,7 +1052,7 @@ func unavailableToolResult(callID, name string) model.ToolResult {
 // the original call under its reserved identity: no effect began and no tool
 // active intent was written.
 func permissionDeniedToolResult(callID string) model.ToolResult {
-	return model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: permissionDeniedToolResultContent}
+	return model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: PermissionDeniedContent}
 }
 
 // validationToolResult is the immediate validation-error result for an

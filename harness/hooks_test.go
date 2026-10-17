@@ -641,7 +641,7 @@ func TestToolArgumentHookDenialSettlesAfterHooks(t *testing.T) {
 		if err != nil {
 			t.Fatalf("tool effect: %v", err)
 		}
-		if got != (model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: permissionDeniedToolResultContent}) {
+		if got != (model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent}) {
 			t.Fatalf("tool result = %+v, want the permission denial", got)
 		}
 		if executed != 0 {

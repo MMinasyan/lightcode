@@ -45,8 +45,8 @@ var dangerousReadOnlyFlags = []string{
 // ReadOnlyRunCommandDescription is the retained read-only run_command
 // description: allowlist/rejected syntax and background bullets.
 const ReadOnlyRunCommandDescription = `Executes a read-only shell command and returns combined stdout and stderr.
-- Only a fixed allowlist of read-only commands runs; anything outside it is rejected, even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, rg, and read-only git (status, log, diff, show, blame, rev-parse). Output redirection (>, >>), command substitution ($(...) or backticks), and write/exec flags (e.g. --output, -exec) are rejected.
-- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
+- Only a fixed allowlist of read-only commands runs; anything outside it is rejected, even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, rg, and read-only git (status, log, diff, show, blame, rev-parse, branch/tag listing). Output redirection (>, >>), command substitution ($(...) or backticks), and write/exec flags (e.g. --output, -exec) are rejected.
+- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
 - Do not use this tool to read file contents — use read_file.`

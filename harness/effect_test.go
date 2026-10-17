@@ -82,7 +82,7 @@ func objectNormalize(call model.ToolCall) (json.RawMessage, error) {
 // fixturePermission is one built-in-allowed declaration: command.run allows
 // any target, so fixture plans reach their intended executor or immediate
 // result through the permission boundary.
-var fixturePermission = []PermissionRequest{{Permission: permissionCommandRun, Target: "fixture"}}
+var fixturePermission = []PermissionRequest{{Permission: PermissionCommandRun, Target: "fixture"}}
 
 // effectExecution supplies the normalizer every opened execution requires.
 func effectExecution(modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) Execution {
@@ -1408,7 +1408,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 					return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 				}}
 			},
-			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: permissionDeniedToolResultContent},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent},
 			wantReplaces: 2, // denial settles through the intent-free transition
 		},
 		{
@@ -1416,7 +1416,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 			},
-			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: permissionDeniedToolResultContent},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent},
 			wantReplaces: 2,
 		},
 		{
@@ -1447,13 +1447,13 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			name: "empty permission or target pair is denied",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions: []PermissionRequest{{Permission: permissionCommandRun, Target: "fixture"}, {Permission: "", Target: "fixture"}},
+					Permissions: []PermissionRequest{{Permission: PermissionCommandRun, Target: "fixture"}, {Permission: "", Target: "fixture"}},
 					Execute: func(context.Context) ToolOutcome {
 						return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 					},
 				}
 			},
-			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: permissionDeniedToolResultContent},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent},
 			wantReplaces: 2,
 		},
 		{
@@ -1461,8 +1461,8 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
 					Permissions: []PermissionRequest{
-						{Permission: permissionCommandRun, Target: "fixture"},
-						{Permission: permissionFileWrite, Target: "/w/sub/.env"},
+						{Permission: PermissionCommandRun, Target: "fixture"},
+						{Permission: PermissionFileWrite, Target: "/w/sub/.env"},
 					},
 					CanonicalWorkspace: "/w",
 					Execute: func(context.Context) ToolOutcome {
@@ -1470,7 +1470,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 					},
 				}
 			},
-			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: permissionDeniedToolResultContent},
+			want:         model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent},
 			wantReplaces: 2,
 		},
 		{
@@ -1585,100 +1585,100 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 	}{
 		{
 			name:        "file.read inside the canonical Workspace is allowed",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "/w/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "file.write inside the canonical Workspace is allowed without readonly",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "file.read outside the canonical Workspace is denied",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "/other/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/other/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "an explicit user rule allows a file.read target outside the canonical Workspace",
 			policy:      ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.read","target":"*","access":"allow"}]}`), nil),
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "/other/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/other/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "empty file target is denied",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: ""}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: ""}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "relative file target is denied",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "lexically unclean file target is denied",
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/../b.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/../b.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name: "empty canonical Workspace root for a file plan is denied",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions: []PermissionRequest{{Permission: permissionFileRead, Target: "/w/a.txt"}},
+					Permissions: []PermissionRequest{{Permission: PermissionFileRead, Target: "/w/a.txt"}},
 					Execute: func(context.Context) ToolOutcome {
 						return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 					},
 				}
 			},
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a relative canonical Workspace root is denied",
-			plan:        filePlanRoots("w", "/w/sub", PermissionRequest{Permission: permissionFileRead, Target: "/w/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlanRoots("w", "/w/sub", PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical Workspace root is denied",
-			plan:        filePlanRoots("/w/../w", "/w/sub", PermissionRequest{Permission: permissionFileRead, Target: "/w/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlanRoots("/w/../w", "/w/sub", PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a relative canonical write root is denied",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
-			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical write root is denied",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
-			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir denies file.write",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/a.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir still allows file.read",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
-			plan:        filePlan(PermissionRequest{Permission: permissionFileRead, Target: "/w/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir confines file.write inside it",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir denies file.write outside it even when policy allows",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/other.txt"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/other.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:    "configured write_dir without a canonical prepared write root is denied",
@@ -1686,40 +1686,40 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 			policy:  allowAllWrites,
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions:        []PermissionRequest{{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}},
+					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}},
 					CanonicalWorkspace: "/w",
 					Execute: func(context.Context) ToolOutcome {
 						return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 					},
 				}
 			},
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly with write_dir allows confined writes",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/a.txt"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir does not lift the built-in sensitive-basename denial",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/.env"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "an explicit user rule overrides the sensitive denial inside write_dir",
 			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
 			policy:      allowAllWrites,
-			plan:        filePlan(PermissionRequest{Permission: permissionFileWrite, Target: "/w/sub/.env"}),
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name: "command-only plan needs no canonical bindings",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions: []PermissionRequest{{Permission: permissionCommandRun, Target: "git status"}},
+					Permissions: []PermissionRequest{{Permission: PermissionCommandRun, Target: "git status"}},
 					Execute: func(context.Context) ToolOutcome {
 						return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 					},
@@ -1730,37 +1730,37 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		{
 			name:        "unknown permission namespace is denied",
 			plan:        filePlan(PermissionRequest{Permission: "file.exec", Target: "*"}),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name: "multi-target patch with every pair allowed executes once",
 			plan: filePlan(
-				PermissionRequest{Permission: permissionFileRead, Target: "/w/src.txt"},
-				PermissionRequest{Permission: permissionFileWrite, Target: "/w/dst.txt"},
+				PermissionRequest{Permission: PermissionFileRead, Target: "/w/src.txt"},
+				PermissionRequest{Permission: PermissionFileWrite, Target: "/w/dst.txt"},
 			),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name: "multi-target patch with a denied source denies the whole call",
 			plan: filePlan(
-				PermissionRequest{Permission: permissionFileRead, Target: "/other/src.txt"},
-				PermissionRequest{Permission: permissionFileWrite, Target: "/w/dst.txt"},
+				PermissionRequest{Permission: PermissionFileRead, Target: "/other/src.txt"},
+				PermissionRequest{Permission: PermissionFileWrite, Target: "/w/dst.txt"},
 			),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name: "multi-target patch with a denied destination denies the whole call",
 			plan: filePlan(
-				PermissionRequest{Permission: permissionFileRead, Target: "/w/src.txt"},
-				PermissionRequest{Permission: permissionFileWrite, Target: "/other/dst.txt"},
+				PermissionRequest{Permission: PermissionFileRead, Target: "/w/src.txt"},
+				PermissionRequest{Permission: PermissionFileWrite, Target: "/other/dst.txt"},
 			),
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name: "immediate success passes through the same evaluation",
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions:        []PermissionRequest{{Permission: permissionFileWrite, Target: "/w/a.txt"}},
+					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/a.txt"}},
 					CanonicalWorkspace: "/w",
 					Immediate:          &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}},
 				}
@@ -1772,12 +1772,12 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
-					Permissions:        []PermissionRequest{{Permission: permissionFileWrite, Target: "/w/a.txt"}},
+					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/a.txt"}},
 					CanonicalWorkspace: "/w",
 					Immediate:          &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}},
 				}
 			},
-			wantContent: permissionDeniedToolResultContent, wantDenied: true,
+			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 	}
 	for _, tc := range cases {
@@ -1861,7 +1861,7 @@ func TestToolEffectDeniedSettlesOnlyItsCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("denied tool effect: %v", err)
 	}
-	if got.Status != model.ResultDenied || got.Content != permissionDeniedToolResultContent {
+	if got.Status != model.ResultDenied || got.Content != PermissionDeniedContent {
 		t.Fatalf("call-1 result = %+v, want the fixed denial", got)
 	}
 	if executions != 0 {

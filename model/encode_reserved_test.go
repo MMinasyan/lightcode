@@ -158,3 +158,37 @@ func TestReservedKeysIdentifiedDespiteMalformedValues(t *testing.T) {
 		}
 	})
 }
+
+// TestReservedBodyKeysReturnsOwnedCopyInFixedOrder pins the one exported
+// ownership surface: the exact ordered set, as a copy the caller owns. The
+// encoder's private checks keep their own set, so a mutated copy neither
+// changes later returns nor weakens wire rejection.
+func TestReservedBodyKeysReturnsOwnedCopyInFixedOrder(t *testing.T) {
+	want := []string{"model", "messages", "tools", "tool_choice", "stream", "stream_options", "max_tokens", "max_completion_tokens", "n"}
+	got := ReservedBodyKeys()
+	if len(got) != len(want) {
+		t.Fatalf("ReservedBodyKeys() = %#v, want %d keys", got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ReservedBodyKeys()[%d] = %q, want %q (exact order)", i, got[i], want[i])
+		}
+	}
+
+	got[0] = "temperature" // the returned slice is the caller's to modify.
+	again := ReservedBodyKeys()
+	if len(again) != len(want) || again[0] != want[0] {
+		t.Fatalf("ReservedBodyKeys() after caller mutation = %#v, want a fresh %#v", again, want)
+	}
+
+	rt := testResolved() // the key the caller renamed in its copy still rejects at the wire boundary.
+	rt.ProviderExtraBody = Extra{"model": json.RawMessage(`"forged"`)}
+	body, _, err := Encode(rt, Request{Messages: []Message{userText("hi")}}, nil)
+	var reserved *ReservedKeyError
+	if !errors.As(err, &reserved) || !errors.Is(err, ErrReservedKeys) || len(body) != 0 {
+		t.Fatalf("encode after caller mutation = (%s, %v), want the typed rejection with no body", string(body), err)
+	}
+	if len(reserved.Keys) != 1 || reserved.Keys[0] != "model" {
+		t.Fatalf("keys = %#v, want [model]", reserved.Keys)
+	}
+}

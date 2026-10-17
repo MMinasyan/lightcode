@@ -23,9 +23,8 @@ import (
 )
 
 const (
-	pluginID              = "tasks"
-	toolID                = "task"
-	permissionChildLaunch = "child.launch"
+	pluginID = "tasks"
+	toolID   = "task"
 )
 
 // taskDescriptionPrefix is the fixed model-facing introduction every task
@@ -123,7 +122,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 		return immediateError(call.ID, fmt.Errorf("unknown subagent type %q: %w", subagentType, err))
 	}
 	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: permissionChildLaunch, Target: subagentType}},
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: subagentType}},
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			operationID, err := newOperationID()
 			if err != nil {

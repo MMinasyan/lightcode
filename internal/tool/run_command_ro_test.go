@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -219,5 +220,26 @@ func TestPR11Closure_ReadOnlyRejectsHeredocAndHereString(t *testing.T) {
 				t.Fatalf("isReadOnlyCommand(%q) = true, want false (heredoc/here-string redirection must be rejected)", command)
 			}
 		})
+	}
+}
+
+// TestReadOnlyRunCommandDescriptionMatchesEnforcement pins the published
+// description to what the allowlist actually accepts: the advertised git
+// branch/tag listing modes run, and the removed working-directory suggestion
+// is one the allowlist rejects.
+func TestReadOnlyRunCommandDescriptionMatchesEnforcement(t *testing.T) {
+	for _, command := range []string{"git branch --list", "git tag -l 'v*'"} {
+		if _, err := ReadOnlyCommand(command); err != nil {
+			t.Errorf("ReadOnlyCommand(%q) error = %v, want the advertised listing mode accepted", command, err)
+		}
+	}
+	if !strings.Contains(ReadOnlyRunCommandDescription, "branch/tag listing") {
+		t.Error("read-only description does not advertise the branch/tag listing modes the allowlist accepts")
+	}
+	if strings.Contains(ReadOnlyRunCommandDescription, "cd ") {
+		t.Error("read-only description suggests a cd command the allowlist rejects")
+	}
+	if isReadOnlyCommand("cd /tmp && pwd") {
+		t.Error("isReadOnlyCommand accepted a cd chain, so the description's removed suggestion was not unsupported")
 	}
 }

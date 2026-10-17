@@ -1242,6 +1242,20 @@ func TestRetainedCodeSnapshotsProof(t *testing.T) {
 			t.Fatalf("empty retained revert = (%+v, %v), want non-nil empty success", result, err)
 		}
 
+		// The workspace proof is lexical: a non-normalized spelling of the
+		// same root normalizes to the same storage key and meta proof, while
+		// a symlinked spelling is a different key and is never resolved.
+		if turns, err := r.listRetainedCodeSnapshots(context.Background(), workspace+string(filepath.Separator)+".", legacyID); err != nil || len(turns.Turns) != 0 {
+			t.Fatalf("non-normalized workspace spelling = (%+v, %v), want the proven empty success", turns, err)
+		}
+		symlink := filepath.Join(e.home, "legacy-ws-link")
+		if err := os.Symlink(workspace, symlink); err != nil {
+			t.Fatalf("symlink workspace: %v", err)
+		}
+		if _, err := r.listRetainedCodeSnapshots(context.Background(), symlink, legacyID); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("symlinked workspace spelling = %v, want harness.ErrNotFound (lexical proof only)", err)
+		}
+
 		if _, err := r.listRetainedCodeSnapshots(context.Background(), "", legacyID); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("empty workspace = %v, want harness.ErrInvalid", err)
 		}

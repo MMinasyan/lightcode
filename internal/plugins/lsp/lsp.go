@@ -29,12 +29,6 @@ import (
 const (
 	pluginID = "lsp"
 
-	permissionWorkspaceInspect = "workspace.inspect"
-
-	// deniedToolResultContent is the contract-fixed model-visible content of
-	// every failed canonical preparation, mirroring the Harness policy denial.
-	deniedToolResultContent = "Permission denied."
-
 	// maxDiagnosticBytes is the durable diagnostic bound for the
 	// validation-class diagnostics this plugin produces, matching the
 	// Harness's own tool-boundary bound.
@@ -184,7 +178,7 @@ func immediateError(callID string, cause error) harness.PreparedTool {
 // fixed denial, per the tool-boundary contract.
 func immediateDenied(callID string) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: deniedToolResultContent},
+		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: harness.PermissionDeniedContent},
 	}}
 }
 
@@ -279,7 +273,7 @@ func (in *instance) prepareLSP(tc runtime.ToolContext, call model.ToolCall, quer
 		return immediateDenied(call.ID)
 	}
 	return harness.PreparedTool{
-		Permissions:        []harness.PermissionRequest{{Permission: permissionWorkspaceInspect, Target: canonicalRoot}},
+		Permissions:        []harness.PermissionRequest{{Permission: harness.PermissionWorkspaceInspect, Target: canonicalRoot}},
 		CanonicalWorkspace: canonicalRoot,
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			return in.execute(call.ID, tc, canonicalRoot, ctx, query)

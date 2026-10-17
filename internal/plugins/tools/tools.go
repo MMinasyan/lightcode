@@ -33,16 +33,6 @@ import (
 const (
 	pluginID = "tools"
 
-	permissionFileRead   = "file.read"
-	permissionFileWrite  = "file.write"
-	permissionCommandRun = "command.run"
-	permissionSleep      = "sleep"
-	permissionProcessOwn = "process.own"
-
-	// deniedToolResultContent is the contract-fixed model-visible content of
-	// every failed canonical preparation, mirroring the Harness policy denial.
-	deniedToolResultContent = "Permission denied."
-
 	// maxDiagnosticBytes is the durable diagnostic bound for the
 	// validation-class diagnostics this plugin produces, matching the
 	// Harness's own tool-boundary bound.
@@ -167,7 +157,7 @@ func immediateError(callID string, cause error) harness.PreparedTool {
 // fixed denial, per the tool-boundary contract.
 func immediateDenied(callID string) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: deniedToolResultContent},
+		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: harness.PermissionDeniedContent},
 	}}
 }
 
@@ -321,7 +311,7 @@ func (t readTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 		return immediateDenied(call.ID)
 	}
 	return harness.PreparedTool{
-		Permissions:        permissionPairs(permissionFileRead, prepared.Targets),
+		Permissions:        permissionPairs(harness.PermissionFileRead, prepared.Targets),
 		CanonicalWorkspace: workspace,
 		CanonicalWriteDir:  writeDirCanonical,
 		Execute: func(ctx context.Context) harness.ToolOutcome {
@@ -361,7 +351,7 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 		return immediateDenied(call.ID)
 	}
 	return harness.PreparedTool{
-		Permissions:        permissionPairs(permissionFileWrite, prepared.targets),
+		Permissions:        permissionPairs(harness.PermissionFileWrite, prepared.targets),
 		CanonicalWorkspace: workspace,
 		CanonicalWriteDir:  writeDirCanonical,
 		Execute:            prepared.execute,
@@ -551,7 +541,7 @@ func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call 
 	}
 	pairs := make([]harness.PermissionRequest, 0, len(targets))
 	for _, target := range targets {
-		pairs = append(pairs, harness.PermissionRequest{Permission: permissionCommandRun, Target: target})
+		pairs = append(pairs, harness.PermissionRequest{Permission: harness.PermissionCommandRun, Target: target})
 	}
 	spillDir := filepath.Join(t.inst.dataDir, "code", tc.AdmittedEntry.SessionID, "output")
 	return harness.PreparedTool{
@@ -752,7 +742,7 @@ func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.To
 		}
 	}
 	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: permissionSleep, Target: "*"}},
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionSleep, Target: "*"}},
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			result, err := tool.Sleep{}.Execute(ctx, map[string]any{"seconds": seconds})
 			if err != nil {
@@ -806,7 +796,7 @@ func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call mod
 		}
 		target := sessionID + "/" + id
 		return harness.PreparedTool{
-			Permissions: []harness.PermissionRequest{{Permission: permissionProcessOwn, Target: target}},
+			Permissions: []harness.PermissionRequest{{Permission: harness.PermissionProcessOwn, Target: target}},
 			Execute: func(_ context.Context) harness.ToolOutcome {
 				if action == "read" {
 					output, err := t.inst.jobs.Read(sessionID, id)
@@ -823,7 +813,7 @@ func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call mod
 		}
 	case "list":
 		return harness.PreparedTool{
-			Permissions: []harness.PermissionRequest{{Permission: permissionProcessOwn, Target: "*"}},
+			Permissions: []harness.PermissionRequest{{Permission: harness.PermissionProcessOwn, Target: "*"}},
 			Execute: func(_ context.Context) harness.ToolOutcome {
 				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.inst.jobs.List(sessionID)}}
 			},
