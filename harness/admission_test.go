@@ -289,7 +289,7 @@ func TestReadsMaterializeValidatedState(t *testing.T) {
 	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent session = %v, want ErrNotFound", err)
 	}
-	if _, _, err := h.ReadSessionHistory(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
+	if _, err := h.ReadHistoryView(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent history = %v, want ErrNotFound", err)
 	}
 	if _, err := h.ReadSessionHeader(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
@@ -329,7 +329,7 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 		return err
 	}())
 	wantCorruption(t, func() error {
-		_, _, err := h.ReadSessionHistory(context.Background(), testSessionID)
+		_, err := h.ReadHistoryView(context.Background(), testSessionID)
 		return err
 	}())
 	wantCorruption(t, func() error {
@@ -357,20 +357,20 @@ func TestChangeAgentType(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
 
-	beforeSnap, err := h.SnapshotSession(context.Background(), testSessionID)
+	before, err := h.ReadSessionHeader(context.Background(), testSessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionHeader: %v", err)
 	}
-	before := beforeSnap.Session
+	beforeUsage := readSessionView(t, h, testSessionID).TotalUsage
 	after, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
 	if err != nil {
 		t.Fatalf("ChangeAgentType: %v", err)
 	}
-	if after.State.CurrentAgentType != "reviewer" || after.Revision != before.Revision+1 {
+	if after.State.CurrentAgentType != "reviewer" || after.Revision != before.Revision.DurableRevision+1 {
 		t.Fatalf("changed session = %+v", after.State)
 	}
-	if after.Identity != before.Identity || !after.State.LastActivity.Equal(before.State.LastActivity) ||
-		!usageTotalsEqual(after.State.Usage, before.State.Usage) {
+	if after.Identity != before.Identity || !after.State.LastActivity.Equal(before.LastActivity) ||
+		!usageTotalsEqual(after.State.Usage, beforeUsage) {
 		t.Fatalf("agent-type change altered identity, activity or usage: %+v", after)
 	}
 	if _, err := h.ChangeAgentType(context.Background(), testSessionID, ""); !errors.Is(err, ErrInvalid) {

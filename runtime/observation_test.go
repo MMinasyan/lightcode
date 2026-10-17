@@ -698,11 +698,10 @@ func assertOperationScoped(t *testing.T, event Event, sessionID, operationID str
 }
 
 // snapshotPairOf reads one Session's current revision pair through the
-// public snapshot.
+// metadata read.
 func snapshotPairOf(t *testing.T, r *Runtime, sessionID string) protocol.SessionRevision {
 	t.Helper()
-	snap := snapshotThroughRuntime(t, r, sessionID)
-	return wireRevision(snapshotRevision(snap))
+	return wireRevision(headerThroughRuntime(t, r, sessionID).Revision)
 }
 
 // TestObservationRefusalDeltaProgress proves live refusal-bearing model

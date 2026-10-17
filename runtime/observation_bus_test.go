@@ -65,7 +65,7 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 		awaitLifecycle := func(want harness.SessionLifecycle) {
 			t.Helper()
 			deadline := time.Now().Add(10 * time.Second)
-			for snapshotThroughRuntime(t, r, sessionID).Session.State.Lifecycle != want {
+			for sessionViewThroughRuntime(t, r, sessionID).Header.Lifecycle != want {
 				if time.Now().After(deadline) {
 					t.Fatalf("the session never reached lifecycle %q while its publication was paused", want)
 				}
@@ -144,7 +144,7 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, bg.r, root)
 
-		workspace := snapshotThroughRuntime(t, bg.r, root).Session.Identity.Workspace
+		workspace := sessionViewThroughRuntime(t, bg.r, root).Header.Identity.Workspace
 		rootInvalidations := 0
 		childInvalidations := 0
 		childProgress := 0
@@ -334,7 +334,7 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 			t.Fatalf("Subscribe: %v", err)
 		}
 		session := bg.session("job-ws")
-		workspace := snapshotThroughRuntime(t, bg.r, session).Session.Identity.Workspace
+		workspace := sessionViewThroughRuntime(t, bg.r, session).Header.Identity.Workspace
 
 		// One live job member whose spawn parks after signaling: the member
 		// is admitted (the job-scoped hint) while the internal start — the

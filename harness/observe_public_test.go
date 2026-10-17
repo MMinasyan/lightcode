@@ -6,6 +6,7 @@ package harness_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -108,16 +109,16 @@ func newObservedPublicHarnessWithTool(t *testing.T, store harness.Storage, scrip
 
 // awaitPublicQuiet waits until one Session is quiet and the observer has
 // delivered at least one publication, the deterministic post-terminal barrier.
-func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *publicFactSink) harness.SessionSnapshot {
+func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *publicFactSink) harness.SessionReadView {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap, err := h.SnapshotSession(context.Background(), session)
+		view, err := h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" && len(sink.invalidations()) > 0 {
-			return snap
+		if !view.History.ExecutionBusy && view.Header.CurrentOperationID == "" && len(sink.invalidations()) > 0 {
+			return view
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session %s never reached the observed quiet pair", session)
@@ -337,15 +338,15 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		if err != nil || steered.Disposition != harness.DispositionSteering || steered.Operation != nil {
 			t.Fatalf("checkpoint steering submit = %+v, %v", steered, err)
 		}
-		frozen, err := h.SnapshotSession(context.Background(), child)
+		frozen, err := h.ReadSessionView(context.Background(), child)
 		if err != nil {
-			t.Fatalf("frozen snapshot: %v", err)
+			t.Fatalf("frozen read: %v", err)
 		}
 		if len(frozen.Steering) != 1 || frozen.Steering[0].OperationID != "child-op-3" {
 			t.Fatalf("steering during the checkpoint = %+v, want the head pending", frozen.Steering)
 		}
 		for _, op := range frozen.Operations {
-			if op.Admission.OperationID == "child-op-3" {
+			if op.OperationID == "child-op-3" {
 				t.Fatalf("the pending head was scoped as an Operation inside the frozen checkpoint")
 			}
 		}
@@ -390,8 +391,21 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		if successorCalls != 1 || len(successorGot) != 4 || successorGot[1] != got[1] || successorGot[2] != "child answer" || successorGot[3] != "steered child" {
 			t.Fatalf("checkpoint successor calls/projection = %d/%v, want the summary, the post-checkpoint turn, then its own admitted input", successorCalls, successorGot)
 		}
+		childFacts := childQuiet.History.HistoryFacts(historyIDsOf(childQuiet.History.HistoryHeaders()))
+		childBoundaryReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: child, Kind: harness.RegisterSession})
+		if err != nil {
+			t.Fatalf("child session register: %v", err)
+		}
+		var childSessionState struct {
+			State struct {
+				CompactionEntryID string `json:"compaction_entry_id"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(childBoundaryReg.Payload, &childSessionState); err != nil {
+			t.Fatalf("decode child session register: %v", err)
+		}
 		steerOwned := false
-		for _, fact := range childQuiet.Facts {
+		for _, fact := range childFacts {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 &&
 				fact.Input.Content[0].Text == "steered child" {
 				if fact.OperationID != "child-op-3" {
@@ -404,14 +418,14 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			t.Fatalf("the checkpoint steering head never committed under its own Operation")
 		}
 		compactions := 0
-		for _, fact := range childQuiet.Facts {
+		for _, fact := range childFacts {
 			if fact.Kind == harness.EntryCompaction {
 				comp := fact.Compaction
 				if comp == nil {
 					t.Fatal("compaction fact has no payload")
 				}
 				compactions++
-				if comp.OperationID != "child-op-2" || comp.Summary != "child summary" || comp.Usage == nil || *comp.Usage != (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) || childQuiet.Session.State.CompactionEntryID != comp.EntryID {
+				if comp.OperationID != "child-op-2" || comp.Summary != "child summary" || comp.Usage == nil || *comp.Usage != (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) || childSessionState.State.CompactionEntryID != comp.EntryID {
 					t.Fatalf("child compaction/projection = %+v", comp)
 				}
 			}
@@ -427,8 +441,8 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			}
 			return false
 		}
-		if !pieceCount(secondOperation.State.Usage) || !pieceCount(childQuiet.Session.State.Usage) {
-			t.Fatalf("child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.Session.State.Usage)
+		if !pieceCount(secondOperation.State.Usage) || !pieceCount(childQuiet.TotalUsage) {
+			t.Fatalf("child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.TotalUsage)
 		}
 		if len(observedPrepares) != 4 || observedPrepares[0].Session.Identity.SessionID != child || observedPrepares[1].Session.Identity.SessionID != root || observedPrepares[2].Session.Identity.SessionID != child || observedPrepares[3].Session.Identity.SessionID != child {
 			t.Fatalf("shared preparation lineage = %+v", observedPrepares)
@@ -497,7 +511,7 @@ func TestObservePublicBothStores(t *testing.T) {
 		if len(sink.invalidations()) == 0 {
 			t.Fatalf("no invalidation was delivered: %+v", sink.snapshot())
 		}
-		current := harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
+		current := harness.SessionRevision{DurableRevision: snap.Header.Revision.DurableRevision, LocalRevision: snap.Header.Revision.LocalRevision}
 		if _, pair, ok := h.ReadObservation(session); !ok || pair != current {
 			t.Fatalf("cached publication read = %+v %v, quiet snapshot = %+v", pair, ok, current)
 		}
@@ -522,8 +536,8 @@ func TestObservePublicBothStores(t *testing.T) {
 		if _, err := restarted.ReadSessionHeader(context.Background(), session); err != nil {
 			t.Fatalf("ReadSession: %v", err)
 		}
-		if _, err := restarted.SnapshotSession(context.Background(), session); err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+		if _, err := restarted.ReadHistoryView(context.Background(), session); err != nil {
+			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if got := restartSink.snapshot(); len(got) != 0 {
 			t.Fatalf("the restarted owner replayed %+v", got)
@@ -594,9 +608,9 @@ func TestObservePublicJobAndChild(t *testing.T) {
 		}()
 		root := createSession(t, h)
 
-		beforeAdmit, err := h.SnapshotSession(context.Background(), root)
+		beforeAdmit, err := h.ReadSessionHeader(context.Background(), root)
 		if err != nil {
-			t.Fatalf("SnapshotSession before the job admission: %v", err)
+			t.Fatalf("ReadSessionHeader before the job admission: %v", err)
 		}
 		var completionID string
 		if err := h.StartJob(context.Background(), root, "deadbeef", func(_ context.Context, id string) error {
@@ -609,33 +623,33 @@ func TestObservePublicJobAndChild(t *testing.T) {
 		if len(jobFacts) != 1 {
 			t.Fatalf("job admission facts = %+v, want one job-attributed invalidation", jobFacts)
 		}
-		afterAdmit, err := h.SnapshotSession(context.Background(), root)
+		afterAdmit, err := h.ReadSessionHeader(context.Background(), root)
 		if err != nil {
-			t.Fatalf("SnapshotSession after the job admission: %v", err)
+			t.Fatalf("ReadSessionHeader after the job admission: %v", err)
 		}
-		if afterAdmit.Session.Revision != beforeAdmit.Session.Revision || afterAdmit.LocalRevision != beforeAdmit.LocalRevision+1 {
+		if afterAdmit.Revision.DurableRevision != beforeAdmit.Revision.DurableRevision || afterAdmit.Revision.LocalRevision != beforeAdmit.Revision.LocalRevision+1 {
 			t.Fatalf("job admission pair = %d/%d, want one local publication over %d/%d",
-				afterAdmit.Session.Revision, afterAdmit.LocalRevision, beforeAdmit.Session.Revision, beforeAdmit.LocalRevision)
+				afterAdmit.Revision.DurableRevision, afterAdmit.Revision.LocalRevision, beforeAdmit.Revision.DurableRevision, beforeAdmit.Revision.LocalRevision)
 		}
 
-		beforeFinish, err := h.SnapshotSession(context.Background(), root)
+		beforeFinish, err := h.ReadSessionHeader(context.Background(), root)
 		if err != nil {
-			t.Fatalf("SnapshotSession before the job finish: %v", err)
+			t.Fatalf("ReadSessionHeader before the job finish: %v", err)
 		}
 		if err := h.DeliverBackgroundCompletion(context.Background(), root, completionID, "job done"); err != nil {
 			t.Fatalf("DeliverBackgroundCompletion: %v", err)
 		}
-		afterFinish, err := h.SnapshotSession(context.Background(), root)
+		afterFinish, err := h.ReadSessionHeader(context.Background(), root)
 		if err != nil {
-			t.Fatalf("SnapshotSession after the job finish: %v", err)
+			t.Fatalf("ReadSessionHeader after the job finish: %v", err)
 		}
 		jobFacts = jobInvalidations(sink, root)
 		if len(jobFacts) != 2 {
 			t.Fatalf("job facts = %+v, want the admission and the finish", jobFacts)
 		}
-		if afterFinish.Session.Revision <= beforeFinish.Session.Revision {
-			t.Fatalf("job finish pair = %d/%d, want a durable advance past the before snapshot %d",
-				afterFinish.Session.Revision, afterFinish.LocalRevision, beforeFinish.Session.Revision)
+		if afterFinish.Revision.DurableRevision <= beforeFinish.Revision.DurableRevision {
+			t.Fatalf("job finish pair = %d/%d, want a durable advance past the before read %d",
+				afterFinish.Revision.DurableRevision, afterFinish.Revision.LocalRevision, beforeFinish.Revision.DurableRevision)
 		}
 		script.releaseGate()
 		if rec := awaitTerminal(t, h, root, completionID); rec.State.Status != harness.OperationSuccess {

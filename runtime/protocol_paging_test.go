@@ -33,14 +33,20 @@ func pageEntryID(i int) string {
 	return fmt.Sprintf("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%02d", i)
 }
 
-// pageSnapshot builds one typed snapshot with the given number of input
-// facts, each projecting to exactly one item.
-func pageSnapshot(n int) harness.SessionSnapshot {
-	facts := make([]harness.HistoryFact, 0, n)
+// pageHeaders builds one sequence-ordered value-metadata fixture of n input
+// entries, each of which forms exactly one page item.
+func pageHeaders(n int) []harness.HistoryEntryHeader {
+	headers := make([]harness.HistoryEntryHeader, 0, n)
 	for i := 0; i < n; i++ {
-		facts = append(facts, convInputFact(pageEntryID(i), "op-1"))
+		headers = append(headers, harness.HistoryEntryHeader{
+			EntryID:     pageEntryID(i),
+			OperationID: "op-1",
+			Sequence:    int64(i + 1),
+			Kind:        harness.EntryInput,
+			InputOrigin: harness.InputOriginUser,
+		})
 	}
-	return convSnapshot(facts)
+	return headers
 }
 
 // wireItemID reads one projected wire item's stable identity through the
@@ -109,27 +115,24 @@ func wantPageItemID(i int) string {
 // the oldest returned item anchoring the next cursor exactly when older
 // items remain, and every older page ending strictly before its anchor.
 func TestHistoryPagePureThreePages(t *testing.T) {
-	snap := pageSnapshot(120)
+	headers := pageHeaders(120)
 
-	page1, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), nil)
+	page1, older1, err := selectHistoryPage(convSessionID, headers, nil)
 	if err != nil {
 		t.Fatalf("initial page: %v", err)
 	}
-	if page1.SessionRevision != wantSessionRevision(t, snap) {
-		t.Fatalf("page revision = %+v, want the snapshot pair %+v", page1.SessionRevision, wantSessionRevision(t, snap))
+	if len(page1) != 50 {
+		t.Fatalf("initial page = %d items, want exactly 50", len(page1))
 	}
-	if len(page1.Items) != 50 {
-		t.Fatalf("initial page = %d items, want exactly 50", len(page1.Items))
-	}
-	for i, id := range pageItemIDs(t, page1) {
-		if id != wantPageItemID(70+i) {
+	for i, entryID := range page1 {
+		if id := projectItemID(convSessionID, entryID); id != wantPageItemID(70+i) {
 			t.Fatalf("initial item %d = %q, want the ascending item %d", i, id, 70+i)
 		}
 	}
-	if page1.OlderCursor == nil {
+	if older1 == nil {
 		t.Fatal("initial page produced no older cursor with 70 older items")
 	}
-	cursor1, err := decodeHistoryCursor(*page1.OlderCursor, convSessionID)
+	cursor1, err := decodeHistoryCursor(*older1, convSessionID)
 	if err != nil {
 		t.Fatalf("decode older cursor: %v", err)
 	}
@@ -137,28 +140,27 @@ func TestHistoryPagePureThreePages(t *testing.T) {
 		t.Fatalf("older cursor = %+v, want this session anchored at item 70", cursor1)
 	}
 
-	page2, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page1.OlderCursor)
+	page2, older2, err := selectHistoryPage(convSessionID, headers, older1)
 	if err != nil {
 		t.Fatalf("second page: %v", err)
 	}
-	ids2 := pageItemIDs(t, page2)
-	if len(ids2) != 50 {
-		t.Fatalf("second page = %d items, want exactly 50", len(ids2))
+	if len(page2) != 50 {
+		t.Fatalf("second page = %d items, want exactly 50", len(page2))
 	}
-	for i, id := range ids2 {
-		if id != wantPageItemID(20+i) {
+	for i, entryID := range page2 {
+		if id := projectItemID(convSessionID, entryID); id != wantPageItemID(20+i) {
 			t.Fatalf("second page item %d = %q, want item %d", i, id, 20+i)
 		}
 	}
-	for _, id := range ids2 { // strictly before the anchor
-		if id == cursor1.AnchorItemID {
-			t.Fatalf("second page contains its own anchor %q", id)
+	for _, entryID := range page2 { // strictly before the anchor
+		if projectItemID(convSessionID, entryID) == cursor1.AnchorItemID {
+			t.Fatalf("second page contains its own anchor %q", entryID)
 		}
 	}
-	if page2.OlderCursor == nil {
+	if older2 == nil {
 		t.Fatal("second page produced no older cursor with 20 older items")
 	}
-	cursor2, err := decodeHistoryCursor(*page2.OlderCursor, convSessionID)
+	cursor2, err := decodeHistoryCursor(*older2, convSessionID)
 	if err != nil {
 		t.Fatalf("decode second cursor: %v", err)
 	}
@@ -166,83 +168,72 @@ func TestHistoryPagePureThreePages(t *testing.T) {
 		t.Fatalf("second cursor anchor = %q, want item 20", cursor2.AnchorItemID)
 	}
 
-	page3, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page2.OlderCursor)
+	page3, older3, err := selectHistoryPage(convSessionID, headers, older2)
 	if err != nil {
 		t.Fatalf("third page: %v", err)
 	}
-	ids3 := pageItemIDs(t, page3)
-	if len(ids3) != 20 {
-		t.Fatalf("third page = %d items, want the remaining 20", len(ids3))
+	if len(page3) != 20 {
+		t.Fatalf("third page = %d items, want the remaining 20", len(page3))
 	}
-	for i, id := range ids3 {
-		if id != wantPageItemID(i) {
+	for i, entryID := range page3 {
+		if id := projectItemID(convSessionID, entryID); id != wantPageItemID(i) {
 			t.Fatalf("third page item %d = %q, want item %d", i, id, i)
 		}
 	}
-	if page3.OlderCursor != nil {
-		t.Fatalf("third page produced an older cursor %v with nothing older", page3.OlderCursor)
+	if older3 != nil {
+		t.Fatalf("third page produced an older cursor %v with nothing older", older3)
 	}
 }
 
 // TestHistoryPagePureIndivisibleBoundary proves the page boundary can never
-// split an assistant from its tool result: the result is absorbed into its
-// assistant item, the assistant sits at the page's edge carrying its
-// terminal outcome, and no standalone result item exists anywhere.
+// split an assistant from its tool result: the assistant forms one item at
+// the page's edge, the terminal result forms no item anywhere, and the next
+// older page holds exactly the input before the assistant. Its attachment to
+// the assistant item is the conversation projector's own observation.
 func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	assistantID := pageEntryID(50)
 	resultID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb99"
-	facts := make([]harness.HistoryFact, 0, 52)
-	for i := 0; i < 50; i++ {
-		facts = append(facts, convInputFact(pageEntryID(i), "op-1"))
-	}
-	facts = append(facts, convAssistantFact(assistantID, "op-1", harness.AssistantEntry{
-		SessionID: convSessionID, EntryID: assistantID, OperationID: "op-1",
-		Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
-		Content:   []model.ContentPart{{Kind: model.PartText, Text: "with tools"}},
-		ToolCalls: []harness.ToolCallRecord{{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`{}`), ResultEntryID: resultID}},
-	}))
-	facts = append(facts, convResultFact(resultID, assistantID, "call-1", "success", "tool output", ""))
+	headers := pageHeaders(50)
+	headers = append(headers,
+		harness.HistoryEntryHeader{EntryID: assistantID, OperationID: "op-1", Sequence: 51, Kind: harness.EntryAssistant},
+		harness.HistoryEntryHeader{EntryID: resultID, OperationID: "op-1", Sequence: 52, Kind: harness.EntryToolResult},
+	)
 
-	snap := convSnapshot(facts)
-	page1, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), nil)
+	page1, older1, err := selectHistoryPage(convSessionID, headers, nil)
 	if err != nil {
 		t.Fatalf("initial page: %v", err)
 	}
-	if len(page1.Items) != 50 {
-		t.Fatalf("initial page = %d items, want exactly 50", len(page1.Items))
+	if len(page1) != 50 {
+		t.Fatalf("initial page = %d items, want exactly 50", len(page1))
 	}
-	edge, err := page1.Items[49].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("page edge item: %v", err)
+	if page1[49] != assistantID {
+		t.Fatalf("page edge item = %q, want the assistant %q at the boundary", page1[49], assistantID)
 	}
-	if edge.ItemId != projectItemID(convSessionID, assistantID) ||
-		len(edge.ToolCalls) != 1 || edge.ToolCalls[0].Status == nil ||
-		*edge.ToolCalls[0].Status != protocol.ToolCallStatusSuccess ||
-		edge.ToolCalls[0].Content == nil || *edge.ToolCalls[0].Content != "tool output" {
-		t.Fatalf("page edge assistant = %+v, want the indivisible item with its attached result at the page boundary", edge)
-	}
-	if page1.OlderCursor == nil {
+	if older1 == nil {
 		t.Fatal("initial page produced no older cursor with one older item")
 	}
-	page2, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), page1.OlderCursor)
+	cursor1, err := decodeHistoryCursor(*older1, convSessionID)
+	if err != nil {
+		t.Fatalf("decode older cursor: %v", err)
+	}
+	if cursor1.AnchorItemID != wantPageItemID(1) {
+		t.Fatalf("older cursor anchor = %q, want the oldest returned input %q", cursor1.AnchorItemID, wantPageItemID(1))
+	}
+	page2, older2, err := selectHistoryPage(convSessionID, headers, older1)
 	if err != nil {
 		t.Fatalf("older page: %v", err)
 	}
-	if len(page2.Items) != 1 {
-		t.Fatalf("older page = %d items, want the single oldest input", len(page2.Items))
+	if len(page2) != 1 || page2[0] != pageEntryID(0) {
+		t.Fatalf("older page = %v, want the single oldest input", page2)
+	}
+	if older2 != nil {
+		t.Fatalf("older page produced a next cursor %v with nothing older", older2)
 	}
 	// The result entry never became an item of either page.
-	for _, page := range []protocol.HistoryPage{page1, page2} {
-		for i, item := range page.Items {
-			if kind, _ := item.Discriminator(); kind == "assistant" {
-				continue
-			}
-			data, err := json.Marshal(item)
-			if err != nil {
-				t.Fatalf("marshal item %d: %v", i, err)
-			}
-			if strings.Contains(string(data), resultID) {
-				t.Fatalf("item %d wire = %s, want no standalone result item", i, data)
+	for _, page := range [][]string{page1, page2} {
+		for _, entryID := range page {
+			if entryID == resultID {
+				t.Fatalf("the terminal result entry %q became a page item", resultID)
 			}
 		}
 	}
@@ -273,9 +264,9 @@ func cursorJSON(sessionID, anchor string) string {
 // anchor passes, and every malformed sibling fails uniformly with
 // harness.ErrInvalid.
 func TestHistoryCursorStrictValidation(t *testing.T) {
-	snap := pageSnapshot(3)
+	headers := pageHeaders(3)
 	valid := cursorBody(t, cursorJSON(convSessionID, wantPageItemID(1)))
-	if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), valid); err != nil {
+	if _, _, err := selectHistoryPage(convSessionID, headers, valid); err != nil {
 		t.Fatalf("valid cursor rejected: %v", err)
 	}
 
@@ -294,19 +285,19 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 		"nonexistent anchor":       cursorBody(t, cursorJSON(convSessionID, "missing")),
 	}
 	for name, cursor := range rejections {
-		if _, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursor); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("%s: projectHistoryPage = %v, want harness.ErrInvalid", name, err)
+		if _, _, err := selectHistoryPage(convSessionID, headers, cursor); !errors.Is(err, harness.ErrInvalid) {
+			t.Fatalf("%s: selectHistoryPage = %v, want harness.ErrInvalid", name, err)
 		}
 	}
 
 	// The one uniform slicing rule for a resolvable anchor with nothing
 	// older: a present empty page with no next cursor.
-	page, err := projectHistoryPage(convSessionID, snap.Facts, snapshotRevision(snap), cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0))))
+	page, older, err := selectHistoryPage(convSessionID, headers, cursorBody(t, cursorJSON(convSessionID, wantPageItemID(0))))
 	if err != nil {
 		t.Fatalf("oldest-anchor page: %v", err)
 	}
-	if page.Items == nil || len(page.Items) != 0 || page.OlderCursor != nil {
-		t.Fatalf("oldest-anchor page = %+v, want the present empty page with no cursor", page)
+	if page == nil || len(page) != 0 || older != nil {
+		t.Fatalf("oldest-anchor page = %+v / %+v, want the present empty page with no cursor", page, older)
 	}
 }
 
@@ -315,144 +306,27 @@ func TestHistoryCursorStrictValidation(t *testing.T) {
 // usageRef is the fixture model identity every usage row reports under.
 var usageRef = model.ModelRef{Provider: "prov", Model: "m"}
 
-func usageFact(entryID string, kind harness.EntryKind, usage *harness.UsageCount) harness.HistoryFact {
-	fact := harness.HistoryFact{EntryID: entryID, Sequence: 1, CommittedAt: convTime, Kind: kind}
-	switch kind {
-	case harness.EntryAssistant:
-		fact.Assistant = &harness.AssistantEntry{
-			SessionID: convSessionID, EntryID: entryID, Status: model.OutputCompleted,
-			Source: usageRef, Content: []model.ContentPart{{Kind: model.PartText, Text: "answer"}},
-			Usage: usage,
-		}
-	case harness.EntryOperationSettlement:
-		settlement := &harness.OperationSettlementEntry{
-			SessionID: convSessionID, EntryID: entryID, Status: harness.OperationSuccess,
-		}
-		if usage != nil {
-			ref := usageRef
-			settlement.Model, settlement.Usage = &ref, usage
-		}
-		fact.Settlement = settlement
-	case harness.EntryCompaction:
-		fact.Compaction = &harness.CompactionEntry{
-			SessionID: convSessionID, EntryID: entryID, Summary: "summary",
-			Model: usageRef, Usage: usage,
-		}
-	}
-	return fact
-}
-
-// TestUsedTokensPureClocks proves the display estimate's separate clock: the
-// latest measured input+cached count strictly after the compaction boundary,
-// nil usage transparent, compaction usage totals-only, no later measurement
-// zero, and the exact signed sum — mixed signs stay exact and a sum beyond
-// MaxInt64 stays positive-exact.
+// TestUsedTokensPureClocks proves the display estimate's exact arithmetic:
+// the signed input+cached sum stays exact for mixed signs and beyond
+// MaxInt64, and no measurement renders zero. The boundary scan that selects
+// the measurement is the history view accessor's own observation.
 func TestUsedTokensPureClocks(t *testing.T) {
 	cases := []struct {
-		name  string
-		facts []harness.HistoryFact
-		want  string
+		name     string
+		measured *harness.UsageCount
+		want     string
 	}{
 		{"no measurement", nil, "0"},
-		{
-			"latest assistant wins",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("e2", harness.EntryAssistant, &harness.UsageCount{InputTokens: 200, CachedInputTokens: 20, OutputTokens: 7}),
-			},
-			"220",
-		},
-		{
-			"latest settlement wins",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("e2", harness.EntryOperationSettlement, &harness.UsageCount{InputTokens: 300, CachedInputTokens: 20, OutputTokens: 7}),
-			},
-			"320",
-		},
-		{
-			"nil usage transparent",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("e2", harness.EntryAssistant, nil),
-			},
-			"110",
-		},
-		{
-			"compaction resets to zero",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("c1", harness.EntryCompaction, &harness.UsageCount{InputTokens: 9, CachedInputTokens: 9, OutputTokens: 9}),
-				usageFact("e2", harness.EntryAssistant, nil),
-			},
-			"0",
-		},
-		{
-			"boundary hides earlier measurement",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("c1", harness.EntryCompaction, nil),
-				usageFact("e2", harness.EntryAssistant, &harness.UsageCount{InputTokens: 50, CachedInputTokens: 5, OutputTokens: 3}),
-			},
-			"55",
-		},
-		{
-			"settlement measured after boundary",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}),
-				usageFact("c1", harness.EntryCompaction, nil),
-				usageFact("e2", harness.EntryAssistant, nil),
-				usageFact("e3", harness.EntryOperationSettlement, &harness.UsageCount{InputTokens: 300, CachedInputTokens: 20, OutputTokens: 7}),
-			},
-			"320",
-		},
-		{
-			"negative cached stays exact",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 0, CachedInputTokens: -5, OutputTokens: 0}),
-			},
-			"-5",
-		},
-		{
-			"mixed signs stay exact",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: 100, CachedInputTokens: -5, OutputTokens: 0}),
-				usageFact("e2", harness.EntryOperationSettlement, &harness.UsageCount{InputTokens: -7, CachedInputTokens: 0, OutputTokens: 0}),
-			},
-			"-7",
-		},
-		{
-			"negative input stays exact",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: -5, CachedInputTokens: 0, OutputTokens: 0}),
-			},
-			"-5",
-		},
-		{
-			"positive extreme beyond MaxInt64",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: math.MaxInt64, CachedInputTokens: math.MaxInt64, OutputTokens: 0}),
-			},
-			"18446744073709551614",
-		},
-		{
-			"negative total with later positive recovery",
-			[]harness.HistoryFact{
-				usageFact("e1", harness.EntryAssistant, &harness.UsageCount{InputTokens: -20, CachedInputTokens: 0, OutputTokens: 0}),
-				usageFact("e2", harness.EntryAssistant, &harness.UsageCount{InputTokens: 15, CachedInputTokens: 40, OutputTokens: 0}),
-			},
-			"55",
-		},
+		{"plain sum", &harness.UsageCount{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 5}, "110"},
+		{"negative cached stays exact", &harness.UsageCount{InputTokens: 0, CachedInputTokens: -5, OutputTokens: 0}, "-5"},
+		{"negative input stays exact", &harness.UsageCount{InputTokens: -5, CachedInputTokens: 0, OutputTokens: 0}, "-5"},
+		{"mixed signs stay exact", &harness.UsageCount{InputTokens: 100, CachedInputTokens: -105, OutputTokens: 0}, "-5"},
+		{"positive extreme beyond MaxInt64", &harness.UsageCount{InputTokens: math.MaxInt64, CachedInputTokens: math.MaxInt64, OutputTokens: 0}, "18446744073709551614"},
 	}
 	for _, tc := range cases {
-		if got := projectUsedTokens(tc.facts, "c1"); got != tc.want {
+		if got := projectUsedTokens(tc.measured); got != tc.want {
 			t.Fatalf("%s: used tokens = %q, want %q", tc.name, got, tc.want)
 		}
-	}
-
-	// No boundary named: the whole history is the scan domain.
-	if got := projectUsedTokens(cases[1].facts, ""); got != "220" {
-		t.Fatalf("no-boundary scan = %q, want 220", got)
 	}
 }
 
@@ -464,62 +338,48 @@ const (
 	usageWindowAgents = `{"solo":{"model":"prov/m","system_prompt":"simple"},"modelless":{"system_prompt":"simple"}}`
 )
 
-// windowSnapshot builds one typed snapshot with the given durably running
-// current Operation, busy fact, and Agent selection.
-func windowSnapshot(currentOp, agentType string, busy bool, ops ...harness.OperationRecord) harness.SessionSnapshot {
-	snap := convSnapshot(nil)
-	snap.Session.State.CurrentOperationID = currentOp
-	snap.Session.State.CurrentAgentType = agentType
-	snap.ExecutionBusy = busy
-	snap.Operations = ops
-	return snap
-}
-
-func windowOperation(operationID string, window int) harness.OperationRecord {
-	return harness.OperationRecord{
-		Admission: harness.OperationAdmission{
-			OperationID: operationID,
-			Execution:   harness.ExecutionCapture{Model: usageRef, ContextWindow: window},
-		},
-		State: harness.OperationCurrentState{Status: harness.OperationRunning},
-	}
-}
-
-// TestSessionContextWindowPureClocks proves the window's two clocks: the
+// TestSessionContextWindowPureClocks proves the window resolution rule: the
 // durably running Operation's captured window while one is admitted — the
-// busy fact and a retiring run alone are not an active Operation —
-// otherwise the captured configuration's catalog window for the selected
-// Agent type, with every unavailable resolution reporting 0.
+// busy fact and a retiring run alone are not an active Operation — otherwise
+// the captured configuration's catalog window for the selected Agent type,
+// with every unavailable resolution reporting 0. The capture of that window
+// from a durably current Operation is the composed view's own observation.
 func TestSessionContextWindowPureClocks(t *testing.T) {
 	captured, err := assembleConfiguration(2, usageWindowConfig, usageWindowAgents, nil)
 	if err != nil {
 		t.Fatalf("assembleConfiguration: %v", err)
 	}
-	window := func(snap harness.SessionSnapshot) int {
-		return sessionContextWindow(snap, resolveSessionSelection(snap.Session.State.CurrentAgentType, captured))
+	window := func(view harness.SessionReadView) int {
+		return sessionContextWindow(view, resolveSessionSelection(view.Header.CurrentAgentType, captured))
 	}
 
 	// The active Operation's capture wins over the distinct catalog window.
-	active := windowSnapshot("op-1", "solo", true, windowOperation("op-1", 4096))
+	active := harness.SessionReadView{
+		Header:              harness.SessionHeader{CurrentOperationID: "op-1", CurrentAgentType: "solo"},
+		ActiveContextWindow: 4096,
+	}
 	if got := window(active); got != 4096 {
 		t.Fatalf("active window = %d, want the captured 4096", got)
 	}
 
 	// The busy fact and a retiring run alone are not an active Operation:
 	// with no durably running current Operation the idle clock applies.
-	retiring := windowSnapshot("", "solo", true)
+	retiring := harness.SessionReadView{
+		Header:  harness.SessionHeader{CurrentAgentType: "solo"},
+		History: harness.HistoryReadView{ExecutionBusy: true},
+	}
 	if got := window(retiring); got != 8192 {
 		t.Fatalf("retiring-run window = %d, want the captured catalog 8192", got)
 	}
 
-	idle := windowSnapshot("", "solo", false)
+	idle := harness.SessionReadView{Header: harness.SessionHeader{CurrentAgentType: "solo"}}
 	if got := window(idle); got != 8192 {
 		t.Fatalf("idle window = %d, want the catalog 8192", got)
 	}
-	if got := window(windowSnapshot("", "modelless", false)); got != 0 {
+	if got := window(harness.SessionReadView{Header: harness.SessionHeader{CurrentAgentType: "modelless"}}); got != 0 {
 		t.Fatalf("modelless window = %d, want 0", got)
 	}
-	if got := window(windowSnapshot("", "unknown", false)); got != 0 {
+	if got := window(harness.SessionReadView{Header: harness.SessionHeader{CurrentAgentType: "unknown"}}); got != 0 {
 		t.Fatalf("unknown type window = %d, want 0", got)
 	}
 }
@@ -1043,8 +903,10 @@ func TestForkBoundaryResolution(t *testing.T) {
 		awaitIdleSession(t, r, session)
 
 		facts, _ := historyThroughRuntime(t, r, session)
+		view := historyViewThroughRuntime(t, r, session)
+		headers := view.HistoryHeaders()
 		entryID := inputEntryID(t, r, session, "op-1")
-		boundary, err := resolveBoundaryEntry(session, facts, projectItemID(session, entryID))
+		boundary, err := resolveBoundaryEntry(session, headers, projectItemID(session, entryID))
 		if err != nil {
 			t.Fatalf("resolveBoundaryEntry: %v", err)
 		}
@@ -1054,7 +916,7 @@ func TestForkBoundaryResolution(t *testing.T) {
 
 		// The user input of a different Session's namespace never resolves.
 		foreign := projectItemID("ffffffffffffffffffffffffffffffff", entryID)
-		if _, err := resolveBoundaryEntry(session, facts, foreign); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, headers, foreign); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("foreign boundary = %v, want harness.ErrInvalid", err)
 		}
 		// A committed non-user item never resolves: find the first turn's
@@ -1066,11 +928,110 @@ func TestForkBoundaryResolution(t *testing.T) {
 				break
 			}
 		}
-		if _, err := resolveBoundaryEntry(session, facts, assistantItem); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, headers, assistantItem); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("assistant boundary = %v, want harness.ErrInvalid", err)
 		}
-		if _, err := resolveBoundaryEntry(session, facts, "no-such-item"); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := resolveBoundaryEntry(session, headers, "no-such-item"); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("nonexistent boundary = %v, want harness.ErrInvalid", err)
+		}
+	})
+}
+
+// TestHistoryPageAttachesResultsBeyondTheBaseRange proves the page producer
+// resolves every selected assistant's reserved result identities through the
+// same captured history view, including results committed after the page's
+// last base entry: the anchored page ending just before the interruption
+// signal still carries the interrupted assistant's published call outcomes,
+// and no result entry forms an item of its own.
+func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		session := bg.session("page-results")
+		releaseTool := make(chan struct{})
+		releaseToolOnce := sync.OnceFunc(func() { close(releaseTool) })
+		defer releaseToolOnce()
+		toolStarted := make(chan struct{}, 1)
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			return []string{
+				`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			}
+		})
+		// The started call parks until the run's cancellation releases it; the
+		// unstarted call never begins and settles synthetically.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			if call.ID != "call-1" {
+				return harness.PreparedTool{
+					Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+				}
+			}
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Execute: func(execCtx context.Context) harness.ToolOutcome {
+					select {
+					case toolStarted <- struct{}{}:
+					default:
+					}
+					select {
+					case <-releaseTool:
+					case <-execCtx.Done(): // the interrupt releases the started call
+					}
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+				},
+			}
+		})
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		select {
+		case <-toolStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the first call never started")
+		}
+		if err := bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+			return h.Interrupt(ctx, session)
+		}); err != nil {
+			t.Fatalf("Interrupt: %v", err)
+		}
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
+		awaitIdleSession(t, bg.r, session)
+
+		// The interruption signal's item identity anchors the older page.
+		newest, err := bg.r.getHistory(ctx, session, nil)
+		if err != nil {
+			t.Fatalf("getHistory: %v", err)
+		}
+		signalAnchor := ""
+		for _, item := range newest.Items {
+			if kind, _ := item.Discriminator(); kind == "signal" {
+				signalAnchor = wireItemID(t, item)
+			}
+		}
+		if signalAnchor == "" {
+			t.Fatalf("newest page items = %s, want the interruption signal", itemKinds(t, newest.Items))
+		}
+
+		page, err := bg.r.getHistory(ctx, session, cursorBody(t, cursorJSON(session, signalAnchor)))
+		if err != nil {
+			t.Fatalf("anchored getHistory: %v", err)
+		}
+		if len(page.Items) != 2 { // the input and the interrupted assistant
+			t.Fatalf("anchored page = %s, want the input and the assistant before the signal", itemKinds(t, page.Items))
+		}
+		assistant, err := page.Items[1].AsAssistantItem()
+		if err != nil || len(assistant.ToolCalls) != 2 {
+			t.Fatalf("anchored assistant = %+v err %v, want both published calls", assistant, err)
+		}
+		started := assistant.ToolCalls[0]
+		if started.Id != "call-1" || started.Status == nil || *started.Status != protocol.ToolCallStatusSuccess ||
+			started.Content == nil || *started.Content != "first ran" {
+			t.Fatalf("started call = %+v, want the real returned outcome attached beyond the page range", started)
+		}
+		unstarted := assistant.ToolCalls[1]
+		if unstarted.Id != "call-2" || unstarted.Status == nil || *unstarted.Status != protocol.ToolCallStatusInterrupted {
+			t.Fatalf("unstarted call = %+v, want the synthetic interrupted outcome attached beyond the page range", unstarted)
 		}
 	})
 }
@@ -1265,7 +1226,7 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		facts, _ := historyThroughRuntime(t, bg.r, root)
 		for _, fact := range facts {
 			if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginRuntime {
-				if _, err := resolveBoundaryEntry(root, facts, projectItemID(root, fact.EntryID)); !errors.Is(err, harness.ErrInvalid) {
+				if _, err := resolveBoundaryEntry(root, historyViewThroughRuntime(t, bg.r, root).HistoryHeaders(), projectItemID(root, fact.EntryID)); !errors.Is(err, harness.ErrInvalid) {
 					t.Fatalf("runtime-origin boundary = %v, want harness.ErrInvalid", err)
 				}
 			}

@@ -1486,9 +1486,9 @@ func shortScopeProbe(id string, scope ScopeKind, opens *atomic.Int64) Plugin {
 	}
 }
 
-// readSessionFacts reads one Session's header and whole fact list through
-// the live owner. The header comes from the Harness; the facts are the
-// projected durable entries.
+// readSessionFacts reads one Session's header and whole committed fact set
+// through the live owner: the metadata producer plus the narrow history
+// accessors.
 func readSessionFacts(t *testing.T, r *Runtime, sessionID string) (harness.SessionHeader, []harness.HistoryFact) {
 	t.Helper()
 	var header harness.SessionHeader
@@ -1499,11 +1499,11 @@ func readSessionFacts(t *testing.T, r *Runtime, sessionID string) (harness.Sessi
 			return err
 		}
 		header = rec
-		snap, err := h.SnapshotSession(ctx, sessionID)
+		view, err := h.ReadHistoryView(ctx, sessionID)
 		if err != nil {
 			return err
 		}
-		facts = snap.Facts
+		facts = historyFactsOf(view)
 		return nil
 	})
 	if err != nil {

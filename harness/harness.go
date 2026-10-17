@@ -321,20 +321,18 @@ func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID stri
 	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
 	}
-	c, err := h.coordinatorFor(ctx, sessionID)
-	if err != nil {
+	var record OperationRecord
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
+		rec, ok := c.graph.Operation(operationID)
+		if !ok {
+			return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		}
+		record = ownOperationRecord(rec)
+		return nil
+	}); err != nil {
 		return OperationRecord{}, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := h.unavailableLocked(c, sessionID); err != nil {
-		return OperationRecord{}, err
-	}
-	rec, ok := c.graph.Operation(operationID)
-	if !ok {
-		return OperationRecord{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
-	}
-	return ownOperationRecord(rec), nil
+	return record, nil
 }
 
 // ChangeAgentType changes the current Agent type of an open Session. It
