@@ -12,9 +12,10 @@ import (
 // TestRetentionBoundsInactiveGraphs proves the inactive-graph bound and the
 // survival of every local fact: with more than eight idle Sessions the oldest
 // graphs are cleared while their cells, local revisions, groups, and buffers
-// stay, an evicted Session remains fully usable through its own
-// re-materialization, a metadata archive adoption still commits against the
-// evicted cell, and a live member's completion still delivers under pressure.
+// stay, a Session with a live member is bounded exactly like an idle one, an
+// evicted Session remains fully usable through its own re-materialization, a
+// metadata archive adoption still commits against the evicted cell, and a
+// live member's completion still delivers under pressure.
 func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	store := emptyStore(t)
 	h := newTestHarness(t, store, newPrepareStub(modelPrepared(quickModel())).prepare)
@@ -80,9 +81,9 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	}
 	bufferedLease()
 
-	// Eight more idle Sessions fill the inactive cache and push the idle
-	// graphs out; the live member's own Session stays pinned and out of the
-	// inactive set.
+	// Eight more idle Sessions fill the inactive cache and push the oldest
+	// graphs out: a live member owns no graph residency, so its Session is
+	// evicted like any other inactive one.
 	newest := make([]string, 0, inactiveGraphLimit)
 	for i := 0; i < inactiveGraphLimit; i++ {
 		newest = append(newest, createSession(t, h))
@@ -90,7 +91,7 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, newest) {
 		t.Fatalf("inactive cache = %v, want the eight newest identities %v", got, newest)
 	}
-	for _, evicted := range []string{idle, buffered} {
+	for _, evicted := range []string{idle, subject, buffered} {
 		c := cachedCoordinator(t, h, evicted)
 		h.mu.Lock()
 		cached := c.cached
@@ -98,12 +99,6 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 		if cached {
 			t.Fatalf("the oldest inactive graph of %q was not evicted", evicted)
 		}
-	}
-	h.mu.Lock()
-	subjectCached, subjectNode := subjectC.cached, subjectC.lruNode
-	h.mu.Unlock()
-	if !subjectCached || subjectNode != nil {
-		t.Fatalf("the live member's Session = cached %v node %v, want a pinned graph outside the inactive set", subjectCached, subjectNode)
 	}
 
 	// The cells are the same objects and keep every local fact.
@@ -146,8 +141,9 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 		t.Fatalf("ArchiveSession of the evicted Session = %+v err %v, want the committed archive", archived, err)
 	}
 
-	// The live member's completion still delivers, and its finish ends the pin:
-	// the Session's graph becomes the newest inactive cache entry.
+	// The live member's completion still delivers from the evicted cell, and
+	// the delivery's own re-materialization leaves the Session's graph as the
+	// newest inactive cache entry.
 	if err := h.DeliverBackgroundCompletion(ctx, subject, completionID, "job done"); err != nil {
 		t.Fatalf("DeliverBackgroundCompletion under pressure: %v", err)
 	}
@@ -379,6 +375,124 @@ func TestStopAllExcludesNeverLoadedLatchedCells(t *testing.T) {
 	rootCell.mu.Unlock()
 	if members != 0 {
 		t.Fatalf("the established root's member stayed live: %d", members)
+	}
+}
+
+// cancelledReadStore makes the private fake storage honor a canceled context
+// on its reads exactly like the shipped stores do, so a cold load under a
+// canceled context fails instead of succeeding against the in-process fake.
+type cancelledReadStore struct {
+	Storage
+}
+
+func (s cancelledReadStore) ReadRegisters(ctx context.Context, sessionID string) ([]Register, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Storage.ReadRegisters(ctx, sessionID)
+}
+
+func (s cancelledReadStore) ReadEntries(ctx context.Context, sessionID string, after int64) ([]Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Storage.ReadEntries(ctx, sessionID, after)
+}
+
+// TestCancelledMemberFinishSettlesTheChildCompletion proves the loss scenario
+// the member-finish ordering and the settlement context close together: a
+// child Session owns a live Job member and its own pending completion, the
+// Harness is canceled, and the child's graph is not resident when the member
+// finish triggers the settlement. The child's terminal completion still
+// renders and reaches the parent as its durable closed-path record instead of
+// being abandoned.
+//
+// The pressure is deterministic: every older cache entry is borrowed, so the
+// child's own release is the fallback eviction victim, and the canceled
+// Harness makes the settlement's cold load the load that fails under a
+// canceled context — while a live Harness would keep it resident.
+func TestCancelledMemberFinishSettlesTheChildCompletion(t *testing.T) {
+	store := completionChildGraph(completionParentID, false, OperationSuccess, "", "child text").storage(t)
+	addRootSession(t, store, completionParentID)
+	h, cancel := newCancelableHarness(t, cancelledReadStore{Storage: store}, PreparedExecution{}, nil)
+	defer cancel()
+	ctx := context.Background()
+
+	if _, err := h.ReadHistoryView(ctx, completionChildID); err != nil {
+		t.Fatalf("child ReadHistoryView: %v", err)
+	}
+	if _, err := h.ReadHistoryView(ctx, completionParentID); err != nil {
+		t.Fatalf("parent ReadHistoryView: %v", err)
+	}
+	child := cachedCoordinator(t, h, completionChildID)
+	parent := cachedCoordinator(t, h, completionParentID)
+	parentMember, err := admitLocked(h, parent, memberChild, completionChildID, 0)
+	if err != nil {
+		t.Fatalf("child member admission: %v", err)
+	}
+	jobMember, err := admitLocked(h, child, memberJob, jobFixtureID, 0)
+	if err != nil {
+		t.Fatalf("job member admission: %v", err)
+	}
+	child.mu.Lock()
+	child.pendingCompletion = &launchInfo{completionID: parentMember.completionID, outputLimit: 1024}
+	child.mu.Unlock()
+
+	// The parent's graph and eight more idle Sessions are the borrowed older
+	// entries the fallback eviction skips.
+	borrowed := make([]func(), 0, inactiveGraphLimit+1)
+	_, parentRelease := leaseCoordinatorNow(t, h, completionParentID)
+	borrowed = append(borrowed, parentRelease)
+	for i := 0; i < inactiveGraphLimit; i++ {
+		id := createSession(t, h)
+		_, release := leaseCoordinatorNow(t, h, id)
+		borrowed = append(borrowed, release)
+	}
+	defer func() {
+		for _, release := range borrowed {
+			release()
+		}
+	}()
+
+	cancel()
+
+	// The job's own completion finishes the member; the child's pending
+	// completion must settle from that finish. The observer is installed after
+	// the admissions, so the collected facts are the finish-time ones.
+	col := observeHarness(h)
+	if err := h.DeliverBackgroundCompletion(ctx, completionChildID, jobMember.completionID, "job done"); err != nil {
+		t.Fatalf("job completion delivery: %v", err)
+	}
+	jobFacts := 0
+	for _, fact := range col.invalidations() {
+		if fact.SessionID == completionChildID && fact.JobID == jobFixtureID {
+			jobFacts++
+		}
+	}
+	if jobFacts != 1 {
+		t.Fatalf("child job invalidations = %d, want the member finish's one fact from the evicted graph", jobFacts)
+	}
+	signals := storedSignals(t, store, completionParentID)
+	if len(signals) != 1 || signals[0].Content != "child text" {
+		t.Fatalf("parent signals = %+v, want the child's rendered completion as the closed-path record", signals)
+	}
+	if childSignals := storedSignals(t, store, completionChildID); len(childSignals) != 1 || childSignals[0].Content != "job done" {
+		t.Fatalf("child signals = %+v, want the job's own completion record", childSignals)
+	}
+	parent.mu.Lock()
+	remaining := 0
+	if parent.group != nil {
+		remaining = len(parent.group.members)
+	}
+	parent.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("the child member stayed live after the settlement: %d members", remaining)
+	}
+	child.mu.Lock()
+	pending := child.pendingCompletion
+	child.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("the pending completion was not consumed: %+v", pending)
 	}
 }
 

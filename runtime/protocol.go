@@ -199,14 +199,6 @@ func projectItemID(sessionID, entryID string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:16])
 }
 
-// projectedItem is one generated conversation item alongside the stable
-// identity its source fact produced: the identity travels with the item from
-// its source, so paging anchors and cursors never re-decode a union variant.
-type projectedItem struct {
-	id   string
-	item protocol.ConversationItem
-}
-
 // projectConversation derives the complete client conversation from one owned
 // Session's validated facts, in committed order. It consumes only the facts:
 // they are already materialized, validated, and owned, so no storage payload
@@ -218,9 +210,9 @@ type projectedItem struct {
 // repeating the binding here would add nothing — while an unresolved call
 // keeps its assistant item without terminal members and gains them on a
 // later read under the same item ID.
-func projectConversation(sessionID string, facts []harness.HistoryFact) ([]projectedItem, error) {
+func projectConversation(sessionID string, facts []harness.HistoryFact) ([]protocol.ConversationItem, error) {
 	results := indexToolResults(facts)
-	items := make([]projectedItem, 0, len(facts))
+	items := make([]protocol.ConversationItem, 0, len(facts))
 	for _, fact := range facts {
 		item, err := projectConversationItem(sessionID, fact, results)
 		if err != nil {
@@ -250,12 +242,11 @@ func indexToolResults(facts []harness.HistoryFact) map[string]harness.ToolResult
 }
 
 // projectConversationItem maps one validated fact to its generated client
-// item and source-known stable identity: one item identity is derived per
-// produced item, before its generated variant is constructed, and shared by
-// the variant, the assistant/signal projectors and the returned pair.
-// Tool-result facts are absorbed into their publishing assistant and produce
-// no item of their own.
-func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (*projectedItem, error) {
+// item: one item identity is derived per produced item, before its generated
+// variant is constructed, and shared by the variant and the assistant/signal
+// projectors. Tool-result facts are absorbed into their publishing assistant
+// and produce no item of their own.
+func projectConversationItem(sessionID string, fact harness.HistoryFact, results map[string]harness.ToolResultEntry) (*protocol.ConversationItem, error) {
 	if fact.Kind == harness.EntryToolResult {
 		return nil, nil
 	}
@@ -305,7 +296,7 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 	if err != nil {
 		return nil, fmt.Errorf("project %s entry %q: %w", fact.Kind, fact.EntryID, err)
 	}
-	return &projectedItem{id: id, item: item}, nil
+	return &item, nil
 }
 
 // operationAttribution points at a fact's owning Operation when it has one;
@@ -598,7 +589,7 @@ func historyPageFromView(sessionID string, view harness.HistoryReadView, cursor 
 		OlderCursor:     older,
 	}
 	for i, item := range items {
-		page.Items[i] = item.item
+		page.Items[i] = item
 	}
 	return page, nil
 }
