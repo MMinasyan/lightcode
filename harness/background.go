@@ -34,6 +34,7 @@ type backgroundMember struct {
 	completionID string        // reserved, session-unique, first-writer-wins
 	claimed      bool          // set by the first-winner claim; a second claim is a no-op
 	done         chan struct{} // closed when the member finishes
+	release      func()        // the member's graph pin on its owning Session, released once at finish
 }
 
 // backgroundGroup is one Session's set of live background members.
@@ -59,7 +60,9 @@ type stopInterval struct {
 // lifecycle, harness cancellation (the raw error, Submit's entry-gate shape),
 // and a group that is stopping or closed; with a positive cap the kind's live
 // count must stay below it. The returned member is the caller's handle —
-// member.completionID is the completion identity every later step consumes.
+// member.completionID is the completion identity every later step consumes,
+// and the member itself pins its owning Session's graph until it finishes.
+// The caller already holds a use on the coordinator, so the pin extends it.
 func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id string, cap int) (*backgroundMember, error) {
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
 		return nil, invalidInput("session %q is archived; admission requires an open Session", c.graph.Session.Identity.SessionID)
@@ -89,6 +92,7 @@ func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id stri
 		return nil, fmt.Errorf("%w: %v", ErrStorage, err)
 	}
 	m := &backgroundMember{kind: kind, id: id, completionID: completionID, done: make(chan struct{})}
+	m.release = h.retainGraph(c) // the member pins its owning Session's graph until it ends
 	c.group.members[completionID] = m
 	c.bumpLocalRevision() // the member admission is a coordinator-local publication
 	return m, nil
@@ -111,11 +115,11 @@ func (h *Harness) claimBackgroundMember(c *coordinator, completionID string) (*b
 }
 
 // finishBackgroundMember performs the terminal transition: it removes the
-// member if still present and closes done. An already-removed member is a
-// no-op. Every member-ending path runs claim-then-finish. It takes c.mu
-// itself, then — after removal and outside c.mu — runs the recursive
-// completion check: a finishing descendant may unblock this session's own
-// pending completion.
+// member if still present, closes done, and releases the member's graph pin
+// outside the coordinator mutex. An already-removed member is a no-op. Every
+// member-ending path runs claim-then-finish. It takes c.mu itself, then —
+// after removal and outside c.mu — runs the recursive completion check: a
+// finishing descendant may unblock this session's own pending completion.
 func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 	c.mu.Lock()
 	removed := false
@@ -134,6 +138,7 @@ func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 		} else {
 			h.observeInvalidation(c)
 		}
+		m.release() // the member's graph pin ends with the member
 	}
 	h.childCompletionSettled(c, "")
 }
@@ -211,13 +216,11 @@ func (h *Harness) DeliverBackgroundCompletion(ctx context.Context, sessionID, co
 // remains in the group through the whole attempt, so recursive readiness and
 // Stop cannot treat it as finished before delivery has resolved.
 func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinator, member *backgroundMember, content string) error {
-	c.mu.Lock()
-	sessionID := c.graph.Session.Identity.SessionID
-	c.mu.Unlock()
-	validated, err := h.coordinatorFor(ctx, sessionID)
+	validated, release, err := h.acquireCoordinator(ctx, c.sessionID, true)
 	if err != nil {
 		return err
 	}
+	defer release()
 	part, err := model.NewContentPart(model.ContentPart{Kind: model.PartText, Text: content})
 	if err != nil {
 		return invalidInput("background completion content: %v", err)
@@ -258,7 +261,7 @@ func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember
 	}
 	defer release()
 	c.mu.Lock()
-	sessionID := c.graph.Session.Identity.SessionID
+	sessionID := c.sessionID
 	mode := backgroundDeliveryPriority(h, c, &pendingMessage{operationID: member.completionID, origin: InputOriginRuntime, content: parts})
 	c.mu.Unlock()
 	if mode == bgDeliverSteering { // the completion enqueue is a coordinator-local publication
@@ -390,11 +393,14 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 		c.mu.Unlock()
 		return
 	}
-	childID := c.graph.Session.Identity.SessionID
-	parentID := c.graph.Session.Identity.ParentSessionID
+	parentID := c.identity.ParentSessionID
 	c.mu.Unlock()
 
-	if _, err := h.coordinatorFor(h.ctx, childID); err != nil {
+	// The pending obligation pins the child's graph through rendering and the
+	// parent delivery, and its acquisition is the same validated access every
+	// other graph consumer takes.
+	_, release, err := h.acquireCoordinator(h.ctx, c.sessionID, true)
+	if err != nil {
 		// validation failure takes the pending obligation for abandonment
 		c.mu.Lock()
 		info := c.pendingCompletion
@@ -405,6 +411,7 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 		}
 		return
 	}
+	defer release()
 
 	c.mu.Lock()
 	info := c.pendingCompletion
@@ -565,20 +572,36 @@ func liveBackground(c *coordinator) bool {
 // one's interval and returns its stored error. Member-stop errors are
 // collected during the stop and returned only after convergence; no
 // state-owning lock is ever held while waiting, and no error skips a wait.
+// The public entry is a metadata-only use: it validates the addressed Session
+// and then runs the stop body.
 func (h *Harness) Stop(ctx context.Context, sessionID string) error {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
 	if err != nil {
 		return err
 	}
+	defer release()
+	return h.stopCoordinator(ctx, c)
+}
 
+// stopCoordinator is the stop body: it needs no graph, only the cell's
+// retained identity and its local group, run, and reservation handles, so a
+// caller that already holds a validated cell stops it directly. A specifically
+// addressed child still materializes through the recursive public Stop when it
+// is not cached: that wait is part of the stop, never skipped.
+func (h *Harness) stopCoordinator(ctx context.Context, c *coordinator) error {
+	sessionID := c.sessionID
 	c.mu.Lock()
+	if err := h.unavailableLocked(c, sessionID); err != nil { // an established gone or corrupt cell keeps its error
+		c.mu.Unlock()
+		return err
+	}
 	if c.stop != nil { // a concurrent stop owns the interval: join it and return its stored error
 		interval := c.stop
 		c.mu.Unlock()
 		<-interval.done // err is written before done closes
 		return interval.err
 	}
-	parentID := c.graph.Session.Identity.ParentSessionID
+	parentID := c.identity.ParentSessionID
 	isChild := parentID != ""
 	interval := &stopInterval{done: make(chan struct{})}
 	var (
@@ -709,19 +732,17 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 	return interval.err
 }
 
-// StopAll stops every cached Session's background ownership group and joins
-// the collected errors. It is idempotent: a stopped root with no live members
-// and a permanently closed child both stop again as no-ops.
+// StopAll stops every established Session's background ownership group and
+// joins the collected errors. It snapshots the established cells — the ones
+// whose graph was validated at least once, so they own every local field
+// whether or not a graph is cached — and drives each stop body directly with
+// its retained identity and local handles: an idle corpus is never loaded to
+// be classified. It is idempotent: a stopped root with no live members and a
+// permanently closed child both stop again as no-ops.
 func (h *Harness) StopAll(ctx context.Context) error {
-	h.mu.Lock()
-	ids := make([]string, 0, len(h.sessions))
-	for id := range h.sessions {
-		ids = append(ids, id)
-	}
-	h.mu.Unlock()
 	var errs []error
-	for _, id := range ids {
-		if err := h.Stop(ctx, id); err != nil {
+	for _, c := range h.snapshotEstablishedCoordinators() {
+		if err := h.stopCoordinator(ctx, c); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -747,10 +768,11 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 	if spawn == nil {
 		return invalidInput("job start requires a non-nil spawn callback")
 	}
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID, true)
 	if err != nil {
 		return err
 	}
+	defer release()
 	c.mu.Lock()
 	member, err := h.admitBackgroundMember(c, memberJob, jobID, 0)
 	c.mu.Unlock()
@@ -814,10 +836,11 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
-	c, err := h.coordinatorFor(ctx, req.ParentSessionID)
+	c, release, err := h.acquireCoordinator(ctx, req.ParentSessionID, true)
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
+	defer release()
 	c.mu.Lock()
 	if c.graph.Session.Identity.ParentSessionID != "" { // the retained recursion rule: no depth counters
 		c.mu.Unlock()
@@ -881,13 +904,17 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	if err := h.backgroundHandoffFailure(c, member); err != nil {
 		return LaunchChildResult{}, h.settleRejectedChildLaunch(ctx, c, member, childID, req.OperationID, err)
 	}
-	childCoordinator, err := h.coordinatorFor(ctx, childID)
+	// The committed child installs as a stable cell with its validated durable
+	// graph and a call-owned pin, so the pending completion and the execution
+	// are installed on the real child rather than on a failed-load placeholder.
+	childCoordinator, childRelease, err := h.acquireCoordinator(ctx, childID, true)
 	if err != nil {
 		// the durable running Operation stays for recovery; no delivery
 		h.recordStorageFailure(err)
 		h.claimFinishBackgroundMember(c, member.completionID)
 		return LaunchChildResult{}, err
 	}
+	defer childRelease()
 	childCoordinator.mu.Lock()
 	childCoordinator.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: req.OutputLimit}
 	childCoordinator.mu.Unlock()
@@ -950,8 +977,9 @@ func (h *Harness) launchTransaction(tx Transaction, view SessionRecord, req Laun
 // delivery — and otherwise returns the handoff failure after the
 // interruption and the finish.
 func (h *Harness) settleRejectedChildLaunch(ctx context.Context, c *coordinator, member *backgroundMember, childID, operationID string, handoffErr error) error {
-	child, err := h.coordinatorFor(ctx, childID)
+	child, childRelease, err := h.acquireCoordinator(ctx, childID, true)
 	if err == nil {
+		defer childRelease()
 		settleCtx := context.WithoutCancel(h.ctx)
 		err = recoverRunningOperation(settleCtx, h.deps.Storage, childID, operationID)
 		if err == nil { // the cached child view predates the settlement commit

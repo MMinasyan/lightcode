@@ -14,8 +14,8 @@ import (
 // The capture-availability contract regressions: the surviving reads must
 // decide one Session's availability inside the same coordinator-mutex hold
 // that copies their returned state, so a corruption marker that a real
-// transition sticks on a warm coordinator between a reader's coordinatorFor
-// lookup and its capture refuses that capture.
+// transition sticks on a warm coordinator between a reader's acquisition
+// and its capture refuses that capture.
 //
 // The window's real producer is Fork: its store-wide transaction runs outside
 // the source coordinator's c.mu and fails on a corrupted durable session
@@ -26,8 +26,8 @@ import (
 // The rendezvous is deterministic, with no stack inspection, sleeps, or
 // scheduler guesses: the shared prepareStub gate parks Fork before its
 // transaction; the reader goroutine drives the private capture path itself —
-// it acquires the warm coordinator through coordinatorFor (the lookup whose
-// corruption sample must already be complete), signals acquisition, and parks
+// it acquires the warm coordinator through the private acquisition (the step
+// whose corruption sample must already be complete), signals acquisition, and parks
 // before calling captureAvailable. Releasing the Fork gate lets the
 // transaction fail and the real marker land while the reader is parked; only
 // then is the reader let through, strictly after the mark. Every wait is
@@ -177,15 +177,17 @@ type captureOutcome struct {
 }
 
 // parkedCaptureReader is the named reader goroutine root: it acquires the warm
-// coordinator through the private lookup, signals acquisition, parks until
+// coordinator through the private acquisition, signals acquisition, parks until
 // released, then runs one real captureAvailable call with a callback that
-// records whether it executed.
+// records whether it executed. Its own lease covers the park exactly like a
+// production reader's use.
 func parkedCaptureReader(ctx context.Context, h *Harness, sessionID string, acquired chan<- struct{}, release <-chan struct{}, out chan<- captureOutcome) {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, lease, err := h.acquireCoordinator(ctx, sessionID, false)
 	if err != nil {
 		out <- captureOutcome{err: err}
 		return
 	}
+	defer lease()
 	acquired <- struct{}{}
 	<-release
 	ran := false
@@ -219,8 +221,8 @@ func assertCaptureCorruption(t *testing.T, err error, sessionID, read string) {
 // runMarkWindow performs the shared deterministic window rendezvous for one
 // parked private reader against the warm source of one real Fork transition:
 // it arms the preparation gate, starts Fork and parks it in preparation,
-// starts the reader and waits until its coordinatorFor lookup succeeded and it
-// parked before the availability check, releases the gate so Fork's own
+// starts the reader and waits until its acquisition succeeded and it parked
+// before the availability check, releases the gate so Fork's own
 // register-decode corruption path sticks the marker on the warm source, awaits
 // the marker, and lets the reader through so its real captureAvailable call
 // proceeds strictly after the mark. One deferred failure-safe release — the
@@ -265,7 +267,7 @@ func runMarkWindow(t *testing.T, ctx context.Context, h *Harness, stub *prepareS
 		parkedCaptureReader(ctx, h, req.SourceSessionID, acquired, releaseCapture, reader)
 	}()
 	select {
-	case <-acquired: // the reader's coordinatorFor lookup succeeded (its corru sample was nil) and it parked before the availability check
+	case <-acquired: // the reader's acquisition succeeded (its corru sample was nil) and it parked before the availability check
 	case <-time.After(captureBarrierWait):
 		t.Fatalf("the reader never acquired the warm coordinator within %s", captureBarrierWait)
 	}
@@ -286,7 +288,7 @@ func runMarkWindow(t *testing.T, ctx context.Context, h *Harness, stub *prepareS
 }
 
 // TestCorruptMarkBetweenLookupAndCapture is the window regression: a reader
-// whose coordinatorFor lookup passed before the real Fork transition stuck the
+// whose acquisition passed before the real Fork transition stuck the
 // corruption marker on the warm source must still refuse its capture — the
 // capture callback never executes — because the availability decision runs
 // inside the capture hold. Both rows share the window; each also proves the

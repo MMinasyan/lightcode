@@ -42,10 +42,7 @@ func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request)
 	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID
 }
 
@@ -708,10 +705,7 @@ func projectionTestGraph() *testGraph {
 func TestContextSourceProjectsFullHistory(t *testing.T) {
 	store := projectionTestGraph().storage(t)
 	h := newTestHarness(t, store, nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	msgs, err := h.contextSource(c, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("context projection: %v", err)
@@ -1026,10 +1020,7 @@ func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmissio
 	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID, prepared, cancel
 }
 

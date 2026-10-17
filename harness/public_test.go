@@ -2784,14 +2784,13 @@ func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 	})
 }
 
-// TestPublicDeleteVsMaterialization proves the delete-vs-materialization
-// contract through public operations on one live Harness: an archived Session
-// is seeded before the Harness exists; its first materialization captures its
-// valid pre-deletion register and entry state, then parks while a concurrent
-// DeleteSession materializes and deletes the same Session; released, the first
-// materialization completes validation on the captured pre-deletion data,
-// finds the registry generation changed, retries, and resolves to ErrNotFound
-// — never installing or serving a stale coordinator.
+// TestPublicDeleteVsMaterialization proves the delete-vs-load row under the
+// stable-cell protocol: a read parked inside its Session's first load holds
+// that Session's cell, so a concurrent canonical deletion waits for the load
+// and never observes a partially published graph; the parked read resolves
+// either to its pre-deletion capture or to the not-found class, the deletion
+// then commits, and no later read, listing, or registry lookup resurrects the
+// deleted Session.
 func TestPublicDeleteVsMaterialization(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		session := seedArchivedSession(t, store) // seeded before the live Harness is constructed
@@ -2801,19 +2800,35 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		ctx := context.Background()
 
 		readDone := make(chan error, 1)
-		go func() { _, err := f.h.ReadSessionHeader(ctx, session); readDone <- err }() // the first materialization
-		<-gated.started                                                                // parked after capturing its valid pre-deletion state
+		go func() { _, err := f.h.ReadSessionHeader(ctx, session); readDone <- err }() // the first load
+		<-gated.started                                                                // parked inside the load, holding the Session's cell
 
-		if err := f.h.DeleteSession(ctx, session); err != nil { // materializes and deletes the same Session
-			t.Fatalf("delete of the seeded session: %v", err)
+		deleteDone := make(chan error, 1)
+		go func() { deleteDone <- f.h.DeleteSession(ctx, session) }() // the canonical deletion of the same Session
+		select {
+		case err := <-deleteDone:
+			t.Fatalf("delete returned (%v) while the load still held the Session's cell", err)
+		case <-time.After(200 * time.Millisecond):
 		}
 
 		close(gated.release) // validation now completes on the captured pre-deletion value
-		if err := <-readDone; !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("materialization across a deletion = err %v, want ErrNotFound", err)
+		if err := <-readDone; err != nil && !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("load across a deletion = err %v, want the pre-deletion capture or ErrNotFound", err)
+		}
+		if err := <-deleteDone; err != nil {
+			t.Fatalf("delete after the load released the cell = %v, want nil", err)
 		}
 		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("later materialization installed a stale coordinator: err %v, want ErrNotFound", err)
+		}
+		listed, err := f.h.ListSessions(ctx)
+		if err != nil {
+			t.Fatalf("ListSessions: %v", err)
+		}
+		for _, row := range listed {
+			if row.Identity.SessionID == session {
+				t.Fatalf("the deleted Session stayed listed: %+v", row)
+			}
 		}
 	})
 }

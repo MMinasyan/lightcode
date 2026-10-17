@@ -782,8 +782,9 @@ func (s *failingListStorage) ReadEntries(ctx context.Context, sessionID string, 
 
 // TestPublicListSessionsValidationAndFailures proves the listing rows over
 // both stores: sorted available records, corrupt and malformed rows omitted
-// with typed direct errors, cold-corrupt revalidation, warm reads without
-// history re-reads, deletion omission, and failure propagation.
+// with typed direct errors, the one-time validation of a corrupt candidate
+// that then stays latched, metadata listings that revalidate without
+// retaining the corpus, deletion omission, and failure propagation.
 func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -843,15 +844,17 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			t.Fatalf("malformed direct read = %v, want the invalid class", err)
 		}
 
-		// A cold corrupt Session revalidates on every list; the warm valid
-		// Session's history is never reread.
+		// A listing is metadata-only: each candidate's graph is validated once
+		// for that listing and discarded when the candidate's call releases it,
+		// so a repeat listing revalidates the corpus instead of retaining it,
+		// and the latched corrupt candidate is never re-read at all.
 		registersBefore, entriesBefore := counting.counts(second)
 		if _, err := lister.h.ListSessions(ctx); err != nil {
 			t.Fatalf("second ListSessions: %v", err)
 		}
 		registersAfter, entriesAfter := counting.counts(second)
-		if registersAfter != registersBefore || entriesAfter != entriesBefore {
-			t.Fatalf("the warm valid Session reread its graph (%d/%d -> %d/%d)",
+		if registersAfter != registersBefore+1 || entriesAfter != entriesBefore+1 {
+			t.Fatalf("the listed valid Session graph reads = %d/%d -> %d/%d, want exactly one revalidation per listing",
 				registersBefore, entriesBefore, registersAfter, entriesAfter)
 		}
 		corruptRegistersBefore, _ := counting.counts(first)
@@ -859,9 +862,13 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			t.Fatalf("third ListSessions: %v", err)
 		}
 		corruptRegistersAfter, _ := counting.counts(first)
-		if corruptRegistersAfter != corruptRegistersBefore+1 {
-			t.Fatalf("the cold corrupt Session was revalidated %d times in one list, want exactly one attempt",
+		if corruptRegistersAfter != corruptRegistersBefore {
+			t.Fatalf("the latched corrupt Session was revalidated %d times, want none: the corruption sticks to its cell",
 				corruptRegistersAfter-corruptRegistersBefore)
+		}
+		if malformedRegisters, malformedEntries := counting.counts("corrupt-id"); malformedRegisters != 0 || malformedEntries != 0 {
+			t.Fatalf("the malformed identity reached storage (%d/%d), want the shape filter to drop it before any read",
+				malformedRegisters, malformedEntries)
 		}
 
 		// Deletion removes the row from the listing while the direct read

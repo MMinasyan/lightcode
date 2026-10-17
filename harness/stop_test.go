@@ -110,6 +110,13 @@ func (g *launchGate) Transact(ctx context.Context, fn func(Transaction) error) e
 	return err
 }
 
+// readCount reports how many register reads the gate served.
+func (g *launchGate) readCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.reads
+}
+
 // awaitStopInterval proves a Stop call is held inside its stop interval: the
 // interval is installed under the coordinator lock after the snapshot and is
 // cleared only at the return, so finding it open with the call's result still
@@ -454,10 +461,7 @@ func TestSubmitRejectsClosedActiveChild(t *testing.T) {
 	store := completionChildGraph(completionParentID, true, OperationRunning, "", "").storage(t)
 	addRootSession(t, store, completionParentID)
 	h := newTestHarness(t, store, nil)
-	childC, err := h.coordinatorFor(context.Background(), completionChildID)
-	if err != nil {
-		t.Fatalf("coordinatorFor(child): %v", err)
-	}
+	childC := leaseCoordinator(t, h, completionChildID)
 	closeBackgroundMode(childC)
 	if _, err := submitText(t, h, completionChildID, "op-x", MessageModeRegular, "hi"); !errors.Is(err, ErrInvalid) ||
 		!strings.Contains(err.Error(), "session is closed to agent work") {
@@ -465,25 +469,23 @@ func TestSubmitRejectsClosedActiveChild(t *testing.T) {
 	}
 }
 
-// TestStopGatedLaunchRunsClosedEntryPath proves the gated initial launch: a
-// child Stop during the launch's materialization window captures its parent
-// membership and cannot return; releasing the launch runs the closed-entry
-// interruption path, completes the delivery to the parent, and releases Stop.
-func TestStopGatedLaunchRunsClosedEntryPath(t *testing.T) {
+// TestStopGatedLaunchWaitsForMaterialization proves the materialization-window
+// row under the stable-cell protocol: a child Stop that lands while the
+// launch's child load is parked shares the child's one stable cell and waits
+// for that load — it neither skips the addressed child nor starts a second
+// load — and once released the child is permanently closed, its Operation
+// reaches a terminal, and the parent receives the completion before the stop
+// returns. The closed-entry interruption outcome itself is pinned by
+// TestStopRacingStartSettlesWithoutStarting, whose stop completes before the
+// launch resumes.
+func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
 	store := freshSessionStore(t)
 	gate := newLaunchGate(store, "read")
-	var (
-		mu    sync.Mutex
-		opens []string
-	)
 	exec := validExecution()
 	exec.Model = quickModel()
 	stub := newPrepareStub(PreparedExecution{
 		Capture: testCapture(),
-		Open: func(_ context.Context, admission OperationAdmission) (Execution, error) {
-			mu.Lock()
-			opens = append(opens, admission.SessionID)
-			mu.Unlock()
+		Open: func(_ context.Context, _ OperationAdmission) (Execution, error) {
 			return exec, nil
 		},
 	})
@@ -509,42 +511,38 @@ func TestStopGatedLaunchRunsClosedEntryPath(t *testing.T) {
 		t.Fatalf("the committed child register is missing")
 	}
 
-	childC, err := h.coordinatorFor(context.Background(), childID)
-	if err != nil {
-		t.Fatalf("coordinatorFor(child): %v", err)
-	}
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), childID) }()
-	awaitStopInterval(t, childC, stopDone) // the parent membership holds the stop
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop(child) = %v, want it held behind the parked materialization", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	sharedLoads := gate.readCount() // the parent's load plus the parked child's: the stop must not add a third
+	if sharedLoads != 2 {
+		t.Fatalf("register reads while the stop waited = %d, want the parent's and the parked child's two", sharedLoads)
+	}
 
 	close(gate.readRelease)
 	if err := stopResult(t, stopDone); err != nil {
 		t.Fatalf("Stop(child) = %v, want nil", err)
 	}
 	if err := <-launchDone; err != nil {
-		t.Fatalf("LaunchChildSession = %v, want the launch to succeed with the entry interruption", err)
+		t.Fatalf("LaunchChildSession = %v, want the launch to succeed", err)
 	}
-	mu.Lock()
-	childOpened := false
-	for _, id := range opens {
-		if id == childID {
-			childOpened = true
-		}
+	if got := gate.readCount(); got != sharedLoads {
+		t.Fatalf("register reads after the stop joined = %d, want the same %d: no second child load", got, sharedLoads)
 	}
-	mu.Unlock()
-	if childOpened {
-		t.Fatalf("the closed child's execution opened; want the entry interruption without an opener call")
+	if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status == OperationRunning || rec.State.Terminal == nil {
+		t.Fatalf("child operation state = %+v, want a terminal settlement", rec.State)
 	}
-	if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status != OperationInterruption ||
-		rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("child operation state = %+v, want terminal interruption with the contract detail", rec.State)
-	}
-	if got := runtimeInputTextRaw(t, store, testSessionID); got != "Task interrupted." {
+	if got := runtimeInputTextRaw(t, store, testSessionID); got == "" {
 		t.Fatalf("parent runtime input = %q, want the child completion delivered", got)
 	}
 	if len(storedSignals(t, store, testSessionID)) != 0 {
 		t.Fatalf("parent signals = %+v, want the idle parent's admission delivery, not a signal", storedSignals(t, store, testSessionID))
 	}
+	childC := cachedCoordinator(t, h, childID)
 	childC.mu.Lock()
 	closed := childC.bgState == bgClosed
 	childC.mu.Unlock()
@@ -595,10 +593,7 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 		t.Fatalf("the committed child register is missing")
 	}
 
-	childC, err := h.coordinatorFor(context.Background(), childID)
-	if err != nil {
-		t.Fatalf("coordinatorFor(child): %v", err)
-	}
+	childC := leaseCoordinator(t, h, childID)
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), childID) }()
 	awaitStopInterval(t, childC, stopDone) // the parent membership holds the stop
@@ -639,10 +634,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 	stub := newPrepareStub(modelPrepared(quickModel()))
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
-	childC, err := h.coordinatorFor(context.Background(), completionChildID)
-	if err != nil {
-		t.Fatalf("coordinatorFor(child): %v", err)
-	}
+	childC := leaseCoordinator(t, h, completionChildID)
 	release, err := h.reserve(context.Background(), childC)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
@@ -781,10 +773,7 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	insertMalformedChildSession(t, store, childID)
 	h, cancel := newCancelableHarness(t, store, modelPrepared(quickModel()), nil)
 	defer cancel()
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, childID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -882,10 +871,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		childID := hexID(9)
 		insertMalformedChildSession(t, store, childID)
 		h := newTestHarness(t, store, nil)
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, childID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -907,10 +893,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		stub := newPrepareStub(modelPrepared(quickModel()))
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -932,10 +915,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		store.mu.Lock()
 		store.registersErr = nil // the transient failure clears: the natural path converges
 		store.mu.Unlock()
-		childC, err := h.coordinatorFor(context.Background(), completionChildID)
-		if err != nil {
-			t.Fatalf("coordinatorFor(child): %v", err)
-		}
+		childC := leaseCoordinator(t, h, completionChildID)
 		childC.mu.Lock()
 		childC.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: 1024}
 		childC.mu.Unlock()
@@ -1109,10 +1089,7 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)

@@ -80,13 +80,24 @@ func (h *Harness) emitFact(fact HarnessFact) {
 // readObservation samples one coordinator's current identity and revision
 // pair under the coordinator mutex, using the shared unavailable check (gone
 // and the sticky corruption marker, the latter read through the registry
-// mutex taken inside that hold — the permitted c.mu→h.mu order). A deleted or
-// corrupt coordinator reports false. No snapshot or history copy is built to
-// read the pair; the identity is copied by value from the cached graph.
+// mutex taken inside that hold — the permitted c.mu→h.mu order). The use is
+// claimed first, under the registry mutex, without inspecting the graph: a
+// cached-only observation never loads, so an evicted graph is a normal cache
+// miss and can never race an eviction. A deleted, corrupt, or graphless
+// coordinator reports false. No snapshot or history copy is built to read the
+// pair; the identity is copied by value from the cached graph.
 func (h *Harness) readObservation(c *coordinator) (SessionIdentity, SessionRevision, bool) {
+	release, ok := h.claimCoordinator(c)
+	if !ok {
+		return SessionIdentity{}, SessionRevision{}, false
+	}
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if h.unavailableLocked(c, c.graph.Session.Identity.SessionID) != nil {
+	if h.unavailableLocked(c, c.sessionID) != nil {
+		return SessionIdentity{}, SessionRevision{}, false
+	}
+	if c.graph == nil { // a cached-only observation never loads a Session
 		return SessionIdentity{}, SessionRevision{}, false
 	}
 	return c.graph.Session.Identity,

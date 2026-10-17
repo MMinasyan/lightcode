@@ -87,14 +87,16 @@ func captureSweepStderr(t *testing.T) func() string {
 
 // sweepStore wraps the Core storage for the scheduler cases: it counts
 // ListSessionIDs calls, fails the next armed number of them with a chosen
-// error, parks the next transaction on a test release, and can fail one named
-// Session's deletion after its real effect.
+// error, fails one named Session's register read (the candidate's
+// validation-class fault), parks the next transaction on a test release, and
+// can fail one named Session's deletion after its real effect.
 type sweepStore struct {
 	harness.Storage
 	mu           sync.Mutex
 	lists        int
 	failErr      error
 	failLeft     int
+	readErrFor   map[string]error
 	blocked      bool
 	releaseErr   error
 	release      chan struct{}
@@ -104,7 +106,32 @@ type sweepStore struct {
 }
 
 func newSweepStore(base harness.Storage) *sweepStore {
-	return &sweepStore{Storage: base, arrived: make(chan struct{}, 1), written: make(chan struct{}, 8)}
+	return &sweepStore{Storage: base, readErrFor: map[string]error{}, arrived: make(chan struct{}, 1), written: make(chan struct{}, 8)}
+}
+
+// armReadFailure makes one Session's register read fail until it is disarmed,
+// the validation-class fault that stops a pass at its candidate load.
+func (s *sweepStore) armReadFailure(sessionID string, err error) {
+	s.mu.Lock()
+	s.readErrFor[sessionID] = err
+	s.mu.Unlock()
+}
+
+// disarmReadFailure clears one Session's armed read failure.
+func (s *sweepStore) disarmReadFailure(sessionID string) {
+	s.mu.Lock()
+	delete(s.readErrFor, sessionID)
+	s.mu.Unlock()
+}
+
+func (s *sweepStore) ReadRegisters(ctx context.Context, sessionID string) ([]harness.Register, error) {
+	s.mu.Lock()
+	failure := s.readErrFor[sessionID]
+	s.mu.Unlock()
+	if failure != nil {
+		return nil, failure
+	}
+	return s.Storage.ReadRegisters(ctx, sessionID)
 }
 
 func (s *sweepStore) ListSessionIDs(ctx context.Context) ([]string, error) {
@@ -1581,6 +1608,132 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		out := stderr()
 		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
 			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
+		}
+	})
+}
+
+// TestMaintenanceSweepStopsOnCandidateReadFailure proves the validation-class
+// partial batch through the pass: two candidates' deletions commit, a later
+// candidate's graph load fails at its storage read — outside every transaction
+// — the pass stops with that error, and both committed deletions still receive
+// their artifact and warning cleanup in the one batch section with one retained
+// diagnostic. The unreadable candidate is left retryable, not latched.
+func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
+		var ids []string
+		for _, name := range []string{"a", "b", "c"} {
+			ids = append(ids, seedStaleArchivedSession(t, store, filepath.Join(e.dataDir, name), 100*time.Hour))
+		}
+		slices.Sort(ids)
+		first, second, third := ids[0], ids[1], ids[2]
+		firstCode := plantSessionCode(t, e.dataDir, first)
+		secondCode := plantSessionCode(t, e.dataDir, second)
+		thirdCode := plantSessionCode(t, e.dataDir, third)
+
+		wrapped := newSweepStore(store)
+		ticks := make(chan time.Time)
+		opts := e.options(e.storagePlugin(wrapped))
+		opts.sweepTicks = ticks
+		r, err := open(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() {
+			if err := r.Close(context.Background()); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+
+		keeper, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "keeper"), "solo")
+		if err != nil {
+			t.Fatalf("createSession(keeper): %v", err)
+		}
+		keeperID := keeper.Identity.SessionID
+		seed := func(sessionID, kind string) {
+			id := sessionID
+			r.warnings.setSessionPrompt(sessionID, []protocol.Warning{{Source: "runtime:prompt", Kind: kind, Message: kind, SessionId: &id}})
+		}
+		seed(first, "first")
+		seed(second, "second")
+		seed(third, "third")
+		seed(keeperID, "keeper")
+
+		sub, err := r.Subscribe(64)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		t.Cleanup(sub.Close)
+		baseRevision, _ := r.warnings.snapshot()
+
+		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
+		if _, err := r.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		readFailure := errors.New("test sweep register read failure")
+		wrapped.armReadFailure(third, readFailure)
+		stderr := captureSweepStderr(t)
+		sendTick(t, ticks, time.Now().Add(200*time.Hour)) // the pass commits first and second, then stops on third's read
+
+		// The batch hint is the failed pass's warning-cleanup completion
+		// barrier: it publishes after every returned committed identity was
+		// cleaned.
+		var hint *protocol.WarningChangedEvent
+		for hint == nil {
+			event, ok := nextEvent(t, sub)
+			if !ok {
+				t.Fatal("the subscription closed before the sweep's warning hint")
+			}
+			if eventKind(t, event) != "warning_changed" {
+				continue
+			}
+			body, err := event.AsWarningChangedEvent()
+			if err != nil {
+				t.Fatalf("warning event body: %v", err)
+			}
+			if scopeKind(t, body.Scope) != "runtime" {
+				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
+			}
+			hint = &body
+		}
+		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
+			t.Fatalf("sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
+		}
+		assertNoEvent(t, sub)
+
+		mustNotExist(t, firstCode, "the first committed deletion's artifacts despite the stopping read failure")
+		mustNotExist(t, secondCode, "the second committed deletion's artifacts despite the stopping read failure")
+		mustExist(t, thirdCode, "the unreadable candidate's artifacts")
+		for _, id := range []string{first, second} {
+			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("committed deletion of %s = err %v, want the register gone", id, err)
+			}
+			if _, warnings := r.warnings.snapshot(); sessionWarningPresent(warnings, id) {
+				t.Fatalf("committed deletion of %s kept its warning group: %+v", id, warnings)
+			}
+		}
+		readSweepRegister(t, wrapped, third) // the unreadable candidate stays present for the next pass
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, third) {
+			t.Fatalf("the unreadable candidate dropped its warning group")
+		}
+		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, keeperID) {
+			t.Fatalf("the unrelated Session's warning group was removed")
+		}
+		wrapped.disarmReadFailure(third) // the transient read failure is retryable, never latched
+		if rec, err := readSweptSession(t, r, third); err != nil || rec.Lifecycle != harness.LifecycleArchived {
+			t.Fatalf("the unreadable candidate after the pass = %+v err %v, want it left readable and archived", rec, err)
+		}
+
+		// The pass error's one retained diagnostic may land just after the
+		// hint; poll it under a bounded budget.
+		deadline := time.Now().Add(5 * time.Second)
+		for strings.Count(stderr(), "lightcode: sweep: "+readFailure.Error()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		out := stderr()
+		if n := strings.Count(out, "lightcode: sweep: "+readFailure.Error()); n != 1 {
+			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line reporting the stopping read failure", n, out)
 		}
 	})
 }
