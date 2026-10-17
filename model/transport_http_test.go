@@ -837,7 +837,7 @@ func TestStreamClassifiesInvalidInputErrors(t *testing.T) { // one transport ove
 		}
 	})
 
-	t.Run("invalidToolParametersReturnTypedInvalidInputPreservingValidationIdentity", func(t *testing.T) { // tools-scope identity through validateToolDefinition: parameters must be a JSON object, an array literal fails... (the third scope's representative — together with the two messages rows above this pins one distinct validator branch per closed request-value class so dropping ANY identity from classification would break exactly its own row).
+	t.Run("invalidToolParametersReturnTypedInvalidInputPreservingValidationIdentity", func(t *testing.T) { // tools-scope identity through ValidateToolDefinition: parameters must be a JSON object, an array literal fails... (the third scope's representative — together with the two messages rows above this pins one distinct validator branch per closed request-value class so dropping ANY identity from classification would break exactly its own row).
 		req := Request{Messages: []Message{userText("hi")}, Tools: []ToolDefinition{{Name: "lookup", Parameters: json.RawMessage(`[1]`)}}} // valid messages plus one structurally-wrong tool definition isolates the failure to tools-scope validation with zero confounding variables from message handling in this row's payload...
 
 		stream, _, err := tr.Stream(context.Background(), req, nil)

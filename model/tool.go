@@ -17,7 +17,8 @@ type ToolDefinition struct {
 // ErrInvalidParameters is returned when a tool definition's parameters are not valid JSON with an object top-level value (malformed, array, primitive, or null).
 var ErrInvalidParameters = errors.New("tool parameters must be a JSON object")
 
-func validateToolDefinition(d ToolDefinition) error {
+// ValidateToolDefinition applies exactly the NewToolDefinition accepting rules — a non-empty name and object-shaped well-formed parameter JSON, checked at the syntax level only — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original definition.
+func ValidateToolDefinition(d ToolDefinition) error {
 	if d.Name == "" {
 		return fmt.Errorf("%w: tool definition name", ErrMissingField)
 	}
@@ -33,7 +34,7 @@ func validateToolDefinition(d ToolDefinition) error {
 
 // NewToolDefinition validates in and returns an independent copy with the parameters bytes cloned. Validation rejects empty names, malformed parameter JSON, and non-object top levels; schema-dialect content is deliberately not checked here.
 func NewToolDefinition(in ToolDefinition) (ToolDefinition, error) {
-	if err := validateToolDefinition(in); err != nil {
+	if err := ValidateToolDefinition(in); err != nil {
 		return ToolDefinition{}, err
 	}
 	out := in
@@ -77,26 +78,38 @@ type Request struct {
 // ErrDuplicateToolName is returned when two tool definitions in one request share a name.
 var ErrDuplicateToolName = errors.New("duplicate tool definition name")
 
-// NewRequest validates and deep-copies every message (role/source rules, field combinations, part kinds) and tool definition (name, object-shaped parameters), rejects duplicate tool names, and returns an owned request independent of the input slices and bytes.
-func NewRequest(in Request) (Request, error) {
-	out := Request{Messages: make([]Message, 0, len(in.Messages)), Tools: make([]ToolDefinition, 0, len(in.Tools))}
-
+// ValidateRequest applies exactly the NewRequest accepting rules — every message through the message validator under its "messages[%d]:" prefix in index order, then every tool definition through ValidateToolDefinition under its "tools[%d]:" prefix, with the duplicate-name rejection at its existing position inside that per-tool pass — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original request.
+func ValidateRequest(in Request) error {
 	for i, msg := range in.Messages {
 		if err := validateMessage(msg); err != nil {
-			return Request{}, fmt.Errorf("messages[%d]: %w", i, err)
+			return fmt.Errorf("messages[%d]: %w", i, err)
 		}
-		out.Messages = append(out.Messages, cloneOwnedMessage(msg))
 	}
 
 	seen := make(map[string]bool, len(in.Tools))
 	for i, def := range in.Tools {
-		if err := validateToolDefinition(def); err != nil {
-			return Request{}, fmt.Errorf("tools[%d]: %w", i, err)
+		if err := ValidateToolDefinition(def); err != nil {
+			return fmt.Errorf("tools[%d]: %w", i, err)
 		}
 		if seen[def.Name] {
-			return Request{}, fmt.Errorf("%w: %q", ErrDuplicateToolName, def.Name)
+			return fmt.Errorf("%w: %q", ErrDuplicateToolName, def.Name)
 		}
 		seen[def.Name] = true
+	}
+	return nil
+}
+
+// NewRequest validates and deep-copies every message (role/source rules, field combinations, part kinds) and tool definition (name, object-shaped parameters), rejects duplicate tool names, and returns an owned request independent of the input slices and bytes.
+func NewRequest(in Request) (Request, error) {
+	if err := ValidateRequest(in); err != nil {
+		return Request{}, err
+	}
+
+	out := Request{Messages: make([]Message, 0, len(in.Messages)), Tools: make([]ToolDefinition, 0, len(in.Tools))}
+	for _, msg := range in.Messages {
+		out.Messages = append(out.Messages, cloneOwnedMessage(msg))
+	}
+	for _, def := range in.Tools {
 		out.Tools = append(out.Tools, ToolDefinition{
 			Name:        def.Name,
 			Description: def.Description,

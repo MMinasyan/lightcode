@@ -228,7 +228,7 @@ func validateInputEntry(v inputEntry) error {
 		return fmt.Errorf("input origin %q is not one of user, runtime or plugin", v.Origin)
 	}
 	for i, part := range v.Content {
-		if _, err := model.NewContentPart(part); err != nil {
+		if err := model.ValidateContentPart(part); err != nil {
 			return fmt.Errorf("content[%d]: %w", i, err)
 		}
 	}
@@ -498,7 +498,7 @@ func validateAssistantEntry(v assistantEntry) error {
 		return fmt.Errorf("assistant source %q must be a complete model identity", v.Source.String())
 	}
 	for i, part := range v.Content {
-		if _, err := model.NewContentPart(part); err != nil {
+		if err := model.ValidateContentPart(part); err != nil {
 			return fmt.Errorf("content[%d]: %w", i, err)
 		}
 	}
@@ -2115,7 +2115,7 @@ func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error
 // validateExecutionCapture enforces the closed capture shape: non-empty
 // stable revision, complete model identity, positive conversation window and
 // output reserve, a complete valid compaction configuration, unique tool
-// names in preserved order through the landed request constructor, and
+// names in preserved order through the shared request validator, and
 // non-empty unique capability IDs in preserved order. Capability names are
 // checked for shape only: no plugin definition is consulted, so a historical
 // capture stays readable when plugins change.
@@ -2135,7 +2135,7 @@ func validateExecutionCapture(v ExecutionCapture) error {
 	if err := validateCompactCapture(v.Compact); err != nil {
 		return fmt.Errorf("compact: %w", err)
 	}
-	if _, err := model.NewRequest(model.Request{Tools: v.Tools}); err != nil {
+	if err := model.ValidateRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
 	}
 	seen := make(map[string]bool, len(v.Capabilities))

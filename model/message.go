@@ -51,7 +51,8 @@ type ContentPart struct {
 	Extra          Extra  // raw extras; deep-copied at every accepting boundary.
 }
 
-func validateContentPart(p ContentPart) error {
+// ValidateContentPart applies exactly the NewContentPart accepting rules — the closed kind set, per-kind field ownership, opaque parts requiring their non-empty original wire type, and Extra values that must be complete valid JSON — and returns the first violation with the constructor's exact error identity, precedence and detail. It retains and mutates nothing: it is the validation-only read of the same contract, for callers that keep their original part.
+func ValidateContentPart(p ContentPart) error {
 	switch p.Kind {
 	case PartText:
 		if p.URL != "" || p.OpaqueWireType != "" {
@@ -79,7 +80,7 @@ func validateContentPart(p ContentPart) error {
 
 // NewContentPart validates in and returns an independent deep copy with its extras cloned. Validation rejects unknown kinds, cross-kind field combinations, opaque parts without their original wire type, and extra values that are not valid JSON; empty kind-specific content is allowed because finalization omits empty parts later.
 func NewContentPart(in ContentPart) (ContentPart, error) {
-	if err := validateContentPart(in); err != nil {
+	if err := ValidateContentPart(in); err != nil {
 		return ContentPart{}, err
 	}
 	out := in
@@ -129,7 +130,7 @@ func validateMessage(m Message) error {
 	}
 
 	for i, part := range m.Content {
-		if err := validateContentPart(part); err != nil {
+		if err := ValidateContentPart(part); err != nil {
 			return fmt.Errorf("content[%d]: %w", i, err)
 		}
 	}
