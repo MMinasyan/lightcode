@@ -126,10 +126,7 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 	t.Run("closed group", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), nil)
 		h.deps.Jobs = stubJobStopper{}
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		c.mu.Lock()
 		c.bgState = bgStopping
 		c.mu.Unlock()
@@ -177,10 +174,7 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 func TestStartJobHandoffLossFinishesMemberOnce(t *testing.T) {
 	t.Run("closed group rejects with the closed-or-stopping text", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), nil)
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -214,10 +208,7 @@ func TestStartJobHandoffLossFinishesMemberOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -235,10 +226,7 @@ func TestStartJobHandoffLossFinishesMemberOnce(t *testing.T) {
 func TestStartJobSpawnFailureFinishesMemberOnce(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
 	h.deps.Jobs = stubJobStopper{}
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	var spawned []string
 	spawn := spawnRecord(&spawned, errors.New("spawn down"))
 	if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); err == nil || err.Error() != "spawn down" {
@@ -264,10 +252,7 @@ func TestStartJobSpawnFailureFinishesMemberOnce(t *testing.T) {
 func TestStartJobDrivesSpawnThroughAdmission(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
 	h.deps.Jobs = stubJobStopper{}
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	var spawned []string
 	spawn := spawnRecord(&spawned, nil)
 	if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); err != nil {
@@ -327,10 +312,7 @@ func TestLaunchChildSessionRefusesChildParent(t *testing.T) {
 	childParent.Identity.ParentSessionID = hexID(2)
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, (&testGraph{session: childParent}).storage(t), stub.prepare)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	if _, err := h.LaunchChildSession(context.Background(), launchRequest()); !errors.Is(err, ErrInvalid) ||
 		!strings.Contains(err.Error(), "child sessions cannot launch child sessions") {
 		t.Fatalf("child-parent launch = %v, want the refusal", err)
@@ -355,11 +337,8 @@ func TestLaunchChildSessionArchivedParent(t *testing.T) {
 	archived.State.ArchivedAt = &now
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, (&testGraph{session: archived}).storage(t), stub.prepare)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
-	_, err = h.LaunchChildSession(context.Background(), launchRequest())
+	c := leaseCoordinator(t, h, testSessionID)
+	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	want := invalidInput("session %q is archived; admission requires an open Session", testSessionID)
 	if err == nil || err.Error() != want.Error() {
 		t.Fatalf("archived launch = %v, want %v", err, want)
@@ -405,10 +384,7 @@ func TestLaunchChildSessionCapRejection(t *testing.T) {
 	stub := newPrepareStub(validPrepared())
 	h, cancel := newCancelableHarness(t, freshSessionStore(t), PreparedExecution{}, stub.prepare)
 	defer cancel()
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, "existing-child", 0)
 	if err != nil {
 		t.Fatalf("pre-admission: %v", err)
@@ -452,10 +428,7 @@ func TestLaunchChildSessionPrepareFailure(t *testing.T) {
 	stub := newPrepareStub(PreparedExecution{})
 	stub.err = errors.New("prepare down")
 	h := newTestHarness(t, freshSessionStore(t), stub.prepare)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	if _, err := h.LaunchChildSession(context.Background(), launchRequest()); err == nil || err.Error() != "prepare down" {
 		t.Fatalf("prepare failure = %v, want the unchanged preparation error", err)
 	}
@@ -480,12 +453,9 @@ func TestLaunchChildSessionPublicationFailure(t *testing.T) {
 	store := freshSessionStore(t)
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, store, stub.prepare)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	store.txHook = func(string) error { return fmt.Errorf("%w: storage down", ErrStorage) }
-	_, err = h.LaunchChildSession(context.Background(), launchRequest())
+	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	store.txHook = nil
 	if !errors.Is(err, ErrStorage) {
 		t.Fatalf("publication failure = %v, want the storage class", err)
@@ -512,10 +482,7 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 		stub := newPrepareStub(validPrepared())
 		stub.gate = make(chan struct{})
 		h := newTestHarness(t, store, stub.prepare)
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		return h, store, stub, c
 	}
 	runLaunch := func(t *testing.T, h *Harness, stub *prepareStub, mutate func()) error {
@@ -628,17 +595,14 @@ func TestLaunchChildSessionSettlesRejectedHandoff(t *testing.T) {
 	stub := newPrepareStub(modelPrepared(script.model))
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	store.txHook = func(string) error { // the stop lands between admission and handoff
 		c.mu.Lock()
 		c.bgState = bgStopping
 		c.mu.Unlock()
 		return nil
 	}
-	_, err = h.LaunchChildSession(context.Background(), launchRequest())
+	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	store.txHook = nil
 	if err == nil || err.Error() != "harness: invalid storage request: background group is closed or stopping" {
 		t.Fatalf("rejected launch = %v, want the closed-or-stopping rejection", err)
@@ -741,13 +705,10 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 		stub := newPrepareStub(modelPrepared(script.model))
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 
 		store.registersErr = fmt.Errorf("%w: storage down", ErrStorage) // the child materialization read fails
-		_, err = h.LaunchChildSession(context.Background(), launchRequest())
+		_, err := h.LaunchChildSession(context.Background(), launchRequest())
 		store.registersErr = nil
 		if !errors.Is(err, ErrStorage) {
 			t.Fatalf("materialization failure = %v, want the storage class", err)
@@ -761,10 +722,7 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 		stub := newPrepareStub(modelPrepared(script.model))
 		h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 
 		// The launch transaction fires exactly four mutation hooks (child
 		// session insert_register, input insert_entry, operation
@@ -784,7 +742,7 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 			}
 			return nil
 		}
-		_, err = h.LaunchChildSession(context.Background(), launchRequest())
+		_, err := h.LaunchChildSession(context.Background(), launchRequest())
 		store.txHook = nil
 		if !errors.Is(err, ErrStorage) {
 			t.Fatalf("settlement failure = %v, want the storage class", err)
@@ -804,10 +762,7 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	stub := newPrepareStub(modelPrepared(script.model))
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 
 	res, err := h.LaunchChildSession(context.Background(), launchRequest())
 	if err != nil {

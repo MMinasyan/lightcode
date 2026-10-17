@@ -791,10 +791,7 @@ func TestHistoryViewRetainedCaptureStable(t *testing.T) {
 // a repeated finish is a no-op publication.
 func TestSessionReadViewMemberPublications(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	read := func() SessionReadView {
 		t.Helper()
 		view, err := h.ReadSessionView(context.Background(), testSessionID)

@@ -884,8 +884,8 @@ func TestObserveSuppression(t *testing.T) {
 // producer's lock time.
 func TestObserveCurrentPair(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-		t.Fatalf("ReadSession: %v", err)
+	if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use caches the view
+		t.Fatalf("ReadSessionView: %v", err)
 	}
 	c := cachedCoordinator(t, h, testSessionID)
 	col := observeHarness(h)
@@ -1566,8 +1566,8 @@ func TestObserveToolLifecycle(t *testing.T) {
 func TestObserveRematerializationNoHint(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-		t.Fatalf("ReadSession: %v", err)
+	if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the view
+		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	col := observeHarness(h)
 	advanceSessionRevision(t, store, testSessionID) // the foreign writer
@@ -1662,8 +1662,8 @@ func (s *observationCountingStorage) ReadRegisters(ctx context.Context, sessionI
 func TestReadObservation(t *testing.T) {
 	t.Run("valid warm coordinator", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-			t.Fatalf("ReadSession: %v", err)
+		if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use keeps the graph cached
+			t.Fatalf("ReadSessionView: %v", err)
 		}
 		identity, revision, ok := h.ReadObservation(testSessionID)
 		if !ok {

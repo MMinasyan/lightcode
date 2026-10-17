@@ -1052,10 +1052,7 @@ func TestWaitDiscardsBuffersOfStuckSessions(t *testing.T) {
 		t.Fatalf("first submit: %v", err)
 	}
 	<-failed // the admitted work stopped; the Operation stays running for recovery
-	c, err := h.coordinatorFor(context.Background(), session)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session)
 	// The stuck Operation keeps the Session active: both submits buffer.
 	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
 		t.Fatalf("steering submit: %v", err)
@@ -1147,10 +1144,7 @@ func TestSubmitCancellationGate(t *testing.T) {
 		}
 		<-script.arrived // the Session is active
 
-		c, err := h.coordinatorFor(context.Background(), session)
-		if err != nil {
-			t.Fatalf("coordinator: %v", err)
-		}
+		c := leaseCoordinator(t, h, session)
 		submitCtx, cancelSubmit := context.WithCancel(context.Background())
 		cancelSubmit() // the caller context dies before the gate resolves
 		done := make(chan SubmitResult, 1)
@@ -1233,10 +1227,7 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 		if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 			t.Fatalf("disposition %q, want admitted", disposition)
 		}
-		c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-		if err != nil {
-			t.Fatalf("coordinator: %v", err)
-		}
+		c := leaseCoordinator(t, h, session.Identity.SessionID)
 		if _, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess}); err != nil {
 			t.Fatalf("settle the admitted operation: %v", err)
 		}
@@ -1347,10 +1338,7 @@ func TestSnapshotCoordinatorsReleasesRegistryMutex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 
 	c.mu.Lock() // a coordinator mutex held across the snapshot call
 	got := h.snapshotCoordinators()
