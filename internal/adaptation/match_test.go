@@ -122,23 +122,16 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 }
 
 func TestSectionAdditionResolution(t *testing.T) {
-	origDefault := defaultAdditions
-	defer func() { defaultAdditions = origDefault }()
-
-	defaultAdditions = map[string]string{"tone": "DEFAULT_TONE_ADDITION"}
-
 	cases := []struct {
 		name    string
 		adapt   *Adaptation
 		section string
 		want    string
 	}{
-		{"nil adapt + no default", nil, "safety", ""},
+		{"nil adapt", nil, "safety", ""},
 		{"active non-empty key", &Adaptation{Additions: map[string]string{"tone": "ACTIVE_TONE"}}, "tone", "ACTIVE_TONE"},
-		{"active key absent + default present", &Adaptation{Additions: map[string]string{"safety": "ACTIVE_SAFETY"}}, "tone", "DEFAULT_TONE_ADDITION"},
-		{"nil adapt + default present", nil, "tone", "DEFAULT_TONE_ADDITION"},
-		{"active present + default present", &Adaptation{Additions: map[string]string{"tone": "ACTIVE_TONE"}}, "tone", "ACTIVE_TONE"},
-		{"nil Additions map", &Adaptation{Name: "empty"}, "tone", "DEFAULT_TONE_ADDITION"},
+		{"active key absent", &Adaptation{Additions: map[string]string{"safety": "ACTIVE_SAFETY"}}, "tone", ""},
+		{"nil Additions map", &Adaptation{Name: "empty"}, "tone", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,17 +140,6 @@ func TestSectionAdditionResolution(t *testing.T) {
 				t.Fatalf("SectionAddition(%v, %q) = %q, want %q", tc.adapt, tc.section, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestShippedDefaultsEmpty(t *testing.T) {
-	if len(defaultAdditions) != 0 {
-		t.Fatalf("production defaultAdditions ships with %d entries, want 0", len(defaultAdditions))
-	}
-	for _, section := range []string{"safety", "tone", "task_execution", "language"} {
-		if got := SectionAddition(nil, section); got != "" {
-			t.Fatalf("SectionAddition(nil, %q) = %q, want empty (empty ship)", section, got)
-		}
 	}
 }
 

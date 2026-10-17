@@ -16,10 +16,6 @@ type entry struct {
 	adapt   Adaptation
 }
 
-// defaultAdditions is the system-owned fallback for per-section additions.
-// Empty means there is no baseline addition for that section.
-var defaultAdditions map[string]string
-
 // defaultToolDescriptionReplacements is populated from bundled data and applies
 // to model-facing tool descriptions when no active adaptation overrides a key.
 var defaultToolDescriptionReplacements map[string]string
@@ -32,17 +28,15 @@ func Match(modelID string) *Adaptation {
 	return matchIn(bundledTable, modelID)
 }
 
-// SectionAddition returns the addition for section from the active adaptation
-// if it exists and is non-empty, otherwise the default addition for that
-// section (which may be empty). section is one of the four user-overridable
-// section ids: "safety", "tone", "task_execution", "language".
+// SectionAddition returns the nonempty addition for section from the active
+// adaptation, or "" when the adaptation or the entry is absent. section is one
+// of the four user-overridable section ids: "safety", "tone", "task_execution",
+// "language".
 func SectionAddition(adapt *Adaptation, section string) string {
-	if adapt != nil && adapt.Additions != nil {
-		if v := adapt.Additions[section]; v != "" {
-			return v
-		}
+	if adapt == nil {
+		return ""
 	}
-	return defaultAdditions[section]
+	return adapt.Additions[section]
 }
 
 // RenderToolDescription applies bundled placeholder replacements to a
@@ -81,8 +75,7 @@ func RenderToolDescription(description string, adapt *Adaptation) string {
 // matches modelID, or nil. Matching is case-insensitive and walks t in order, so
 // the table's most-specific-first ordering decides ties (first match wins). The
 // result aliases nothing mutable in t — its slice fields are cloned — so a caller
-// can never corrupt the table through the resolved adaptation. (The LeakPattern
-// regexp is shared intentionally: it is read-only and safe for concurrent use.)
+// can never corrupt the table through the resolved adaptation.
 func matchIn(t []entry, modelID string) *Adaptation {
 	id := strings.ToLower(modelID)
 	for i := range t {

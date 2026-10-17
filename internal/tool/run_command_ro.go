@@ -73,7 +73,7 @@ func ReadOnlyCommand(command string) (string, error) {
 	}
 	parts := make([]string, 0, len(segments)*2)
 	for i, segment := range segments {
-		if segment.UnsafeExpansion || len(segment.Redirections) > 0 {
+		if segment.UnsafeExpansion || segment.HasRedirection {
 			return "", fmt.Errorf("unsupported shell syntax")
 		}
 		argv, ok := readOnlyArgv(segment.Argv)

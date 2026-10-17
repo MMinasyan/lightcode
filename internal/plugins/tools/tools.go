@@ -91,13 +91,12 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 }
 
 // toolsConfig projects the decoded settings onto the shared file-tool
-// configuration; the command members are irrelevant to the file tools.
+// configuration.
 func (s settings) toolsConfig() config.ToolsConfig {
 	return config.ToolsConfig{
 		MaxOutputBytes:   s.MaxOutputBytes,
 		ReadMaxLines:     s.ReadMaxLines,
 		ReadLineMaxChars: s.ReadLineMaxChars,
-		CommandTimeout:   s.CommandTimeout,
 	}
 }
 

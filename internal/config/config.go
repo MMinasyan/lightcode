@@ -53,13 +53,11 @@ type SessionConfig struct {
 	DeleteAfterArchiveDays int  `json:"delete_after_archive_days"`
 }
 
-// ToolsConfig holds limits and timeouts for built-in tools.
+// ToolsConfig holds limits for built-in file tools.
 type ToolsConfig struct {
-	MaxOutputBytes         int `json:"max_output_bytes"`
-	ReadMaxLines           int `json:"read_max_lines"`
-	ReadLineMaxChars       int `json:"read_line_max_chars"`
-	CommandTimeout         int `json:"command_timeout"`
-	MaxBackgroundProcesses int `json:"max_background_processes"`
+	MaxOutputBytes   int `json:"max_output_bytes"`
+	ReadMaxLines     int `json:"read_max_lines"`
+	ReadLineMaxChars int `json:"read_line_max_chars"`
 }
 
 // Config is the decoded config file. Providers are retained as raw JSON-ish
