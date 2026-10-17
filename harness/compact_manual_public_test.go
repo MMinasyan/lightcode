@@ -367,18 +367,18 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("compaction entries = %v, want exactly one", ids)
 		}
 		// The piece usage landed keyed by the compact model.
-		sess, err := f.h.SnapshotSession(context.Background(), session)
+		view, err := f.h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
 		found := false
-		for _, mu := range sess.Session.State.Usage.ByModel {
+		for _, mu := range view.TotalUsage.ByModel {
 			if mu.Model == compactModelRef {
 				found = mu.Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5})
 			}
 		}
 		if !found {
-			t.Fatalf("session usage = %+v, want the piece counts keyed by the compact model", sess.Session.State.Usage)
+			t.Fatalf("session usage = %+v, want the piece counts keyed by the compact model", view.TotalUsage)
 		}
 		// The compact preparation carried the compact request kind while the
 		// conversation turn's preparation carried the message kind.
@@ -590,12 +590,20 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 		if ids := compactionEntryIDs(t, store, session); len(ids) != 0 {
 			t.Fatalf("compaction entries = %v, want none", ids)
 		}
-		sess, err := f.h.SnapshotSession(context.Background(), session)
+		sessionReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("session register read: %v", err)
 		}
-		if sess.Session.State.CompactionEntryID != "" {
-			t.Fatalf("compaction_entry_id = %q, want it unchanged", sess.Session.State.CompactionEntryID)
+		var sessionState struct {
+			State struct {
+				CompactionEntryID string `json:"compaction_entry_id"`
+			} `json:"state"`
+		}
+		if err := json.Unmarshal(sessionReg.Payload, &sessionState); err != nil {
+			t.Fatalf("decode session register: %v", err)
+		}
+		if sessionState.State.CompactionEntryID != "" {
+			t.Fatalf("compaction_entry_id = %q, want it unchanged", sessionState.State.CompactionEntryID)
 		}
 		// Subsequent messages never see a synthetic compact request.
 		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {

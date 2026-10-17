@@ -424,12 +424,16 @@ func TestPublicTurnLifecycle(t *testing.T) {
 		if len(first.State.Usage.ByModel) != 1 || first.State.Usage.ByModel[0] != want.ByModel[0] {
 			t.Fatalf("operation usage = %+v, want the reported counts", first.State.Usage)
 		}
-		sessionSnap, err := f.h.SnapshotSession(context.Background(), session)
-		if err != nil || sessionSnap.Session.State.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v", sessionSnap, err)
+		sessionHeader, err := f.h.ReadSessionHeader(context.Background(), session)
+		if err != nil || sessionHeader.CurrentOperationID != "" {
+			t.Fatalf("session after convergence = %+v err %v", sessionHeader, err)
 		}
-		if len(sessionSnap.Session.State.Usage.ByModel) != 1 || sessionSnap.Session.State.Usage.ByModel[0] != want.ByModel[0] {
-			t.Fatalf("session usage = %+v, want the same totals", sessionSnap.Session.State.Usage)
+		sessionView, err := f.h.ReadSessionView(context.Background(), session)
+		if err != nil {
+			t.Fatalf("ReadSessionView: %v", err)
+		}
+		if len(sessionView.TotalUsage.ByModel) != 1 || sessionView.TotalUsage.ByModel[0] != want.ByModel[0] {
+			t.Fatalf("session usage = %+v, want the same totals", sessionView.TotalUsage)
 		}
 		second, err := f.h.ReadOperation(context.Background(), session, "op-2")
 		if err != nil || second.State.Status != harness.OperationFailure ||
@@ -489,11 +493,7 @@ func TestPublicSteeringContinuation(t *testing.T) {
 		if err != nil || successor.State.Status != harness.OperationSuccess {
 			t.Fatalf("steering operation = %+v err %v, want the successor's success", successor, err)
 		}
-		snap, err := f.h.SnapshotSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("snapshot: %v", err)
-		}
-		for _, fact := range snap.Facts {
+		for _, fact := range readHistoryFacts(t, f.h, session) {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "steer" {
 				if fact.OperationID != "op-2" {
 					t.Fatalf("steering input owned by %q, want its own Operation op-2", fact.OperationID)
@@ -1574,11 +1574,7 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				successor.State.Terminal == nil || successor.State.Terminal.Detail != "successor settled" {
 				t.Fatalf("successor operation = %+v err %v, want the boundary input's own Operation at its terminal", successor, err)
 			}
-			snap, err := f.h.SnapshotSession(context.Background(), session)
-			if err != nil {
-				t.Fatalf("snapshot: %v", err)
-			}
-			for _, fact := range snap.Facts {
+			for _, fact := range readHistoryFacts(t, f.h, session) {
 				if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "at-boundary" {
 					if fact.OperationID != "op-2" {
 						t.Fatalf("boundary input owned by %q, want its own Operation op-2", fact.OperationID)
@@ -5335,9 +5331,13 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 
 		// the fork's own turn settled through its model-originated terminal
-		snapshot, err := f2.h.SnapshotSession(ctx, dest)
-		if err != nil || snapshot.Session.State.CurrentOperationID != "" || len(snapshot.Session.State.Usage.ByModel) != 0 {
-			t.Fatalf("fork session after convergence = %+v err %v, want it settled with zero usage", snapshot, err)
+		destHeader, err := f2.h.ReadSessionHeader(ctx, dest)
+		if err != nil || destHeader.CurrentOperationID != "" {
+			t.Fatalf("fork session after convergence = %+v err %v, want it settled", destHeader, err)
+		}
+		destView, err := f2.h.ReadSessionView(ctx, dest)
+		if err != nil || len(destView.TotalUsage.ByModel) != 0 {
+			t.Fatalf("fork session usage = %+v err %v, want zero usage", destView.TotalUsage, err)
 		}
 		rec, err := f2.h.ReadOperation(ctx, dest, "fork-1")
 		if err != nil || rec.State.Status != harness.OperationFailure ||
@@ -6381,16 +6381,28 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		// inherits none of the source's usage: the source's compact-model
 		// piece counts never reach the destination, whose only totals are its
 		// own fork turn's conversation counts.
-		snap, err := f.h.SnapshotSession(ctx, dest)
+		destReg, err := f.store.ReadRegister(ctx, harness.RegisterKey{SessionID: dest, Kind: harness.RegisterSession})
 		if err != nil {
-			t.Fatalf("SnapshotSession(dest): %v", err)
+			t.Fatalf("destination session register: %v", err)
 		}
-		if snap.Session.State.CompactionEntryID != copied.ID {
-			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", snap.Session.State.CompactionEntryID, copied.ID)
+		var destState struct {
+			State struct {
+				CompactionEntryID string `json:"compaction_entry_id"`
+			} `json:"state"`
 		}
-		for _, mu := range snap.Session.State.Usage.ByModel {
+		if err := json.Unmarshal(destReg.Payload, &destState); err != nil {
+			t.Fatalf("decode destination session register: %v", err)
+		}
+		if destState.State.CompactionEntryID != copied.ID {
+			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", destState.State.CompactionEntryID, copied.ID)
+		}
+		destView, err := f.h.ReadSessionView(ctx, dest)
+		if err != nil {
+			t.Fatalf("ReadSessionView(dest): %v", err)
+		}
+		for _, mu := range destView.TotalUsage.ByModel {
 			if mu.Model == compactModelRef {
-				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", snap.Session.State.Usage)
+				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
 			}
 		}
 		// The fork's own turn projected at the copied summary.

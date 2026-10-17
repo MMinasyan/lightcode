@@ -19,22 +19,6 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
-// withSessionSnapshot runs one projection callback inside a single admitted
-// call: the captured configuration snapshot is taken exactly once before the
-// one Harness snapshot, and the callback consumes both before the admission
-// releases — the whole projection lifetime stays joined to the call. Reads
-// that need no configuration ignore it.
-func (r *Runtime) withSessionSnapshot(ctx context.Context, sessionID string, callback func(harness.SessionSnapshot, *configuration) error) error {
-	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		captured := r.config.current()
-		snap, err := h.SnapshotSession(ctx, sessionID)
-		if err != nil {
-			return err
-		}
-		return callback(snap, captured)
-	})
-}
-
 // listSessions projects Session headers under one required workspace and
 // lifecycle filter set, inside a single admitted call. Absent, empty, or
 // unknown filter members and a failing workspace normalization wrap the
@@ -109,31 +93,6 @@ func (r *Runtime) listWorkspaces(ctx context.Context) ([]protocol.Workspace, err
 	return out, nil
 }
 
-// snapshotRevision derives the value revision pair from one full snapshot:
-// the durable register revision and the coordinator-local counter.
-func snapshotRevision(snap harness.SessionSnapshot) harness.SessionRevision {
-	return harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
-}
-
-// snapshotHeader adapts one owned full snapshot to the metadata value the
-// narrow header producer returns, for projections that already hold the
-// complete snapshot (hydration).
-func snapshotHeader(snap harness.SessionSnapshot) harness.SessionHeader {
-	header := harness.SessionHeader{
-		Identity:           snap.Session.Identity,
-		Lifecycle:          snap.Session.State.Lifecycle,
-		CurrentAgentType:   snap.Session.State.CurrentAgentType,
-		CurrentOperationID: snap.Session.State.CurrentOperationID,
-		LastActivity:       snap.Session.State.LastActivity,
-		Revision:           snapshotRevision(snap),
-	}
-	if snap.Session.State.ArchivedAt != nil {
-		stamped := *snap.Session.State.ArchivedAt
-		header.ArchivedAt = &stamped
-	}
-	return header
-}
-
 // projectSession maps one owned metadata header to its generated Session
 // header. Every field comes from the header's validated values; timestamps
 // are UTC. The instance identifier stays empty in these pre-server values:
@@ -171,21 +130,41 @@ func projectSession(header harness.SessionHeader) protocol.Session {
 // admission identity, the captured Agent type and model ref, the terminal
 // status and detail, and the canonical register totals as decimal strings.
 func projectOperation(record harness.OperationRecord) protocol.Operation {
-	op := protocol.Operation{
-		AdmittedAt:  record.Admission.AdmittedAt.UTC(),
+	summary := harness.OperationSummary{
+		OperationID: record.Admission.OperationID,
+		RequestKind: record.Admission.RequestKind,
 		AgentType:   record.Admission.AgentType,
-		Model:       record.Admission.Execution.Model.String(),
-		OperationId: record.Admission.OperationID,
-		RequestKind: protocol.OperationRequestKind(record.Admission.RequestKind),
-		Status:      protocol.OperationStatus(record.State.Status),
-		Usage:       projectUsage(record.State.Usage),
+		Model:       record.Admission.Execution.Model,
+		AdmittedAt:  record.Admission.AdmittedAt,
+		Status:      record.State.Status,
+		SettledAt:   record.State.SettledAt,
+		Usage:       record.State.Usage,
 	}
-	if record.State.SettledAt != nil {
-		settled := record.State.SettledAt.UTC()
+	if record.State.Terminal != nil {
+		summary.Detail = record.State.Terminal.Detail
+	}
+	return projectOperationSummary(summary)
+}
+
+// projectOperationSummary maps one value-only Operation summary to its
+// generated header: the same projection rule the full-register adapter
+// consumes.
+func projectOperationSummary(summary harness.OperationSummary) protocol.Operation {
+	op := protocol.Operation{
+		AdmittedAt:  summary.AdmittedAt.UTC(),
+		AgentType:   summary.AgentType,
+		Model:       summary.Model.String(),
+		OperationId: summary.OperationID,
+		RequestKind: protocol.OperationRequestKind(summary.RequestKind),
+		Status:      protocol.OperationStatus(summary.Status),
+		Usage:       projectUsage(summary.Usage),
+	}
+	if summary.SettledAt != nil {
+		settled := summary.SettledAt.UTC()
 		op.SettledAt = &settled
 	}
-	if record.State.Terminal != nil && record.State.Terminal.Detail != "" {
-		detail := record.State.Terminal.Detail
+	if summary.Detail != "" {
+		detail := summary.Detail
 		op.Detail = &detail
 	}
 	return op
@@ -254,7 +233,7 @@ func projectConversation(sessionID string, facts []harness.HistoryFact) ([]proje
 	return items, nil
 }
 
-// indexToolResults maps the snapshot's terminal tool results by their
+// indexToolResults maps the facts' terminal tool results by their
 // reserved result entry identities — Session-unique under the validated
 // facts' own reservation rule. Unmatched identities cannot exist in
 // validated facts and simply never match.
@@ -525,61 +504,114 @@ func decodeHistoryCursor(raw, sessionID string) (historyCursor, error) {
 	return c, nil
 }
 
-// projectHistoryPage slices one owned history capture's complete projected
-// conversation into one anchored page: exactly historyPageSize indivisible
-// items in ascending display order, the newest 50 for the nil initial
-// cursor, otherwise the newest items strictly before the anchor item —
-// whose identity is resolved among this same projection's source-known item
-// identities. The oldest returned item anchors the next older cursor exactly
-// when older items remain. A nil cursor is the initial page; an empty
-// supplied cursor, a malformed document, or an anchor that resolves to no
-// item of this Session fails with harness.ErrInvalid.
-func projectHistoryPage(sessionID string, facts []harness.HistoryFact, revision harness.SessionRevision, cursor *string) (protocol.HistoryPage, error) {
-	items, err := projectConversation(sessionID, facts)
-	if err != nil {
-		return protocol.HistoryPage{}, err
+// headerFormsItem reports whether one committed entry kind produces a client
+// conversation item; a terminal tool result is absorbed into its publishing
+// assistant item instead.
+func headerFormsItem(kind harness.EntryKind) bool {
+	switch kind {
+	case harness.EntryInput, harness.EntryAssistant, harness.EntrySignal,
+		harness.EntryCompaction, harness.EntryOperationSettlement:
+		return true
+	default:
+		return false
+	}
+}
+
+// selectHistoryPage resolves one anchored page among the item-forming headers
+// of one captured history view: exactly historyPageSize entry identities in
+// ascending display order, the newest 50 for the nil initial cursor,
+// otherwise the newest items strictly before the anchor item — whose identity
+// is resolved among those same headers. The oldest selected item anchors the
+// next older cursor exactly when older items remain. A nil cursor is the
+// initial page; an empty supplied cursor, a malformed document, or an anchor
+// that resolves to no item of this Session fails with harness.ErrInvalid.
+func selectHistoryPage(sessionID string, headers []harness.HistoryEntryHeader, cursor *string) ([]string, *string, error) {
+	items := make([]int, 0, len(headers))
+	for i, header := range headers {
+		if headerFormsItem(header.Kind) {
+			items = append(items, i)
+		}
 	}
 	end := len(items)
 	if cursor != nil {
 		decoded, err := decodeHistoryCursor(*cursor, sessionID)
 		if err != nil {
-			return protocol.HistoryPage{}, err
+			return nil, nil, err
 		}
 		end = -1
-		for i, item := range items {
-			if item.id == decoded.AnchorItemID {
+		for i, index := range items {
+			if projectItemID(sessionID, headers[index].EntryID) == decoded.AnchorItemID {
 				end = i
 				break
 			}
 		}
 		if end < 0 {
-			return protocol.HistoryPage{}, fmt.Errorf("history cursor anchor %q names no item of session %q: %w", decoded.AnchorItemID, sessionID, harness.ErrInvalid)
+			return nil, nil, fmt.Errorf("history cursor anchor %q names no item of session %q: %w", decoded.AnchorItemID, sessionID, harness.ErrInvalid)
 		}
 	}
 	start := max(end-historyPageSize, 0)
-	page := protocol.HistoryPage{
-		SessionRevision: wireRevision(revision),
-		Items:           make([]protocol.ConversationItem, end-start),
+	entryIDs := make([]string, 0, end-start)
+	for _, index := range items[start:end] {
+		entryIDs = append(entryIDs, headers[index].EntryID)
 	}
-	for i, item := range items[start:end] {
-		page.Items[i] = item.item
-	}
+	older := (*string)(nil)
 	if start > 0 {
-		encoded := encodeHistoryCursor(historyCursor{SessionID: sessionID, AnchorItemID: items[start].id})
-		page.OlderCursor = &encoded
+		encoded := encodeHistoryCursor(historyCursor{SessionID: sessionID, AnchorItemID: projectItemID(sessionID, headers[items[start]].EntryID)})
+		older = &encoded
+	}
+	return entryIDs, older, nil
+}
+
+// historyPageFromView projects one captured history view's selected page: the
+// page's entry identities are selected among the item-forming headers, their
+// facts are requested by identity, and the selected assistants' reserved
+// result identities are resolved to their committed results through the same
+// view — including results outside the base-entry sequence range — so every
+// terminal outcome attaches to its publishing call exactly as in the complete
+// projection. Pending calls stay pending; results never become separate
+// items.
+func historyPageFromView(sessionID string, view harness.HistoryReadView, cursor *string) (protocol.HistoryPage, error) {
+	entryIDs, older, err := selectHistoryPage(sessionID, view.HistoryHeaders(), cursor)
+	if err != nil {
+		return protocol.HistoryPage{}, err
+	}
+	facts := view.HistoryFacts(entryIDs)
+	var resultIDs []string
+	for _, fact := range facts {
+		if fact.Kind != harness.EntryAssistant {
+			continue
+		}
+		for _, call := range fact.Assistant.ToolCalls {
+			if call.ResultEntryID != "" {
+				resultIDs = append(resultIDs, call.ResultEntryID)
+			}
+		}
+	}
+	facts = append(facts, view.HistoryFacts(resultIDs)...)
+	items, err := projectConversation(sessionID, facts)
+	if err != nil {
+		return protocol.HistoryPage{}, err
+	}
+	page := protocol.HistoryPage{
+		SessionRevision: wireRevision(view.Revision),
+		Items:           make([]protocol.ConversationItem, len(items)),
+		OlderCursor:     older,
+	}
+	for i, item := range items {
+		page.Items[i] = item.item
 	}
 	return page, nil
 }
 
-// projectPending maps one owned snapshot's both pending FIFOs to their
+// projectPending maps one composed Session view's both pending FIFOs to their
 // generated shape, reusing the conversation content projection. Queue
 // inspection rides hydration; no separate pending read exists.
-func projectPending(snap harness.SessionSnapshot) (protocol.PendingQueues, error) {
-	steering, err := projectPendingInputs(snap.Steering)
+func projectPending(view harness.SessionReadView) (protocol.PendingQueues, error) {
+	steering, err := projectPendingInputs(view.Steering)
 	if err != nil {
 		return protocol.PendingQueues{}, err
 	}
-	queued, err := projectPendingInputs(snap.Queued)
+	queued, err := projectPendingInputs(view.Queued)
 	if err != nil {
 		return protocol.PendingQueues{}, err
 	}
@@ -633,51 +665,28 @@ func resolveSessionSelection(agentType string, captured *configuration) sessionS
 	return sessionSelection{model: &selected, window: entry.ContextWindow}
 }
 
-// projectSessionUsage maps one owned snapshot's usage onto its two distinct
-// clocks: the canonical register totals as they stand, and the display
-// estimate plus the context window of the shared selection resolution.
-func projectSessionUsage(snap harness.SessionSnapshot, selection sessionSelection) protocol.UsageProjection {
+// projectSessionUsage maps one composed Session view's usage onto its two
+// distinct clocks: the canonical register totals as they stand, and the
+// display estimate plus the context window of the shared selection
+// resolution.
+func projectSessionUsage(view harness.SessionReadView, measured *harness.UsageCount, selection sessionSelection) protocol.UsageProjection {
 	return protocol.UsageProjection{
-		Totals:  projectUsage(snap.Session.State.Usage),
-		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(snap.Facts, snap.Session.State.CompactionEntryID), ContextWindow: sessionContextWindow(snap, selection)},
+		Totals:  projectUsage(view.TotalUsage),
+		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(measured), ContextWindow: sessionContextWindow(view, selection)},
 	}
 }
 
-// projectUsedTokens is the display estimate: the latest measured
-// input+cached count among the validated facts strictly after the current
-// compaction boundary, considering only usage-bearing assistant and
-// settlement entries — compaction usage stays totals-only, an unknown usage
-// is transparent, and no later measurement means zero.
-func projectUsedTokens(facts []harness.HistoryFact, compactionEntryID string) string {
-	start := 0
-	if compactionEntryID != "" {
-		for i, fact := range facts {
-			if fact.Kind == harness.EntryCompaction && fact.EntryID == compactionEntryID {
-				start = i + 1
-				break
-			}
-		}
-	}
-	var measured *harness.UsageCount
-	for _, fact := range facts[start:] {
-		var candidate *harness.UsageCount
-		switch {
-		case fact.Assistant != nil:
-			candidate = fact.Assistant.Usage
-		case fact.Settlement != nil:
-			candidate = fact.Settlement.Usage
-		}
-		if candidate != nil {
-			measured = candidate
-		}
-	}
+// projectUsedTokens is the display estimate of one measured count: the exact
+// mathematical input+cached sum — mixed signs stay negative-exact and a sum
+// beyond MaxInt64 stays positive-exact — with no later measurement rendering
+// zero.
+func projectUsedTokens(measured *harness.UsageCount) string {
 	if measured == nil {
 		return "0"
 	}
 	// The reported counts are signed int64: the display value is the exact
-	// mathematical input+cached sum — mixed signs stay negative-exact and a
-	// sum beyond MaxInt64 stays positive-exact — so the one addition rides
-	// math/big with no clamping or hand-rolled overflow cases.
+	// mathematical input+cached sum, so the one addition rides math/big with
+	// no clamping or hand-rolled overflow cases.
 	return new(big.Int).Add(big.NewInt(measured.InputTokens), big.NewInt(measured.CachedInputTokens)).String()
 }
 
@@ -687,63 +696,55 @@ func projectUsedTokens(facts []harness.HistoryFact, compactionEntryID string) st
 // selection's catalog window. An unavailable selection reports 0 rather than
 // an admission error; a usable model always has a positive window, so 0
 // never invents a model.
-func sessionContextWindow(snap harness.SessionSnapshot, selection sessionSelection) int {
-	if opID := snap.Session.State.CurrentOperationID; opID != "" {
-		for _, op := range snap.Operations {
-			if op.Admission.OperationID == opID {
-				return op.Admission.Execution.ContextWindow
-			}
-		}
+func sessionContextWindow(view harness.SessionReadView, selection sessionSelection) int {
+	if view.Header.CurrentOperationID != "" {
+		return view.ActiveContextWindow
 	}
 	return selection.window
 }
 
 // projectHydration assembles the complete Session-owned hydration body from
-// one owned snapshot and one captured configuration: the newest conversation
-// page, one Session header, the next-admission model selection, the sorted
-// Operation headers with the active pointer into them, both pending FIFOs,
-// background membership, the usage projection, and the warning presentation —
-// every global group plus this Session's own prompt and protocol warnings,
-// under the independently captured warning revision.
-func projectHydration(snap harness.SessionSnapshot, captured *configuration, warnings []protocol.Warning, warningsRevision uint64) (protocol.Hydration, error) {
-	revision := snapshotRevision(snap)
-	page, err := projectHistoryPage(snap.Session.Identity.SessionID, snap.Facts, revision, nil)
+// one composed Session view, its already-selected newest conversation page,
+// the view's newest context measurement, and one captured configuration: the
+// Session header, the next-admission model selection, the sorted Operation
+// headers with the active pointer into them, both pending FIFOs, background
+// membership, the usage projection, and the warning presentation — every
+// global group plus this Session's own prompt and protocol warnings, under
+// the independently captured warning revision.
+func projectHydration(view harness.SessionReadView, page protocol.ConversationPage, measured *harness.UsageCount, captured *configuration, warnings []protocol.Warning, warningsRevision uint64) (protocol.Hydration, error) {
+	pending, err := projectPending(view)
 	if err != nil {
 		return protocol.Hydration{}, err
 	}
-	pending, err := projectPending(snap)
-	if err != nil {
-		return protocol.Hydration{}, err
-	}
-	operations := make([]protocol.Operation, 0, len(snap.Operations))
+	operations := make([]protocol.Operation, 0, len(view.Operations))
 	var active *protocol.Operation
-	for _, record := range snap.Operations {
-		projected := projectOperation(record)
-		if record.Admission.OperationID == snap.Session.State.CurrentOperationID {
+	for _, summary := range view.Operations {
+		projected := projectOperationSummary(summary)
+		if summary.OperationID == view.Header.CurrentOperationID {
 			operation := projected
 			active = &operation
 		}
 		operations = append(operations, projected)
 	}
-	background := make([]protocol.BackgroundMember, 0, len(snap.Background))
-	for _, member := range snap.Background {
+	background := make([]protocol.BackgroundMember, 0, len(view.Background))
+	for _, member := range view.Background {
 		background = append(background, protocol.BackgroundMember{Kind: protocol.BackgroundMemberKind(member.Kind), Id: member.ID})
 	}
-	selection := resolveSessionSelection(snap.Session.State.CurrentAgentType, captured)
+	selection := resolveSessionSelection(view.Header.CurrentAgentType, captured)
 	var selectedModel *protocol.ModelRef
 	if selection.model != nil {
 		rendered := selection.model.String()
 		selectedModel = &rendered
 	}
 	return protocol.Hydration{
-		Session:               projectSession(snapshotHeader(snap)),
-		SessionRevision:       wireRevision(revision),
+		Session:               projectSession(view.Header),
+		SessionRevision:       wireRevision(view.History.Revision),
 		SelectedModel:         selectedModel,
 		Operations:            operations,
 		ActiveOperation:       active,
 		Pending:               pending,
-		Conversation:          protocol.ConversationPage{Items: page.Items, OlderCursor: page.OlderCursor},
-		Usage:                 projectSessionUsage(snap, selection),
+		Conversation:          page,
+		Usage:                 projectSessionUsage(view, measured, selection),
 		Background:            background,
 		Warnings:              warnings, // the shared read producer returns owned non-nil slices
 		WarningsRevision:      protocol.WarningsRevision{Revision: formatWarningRevision(warningsRevision)},
@@ -752,24 +753,23 @@ func projectHydration(snap harness.SessionSnapshot, captured *configuration, war
 }
 
 // configurationRevision derives the wire configuration revision from one
-// captured snapshot: the publication generation as a decimal string, with
+// captured configuration: the publication generation as a decimal string, with
 // the empty pre-server instance identity.
 func configurationRevision(captured *configuration) protocol.ConfigurationRevision {
 	return protocol.ConfigurationRevision{Generation: strconv.FormatUint(captured.generation, 10)}
 }
 
 // getHistory is the private paged history read: one admitted call taking
-// exactly one owned history capture — the committed facts and revision, no
-// Operations, FIFOs, or usage — and projecting the whole conversation before
-// slicing, so an assistant and its tool result never split.
+// exactly one narrow history capture and selecting the page's items before
+// requesting their facts, so an assistant and its tool result never split.
 func (r *Runtime) getHistory(ctx context.Context, sessionID string, cursor *string) (protocol.HistoryPage, error) {
 	var page protocol.HistoryPage
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		facts, revision, err := h.ReadSessionHistory(ctx, sessionID)
+		view, err := h.ReadHistoryView(ctx, sessionID)
 		if err != nil {
 			return err
 		}
-		page, err = projectHistoryPage(sessionID, facts, revision, cursor)
+		page, err = historyPageFromView(sessionID, view, cursor)
 		return err
 	}); err != nil {
 		return protocol.HistoryPage{}, err
@@ -778,16 +778,25 @@ func (r *Runtime) getHistory(ctx context.Context, sessionID string, cursor *stri
 }
 
 // buildHydration is the private Session-owned hydration builder: one Harness
-// snapshot and one captured configuration assemble every body member under
-// that snapshot revision, and one captured warning snapshot supplies the
-// warning presentation with its independently revisioned clock — the warning
-// capture happens exactly once per read and is not another Session read.
+// admission takes the captured configuration, the composed Session view, the
+// newest conversation page selected from the same view, its newest context
+// measurement, and one captured warning snapshot supplying the warning
+// presentation with its independently revisioned clock — the warning capture
+// happens exactly once per read and is not another Session read.
 func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protocol.Hydration, error) {
 	var hydration protocol.Hydration
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, captured *configuration) error {
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		captured := r.config.current()
+		view, err := h.ReadSessionView(ctx, sessionID)
+		if err != nil {
+			return err
+		}
 		warningsRevision, warnings := r.warnings.hydrate(sessionID)
-		var err error
-		hydration, err = projectHydration(snap, captured, warnings, warningsRevision)
+		page, err := historyPageFromView(sessionID, view.History, nil)
+		if err != nil {
+			return err
+		}
+		hydration, err = projectHydration(view, protocol.ConversationPage{Items: page.Items, OlderCursor: page.OlderCursor}, view.History.LatestContextUsage(), captured, warnings, warningsRevision)
 		return err
 	}); err != nil {
 		return protocol.Hydration{}, err
@@ -795,18 +804,18 @@ func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protoco
 	return hydration, nil
 }
 
-// resolveBoundaryEntry resolves one client boundary item ID against one owned
-// history capture's committed user-origin input facts and their
+// resolveBoundaryEntry resolves one client boundary item ID against one
+// captured history view's committed user-origin input headers and their
 // namespace-derived projected identities, returning the private entry
-// identity for the Harness Fork command. It is pure over the capture, so the
-// admitted fork command and every test share exactly one rule. A foreign,
-// non-user, or nonexistent item — and an empty boundary item — fails with the
-// shared harness.ErrInvalid sentinel.
-func resolveBoundaryEntry(sessionID string, facts []harness.HistoryFact, boundaryItemID string) (string, error) {
-	for _, fact := range facts {
-		if fact.Kind == harness.EntryInput && fact.Input.Origin == harness.InputOriginUser &&
-			projectItemID(sessionID, fact.EntryID) == boundaryItemID {
-			return fact.EntryID, nil
+// identity for the Harness Fork command. It is pure over the value metadata,
+// so the admitted fork command and every test share exactly one rule. A
+// foreign, non-user, or nonexistent item — and an empty boundary item — fails
+// with the shared harness.ErrInvalid sentinel.
+func resolveBoundaryEntry(sessionID string, headers []harness.HistoryEntryHeader, boundaryItemID string) (string, error) {
+	for _, header := range headers {
+		if header.Kind == harness.EntryInput && header.InputOrigin == harness.InputOriginUser &&
+			projectItemID(sessionID, header.EntryID) == boundaryItemID {
+			return header.EntryID, nil
 		}
 	}
 	return "", fmt.Errorf("boundary item %q is not a committed user input of session %q: %w", boundaryItemID, sessionID, harness.ErrInvalid)

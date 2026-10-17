@@ -573,8 +573,9 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 
 		// The boundary item id of the committed first input resolves through
 		// the mounted fork route on the now-idle source Session.
-		snap := snapshotThroughRuntime(t, r, session)
-		boundary := projectItemID(session, snap.Facts[0].EntryID)
+		sessionView := sessionViewThroughRuntime(t, r, session)
+		viewFacts := historyFactsOf(sessionView.History)
+		boundary := projectItemID(session, viewFacts[0].EntryID)
 		forked, err := client.ForkSessionWithResponse(ctx, session, protocol.ForkRequest{
 			BoundaryItemId: boundary,
 			OperationId:    "fork-1",

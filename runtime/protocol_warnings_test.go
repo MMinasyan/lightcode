@@ -235,7 +235,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 func awaitSessionNotBusy(t *testing.T, r *Runtime, sessionID string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
-	for snapshotThroughRuntime(t, r, sessionID).ExecutionBusy {
+	for sessionViewThroughRuntime(t, r, sessionID).History.ExecutionBusy {
 		if time.Now().After(deadline) {
 			t.Fatalf("session %q never left its busy state", sessionID)
 		}
@@ -929,7 +929,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		submitThroughRuntime(t, r, sourceID, "op-src", "boundary")
 		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
 		awaitIdleSession(t, r, sourceID)
-		snap := snapshotThroughRuntime(t, r, sourceID)
+		snap := sessionViewThroughRuntime(t, r, sourceID)
 		boundaryItem := projectItemID(sourceID, commandUserInputEntry(t, snap, "op-src"))
 
 		beforeFork, err := r.getWarnings(ctx)

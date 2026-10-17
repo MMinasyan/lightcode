@@ -66,14 +66,14 @@ func observeHarness(h *Harness) *factCollector {
 }
 
 // snapshotPair reads one Session's current revision pair through the landed
-// public snapshot.
+// metadata read.
 func snapshotPair(t *testing.T, h *Harness, sessionID string) SessionRevision {
 	t.Helper()
-	snap, err := h.SnapshotSession(context.Background(), sessionID)
+	header, err := h.ReadSessionHeader(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionHeader: %v", err)
 	}
-	return SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
+	return header.Revision
 }
 
 // wantPairAt asserts that one Session's current revision pair equals the
@@ -89,16 +89,16 @@ func wantPairAt(t *testing.T, h *Harness, sessionID string, durable int64, local
 
 // awaitHarnessQuiet waits until one Session has no current Operation and no
 // installed run, the deterministic post-terminal barrier.
-func awaitHarnessQuiet(t *testing.T, h *Harness, sessionID string) SessionSnapshot {
+func awaitHarnessQuiet(t *testing.T, h *Harness, sessionID string) SessionReadView {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap, err := h.SnapshotSession(context.Background(), sessionID)
+		view, err := h.ReadSessionView(context.Background(), sessionID)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" {
-			return snap
+		if !view.History.ExecutionBusy && view.Header.CurrentOperationID == "" {
+			return view
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session %s never went quiet", sessionID)
@@ -281,11 +281,11 @@ func TestObserveRunLifecycle(t *testing.T) {
 		}
 		// The queued successor was installed by the drain and is parked at
 		// gate2: the predecessor's tail must not have cleared its slot.
-		snap, err := h.SnapshotSession(context.Background(), session)
+		view, err := h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy {
+		if !view.History.ExecutionBusy {
 			t.Fatalf("the drain-installed successor slot was cleared by its predecessor")
 		}
 		close(gate2)
@@ -294,8 +294,8 @@ func TestObserveRunLifecycle(t *testing.T) {
 		if len(facts) < 2 {
 			t.Fatalf("successor facts = %d, want at least the successor's retire and the predecessor's release", len(facts))
 		}
-		if final.Session.Revision <= base.DurableRevision || final.LocalRevision <= base.LocalRevision {
-			t.Fatalf("successor pair = %+v, want the successor's durable admission and its local publications over %+v", final, base)
+		if final.Header.Revision.DurableRevision <= base.DurableRevision || final.Header.Revision.LocalRevision <= base.LocalRevision {
+			t.Fatalf("successor pair = %+v, want the successor's durable admission and its local publications over %+v", final.Header.Revision, base)
 		}
 	})
 }
@@ -669,14 +669,14 @@ func TestObserveDurableAdvances(t *testing.T) {
 		if _, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess}); err != nil {
 			t.Fatalf("terminal settlement: %v", err)
 		}
-		snap, err := h.SnapshotSession(context.Background(), testSessionID)
-		if err != nil || len(snap.Facts) == 0 || snap.Facts[0].Kind != EntryInput {
-			t.Fatalf("source facts = %+v err %v", snap.Facts, err)
+		sourceFacts := readSessionFacts(t, h, testSessionID)
+		if len(sourceFacts) == 0 || sourceFacts[0].Kind != EntryInput {
+			t.Fatalf("source facts = %+v", sourceFacts)
 		}
 		col := observeHarness(h)
 		res, err := h.Fork(context.Background(), ForkRequest{
 			SourceSessionID: testSessionID,
-			BoundaryEntryID: snap.Facts[0].EntryID,
+			BoundaryEntryID: sourceFacts[0].EntryID,
 			OperationID:     "fork-op-1",
 			Content:         admissionContent("forked"),
 		})
@@ -703,16 +703,16 @@ func TestObserveDurableAdvances(t *testing.T) {
 		final := awaitHarnessQuiet(t, h, dest)
 		settled := false
 		for _, op := range final.Operations {
-			if op.Admission.OperationID == "fork-op-1" {
-				settled = op.State.Status == OperationSuccess && op.State.Terminal != nil
+			if op.OperationID == "fork-op-1" {
+				settled = op.Status == OperationSuccess && op.SettledAt != nil
 			}
 		}
 		if !settled {
 			t.Fatalf("fork destination operations = %+v, want the fork Operation settled success", final.Operations)
 		}
-		if final.Session.Revision <= 2 || final.LocalRevision <= 1 {
+		if final.Header.Revision.DurableRevision <= 2 || final.Header.Revision.LocalRevision <= 1 {
 			t.Fatalf("completed destination pair = {%d %d}, want the settlement's durable advance and the drain's local publications over the held {2 1}",
-				final.Session.Revision, final.LocalRevision)
+				final.Header.Revision.DurableRevision, final.Header.Revision.LocalRevision)
 		}
 	})
 }
@@ -1012,7 +1012,7 @@ func (p *transactionProbe) observe(fact HarnessFact) {
 		p.readErrs = append(p.readErrs, err)
 		p.mu.Unlock()
 	}
-	if _, err := p.h.SnapshotSession(context.Background(), fact.SessionID); err != nil {
+	if _, err := p.h.ReadSessionView(context.Background(), fact.SessionID); err != nil {
 		p.mu.Lock()
 		p.readErrs = append(p.readErrs, err)
 		p.mu.Unlock()
@@ -1364,12 +1364,9 @@ func TestObserveRefusalFacts(t *testing.T) {
 	}
 	// Final refusal retention: the committed assistant entry keeps the
 	// fragments joined in arrival order.
-	snap, err := h.SnapshotSession(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
-	}
+	facts := readSessionFacts(t, h, sessionID)
 	retained := false
-	for _, fact := range snap.Facts {
+	for _, fact := range facts {
 		if fact.Assistant == nil {
 			continue
 		}
@@ -1379,7 +1376,7 @@ func TestObserveRefusalFacts(t *testing.T) {
 		retained = true
 	}
 	if !retained {
-		t.Fatalf("no committed assistant fact in %+v", snap.Facts)
+		t.Fatalf("no committed assistant fact in %+v", facts)
 	}
 }
 
@@ -1619,8 +1616,8 @@ func TestObserveRestartNoReplay(t *testing.T) {
 	if _, err := restarted.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if _, err := restarted.SnapshotSession(context.Background(), testSessionID); err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+	if _, err := restarted.ReadHistoryView(context.Background(), testSessionID); err != nil {
+		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	if _, err := restarted.ListSessions(context.Background()); err != nil {
 		t.Fatalf("ListSessions: %v", err)

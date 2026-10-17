@@ -50,28 +50,28 @@ func commandSubmitRequest(t *testing.T, operationID, text string) protocol.Submi
 }
 
 // commandInputFact returns the committed user input fact owned by one
-// Operation of one snapshot.
-func commandInputFact(t *testing.T, snap harness.SessionSnapshot, operationID string) harness.HistoryFact {
+// Operation of one Session view.
+func commandInputFact(t *testing.T, view harness.SessionReadView, operationID string) harness.HistoryFact {
 	t.Helper()
-	for _, fact := range snap.Facts {
+	for _, fact := range historyFactsOf(view.History) {
 		if fact.Kind == harness.EntryInput && fact.OperationID == operationID {
 			return fact
 		}
 	}
-	t.Fatalf("session %q has no committed input fact for operation %q", snap.Session.Identity.SessionID, operationID)
+	t.Fatalf("session %q has no committed input fact for operation %q", view.Header.Identity.SessionID, operationID)
 	return harness.HistoryFact{}
 }
 
 // commandUserInputEntry returns the committed user-origin input entry
-// identity owned by one Operation of one snapshot.
-func commandUserInputEntry(t *testing.T, snap harness.SessionSnapshot, operationID string) string {
+// identity owned by one Operation of one Session view.
+func commandUserInputEntry(t *testing.T, view harness.SessionReadView, operationID string) string {
 	t.Helper()
-	for _, fact := range snap.Facts {
+	for _, fact := range historyFactsOf(view.History) {
 		if fact.Kind == harness.EntryInput && fact.OperationID == operationID && fact.Input.Origin == harness.InputOriginUser {
 			return fact.EntryID
 		}
 	}
-	t.Fatalf("session %q has no committed user input entry for operation %q", snap.Session.Identity.SessionID, operationID)
+	t.Fatalf("session %q has no committed user input entry for operation %q", view.Header.Identity.SessionID, operationID)
 	return ""
 }
 
@@ -90,12 +90,12 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("createSessionHeader: %v", err)
 		}
-		snap := snapshotThroughRuntime(t, r, header.SessionId)
-		if !reflect.DeepEqual(header, projectSession(snapshotHeader(snap))) {
-			t.Fatalf("create header = %+v, want the real post-transition snapshot projection %+v", header, projectSession(snapshotHeader(snap)))
+		snap := sessionViewThroughRuntime(t, r, header.SessionId)
+		if !reflect.DeepEqual(header, projectSession(snap.Header)) {
+			t.Fatalf("create header = %+v, want the real post-transition read projection %+v", header, projectSession(snap.Header))
 		}
-		if header.SessionRevision != wireRevision(snapshotRevision(snap)) {
-			t.Fatalf("create header revision = %+v, want the snapshot pair %+v", header.SessionRevision, wireRevision(snapshotRevision(snap)))
+		if header.SessionRevision != wireRevision(snap.Header.Revision) {
+			t.Fatalf("create header revision = %+v, want the read pair %+v", header.SessionRevision, wireRevision(snap.Header.Revision))
 		}
 		if header.Workspace != workspace || header.AgentType != "solo" || header.Lifecycle != protocol.Open {
 			t.Fatalf("create header = %+v, want workspace %q solo open", header, workspace)
@@ -127,9 +127,9 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		if _, err := r.submitSession(ctx, ghost.SessionId, commandSubmitRequest(t, "op-ghost", "hi")); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("submit on unknown agent type = %v, want the preparation-time harness.ErrInvalid", err)
 		}
-		ghostSnap := snapshotThroughRuntime(t, r, ghost.SessionId)
-		if len(ghostSnap.Operations) != 0 || ghostSnap.Session.State.CurrentOperationID != "" {
-			t.Fatalf("unknown-type preparation failure committed state: %+v", ghostSnap.Session.State)
+		ghostSnap := sessionViewThroughRuntime(t, r, ghost.SessionId)
+		if len(ghostSnap.Operations) != 0 || ghostSnap.Header.CurrentOperationID != "" {
+			t.Fatalf("unknown-type preparation failure committed state: %+v", ghostSnap.Header)
 		}
 	})
 }
@@ -156,18 +156,18 @@ func TestSessionCommandAgentType(t *testing.T) {
 		if header.AgentType != "ghost" {
 			t.Fatalf("ghost header agent type = %q, want ghost", header.AgentType)
 		}
-		snap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(header, projectSession(snapshotHeader(snap))) || header.SessionRevision != wireRevision(snapshotRevision(snap)) {
-			t.Fatalf("ghost header = %+v, want the real snapshot projection %+v", header, projectSession(snapshotHeader(snap)))
+		snap := sessionViewThroughRuntime(t, r, sessionID)
+		if !reflect.DeepEqual(header, projectSession(snap.Header)) || header.SessionRevision != wireRevision(snap.Header.Revision) {
+			t.Fatalf("ghost header = %+v, want the real read projection %+v", header, projectSession(snap.Header))
 		}
 
 		worker, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
 		if err != nil {
 			t.Fatalf("setSessionAgentType(worker): %v", err)
 		}
-		workerSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(worker, projectSession(snapshotHeader(workerSnap))) || worker.SessionRevision != wireRevision(snapshotRevision(workerSnap)) {
-			t.Fatalf("worker header = %+v, want the real snapshot projection %+v", worker, projectSession(snapshotHeader(workerSnap)))
+		workerSnap := sessionViewThroughRuntime(t, r, sessionID)
+		if !reflect.DeepEqual(worker, projectSession(workerSnap.Header)) || worker.SessionRevision != wireRevision(workerSnap.Header.Revision) {
+			t.Fatalf("worker header = %+v, want the real read projection %+v", worker, projectSession(workerSnap.Header))
 		}
 		if worker.SessionRevision.DurableRevision == header.SessionRevision.DurableRevision {
 			t.Fatalf("durable revision did not advance across the committed change: %+v", worker.SessionRevision)
@@ -176,9 +176,9 @@ func TestSessionCommandAgentType(t *testing.T) {
 		if _, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{}); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("empty agent type = %v, want harness.ErrInvalid", err)
 		}
-		after := snapshotThroughRuntime(t, r, sessionID)
-		if after.Session.State.CurrentAgentType != "worker" {
-			t.Fatalf("agent type after empty refusal = %q, want worker", after.Session.State.CurrentAgentType)
+		after := sessionViewThroughRuntime(t, r, sessionID)
+		if after.Header.CurrentAgentType != "worker" {
+			t.Fatalf("agent type after empty refusal = %q, want worker", after.Header.CurrentAgentType)
 		}
 
 		if _, err := r.setSessionAgentType(ctx, "ffffffffffffffffffffffffffffffff", protocol.SetSessionAgentTypeRequest{AgentType: "worker"}); !errors.Is(err, harness.ErrNotFound) {
@@ -274,7 +274,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 			t.Fatalf("queued result = %+v, want queued with nil Operation", queued)
 		}
 
-		buffered := snapshotThroughRuntime(t, r, sessionID)
+		buffered := sessionViewThroughRuntime(t, r, sessionID)
 		if len(buffered.Steering) != 1 || buffered.Steering[0].OperationID != "op-steer" || buffered.Steering[0].Origin != harness.InputOriginUser {
 			t.Fatalf("steering buffer = %+v, want the caller-minted op-steer user item", buffered.Steering)
 		}
@@ -282,8 +282,8 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 			t.Fatalf("queued buffer = %+v, want the caller-minted op-queued user item", buffered.Queued)
 		}
 		for _, op := range buffered.Operations {
-			if op.Admission.OperationID == "op-steer" || op.Admission.OperationID == "op-queued" {
-				t.Fatalf("buffered input %q was durably admitted before the drain", op.Admission.OperationID)
+			if op.OperationID == "op-steer" || op.OperationID == "op-queued" {
+				t.Fatalf("buffered input %q was durably admitted before the drain", op.OperationID)
 			}
 		}
 
@@ -293,8 +293,8 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		awaitOperation(t, r, sessionID, "op-steer", harness.OperationSuccess) // the steering head's own Operation
 		awaitOperation(t, r, sessionID, "op-queued", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
-		drained := snapshotThroughRuntime(t, r, sessionID)
-		for _, fact := range drained.Facts {
+		drained := sessionViewThroughRuntime(t, r, sessionID)
+		for _, fact := range historyFactsOf(drained.History) {
 			if fact.Kind != harness.EntryInput || fact.OperationID != "op-steer" {
 				continue
 			}
@@ -321,7 +321,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		if !errors.Is(err, harness.ErrInvalid) || !strings.Contains(err.Error(), "another session") {
 			t.Fatalf("cross-Session Operation ID reuse = %v, want the landed invalid rule", err)
 		}
-		secondSnap := snapshotThroughRuntime(t, r, second.Identity.SessionID)
+		secondSnap := sessionViewThroughRuntime(t, r, second.Identity.SessionID)
 		if len(secondSnap.Operations) != 0 {
 			t.Fatalf("cross-Session reuse committed an Operation: %+v", secondSnap.Operations)
 		}
@@ -374,7 +374,7 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 		}
 		awaitOperation(t, r, sessionID, "op-content", harness.OperationSuccess)
 
-		snap := snapshotThroughRuntime(t, r, sessionID)
+		snap := sessionViewThroughRuntime(t, r, sessionID)
 		fact := commandInputFact(t, snap, "op-content")
 		want := []model.ContentPart{
 			{Kind: model.PartText, Text: "hello", Extra: model.Extra{"n": json.RawMessage("42")}},
@@ -439,8 +439,8 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 			t.Fatalf("empty operation id = %v, want harness.ErrInvalid", err)
 		}
 
-		after := snapshotThroughRuntime(t, r, sessionID)
-		if len(after.Operations) != 1 || after.Operations[0].Admission.OperationID != "op-content" {
+		after := sessionViewThroughRuntime(t, r, sessionID)
+		if len(after.Operations) != 1 || after.Operations[0].OperationID != "op-content" {
 			t.Fatalf("malformed submits committed state: %+v", after.Operations)
 		}
 	})
@@ -523,11 +523,11 @@ func TestSessionCommandFork(t *testing.T) {
 		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
 		awaitIdleSession(t, r, sourceID)
 
-		sourceSnap := snapshotThroughRuntime(t, r, sourceID)
+		sourceSnap := sessionViewThroughRuntime(t, r, sourceID)
 		boundaryEntry := commandUserInputEntry(t, sourceSnap, "op-src")
 		boundaryItem := projectItemID(sourceID, boundaryEntry)
 		assistantEntry := ""
-		for _, fact := range sourceSnap.Facts {
+		for _, fact := range historyFactsOf(sourceSnap.History) {
 			if fact.Kind == harness.EntryAssistant {
 				assistantEntry = fact.EntryID
 			}
@@ -584,9 +584,9 @@ func TestSessionCommandFork(t *testing.T) {
 		if status, err := operationStatusOf(store, destID, "op-fork"); err != nil || status != harness.OperationRunning {
 			t.Fatalf("fork header rendezvous = (%q, %v), want the destination still running", status, err)
 		}
-		destSnap := snapshotThroughRuntime(t, r, destID)
-		if !reflect.DeepEqual(result.Session, projectSession(snapshotHeader(destSnap))) || result.Session.SessionRevision != wireRevision(snapshotRevision(destSnap)) {
-			t.Fatalf("fork header = %+v, want the real snapshot projection %+v", result.Session, projectSession(snapshotHeader(destSnap)))
+		destSnap := sessionViewThroughRuntime(t, r, destID)
+		if !reflect.DeepEqual(result.Session, projectSession(destSnap.Header)) || result.Session.SessionRevision != wireRevision(destSnap.Header.Revision) {
+			t.Fatalf("fork header = %+v, want the real read projection %+v", result.Session, projectSession(destSnap.Header))
 		}
 
 		retry, err := r.forkSession(ctx, sourceID, req)
@@ -663,7 +663,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 		}
 		awaitOperation(t, first, sourceID, "op-src", harness.OperationSuccess)
 		awaitIdleSession(t, first, sourceID)
-		sourceSnap := snapshotThroughRuntime(t, first, sourceID)
+		sourceSnap := sessionViewThroughRuntime(t, first, sourceID)
 		boundaryEntry := commandUserInputEntry(t, sourceSnap, "op-src")
 		boundaryItem := projectItemID(sourceID, boundaryEntry)
 		req := protocol.ForkRequest{
@@ -741,8 +741,8 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, r, sessionID)
 
-		before := snapshotThroughRuntime(t, r, sessionID)
-		if before.LocalRevision == 0 {
+		before := sessionViewThroughRuntime(t, r, sessionID)
+		if before.Header.Revision.LocalRevision == 0 {
 			t.Fatal("fixture published no coordinator-local revision")
 		}
 
@@ -753,12 +753,12 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		if archived.Lifecycle != protocol.Archived || archived.ArchivedAt == nil {
 			t.Fatalf("archive header = %+v, want archived with a timestamp", archived)
 		}
-		archivedSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(archived, projectSession(snapshotHeader(archivedSnap))) || archived.SessionRevision != wireRevision(snapshotRevision(archivedSnap)) {
-			t.Fatalf("archive header = %+v, want the real snapshot projection %+v", archived, projectSession(snapshotHeader(archivedSnap)))
+		archivedSnap := sessionViewThroughRuntime(t, r, sessionID)
+		if !reflect.DeepEqual(archived, projectSession(archivedSnap.Header)) || archived.SessionRevision != wireRevision(archivedSnap.Header.Revision) {
+			t.Fatalf("archive header = %+v, want the real read projection %+v", archived, projectSession(archivedSnap.Header))
 		}
-		if archived.SessionRevision.LocalRevision != wireRevision(snapshotRevision(before)).LocalRevision {
-			t.Fatalf("archive header local revision = %q, want the real %q", archived.SessionRevision.LocalRevision, wireRevision(snapshotRevision(before)).LocalRevision)
+		if archived.SessionRevision.LocalRevision != wireRevision(before.Header.Revision).LocalRevision {
+			t.Fatalf("archive header local revision = %q, want the real %q", archived.SessionRevision.LocalRevision, wireRevision(before.Header.Revision).LocalRevision)
 		}
 
 		reopened, err := r.reopenSession(ctx, sessionID)
@@ -768,9 +768,9 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		if reopened.Lifecycle != protocol.Open || reopened.ArchivedAt != nil {
 			t.Fatalf("reopen header = %+v, want open without a timestamp", reopened)
 		}
-		reopenedSnap := snapshotThroughRuntime(t, r, sessionID)
-		if !reflect.DeepEqual(reopened, projectSession(snapshotHeader(reopenedSnap))) || reopened.SessionRevision != wireRevision(snapshotRevision(reopenedSnap)) {
-			t.Fatalf("reopen header = %+v, want the real snapshot projection %+v", reopened, projectSession(snapshotHeader(reopenedSnap)))
+		reopenedSnap := sessionViewThroughRuntime(t, r, sessionID)
+		if !reflect.DeepEqual(reopened, projectSession(reopenedSnap.Header)) || reopened.SessionRevision != wireRevision(reopenedSnap.Header.Revision) {
+			t.Fatalf("reopen header = %+v, want the real read projection %+v", reopened, projectSession(reopenedSnap.Header))
 		}
 
 		running, err := r.createSession(ctx, filepath.Join(e.home, "life-running"), "solo")
@@ -1006,7 +1006,7 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 			if status, err := operationStatusOf(store, root, "op-root"); err != nil || status != harness.OperationRunning {
 				t.Fatalf("root stop touched the root Operation: status = (%q, %v), want still running", status, err)
 			}
-			snap := snapshotThroughRuntime(t, bg.r, root)
+			snap := sessionViewThroughRuntime(t, bg.r, root)
 			if len(snap.Queued) != 1 || snap.Queued[0].OperationID != "op-wait" {
 				t.Fatalf("root stop touched the pending buffer: %+v", snap.Queued)
 			}
@@ -1038,8 +1038,8 @@ func TestSessionCommandPreparationError(t *testing.T) {
 		if res.Disposition != "" || res.Operation != nil {
 			t.Fatalf("failing preparation result = %+v, want the zero result", res)
 		}
-		snap := snapshotThroughRuntime(t, bg.r, root)
-		if len(snap.Operations) != 0 || snap.Session.State.CurrentOperationID != "" || len(snap.Facts) != 0 {
+		snap := sessionViewThroughRuntime(t, bg.r, root)
+		if len(snap.Operations) != 0 || snap.Header.CurrentOperationID != "" || len(snap.History.HistoryHeaders()) != 0 {
 			t.Fatalf("failing preparation committed state: %+v", snap)
 		}
 

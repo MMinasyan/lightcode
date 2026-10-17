@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 
@@ -28,57 +27,42 @@ import (
 // route, Harness durability kind, legacy Store, or conversation/recovery
 // authority enters here.
 
-// codeGroup is one derivable target code group: the owning Operation, its
-// admitted input entry — the group key, never a filesystem segment supplied
-// by a caller — and the committed input sequence that orders groups by
-// admission.
+// codeGroup is one derivable target code group: the owning Operation and its
+// admitted input entry — the group key, never a filesystem segment supplied by
+// a caller.
 type codeGroup struct {
 	operationID string
 	entryID     string
-	sequence    int64
 }
 
-// codeGroups derives the Session's target code groups from one owned
-// snapshot: every Operation whose OWN admitted input entry appears among the
-// validated facts, ordered by that entry's committed sequence. The match is
-// on the admitted-entry identity, never on the Operation identity (every
-// delivered message — steering included — owns exactly one Operation and one
-// admitted input, so every normally delivered head derives its own group) and
-// never on Operation IDs or admission timestamps (the Operation list is
-// identity-sorted). A manual-compaction Operation has no admitted entry and
-// derives no group; an ordinary message Operation derives its group even
+// codeGroups derives the Session's target code groups from one captured
+// history view's entry headers: every input entry owned by an Operation
+// (header Operation ownership nonempty), in the headers' own sequence order.
+// The group key is the admitted-entry identity, never the Operation identity
+// (every delivered message — steering included — owns exactly one Operation
+// and one admitted input, so every normally delivered head derives its own
+// group) and never admission timestamps (headers arrive in sequence order, so
+// filtering preserves it). A manual-compaction Operation has no admitted entry
+// and derives no group; an ordinary message Operation derives its group even
 // when no snapshots were recorded for it, because a later group still
 // rewinds.
-func codeGroups(snap harness.SessionSnapshot) []codeGroup {
-	sequences := make(map[string]int64, len(snap.Facts))
-	for _, fact := range snap.Facts {
-		if fact.Kind == harness.EntryInput {
-			sequences[fact.EntryID] = fact.Sequence
-		}
-	}
-	groups := make([]codeGroup, 0, len(snap.Operations))
-	for _, op := range snap.Operations {
-		entryID := op.Admission.AdmittedEntry.EntryID
-		if entryID == "" {
-			continue
-		}
-		sequence, ok := sequences[entryID]
-		if !ok {
+func codeGroups(headers []harness.HistoryEntryHeader) []codeGroup {
+	groups := make([]codeGroup, 0, len(headers))
+	for _, header := range headers {
+		if header.Kind != harness.EntryInput || header.OperationID == "" {
 			continue
 		}
 		groups = append(groups, codeGroup{
-			operationID: op.Admission.OperationID,
-			entryID:     entryID,
-			sequence:    sequence,
+			operationID: header.OperationID,
+			entryID:     header.EntryID,
 		})
 	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].sequence < groups[j].sequence })
 	return groups
 }
 
 // targetCodeGroupDir is the one target group layout: DataDir/code/<session>/
 // <admitted-entry>. The session and entry identities come from the validated
-// Harness snapshot, never from caller data.
+// Harness history headers, never from caller data.
 func targetCodeGroupDir(dataDir, sessionID, entryID string) string {
 	return filepath.Join(dataDir, "code", sessionID, entryID)
 }
@@ -92,12 +76,16 @@ func sessionArtifactDir(dataDir, sessionID string) string {
 
 // listSessionCodeSnapshots projects every recorded target code group of one
 // Session, ascending by the owning Operation's admitted-entry sequence, from
-// one admitted Harness snapshot. Only groups that recorded files are listed;
-// a valid Session with none returns an empty, non-nil list.
+// one admitted narrow history capture. Only groups that recorded files are
+// listed; a valid Session with none returns an empty, non-nil list.
 func (r *Runtime) listSessionCodeSnapshots(ctx context.Context, sessionID string) ([]protocol.CodeSnapshotGroup, error) {
 	var groups []protocol.CodeSnapshotGroup
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		projected, err := projectCodeSnapshotGroups(snap, r.dataDir)
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		view, err := h.ReadHistoryView(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		projected, err := projectCodeSnapshotGroups(sessionID, view.HistoryHeaders(), r.dataDir)
 		if err != nil {
 			return err
 		}
@@ -109,12 +97,11 @@ func (r *Runtime) listSessionCodeSnapshots(ctx context.Context, sessionID string
 	return groups, nil
 }
 
-// projectCodeSnapshotGroups maps one owned snapshot's derivable groups to the
-// generated list shape through the standalone CodeStore: the recorded
+// projectCodeSnapshotGroups maps one captured history view's derivable groups
+// to the generated list shape through the standalone CodeStore: the recorded
 // repository files with their retained display path and preimage existence.
-func projectCodeSnapshotGroups(snap harness.SessionSnapshot, dataDir string) ([]protocol.CodeSnapshotGroup, error) {
-	sessionID := snap.Session.Identity.SessionID
-	groups := codeGroups(snap)
+func projectCodeSnapshotGroups(sessionID string, headers []harness.HistoryEntryHeader, dataDir string) ([]protocol.CodeSnapshotGroup, error) {
+	groups := codeGroups(headers)
 	out := make([]protocol.CodeSnapshotGroup, 0, len(groups))
 	for _, group := range groups {
 		store, err := snapshot.OpenCodeStore(targetCodeGroupDir(dataDir, sessionID, group.entryID))
@@ -146,7 +133,7 @@ func projectCodeSnapshotGroups(snap harness.SessionSnapshot, dataDir string) ([]
 // revertSessionCode restores one target Session's recorded code groups at or
 // after the boundary Operation in reverse admission order. It takes the
 // Session's artifact interval nonblockingly — contention is a conflict — and
-// captures and validates its one owned snapshot while holding the token,
+// captures and validates its one narrow history view while holding the token,
 // then traverses under it. Every group's partial result is accumulated before
 // its error is handled; a traversal failure returns that accumulated result
 // with the internal error class, while a pre-traversal refusal returns no
@@ -158,8 +145,12 @@ func (r *Runtime) revertSessionCode(ctx context.Context, sessionID, boundaryOper
 		return result, err
 	}
 	defer releaseArtifacts()
-	if err := r.withSessionSnapshot(ctx, sessionID, func(snap harness.SessionSnapshot, _ *configuration) error {
-		projected, err := restoreSessionCode(snap, r.dataDir, boundaryOperationID)
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		view, err := h.ReadHistoryView(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		projected, err := restoreSessionCode(sessionID, view, r.dataDir, boundaryOperationID)
 		result = projected
 		return err
 	}); err != nil {
@@ -168,19 +159,18 @@ func (r *Runtime) revertSessionCode(ctx context.Context, sessionID, boundaryOper
 	return result, nil
 }
 
-// restoreSessionCode is the pure restore body over one owned snapshot: the
-// one idle gate, boundary resolution, then one traversal from the last
+// restoreSessionCode is the pure restore body over one captured history view:
+// the one idle gate, boundary resolution, then one traversal from the last
 // admitted group down to the boundary. The shared whole-invocation traversal
 // owns the skip and reported-skip ledgers across every group, so an identity
 // skipped in a newer group is never restored by an older one. Its existing
 // canonical and last-write proof reports changed or unproven files as skipped,
 // never overwritten, and removes only the snapshot entries it restored.
-func restoreSessionCode(snap harness.SessionSnapshot, dataDir, boundaryOperationID string) (protocol.CodeRevertResult, error) {
-	sessionID := snap.Session.Identity.SessionID
-	if err := codeRestoreRefusal(snap); err != nil {
+func restoreSessionCode(sessionID string, view harness.HistoryReadView, dataDir, boundaryOperationID string) (protocol.CodeRevertResult, error) {
+	if err := codeRestoreRefusal(sessionID, view); err != nil {
 		return protocol.CodeRevertResult{}, err
 	}
-	groups := codeGroups(snap)
+	groups := codeGroups(view.HistoryHeaders())
 	boundary := -1
 	for i, group := range groups {
 		if group.operationID == boundaryOperationID {
@@ -209,9 +199,9 @@ func restoreSessionCode(snap harness.SessionSnapshot, dataDir, boundaryOperation
 // member refuses the whole restore before any group is opened. The read is a
 // check, not a reservation, and cannot prevent later admission or another
 // writer.
-func codeRestoreRefusal(snap harness.SessionSnapshot) error {
-	if snap.ExecutionBusy || len(snap.Steering) > 0 || len(snap.Queued) > 0 || len(snap.Background) > 0 {
-		return fmt.Errorf("session %q is not idle for code restore: %w", snap.Session.Identity.SessionID, harness.ErrConflict)
+func codeRestoreRefusal(sessionID string, view harness.HistoryReadView) error {
+	if view.ExecutionBusy || view.HasPending || view.HasBackground {
+		return fmt.Errorf("session %q is not idle for code restore: %w", sessionID, harness.ErrConflict)
 	}
 	return nil
 }

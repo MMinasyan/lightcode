@@ -275,15 +275,15 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if session.Session.State.CurrentOperationID != testOpID {
-		t.Fatalf("current operation %q, want the still-running %q", session.Session.State.CurrentOperationID, testOpID)
+	if view.Header.CurrentOperationID != testOpID {
+		t.Fatalf("current operation %q, want the still-running %q", view.Header.CurrentOperationID, testOpID)
 	}
-	if !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
+	if !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
 	}
 
 	// The second context projection reads the entry the first effect committed.
@@ -350,12 +350,12 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if session.Session.State.CurrentOperationID != testOpID || !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session state = %+v, want the running operation and updated usage", session.Session.State)
+	if view.Header.CurrentOperationID != testOpID || !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session view = %+v, want the running operation and updated usage", view)
 	}
 }
 
@@ -572,12 +572,12 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
+	if !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
 	}
 }
 
