@@ -176,10 +176,11 @@ func signalProjectedText(content string) string {
 // interrupt: unselected items drain after the interrupted Operation's
 // terminal.
 func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
 	if err != nil {
 		return err
 	}
+	defer release()
 	c.mu.Lock()
 	operationID := c.graph.Session.State.CurrentOperationID
 	if operationID == "" {

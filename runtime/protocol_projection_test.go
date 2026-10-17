@@ -56,18 +56,18 @@ func projectionSession(t *testing.T, r *Runtime, workspace, agentType string) ha
 	return rec
 }
 
-func snapshotThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.SessionSnapshot {
+func sessionViewThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.SessionReadView {
 	t.Helper()
-	var snap harness.SessionSnapshot
+	var view harness.SessionReadView
 	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		snap, err = h.SnapshotSession(ctx, sessionID)
+		view, err = h.ReadSessionView(ctx, sessionID)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("SnapshotSession(%s): %v", sessionID, err)
+		t.Fatalf("ReadSessionView(%s): %v", sessionID, err)
 	}
-	return snap
+	return view
 }
 
 // headerThroughRuntime reads one Session's owned metadata header through the
@@ -97,12 +97,16 @@ func historyThroughRuntime(t *testing.T, r *Runtime, sessionID string) ([]harnes
 		revision harness.SessionRevision
 	)
 	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		facts, revision, err = h.ReadSessionHistory(ctx, sessionID)
-		return err
+		view, err := h.ReadHistoryView(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		facts = historyFactsOf(view)
+		revision = view.Revision
+		return nil
 	})
 	if err != nil {
-		t.Fatalf("ReadSessionHistory(%s): %v", sessionID, err)
+		t.Fatalf("ReadHistoryView(%s): %v", sessionID, err)
 	}
 	return facts, revision
 }
@@ -121,9 +125,21 @@ func headerErrorThroughRuntime(ctx context.Context, r *Runtime, sessionID string
 // admission gate and returns its typed error unchanged.
 func historyErrorThroughRuntime(ctx context.Context, r *Runtime, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		_, _, err := h.ReadSessionHistory(ctx, sessionID)
+		_, err := h.ReadHistoryView(ctx, sessionID)
 		return err
 	})
+}
+
+// historyFactsOf reads every committed fact of one captured history view: the
+// value-metadata headers select the entry identities the facts accessor
+// consumes.
+func historyFactsOf(view harness.HistoryReadView) []harness.HistoryFact {
+	headers := view.HistoryHeaders()
+	ids := make([]string, 0, len(headers))
+	for _, header := range headers {
+		ids = append(ids, header.EntryID)
+	}
+	return view.HistoryFacts(ids)
 }
 
 // submitQueuedThroughRuntime submits one buffered queued message.
@@ -200,29 +216,45 @@ func launchChildThroughRuntime(t *testing.T, r *Runtime, parent, operationID str
 }
 
 // wantSessionRevision derives the expected wire revision pair from one
-// snapshot: the durable register revision and the coordinator-local counter
-// as decimal strings, with the empty pre-server instance identity.
-func wantSessionRevision(t *testing.T, snap harness.SessionSnapshot) protocol.SessionRevision {
+// metadata header: the durable register revision and the coordinator-local
+// counter as decimal strings, with the empty pre-server instance identity.
+func wantSessionRevision(t *testing.T, header harness.SessionHeader) protocol.SessionRevision {
 	t.Helper()
 	return protocol.SessionRevision{
 		InstanceId:      "",
-		DurableRevision: strconv.FormatInt(snap.Session.Revision, 10),
-		LocalRevision:   strconv.FormatUint(snap.LocalRevision, 10),
+		DurableRevision: strconv.FormatInt(header.Revision.DurableRevision, 10),
+		LocalRevision:   strconv.FormatUint(header.Revision.LocalRevision, 10),
 	}
 }
 
 // inputEntryID resolves one operation's committed input entry through the
-// Session snapshot's validated facts.
+// Session's committed history headers.
 func inputEntryID(t *testing.T, r *Runtime, sessionID, operationID string) string {
 	t.Helper()
-	snap := snapshotThroughRuntime(t, r, sessionID)
-	for _, fact := range snap.Facts {
-		if fact.Kind == harness.EntryInput && fact.OperationID == operationID {
-			return fact.EntryID
+	view := historyViewThroughRuntime(t, r, sessionID)
+	for _, header := range view.HistoryHeaders() {
+		if header.Kind == harness.EntryInput && header.OperationID == operationID {
+			return header.EntryID
 		}
 	}
 	t.Fatalf("no input entry owned by %q in session %q", operationID, sessionID)
 	return ""
+}
+
+// historyViewThroughRuntime reads one Session's narrow history view through
+// the Runtime's admission gate.
+func historyViewThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.HistoryReadView {
+	t.Helper()
+	var view harness.HistoryReadView
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		view, err = h.ReadHistoryView(ctx, sessionID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ReadHistoryView(%s): %v", sessionID, err)
+	}
+	return view
 }
 
 // awaitModelArrival waits for the parked execution to reach its model
@@ -238,11 +270,10 @@ func awaitModelArrival(t *testing.T, e *ownerEnv) {
 
 // assertStableHeader checks every header field that is stable while its
 // subject holds still: identity, workspace, agent, lifecycle, archive
-// absence, the wanted current-operation member, the snapshot times, the UTC
-// zone, and the revision pair against the same fresh snapshot.
-func assertStableHeader(t *testing.T, header protocol.Session, snap harness.SessionSnapshot, sessionID, workspace, agent, wantCurrent string) {
+// absence, the wanted current-operation member, the header times, the UTC
+// zone, and the revision pair.
+func assertStableHeader(t *testing.T, header protocol.Session, sessionHeader harness.SessionHeader, sessionID, workspace, agent, wantCurrent string) {
 	t.Helper()
-	record := snap.Session
 	currentOK := (wantCurrent == "") == (header.CurrentOperationId == nil) &&
 		(wantCurrent == "" || *header.CurrentOperationId == wantCurrent)
 	if header.SessionId != sessionID ||
@@ -253,14 +284,14 @@ func assertStableHeader(t *testing.T, header protocol.Session, snap harness.Sess
 		!currentOK {
 		t.Fatalf("header = %+v, want the open %s header at %s with current operation %q", header, sessionID, workspace, wantCurrent)
 	}
-	if !header.CreatedAt.Equal(record.Identity.CreatedAt) || !header.LastActivity.Equal(record.State.LastActivity) {
-		t.Fatalf("header times = (%v, %v), want the snapshot times (%v, %v)", header.CreatedAt, header.LastActivity, record.Identity.CreatedAt, record.State.LastActivity)
+	if !header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) || !header.LastActivity.Equal(sessionHeader.LastActivity) {
+		t.Fatalf("header times = (%v, %v), want the read times (%v, %v)", header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
 	}
 	if loc := header.CreatedAt.Location(); loc != time.UTC {
 		t.Fatalf("created_at zone = %v, want UTC", loc)
 	}
-	if header.SessionRevision != wantSessionRevision(t, snap) {
-		t.Fatalf("session_revision = %+v, want the snapshot pair %+v", header.SessionRevision, wantSessionRevision(t, snap))
+	if header.SessionRevision != wantSessionRevision(t, sessionHeader) {
+		t.Fatalf("session_revision = %+v, want the read pair %+v", header.SessionRevision, wantSessionRevision(t, sessionHeader))
 	}
 }
 
@@ -278,7 +309,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 
 		// The root header before any Operation starts.
 		rootHeader := projectSession(headerThroughRuntime(t, r, root.Identity.SessionID))
-		assertStableHeader(t, rootHeader, snapshotThroughRuntime(t, r, root.Identity.SessionID),
+		assertStableHeader(t, rootHeader, headerThroughRuntime(t, r, root.Identity.SessionID),
 			root.Identity.SessionID, workspace, "solo", "")
 		if rootHeader.ParentSessionId != nil || rootHeader.SourceSessionId != nil {
 			t.Fatalf("root lineage pointers = (%v, %v), want none", rootHeader.ParentSessionId, rootHeader.SourceSessionId)
@@ -300,7 +331,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		forked := forkThroughRuntime(t, r, root.Identity.SessionID, boundary, "fork-op-1")
 		awaitModelArrival(t, e)
 		forkHeader := projectSession(headerThroughRuntime(t, r, forked))
-		assertStableHeader(t, forkHeader, snapshotThroughRuntime(t, r, forked),
+		assertStableHeader(t, forkHeader, headerThroughRuntime(t, r, forked),
 			forked, workspace, "solo", "fork-op-1")
 		if forkHeader.SourceSessionId == nil || *forkHeader.SourceSessionId != root.Identity.SessionID {
 			t.Fatalf("fork source = %v, want %s", forkHeader.SourceSessionId, root.Identity.SessionID)
@@ -312,7 +343,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		child := launchChildThroughRuntime(t, r, root.Identity.SessionID, "child-op-1")
 		awaitModelArrival(t, e)
 		childHeader := projectSession(headerThroughRuntime(t, r, child))
-		assertStableHeader(t, childHeader, snapshotThroughRuntime(t, r, child),
+		assertStableHeader(t, childHeader, headerThroughRuntime(t, r, child),
 			child, workspace, "worker", "child-op-1")
 		if childHeader.ParentSessionId == nil || *childHeader.ParentSessionId != root.Identity.SessionID {
 			t.Fatalf("child parent = %v, want %s", childHeader.ParentSessionId, root.Identity.SessionID)
@@ -750,8 +781,8 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 			"session_revision", "session_revision.durable_revision", "session_revision.instance_id",
 			"session_revision.local_revision", "workspace",
 		})
-		snap := snapshotThroughRuntime(t, r, session)
-		operationJSON := assertExactJSONKeys(t, projectOperation(snap.Operations[0]), []string{
+		snap := sessionViewThroughRuntime(t, r, session)
+		operationJSON := assertExactJSONKeys(t, projectOperationSummary(snap.Operations[0]), []string{
 			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
 			"settled_at", "status", "usage", "usage.by_model",
 		})

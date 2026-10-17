@@ -782,10 +782,7 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 	fixture := compactedFixtureGraph(input4, settlement4)
 	fixture.ops = append(fixture.ops, op4)
 	h := newTestHarness(t, fixture.storage(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	snapshot := projectedSnapshot(t, h, c)
 	if len(snapshot) != 2 {
 		t.Fatalf("snapshot messages = %d, want the summary message and the post-boundary entry", len(snapshot))
@@ -827,10 +824,7 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 	fixture := compactedFixtureGraph()
 	h := newTestHarness(t, fixture.storage(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	snapshot := projectedSnapshot(t, h, c)
 	if len(snapshot) != 1 {
 		t.Fatalf("snapshot messages = %d, want only the summary message", len(snapshot))

@@ -20,7 +20,7 @@ import (
 )
 
 // The client conversation projection: every row runs the private pure
-// projector over one SessionSnapshot. The typed-fixture rows pin the exact
+// projector over owned committed facts. The typed-fixture rows pin the exact
 // item shapes and value fidelity against stable validated facts; the live
 // rows drive real model/tool/storage effects through the composed Runtime and
 // project the facts the Harness actually validated.
@@ -39,21 +39,9 @@ func convArgs(raw string) string {
 	return base64.StdEncoding.Strict().EncodeToString([]byte(raw))
 }
 
-// convSnapshot builds one minimal owned snapshot for the given session.
-func convSnapshot(facts []harness.HistoryFact) harness.SessionSnapshot {
-	return harness.SessionSnapshot{
-		Session: harness.SessionRecord{
-			Revision: 7,
-			Identity: harness.SessionIdentity{SessionID: convSessionID, Workspace: "/w", CreatedAt: convTime},
-			State:    harness.SessionState{Lifecycle: harness.LifecycleOpen, LastActivity: convTime},
-		},
-		Operations: []harness.OperationRecord{},
-		Facts:      facts,
-		Steering:   []harness.PendingInput{},
-		Queued:     []harness.PendingInput{},
-		Background: []harness.BackgroundMemberView{},
-	}
-}
+// convSnapshot and its aggregate fixture are retired: the conversation
+// projector consumes owned fact values, the narrow history view accessors
+// consume value metadata, and no test rebuilds a removed aggregate.
 
 func convInputFact(entryID, operationID string, parts ...model.ContentPart) harness.HistoryFact {
 	return harness.HistoryFact{
@@ -100,17 +88,6 @@ func TestConversationItemIDKnownVector(t *testing.T) {
 	if otherSession == want || otherEntry == want || otherSession == otherEntry {
 		t.Fatalf("derived identities collide: %q %q %q", want, otherSession, otherEntry)
 	}
-}
-
-// conversationItems maps one projection's source-known pairs to their
-// generated items for the wire-shape oracles; pagination itself consumes the
-// pairs and never re-decodes a union variant.
-func conversationItems(pairs []projectedItem) []protocol.ConversationItem {
-	items := make([]protocol.ConversationItem, len(pairs))
-	for i, pair := range pairs {
-		items[i] = pair.item
-	}
-	return items
 }
 
 // TestConversationProjectionDeterministicItemKinds proves the exact item
@@ -173,11 +150,10 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 			},
 		},
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	if len(items) != 7 { // the tool result stays absorbed
 		t.Fatalf("items = %d, want exactly the 7 projected facts", len(items))
 	}
@@ -338,11 +314,10 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 	}
 
 	// Determinism: a second projection of the same snapshot is identical.
-	againPairs, err := projectConversation(convSessionID, facts)
+	again, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("second projectConversation: %v", err)
 	}
-	again := conversationItems(againPairs)
 	first, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("marshal first projection: %v", err)
@@ -394,11 +369,10 @@ func TestConversationProjectionSameCallIDAcrossOperations(t *testing.T) {
 		}),
 		convResultFact(resultB, assistantB, "call-1", "success", "answer-b", `{"which":"b"}`),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	if len(items) != 2 { // the results stay absorbed
 		t.Fatalf("items = %d, want exactly the two assistants", len(items))
 	}
@@ -455,11 +429,10 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 				}),
 				convResultFact(resultID, assistantID, "call-1", "success", "out", raw),
 			}
-			pairs, err := projectConversation(convSessionID, facts)
+			items, err := projectConversation(convSessionID, facts)
 			if err != nil {
 				t.Fatalf("projectConversation: %v", err)
 			}
-			items := conversationItems(pairs)
 			// The generated union's own encoding compacts raw values, so the
 			// fidelity contract is the compacted byte form: every value stays
 			// byte-exact after compaction, never re-decoded to a Go float.
@@ -496,11 +469,10 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 		}),
 		convResultFact(resultID, assistantID, "call-1", "denied", "Permission denied.", ""),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	assistant, err := items[0].AsAssistantItem()
 	if err != nil {
 		t.Fatalf("AsAssistantItem: %v", err)
@@ -528,11 +500,10 @@ func TestConversationProjectionRawArgumentText(t *testing.T) {
 			},
 		}),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	assistant, err := items[0].AsAssistantItem()
 	if err != nil {
 		t.Fatalf("AsAssistantItem: %v", err)
@@ -591,20 +562,20 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 			t.Fatalf("hook evidence entries = %d, want the four committed hook_result entries", hookEntries)
 		}
 
-		snap, err := e.snapshotSession(context.Background(), session)
+		view, err := e.sessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		for _, fact := range snap.Facts {
+		hookFacts := historyFactsOf(view.History)
+		for _, fact := range hookFacts {
 			if fact.Kind == harness.EntryHookResult {
 				t.Fatal("hook evidence became a client fact")
 			}
 		}
-		pairs, err := projectConversation(snap.Session.Identity.SessionID, snap.Facts)
+		items, err := projectConversation(view.Header.Identity.SessionID, hookFacts)
 		if err != nil {
 			t.Fatalf("projectConversation: %v", err)
 		}
-		items := conversationItems(pairs)
 		if len(items) != 4 { // input, publishing assistant, continuation assistant, end
 			t.Fatalf("items = %d (%s), want exactly the conversation items", len(items), itemKinds(t, items))
 		}
@@ -766,16 +737,15 @@ func awaitArrival(t *testing.T, arrivals <-chan int, want int, name string) {
 	}
 }
 
-// projectSessionItems snapshots one Session through the Runtime and projects
-// its complete conversation.
+// projectSessionItems reads one Session through the Runtime and projects its
+// complete conversation.
 func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.ConversationItem {
 	t.Helper()
-	snap := snapshotThroughRuntime(t, r, sessionID)
-	pairs, err := projectConversation(sessionID, snap.Facts)
+	snap := sessionViewThroughRuntime(t, r, sessionID)
+	items, err := projectConversation(sessionID, historyFactsOf(snap.History))
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	return items
 }
 
@@ -1245,8 +1215,8 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 			t.Fatalf("AsAssistantItem: %v", err)
 		}
 		copiedAssistantEntry := ""
-		forkSnap := snapshotThroughRuntime(t, bg.r, forked)
-		for _, fact := range forkSnap.Facts {
+		forkSnap := sessionViewThroughRuntime(t, bg.r, forked)
+		for _, fact := range historyFactsOf(forkSnap.History) {
 			// The first copied assistant (committed before its own closing
 			// text assistant and the fork's own turn) publishes call-1; all
 			// copied assistants carry the cleared source Operation.
@@ -1564,8 +1534,8 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 		// Every identity is the stable namespace derivation of its own
 		// committed fact entry.
 		wantEntries := make(map[harness.EntryKind]string, 3)
-		interruptedSnap := snapshotThroughRuntime(t, bg.r, interrupted)
-		for _, fact := range interruptedSnap.Facts {
+		interruptedSnap := sessionViewThroughRuntime(t, bg.r, interrupted)
+		for _, fact := range historyFactsOf(interruptedSnap.History) {
 			switch fact.Kind {
 			case harness.EntryInput, harness.EntrySignal, harness.EntryOperationSettlement:
 				wantEntries[fact.Kind] = fact.EntryID

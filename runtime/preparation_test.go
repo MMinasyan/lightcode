@@ -495,14 +495,14 @@ func (e *prepEnv) readOperation(ctx context.Context, sessionID, operationID stri
 	return rec, err
 }
 
-func (e *prepEnv) snapshotSession(ctx context.Context, sessionID string) (harness.SessionSnapshot, error) {
-	var snap harness.SessionSnapshot
+func (e *prepEnv) sessionView(ctx context.Context, sessionID string) (harness.SessionReadView, error) {
+	var view harness.SessionReadView
 	err := e.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		snap, err = h.SnapshotSession(ctx, sessionID)
+		view, err = h.ReadSessionView(ctx, sessionID)
 		return err
 	})
-	return snap, err
+	return view, err
 }
 
 func (e *prepEnv) fork(ctx context.Context, req harness.ForkRequest) (harness.ForkResult, error) {
@@ -1032,11 +1032,10 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReadEntries: %v", err)
 			}
-			sourceBeforeSnap, err := e.snapshotSession(context.Background(), session)
+			sourceBeforeView, err := e.sessionView(context.Background(), session)
 			if err != nil {
-				t.Fatalf("SnapshotSession: %v", err)
+				t.Fatalf("ReadSessionView: %v", err)
 			}
-			sourceBefore := sourceBeforeSnap.Session
 			e.hooks[0].failNext(errHook)
 			res, err := e.fork(context.Background(), harness.ForkRequest{
 				SourceSessionID: session,
@@ -1061,12 +1060,17 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 			if len(entriesAfter) != len(entriesBefore) {
 				t.Fatalf("source entries after the failed fork = %d, want unchanged %d", len(entriesAfter), len(entriesBefore))
 			}
-			sourceAfterSnap, err := e.snapshotSession(context.Background(), session)
+			sourceAfterView, err := e.sessionView(context.Background(), session)
 			if err != nil {
-				t.Fatalf("SnapshotSession: %v", err)
+				t.Fatalf("ReadSessionView: %v", err)
 			}
-			if !reflect.DeepEqual(sourceAfterSnap.Session, sourceBefore) {
-				t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfterSnap.Session, sourceBefore)
+			// The run's own retirement publications advance the local counter
+			// between the two reads; the durable metadata and the register
+			// totals must stay exactly as they were.
+			afterHeader, beforeHeader := sourceAfterView.Header, sourceBeforeView.Header
+			afterHeader.Revision.LocalRevision, beforeHeader.Revision.LocalRevision = 0, 0
+			if !reflect.DeepEqual(afterHeader, beforeHeader) || !reflect.DeepEqual(sourceAfterView.TotalUsage, sourceBeforeView.TotalUsage) {
+				t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfterView, sourceBeforeView)
 			}
 			if calls := len(e.hooks[0].calls()); calls != 2 {
 				t.Fatalf("hook.first calls = %v, want the source admission plus the failed fork", calls)

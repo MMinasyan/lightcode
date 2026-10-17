@@ -81,17 +81,17 @@ func submitCodeOperation(t *testing.T, r *Runtime, sessionID, operationID, text 
 // awaitRestorableSession polls one Session until its snapshot satisfies the
 // one idle gate the deferred restore reads: no running/reserved/retiring work,
 // empty pending FIFOs, and no live background member.
-func awaitRestorableSession(t *testing.T, r *Runtime, sessionID string) harness.SessionSnapshot {
+func awaitRestorableSession(t *testing.T, r *Runtime, sessionID string) harness.SessionReadView {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap := snapshotThroughRuntime(t, r, sessionID)
-		if !snap.ExecutionBusy && len(snap.Steering) == 0 && len(snap.Queued) == 0 && len(snap.Background) == 0 {
+		snap := sessionViewThroughRuntime(t, r, sessionID)
+		if !snap.History.ExecutionBusy && len(snap.Steering) == 0 && len(snap.Queued) == 0 && len(snap.Background) == 0 {
 			return snap
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session %q never reached the restorable state: busy=%v steering=%d queued=%d background=%d",
-				sessionID, snap.ExecutionBusy, len(snap.Steering), len(snap.Queued), len(snap.Background))
+				sessionID, snap.History.ExecutionBusy, len(snap.Steering), len(snap.Queued), len(snap.Background))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -297,7 +297,7 @@ func TestCodeSnapshotsSteeringDerivesOwnGroup(t *testing.T) {
 		if got := f.submitMode(session, "op-steer", "steering text", harness.MessageModeRegular); got != harness.DispositionSteering {
 			t.Fatalf("steering submit = %q, want steering", got)
 		}
-		if got := snapshotThroughRuntime(t, f.r, session); len(got.Operations) != 1 {
+		if got := sessionViewThroughRuntime(t, f.r, session); len(got.Operations) != 1 {
 			t.Fatalf("operations while the steering input is buffered = %d, want only the predecessor", len(got.Operations))
 		}
 		close(gate)
@@ -605,24 +605,23 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 // TestCodeRevertGateAxes proves the one restore state gate over every
 // semantic axis independently: idle passes; ExecutionBusy (running, reserved
 // or retiring), either pending FIFO, and a live background member each refuse
-// with the conflict class.
+// with the conflict class. The separate FIFO axes are the capture rule's own
+// observation; the gate consumes their single scalar fact.
 func TestCodeRevertGateAxes(t *testing.T) {
-	base := harness.SessionSnapshot{Session: harness.SessionRecord{Identity: harness.SessionIdentity{SessionID: "0123456789abcdef0123456789abcdef"}}}
+	const sessionID = "0123456789abcdef0123456789abcdef"
+	base := harness.HistoryReadView{Identity: harness.SessionIdentity{SessionID: sessionID}}
 	cases := []struct {
 		name    string
-		mutate  func(*harness.SessionSnapshot)
+		mutate  func(*harness.HistoryReadView)
 		refused bool
 	}{
 		{"idle", nil, false},
-		{"busy-running-or-reserved-or-retiring", func(s *harness.SessionSnapshot) { s.ExecutionBusy = true }, true},
-		{"pending-steering", func(s *harness.SessionSnapshot) {
-			s.Steering = []harness.PendingInput{{OperationID: "op"}}
+		{"busy-running-or-reserved-or-retiring", func(v *harness.HistoryReadView) { v.ExecutionBusy = true }, true},
+		{"pending-either-fifo", func(v *harness.HistoryReadView) {
+			v.HasPending = true
 		}, true},
-		{"pending-queued", func(s *harness.SessionSnapshot) {
-			s.Queued = []harness.PendingInput{{OperationID: "op"}}
-		}, true},
-		{"live-background-member", func(s *harness.SessionSnapshot) {
-			s.Background = []harness.BackgroundMemberView{{Kind: "child", ID: "child"}}
+		{"live-background-member", func(v *harness.HistoryReadView) {
+			v.HasBackground = true
 		}, true},
 	}
 	for _, tc := range cases {
@@ -630,7 +629,7 @@ func TestCodeRevertGateAxes(t *testing.T) {
 		if tc.mutate != nil {
 			tc.mutate(&snap)
 		}
-		err := codeRestoreRefusal(snap)
+		err := codeRestoreRefusal(sessionID, snap)
 		if tc.refused {
 			if !errors.Is(err, harness.ErrConflict) {
 				t.Fatalf("%s gate = %v, want harness.ErrConflict", tc.name, err)
@@ -697,7 +696,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 		e.server.setHold(childGate)
 		child := launchChildThroughRuntime(t, r, parent, "op-live-child")
 		awaitModelArrival(t, e)
-		if children := snapshotThroughRuntime(t, r, parent).Background; len(children) == 0 {
+		if children := sessionViewThroughRuntime(t, r, parent).Background; len(children) == 0 {
 			t.Fatal("parent background membership is empty after a live child launch")
 		}
 		if _, err := r.revertSessionCode(context.Background(), parent, "op-parent"); !errors.Is(err, harness.ErrConflict) {

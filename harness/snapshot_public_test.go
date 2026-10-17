@@ -20,6 +20,28 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// historyIDsOf collects value-metadata header identities in sequence order:
+// the request the narrow fact accessor consumes.
+func historyIDsOf(headers []harness.HistoryEntryHeader) []string {
+	ids := make([]string, 0, len(headers))
+	for _, header := range headers {
+		ids = append(ids, header.EntryID)
+	}
+	return ids
+}
+
+// readHistoryFacts reads one Session's complete committed fact set through the
+// narrow history view: the value-metadata headers select the entry identities
+// the facts accessor consumes.
+func readHistoryFacts(t *testing.T, h *harness.Harness, sessionID string) []harness.HistoryFact {
+	t.Helper()
+	view, err := h.ReadHistoryView(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("ReadHistoryView(%s): %v", sessionID, err)
+	}
+	return view.HistoryFacts(historyIDsOf(view.HistoryHeaders()))
+}
+
 // snapshotTurnPrepared returns the snapshot rows' prepared execution: the
 // scripted model over an immediate-success tool plan whose result carries
 // tool-owned metadata, so the committed history covers the assistant,
@@ -43,12 +65,11 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	}
 }
 
-// TestPublicReadSessionHistoryOwnedCapture proves the direct narrow history
+// TestPublicReadSessionHistoryOwnedCapture proves the narrow history
 // producer over both stores: exact envelope identity/kind/order of every
-// committed entry with hook evidence excluded, the revision pair sampled in
-// the same hold as the full snapshot pair, cross-producer equality with the
-// full snapshot's facts, and nested returned-value ownership against a
-// serialized expectation captured before mutation.
+// committed entry with hook evidence excluded, the revision pair of the same
+// capture, and nested returned-value ownership against a serialized
+// expectation captured before mutation.
 func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -68,10 +89,11 @@ func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 			_ = h.Wait(context.Background())
 		}()
 
-		facts, pair, err := h.ReadSessionHistory(ctx, fixture.SessionID)
+		view, err := h.ReadHistoryView(ctx, fixture.SessionID)
 		if err != nil {
-			t.Fatalf("ReadSessionHistory: %v", err)
+			t.Fatalf("ReadHistoryView: %v", err)
 		}
+		facts := view.HistoryFacts(historyIDsOf(view.HistoryHeaders()))
 		if fixture.HookEntryID == "" {
 			t.Fatal("the owning fixture lost its hook evidence entry")
 		}
@@ -88,22 +110,13 @@ func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 				t.Fatalf("fact %d leaked the hook evidence entry", i)
 			}
 		}
-
-		snap, err := h.SnapshotSession(ctx, fixture.SessionID)
-		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
-		}
-		wantPair := harness.SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
-		if pair != wantPair {
-			t.Fatalf("history pair = %+v, want the full snapshot's %+v", pair, wantPair)
-		}
-		if !reflect.DeepEqual(facts, snap.Facts) {
-			t.Fatal("the narrow history producer and the full snapshot disagree on the committed facts")
+		if view.Revision.LocalRevision != 0 || view.Revision.DurableRevision <= 0 {
+			t.Fatalf("history revision pair = %+v, want the durable register revision with a fresh coordinator's zero local counter", view.Revision)
 		}
 
 		// The serialized expectation is captured BEFORE any mutation: the
-		// returned values are owned, so both a fresh narrow read and a fresh
-		// full snapshot must still serialize to it.
+		// returned values are owned, so a fresh narrow read must still
+		// serialize to it.
 		expected, err := json.Marshal(facts)
 		if err != nil {
 			t.Fatalf("marshal the baseline history: %v", err)
@@ -154,34 +167,23 @@ func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 				}
 			}
 		}
-		again, _, err := h.ReadSessionHistory(ctx, fixture.SessionID)
+		again, err := h.ReadHistoryView(ctx, fixture.SessionID)
 		if err != nil {
-			t.Fatalf("ReadSessionHistory after mutation: %v", err)
+			t.Fatalf("ReadHistoryView after mutation: %v", err)
 		}
-		got, err := json.Marshal(again)
+		got, err := json.Marshal(again.HistoryFacts(historyIDsOf(again.HistoryHeaders())))
 		if err != nil {
 			t.Fatalf("marshal the fresh history: %v", err)
 		}
 		if !bytes.Equal(got, expected) {
 			t.Fatal("a mutation of the returned history reached the owner or another read")
 		}
-		snapAfter, err := h.SnapshotSession(ctx, fixture.SessionID)
-		if err != nil {
-			t.Fatalf("SnapshotSession after mutation: %v", err)
-		}
-		snapGot, err := json.Marshal(snapAfter.Facts)
-		if err != nil {
-			t.Fatalf("marshal the fresh snapshot facts: %v", err)
-		}
-		if !bytes.Equal(snapGot, expected) {
-			t.Fatal("a mutation of the returned history reached the full snapshot producer")
-		}
 	})
 }
 
-// TestPublicSnapshotSessionReadsAndOwns proves the complete owned read over
+// TestPublicSnapshotSessionReadsAndOwns proves the composed owned read over
 // both stores: sorted warm Operations, the typed fact union in ascending
-// sequence, the durable Session record, and the quiet busy fact.
+// sequence, the metadata header, and the quiet busy fact.
 func TestPublicSnapshotSessionReadsAndOwns(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -213,30 +215,31 @@ func TestPublicSnapshotSessionReadsAndOwns(t *testing.T) {
 			t.Fatalf("Wait: %v", err)
 		}
 
-		pristine, err := f.h.SnapshotSession(ctx, session)
+		pristine, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
 		if len(pristine.Operations) != 2 ||
-			pristine.Operations[0].Admission.OperationID != "op-a" ||
-			pristine.Operations[1].Admission.OperationID != "op-z" {
+			pristine.Operations[0].OperationID != "op-a" ||
+			pristine.Operations[1].OperationID != "op-z" {
 			t.Fatalf("operations = %+v, want lexicographic order over the warm append order", pristine.Operations)
 		}
-		if pristine.ExecutionBusy || pristine.LocalRevision == 0 {
-			t.Fatalf("quiet snapshot = busy %v local %d", pristine.ExecutionBusy, pristine.LocalRevision)
+		if pristine.History.ExecutionBusy || pristine.History.Revision.LocalRevision == 0 {
+			t.Fatalf("quiet view = busy %v local %d", pristine.History.ExecutionBusy, pristine.History.Revision.LocalRevision)
 		}
-		if pristine.Session.Identity.SessionID != session || pristine.Session.State.Lifecycle != harness.LifecycleOpen {
-			t.Fatalf("session record = %+v", pristine.Session)
+		if pristine.Header.Identity.SessionID != session || pristine.Header.Lifecycle != harness.LifecycleOpen {
+			t.Fatalf("session header = %+v", pristine.Header)
 		}
 
 		wantKinds := []harness.EntryKind{
 			harness.EntryInput, harness.EntryAssistant, harness.EntryToolResult, harness.EntryAssistant,
 			harness.EntryOperationSettlement, harness.EntryInput, harness.EntryAssistant, harness.EntryOperationSettlement,
 		}
-		if len(pristine.Facts) != len(wantKinds) {
-			t.Fatalf("facts = %d, want %d", len(pristine.Facts), len(wantKinds))
+		pristineFacts := pristine.History.HistoryFacts(historyIDsOf(pristine.History.HistoryHeaders()))
+		if len(pristineFacts) != len(wantKinds) {
+			t.Fatalf("facts = %d, want %d", len(pristineFacts), len(wantKinds))
 		}
-		for i, fact := range pristine.Facts {
+		for i, fact := range pristineFacts {
 			if fact.Kind != wantKinds[i] {
 				t.Fatalf("fact[%d].Kind = %q, want %q", i, fact.Kind, wantKinds[i])
 			}
@@ -244,20 +247,20 @@ func TestPublicSnapshotSessionReadsAndOwns(t *testing.T) {
 				t.Fatalf("fact[%d] loses its envelope identity: %+v", i, fact)
 			}
 		}
-		assistant := pristine.Facts[1].Assistant
+		assistant := pristineFacts[1].Assistant
 		if assistant == nil || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "call-1" ||
 			assistant.ToolCalls[0].ResultEntryID == "" {
 			t.Fatalf("assistant fact = %+v", assistant)
 		}
-		result := pristine.Facts[2].ToolResult
+		result := pristineFacts[2].ToolResult
 		// the durable codec's JSON encoding escapes the raw metadata's markup
 		if result == nil || result.ToolCallID != "call-1" ||
 			string(result.Metadata) != `{"n":[1,1.0],"s":"\u003c\u003e\u0026"}` {
 			t.Fatalf("tool result fact = %+v", result)
 		}
 		for i, seq := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
-			if pristine.Facts[i].Sequence != seq {
-				t.Fatalf("fact[%d].Sequence = %d, want ascending %d", i, pristine.Facts[i].Sequence, seq)
+			if pristineFacts[i].Sequence != seq {
+				t.Fatalf("fact[%d].Sequence = %d, want ascending %d", i, pristineFacts[i].Sequence, seq)
 			}
 		}
 
@@ -330,8 +333,8 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		}
 		session := createSession(t, f.h)
 
-		baseline, err := f.h.SnapshotSession(ctx, session)
-		if err != nil || baseline.LocalRevision != 0 || baseline.ExecutionBusy {
+		baseline, err := f.h.ReadSessionView(ctx, session)
+		if err != nil || baseline.History.Revision.LocalRevision != 0 || baseline.History.ExecutionBusy {
 			t.Fatalf("baseline = %+v err %v", baseline, err)
 		}
 
@@ -347,29 +350,29 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 			}
 		}()
 		<-f.prepare // the preparation entered and parks on its gate; the reservation is held
-		reserved, err := f.h.SnapshotSession(ctx, session)
+		reserved, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot during preparation: %v", err)
+			t.Fatalf("read during preparation: %v", err)
 		}
-		if !reserved.ExecutionBusy || len(reserved.Operations) != 0 || len(reserved.Facts) != 0 {
-			t.Fatalf("snapshot during preparation = busy %v ops %d facts %d, want the entirely-old state with the busy reservation",
-				reserved.ExecutionBusy, len(reserved.Operations), len(reserved.Facts))
+		if !reserved.History.ExecutionBusy || len(reserved.Operations) != 0 || len(reserved.History.HistoryHeaders()) != 0 {
+			t.Fatalf("read during preparation = busy %v ops %d facts %d, want the entirely-old state with the busy reservation",
+				reserved.History.ExecutionBusy, len(reserved.Operations), len(reserved.History.HistoryHeaders()))
 		}
-		if reserved.LocalRevision != baseline.LocalRevision+1 {
-			t.Fatalf("reservation revision = %d, want %d", reserved.LocalRevision, baseline.LocalRevision+1)
+		if reserved.History.Revision.LocalRevision != baseline.History.Revision.LocalRevision+1 {
+			t.Fatalf("reservation revision = %d, want %d", reserved.History.Revision.LocalRevision, baseline.History.Revision.LocalRevision+1)
 		}
 		releasePrep() // op-1's preparation proceeds
 		<-submitDone
 		<-script.arrived // the run is parked at its boundary
-		installed, err := f.h.SnapshotSession(ctx, session)
+		installed, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after installation: %v", err)
+			t.Fatalf("read after installation: %v", err)
 		}
-		if !installed.ExecutionBusy || len(installed.Operations) != 1 || installed.Operations[0].Admission.OperationID != "op-1" {
-			t.Fatalf("snapshot after installation = %+v", installed)
+		if !installed.History.ExecutionBusy || len(installed.Operations) != 1 || installed.Operations[0].OperationID != "op-1" {
+			t.Fatalf("read after installation = %+v", installed)
 		}
-		if installed.LocalRevision != reserved.LocalRevision+2 { // the run slot's installation and the reservation release
-			t.Fatalf("installed revision = %d, want %d", installed.LocalRevision, reserved.LocalRevision+2)
+		if installed.History.Revision.LocalRevision != reserved.History.Revision.LocalRevision+2 { // the run slot's installation and the reservation release
+			t.Fatalf("installed revision = %d, want %d", installed.History.Revision.LocalRevision, reserved.History.Revision.LocalRevision+2)
 		}
 
 		// Active routing buffers by mode: each Submit's reservation, enqueue,
@@ -380,20 +383,20 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if _, err := submit(t, f.h, session, "op-3", harness.MessageModeRegular, "steer-1"); err != nil {
 			t.Fatalf("steering submit: %v", err)
 		}
-		buffered, err := f.h.SnapshotSession(ctx, session)
+		buffered, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after buffering: %v", err)
+			t.Fatalf("read after buffering: %v", err)
 		}
 		if len(buffered.Steering) != 1 || buffered.Steering[0].OperationID != "op-3" ||
 			len(buffered.Queued) != 1 || buffered.Queued[0].OperationID != "op-2" {
 			t.Fatalf("buffers after the submits = %+v / %+v", buffered.Steering, buffered.Queued)
 		}
-		if buffered.LocalRevision != installed.LocalRevision+6 {
-			t.Fatalf("buffered revision = %d, want %d", buffered.LocalRevision, installed.LocalRevision+6)
+		if buffered.History.Revision.LocalRevision != installed.History.Revision.LocalRevision+6 {
+			t.Fatalf("buffered revision = %d, want %d", buffered.History.Revision.LocalRevision, installed.History.Revision.LocalRevision+6)
 		}
 		buffered.Steering[0].Content[0].Text = "mutated"
 		buffered.Queued[0].Content[0].Text = "mutated"
-		reread, err := f.h.SnapshotSession(ctx, session)
+		reread, err := f.h.ReadSessionView(ctx, session)
 		if err != nil || reread.Steering[0].Content[0].Text != "steer-1" || reread.Queued[0].Content[0].Text != "queued-1" {
 			t.Fatalf("a pending input's content mutation reached the coordinator: %q / %q err %v",
 				reread.Steering[0].Content[0].Text, reread.Queued[0].Content[0].Text, err)
@@ -405,16 +408,16 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		// and Archive/Fork reach the held reservation's wait.
 		script.releaseGate()
 		<-closeArrived // the predecessor's Close parks
-		parkedClose, err := f.h.SnapshotSession(ctx, session)
+		parkedClose, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot at the parked Close: %v", err)
+			t.Fatalf("read at the parked Close: %v", err)
 		}
-		if parkedClose.Session.State.CurrentOperationID != "" {
-			t.Fatalf("current operation at the parked Close = %q, want the settled predecessor", parkedClose.Session.State.CurrentOperationID)
+		if parkedClose.Header.CurrentOperationID != "" {
+			t.Fatalf("current operation at the parked Close = %q, want the settled predecessor", parkedClose.Header.CurrentOperationID)
 		}
 		for _, op := range parkedClose.Operations {
-			if op.Admission.OperationID == "op-1" && op.State.Status != harness.OperationSuccess {
-				t.Fatalf("op-1 = %q at the parked Close, want the quiet success readable", op.State.Status)
+			if op.OperationID == "op-1" && op.Status != harness.OperationSuccess {
+				t.Fatalf("op-1 = %q at the parked Close, want the quiet success readable", op.Status)
 			}
 		}
 		if len(parkedClose.Steering) != 1 || parkedClose.Steering[0].OperationID != "op-3" ||
@@ -455,13 +458,14 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 			t.Fatal("Archive never returned after its cancellation")
 		}
 		boundary := ""
-		for _, fact := range parkedClose.Facts {
+		parkedCloseFacts := parkedClose.History.HistoryFacts(historyIDsOf(parkedClose.History.HistoryHeaders()))
+		for _, fact := range parkedCloseFacts {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && fact.OperationID == "op-1" {
 				boundary = fact.EntryID
 			}
 		}
 		if boundary == "" {
-			t.Fatalf("the predecessor's admitted entry is missing from the parked snapshot")
+			t.Fatalf("the predecessor's admitted entry is missing from the parked read")
 		}
 		forkBase, forkCancel := context.WithCancel(ctx)
 		defer forkCancel()
@@ -495,9 +499,9 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		}
 		releaseClose() // completion resumes: the drain selects the steering head and its admission parks
 		<-f.prepare    // the drain admission of the steering head (op-3) is preparing
-		parked, err := f.h.SnapshotSession(ctx, session)
+		parked, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot during the parked delivery: %v", err)
+			t.Fatalf("read during the parked delivery: %v", err)
 		}
 		if len(parked.Steering) != 1 || parked.Steering[0].OperationID != "op-3" {
 			t.Fatalf("steering buffer during the parked delivery = %+v, want the selected head still pending until adoption", parked.Steering)
@@ -505,22 +509,22 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if len(parked.Queued) != 1 || parked.Queued[0].OperationID != "op-2" {
 			t.Fatalf("queued buffer during the parked delivery = %+v, want the queued head pending behind the steering head", parked.Queued)
 		}
-		if parked.Session.State.CurrentOperationID != "" {
-			t.Fatalf("current operation during the parked delivery = %q, want the settled predecessor cleared", parked.Session.State.CurrentOperationID)
+		if parked.Header.CurrentOperationID != "" {
+			t.Fatalf("current operation during the parked delivery = %q, want the settled predecessor cleared", parked.Header.CurrentOperationID)
 		}
 		for _, op := range parked.Operations {
-			if op.Admission.OperationID == "op-2" || op.Admission.OperationID == "op-3" {
-				t.Fatalf("the pending item %s committed before its delivery completed", op.Admission.OperationID)
+			if op.OperationID == "op-2" || op.OperationID == "op-3" {
+				t.Fatalf("the pending item %s committed before its delivery completed", op.OperationID)
 			}
-			if op.Admission.OperationID == "op-1" && op.State.Status != harness.OperationSuccess {
-				t.Fatalf("op-1 = %q during the parked delivery, want the quiet success", op.State.Status)
+			if op.OperationID == "op-1" && op.Status != harness.OperationSuccess {
+				t.Fatalf("op-1 = %q during the parked delivery, want the quiet success", op.Status)
 			}
 		}
 		// the one completion owner's reservation is the only local publication
 		// between the buffering and the parked admission: one reservation and
 		// one release span the whole delivery cycle
-		if parked.LocalRevision != buffered.LocalRevision+1 {
-			t.Fatalf("parked revision = %d, want %d", parked.LocalRevision, buffered.LocalRevision+1)
+		if parked.History.Revision.LocalRevision != buffered.History.Revision.LocalRevision+1 {
+			t.Fatalf("parked revision = %d, want %d", parked.History.Revision.LocalRevision, buffered.History.Revision.LocalRevision+1)
 		}
 		releaseDrain()   // the steering head admits, runs, and settles; the queued head follows
 		<-script.arrived // the admitted steering Operation's execution started
@@ -534,17 +538,17 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		if rec, err := f.h.ReadOperation(ctx, session, "op-1"); err != nil || rec.State.Status != harness.OperationSuccess {
 			t.Fatalf("op-1 after Wait = %+v err %v, want the settlement preserved", rec, err)
 		}
-		final, err := f.h.SnapshotSession(ctx, session)
+		final, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("final snapshot: %v", err)
+			t.Fatalf("final read: %v", err)
 		}
-		if final.ExecutionBusy || len(final.Steering) != 0 || len(final.Queued) != 0 {
-			t.Fatalf("final snapshot = busy %v steering %d queued %d", final.ExecutionBusy, len(final.Steering), len(final.Queued))
+		if final.History.ExecutionBusy || len(final.Steering) != 0 || len(final.Queued) != 0 {
+			t.Fatalf("final read = busy %v steering %d queued %d", final.History.ExecutionBusy, len(final.Steering), len(final.Queued))
 		}
 		if len(final.Operations) != 3 {
 			t.Fatalf("final operations = %d, want the three split Operations", len(final.Operations))
 		}
-		for _, fact := range final.Facts {
+		for _, fact := range final.History.HistoryFacts(historyIDsOf(final.History.HistoryHeaders())) {
 			if fact.Kind != harness.EntryInput || fact.Input == nil || len(fact.Input.Content) == 0 {
 				continue
 			}
@@ -580,9 +584,9 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 			if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
 				t.Fatalf("queued submit: %v", err)
 			}
-			buffered, err := f.h.SnapshotSession(ctx, session)
+			buffered, err := f.h.ReadSessionView(ctx, session)
 			if err != nil || len(buffered.Queued) != 1 {
-				t.Fatalf("buffered snapshot = %+v err %v", buffered, err)
+				t.Fatalf("buffered read = %+v err %v", buffered, err)
 			}
 
 			f.cancel()                                             // the Harness loss closes admission and discards the buffers
@@ -590,17 +594,17 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 			if err := f.h.Wait(context.Background()); err != nil { // joins every in-flight execution
 				t.Fatalf("Wait: %v", err)
 			}
-			after, err := f.h.SnapshotSession(ctx, session)
+			after, err := f.h.ReadSessionView(ctx, session)
 			if err != nil {
-				t.Fatalf("snapshot after the loss: %v", err)
+				t.Fatalf("read after the loss: %v", err)
 			}
 			if len(after.Queued) != 0 || len(after.Steering) != 0 {
 				t.Fatalf("buffers after the loss = %+v / %+v", after.Steering, after.Queued)
 			}
 			// the discard publication plus the loss path's reservation,
 			// release, and run-slot retirement
-			if after.LocalRevision != buffered.LocalRevision+4 {
-				t.Fatalf("discard revision = %d, want %d", after.LocalRevision, buffered.LocalRevision+4)
+			if after.History.Revision.LocalRevision != buffered.History.Revision.LocalRevision+4 {
+				t.Fatalf("discard revision = %d, want %d", after.History.Revision.LocalRevision, buffered.History.Revision.LocalRevision+4)
 			}
 		})
 	})
@@ -625,9 +629,9 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		}
 		awaitTerminal(t, f.h, session, "op-1")
 		awaitQuiet(t, f.h, session) // the retiring run's drain publications land before the stable baseline
-		before, err := f.h.SnapshotSession(ctx, session)
+		before, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot before the compact: %v", err)
+			t.Fatalf("read before the compact: %v", err)
 		}
 
 		compactPrepStarted := make(chan struct{})
@@ -654,32 +658,32 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		case err := <-compactDone: // a rejection before the preparation reports instead of parking the test forever
 			t.Fatalf("Compact returned before its preparation started: %v", err)
 		}
-		duringCompact, err := f.h.SnapshotSession(ctx, session)
+		duringCompact, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot during the compact preparation: %v", err)
+			t.Fatalf("read during the compact preparation: %v", err)
 		}
-		if !duringCompact.ExecutionBusy {
-			t.Fatalf("snapshot during the compact preparation = busy %v, want the held reservation", duringCompact.ExecutionBusy)
+		if !duringCompact.History.ExecutionBusy {
+			t.Fatalf("read during the compact preparation = busy %v, want the held reservation", duringCompact.History.ExecutionBusy)
 		}
 		for _, op := range duringCompact.Operations {
-			if op.Admission.OperationID == "comp-1" {
+			if op.OperationID == "comp-1" {
 				t.Fatalf("the compact Operation appeared before its commit")
 			}
 		}
-		if duringCompact.LocalRevision <= before.LocalRevision {
-			t.Fatalf("reservation revision = %d, want an advance past %d", duringCompact.LocalRevision, before.LocalRevision)
+		if duringCompact.History.Revision.LocalRevision <= before.History.Revision.LocalRevision {
+			t.Fatalf("reservation revision = %d, want an advance past %d", duringCompact.History.Revision.LocalRevision, before.History.Revision.LocalRevision)
 		}
 		releaseCompactGate()
 		if err := <-compactDone; err != nil {
 			t.Fatalf("Compact: %v", err)
 		}
 		awaitTerminal(t, f.h, session, "comp-1")
-		after, err := f.h.SnapshotSession(ctx, session)
+		after, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after the compact: %v", err)
+			t.Fatalf("read after the compact: %v", err)
 		}
 		var compaction *harness.CompactionEntry
-		for _, fact := range after.Facts {
+		for _, fact := range after.History.HistoryFacts(historyIDsOf(after.History.HistoryHeaders())) {
 			if fact.Compaction != nil {
 				compaction = fact.Compaction
 			}
@@ -689,12 +693,12 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		}
 		found := false
 		for _, op := range after.Operations {
-			if op.Admission.OperationID == "comp-1" {
+			if op.OperationID == "comp-1" {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("the compact Operation is missing from the snapshot")
+			t.Fatalf("the compact Operation is missing from the read")
 		}
 
 		if _, err := f.h.ArchiveSession(ctx, session); err != nil {
@@ -703,8 +707,8 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		if err := f.h.DeleteSession(ctx, session); err != nil {
 			t.Fatalf("DeleteSession: %v", err)
 		}
-		if _, err := f.h.SnapshotSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("snapshot after deletion = %v, want the not-found class", err)
+		if _, err := f.h.ReadSessionView(ctx, session); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("read after deletion = %v, want the not-found class", err)
 		}
 		listed, err := f.h.ListSessions(ctx)
 		if err != nil || len(listed) != 0 {
@@ -778,8 +782,9 @@ func (s *failingListStorage) ReadEntries(ctx context.Context, sessionID string, 
 
 // TestPublicListSessionsValidationAndFailures proves the listing rows over
 // both stores: sorted available records, corrupt and malformed rows omitted
-// with typed direct errors, cold-corrupt revalidation, warm reads without
-// history re-reads, deletion omission, and failure propagation.
+// with typed direct errors, the one-time validation of a corrupt candidate
+// that then stays latched, metadata listings that revalidate without
+// retaining the corpus, deletion omission, and failure propagation.
 func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -832,22 +837,24 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 		if len(listed) != 2 || listed[0].Identity.SessionID != want[0] || listed[1].Identity.SessionID != want[1] {
 			t.Fatalf("ListSessions = %+v, want the valid siblings in the sorted listing order", listed)
 		}
-		if _, err := lister.h.SnapshotSession(ctx, first); !errors.Is(err, harness.ErrCorrupt) {
+		if _, err := lister.h.ReadSessionHeader(ctx, first); !errors.Is(err, harness.ErrCorrupt) {
 			t.Fatalf("corrupt direct read = %v, want the corruption error", err)
 		}
-		if _, err := lister.h.SnapshotSession(ctx, "corrupt-id"); !errors.Is(err, harness.ErrInvalid) {
+		if _, err := lister.h.ReadSessionHeader(ctx, "corrupt-id"); !errors.Is(err, harness.ErrInvalid) {
 			t.Fatalf("malformed direct read = %v, want the invalid class", err)
 		}
 
-		// A cold corrupt Session revalidates on every list; the warm valid
-		// Session's history is never reread.
+		// A listing is metadata-only: each candidate's graph is validated once
+		// for that listing and discarded when the candidate's call releases it,
+		// so a repeat listing revalidates the corpus instead of retaining it,
+		// and the latched corrupt candidate is never re-read at all.
 		registersBefore, entriesBefore := counting.counts(second)
 		if _, err := lister.h.ListSessions(ctx); err != nil {
 			t.Fatalf("second ListSessions: %v", err)
 		}
 		registersAfter, entriesAfter := counting.counts(second)
-		if registersAfter != registersBefore || entriesAfter != entriesBefore {
-			t.Fatalf("the warm valid Session reread its graph (%d/%d -> %d/%d)",
+		if registersAfter != registersBefore+1 || entriesAfter != entriesBefore+1 {
+			t.Fatalf("the listed valid Session graph reads = %d/%d -> %d/%d, want exactly one revalidation per listing",
 				registersBefore, entriesBefore, registersAfter, entriesAfter)
 		}
 		corruptRegistersBefore, _ := counting.counts(first)
@@ -855,9 +862,13 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			t.Fatalf("third ListSessions: %v", err)
 		}
 		corruptRegistersAfter, _ := counting.counts(first)
-		if corruptRegistersAfter != corruptRegistersBefore+1 {
-			t.Fatalf("the cold corrupt Session was revalidated %d times in one list, want exactly one attempt",
+		if corruptRegistersAfter != corruptRegistersBefore {
+			t.Fatalf("the latched corrupt Session was revalidated %d times, want none: the corruption sticks to its cell",
 				corruptRegistersAfter-corruptRegistersBefore)
+		}
+		if malformedRegisters, malformedEntries := counting.counts("corrupt-id"); malformedRegisters != 0 || malformedEntries != 0 {
+			t.Fatalf("the malformed identity reached storage (%d/%d), want the shape filter to drop it before any read",
+				malformedRegisters, malformedEntries)
 		}
 
 		// Deletion removes the row from the listing while the direct read
@@ -878,7 +889,7 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 		if err != nil || len(listed) != 0 {
 			t.Fatalf("ListSessions after deletion = %+v err %v", listed, err)
 		}
-		if _, err := lister.h.SnapshotSession(ctx, second); !errors.Is(err, harness.ErrNotFound) {
+		if _, err := lister.h.ReadSessionHeader(ctx, second); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("deleted direct read = %v, want the not-found class", err)
 		}
 	})
@@ -912,9 +923,10 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 }
 
 // TestPublicSnapshotSessionDeletionRace proves the deletion/read race: every
-// concurrent snapshot either returns exactly the independent archived
-// baseline bytes or the typed not-found class, never a mixed or corrupted
-// read.
+// concurrent read either returns exactly the independent archived baseline
+// bytes and history answers or the typed not-found class, never a mixed or
+// corrupted read. The marshaled view cannot see the unexported entry prefix,
+// so the history accessors are compared explicitly.
 func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -931,13 +943,18 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 		if _, err := f.h.ArchiveSession(ctx, session); err != nil {
 			t.Fatalf("ArchiveSession: %v", err)
 		}
-		baseline, err := f.h.SnapshotSession(ctx, session)
+		baseline, err := f.h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("archived baseline snapshot: %v", err)
+			t.Fatalf("archived baseline read: %v", err)
 		}
 		expected, err := json.Marshal(baseline)
 		if err != nil {
 			t.Fatalf("marshal the archived baseline: %v", err)
+		}
+		expectedHeaders := baseline.History.HistoryHeaders()
+		expectedFacts := baseline.History.HistoryFacts(historyIDsOf(expectedHeaders))
+		if len(expectedHeaders) == 0 || len(expectedFacts) == 0 {
+			t.Fatal("the archived baseline carries no committed history")
 		}
 
 		const readers = 4
@@ -955,7 +972,7 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 						return
 					default:
 					}
-					snap, err := f.h.SnapshotSession(ctx, session)
+					view, err := f.h.ReadSessionView(ctx, session)
 					if err != nil {
 						if !errors.Is(err, harness.ErrNotFound) {
 							errs <- err
@@ -963,13 +980,18 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 						}
 						continue
 					}
-					body, merr := json.Marshal(snap)
+					body, merr := json.Marshal(view)
 					if merr != nil {
 						errs <- merr
 						return
 					}
 					if !bytes.Equal(expected, body) { // every successful read equals the complete archived state
 						errs <- errors.New("a concurrent read observed a different body than the archived baseline")
+						return
+					}
+					if !reflect.DeepEqual(view.History.HistoryHeaders(), expectedHeaders) ||
+						!reflect.DeepEqual(view.History.HistoryFacts(historyIDsOf(view.History.HistoryHeaders())), expectedFacts) {
+						errs <- errors.New("a concurrent read observed different history answers than the archived baseline")
 						return
 					}
 				}
@@ -982,7 +1004,7 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 		wg.Wait()
 		close(errs)
 		for err := range errs {
-			t.Fatalf("concurrent snapshot failed: %v", err)
+			t.Fatalf("concurrent read failed: %v", err)
 		}
 	})
 }
@@ -1073,8 +1095,8 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 		h := f.h
 		session := createSession(t, h)
 
-		baseline, err := h.SnapshotSession(ctx, session)
-		if err != nil || baseline.LocalRevision != 0 || len(baseline.Background) != 0 {
+		baseline, err := h.ReadSessionView(ctx, session)
+		if err != nil || baseline.History.Revision.LocalRevision != 0 || len(baseline.Background) != 0 {
 			t.Fatalf("baseline = %+v err %v", baseline, err)
 		}
 
@@ -1091,29 +1113,29 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 			})
 		}()
 		<-spawnEntered
-		admitted, err := h.SnapshotSession(ctx, session)
+		admitted, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot during the spawn: %v", err)
+			t.Fatalf("read during the spawn: %v", err)
 		}
 		if len(admitted.Background) != 1 || admitted.Background[0] != (harness.BackgroundMemberView{Kind: "job", ID: "000000aa"}) {
 			t.Fatalf("background during the spawn = %+v", admitted.Background)
 		}
-		if admitted.LocalRevision != baseline.LocalRevision+1 {
-			t.Fatalf("admission revision = %d, want %d", admitted.LocalRevision, baseline.LocalRevision+1)
+		if admitted.History.Revision.LocalRevision != baseline.History.Revision.LocalRevision+1 {
+			t.Fatalf("admission revision = %d, want %d", admitted.History.Revision.LocalRevision, baseline.History.Revision.LocalRevision+1)
 		}
 		close(spawnRelease)
 		if err := <-startErr; err == nil || !strings.Contains(err.Error(), "spawn down") {
 			t.Fatalf("StartJob error = %v, want the spawn failure", err)
 		}
-		cleaned, err := h.SnapshotSession(ctx, session)
+		cleaned, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after the failed start: %v", err)
+			t.Fatalf("read after the failed start: %v", err)
 		}
 		if len(cleaned.Background) != 0 {
 			t.Fatalf("background after the failed start = %+v", cleaned.Background)
 		}
-		if cleaned.LocalRevision != admitted.LocalRevision+1 {
-			t.Fatalf("cleanup revision = %d, want %d", cleaned.LocalRevision, admitted.LocalRevision+1)
+		if cleaned.History.Revision.LocalRevision != admitted.History.Revision.LocalRevision+1 {
+			t.Fatalf("cleanup revision = %d, want %d", cleaned.History.Revision.LocalRevision, admitted.History.Revision.LocalRevision+1)
 		}
 
 		// An active Session steers a delivered completion under the
@@ -1122,9 +1144,9 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 			t.Fatalf("submit: %v", err)
 		}
 		<-arrived // the admitted Operation reached its parked boundary
-		active, err := h.SnapshotSession(ctx, session)
-		if err != nil || !active.ExecutionBusy {
-			t.Fatalf("active snapshot = %+v err %v", active, err)
+		active, err := h.ReadSessionView(ctx, session)
+		if err != nil || !active.History.ExecutionBusy {
+			t.Fatalf("active read = %+v err %v", active, err)
 		}
 		secondCompletion := ""
 		if err := h.StartJob(ctx, session, "000000bb", func(_ context.Context, completionID string) error {
@@ -1133,17 +1155,17 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("StartJob: %v", err)
 		}
-		withMember, err := h.SnapshotSession(ctx, session)
+		withMember, err := h.ReadSessionView(ctx, session)
 		if err != nil || len(withMember.Background) != 1 || withMember.Background[0].ID != "000000bb" {
 			t.Fatalf("background after the start = %+v err %v", withMember.Background, err)
 		}
-		beforeDelivery := withMember.LocalRevision
+		beforeDelivery := withMember.History.Revision.LocalRevision
 		if err := h.DeliverBackgroundCompletion(ctx, session, secondCompletion, "bg answer"); err != nil {
 			t.Fatalf("DeliverBackgroundCompletion: %v", err)
 		}
-		delivered, err := h.SnapshotSession(ctx, session)
+		delivered, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after the delivery: %v", err)
+			t.Fatalf("read after the delivery: %v", err)
 		}
 		if len(delivered.Background) != 0 {
 			t.Fatalf("background after the delivery = %+v", delivered.Background)
@@ -1152,8 +1174,8 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 			delivered.Steering[0].Origin != harness.InputOriginRuntime || delivered.Steering[0].Content[0].Text != "bg answer" {
 			t.Fatalf("steering after the delivery = %+v", delivered.Steering)
 		}
-		if delivered.LocalRevision != beforeDelivery+2 { // the enqueue and the finish
-			t.Fatalf("delivery revision = %d, want %d", delivered.LocalRevision, beforeDelivery+2)
+		if delivered.History.Revision.LocalRevision != beforeDelivery+2 { // the enqueue and the finish
+			t.Fatalf("delivery revision = %d, want %d", delivered.History.Revision.LocalRevision, beforeDelivery+2)
 		}
 
 		// Converge: the cancellation settles the parked Operation and
@@ -1163,12 +1185,12 @@ func TestPublicSnapshotJobMemberRevisions(t *testing.T) {
 		if err := h.Wait(context.Background()); err != nil {
 			t.Fatalf("Wait: %v", err)
 		}
-		final, err := h.SnapshotSession(ctx, session)
+		final, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("final snapshot: %v", err)
+			t.Fatalf("final read: %v", err)
 		}
-		if final.ExecutionBusy || len(final.Steering) != 0 || len(final.Background) != 0 {
-			t.Fatalf("final snapshot = busy %v steering %d background %d", final.ExecutionBusy, len(final.Steering), len(final.Background))
+		if final.History.ExecutionBusy || len(final.Steering) != 0 || len(final.Background) != 0 {
+			t.Fatalf("final read = busy %v steering %d background %d", final.History.ExecutionBusy, len(final.Steering), len(final.Background))
 		}
 	})
 }
@@ -1193,8 +1215,8 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 			t.Fatalf("submit: %v", err)
 		}
 		<-arrived // the parent's Operation is parked at its boundary
-		parentBefore, err := h.SnapshotSession(ctx, root)
-		if err != nil || parentBefore.LocalRevision != 3 {
+		parentBefore, err := h.ReadSessionView(ctx, root)
+		if err != nil || parentBefore.History.Revision.LocalRevision != 3 {
 			t.Fatalf("parent before the launch = %+v err %v", parentBefore, err)
 		}
 
@@ -1210,69 +1232,71 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 			t.Fatalf("LaunchChildSession: %v", err)
 		}
 		<-arrived // the child's Operation is parked at its boundary
-		parent, err := h.SnapshotSession(ctx, root)
+		parent, err := h.ReadSessionView(ctx, root)
 		if err != nil {
-			t.Fatalf("parent snapshot: %v", err)
+			t.Fatalf("parent read: %v", err)
 		}
 		if len(parent.Background) != 1 || parent.Background[0] != (harness.BackgroundMemberView{Kind: "child", ID: res.ChildSessionID}) {
 			t.Fatalf("parent background = %+v", parent.Background)
 		}
-		if parent.LocalRevision != parentBefore.LocalRevision+1 {
-			t.Fatalf("admission revision = %d, want %d", parent.LocalRevision, parentBefore.LocalRevision+1)
+		if parent.History.Revision.LocalRevision != parentBefore.History.Revision.LocalRevision+1 {
+			t.Fatalf("admission revision = %d, want %d", parent.History.Revision.LocalRevision, parentBefore.History.Revision.LocalRevision+1)
 		}
-		child, err := h.SnapshotSession(ctx, res.ChildSessionID)
+		child, err := h.ReadSessionView(ctx, res.ChildSessionID)
 		if err != nil {
-			t.Fatalf("child snapshot: %v", err)
+			t.Fatalf("child read: %v", err)
 		}
-		if !child.ExecutionBusy || child.LocalRevision != 1 || len(child.Operations) != 1 ||
-			child.Operations[0].Admission.OperationID != "child-op-1" {
-			t.Fatalf("child snapshot = busy %v rev %d ops %+v", child.ExecutionBusy, child.LocalRevision, child.Operations)
+		if !child.History.ExecutionBusy || child.History.Revision.LocalRevision != 1 || len(child.Operations) != 1 ||
+			child.Operations[0].OperationID != "child-op-1" {
+			t.Fatalf("child read = busy %v rev %d ops %+v", child.History.ExecutionBusy, child.History.Revision.LocalRevision, child.Operations)
 		}
-		if len(child.Facts) != 1 || child.Facts[0].Kind != harness.EntryInput {
-			t.Fatalf("child facts = %+v", child.Facts)
+		childFacts := child.History.HistoryFacts(historyIDsOf(child.History.HistoryHeaders()))
+		if len(childFacts) != 1 || childFacts[0].Kind != harness.EntryInput {
+			t.Fatalf("child facts = %+v", childFacts)
 		}
 
 		if _, err := submit(t, h, res.ChildSessionID, "op-2", harness.MessageModeRegular, "steer-me"); err != nil {
 			t.Fatalf("child steering submit: %v", err)
 		}
-		buffered, err := h.SnapshotSession(ctx, res.ChildSessionID)
-		if err != nil || len(buffered.Steering) != 1 || buffered.LocalRevision != child.LocalRevision+3 {
-			t.Fatalf("child buffered snapshot = %+v err %v", buffered, err)
+		buffered, err := h.ReadSessionView(ctx, res.ChildSessionID)
+		if err != nil || len(buffered.Steering) != 1 || buffered.History.Revision.LocalRevision != child.History.Revision.LocalRevision+3 {
+			t.Fatalf("child buffered read = %+v err %v", buffered, err)
 		}
 
 		if err := h.Stop(ctx, res.ChildSessionID); err != nil {
 			t.Fatalf("Stop(child): %v", err)
 		}
-		closed, err := h.SnapshotSession(ctx, res.ChildSessionID)
+		closed, err := h.ReadSessionView(ctx, res.ChildSessionID)
 		if err != nil {
-			t.Fatalf("child snapshot after the stop: %v", err)
+			t.Fatalf("child read after the stop: %v", err)
 		}
-		if len(closed.Steering) != 0 || closed.ExecutionBusy {
-			t.Fatalf("closed child = steering %d busy %v", len(closed.Steering), closed.ExecutionBusy)
+		if len(closed.Steering) != 0 || closed.History.ExecutionBusy {
+			t.Fatalf("closed child = steering %d busy %v", len(closed.Steering), closed.History.ExecutionBusy)
 		}
 		// the closure publication plus the canceled run's retirement drain
-		if closed.LocalRevision != buffered.LocalRevision+4 {
-			t.Fatalf("closure revision = %d, want %d", closed.LocalRevision, buffered.LocalRevision+4)
+		if closed.History.Revision.LocalRevision != buffered.History.Revision.LocalRevision+4 {
+			t.Fatalf("closure revision = %d, want %d", closed.History.Revision.LocalRevision, buffered.History.Revision.LocalRevision+4)
 		}
-		if len(closed.Facts) != 3 || closed.Facts[0].Kind != harness.EntryInput ||
-			closed.Facts[1].Kind != harness.EntrySignal ||
-			closed.Facts[2].Kind != harness.EntryOperationSettlement ||
-			closed.Facts[2].Settlement.Status != harness.OperationInterruption {
-			t.Fatalf("closed child facts = %+v", closed.Facts)
+		closedFacts := closed.History.HistoryFacts(historyIDsOf(closed.History.HistoryHeaders()))
+		if len(closedFacts) != 3 || closedFacts[0].Kind != harness.EntryInput ||
+			closedFacts[1].Kind != harness.EntrySignal ||
+			closedFacts[2].Kind != harness.EntryOperationSettlement ||
+			closedFacts[2].Settlement.Status != harness.OperationInterruption {
+			t.Fatalf("closed child facts = %+v", closedFacts)
 		}
 		if err := h.Stop(ctx, res.ChildSessionID); err != nil { // the repeat stop is a no-op
 			t.Fatalf("repeat Stop(child): %v", err)
 		}
-		repeated, err := h.SnapshotSession(ctx, res.ChildSessionID)
-		if err != nil || repeated.LocalRevision != closed.LocalRevision {
-			t.Fatalf("repeat stop revision = %d err %v, want %d", repeated.LocalRevision, err, closed.LocalRevision)
+		repeated, err := h.ReadSessionView(ctx, res.ChildSessionID)
+		if err != nil || repeated.History.Revision.LocalRevision != closed.History.Revision.LocalRevision {
+			t.Fatalf("repeat stop revision = %d err %v, want %d", repeated.History.Revision.LocalRevision, err, closed.History.Revision.LocalRevision)
 		}
 
 		// The child's completion steered into the active parent and finished
 		// the parent's member.
-		parent, err = h.SnapshotSession(ctx, root)
+		parent, err = h.ReadSessionView(ctx, root)
 		if err != nil {
-			t.Fatalf("parent snapshot after the child stop: %v", err)
+			t.Fatalf("parent read after the child stop: %v", err)
 		}
 		if len(parent.Background) != 0 {
 			t.Fatalf("parent background after the finish = %+v", parent.Background)
@@ -1281,8 +1305,8 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 			parent.Steering[0].Content[0].Text != "Task interrupted." {
 			t.Fatalf("parent steering after the delivery = %+v", parent.Steering)
 		}
-		if parent.LocalRevision != parentBefore.LocalRevision+3 { // admit, enqueue, finish
-			t.Fatalf("parent revision after the child stop = %d, want %d", parent.LocalRevision, parentBefore.LocalRevision+3)
+		if parent.History.Revision.LocalRevision != parentBefore.History.Revision.LocalRevision+3 { // admit, enqueue, finish
+			t.Fatalf("parent revision after the child stop = %d, want %d", parent.History.Revision.LocalRevision, parentBefore.History.Revision.LocalRevision+3)
 		}
 
 		f.cancel()
@@ -1325,8 +1349,8 @@ func TestPublicSnapshotRootStopRevisions(t *testing.T) {
 			t.Fatalf("submit: %v", err)
 		}
 		<-arrived
-		before, err := h.SnapshotSession(ctx, session)
-		if err != nil || before.LocalRevision != 3 {
+		before, err := h.ReadSessionView(ctx, session)
+		if err != nil || before.History.Revision.LocalRevision != 3 {
 			t.Fatalf("before the start = %+v err %v", before, err)
 		}
 
@@ -1338,20 +1362,20 @@ func TestPublicSnapshotRootStopRevisions(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("StartJob: %v", err)
 		}
-		started, err := h.SnapshotSession(ctx, session)
+		started, err := h.ReadSessionView(ctx, session)
 		if err != nil || len(started.Background) != 1 || started.Background[0] != (harness.BackgroundMemberView{Kind: "job", ID: "deadbeef"}) {
 			t.Fatalf("after the start = %+v err %v", started, err)
 		}
-		if started.LocalRevision != before.LocalRevision+1 {
-			t.Fatalf("admission revision = %d, want %d", started.LocalRevision, before.LocalRevision+1)
+		if started.History.Revision.LocalRevision != before.History.Revision.LocalRevision+1 {
+			t.Fatalf("admission revision = %d, want %d", started.History.Revision.LocalRevision, before.History.Revision.LocalRevision+1)
 		}
 
 		if err := h.Stop(ctx, session); err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
-		stopped, err := h.SnapshotSession(ctx, session)
+		stopped, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("snapshot after the stop: %v", err)
+			t.Fatalf("read after the stop: %v", err)
 		}
 		if len(stopped.Background) != 0 {
 			t.Fatalf("background after the stop = %+v", stopped.Background)
@@ -1362,15 +1386,15 @@ func TestPublicSnapshotRootStopRevisions(t *testing.T) {
 		}
 		// the stopping publication, the completion enqueue, the member finish,
 		// and the reopen publication
-		if stopped.LocalRevision != started.LocalRevision+4 {
-			t.Fatalf("stop revision = %d, want %d", stopped.LocalRevision, started.LocalRevision+4)
+		if stopped.History.Revision.LocalRevision != started.History.Revision.LocalRevision+4 {
+			t.Fatalf("stop revision = %d, want %d", stopped.History.Revision.LocalRevision, started.History.Revision.LocalRevision+4)
 		}
 		if err := h.Stop(ctx, session); err != nil { // the repeat stop is a no-op
 			t.Fatalf("repeat Stop: %v", err)
 		}
-		repeated, err := h.SnapshotSession(ctx, session)
-		if err != nil || repeated.LocalRevision != stopped.LocalRevision {
-			t.Fatalf("repeat stop revision = %d err %v, want %d", repeated.LocalRevision, err, stopped.LocalRevision)
+		repeated, err := h.ReadSessionView(ctx, session)
+		if err != nil || repeated.History.Revision.LocalRevision != stopped.History.Revision.LocalRevision {
+			t.Fatalf("repeat stop revision = %d err %v, want %d", repeated.History.Revision.LocalRevision, err, stopped.History.Revision.LocalRevision)
 		}
 
 		f.cancel()
@@ -1464,15 +1488,15 @@ func TestPublicListSessionsStaleEnumeratedRow(t *testing.T) {
 		if !reflect.DeepEqual(result.rows[0], survivor) {
 			t.Fatalf("the surviving row = %+v, want the complete archived record %+v", result.rows[0], survivor)
 		}
-		if _, err := f.h.SnapshotSession(ctx, victim); !errors.Is(err, harness.ErrNotFound) {
+		if _, err := f.h.ReadSessionHeader(ctx, victim); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("the disappeared row's direct read = %v, want the typed not-found class", err)
 		}
 	})
 }
 
 // TestPublicSnapshotSessionColdReadFailures proves a never-materialized
-// Session's direct snapshot propagates the injected storage failure and the
-// canceled caller context exactly, with no partial body. The cold fixture
+// Session's direct hydration read propagates the injected storage failure and
+// the canceled caller context exactly, with no partial body. The cold fixture
 // executes its storage reads: the entries failure surfaces from the entry
 // read and the cancellation from the first register read.
 func TestPublicSnapshotSessionColdReadFailures(t *testing.T) {
@@ -1485,23 +1509,23 @@ func TestPublicSnapshotSessionColdReadFailures(t *testing.T) {
 
 		entriesFailure := errors.New("entry read failed")
 		wrapped.entriesErrFor[cold] = entriesFailure
-		snap, err := f.h.SnapshotSession(ctx, cold)
+		view, err := f.h.ReadSessionView(ctx, cold)
 		if !errors.Is(err, entriesFailure) {
-			t.Fatalf("cold snapshot over a failing entry read = %v, want the exact injected storage failure", err)
+			t.Fatalf("cold read over a failing entry read = %v, want the exact injected storage failure", err)
 		}
-		if !reflect.DeepEqual(snap, harness.SessionSnapshot{}) {
-			t.Fatalf("failing cold snapshot = %+v, want no partial body", snap)
+		if !reflect.DeepEqual(view, harness.SessionReadView{}) {
+			t.Fatalf("failing cold read = %+v, want no partial body", view)
 		}
 		delete(wrapped.entriesErrFor, cold)
 
 		canceled, cancel := context.WithCancel(ctx)
 		cancel()
-		snap, err = f.h.SnapshotSession(canceled, cold)
+		view, err = f.h.ReadSessionView(canceled, cold)
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cold snapshot over a canceled context = %v, want the exact context error", err)
+			t.Fatalf("cold read over a canceled context = %v, want the exact context error", err)
 		}
-		if !reflect.DeepEqual(snap, harness.SessionSnapshot{}) {
-			t.Fatalf("canceled cold snapshot = %+v, want no partial body", snap)
+		if !reflect.DeepEqual(view, harness.SessionReadView{}) {
+			t.Fatalf("canceled cold read = %+v, want no partial body", view)
 		}
 	})
 }
@@ -1513,11 +1537,11 @@ func awaitQuiet(t *testing.T, h *harness.Harness, session string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap, err := h.SnapshotSession(context.Background(), session)
+		view, err := h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy {
+		if !view.History.ExecutionBusy {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -1622,36 +1646,33 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		submitExtra("op-3", "steer-me", harness.MessageModeRegular)
 		submitExtra("op-4", "queue-me", harness.MessageModeQueued)
 
-		parked, err := h.SnapshotSession(ctx, session)
+		parked, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("parked snapshot: %v", err)
+			t.Fatalf("parked read: %v", err)
 		}
 		parkedExpected, err := json.Marshal(parked)
 		if err != nil {
 			t.Fatalf("marshal the parked baseline: %v", err)
 		}
-		if !parked.ExecutionBusy || len(parked.Operations) != 2 {
-			t.Fatalf("parked snapshot = busy %v ops %d", parked.ExecutionBusy, len(parked.Operations))
+		if !parked.History.ExecutionBusy || len(parked.Operations) != 2 {
+			t.Fatalf("parked read = busy %v ops %d", parked.History.ExecutionBusy, len(parked.Operations))
 		}
-		parkedOp := parked.Operations[1].State // the sorted copy places op-2 after op-1
-		if parkedOp.ActiveEffect == nil || parkedOp.ActiveEffect.Kind != harness.EffectTool ||
-			len(parkedOp.PendingToolCalls) != 1 {
-			t.Fatalf("parked operation state = %+v, want the active tool effect and its pending call", parkedOp)
+		parkedOp, err := h.ReadOperation(ctx, session, "op-2")
+		if err != nil {
+			t.Fatalf("parked ReadOperation: %v", err)
+		}
+		if parkedOp.State.ActiveEffect == nil || parkedOp.State.ActiveEffect.Kind != harness.EffectTool ||
+			len(parkedOp.State.PendingToolCalls) != 1 {
+			t.Fatalf("parked operation state = %+v, want the active tool effect and its pending call", parkedOp.State)
 		}
 		if len(parked.Steering) != 1 || len(parked.Queued) != 1 {
 			t.Fatalf("parked buffers = %+v / %+v", parked.Steering, parked.Queued)
 		}
 
-		mutatedParked, err := h.SnapshotSession(ctx, session)
+		mutatedParked, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("parked mutation snapshot: %v", err)
+			t.Fatalf("parked mutation read: %v", err)
 		}
-		mutatedParked.Operations[1].State.ActiveEffect.Kind = "mutated"
-		mutatedParked.Operations[1].State.ActiveEffect.ResultEntryID = "mutated"
-		mutatedParked.Operations[1].State.ActiveEffect.ToolCallID = "mutated"
-		mutatedParked.Operations[1].State.PendingToolCalls[0].CallID = "mutated"
-		mutatedParked.Operations[1].State.PendingToolCalls[0].ResultEntryID = "mutated"
-		mutatedParked.Operations[1].State.PendingToolCalls = append(mutatedParked.Operations[1].State.PendingToolCalls, harness.PendingToolCall{CallID: "forged"})
 		mutatedParked.Steering[0].Content[0].Text = "mutated"
 		mutatedParked.Steering[0].Content[0].Extra["q"][6] = '3'
 		mutatedParked.Steering[0].Content[0].Extra["p"] = json.RawMessage(`"mutated"`)
@@ -1661,8 +1682,18 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		mutatedParked.Queued[0].Content[0].Extra["q"][6] = '3'
 		mutatedParked.Queued[0].Content[0].Extra["p"] = json.RawMessage(`"mutated"`)
 		mutatedParked.Queued = append(mutatedParked.Queued, harness.PendingInput{OperationID: "forged"})
+		mutatedParkedOp, err := h.ReadOperation(ctx, session, "op-2")
+		if err != nil {
+			t.Fatalf("parked mutation ReadOperation: %v", err)
+		}
+		mutatedParkedOp.State.ActiveEffect.Kind = "mutated"
+		mutatedParkedOp.State.ActiveEffect.ResultEntryID = "mutated"
+		mutatedParkedOp.State.ActiveEffect.ToolCallID = "mutated"
+		mutatedParkedOp.State.PendingToolCalls[0].CallID = "mutated"
+		mutatedParkedOp.State.PendingToolCalls[0].ResultEntryID = "mutated"
+		mutatedParkedOp.State.PendingToolCalls = append(mutatedParkedOp.State.PendingToolCalls, harness.PendingToolCall{CallID: "forged"})
 
-		freshParked, err := h.SnapshotSession(ctx, session)
+		freshParked, err := h.ReadSessionView(ctx, session)
 		if err != nil {
 			t.Fatalf("parked fresh read: %v", err)
 		}
@@ -1671,7 +1702,15 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			t.Fatalf("marshal the parked fresh read: %v", err)
 		}
 		if !bytes.Equal(parkedExpected, freshParkedBytes) {
-			t.Fatalf("a mutation of the parked snapshot reached the coordinator or another snapshot")
+			t.Fatalf("a mutation of the parked read reached the coordinator or another read")
+		}
+		freshParkedOp, err := h.ReadOperation(ctx, session, "op-2")
+		if err != nil {
+			t.Fatalf("parked fresh ReadOperation: %v", err)
+		}
+		if freshParkedOp.State.ActiveEffect.Kind != harness.EffectTool || len(freshParkedOp.State.PendingToolCalls) != 1 ||
+			freshParkedOp.State.ActiveEffect.ToolCallID == "mutated" {
+			t.Fatalf("a mutation of the parked Operation reached the coordinator: %+v", freshParkedOp.State)
 		}
 
 		// Release the parked tool: op-2's completed turn continues for the
@@ -1720,9 +1759,9 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			t.Fatalf("ArchiveSession: %v", err)
 		}
 
-		baseline, err := h.SnapshotSession(ctx, session)
+		baseline, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("final snapshot: %v", err)
+			t.Fatalf("final read: %v", err)
 		}
 		expected, err := json.Marshal(baseline)
 		if err != nil {
@@ -1730,12 +1769,17 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		}
 
 		// Every applicable reference must be present in the fixture.
-		if baseline.Session.State.ArchivedAt == nil || len(baseline.Session.State.Usage.ByModel) == 0 {
-			t.Fatalf("session fixture lost its archived time or usage: %+v", baseline.Session.State)
+		if baseline.Header.ArchivedAt == nil || len(baseline.TotalUsage.ByModel) == 0 {
+			t.Fatalf("session fixture lost its archived time or usage: %+v", baseline.Header)
+		}
+		baselineFacts := baseline.History.HistoryFacts(historyIDsOf(baseline.History.HistoryHeaders()))
+		expectedFacts, err := json.Marshal(baselineFacts)
+		if err != nil {
+			t.Fatalf("marshal the baseline facts: %v", err)
 		}
 		kinds := map[harness.EntryKind]int{}
 		var relatedOperation, relatedMember, settlementWithUsage, assistantReferences, resultMetadata bool
-		for _, fact := range baseline.Facts {
+		for _, fact := range baselineFacts {
 			kinds[fact.Kind]++
 			switch fact.Kind {
 			case harness.EntryInput:
@@ -1791,46 +1835,84 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		if !settlementWithUsage {
 			t.Fatalf("fixture never produced a settlement carrying its model and usage pointers")
 		}
+		var recordExpected []byte
 		for _, op := range baseline.Operations {
-			if op.State.SettledAt == nil || op.State.Terminal == nil {
-				t.Fatalf("operation fixture lost its terminal pointers: %+v", op.State)
+			if op.SettledAt == nil {
+				t.Fatalf("operation fixture lost its settlement pointer: %+v", op)
 			}
-			if len(op.Admission.Execution.Tools) == 0 || len(op.Admission.Execution.Tools[0].Parameters) == 0 ||
-				len(op.Admission.Execution.Capabilities) == 0 {
-				t.Fatalf("operation fixture lost its execution references: %+v", op.Admission.Execution)
+			record, err := h.ReadOperation(ctx, session, op.OperationID)
+			if err != nil {
+				t.Fatalf("ReadOperation(%s): %v", op.OperationID, err)
+			}
+			if record.State.SettledAt == nil || record.State.Terminal == nil {
+				t.Fatalf("operation fixture lost its terminal pointers: %+v", record.State)
+			}
+			if len(record.Admission.Execution.Tools) == 0 || len(record.Admission.Execution.Tools[0].Parameters) == 0 ||
+				len(record.Admission.Execution.Capabilities) == 0 {
+				t.Fatalf("operation fixture lost its execution references: %+v", record.Admission.Execution)
+			}
+			if recordExpected == nil {
+				recordExpected, err = json.Marshal(record)
+				if err != nil {
+					t.Fatalf("marshal the baseline operation: %v", err)
+				}
 			}
 		}
 
-		// The full mutation matrix on a second returned snapshot.
-		mutated, err := h.SnapshotSession(ctx, session)
+		// The full mutation matrix on a second returned read. The hydration
+		// groups ride the composed view; full execution captures stay at
+		// ReadOperation.
+		mutated, err := h.ReadSessionView(ctx, session)
 		if err != nil {
-			t.Fatalf("mutation snapshot: %v", err)
+			t.Fatalf("mutation read: %v", err)
 		}
-		mutated.Session.Identity.Workspace = "mutated"
-		*mutated.Session.State.ArchivedAt = baseline.Session.State.ArchivedAt.Add(time.Hour)
-		mutated.Session.State.Usage.ByModel[0].Model.Provider = "mutated"
-		mutated.Session.State.Usage.ByModel[0].Usage.InputTokens = 999
-		mutated.Session.State.Usage.ByModel = append(mutated.Session.State.Usage.ByModel, harness.ModelUsage{})
-		mutated.Session.State.CurrentAgentType = "mutated"
-		mutated.Session.State.CompactionEntryID = "mutated"
+		mutated.Header.Identity.Workspace = "mutated"
+		*mutated.Header.ArchivedAt = baseline.Header.ArchivedAt.Add(time.Hour)
+		mutated.TotalUsage.ByModel[0].Model.Provider = "mutated"
+		mutated.TotalUsage.ByModel[0].Usage.InputTokens = 999
+		mutated.TotalUsage.ByModel = append(mutated.TotalUsage.ByModel, harness.ModelUsage{})
+		mutated.Header.CurrentAgentType = "mutated"
 		for i := range mutated.Operations {
 			op := &mutated.Operations[i]
-			op.Admission.Execution.Model.Provider = "mutated"
-			op.Admission.Execution.Tools[0].Parameters[9] = 'p'
-			op.Admission.Execution.Tools = append(op.Admission.Execution.Tools, model.ToolDefinition{})
-			op.Admission.Execution.Capabilities[0] = "mutated"
-			op.Admission.Execution.Capabilities = append(op.Admission.Execution.Capabilities, "forged")
-			op.Admission.Execution.Compact.SystemPrompt = "mutated"
-			*op.State.SettledAt = op.State.SettledAt.Add(2 * time.Hour)
-			op.State.Terminal.Detail = "mutated"
-			op.State.Terminal.SettlementEntry.EntryID = "mutated"
-			op.State.Usage.ByModel[0].Usage.OutputTokens = 999
-			op.State.Usage.ByModel = append(op.State.Usage.ByModel, harness.ModelUsage{})
-			op.State.PendingToolCalls = append(op.State.PendingToolCalls, harness.PendingToolCall{CallID: "forged"})
+			op.Model.Provider = "mutated"
+			*op.SettledAt = op.SettledAt.Add(2 * time.Hour)
+			op.Detail = "mutated"
+			op.Usage.ByModel[0].Usage.OutputTokens = 999
+			op.Usage.ByModel = append(op.Usage.ByModel, harness.ModelUsage{})
 		}
-		mutated.Operations = append(mutated.Operations, harness.OperationRecord{})
-		for i := range mutated.Facts {
-			fact := &mutated.Facts[i]
+		mutated.Operations = append(mutated.Operations, harness.OperationSummary{})
+
+		mutatedRecord, err := h.ReadOperation(ctx, session, baseline.Operations[0].OperationID)
+		if err != nil {
+			t.Fatalf("ReadOperation mutation: %v", err)
+		}
+		mutatedRecord.Admission.Execution.Model.Provider = "mutated"
+		mutatedRecord.Admission.Execution.Tools[0].Parameters[9] = 'p'
+		mutatedRecord.Admission.Execution.Tools = append(mutatedRecord.Admission.Execution.Tools, model.ToolDefinition{})
+		mutatedRecord.Admission.Execution.Capabilities[0] = "mutated"
+		mutatedRecord.Admission.Execution.Capabilities = append(mutatedRecord.Admission.Execution.Capabilities, "forged")
+		mutatedRecord.Admission.Execution.Compact.SystemPrompt = "mutated"
+		*mutatedRecord.State.SettledAt = mutatedRecord.State.SettledAt.Add(2 * time.Hour)
+		mutatedRecord.State.Terminal.Detail = "mutated"
+		mutatedRecord.State.Terminal.SettlementEntry.EntryID = "mutated"
+		mutatedRecord.State.Usage.ByModel[0].Usage.OutputTokens = 999
+		mutatedRecord.State.Usage.ByModel = append(mutatedRecord.State.Usage.ByModel, harness.ModelUsage{})
+		mutatedRecord.State.PendingToolCalls = append(mutatedRecord.State.PendingToolCalls, harness.PendingToolCall{CallID: "forged"})
+
+		freshRecord, err := h.ReadOperation(ctx, session, baseline.Operations[0].OperationID)
+		if err != nil {
+			t.Fatalf("ReadOperation fresh read: %v", err)
+		}
+		freshRecordBytes, err := json.Marshal(freshRecord)
+		if err != nil {
+			t.Fatalf("marshal the fresh operation: %v", err)
+		}
+		if !bytes.Equal(recordExpected, freshRecordBytes) {
+			t.Fatalf("a mutation of one returned Operation reached the coordinator or another read")
+		}
+
+		for i := range baselineFacts {
+			fact := &baselineFacts[i]
 			switch {
 			case fact.Input != nil:
 				fact.Input.Content[0].Text = "mutated"
@@ -1893,9 +1975,9 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 				fact.Settlement.Detail = "mutated"
 			}
 		}
-		mutated.Facts = append(mutated.Facts, harness.HistoryFact{EntryID: "forged"})
+		baselineFacts = append(baselineFacts, harness.HistoryFact{EntryID: "forged"})
 
-		again, err := h.SnapshotSession(ctx, session)
+		again, err := h.ReadSessionView(ctx, session)
 		if err != nil {
 			t.Fatalf("fresh read: %v", err)
 		}
@@ -1904,17 +1986,32 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			t.Fatalf("marshal the fresh read: %v", err)
 		}
 		if !bytes.Equal(expected, freshBytes) {
-			t.Fatalf("a mutation of one snapshot reached the coordinator or another snapshot")
+			t.Fatalf("a mutation of one read reached the coordinator or another read")
+		}
+		freshFacts := readHistoryFacts(t, h, session)
+		freshFactsBytes, err := json.Marshal(freshFacts)
+		if err != nil {
+			t.Fatalf("marshal the fresh facts: %v", err)
+		}
+		if !bytes.Equal(expectedFacts, freshFactsBytes) {
+			t.Fatalf("a mutation of one returned fact set reached the coordinator or another read")
 		}
 
-		// The mutated snapshot must actually differ from the expectation, so
-		// the comparison above cannot pass on untouched data.
+		// The mutated read and fact set must actually differ from the
+		// expectations, so the comparisons above cannot pass on untouched data.
 		mutatedBytes, err := json.Marshal(mutated)
 		if err != nil {
-			t.Fatalf("marshal the mutated snapshot: %v", err)
+			t.Fatalf("marshal the mutated read: %v", err)
 		}
 		if bytes.Equal(expected, mutatedBytes) {
 			t.Fatalf("the mutation matrix changed nothing; the ownership comparison is vacuous")
+		}
+		mutatedFactsBytes, err := json.Marshal(baselineFacts)
+		if err != nil {
+			t.Fatalf("marshal the mutated facts: %v", err)
+		}
+		if bytes.Equal(expectedFacts, mutatedFactsBytes) {
+			t.Fatalf("the fact mutation matrix changed nothing; the ownership comparison is vacuous")
 		}
 		if err := h.Wait(context.Background()); err != nil {
 			t.Fatalf("Wait: %v", err)
@@ -1930,11 +2027,11 @@ func awaitStoreQuiet(t *testing.T, h *harness.Harness, session string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap, err := h.SnapshotSession(context.Background(), session)
+		view, err := h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" {
+		if !view.History.ExecutionBusy && view.Header.CurrentOperationID == "" {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -2064,9 +2161,9 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 		if _, err := f.h.ArchiveSession(context.Background(), session); err != nil {
 			t.Fatalf("ArchiveSession: %v", err)
 		}
-		baseline, err := f.h.SnapshotSession(context.Background(), session)
+		baseline, err := f.h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("archived baseline snapshot: %v", err)
+			t.Fatalf("archived baseline read: %v", err)
 		}
 		expected, err := json.Marshal(baseline)
 		if err != nil {
@@ -2094,7 +2191,7 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 			// partial body can ever be observed.
 			reads := make(chan error, 1)
 			go func() {
-				_, err := h.SnapshotSession(context.Background(), session)
+				_, err := h.ReadSessionView(context.Background(), session)
 				reads <- err
 			}()
 			close(gate.release)
@@ -2102,10 +2199,10 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 				t.Fatalf("DeleteSession: %v", err)
 			}
 			if err := <-reads; !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("snapshot across the held delete = %v, want the typed not-found class", err)
+				t.Fatalf("read across the held delete = %v, want the typed not-found class", err)
 			}
-			if _, err := h.SnapshotSession(context.Background(), session); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("post-delete snapshot = %v, want the typed not-found class", err)
+			if _, err := h.ReadSessionView(context.Background(), session); !errors.Is(err, harness.ErrNotFound) {
+				t.Fatalf("post-delete read = %v, want the typed not-found class", err)
 			}
 			listed, err := h.ListSessions(context.Background())
 			if err != nil || len(listed) != 0 {
@@ -2132,9 +2229,9 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 				t.Fatalf("DeleteSession = %v, want the injected rollback failure", err)
 			}
 
-			after, err := h.SnapshotSession(context.Background(), session)
+			after, err := h.ReadSessionView(context.Background(), session)
 			if err != nil {
-				t.Fatalf("snapshot after the rollback: %v", err)
+				t.Fatalf("read after the rollback: %v", err)
 			}
 			fresh, err := json.Marshal(after)
 			if err != nil {

@@ -13,10 +13,7 @@ import (
 func newProjectionFixture(t *testing.T, fixture *testGraph) (*Harness, *coordinator) {
 	t.Helper()
 	h := newTestHarness(t, fixture.storage(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	return h, c
 }
 

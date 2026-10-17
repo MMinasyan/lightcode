@@ -140,10 +140,7 @@ func validPrepared() PreparedExecution { return preparedExecuting(validExecution
 // private wrappers directly on the admitted Operation.
 func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID string, content []model.ContentPart) (OperationRecord, SubmitDisposition) {
 	t.Helper()
-	c, err := h.coordinatorFor(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, sessionID)
 	release, err := h.reserve(context.Background(), c)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
@@ -289,7 +286,7 @@ func TestReadsMaterializeValidatedState(t *testing.T) {
 	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent session = %v, want ErrNotFound", err)
 	}
-	if _, _, err := h.ReadSessionHistory(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
+	if _, err := h.ReadHistoryView(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent history = %v, want ErrNotFound", err)
 	}
 	if _, err := h.ReadSessionHeader(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
@@ -329,7 +326,7 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 		return err
 	}())
 	wantCorruption(t, func() error {
-		_, _, err := h.ReadSessionHistory(context.Background(), testSessionID)
+		_, err := h.ReadHistoryView(context.Background(), testSessionID)
 		return err
 	}())
 	wantCorruption(t, func() error {
@@ -357,20 +354,20 @@ func TestChangeAgentType(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
 
-	beforeSnap, err := h.SnapshotSession(context.Background(), testSessionID)
+	before, err := h.ReadSessionHeader(context.Background(), testSessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionHeader: %v", err)
 	}
-	before := beforeSnap.Session
+	beforeUsage := readSessionView(t, h, testSessionID).TotalUsage
 	after, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
 	if err != nil {
 		t.Fatalf("ChangeAgentType: %v", err)
 	}
-	if after.State.CurrentAgentType != "reviewer" || after.Revision != before.Revision+1 {
+	if after.State.CurrentAgentType != "reviewer" || after.Revision != before.Revision.DurableRevision+1 {
 		t.Fatalf("changed session = %+v", after.State)
 	}
-	if after.Identity != before.Identity || !after.State.LastActivity.Equal(before.State.LastActivity) ||
-		!usageTotalsEqual(after.State.Usage, before.State.Usage) {
+	if after.Identity != before.Identity || !after.State.LastActivity.Equal(before.LastActivity) ||
+		!usageTotalsEqual(after.State.Usage, beforeUsage) {
 		t.Fatalf("agent-type change altered identity, activity or usage: %+v", after)
 	}
 	if _, err := h.ChangeAgentType(context.Background(), testSessionID, ""); !errors.Is(err, ErrInvalid) {
@@ -1170,8 +1167,8 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize the open session
-			t.Fatalf("ReadSession: %v", err)
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the validated open view
+			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
 			return foreignArchiveChange(tx, testSessionID)
@@ -1202,8 +1199,8 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize the idle open session
-			t.Fatalf("ReadSession: %v", err)
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the validated idle view
+			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
 			return insertForeignAdmission(t, tx, testSessionID, "foreign-op")
@@ -1269,8 +1266,8 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 	t.Run("failed agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
-			t.Fatalf("ReadSession: %v", err)
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches revision 1
+			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
 			return foreignAgentTypeChange(tx, testSessionID, "foreign")
@@ -1618,13 +1615,15 @@ func TestAdmittedOperationCarriesRegisterRevision(t *testing.T) {
 
 // corruptGateStore wraps one Storage and parks its first ReadRegisters call
 // until released, serving it a scripted register set; every other call passes
-// through unchanged. It forces one deterministic interleave of two concurrent
-// first materializations: the parked caller reads storage before the other
-// caller installs its coordinator and sees the scripted registers after.
+// through unchanged. It forces one deterministic interleave: the parked
+// caller's load holds the Session's one stable cell while the concurrent
+// caller waits on it, and the parked caller reads the scripted registers. It
+// counts the calls, so a row can prove that concurrent first acquisitions
+// share one load.
 type corruptGateStore struct {
 	Storage
 	mu      sync.Mutex
-	seen    bool
+	reads   int
 	entered chan struct{}
 	release chan struct{}
 	served  []Register
@@ -1632,8 +1631,8 @@ type corruptGateStore struct {
 
 func (s *corruptGateStore) ReadRegisters(ctx context.Context, sessionID string) ([]Register, error) {
 	s.mu.Lock()
-	first := !s.seen
-	s.seen = true
+	s.reads++
+	first := s.reads == 1
 	s.mu.Unlock()
 	if !first {
 		return s.Storage.ReadRegisters(ctx, sessionID)
@@ -1651,12 +1650,19 @@ func (s *corruptGateStore) ReadRegisters(ctx context.Context, sessionID string) 
 	return s.served, nil
 }
 
+// readCount reports how many register reads the store served.
+func (s *corruptGateStore) readCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
 // TestConcurrentMaterializationSticksDiscoveredCorruption proves sticky
-// per-Session corruption isolation across two concurrent first
-// materializations of one Session: storage serves a valid graph to the caller
-// that installs its coordinator and a persisted violation to the parked
-// caller that discovers it afterwards; every later read of that Session then
-// returns the corruption while a valid sibling stays usable.
+// per-Session corruption isolation across two concurrent first acquisitions of
+// one Session: both share the one stable cell and its one load, the parked
+// caller discovers the persisted violation the store serves it, and every
+// later read of that Session — including the waiter that was held behind the
+// load — returns the corruption while a valid sibling stays usable.
 func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	store := freshSessionStore(t)
 	validRaw, err := encodeSessionRegister(validSessionRecord())
@@ -1678,24 +1684,22 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		corruptErr <- err
 	}()
-	<-gate.entered // the parked materialization saw no installed coordinator
+	<-gate.entered // the parked load holds the Session's one stable cell
 
-	validDone := make(chan SessionHeader, 1)
+	sharedErr := make(chan error, 1)
 	go func() {
-		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Errorf("valid materialization: %v", err)
-			validDone <- SessionHeader{}
-			return
-		}
-		validDone <- rec
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
+		sharedErr <- err
 	}()
-	validRec := <-validDone // the valid coordinator is installed before the discovery
+
 	close(gate.release)
 
 	wantCorruption(t, <-corruptErr)
-	if validRec.Identity.SessionID != testSessionID || validRec.Lifecycle != LifecycleOpen {
-		t.Fatalf("valid materialization = %+v", validRec)
+	// The concurrent acquirer never started a second load: it waited on the
+	// stable cell and observed the same load's outcome.
+	wantCorruption(t, <-sharedErr)
+	if got := gate.readCount(); got != 1 {
+		t.Fatalf("register reads for two concurrent first acquisitions = %d, want the one shared load", got)
 	}
 	wantCorruption(t, func() error {
 		_, err := h.ReadSessionHeader(context.Background(), testSessionID)

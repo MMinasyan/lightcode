@@ -104,10 +104,7 @@ func TestCompactAdmissionKindResolution(t *testing.T) {
 			t.Fatalf("foreign compact admission: %v", err)
 		}
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinator: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		release, err := h.reserve(context.Background(), c)
 		if err != nil {
 			t.Fatalf("reserve: %v", err)
@@ -146,10 +143,7 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 		stub.gate = gate
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, stub.prepare)
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinator: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		release, err := h.reserve(context.Background(), c)
 		if err != nil {
 			t.Fatalf("reserve: %v", err)

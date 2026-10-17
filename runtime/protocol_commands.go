@@ -148,9 +148,9 @@ func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protoco
 // O(Sessions) and may validate a cold coordinator; no dedup or index state is
 // added, and every normal new fork is revalidated by the Harness transaction.
 func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string, req protocol.ForkRequest) (string, error) {
-	facts, _, err := h.ReadSessionHistory(ctx, sourceID)
+	view, err := h.ReadHistoryView(ctx, sourceID)
 	if err == nil {
-		return resolveBoundaryEntry(sourceID, facts, req.BoundaryItemId)
+		return resolveBoundaryEntry(sourceID, view.HistoryHeaders(), req.BoundaryItemId)
 	}
 	if !errors.Is(err, harness.ErrNotFound) && !errors.Is(err, harness.ErrCorrupt) {
 		return "", err
