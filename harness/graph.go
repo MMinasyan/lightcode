@@ -191,6 +191,7 @@ type graphValidation struct {
 	graph        *sessionGraph
 	opsByID      map[string]*OperationRecord
 	entryByID    map[string]graphEntry
+	entriesByOp  map[string][]int
 	reservations map[string]publishedReservation
 }
 
@@ -226,11 +227,21 @@ func (v *graphValidation) run() error {
 		return v.corrupt("duplicate Operation identity among Operation registers")
 	}
 	v.entryByID = make(map[string]graphEntry, len(v.graph.Entries))
-	for _, entry := range v.graph.Entries {
+	// entriesByOp groups committed entry indexes by owning Operation ID,
+	// preserving sequence order, so per-Operation scans traverse only their own
+	// operation's entries instead of rescanning the whole history. It is a
+	// transient index into graph.Entries: indexes only, no payload copies, and
+	// it is discarded with the validation pass that built it. Entries without
+	// an owning Operation group under the empty ID, keeping those entries
+	// visible to the Session-wide checks and to any scan exactly as the
+	// per-entry ownership filter did.
+	v.entriesByOp = make(map[string][]int, len(v.graph.Operations)+1)
+	for i, entry := range v.graph.Entries {
 		if _, dup := v.entryByID[entry.Envelope.ID]; dup {
 			return v.corrupt("duplicate entry id %q", entry.Envelope.ID)
 		}
 		v.entryByID[entry.Envelope.ID] = entry
+		v.entriesByOp[entry.Envelope.OperationID] = append(v.entriesByOp[entry.Envelope.OperationID], i)
 	}
 	if err := v.validateSessionState(); err != nil {
 		return err
@@ -516,8 +527,8 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 		if err := v.validatePendingCalls(opID, published, resultCount, op.State.PendingToolCalls); err != nil {
 			return err
 		}
-		for _, entry := range v.graph.Entries {
-			if entry.Envelope.OperationID == opID && entry.Settlement != nil {
+		for _, i := range v.entriesByOp[opID] {
+			if entry := v.graph.Entries[i]; entry.Settlement != nil {
 				return v.corrupt("running operation %q carries settlement entry %s", opID, entry.Envelope.ID)
 			}
 		}
@@ -567,8 +578,8 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 			}
 		}
 		settlementCount := 0
-		for _, entry := range v.graph.Entries {
-			if entry.Envelope.OperationID == opID && entry.Settlement != nil {
+		for _, i := range v.entriesByOp[opID] {
+			if v.graph.Entries[i].Settlement != nil {
 				settlementCount++
 			}
 		}
@@ -602,8 +613,9 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 func (v *graphValidation) collectPublishedCalls(opID string) ([]publishedCall, error) {
 	var published []publishedCall
 	seenCalls := make(map[string]bool)
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.Assistant == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.Assistant == nil {
 			continue
 		}
 		for _, call := range entry.Assistant.ToolCalls {
@@ -630,8 +642,9 @@ func (v *graphValidation) collectToolResults(opID string, published []publishedC
 		byCall[published[i].callID] = &published[i]
 	}
 	counts := make(map[string]int, len(published))
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.ToolResult == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.ToolResult == nil {
 			continue
 		}
 		call, ok := byCall[entry.ToolResult.ToolCallID]
@@ -670,8 +683,9 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 	}
 	settled := make(map[hookExecution]bool, len(published))
 	lastStatus := make(map[string]hookResultStatus, len(published))
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.HookResult == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.HookResult == nil {
 			continue
 		}
 		call, ok := byCall[entry.HookResult.ToolCallID]
