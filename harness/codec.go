@@ -295,7 +295,7 @@ func decodeModelRef(obj map[string]json.RawMessage) (model.ModelRef, error) {
 // plus optional extra. Per-kind field ownership means a part carries only its
 // own field: a text part never carries a URL or opaque wire type.
 func encodeContentPart(p model.ContentPart) (json.RawMessage, error) {
-	if _, err := model.NewContentPart(p); err != nil {
+	if err := model.ValidateContentPart(p); err != nil {
 		return nil, invalidInput("content part: %v", err)
 	}
 	obj := map[string]json.RawMessage{}
@@ -403,7 +403,7 @@ func marshalExtra(e model.Extra) (json.RawMessage, error) {
 // encodeToolDefinition renders one tool definition with exact keys name,
 // description, and object-valued parameters.
 func encodeToolDefinition(d model.ToolDefinition) (json.RawMessage, error) {
-	if _, err := model.NewToolDefinition(d); err != nil {
+	if err := model.ValidateToolDefinition(d); err != nil {
 		return nil, invalidInput("tool definition: %v", err)
 	}
 	obj := map[string]json.RawMessage{}
@@ -419,7 +419,7 @@ func encodeToolDefinition(d model.ToolDefinition) (json.RawMessage, error) {
 }
 
 // decodeToolDefinition reads one tool definition, preserves its parameter
-// bytes verbatim, and re-validates it through the landed constructor.
+// bytes verbatim, and re-validates it through the shared definition validator.
 func decodeToolDefinition(raw json.RawMessage) (model.ToolDefinition, error) {
 	obj, err := decodePayloadObject(raw)
 	if err != nil {
@@ -443,7 +443,7 @@ func decodeToolDefinition(raw json.RawMessage) (model.ToolDefinition, error) {
 		return model.ToolDefinition{}, fmt.Errorf("member %q: %w", "parameters", err)
 	}
 	d.Parameters = model.CloneRaw(params)
-	if _, err := model.NewToolDefinition(d); err != nil {
+	if err := model.ValidateToolDefinition(d); err != nil {
 		return model.ToolDefinition{}, err
 	}
 	return d, nil

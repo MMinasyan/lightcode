@@ -191,6 +191,7 @@ type graphValidation struct {
 	graph        *sessionGraph
 	opsByID      map[string]*OperationRecord
 	entryByID    map[string]graphEntry
+	entriesByOp  map[string][]int
 	reservations map[string]publishedReservation
 }
 
@@ -226,11 +227,21 @@ func (v *graphValidation) run() error {
 		return v.corrupt("duplicate Operation identity among Operation registers")
 	}
 	v.entryByID = make(map[string]graphEntry, len(v.graph.Entries))
-	for _, entry := range v.graph.Entries {
+	// entriesByOp groups committed entry indexes by owning Operation ID,
+	// preserving sequence order, so per-Operation scans traverse only their own
+	// operation's entries instead of rescanning the whole history. It is a
+	// transient index into graph.Entries: indexes only, no payload copies, and
+	// it is discarded with the validation pass that built it. Entries without
+	// an owning Operation group under the empty ID, keeping those entries
+	// visible to the Session-wide checks and to any scan exactly as the
+	// per-entry ownership filter did.
+	v.entriesByOp = make(map[string][]int, len(v.graph.Operations)+1)
+	for i, entry := range v.graph.Entries {
 		if _, dup := v.entryByID[entry.Envelope.ID]; dup {
 			return v.corrupt("duplicate entry id %q", entry.Envelope.ID)
 		}
 		v.entryByID[entry.Envelope.ID] = entry
+		v.entriesByOp[entry.Envelope.OperationID] = append(v.entriesByOp[entry.Envelope.OperationID], i)
 	}
 	if err := v.validateSessionState(); err != nil {
 		return err
@@ -516,8 +527,8 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 		if err := v.validatePendingCalls(opID, published, resultCount, op.State.PendingToolCalls); err != nil {
 			return err
 		}
-		for _, entry := range v.graph.Entries {
-			if entry.Envelope.OperationID == opID && entry.Settlement != nil {
+		for _, i := range v.entriesByOp[opID] {
+			if entry := v.graph.Entries[i]; entry.Settlement != nil {
 				return v.corrupt("running operation %q carries settlement entry %s", opID, entry.Envelope.ID)
 			}
 		}
@@ -567,8 +578,8 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 			}
 		}
 		settlementCount := 0
-		for _, entry := range v.graph.Entries {
-			if entry.Envelope.OperationID == opID && entry.Settlement != nil {
+		for _, i := range v.entriesByOp[opID] {
+			if v.graph.Entries[i].Settlement != nil {
 				settlementCount++
 			}
 		}
@@ -602,8 +613,9 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 func (v *graphValidation) collectPublishedCalls(opID string) ([]publishedCall, error) {
 	var published []publishedCall
 	seenCalls := make(map[string]bool)
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.Assistant == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.Assistant == nil {
 			continue
 		}
 		for _, call := range entry.Assistant.ToolCalls {
@@ -630,8 +642,9 @@ func (v *graphValidation) collectToolResults(opID string, published []publishedC
 		byCall[published[i].callID] = &published[i]
 	}
 	counts := make(map[string]int, len(published))
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.ToolResult == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.ToolResult == nil {
 			continue
 		}
 		call, ok := byCall[entry.ToolResult.ToolCallID]
@@ -670,8 +683,9 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 	}
 	settled := make(map[hookExecution]bool, len(published))
 	lastStatus := make(map[string]hookResultStatus, len(published))
-	for _, entry := range v.graph.Entries {
-		if entry.Envelope.OperationID != opID || entry.HookResult == nil {
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.HookResult == nil {
 			continue
 		}
 		call, ok := byCall[entry.HookResult.ToolCallID]
@@ -762,10 +776,12 @@ func (v *graphValidation) validatePendingCalls(opID string, published []publishe
 // validateUsage recomputes Operation and Session totals from the
 // usage-bearing producer entries — assistant usages, terminal
 // no-output-settlement usage pairs, and committed compaction usage — and
-// requires exact agreement.
+// requires exact agreement. Counts accumulate per model identity into maps
+// and each total materializes exactly once, so the pass stays linear in
+// usage-bearing entries under any number of distinct model identities.
 func (v *graphValidation) validateUsage() error {
-	sessionUsage := UsageTotals{}
-	perOperation := make(map[string]UsageTotals, len(v.graph.Operations))
+	sessionCounts := make(map[model.ModelRef]UsageCount)
+	perOperation := make(map[string]map[model.ModelRef]UsageCount, len(v.graph.Operations))
 	for _, entry := range v.graph.Entries {
 		var ref model.ModelRef
 		var counts UsageCount
@@ -781,26 +797,41 @@ func (v *graphValidation) validateUsage() error {
 		if !bears {
 			continue
 		}
-		contribution := UsageTotals{ByModel: []ModelUsage{{Model: ref, Usage: counts}}}
 		if entry.Envelope.OperationID != "" {
-			updated, err := addUsageTotals(perOperation[entry.Envelope.OperationID], contribution)
+			opCounts := perOperation[entry.Envelope.OperationID]
+			if opCounts == nil {
+				opCounts = make(map[model.ModelRef]UsageCount)
+				perOperation[entry.Envelope.OperationID] = opCounts
+			}
+			sum, err := addUsageCount(opCounts[ref], counts)
 			if err != nil {
 				return v.corrupt("usage of operation %q overflows: %v", entry.Envelope.OperationID, err)
 			}
-			perOperation[entry.Envelope.OperationID] = updated
+			opCounts[ref] = sum
 		}
-		updated, err := addUsageTotals(sessionUsage, contribution)
+		sum, err := addUsageCount(sessionCounts[ref], counts)
 		if err != nil {
 			return v.corrupt("session usage overflows: %v", err)
 		}
-		sessionUsage = updated
+		sessionCounts[ref] = sum
 	}
 	for i := range v.graph.Operations {
 		op := &v.graph.Operations[i]
-		if !usageTotalsEqual(perOperation[op.Admission.OperationID], op.State.Usage) {
+		counts := perOperation[op.Admission.OperationID]
+		materialized := UsageTotals{ByModel: make([]ModelUsage, 0, len(counts))}
+		for ref, usage := range counts {
+			materialized.ByModel = append(materialized.ByModel, ModelUsage{Model: ref, Usage: usage})
+		}
+		sortUsageTotals(materialized.ByModel)
+		if !usageTotalsEqual(materialized, op.State.Usage) {
 			return v.corrupt("usage totals of operation %q disagree with its usage-bearing entries", op.Admission.OperationID)
 		}
 	}
+	sessionUsage := UsageTotals{ByModel: make([]ModelUsage, 0, len(sessionCounts))}
+	for ref, usage := range sessionCounts {
+		sessionUsage.ByModel = append(sessionUsage.ByModel, ModelUsage{Model: ref, Usage: usage})
+	}
+	sortUsageTotals(sessionUsage.ByModel)
 	if !usageTotalsEqual(sessionUsage, v.graph.Session.State.Usage) {
 		return v.corrupt("usage totals of the Session disagree with its usage-bearing entries")
 	}

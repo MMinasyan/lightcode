@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -300,7 +301,7 @@ type testGraph struct {
 	entries            []testEntry
 }
 
-func mustEncode(t *testing.T, err error) {
+func mustEncode(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatalf("fixture encode: %v", err)
@@ -308,7 +309,7 @@ func mustEncode(t *testing.T, err error) {
 }
 
 // storage encodes every fixture record into a fresh read-only substitute.
-func (g *testGraph) storage(t *testing.T) *graphStorage {
+func (g *testGraph) storage(t testing.TB) *graphStorage {
 	t.Helper()
 	out := &graphStorage{registers: map[string][]Register{}, entries: map[string][]Entry{}}
 	sessionRaw, err := encodeSessionRegister(g.session)
@@ -891,6 +892,19 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			totals := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: *testUsage(4)}}}
 			fixture.ops[0].State.Usage = totals
 		}},
+		{"usage accumulation overflows", func(t *testing.T, fixture *testGraph) {
+			first := validAssistantEntry(testOpID)
+			first.EntryID = hexID(2)
+			first.Usage = &UsageCount{InputTokens: math.MaxInt64}
+			fixture.entries[1].assistant = &first
+			second := validAssistantEntry(testOpID)
+			second.EntryID = hexID(3)
+			second.Usage = &UsageCount{InputTokens: 1}
+			fixture.entries = append(fixture.entries, testEntry{
+				env:       Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryAssistant, Sequence: 3, CommittedAt: testTime},
+				assistant: &second,
+			})
+		}},
 		{"duplicate entry identity", func(t *testing.T, fixture *testGraph) {
 			fixture.entries[1].env.ID = hexID(1)
 		}},
@@ -1392,6 +1406,12 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		"extra owned input under a terminal message operation": true,
 		"input owned by a compact operation":                   true,
 	}
+	// The usage-overflow row pins the preserved overflow diagnostic: the
+	// Operation-total overflow check surfaces before the Session-total one at
+	// the same iteration position, in the storage-failure class.
+	usageOverflowDetail := map[string]string{
+		"usage accumulation overflows": fmt.Sprintf("usage of operation %q overflows: harness: storage failure: input token count overflows int64", testOpID),
+	}
 	for _, tc := range corruptions {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := validTestGraph()
@@ -1406,6 +1426,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			}())
 			if ownership[tc.name] && corrupt.Detail != ownershipDetail {
 				t.Fatalf("ownership corruption detail = %q, want the one generic %q", corrupt.Detail, ownershipDetail)
+			}
+			if want, ok := usageOverflowDetail[tc.name]; ok && corrupt.Detail != want {
+				t.Fatalf("overflow corruption detail = %q, want %q", corrupt.Detail, want)
 			}
 		})
 	}
@@ -2065,4 +2088,73 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 			t.Fatalf("source register revision = %d, want %d", reg.Revision, fixture.session.Revision)
 		}
 	})
+}
+
+// TestGraphValidatorGroupsEntriesByOperation pins per-Operation grouping over
+// an interleaved committed history: each Operation's publication, result,
+// hook, and settlement checks see exactly their own entries in sequence order,
+// and one Operation's entries can neither satisfy nor corrupt another's
+// checks. The running Operation publishes its two calls from two separate
+// assistant entries whose group order must stay sequence order for its pending
+// list to agree.
+func TestGraphValidatorGroupsEntriesByOperation(t *testing.T) {
+	fixture := &testGraph{session: validSessionRecord()}
+	fixture.session.State.CurrentOperationID = testOpID
+	running := validOperationRecord()
+	running.State.PendingToolCalls = []PendingToolCall{
+		{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}, CallID: "a1", ResultEntryID: hexID(9)},
+		{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(6)}, CallID: "a2", ResultEntryID: hexID(10)},
+	}
+	terminal := validOperationRecord()
+	terminal.Admission.OperationID = "op-2"
+	terminal.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+	stamped := testTime
+	terminal.State.Status = OperationSuccess
+	terminal.State.SettledAt = &stamped
+	terminal.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(8)}}
+	fixture.ops = []OperationRecord{running, terminal}
+
+	inputA := validInputEntry(testOpID)
+	inputA.EntryID = hexID(1)
+	inputB := validInputEntry("op-2")
+	inputB.EntryID = hexID(2)
+	assistantA1 := validAssistantEntry(testOpID)
+	assistantA1.EntryID = hexID(3)
+	callA1 := validToolCallRecord()
+	callA1.ID, callA1.ResultEntryID = "a1", hexID(9)
+	assistantA1.ToolCalls = []toolCallRecord{callA1}
+	assistantA2 := validAssistantEntry(testOpID)
+	assistantA2.EntryID = hexID(6)
+	callA2 := validToolCallRecord()
+	callA2.ID, callA2.ResultEntryID = "a2", hexID(10)
+	assistantA2.ToolCalls = []toolCallRecord{callA2}
+	assistantB := validAssistantEntry("op-2")
+	assistantB.EntryID = hexID(4)
+	callB := validToolCallRecord()
+	callB.ID, callB.ResultEntryID = "b1", hexID(7)
+	assistantB.ToolCalls = []toolCallRecord{callB}
+	hookA := validHookResultEntry(hookSucceeded)
+	hookA.EntryID = hexID(5)
+	hookA.ToolCallID = "a1"
+	resultB := validToolResultEntry("op-2")
+	resultB.EntryID = hexID(7)
+	resultB.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(4)}
+	resultB.ToolCallID = "b1"
+	settlementB := validSettlementEntry()
+	settlementB.EntryID = hexID(8)
+	settlementB.OperationID = "op-2"
+
+	fixture.entries = []testEntry{
+		{env: Entry{SessionID: testSessionID, ID: hexID(1), OperationID: testOpID, Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: &inputA},
+		{env: Entry{SessionID: testSessionID, ID: hexID(2), OperationID: "op-2", Kind: EntryInput, Sequence: 2, CommittedAt: testTime}, input: &inputB},
+		{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryAssistant, Sequence: 3, CommittedAt: testTime}, assistant: &assistantA1},
+		{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: "op-2", Kind: EntryAssistant, Sequence: 4, CommittedAt: testTime}, assistant: &assistantB},
+		{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &hookA},
+		{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryAssistant, Sequence: 6, CommittedAt: testTime}, assistant: &assistantA2},
+		{env: Entry{SessionID: testSessionID, ID: hexID(7), OperationID: "op-2", Kind: EntryToolResult, Sequence: 7, CommittedAt: testTime}, toolResult: &resultB},
+		{env: Entry{SessionID: testSessionID, ID: hexID(8), OperationID: "op-2", Kind: EntryOperationSettlement, Sequence: 8, CommittedAt: testTime}, settlement: &settlementB},
+	}
+	if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+		t.Fatalf("interleaved multi-operation history rejected: %v", err)
+	}
 }
