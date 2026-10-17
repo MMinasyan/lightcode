@@ -9,6 +9,7 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
 	"golang.org/x/sys/unix"
 )
@@ -175,10 +177,14 @@ func TestWorkspaceSymbolReturnsCanceledNotSwallowed(t *testing.T) {
 	}
 }
 
-// TestGetDiagnosticsCancellationReturnsPartial pins the cancellation
+// TestGetDiagnosticsCanonicalCancellationReturnsPartial pins the cancellation
 // observation at the sync wait: a canceled caller gets the could-not-check
-// content accumulated so far with the cancellation error.
-func TestGetDiagnosticsCancellationReturnsPartial(t *testing.T) {
+// content accumulated so far with the cancellation error. The healthy file
+// synchronizes (its document sync proves the sample wait is under way) while
+// the missing leaf accumulates its refusal.
+func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
+	reqLog := filepath.Join(t.TempDir(), "requests.log")
+	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 	if err := inst.waitReady(context.Background()); err != nil {
@@ -190,30 +196,46 @@ func TestGetDiagnosticsCancellationReturnsPartial(t *testing.T) {
 	m.instances[def.Name] = inst
 	m.mu.Unlock()
 
-	missing := filepath.Join(t.TempDir(), "missing.go")
+	dir := t.TempDir()
+	healthy := filepath.Join(dir, "healthy.go")
+	if err := os.WriteFile(healthy, []byte("package healthy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing.go")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		client := NewClient(m)
-		content, err := client.GetDiagnostics(ctx, []string{missing})
+		content, err := client.GetDiagnosticsCanonical(ctx, []string{missing, healthy})
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("GetDiagnostics canceled = (%q, %v), want the cancellation error", content, err)
+			t.Errorf("GetDiagnosticsCanonical canceled = (%q, %v), want the cancellation error", content, err)
 		}
 		if !strings.Contains(content, "(could not check)") {
-			t.Errorf("GetDiagnostics canceled content = %q, want the partial could-not-check line", content)
+			t.Errorf("GetDiagnosticsCanonical canceled content = %q, want the partial could-not-check line", content)
 		}
 	}()
-	time.Sleep(50 * time.Millisecond)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, _ := os.ReadFile(reqLog)
+		if strings.Contains(string(data), "textDocument/didOpen") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the healthy document sync never reached the server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	cancel()
 	<-done
 }
 
 // TestGetDiagnosticsCanonicalRefusesReplacedSymlink pins the canonical read:
 // a file replaced by a symlink fails the no-follow open, reports the retained
-// could-not-check line, and never sends the substituted content to the
-// server. The legacy reader on the same tree follows the symlink and syncs
-// the target's content — the difference between the two readers.
+// could-not-check line through the all-failed error, and never sends the
+// substituted content to the server.
 func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
@@ -245,12 +267,12 @@ func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 	}
 
 	client := NewClient(m)
-	canonical, err := client.GetDiagnosticsCanonical(context.Background(), []string{swapped})
-	if err != nil {
-		t.Fatalf("GetDiagnosticsCanonical: %v", err)
+	content, err := client.GetDiagnosticsCanonical(context.Background(), []string{swapped})
+	if err == nil || content != "" {
+		t.Fatalf("GetDiagnosticsCanonical = (%q, %v), want the all-failed error for the replaced symlink", content, err)
 	}
-	if !strings.Contains(canonical, "(could not check)") {
-		t.Fatalf("GetDiagnosticsCanonical = %q, want the could-not-check line for the replaced symlink", canonical)
+	if !strings.Contains(err.Error(), "(could not check)") {
+		t.Fatalf("GetDiagnosticsCanonical error = %q, want the could-not-check refusal line", err)
 	}
 	data, err := os.ReadFile(reqLog)
 	if err != nil {
@@ -259,26 +281,12 @@ func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 	if strings.Contains(string(data), "didOpen") || strings.Contains(string(data), "didChange") {
 		t.Fatalf("canonical read sent document sync for the symlink leaf: %s", data)
 	}
-
-	// The legacy reader keeps its current behavior: it follows the symlink
-	// and syncs the target's content.
-	legacy, err := client.GetDiagnostics(context.Background(), []string{swapped})
-	if err != nil {
-		t.Fatalf("GetDiagnostics: %v", err)
-	}
-	data, err = os.ReadFile(reqLog)
-	if err != nil {
-		t.Fatalf("read requests log: %v", err)
-	}
-	if !strings.Contains(string(data), "didOpen") && !strings.Contains(string(data), "didChange") {
-		t.Fatalf("legacy read never synced the symlinked document (result %q)", legacy)
-	}
 }
 
 // TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck pins the
 // non-blocking leaf open on the canonical read: a writerless FIFO leaf
-// cannot block the openat — the no-follow open settles immediately, the
-// read fails, and the retained could-not-check line reports it.
+// cannot block the openat — the no-follow open settles immediately, none
+// synchronizes, and the retained could-not-check line is the all-failed error.
 func TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
@@ -308,21 +316,23 @@ func TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck(t *testing.T) {
 	}()
 	select {
 	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("GetDiagnosticsCanonical: %v", got.err)
+		if got.err == nil || got.content != "" {
+			t.Fatalf("GetDiagnosticsCanonical writerless FIFO = (%q, %v), want the all-failed error", got.content, got.err)
 		}
-		if !strings.Contains(got.content, "(could not check)") {
-			t.Fatalf("GetDiagnosticsCanonical writerless FIFO = %q, want the could-not-check line", got.content)
+		if !strings.Contains(got.err.Error(), "(could not check)") {
+			t.Fatalf("GetDiagnosticsCanonical error = %q, want the could-not-check refusal line", got.err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("GetDiagnosticsCanonical blocked on the writerless FIFO leaf; want the could-not-check line")
 	}
 }
 
-// TestGetDiagnosticsCanonicalMissingLeafIsCouldNotCheck pins the missing-file
-// sibling of the canonical read: a vanished leaf reports could-not-check
-// rather than any substitute.
-func TestGetDiagnosticsCanonicalMissingLeafIsCouldNotCheck(t *testing.T) {
+// TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck pins the
+// usable-partial rule for refused documents: a vanished leaf and an
+// unsupported path can contribute no cached diagnostics, while a
+// synchronizable regular sibling still produces the explicit failed-path lines
+// and the sampled result.
+func TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 	if err := inst.waitReady(context.Background()); err != nil {
@@ -334,23 +344,149 @@ func TestGetDiagnosticsCanonicalMissingLeafIsCouldNotCheck(t *testing.T) {
 	m.instances[def.Name] = inst
 	m.mu.Unlock()
 
-	missing := filepath.Join(t.TempDir(), "gone.go")
+	dir := t.TempDir()
+	healthy := filepath.Join(dir, "healthy.go")
+	if err := os.WriteFile(healthy, []byte("package healthy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "gone.go")
+	unsupported := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(unsupported, []byte("notes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	client := NewClient(m)
-	got, err := client.GetDiagnosticsCanonical(context.Background(), []string{missing})
+	got, err := client.GetDiagnosticsCanonical(context.Background(), []string{missing, unsupported, healthy})
 	if err != nil {
 		t.Fatalf("GetDiagnosticsCanonical: %v", err)
 	}
-	if !strings.Contains(got, "(could not check)") {
-		t.Fatalf("GetDiagnosticsCanonical missing leaf = %q, want the could-not-check line", got)
+	if !strings.Contains(got, "gone.go") || !strings.Contains(got, "notes.txt") {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the failed-path lines for the refused documents", got)
 	}
-	// The legacy reader reports the same retained could-not-check shape for
-	// the same missing leaf — the shared body's one rendering, with each
-	// reader's own underlying error text.
-	legacy, err := client.GetDiagnostics(context.Background(), []string{missing})
+	noErrorIdx := strings.Index(got, "No error diagnostics are currently reported for the synchronized files.")
+	firstRefusedIdx := strings.Index(got, "(could not check)")
+	lastRefusedIdx := strings.LastIndex(got, "(could not check)")
+	caveatIdx := strings.Index(got, "Diagnostics are asynchronous and may not reflect the latest edit.")
+	if noErrorIdx < 0 || firstRefusedIdx < 0 || caveatIdx < 0 {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the sampled no-error line, the refused lines and the caveat", got)
+	}
+	if noErrorIdx > firstRefusedIdx || lastRefusedIdx > caveatIdx {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the no-error line before the refused lines before the caveat", got)
+	}
+}
+
+// TestGetDiagnosticsCanonicalRefusedPathDropsCachedDiagnostics pins the
+// sampling boundary: a leaf that was replaced after the server published a
+// diagnostic for it keeps that entry cached, but the refused path never
+// synchronizes and must not contribute the stale cached line — only the
+// synchronized sibling's cached error and the refused path's could-not-check
+// line appear.
+func TestGetDiagnosticsCanonicalRefusedPathDropsCachedDiagnostics(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	m := NewManager(t.TempDir(), t.TempDir())
+	def := server.ForExtension(".go")
+	m.mu.Lock()
+	m.instances[def.Name] = inst
+	m.mu.Unlock()
+
+	dir := t.TempDir()
+	healthy := filepath.Join(dir, "healthy.go")
+	if err := os.WriteFile(healthy, []byte("package healthy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refused := filepath.Join(dir, "refused.go")
+	if err := os.WriteFile(refused, []byte("package refused\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The server published one cached error for each leaf before the refused
+	// leaf changed shape.
+	severity := protocol.SeverityError
+	for _, seeded := range []struct{ path, message string }{
+		{healthy, "healthy cached error"},
+		{refused, "stale refused error"},
+	} {
+		params, err := json.Marshal(protocol.PublishDiagnosticsParams{
+			URI: protocol.URIFromPath(seeded.path),
+			Diagnostics: []protocol.Diagnostic{{
+				Severity: &severity,
+				Message:  seeded.message,
+				Range:    protocol.Range{Start: protocol.Position{Line: 2}},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inst.handleNotification("textDocument/publishDiagnostics", params, inst.readyCh)
+	}
+	// The refused leaf becomes a dangling symlink: its canonical open fails,
+	// so it never synchronizes.
+	if err := os.Remove(refused); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing-target.go"), refused); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(m)
+	got, err := client.GetDiagnosticsCanonical(context.Background(), []string{refused, healthy})
 	if err != nil {
-		t.Fatalf("GetDiagnostics: %v", err)
+		t.Fatalf("GetDiagnosticsCanonical: %v", err)
 	}
-	if !strings.Contains(legacy, "(could not check)") || !strings.Contains(legacy, "no such file") {
-		t.Fatalf("GetDiagnostics missing leaf = %q, want the retained could-not-check rendering", legacy)
+	if !strings.Contains(got, "healthy cached error") {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the synchronized path's cached error line", got)
+	}
+	if !strings.Contains(got, "refused.go") || !strings.Contains(got, "(could not check)") {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the refused path's could-not-check line", got)
+	}
+	if strings.Contains(got, "stale refused error") {
+		t.Fatalf("GetDiagnosticsCanonical = %q, must not render the refused path's stale cached diagnostic", got)
+	}
+}
+
+// TestGetDiagnosticsCanonicalRefusesHardlinkedLeaf pins the hardlink sibling
+// of the canonical read: a leaf whose link count is greater than one fails the
+// no-follow open, reports the retained could-not-check line through the
+// all-failed error, and never sends the aliased content to the server.
+func TestGetDiagnosticsCanonicalRefusesHardlinkedLeaf(t *testing.T) {
+	reqLog := filepath.Join(t.TempDir(), "requests.log")
+	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	m := NewManager(t.TempDir(), t.TempDir())
+	def := server.ForExtension(".go")
+	m.mu.Lock()
+	m.instances[def.Name] = inst
+	m.mu.Unlock()
+
+	dir := t.TempDir()
+	original := filepath.Join(dir, "original.go")
+	if err := os.WriteFile(original, []byte("package original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliased := filepath.Join(dir, "aliased.go")
+	if err := os.Link(original, aliased); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(m)
+	content, err := client.GetDiagnosticsCanonical(context.Background(), []string{aliased})
+	if err == nil || content != "" {
+		t.Fatalf("GetDiagnosticsCanonical = (%q, %v), want the all-failed error for the hardlinked leaf", content, err)
+	}
+	if !strings.Contains(err.Error(), "(could not check)") || !strings.Contains(err.Error(), "hardlink") {
+		t.Fatalf("GetDiagnosticsCanonical error = %q, want the could-not-check refusal line", err)
+	}
+	data, err := os.ReadFile(reqLog)
+	if err != nil {
+		t.Fatalf("read requests log: %v", err)
+	}
+	if strings.Contains(string(data), "didOpen") || strings.Contains(string(data), "didChange") {
+		t.Fatalf("canonical read sent document sync for the hardlinked leaf: %s", data)
 	}
 }

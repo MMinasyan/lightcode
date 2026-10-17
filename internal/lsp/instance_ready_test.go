@@ -535,13 +535,12 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 	}
 }
 
-// TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite proves the
-// retained-instance terminal admission on openFile: after permanent close wins
-// on a ready instance, openFile must return the unavailable error before
-// reading the file or sending didOpen — no protocol write reaches the server.
-// It fails with the pre-fix openFile, which reads the file and sends didOpen
-// over the still-live connection.
-func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
+// TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite proves
+// the retained-instance terminal admission on the canonical open: after
+// permanent close wins on a ready instance, openFileCanonical must return the
+// unavailable error before reading the file or sending didOpen — no protocol
+// write reaches the server.
+func TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
@@ -555,8 +554,8 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := inst.openFile(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("openFile after permanent close = %v, want the unavailable error", err)
+	if err := inst.openFileCanonical(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("openFileCanonical after permanent close = %v, want the unavailable error", err)
 	}
 	// No protocol write: the server saw the startup initialize/initialized
 	// requests but never a didOpen.
@@ -565,7 +564,7 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 		t.Fatalf("read requests log: %v", err)
 	}
 	if strings.Contains(string(data), "textDocument/didOpen") {
-		t.Fatal("openFile after permanent close sent didOpen to the server")
+		t.Fatal("openFileCanonical after permanent close sent didOpen to the server")
 	}
 }
 
