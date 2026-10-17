@@ -32,9 +32,9 @@ Choices the user made or confirmed. Constraints they stated. Things they rejecte
 Be specific — include file paths, function names, error messages, line numbers. Do not generalize. If the user said "don't use React," write that exactly, not "user has framework preferences."`
 
 func TestResolveBuiltinsInheritThroughPrimary(t *testing.T) {
-	cfg, err := Parse([]byte(`{"primary":{"model":"test/base-model"},"secondary":{"model":"test/secondary-model"}}`))
+	cfg, err := ParseWithCapabilities([]byte(`{"primary":{"model":"test/base-model"},"secondary":{"model":"test/secondary-model"}}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	secondary, err := cfg.Resolve("secondary")
@@ -69,9 +69,9 @@ func TestResolveBuiltinsInheritThroughPrimary(t *testing.T) {
 }
 
 func TestRetainedBuiltinRosterOrderAndResolution(t *testing.T) {
-	cfg, err := Parse([]byte(`{}`))
+	cfg, err := ParseWithCapabilities([]byte(`{}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 	wantOrder := []string{"primary", "secondary", "explore", "review", "compact"}
 	got := namesOf(cfg.All())
@@ -94,12 +94,12 @@ func TestRetainedBuiltinRosterOrderAndResolution(t *testing.T) {
 }
 
 func TestCustomTypeNamedPlanFollowsOrdinaryRules(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "primary": {"model":"test/base-model"},
   "plan": {"prompt":"Write design notes.","tools":["read_file"],"readonly":true,"write_dir":"docs","description":"Notes writer."}
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	resolved, err := cfg.Resolve("plan")
@@ -133,12 +133,12 @@ func TestCustomTypeNamedPlanFollowsOrdinaryRules(t *testing.T) {
 }
 
 func TestSubmitPlanToolIsRejectedInCustomDefinitions(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "planner": {"tools":["read_file","submit_plan"]},
   "reader": {"tools":["read_file"]}
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	if _, err := cfg.Resolve("planner"); err == nil || !strings.Contains(err.Error(), `unknown agent type`) {
@@ -162,12 +162,12 @@ func TestSubmitPlanToolIsRejectedInCustomDefinitions(t *testing.T) {
 }
 
 func TestExecutePendingToolIsRejectedInCustomDefinitions(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "stager": {"tools":["read_file","execute_pending"]},
   "reader": {"tools":["read_file"]}
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	if _, err := cfg.Resolve("stager"); err == nil || !strings.Contains(err.Error(), `unknown agent type`) {
@@ -191,9 +191,9 @@ func TestExecutePendingToolIsRejectedInCustomDefinitions(t *testing.T) {
 }
 
 func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
-	cfg, err := Parse([]byte(`{}`))
+	cfg, err := ParseWithCapabilities([]byte(`{}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	primary, err := cfg.Resolve("primary")
@@ -220,12 +220,12 @@ func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 }
 
 func TestToolsPresenceControlsInheritanceEmptyAndSubset(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "empty": {"tools": []},
   "reader": {"tools": ["read_file", "run_command"]}
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 
 	empty, err := cfg.Resolve("empty")
@@ -252,7 +252,7 @@ func TestToolsPresenceControlsInheritanceEmptyAndSubset(t *testing.T) {
 }
 
 func TestBuiltinLockedFieldsIgnoredAndModelHonored(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "explore": {
     "model": "test/explore-model",
     "system_prompt": "none",
@@ -260,9 +260,9 @@ func TestBuiltinLockedFieldsIgnoredAndModelHonored(t *testing.T) {
     "readonly": false,
     "description": "override"
   }
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 	explore, err := cfg.Resolve("explore")
 	if err != nil {
@@ -280,16 +280,16 @@ func TestBuiltinLockedFieldsIgnoredAndModelHonored(t *testing.T) {
 }
 
 func TestInvalidCustomDropsOnlyBadEntryWithWarning(t *testing.T) {
-	cfg, err := Parse([]byte(`{
+	cfg, err := ParseWithCapabilities([]byte(`{
   "good": {"tools": ["read_file"], "system_prompt": "simple", "model": "test/good"},
   "bad_tool": {"tools": ["does_not_exist"]},
   "bad_prompt": {"system_prompt": "huge"},
   "bad_model": {"model": "not-prefixed"},
   "bad_shape": "not an object",
   "bad_tools_shape": {"tools": "read_file"}
-}`))
+}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 	if _, err := cfg.Resolve("good"); err != nil {
 		t.Fatalf("Resolve(good): %v", err)
@@ -311,9 +311,9 @@ func TestInvalidCustomDropsOnlyBadEntryWithWarning(t *testing.T) {
 }
 
 func TestBuiltinNameWinsOverUserLockedFields(t *testing.T) {
-	cfg, err := Parse([]byte(`{"explore":{"prompt":"custom prompt","description":"custom","subagent":false}}`))
+	cfg, err := ParseWithCapabilities([]byte(`{"explore":{"prompt":"custom prompt","description":"custom","subagent":false}}`), nil, StandardTools, nil)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
 	explore, err := cfg.Resolve("explore")
 	if err != nil {
@@ -431,53 +431,46 @@ func TestParseWithCapabilitiesRejectsEmptyToolNames(t *testing.T) {
 	}
 }
 
-func TestLegacyParseIgnoresCapabilitiesAndKeepsStandardTools(t *testing.T) {
-	// Decoder independence: the legacy reader ignores the target-only field
-	// with no warning, and the target ignores the legacy registry membership
-	// rule — the same document must not fail the same way in both.
+// TestParseWithCapabilitiesDeclaredUniverseRows proves the declared-universe
+// rules for the members that select capabilities and tools: a declared
+// capability value and a declared tool name are retained, while a
+// non-declared capability value, a wrong-typed capabilities member, and a
+// tool outside the declared universe each drop the definition with the
+// retained invalid_agent_type warning.
+func TestParseWithCapabilitiesDeclaredUniverseRows(t *testing.T) {
 	doc := []byte(`{
-  "capable": {"capabilities": ["anything-not-declared"]},
+  "capable": {"capabilities": ["cap-a"], "tools": ["own_tool"]},
+  "undeclared_cap": {"capabilities": ["anything-not-declared"]},
   "broken": {"capabilities": "not-a-list"},
-  "legacy_tool": {"tools": ["does_not_exist"]}
+  "undeclared_tool": {"tools": ["does_not_exist"]}
 }`)
-	legacy, err := Parse(doc)
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	capable, err := legacy.Resolve("capable")
-	if err != nil {
-		t.Fatalf("Resolve(capable): %v", err)
-	}
-	if capable.Capabilities != nil {
-		t.Fatalf("legacy Parse retained capabilities: %q", capable.Capabilities)
-	}
-	// The member is removed from the raw definition before the typed decode,
-	// so neither its value nor its shape can affect legacy parsing.
-	broken, err := legacy.Resolve("broken")
-	if err != nil {
-		t.Fatalf("legacy Resolve(broken): %v, want the wrong-typed member ignored", err)
-	}
-	if broken.Capabilities != nil {
-		t.Fatalf("legacy broken capabilities = %q, want none", broken.Capabilities)
-	}
-	if _, err := legacy.Resolve("legacy_tool"); err == nil {
-		t.Fatal("legacy Parse accepted a tool outside StandardTools")
-	}
-	target, err := ParseWithCapabilities(doc, nil, nil, nil)
+	cfg, err := ParseWithCapabilities(doc, []string{"cap-a"}, []string{"own_tool"}, nil)
 	if err != nil {
 		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
-	if _, err := target.Resolve("capable"); err == nil {
-		t.Fatal("target accepted a capability outside the compiled declarations")
+	capable, err := cfg.Resolve("capable")
+	if err != nil {
+		t.Fatalf("Resolve(capable): %v", err)
 	}
-	if _, err := target.Resolve("broken"); err == nil {
-		t.Fatal("target accepted a wrong-typed capabilities value")
+	if want := []string{"cap-a"}; !reflect.DeepEqual(capable.Capabilities, want) {
+		t.Fatalf("capable capabilities = %q, want %q", capable.Capabilities, want)
 	}
-	// The compiled tool universe replaces the legacy registry: the same
-	// unknown name drops the definition (the retained warning kind is owned
-	// by the dedicated universe test).
-	if _, err := target.Resolve("legacy_tool"); err == nil {
-		t.Fatal("target accepted a tool outside the compiled declarations")
+	if want := []string{"own_tool"}; !reflect.DeepEqual(capable.Tools, want) {
+		t.Fatalf("capable tools = %q, want %q", capable.Tools, want)
+	}
+	for _, name := range []string{"undeclared_cap", "broken", "undeclared_tool"} {
+		if _, err := cfg.Resolve(name); err == nil {
+			t.Fatalf("Resolve(%s) succeeded, want dropped", name)
+		}
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 3 {
+		t.Fatalf("warnings = %#v, want three invalid_agent_type drops", warnings)
+	}
+	for _, warning := range warnings {
+		if warning.Kind != "invalid_agent_type" {
+			t.Fatalf("warning kind = %q, want invalid_agent_type", warning.Kind)
+		}
 	}
 }
 

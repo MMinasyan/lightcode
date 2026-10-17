@@ -8,7 +8,7 @@ const (
 	SystemPromptFull   = "full"
 )
 
-// StandardTools is the base registry-membership set inherited from primary.
+// StandardTools is the built-in primary's default tool set.
 var StandardTools = []string{
 	"read_file",
 	"write_file",
@@ -21,8 +21,7 @@ var StandardTools = []string{
 }
 
 // Definition is the on-disk agent type shape. Pointer fields distinguish
-// omitted fields from explicit zero values for inheritance. Capabilities is
-// target-only: the legacy Parse ignores it.
+// omitted fields from explicit zero values for inheritance.
 type Definition struct {
 	Model        string    `json:"model,omitempty"`
 	SystemPrompt string    `json:"system_prompt,omitempty"`

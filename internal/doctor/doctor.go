@@ -163,7 +163,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 
 		agentsPath := agentcfg.PathForConfig(p.ConfigPath)
 		if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
-			if parsed, parseErr := agentcfg.Parse([]byte("{}")); parseErr == nil {
+			if parsed, parseErr := agentcfg.ParseWithCapabilities([]byte("{}"), nil, agentcfg.StandardTools, nil); parseErr == nil {
 				agentsCfg = parsed
 			}
 			add("data", "agents", StatusOK, "agents.json: not created yet (created on first run)")
@@ -171,7 +171,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 			add("data", "agents", StatusFail, err.Error())
 		} else if data, err := os.ReadFile(agentsPath); err != nil {
 			add("data", "agents", StatusFail, err.Error())
-		} else if parsed, err := agentcfg.Parse(data); err != nil {
+		} else if parsed, err := agentcfg.ParseWithCapabilities(data, nil, agentcfg.StandardTools, nil); err != nil {
 			add("data", "agents", StatusFail, err.Error())
 		} else {
 			agentsCfg = parsed
