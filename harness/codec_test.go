@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1432,6 +1433,194 @@ func TestCodecOwnedValues(t *testing.T) {
 	if string(second.Extra["k"]) != `{"deep":[1]}` || second.Content[0].Text != "hi" {
 		t.Fatalf("decoded value aliased the caller payload buffer")
 	}
+}
+
+// TestAdoptedFormsAcrossInsertAndFork extends the result/fork ownership
+// coverage over the encoded forms the shared codec adopts: raw Extra bytes
+// survive decode-after-insert verbatim, deeply nested argument and metadata
+// forms survive unchanged, numeric lexemes stay exact, and invalid UTF-8 in
+// typed text is replaced with U+FFFD while ordinary multi-byte text is
+// preserved. Producer buffers are clobbered after commit to pin the adopted
+// bytes as independent of them.
+func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
+	const (
+		verbatimExtra   = `{"path":"a/b","list":[1,2]}`
+		nestedExtra     = `{"deep":{"a":[{"b":1},[[2],"c"]]},"keep":true}`
+		lexemeExtra     = `{"n":[1,1.0,1e0,9007199254740993,-0]}`
+		nestedArguments = `{"deep":{"a":[{"b":1},[[2],"c"]]},"n":[1,1.0,1e0,9007199254740993]}`
+		nestedMetadata  = `{"marker":[{"tool":{"nested":[1,{"x":[2,3]}]}}]}`
+	)
+	// wantReplacedText pins one U+FFFD per invalid byte with the ordinary
+	// multi-byte text around it untouched.
+	const wantReplacedText = "a\uFFFD\uFFFDb héllo 世界"
+
+	freshRaw := func(s string) json.RawMessage { return json.RawMessage(append([]byte(nil), s...)) }
+	invalidText := func() string {
+		raw := append([]byte("a"), 0xff, 0xfe)
+		return string(append(raw, []byte("b héllo 世界")...))
+	}
+	invalidRawString := func() json.RawMessage { // one JSON string literal holding the same invalid bytes
+		raw := append([]byte(`"a`), 0xff, 0xfe)
+		return append(raw, []byte("b héllo 世界\"")...)
+	}
+	wantInvalidRaw := string(invalidRawString()) // a copy, independent of the producer buffers clobbered below
+
+	assistantFixture := func(entryID, resultID string) assistantEntry {
+		call := validToolCallRecord()
+		call.ResultEntryID = resultID
+		call.Extra = model.Extra{"nested": freshRaw(nestedExtra), "lexemes": freshRaw(lexemeExtra)}
+		call.NormalizedArguments = freshRaw(nestedArguments)
+		v := validAssistantEntry(testOpID)
+		v.EntryID = entryID
+		v.Content = []model.ContentPart{
+			{Kind: model.PartText, Text: invalidText(), Extra: model.Extra{"raw": freshRaw(verbatimExtra), "utf8": invalidRawString()}},
+			{Kind: model.PartOpaque, OpaqueWireType: "thinking", Extra: model.Extra{"nested": freshRaw(nestedExtra), "lexemes": freshRaw(lexemeExtra)}},
+		}
+		v.Extra = model.Extra{"msg": freshRaw(nestedExtra)}
+		v.ToolCalls = []toolCallRecord{call}
+		return v
+	}
+	resultFixture := func(entryID, assistantID string) toolResultEntry {
+		v := validToolResultEntry(testOpID)
+		v.EntryID = entryID
+		v.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: assistantID}
+		v.Metadata = freshRaw(nestedMetadata)
+		return v
+	}
+	// Ownership oracle: clobber the producer's raw buffers in place.
+	clobber := func(raws ...json.RawMessage) {
+		for _, raw := range raws {
+			for i := range raw {
+				raw[i] = ' '
+			}
+		}
+	}
+	clobberAssistant := func(v assistantEntry) {
+		clobber(v.Content[0].Extra["raw"], v.Content[0].Extra["utf8"], v.Content[1].Extra["nested"], v.Content[1].Extra["lexemes"], v.Extra["msg"], v.ToolCalls[0].Extra["nested"], v.ToolCalls[0].NormalizedArguments)
+	}
+	assertAssistantAdopted := func(t *testing.T, got *assistantEntry) {
+		t.Helper()
+		if got == nil {
+			t.Fatal("adopted assistant entry is missing")
+		}
+		if got.Content[0].Text != wantReplacedText {
+			t.Fatalf("adopted text = %q, want invalid bytes replaced by U+FFFD with ordinary multi-byte text preserved (%q)", got.Content[0].Text, wantReplacedText)
+		}
+		if string(got.Content[0].Extra["raw"]) != verbatimExtra {
+			t.Fatalf("adopted raw Extra = %q, want it verbatim", got.Content[0].Extra["raw"])
+		}
+		if string(got.Content[0].Extra["utf8"]) != wantInvalidRaw {
+			t.Fatalf("adopted raw UTF-8 Extra = %q, want the raw bytes verbatim", got.Content[0].Extra["utf8"])
+		}
+		if string(got.Content[1].Extra["nested"]) != nestedExtra {
+			t.Fatalf("adopted nested content extra = %q, want the nested form unchanged", got.Content[1].Extra["nested"])
+		}
+		if string(got.Content[1].Extra["lexemes"]) != lexemeExtra {
+			t.Fatalf("adopted numeric lexemes = %q, want 9007199254740993 and its siblings exact", got.Content[1].Extra["lexemes"])
+		}
+		if string(got.Extra["msg"]) != nestedExtra {
+			t.Fatalf("adopted message extra = %q, want the nested form unchanged", got.Extra["msg"])
+		}
+		if string(got.ToolCalls[0].Extra["nested"]) != nestedExtra {
+			t.Fatalf("adopted call extra = %q, want the nested form unchanged", got.ToolCalls[0].Extra["nested"])
+		}
+		if string(got.ToolCalls[0].NormalizedArguments) != nestedArguments {
+			t.Fatalf("adopted normalized arguments = %q, want the nested form with exact lexemes unchanged", got.ToolCalls[0].NormalizedArguments)
+		}
+	}
+	assertResultAdopted := func(t *testing.T, got *toolResultEntry) {
+		t.Helper()
+		if got == nil {
+			t.Fatal("adopted tool result entry is missing")
+		}
+		if string(got.Metadata) != nestedMetadata {
+			t.Fatalf("adopted metadata = %q, want the nested form with exact lexemes unchanged", got.Metadata)
+		}
+	}
+
+	t.Run("decode after insert", func(t *testing.T) {
+		store := freshSessionStore(t)
+		assistant := assistantFixture(hexID(2), hexID(3))
+		result := resultFixture(hexID(3), hexID(2))
+		var adoptedAssistant, adoptedResult graphEntry
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			payload, err := encodeAssistantEntry(assistant)
+			if err != nil {
+				return err
+			}
+			if adoptedAssistant, err = insertAndAdopt(tx, testSessionID, EntryDraft{SessionID: testSessionID, ID: hexID(2), OperationID: testOpID, Kind: EntryAssistant, Payload: payload}); err != nil {
+				return err
+			}
+			resultPayload, err := encodeToolResultEntry(result)
+			if err != nil {
+				return err
+			}
+			adoptedResult, err = insertAndAdopt(tx, testSessionID, EntryDraft{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Payload: resultPayload})
+			return err
+		})
+		if err != nil {
+			t.Fatalf("insert and adopt: %v", err)
+		}
+		clobberAssistant(assistant)
+		clobber(result.Metadata)
+		assertAssistantAdopted(t, adoptedAssistant.Assistant)
+		assertResultAdopted(t, adoptedResult.ToolResult)
+	})
+
+	t.Run("fork copy", func(t *testing.T) {
+		session := validSessionRecord()
+		session.State.CurrentOperationID = testOpID
+		op := validOperationRecord()
+		input := validInputEntry(testOpID)
+		input.EntryID = hexID(1)
+		op.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(1)}
+		boundary := validInputEntry(testOpID)
+		boundary.EntryID = hexID(4)
+		assistant := assistantFixture(hexID(2), hexID(3))
+		result := resultFixture(hexID(3), hexID(2))
+		fixture := &testGraph{
+			session: session,
+			ops:     []OperationRecord{op},
+			entries: []testEntry{
+				{env: Entry{SessionID: testSessionID, ID: hexID(1), OperationID: testOpID, Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: &input},
+				{env: Entry{SessionID: testSessionID, ID: hexID(2), OperationID: testOpID, Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &assistant},
+				{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 3, CommittedAt: testTime}, toolResult: &result},
+				{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime}, input: &boundary},
+			},
+		}
+		store := fixture.storage(t)
+		h := newTestHarness(t, store, nil)
+		var commit forkCommit
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			return h.forkTransaction(tx, hexID(9), fixture.session, ForkRequest{
+				SourceSessionID: testSessionID,
+				BoundaryEntryID: hexID(4),
+				OperationID:     "fork-op-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "continue"}},
+			}, nil, testCapture(), &commit)
+		})
+		if err != nil {
+			t.Fatalf("forkTransaction: %v", err)
+		}
+		clobberAssistant(assistant)
+		clobber(result.Metadata)
+
+		copied := 0
+		for i := range commit.entries {
+			entry := commit.entries[i]
+			switch {
+			case entry.Assistant != nil:
+				copied++
+				assertAssistantAdopted(t, entry.Assistant)
+			case entry.ToolResult != nil:
+				copied++
+				assertResultAdopted(t, entry.ToolResult)
+			}
+		}
+		if copied != 2 {
+			t.Fatalf("fork copied %d of the interesting entries, want the assistant and the tool result", copied)
+		}
+	})
 }
 
 // TestTimestampRules proves durable register timestamps: encoded from UTC in

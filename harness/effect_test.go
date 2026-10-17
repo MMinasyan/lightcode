@@ -2152,6 +2152,43 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		}
 	})
 
+	t.Run("committed extras reach the boundary in the decoded encoded form", func(t *testing.T) {
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		producer := json.RawMessage(`{ "n" : [1, 1.0, 9007199254740993] }`) // raw producer form: whitespace survives until the commit encodes it
+		var seenAtBoundary string
+		normalize := func(call model.ToolCall) (json.RawMessage, error) {
+			seenAtBoundary = string(call.Extra["form"])
+			return objectNormalize(call)
+		}
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			d := turnDelta("tool_calls", "done", model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{oops`)})
+			d.ToolFragments[0].Extra = model.Extra{"form": producer}
+			return streamOf(d, usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})), nil
+		}
+		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
+			t.Fatalf("model effect: %v", err)
+		}
+		if got := string(committedAssistant(t, store, sessionID).Extra["form"]); got != `{"n":[1,1.0,9007199254740993]}` {
+			t.Fatalf("committed extra = %q, want the decoded encoded form", got)
+		}
+		for i := range producer { // ownership oracle: clobber the producer's buffer after the commit
+			producer[i] = ' '
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{Tool: func(context.Context, model.ToolCall) PreparedTool {
+			t.Fatalf("preparer must not run for the invalid original")
+			return PreparedTool{}
+		}, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
+		if err != nil {
+			t.Fatalf("tool effect: %v", err)
+		}
+		if got.Status != model.ResultError {
+			t.Fatalf("result = %+v, want the invalid original's validation error", got)
+		}
+		if seenAtBoundary != `{"n":[1,1.0,9007199254740993]}` {
+			t.Fatalf("boundary saw extra = %q, want the committed encoded form", seenAtBoundary)
+		}
+	})
+
 	t.Run("oversized diagnostic is bounded", func(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, nil)
 		diagnostic := "x" + strings.Repeat("y", 2*maxToolDiagnosticBytes)
