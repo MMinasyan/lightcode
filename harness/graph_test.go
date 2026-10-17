@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -891,6 +892,19 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			totals := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: *testUsage(4)}}}
 			fixture.ops[0].State.Usage = totals
 		}},
+		{"usage accumulation overflows", func(t *testing.T, fixture *testGraph) {
+			first := validAssistantEntry(testOpID)
+			first.EntryID = hexID(2)
+			first.Usage = &UsageCount{InputTokens: math.MaxInt64}
+			fixture.entries[1].assistant = &first
+			second := validAssistantEntry(testOpID)
+			second.EntryID = hexID(3)
+			second.Usage = &UsageCount{InputTokens: 1}
+			fixture.entries = append(fixture.entries, testEntry{
+				env:       Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryAssistant, Sequence: 3, CommittedAt: testTime},
+				assistant: &second,
+			})
+		}},
 		{"duplicate entry identity", func(t *testing.T, fixture *testGraph) {
 			fixture.entries[1].env.ID = hexID(1)
 		}},
@@ -1392,6 +1406,12 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		"extra owned input under a terminal message operation": true,
 		"input owned by a compact operation":                   true,
 	}
+	// The usage-overflow row pins the preserved overflow diagnostic: the
+	// Operation-total overflow check surfaces before the Session-total one at
+	// the same iteration position, in the storage-failure class.
+	usageOverflowDetail := map[string]string{
+		"usage accumulation overflows": fmt.Sprintf("usage of operation %q overflows: harness: storage failure: input token count overflows int64", testOpID),
+	}
 	for _, tc := range corruptions {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := validTestGraph()
@@ -1406,6 +1426,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			}())
 			if ownership[tc.name] && corrupt.Detail != ownershipDetail {
 				t.Fatalf("ownership corruption detail = %q, want the one generic %q", corrupt.Detail, ownershipDetail)
+			}
+			if want, ok := usageOverflowDetail[tc.name]; ok && corrupt.Detail != want {
+				t.Fatalf("overflow corruption detail = %q, want %q", corrupt.Detail, want)
 			}
 		})
 	}

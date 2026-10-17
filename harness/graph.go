@@ -776,10 +776,12 @@ func (v *graphValidation) validatePendingCalls(opID string, published []publishe
 // validateUsage recomputes Operation and Session totals from the
 // usage-bearing producer entries — assistant usages, terminal
 // no-output-settlement usage pairs, and committed compaction usage — and
-// requires exact agreement.
+// requires exact agreement. Counts accumulate per model identity into maps
+// and each total materializes exactly once, so the pass stays linear in
+// usage-bearing entries under any number of distinct model identities.
 func (v *graphValidation) validateUsage() error {
-	sessionUsage := UsageTotals{}
-	perOperation := make(map[string]UsageTotals, len(v.graph.Operations))
+	sessionCounts := make(map[model.ModelRef]UsageCount)
+	perOperation := make(map[string]map[model.ModelRef]UsageCount, len(v.graph.Operations))
 	for _, entry := range v.graph.Entries {
 		var ref model.ModelRef
 		var counts UsageCount
@@ -795,26 +797,41 @@ func (v *graphValidation) validateUsage() error {
 		if !bears {
 			continue
 		}
-		contribution := UsageTotals{ByModel: []ModelUsage{{Model: ref, Usage: counts}}}
 		if entry.Envelope.OperationID != "" {
-			updated, err := addUsageTotals(perOperation[entry.Envelope.OperationID], contribution)
+			opCounts := perOperation[entry.Envelope.OperationID]
+			if opCounts == nil {
+				opCounts = make(map[model.ModelRef]UsageCount)
+				perOperation[entry.Envelope.OperationID] = opCounts
+			}
+			sum, err := addUsageCount(opCounts[ref], counts)
 			if err != nil {
 				return v.corrupt("usage of operation %q overflows: %v", entry.Envelope.OperationID, err)
 			}
-			perOperation[entry.Envelope.OperationID] = updated
+			opCounts[ref] = sum
 		}
-		updated, err := addUsageTotals(sessionUsage, contribution)
+		sum, err := addUsageCount(sessionCounts[ref], counts)
 		if err != nil {
 			return v.corrupt("session usage overflows: %v", err)
 		}
-		sessionUsage = updated
+		sessionCounts[ref] = sum
 	}
 	for i := range v.graph.Operations {
 		op := &v.graph.Operations[i]
-		if !usageTotalsEqual(perOperation[op.Admission.OperationID], op.State.Usage) {
+		counts := perOperation[op.Admission.OperationID]
+		materialized := UsageTotals{ByModel: make([]ModelUsage, 0, len(counts))}
+		for ref, usage := range counts {
+			materialized.ByModel = append(materialized.ByModel, ModelUsage{Model: ref, Usage: usage})
+		}
+		sortUsageTotals(materialized.ByModel)
+		if !usageTotalsEqual(materialized, op.State.Usage) {
 			return v.corrupt("usage totals of operation %q disagree with its usage-bearing entries", op.Admission.OperationID)
 		}
 	}
+	sessionUsage := UsageTotals{ByModel: make([]ModelUsage, 0, len(sessionCounts))}
+	for ref, usage := range sessionCounts {
+		sessionUsage.ByModel = append(sessionUsage.ByModel, ModelUsage{Model: ref, Usage: usage})
+	}
+	sortUsageTotals(sessionUsage.ByModel)
 	if !usageTotalsEqual(sessionUsage, v.graph.Session.State.Usage) {
 		return v.corrupt("usage totals of the Session disagree with its usage-bearing entries")
 	}
