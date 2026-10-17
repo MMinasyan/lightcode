@@ -90,17 +90,6 @@ func TestConversationItemIDKnownVector(t *testing.T) {
 	}
 }
 
-// conversationItems maps one projection's source-known pairs to their
-// generated items for the wire-shape oracles; pagination itself consumes the
-// pairs and never re-decodes a union variant.
-func conversationItems(pairs []projectedItem) []protocol.ConversationItem {
-	items := make([]protocol.ConversationItem, len(pairs))
-	for i, pair := range pairs {
-		items[i] = pair.item
-	}
-	return items
-}
-
 // TestConversationProjectionDeterministicItemKinds proves the exact item
 // shapes of every kind from one stable typed snapshot: literal user text
 // stays an input, a signal stays typed, an assistant is indivisible with its
@@ -161,11 +150,10 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 			},
 		},
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	if len(items) != 7 { // the tool result stays absorbed
 		t.Fatalf("items = %d, want exactly the 7 projected facts", len(items))
 	}
@@ -326,11 +314,10 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 	}
 
 	// Determinism: a second projection of the same snapshot is identical.
-	againPairs, err := projectConversation(convSessionID, facts)
+	again, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("second projectConversation: %v", err)
 	}
-	again := conversationItems(againPairs)
 	first, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("marshal first projection: %v", err)
@@ -382,11 +369,10 @@ func TestConversationProjectionSameCallIDAcrossOperations(t *testing.T) {
 		}),
 		convResultFact(resultB, assistantB, "call-1", "success", "answer-b", `{"which":"b"}`),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	if len(items) != 2 { // the results stay absorbed
 		t.Fatalf("items = %d, want exactly the two assistants", len(items))
 	}
@@ -443,11 +429,10 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 				}),
 				convResultFact(resultID, assistantID, "call-1", "success", "out", raw),
 			}
-			pairs, err := projectConversation(convSessionID, facts)
+			items, err := projectConversation(convSessionID, facts)
 			if err != nil {
 				t.Fatalf("projectConversation: %v", err)
 			}
-			items := conversationItems(pairs)
 			// The generated union's own encoding compacts raw values, so the
 			// fidelity contract is the compacted byte form: every value stays
 			// byte-exact after compaction, never re-decoded to a Go float.
@@ -484,11 +469,10 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 		}),
 		convResultFact(resultID, assistantID, "call-1", "denied", "Permission denied.", ""),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	assistant, err := items[0].AsAssistantItem()
 	if err != nil {
 		t.Fatalf("AsAssistantItem: %v", err)
@@ -516,11 +500,10 @@ func TestConversationProjectionRawArgumentText(t *testing.T) {
 			},
 		}),
 	}
-	pairs, err := projectConversation(convSessionID, facts)
+	items, err := projectConversation(convSessionID, facts)
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	assistant, err := items[0].AsAssistantItem()
 	if err != nil {
 		t.Fatalf("AsAssistantItem: %v", err)
@@ -589,11 +572,10 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 				t.Fatal("hook evidence became a client fact")
 			}
 		}
-		pairs, err := projectConversation(view.Header.Identity.SessionID, hookFacts)
+		items, err := projectConversation(view.Header.Identity.SessionID, hookFacts)
 		if err != nil {
 			t.Fatalf("projectConversation: %v", err)
 		}
-		items := conversationItems(pairs)
 		if len(items) != 4 { // input, publishing assistant, continuation assistant, end
 			t.Fatalf("items = %d (%s), want exactly the conversation items", len(items), itemKinds(t, items))
 		}
@@ -760,11 +742,10 @@ func awaitArrival(t *testing.T, arrivals <-chan int, want int, name string) {
 func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.ConversationItem {
 	t.Helper()
 	snap := sessionViewThroughRuntime(t, r, sessionID)
-	pairs, err := projectConversation(sessionID, historyFactsOf(snap.History))
+	items, err := projectConversation(sessionID, historyFactsOf(snap.History))
 	if err != nil {
 		t.Fatalf("projectConversation: %v", err)
 	}
-	items := conversationItems(pairs)
 	return items
 }
 

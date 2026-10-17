@@ -1074,10 +1074,11 @@ func (h *Harness) acquireCoordinator(ctx context.Context, sessionID string, cach
 }
 
 // retainGraph extends the use its caller already holds on one coordinator, for
-// work that outlives that caller: execution, member, and completion retention.
-// The claim increments the use count under the registry mutex without
-// inspecting the graph — the caller's own use already pins the cell — and the
-// returned release is the ordinary use release.
+// work that outlives that caller: execution retention through execute,
+// terminal settlement, disposal, the post-terminal drain, and child
+// completion. The claim increments the use count under the registry mutex
+// without inspecting the graph — the caller's own use already pins the cell —
+// and the returned release is the ordinary use release.
 func (h *Harness) retainGraph(c *coordinator) func() {
 	h.mu.Lock()
 	c.uses++

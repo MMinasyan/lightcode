@@ -105,16 +105,27 @@ func (h *Harness) readObservation(c *coordinator) (SessionIdentity, SessionRevis
 		true
 }
 
-// currentSubject samples one coordinator's stored identity after a producer
-// released its state lock, delegating to the shared cached availability
-// check. A deleted or corrupt coordinator suppresses a delayed stale hint.
-// No snapshot, history, or revision copy is built.
-func (h *Harness) currentSubject(c *coordinator) (string, bool) {
-	identity, _, ok := h.readObservation(c)
+// factSubject samples one coordinator's retained identity for a passive fact:
+// the identity is published when a graph is validated and survives every graph
+// eviction, so a finish-time fact names its Session exactly like a fact emitted
+// with the graph resident. The use is claimed first and the availability check
+// still suppresses a deleted or corrupt subject; no load, snapshot, or
+// revision copy is built.
+func (h *Harness) factSubject(c *coordinator) (string, bool) {
+	release, ok := h.claimCoordinator(c)
 	if !ok {
 		return "", false
 	}
-	return identity.SessionID, true
+	defer release()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if h.unavailableLocked(c, c.sessionID) != nil {
+		return "", false
+	}
+	if c.identity.SessionID == "" { // an unestablished cell names no Session
+		return "", false
+	}
+	return c.identity.SessionID, true
 }
 
 // ReadObservation reads one Session's current identity and revision pair
@@ -122,8 +133,8 @@ func (h *Harness) currentSubject(c *coordinator) (string, bool) {
 // registry mutex and released, and the sample then follows the same
 // coordinator validity rule as the passive facts. A cache miss, a deleted, or
 // a corrupt Session reports false; no materialization, storage read, or
-// registry growth happens. It is the passive publishers' cached identity
-// read, never an authoritative snapshot.
+// registry growth happens. It is the public cached observation read, never an
+// authoritative snapshot.
 func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRevision, bool) {
 	h.mu.Lock()
 	c := h.sessions[sessionID]
@@ -136,12 +147,14 @@ func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRev
 
 // observeInvalidation emits one Session-scoped invalidation. It is the one
 // emission every durable Session advance and every coordinator-local
-// publication calls after releasing its lock and transaction.
+// publication calls after releasing its lock and transaction; its subject is
+// the coordinator's retained identity, so an evicted graph still names its
+// Session.
 func (h *Harness) observeInvalidation(c *coordinator) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, ok := h.currentSubject(c)
+	sessionID, ok := h.factSubject(c)
 	if !ok {
 		return
 	}
@@ -151,12 +164,13 @@ func (h *Harness) observeInvalidation(c *coordinator) {
 // observeMemberInvalidation emits one Job-scoped invalidation for a job
 // member's admission or finish: the owning Session identity and the Job
 // identity. Child members and group transitions use observeInvalidation and
-// never name a Job.
+// never name a Job. Like the Session-scoped emission, its subject is the
+// coordinator's retained identity rather than a live graph.
 func (h *Harness) observeMemberInvalidation(c *coordinator, jobID string) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, ok := h.currentSubject(c)
+	sessionID, ok := h.factSubject(c)
 	if !ok {
 		return
 	}

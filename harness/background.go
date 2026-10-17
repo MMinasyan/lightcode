@@ -34,7 +34,6 @@ type backgroundMember struct {
 	completionID string        // reserved, session-unique, first-writer-wins
 	claimed      bool          // set by the first-winner claim; a second claim is a no-op
 	done         chan struct{} // closed when the member finishes
-	release      func()        // the member's graph pin on its owning Session, released once at finish
 }
 
 // backgroundGroup is one Session's set of live background members.
@@ -60,9 +59,10 @@ type stopInterval struct {
 // lifecycle, harness cancellation (the raw error, Submit's entry-gate shape),
 // and a group that is stopping or closed; with a positive cap the kind's live
 // count must stay below it. The returned member is the caller's handle —
-// member.completionID is the completion identity every later step consumes,
-// and the member itself pins its owning Session's graph until it finishes.
-// The caller already holds a use on the coordinator, so the pin extends it.
+// member.completionID is the completion identity every later step consumes —
+// and it owns no graph residency: a member keeps only its group membership,
+// so its Session's graph is bounded like any other inactive graph while the
+// member is live.
 func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id string, cap int) (*backgroundMember, error) {
 	if c.graph.Session.State.Lifecycle != LifecycleOpen {
 		return nil, invalidInput("session %q is archived; admission requires an open Session", c.graph.Session.Identity.SessionID)
@@ -92,7 +92,6 @@ func (h *Harness) admitBackgroundMember(c *coordinator, kind memberKind, id stri
 		return nil, fmt.Errorf("%w: %v", ErrStorage, err)
 	}
 	m := &backgroundMember{kind: kind, id: id, completionID: completionID, done: make(chan struct{})}
-	m.release = h.retainGraph(c) // the member pins its owning Session's graph until it ends
 	c.group.members[completionID] = m
 	c.bumpLocalRevision() // the member admission is a coordinator-local publication
 	return m, nil
@@ -115,11 +114,14 @@ func (h *Harness) claimBackgroundMember(c *coordinator, completionID string) (*b
 }
 
 // finishBackgroundMember performs the terminal transition: it removes the
-// member if still present, closes done, and releases the member's graph pin
-// outside the coordinator mutex. An already-removed member is a no-op. Every
-// member-ending path runs claim-then-finish. It takes c.mu itself, then —
-// after removal and outside c.mu — runs the recursive completion check: a
-// finishing descendant may unblock this session's own pending completion.
+// member if still present and closes done. An already-removed member is a
+// no-op. Every member-ending path runs claim-then-finish. It takes c.mu
+// itself, then — after removal and outside c.mu — emits the member-ending
+// facts and runs the recursive completion check: a finishing descendant may
+// unblock this session's own pending completion. The check runs in the same
+// tail position as the execution retirement's own settlement, so it settles
+// while any residency the caller holds is still held and a member never
+// releases residency before its Session's completion has had its chance.
 func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 	c.mu.Lock()
 	removed := false
@@ -138,7 +140,6 @@ func (h *Harness) finishBackgroundMember(c *coordinator, m *backgroundMember) {
 		} else {
 			h.observeInvalidation(c)
 		}
-		m.release() // the member's graph pin ends with the member
 	}
 	h.childCompletionSettled(c, "")
 }
@@ -381,14 +382,15 @@ func (h *Harness) deliverClosedCompletion(c *coordinator, member *backgroundMemb
 // childCompletionSettled is the one settlement check behind both readiness
 // triggers — a member finish and an execution's deferred retirement. It
 // returns immediately when the child carries no pending completion; otherwise
-// it validates the child's coordinator, re-checks the pending obligation
-// under the lock (another trigger may have taken it), and either abandons the
-// obligation — a validation failure, or a non-empty settled operation
-// identity still current because that execution's terminal commit failed —
-// or defers while the child is not terminal, retired, and quiet: a non-empty
-// current Operation, an installed run, or a non-empty group. When settled, it
-// takes the pending info and renders the parent-facing completion text; every
-// parent-side call happens after releasing the child lock.
+// it validates the child's coordinator on the settlement context, re-checks
+// the pending obligation under the lock (another trigger may have taken it),
+// and either abandons the obligation — a validation failure, or a non-empty
+// settled operation identity still current because that execution's terminal
+// commit failed — or defers while the child is not terminal, retired, and
+// quiet: a non-empty current Operation, an installed run, or a non-empty
+// group. When settled, it takes the pending info and renders the parent-facing
+// completion text; every parent-side call happens after releasing the child
+// lock.
 func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID string) {
 	c.mu.Lock()
 	if c.pendingCompletion == nil {
@@ -398,10 +400,14 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 	parentID := c.identity.ParentSessionID
 	c.mu.Unlock()
 
-	// The pending obligation pins the child's graph through rendering and the
-	// parent delivery, and its acquisition is the same validated access every
-	// other graph consumer takes.
-	_, release, err := h.acquireCoordinator(h.ctx, c.sessionID, true)
+	// The pending obligation's own use covers rendering and the parent
+	// delivery, and its acquisition is the same validated access every other
+	// graph consumer takes — on the settlement context, which outlives Harness
+	// cancellation: a completion that became due is settled and delivered even
+	// though the Harness is shutting down, so the abandon branch is genuine
+	// unavailability only.
+	settleCtx := context.WithoutCancel(h.ctx)
+	_, release, err := h.acquireCoordinator(settleCtx, c.sessionID, true)
 	if err != nil {
 		// validation failure takes the pending obligation for abandonment
 		c.mu.Lock()
@@ -436,7 +442,11 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 	c.pendingCompletion = nil
 	content := childCompletionContent(c.graph, info.outputLimit)
 	c.mu.Unlock()
-	_ = h.DeliverBackgroundCompletion(h.ctx, parentID, info.completionID, content) // terminal for the pending item; nothing to propagate
+	// The parent-side delivery runs on the same settlement context, so a
+	// canceled Harness routes it to the durable closed path instead of
+	// failing the parent's cold load; a live Harness keeps the ordinary
+	// priority decision.
+	_ = h.DeliverBackgroundCompletion(settleCtx, parentID, info.completionID, content) // terminal for the pending item; nothing to propagate
 }
 
 // abandonChildCompletion releases one pending completion's process-local
