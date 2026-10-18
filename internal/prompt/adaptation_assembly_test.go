@@ -9,7 +9,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/adaptation"
 )
 
-// A named adaptation with no additions produces the same prompt as baseline;
+// An adaptation with no additions produces the same prompt as baseline;
 // only the presence of additions/blocks changes the output.
 func TestAssembleForNoAdditionsMatchesBaseline(t *testing.T) {
 	home := t.TempDir()
@@ -18,7 +18,7 @@ func TestAssembleForNoAdditionsMatchesBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := assembleFull(projectRoot, home, nil).Prompt
-	adapt := assembleFull(projectRoot, home, &adaptation.Adaptation{Name: "no-additions"}).Prompt
+	adapt := assembleFull(projectRoot, home, &adaptation.Adaptation{}).Prompt
 	if base != adapt {
 		t.Fatalf("adaptation with no additions changed the prompt\n--- baseline ---\n%s\n--- adaptation ---\n%s", base, adapt)
 	}
@@ -34,7 +34,7 @@ func TestAssembleForInsertsBlocksAfterSectionsBeforeRules(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_USER_RULES_MARKER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	prompt := assembleFull(projectRoot, home, &adaptation.Adaptation{Name: "fix", Blocks: []string{"COACHING_BLOCK_MARKER"}}).Prompt
+	prompt := assembleFull(projectRoot, home, &adaptation.Adaptation{Blocks: []string{"COACHING_BLOCK_MARKER"}}).Prompt
 
 	idxLanguage := strings.Index(prompt, strings.TrimSpace(languageSection)) // last overridable section
 	idxBlock := strings.Index(prompt, "COACHING_BLOCK_MARKER")
@@ -67,7 +67,6 @@ func TestAssembleForRendersSectionAddition(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapt := &adaptation.Adaptation{
-		Name:      "additions",
 		Additions: map[string]string{"tone": "TONE_ADDITION_MARKER"},
 	}
 	prompt := assembleFull(projectRoot, home, adapt).Prompt
@@ -94,7 +93,6 @@ func TestAssembleForAdditionRendersUnderUserOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapt := &adaptation.Adaptation{
-		Name:      "additions",
 		Additions: map[string]string{"tone": "TONE_ADDITION_MARKER"},
 	}
 	prompt := assembleFull(projectRoot, home, adapt).Prompt
@@ -124,7 +122,6 @@ func TestAssembleForAdditionPerSection(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			marker := strings.ToUpper(name) + "_ADDITION_MARKER"
 			adapt := &adaptation.Adaptation{
-				Name:      "per-section",
 				Additions: map[string]string{name: marker},
 			}
 			prompt := assembleFull(projectRoot, home, adapt).Prompt

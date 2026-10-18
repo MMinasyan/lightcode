@@ -508,9 +508,32 @@ func TestPrimaryModelChecks(t *testing.T) {
 			if tc.env != nil {
 				p.LookupEnv = tc.env
 			}
-			report, _ := run(t, p)
-			if c := find(t, report, "setup", "model"); c.Status != tc.wantStatus {
+			baseline, _ := run(t, p)
+			if c := find(t, baseline, "setup", "model"); c.Status != tc.wantStatus {
 				t.Fatalf("setup/model = %+v, want %s", c, tc.wantStatus)
+			}
+
+			// Custom definitions that the agents parser drops with its own
+			// warnings must not leak into the doctor check stream: the
+			// complete report for the augmented document must equal the
+			// baseline report. Each definition carries a valid model and
+			// fails only at its intended boundary (unavailable capability,
+			// unavailable tool, wrong-typed capabilities member).
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.agents), &doc); err != nil {
+				t.Fatalf("decode case agents document: %v", err)
+			}
+			doc["custom_ghost_capability"] = json.RawMessage(`{"model": "test/ghost", "capabilities": ["not-declared"]}`)
+			doc["custom_ghost_tool"] = json.RawMessage(`{"model": "test/ghost", "tools": ["not-compiled"]}`)
+			doc["custom_broken_capabilities"] = json.RawMessage(`{"model": "test/ghost", "capabilities": "not-a-list"}`)
+			augmented, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatalf("encode augmented agents document: %v", err)
+			}
+			writeAgents(t, home, string(augmented))
+			report, _ := run(t, p)
+			if !reflect.DeepEqual(report, baseline) {
+				t.Fatalf("custom definitions changed the doctor report:\nbaseline:  %+v\naugmented: %+v", baseline, report)
 			}
 		})
 	}

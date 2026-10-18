@@ -9,17 +9,10 @@ import (
 // Segment is one shell command segment split on control operators.
 type Segment struct {
 	Text            string
-	Normalized      string
 	Separator       string
 	Argv            []string
-	Redirections    []Redirection
+	HasRedirection  bool
 	UnsafeExpansion bool
-}
-
-// Redirection is a shell redirection operator seen outside quotes.
-type Redirection struct {
-	Raw       string
-	SafeFDDup bool
 }
 
 // Parse scans a /bin/sh-style command line into command segments.
@@ -272,9 +265,8 @@ func (p *parser) emitSegment(separator string) {
 		return
 	}
 	text := strings.TrimSpace(p.raw.String())
-	if text != "" || len(p.segment.Argv) > 0 || len(p.segment.Redirections) > 0 || separator != "" {
+	if text != "" || len(p.segment.Argv) > 0 || p.segment.HasRedirection || separator != "" {
 		p.segment.Text = text
-		p.segment.Normalized = strings.Join(p.segment.Argv, " ")
 		p.segment.Separator = separator
 		p.segments = append(p.segments, p.segment)
 	}
@@ -298,7 +290,6 @@ func (p *parser) emitSegmentRestricted(separator string) {
 	}
 	if text != "" {
 		p.segment.Text = text
-		p.segment.Normalized = strings.Join(p.segment.Argv, " ")
 		p.segment.Separator = separator
 		p.segments = append(p.segments, p.segment)
 	} else if separator != "\n" && separator != "" {
@@ -454,7 +445,6 @@ func (p *parser) consumeRedirection(i int) (int, error) {
 		}
 	}
 
-	start := i
 	opEnd := redirectionOpEnd(p.runes, i)
 	for j := i; j < opEnd; j++ {
 		p.raw.WriteRune(p.runes[j])
@@ -519,14 +509,7 @@ func (p *parser) consumeRedirection(i int) (int, error) {
 		targetEnd++
 	}
 
-	raw := string(p.runes[start:opEnd])
-	if targetEnd > targetStart {
-		raw += string(p.runes[targetStart:targetEnd])
-	}
-	p.segment.Redirections = append(p.segment.Redirections, Redirection{
-		Raw:       raw,
-		SafeFDDup: isSafeFDDup(raw),
-	})
+	p.segment.HasRedirection = true
 	return targetEnd - 1, nil
 }
 
@@ -582,23 +565,6 @@ func redirectionOpEnd(runes []rune, i int) int {
 		}
 	}
 	return i + 1
-}
-
-func isSafeFDDup(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	idx := strings.Index(raw, ">&")
-	if idx < 0 {
-		return false
-	}
-	prefix := raw[:idx]
-	target := raw[idx+2:]
-	if prefix != "" && !allDigits(prefix) {
-		return false
-	}
-	return target == "-" || allDigits(target)
 }
 
 func allDigits(s string) bool {

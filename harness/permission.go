@@ -8,17 +8,23 @@ import (
 	"strings"
 )
 
-// Semantic permission names and access values of the fixed automatic policy.
-// Permission names are exact strings; plugins may define new namespaced names
-// but cannot contribute rules to the built-in policy.
+// PermissionFileRead, PermissionFileWrite, PermissionCommandRun,
+// PermissionWorkspaceInspect, PermissionSleep, PermissionChildLaunch and
+// PermissionProcessOwn are the published semantic permission names of the
+// fixed automatic policy. They are exact strings; plugins may define new
+// namespaced names but cannot contribute rules to the built-in policy, and
+// these built-in names are not a closed plugin namespace.
+//
+// The access values stay private: access strings and policy parsing are the
+// Harness's own.
 const (
-	permissionFileRead         = "file.read"
-	permissionFileWrite        = "file.write"
-	permissionCommandRun       = "command.run"
-	permissionWorkspaceInspect = "workspace.inspect"
-	permissionSleep            = "sleep"
-	permissionChildLaunch      = "child.launch"
-	permissionProcessOwn       = "process.own"
+	PermissionFileRead         = "file.read"
+	PermissionFileWrite        = "file.write"
+	PermissionCommandRun       = "command.run"
+	PermissionWorkspaceInspect = "workspace.inspect"
+	PermissionSleep            = "sleep"
+	PermissionChildLaunch      = "child.launch"
+	PermissionProcessOwn       = "process.own"
 
 	permissionAccessAllow = "allow"
 	permissionAccessDeny  = "deny"
@@ -146,22 +152,22 @@ var builtinRules = buildBuiltinRules()
 
 func buildBuiltinRules() []builtinRule {
 	rules := []builtinRule{
-		{permission: permissionFileRead, matches: insideWorkspace, allow: true},
-		{permission: permissionFileWrite, matches: insideWorkspace, allow: true},
+		{permission: PermissionFileRead, matches: insideWorkspace, allow: true},
+		{permission: PermissionFileWrite, matches: insideWorkspace, allow: true},
 	}
 	for _, pattern := range sensitiveBasenamePatterns {
 		deny := denySensitiveBasename(pattern)
 		rules = append(rules,
-			builtinRule{permission: permissionFileRead, matches: deny, allow: false},
-			builtinRule{permission: permissionFileWrite, matches: deny, allow: false},
+			builtinRule{permission: PermissionFileRead, matches: deny, allow: false},
+			builtinRule{permission: PermissionFileWrite, matches: deny, allow: false},
 		)
 	}
 	return append(rules,
-		builtinRule{permission: permissionCommandRun, matches: anyTarget, allow: true},
-		builtinRule{permission: permissionWorkspaceInspect, matches: equalsWorkspaceRoot, allow: true},
-		builtinRule{permission: permissionSleep, matches: equalsFixedTarget, allow: true},
-		builtinRule{permission: permissionChildLaunch, matches: anyTarget, allow: true},
-		builtinRule{permission: permissionProcessOwn, matches: anyTarget, allow: true},
+		builtinRule{permission: PermissionCommandRun, matches: anyTarget, allow: true},
+		builtinRule{permission: PermissionWorkspaceInspect, matches: equalsWorkspaceRoot, allow: true},
+		builtinRule{permission: PermissionSleep, matches: equalsFixedTarget, allow: true},
+		builtinRule{permission: PermissionChildLaunch, matches: anyTarget, allow: true},
+		builtinRule{permission: PermissionProcessOwn, matches: anyTarget, allow: true},
 	)
 }
 

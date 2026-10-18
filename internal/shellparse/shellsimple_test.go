@@ -142,7 +142,7 @@ func TestParseSimpleGrammar(t *testing.T) {
 			if segments[i].Text != tc.text[i] {
 				t.Errorf("%s: ParseSimple(%q)[%d].Text = %q, want %q", tc.name, tc.command, i, segments[i].Text, tc.text[i])
 			}
-			if segments[i].UnsafeExpansion || len(segments[i].Redirections) > 0 {
+			if segments[i].UnsafeExpansion || segments[i].HasRedirection {
 				t.Errorf("%s: ParseSimple(%q)[%d] carries grammar markers outside the simple-command shape", tc.name, tc.command, i)
 			}
 		}

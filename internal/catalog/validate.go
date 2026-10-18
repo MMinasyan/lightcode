@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/MMinasyan/lightcode/model"
 )
 
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -401,7 +403,7 @@ func validateProtocolFieldName(add func(string, string, string), model, field, n
 }
 
 func protocolFieldReserved(name string) bool {
-	for _, reserved := range ReservedKeys {
+	for _, reserved := range model.ReservedBodyKeys() {
 		if name == reserved {
 			return true
 		}

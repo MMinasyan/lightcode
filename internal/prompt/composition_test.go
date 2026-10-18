@@ -37,7 +37,7 @@ func TestAssembleConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := NewService(home)
-	adapt := &adaptation.Adaptation{Name: "concurrent", Blocks: []string{"CONCURRENT_BLOCK"}}
+	adapt := &adaptation.Adaptation{Blocks: []string{"CONCURRENT_BLOCK"}}
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -66,7 +66,6 @@ func TestAssembleFullWithAdaptationRendersAdaptationContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapt := &adaptation.Adaptation{
-		Name:      "adapted-full",
 		Blocks:    []string{"FULL_BLOCK_MARKER"},
 		Additions: map[string]string{"tone": "FULL_TONE_ADDITION"},
 	}
@@ -85,7 +84,6 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 		t.Fatal(err)
 	}
 	adapt := &adaptation.Adaptation{
-		Name:      "simple",
 		Blocks:    []string{"SIMPLE_BLOCK_MARKER"},
 		Additions: map[string]string{"safety": "SIMPLE_SAFETY_ADDITION", "tone": "SIMPLE_TONE_ADDITION"},
 	}
@@ -143,7 +141,7 @@ func TestAssembleForSpecNoneProducesBodyOnly(t *testing.T) {
 	prompt := assembleSpec(projectRoot, home, Spec{
 		Size:  SizeNone,
 		Body:  body,
-		Adapt: &adaptation.Adaptation{Name: "ignored", Blocks: []string{"IGNORED_BLOCK"}},
+		Adapt: &adaptation.Adaptation{Blocks: []string{"IGNORED_BLOCK"}},
 	}).Prompt
 
 	if !strings.Contains(prompt, body) {

@@ -37,6 +37,15 @@ const WarningMustPreserveMissing = "protocol_must_preserve_missing"
 // reservedKeys is the closed set of top-level request-body keys owned by this encoder's base body; their presence in any sidecar layer rejects encoding.
 var reservedKeys = []string{"model", "messages", "tools", "tool_choice", "stream", "stream_options", "max_tokens", "max_completion_tokens", "n"}
 
+// ReservedBodyKeys returns an independently owned copy of the ordered
+// top-level request-body keys owned by this encoder's base body. The returned
+// slice is the caller's: retaining or modifying it never reaches the
+// encoder's own set, and the encoder's private checks keep operating on that
+// set alone.
+func ReservedBodyKeys() []string {
+	return append([]string(nil), reservedKeys...)
+}
+
 // Encode serializes one logical request into an owned OpenAI-compatible chat body plus ordered protocol warnings for the given resolved transport input and per-call runtime extra layer. It performs no network or filesystem I/O: validation, replay filtering, sidecar merge, wire-system-role mapping, message/content/tool wire shapes (exactly reproducing the retained legacy encoder minus its persistence fields), warning collection, header construction, and endpoint resolution all happen here as pure computation over deep-copied inputs.
 func Encode(in ResolvedTransport, req Request, runtimeExtras map[string]json.RawMessage) (json.RawMessage, []ProtocolWarning, error) {
 	rt := cloneResolvedInput(in) // own every resolved value before reading it further.

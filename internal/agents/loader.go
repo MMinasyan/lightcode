@@ -10,14 +10,6 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-var allowedTools = func() map[string]struct{} {
-	out := make(map[string]struct{}, len(StandardTools))
-	for _, name := range StandardTools {
-		out[name] = struct{}{}
-	}
-	return out
-}()
-
 // PathForConfig returns the agents.json path beside the active config.json.
 func PathForConfig(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "agents.json")
@@ -28,15 +20,8 @@ type Config struct {
 	warnings []Warning
 }
 
-// Parse loads the legacy on-disk shape: custom tool names must be members
-// of StandardTools and the target-only capabilities field is ignored.
-func Parse(data []byte) (*Config, error) {
-	return parse(data, nil, nil, nil, false)
-}
-
-// ParseWithCapabilities loads the Runtime target shape. Shape, inheritance
-// and every other definition rule are shared with Parse. Capability names
-// are validated against the supplied compiled capability declarations, with
+// ParseWithCapabilities loads the agent definitions. Capability names are
+// validated against the supplied compiled capability declarations, with
 // missing inheritance, empty-list clearing, and the same invalid-custom
 // warning/drop behavior for unknown, duplicate, or empty IDs; built-ins keep
 // their locked fields and an empty default. Configured tool names are
@@ -57,10 +42,10 @@ func ParseWithCapabilities(data []byte, capabilityIDs, toolIDs, defaultCapabilit
 	for _, id := range toolIDs {
 		tools[id] = struct{}{}
 	}
-	return parse(data, declared, tools, defaultCapabilityIDs, true)
+	return parse(data, declared, tools, defaultCapabilityIDs)
 }
 
-func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{}, defaultCapabilityIDs []string, target bool) (*Config, error) {
+func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{}, defaultCapabilityIDs []string) (*Config, error) {
 	var user map[string]json.RawMessage
 	if err := json.Unmarshal(data, &user); err != nil {
 		return nil, err
@@ -95,7 +80,7 @@ func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{},
 			cfg.applyBuiltinOverlay(name, def)
 			continue
 		}
-		def, err := decodeDefinition(raw, target)
+		def, err := decodeDefinition(raw)
 		if err != nil {
 			cfg.warnings = append(cfg.warnings, Warning{
 				Kind:    "invalid_agent_type",
@@ -104,7 +89,7 @@ func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{},
 			})
 			continue
 		}
-		if err := validateCustom(name, def, target, declaredCapabilities, declaredTools); err != nil {
+		if err := validateCustom(name, def, declaredCapabilities, declaredTools); err != nil {
 			cfg.warnings = append(cfg.warnings, Warning{
 				Kind:    "invalid_agent_type",
 				Name:    name,
@@ -114,11 +99,9 @@ func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{},
 		}
 		cfg.defs[name] = copyDefinition(def)
 	}
-	if target {
-		for name, def := range cfg.defs {
-			def.Tools = intersectCompiledTools(def.Tools, declaredTools)
-			cfg.defs[name] = def
-		}
+	for name, def := range cfg.defs {
+		def.Tools = intersectCompiledTools(def.Tools, declaredTools)
+		cfg.defs[name] = def
 	}
 	return cfg, nil
 }
@@ -139,29 +122,17 @@ func intersectCompiledTools(tools *[]string, declared map[string]struct{}) *[]st
 	return &kept
 }
 
-// decodeDefinition decodes one custom definition entry. Legacy decoding
-// shadows the target-only capabilities member with a raw value, so its type
-// and value cannot reach the embedded Definition; every other field keeps
-// the ordinary decoder's behavior. Target decoding stays the typed decode.
-func decodeDefinition(raw json.RawMessage, target bool) (Definition, error) {
+// decodeDefinition decodes one custom definition entry: the entry must be an
+// object and every member keeps the ordinary typed decoder's behavior.
+func decodeDefinition(raw json.RawMessage) (Definition, error) {
 	if err := ensureJSONObject(raw); err != nil {
 		return Definition{}, err
 	}
-	if target {
-		var def Definition
-		if err := json.Unmarshal(raw, &def); err != nil {
-			return Definition{}, err
-		}
-		return def, nil
-	}
-	var legacy struct {
-		Definition
-		Capabilities json.RawMessage `json:"capabilities"`
-	}
-	if err := json.Unmarshal(raw, &legacy); err != nil {
+	var def Definition
+	if err := json.Unmarshal(raw, &def); err != nil {
 		return Definition{}, err
 	}
-	return legacy.Definition, nil
+	return def, nil
 }
 
 func decodeBuiltinOverlay(raw json.RawMessage) (Definition, error) {
@@ -307,7 +278,7 @@ func applyDefinition(out *Resolved, def Definition) {
 	}
 }
 
-func validateCustom(name string, def Definition, target bool, declaredCapabilities, declaredTools map[string]struct{}) error {
+func validateCustom(name string, def Definition, declaredCapabilities, declaredTools map[string]struct{}) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is empty")
 	}
@@ -325,21 +296,15 @@ func validateCustom(name string, def Definition, target bool, declaredCapabiliti
 	}
 	if def.Tools != nil {
 		for _, name := range *def.Tools {
-			if target {
-				if name == "" {
-					return fmt.Errorf("tool name is empty")
-				}
-				if _, ok := declaredTools[name]; !ok {
-					return fmt.Errorf("unknown tool %q", name)
-				}
-				continue
+			if name == "" {
+				return fmt.Errorf("tool name is empty")
 			}
-			if _, ok := allowedTools[name]; !ok {
+			if _, ok := declaredTools[name]; !ok {
 				return fmt.Errorf("unknown tool %q", name)
 			}
 		}
 	}
-	if target && def.Capabilities != nil {
+	if def.Capabilities != nil {
 		seen := make(map[string]bool, len(*def.Capabilities))
 		for _, id := range *def.Capabilities {
 			if _, ok := declaredCapabilities[id]; !ok {

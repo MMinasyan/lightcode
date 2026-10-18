@@ -112,9 +112,9 @@ func TestTaskDescriptionComposesFromRoster(t *testing.T) {
 
 	// The expected text composes from the loader's own roster: builtins
 	// first, customs alphabetically, one retained line per Subagent entry.
-	cfg, err := agents.Parse([]byte("{}"))
+	cfg, err := agents.ParseWithCapabilities([]byte("{}"), nil, nil, nil)
 	if err != nil {
-		t.Fatalf("agents.Parse: %v", err)
+		t.Fatalf("agents.ParseWithCapabilities: %v", err)
 	}
 	var want strings.Builder
 	want.WriteString(taskDescriptionPrefix)

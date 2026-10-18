@@ -2,8 +2,10 @@ package adaptation
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -53,11 +55,17 @@ func TestProductionBundledDataIsValid(t *testing.T) {
 		t.Fatalf("loaded %d rows, fixture has %d", len(tbl), len(doc.Entries))
 	}
 	for i, e := range doc.Entries {
+		if e.Name == "" {
+			t.Errorf("row %d (%q): fixture row has no authoring name", i, e.Pattern)
+		}
 		if tbl[i].pattern != e.Pattern {
 			t.Errorf("row %d: loader pattern %q != fixture %q", i, tbl[i].pattern, e.Pattern)
 		}
-		if tbl[i].adapt.Name != e.Name {
-			t.Errorf("row %d: loader name %q != fixture %q", i, tbl[i].adapt.Name, e.Name)
+		if !maps.Equal(tbl[i].adapt.Additions, e.Additions) ||
+			!slices.Equal(tbl[i].adapt.ExcludeTools, e.ExcludeTools) ||
+			!slices.Equal(tbl[i].adapt.IncludeTools, e.IncludeTools) ||
+			!maps.Equal(tbl[i].adapt.ToolDescriptionReplacements, e.ToolDescriptionReplacements) {
+			t.Errorf("row %d (%q): loaded adaptation outputs %+v != fixture row %+v", i, e.Pattern, tbl[i].adapt, e)
 		}
 	}
 }

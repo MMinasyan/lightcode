@@ -23,7 +23,7 @@ func TestParseNormalizesShellLineContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segments) != 1 || segments[0].Text != "rm -rf x" || segments[0].Normalized != "rm -rf x" {
+	if len(segments) != 1 || segments[0].Text != "rm -rf x" {
 		t.Fatalf("segments = %#v, want shell-effective rm segment", segments)
 	}
 
@@ -31,7 +31,7 @@ func TestParseNormalizesShellLineContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segments) != 1 || segments[0].Text != "rm -rf x" || segments[0].Normalized != "rm -rf x" {
+	if len(segments) != 1 || segments[0].Text != "rm -rf x" {
 		t.Fatalf("CRLF segments = %#v, want shell-effective rm segment", segments)
 	}
 
@@ -93,33 +93,26 @@ func TestParseRejectsExecutableSubstitution(t *testing.T) {
 }
 
 func TestParseRedirections(t *testing.T) {
-	tests := []struct {
-		command string
-		safe    bool
-	}{
-		{"echo ok > file", false},
-		{"echo ok >> file", false},
-		{"echo ok 1>file", false},
-		{"echo ok 2>err", false},
-		{"echo ok >&file", false},
-		{"echo ok &> file", false},
-		{"cat < file", false},
-		{"cat <<EOF", false},
-		{"echo ok 2>&1", true},
-		{"echo ok >&2", true},
-		{"echo ok 2>&-", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.command, func(t *testing.T) {
-			segments, err := Parse(tt.command)
+	for _, command := range []string{
+		"echo ok > file",
+		"echo ok >> file",
+		"echo ok 1>file",
+		"echo ok 2>err",
+		"echo ok >&file",
+		"echo ok &> file",
+		"cat < file",
+		"cat <<EOF",
+		"echo ok 2>&1",
+		"echo ok >&2",
+		"echo ok 2>&-",
+	} {
+		t.Run(command, func(t *testing.T) {
+			segments, err := Parse(command)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(segments) != 1 || len(segments[0].Redirections) != 1 {
-				t.Fatalf("segments = %#v, want one redirection", segments)
-			}
-			if got := segments[0].Redirections[0].SafeFDDup; got != tt.safe {
-				t.Fatalf("SafeFDDup = %v, want %v", got, tt.safe)
+			if len(segments) != 1 || !segments[0].HasRedirection {
+				t.Fatalf("segments = %#v, want one segment with HasRedirection=true", segments)
 			}
 		})
 	}
@@ -133,7 +126,7 @@ func TestParseQuotedMetacharactersAreLiteral(t *testing.T) {
 	if len(segments) != 2 {
 		t.Fatalf("segments = %d, want 2", len(segments))
 	}
-	if len(segments[0].Redirections) != 0 || len(segments[1].Redirections) != 0 {
+	if segments[0].HasRedirection || segments[1].HasRedirection {
 		t.Fatalf("segments = %#v, want no redirections", segments)
 	}
 	if segments[0].Argv[2] != "foo|bar" || segments[1].Argv[1] != ">" {
@@ -207,8 +200,8 @@ func TestPR11Closure_RedirectionTargetMarksOrRejectsSubstitution(t *testing.T) {
 			if len(segments) != 1 || segments[0].UnsafeExpansion {
 				t.Fatalf("Parse(%q) segments = %#v; want one segment with UnsafeExpansion=false", command, segments)
 			}
-			if len(segments[0].Redirections) != 1 {
-				t.Fatalf("Parse(%q) redirections = %#v; want exactly one redirection entry", command, segments[0].Redirections)
+			if !segments[0].HasRedirection {
+				t.Fatalf("Parse(%q) segments = %#v; want HasRedirection=true", command, segments)
 			}
 		}
 	})

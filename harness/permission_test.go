@@ -2,6 +2,8 @@ package harness
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -36,9 +38,9 @@ func rulesJSON(rules ...string) string {
 }
 
 func TestResolvePermissionPolicyFallbackChain(t *testing.T) {
-	broad := ruleJSON(permissionFileRead, "/w/*", permissionAccessDeny)
-	narrow := ruleJSON(permissionFileRead, "/w/sub/*", permissionAccessAllow)
-	countered := ruleJSON(permissionFileRead, "/w/sub/a.txt", permissionAccessDeny)
+	broad := ruleJSON(PermissionFileRead, "/w/*", permissionAccessDeny)
+	narrow := ruleJSON(PermissionFileRead, "/w/sub/*", permissionAccessAllow)
+	countered := ruleJSON(PermissionFileRead, "/w/sub/a.txt", permissionAccessDeny)
 	policy := func(global, workspace string) PermissionPolicy {
 		t.Helper()
 		var g, w json.RawMessage
@@ -59,63 +61,63 @@ func TestResolvePermissionPolicyFallbackChain(t *testing.T) {
 		want    bool
 	}{
 		{"absent levels reach built-in in-root allow", "", "", "/w",
-			PermissionRequest{permissionFileRead, "/w/a.txt"}, true},
+			PermissionRequest{PermissionFileRead, "/w/a.txt"}, true},
 		{"absent levels reach built-in outside-root deny", "", "", "/w",
-			PermissionRequest{permissionFileRead, "/etc/passwd"}, false},
+			PermissionRequest{PermissionFileRead, "/etc/passwd"}, false},
 		{"last matching workspace rule decides over earlier siblings", "", levelJSON(rulesJSON(broad, narrow)), "/w",
-			PermissionRequest{permissionFileRead, "/w/sub/a.txt"}, true},
+			PermissionRequest{PermissionFileRead, "/w/sub/a.txt"}, true},
 		{"last matching workspace rule decides under a later counter-exception", "",
 			levelJSON(rulesJSON(broad, narrow, countered)), "/w",
-			PermissionRequest{permissionFileRead, "/w/sub/a.txt"}, false},
+			PermissionRequest{PermissionFileRead, "/w/sub/a.txt"}, false},
 		{"last matching global rule decides without any workspace level", levelJSON(rulesJSON(broad, narrow)), "", "/w",
-			PermissionRequest{permissionFileRead, "/w/sub/a.txt"}, true},
+			PermissionRequest{PermissionFileRead, "/w/sub/a.txt"}, true},
 		{"workspace rule overrides an opposite global rule",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/*", permissionAccessAllow))),
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/*", permissionAccessAllow))),
 			levelJSON(rulesJSON(broad)), "/w",
-			PermissionRequest{permissionFileRead, "/w/a.txt"}, false},
+			PermissionRequest{PermissionFileRead, "/w/a.txt"}, false},
 		{"workspace match denies even when the workspace default allows", "",
 			levelJSON(`"default":"allow"`, rulesJSON(broad)), "/w",
-			PermissionRequest{permissionFileRead, "/w/a.txt"}, false},
+			PermissionRequest{PermissionFileRead, "/w/a.txt"}, false},
 		{"workspace default applies when no workspace rule matches", "",
-			levelJSON(`"default":"deny"`, rulesJSON(ruleJSON(permissionCommandRun, "*", permissionAccessAllow))), "/w",
-			PermissionRequest{permissionFileRead, "/w/a.txt"}, false},
+			levelJSON(`"default":"deny"`, rulesJSON(ruleJSON(PermissionCommandRun, "*", permissionAccessAllow))), "/w",
+			PermissionRequest{PermissionFileRead, "/w/a.txt"}, false},
 		{"a matching workspace rule outranks a denying workspace default and a denying global",
 			levelJSON(`"default":"deny"`), levelJSON(`"default":"deny"`, rulesJSON(narrow)), "/w",
-			PermissionRequest{permissionFileRead, "/w/sub/a.txt"}, true},
+			PermissionRequest{PermissionFileRead, "/w/sub/a.txt"}, true},
 		{"workspace default decides without consulting global rules",
 			levelJSON(`"default":"deny"`), levelJSON(`"default":"allow"`), "/w",
-			PermissionRequest{permissionFileRead, "/elsewhere/x"}, true},
+			PermissionRequest{PermissionFileRead, "/elsewhere/x"}, true},
 		{"global default applies when the workspace level is absent",
 			levelJSON(`"default":"allow"`), "", "/w",
-			PermissionRequest{permissionFileRead, "/elsewhere/x"}, true},
+			PermissionRequest{PermissionFileRead, "/elsewhere/x"}, true},
 		{"global default applies when the workspace declares neither rules nor default",
 			levelJSON(`"default":"allow"`), "{}", "/w",
-			PermissionRequest{permissionFileRead, "/elsewhere/x"}, true},
+			PermissionRequest{PermissionFileRead, "/elsewhere/x"}, true},
 		{"built-ins apply when user levels provide no default",
 			levelJSON(rulesJSON(ruleJSON("acme.op", "irrelevant", permissionAccessDeny))), "", "/w",
-			PermissionRequest{permissionFileRead, "/w/a.txt"}, true},
+			PermissionRequest{PermissionFileRead, "/w/a.txt"}, true},
 		{"unknown permission namespace reaches the built-in default deny", "", "", "/w",
 			PermissionRequest{"acme.unknown", "*"}, false},
 		{"unknown permission namespace is denied even under an absent-default global",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/*", permissionAccessAllow))), "", "/w",
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/*", permissionAccessAllow))), "", "/w",
 			PermissionRequest{"acme.unknown", "*"}, false},
 		{"outside-root file target denied by the global default",
 			levelJSON(`"default":"deny"`), "", "/w",
-			PermissionRequest{permissionFileRead, "/etc/passwd"}, false},
+			PermissionRequest{PermissionFileRead, "/etc/passwd"}, false},
 		{"workspace rule explicitly allows an outside-root file target", "",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/etc/*", permissionAccessAllow))), "/w",
-			PermissionRequest{permissionFileRead, "/etc/passwd"}, true},
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/etc/*", permissionAccessAllow))), "/w",
+			PermissionRequest{PermissionFileRead, "/etc/passwd"}, true},
 		{"global rule explicitly allows an outside-root file target",
-			levelJSON(rulesJSON(ruleJSON(permissionFileWrite, "/srv/*", permissionAccessAllow))), "", "/w",
-			PermissionRequest{permissionFileWrite, "/srv/data/db"}, true},
+			levelJSON(rulesJSON(ruleJSON(PermissionFileWrite, "/srv/*", permissionAccessAllow))), "", "/w",
+			PermissionRequest{PermissionFileWrite, "/srv/data/db"}, true},
 		{"workspace rule overrides the built-in sensitive-file denial", "",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/.env", permissionAccessAllow))), "/w",
-			PermissionRequest{permissionFileRead, "/w/.env"}, true},
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/.env", permissionAccessAllow))), "/w",
+			PermissionRequest{PermissionFileRead, "/w/.env"}, true},
 		{"global rule overrides the built-in sensitive-file denial",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/.env", permissionAccessAllow))), "", "/w",
-			PermissionRequest{permissionFileRead, "/w/.env"}, true},
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/.env", permissionAccessAllow))), "", "/w",
+			PermissionRequest{PermissionFileRead, "/w/.env"}, true},
 		{"zero policy is the built-in policy", "", "", "/w",
-			PermissionRequest{permissionCommandRun, "echo hi"}, true},
+			PermissionRequest{PermissionCommandRun, "echo hi"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,7 +135,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	}
 	for _, path := range inside {
 		t.Run("in-workspace file allowed "+path, func(t *testing.T) {
-			for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				if !policy.evaluate("/w", PermissionRequest{permission, path}) {
 					t.Errorf("built-in %s of %s denied, want allow", permission, path)
 				}
@@ -143,7 +145,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	outside := []string{"/etc/passwd", "/w.txt", "/other/sub/a", "relative/a.txt", "/w/../secrets/key"}
 	for _, path := range outside {
 		t.Run("outside-workspace file denied "+path, func(t *testing.T) {
-			for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				if policy.evaluate("/w", PermissionRequest{permission, path}) {
 					t.Errorf("built-in %s of %s allowed, want deny", permission, path)
 				}
@@ -151,7 +153,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 		})
 	}
 	t.Run("workspace root itself is inside", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{permissionFileRead, "/w"}) {
+		if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w"}) {
 			t.Error("built-in file.read of the root denied, want allow")
 		}
 	})
@@ -160,7 +162,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 			allow string
 			deny  string
 		}
-		for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+		for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 			for _, p := range []pair{
 				{"/w/.env.cache/README.md", "/w/sub/.env.cache"},
 				{"/w/credentials-cache/data.json", "/w/sub/credentials-cache.json"},
@@ -185,7 +187,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 			"id_dsa.pem",
 		}
 		for _, base := range denied {
-			for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				for _, dir := range []string{"/w/", "/w/sub/"} {
 					target := dir + base
 					if !policy.evaluate("/w", PermissionRequest{permission, target}) {
@@ -205,7 +207,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 			"MyCredentials.JSON", "credentials", "mycredentials.json", "credentials.jsonx",
 		}
 		for _, base := range allowed {
-			for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				for _, dir := range []string{"/w/", "/w/sub/"} {
 					target := dir + base
 					if policy.evaluate("/w", PermissionRequest{permission, target}) {
@@ -219,7 +221,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	t.Run("sensitive-looking ancestor directory never denies its contents", func(t *testing.T) {
 		for _, base := range sensitiveBasenamePatterns {
 			dir := strings.ReplaceAll(base, "*", "x")
-			for _, permission := range []string{permissionFileRead, permissionFileWrite} {
+			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				target := "/w/" + dir + "/f"
 				if !policy.evaluate("/w", PermissionRequest{permission, target}) {
 					t.Errorf("built-in %s of %s denied, want allow", permission, target)
@@ -233,46 +235,46 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	})
 	t.Run("literal glob characters in a real path are plain data", func(t *testing.T) {
 		for _, base := range []string{"*", "?", "[x]", "a?b", "x[1].txt"} {
-			if !policy.evaluate("/w", PermissionRequest{permissionFileRead, "/w/" + base}) {
+			if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/" + base}) {
 				t.Errorf("built-in file.read of %s denied, want allow", base)
 			}
 		}
 	})
 	t.Run("root path metacharacters stay literal path data", func(t *testing.T) {
 		root := "/w/[x]"
-		if !policy.evaluate(root, PermissionRequest{permissionFileRead, root + "/a.txt"}) {
+		if !policy.evaluate(root, PermissionRequest{PermissionFileRead, root + "/a.txt"}) {
 			t.Error("file under a metacharacter root denied, want allow")
 		}
-		if !policy.evaluate(root, PermissionRequest{permissionWorkspaceInspect, root}) {
+		if !policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, root}) {
 			t.Error("inspect of the metacharacter root denied, want allow")
 		}
-		if policy.evaluate(root, PermissionRequest{permissionWorkspaceInspect, "/w/y"}) {
+		if policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, "/w/y"}) {
 			t.Error("inspect of a different root allowed, want deny")
 		}
 	})
 	t.Run("command run allows any canonical command target", func(t *testing.T) {
 		for _, target := range []string{"*", "git push origin main", "rm -rf /tmp/x", "echo\nls"} {
-			if !policy.evaluate("/w", PermissionRequest{permissionCommandRun, target}) {
+			if !policy.evaluate("/w", PermissionRequest{PermissionCommandRun, target}) {
 				t.Errorf("built-in command.run of %q denied, want allow", target)
 			}
 		}
 	})
 	t.Run("workspace inspect allows only the canonical root", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{permissionWorkspaceInspect, "/w"}) {
+		if !policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, "/w"}) {
 			t.Error("built-in inspect of the root denied, want allow")
 		}
 		for _, target := range []string{"/w/keys", "/etc", "*", ""} {
-			if policy.evaluate("/w", PermissionRequest{permissionWorkspaceInspect, target}) {
+			if policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, target}) {
 				t.Errorf("built-in inspect of %q allowed, want deny", target)
 			}
 		}
 	})
 	t.Run("sleep allows the fixed target only", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{permissionSleep, "*"}) {
+		if !policy.evaluate("/w", PermissionRequest{PermissionSleep, "*"}) {
 			t.Error("built-in sleep of the fixed target denied, want allow")
 		}
 		for _, target := range []string{"1", ""} {
-			if policy.evaluate("/w", PermissionRequest{permissionSleep, target}) {
+			if policy.evaluate("/w", PermissionRequest{PermissionSleep, target}) {
 				t.Errorf("built-in sleep of %q allowed, want deny", target)
 			}
 		}
@@ -294,8 +296,8 @@ func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
 		permission string
 		target     string
 	}{
-		{permissionChildLaunch, "0123456789abcdef0123456789abcdef"},
-		{permissionProcessOwn, "a1b2c3d4"},
+		{PermissionChildLaunch, "0123456789abcdef0123456789abcdef"},
+		{PermissionProcessOwn, "a1b2c3d4"},
 	}
 	for _, req := range concrete {
 		t.Run("built-in "+req.permission+" of "+req.target, func(t *testing.T) {
@@ -305,8 +307,8 @@ func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
 		})
 	}
 	denied := ResolvePermissionPolicy(nil, json.RawMessage(levelJSON(rulesJSON(
-		ruleJSON(permissionChildLaunch, "*", permissionAccessDeny),
-		ruleJSON(permissionProcessOwn, "*", permissionAccessDeny),
+		ruleJSON(PermissionChildLaunch, "*", permissionAccessDeny),
+		ruleJSON(PermissionProcessOwn, "*", permissionAccessDeny),
 	))))
 	for _, req := range concrete {
 		t.Run("user deny decides "+req.permission+" of "+req.target, func(t *testing.T) {
@@ -359,13 +361,13 @@ func TestPermissionGlobMatcher(t *testing.T) {
 	}
 	t.Run("rule matching uses the complete canonical target", func(t *testing.T) {
 		policy := ResolvePermissionPolicy(nil, json.RawMessage(levelJSON(rulesJSON(
-			ruleJSON(permissionFileRead, "*", permissionAccessAllow),
-			ruleJSON(permissionFileRead, "/w/docs/*", permissionAccessDeny),
+			ruleJSON(PermissionFileRead, "*", permissionAccessAllow),
+			ruleJSON(PermissionFileRead, "/w/docs/*", permissionAccessDeny),
 		))))
-		if policy.evaluate("/w", PermissionRequest{permissionFileRead, "/w/docs/a.txt"}) {
+		if policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/docs/a.txt"}) {
 			t.Error("the complete-target deny rule did not match its canonical target")
 		}
-		if !policy.evaluate("/w", PermissionRequest{permissionFileRead, "/etc/docs/a.txt"}) {
+		if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/etc/docs/a.txt"}) {
 			t.Error("the complete-target deny rule matched outside its pattern")
 		}
 	})
@@ -381,8 +383,8 @@ func TestCompileGlobRejectsTrailingBackslash(t *testing.T) {
 }
 
 func TestResolvePermissionPolicyMalformedDiscardsBothLevels(t *testing.T) {
-	validGlobal := levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/elsewhere/*", permissionAccessAllow)))
-	validWorkspace := levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/docs/*", permissionAccessDeny)))
+	validGlobal := levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/elsewhere/*", permissionAccessAllow)))
+	validWorkspace := levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/docs/*", permissionAccessDeny)))
 	tests := []struct {
 		name  string
 		bad   string
@@ -409,7 +411,7 @@ func TestResolvePermissionPolicyMalformedDiscardsBothLevels(t *testing.T) {
 		{"rule with empty target is malformed",
 			levelJSON(rulesJSON(`{"permission":"file.read","target":"","access":"allow"}`)), validGlobal},
 		{"rule with unknown access is malformed",
-			levelJSON(rulesJSON(ruleJSON(permissionFileRead, "/w/*", "permit"))), validGlobal},
+			levelJSON(rulesJSON(ruleJSON(PermissionFileRead, "/w/*", "permit"))), validGlobal},
 		{"rule with invalid glob is malformed",
 			levelJSON(rulesJSON(`{"permission":"file.read","target":"/w/sub\\","access":"allow"}`)), validGlobal},
 		{"rules array member that is not an object is malformed",
@@ -443,17 +445,17 @@ func TestResolvePermissionPolicyValidShapes(t *testing.T) {
 		t.Errorf("absent levels resolved to %+v, want the zero built-in policy", got)
 	}
 	outsideAllow := json.RawMessage(levelJSON(rulesJSON(
-		ruleJSON(permissionFileRead, "/elsewhere/*", permissionAccessAllow),
+		ruleJSON(PermissionFileRead, "/elsewhere/*", permissionAccessAllow),
 	)))
 	workspaceDeny := json.RawMessage(levelJSON(rulesJSON(
-		ruleJSON(permissionFileRead, "/w/private/*", permissionAccessDeny),
+		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessDeny),
 	)))
 	if !ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w",
-		PermissionRequest{permissionFileRead, "/elsewhere/x"}) {
+		PermissionRequest{PermissionFileRead, "/elsewhere/x"}) {
 		t.Error("valid global level lost when a valid workspace block is present")
 	}
 	if ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w",
-		PermissionRequest{permissionFileRead, "/w/private/x"}) {
+		PermissionRequest{PermissionFileRead, "/w/private/x"}) {
 		t.Error("valid workspace level lost when a valid global block is present")
 	}
 	// A malformed Workspace block affects only resolutions carrying it: the
@@ -468,7 +470,7 @@ func TestResolvePermissionPolicyValidShapes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			policy := ResolvePermissionPolicy(outsideAllow, tc.workspace)
 			want := tc.name != "malformed workspace block"
-			if got := policy.evaluate("/w", PermissionRequest{permissionFileRead, "/elsewhere/x"}); got != want {
+			if got := policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/elsewhere/x"}); got != want {
 				t.Errorf("global decision under %s = %v, want %v", tc.name, got, want)
 			}
 		})
@@ -481,29 +483,29 @@ func TestResolvePermissionPolicyValidShapes(t *testing.T) {
 	// decoding, not a second duplicate-key parser.
 	duplicates := json.RawMessage(`{"default":"deny","default":"allow","rules":[],"rules":[]}`)
 	if !ResolvePermissionPolicy(nil, duplicates).evaluate("/w",
-		PermissionRequest{permissionFileRead, "/elsewhere/x"}) {
+		PermissionRequest{PermissionFileRead, "/elsewhere/x"}) {
 		t.Error("last duplicate default did not win")
 	}
 	lastRule := json.RawMessage(levelJSON(rulesJSON(
-		ruleJSON(permissionFileRead, "/w/private/*", permissionAccessDeny),
-		ruleJSON(permissionFileRead, "/w/private/*", permissionAccessAllow),
+		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessDeny),
+		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessAllow),
 	)))
 	if !ResolvePermissionPolicy(nil, lastRule).evaluate("/w",
-		PermissionRequest{permissionFileRead, "/w/private/x"}) {
+		PermissionRequest{PermissionFileRead, "/w/private/x"}) {
 		t.Error("last duplicate rule did not win")
 	}
 	// Whitespace before the top-level value is ordinary JSON, not trailing
 	// garbage.
 	padded := json.RawMessage(" \n\t" + levelJSON(`"default":"allow"`))
 	if !ResolvePermissionPolicy(padded, nil).evaluate("/w",
-		PermissionRequest{permissionSleep, "1"}) {
+		PermissionRequest{PermissionSleep, "1"}) {
 		t.Error("whitespace-padded block did not parse as a valid level")
 	}
 }
 
 func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
 	policy := ResolvePermissionPolicy(nil, json.RawMessage(levelJSON(rulesJSON(
-		ruleJSON(permissionFileWrite, "/w/secret", permissionAccessDeny),
+		ruleJSON(PermissionFileWrite, "/w/secret", permissionAccessDeny),
 	))))
 	tests := []struct {
 		name     string
@@ -511,21 +513,21 @@ func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
 		want     bool
 	}{
 		{"every pair allows", []PermissionRequest{
-			{permissionFileWrite, "/w/a.txt"},
-			{permissionFileRead, "/w/b.txt"},
-			{permissionCommandRun, "git status"},
+			{PermissionFileWrite, "/w/a.txt"},
+			{PermissionFileRead, "/w/b.txt"},
+			{PermissionCommandRun, "git status"},
 		}, true},
 		{"one denied pair denies the whole call", []PermissionRequest{
-			{permissionFileWrite, "/w/a.txt"},
-			{permissionFileWrite, "/w/secret"},
-			{permissionFileRead, "/w/b.txt"},
+			{PermissionFileWrite, "/w/a.txt"},
+			{PermissionFileWrite, "/w/secret"},
+			{PermissionFileRead, "/w/b.txt"},
 		}, false},
 		{"one unmatched outside-root pair denies the whole call", []PermissionRequest{
-			{permissionFileWrite, "/w/a.txt"},
-			{permissionFileWrite, "/etc/passwd"},
+			{PermissionFileWrite, "/w/a.txt"},
+			{PermissionFileWrite, "/etc/passwd"},
 		}, false},
 		{"a lone denied pair denies", []PermissionRequest{
-			{permissionFileWrite, "/w/secret"},
+			{PermissionFileWrite, "/w/secret"},
 		}, false},
 		{"no declared pairs declare nothing to deny", nil, true},
 	}
@@ -540,27 +542,137 @@ func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
 
 func TestPermissionLevelDecideSemantics(t *testing.T) {
 	level := permissionLevel{}
-	if _, decided := level.decide(PermissionRequest{permissionFileRead, "/w/a"}); decided {
+	if _, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); decided {
 		t.Error("empty level without a default decided a request")
 	}
 	level.defaultAllow = true
 	level.hasDefault = true
-	if allow, decided := level.decide(PermissionRequest{permissionFileRead, "/w/a"}); !decided || !allow {
+	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); !decided || !allow {
 		t.Errorf("level default did not decide: allow=%v decided=%v", allow, decided)
 	}
 	glob := mustCompileGlob("/w/*")
 	level.rules = []permissionRule{
-		{permission: permissionFileRead, glob: glob, allow: false},
-		{permission: permissionFileWrite, glob: glob, allow: true},
-		{permission: permissionFileRead, glob: glob, allow: true},
+		{permission: PermissionFileRead, glob: glob, allow: false},
+		{permission: PermissionFileWrite, glob: glob, allow: true},
+		{permission: PermissionFileRead, glob: glob, allow: true},
 	}
-	if allow, decided := level.decide(PermissionRequest{permissionFileRead, "/w/a"}); !decided || !allow {
+	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); !decided || !allow {
 		t.Errorf("last matching rule did not decide over the level default: allow=%v decided=%v", allow, decided)
 	}
-	if allow, decided := level.decide(PermissionRequest{permissionCommandRun, "x"}); !decided || !allow {
+	if allow, decided := level.decide(PermissionRequest{PermissionCommandRun, "x"}); !decided || !allow {
 		t.Errorf("level default did not decide an unmatched permission: allow=%v decided=%v", allow, decided)
 	}
-	if allow, decided := level.decide(PermissionRequest{permissionFileRead, "/other/a"}); !decided || !allow {
+	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/other/a"}); !decided || !allow {
 		t.Errorf("level default did not decide an unmatched target: allow=%v decided=%v", allow, decided)
+	}
+}
+
+// TestPermissionNamesKeepPublishedLiterals pins the exported policy
+// vocabulary to its exact published strings: these names cross the plugin
+// boundary as literals, so the constants may never drift from them.
+func TestPermissionNamesKeepPublishedLiterals(t *testing.T) {
+	want := map[string]string{
+		PermissionFileRead:         "file.read",
+		PermissionFileWrite:        "file.write",
+		PermissionCommandRun:       "command.run",
+		PermissionWorkspaceInspect: "workspace.inspect",
+		PermissionSleep:            "sleep",
+		PermissionChildLaunch:      "child.launch",
+		PermissionProcessOwn:       "process.own",
+	}
+	if len(want) != 7 { // distinct literals: a duplicated value would collapse the map.
+		t.Fatalf("published permission vocabulary carries %d distinct literals, want 7", len(want))
+	}
+	for name, literal := range want {
+		if name != literal {
+			t.Errorf("permission constant %q = %q, want the published literal", name, literal)
+		}
+	}
+	if PermissionDeniedContent != "Permission denied." {
+		t.Errorf("PermissionDeniedContent = %q, want the published denial content", PermissionDeniedContent)
+	}
+}
+
+// readmePermissionsDocument extracts the one fenced JSON document in README.md
+// that carries a permissions member: the published Permissions example.
+func readmePermissionsDocument(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "```json" {
+			continue
+		}
+		var block strings.Builder
+		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != "```"; i++ {
+			block.WriteString(lines[i])
+			block.WriteByte('\n')
+		}
+		if strings.Contains(block.String(), `"permissions"`) {
+			return []byte(block.String())
+		}
+	}
+	t.Fatal("README.md has no fenced permissions JSON example")
+	return nil
+}
+
+// TestReadmePermissionsExampleAppliesItsRules guards the published example
+// with the parser that actually consumes it: the fenced document must parse
+// through the private level parser — no silent built-in fallback — and its
+// git allow, generated-file deny and default-deny rules must decide exactly
+// as written. The built-in policy would answer the deny and default rows the
+// opposite way, so those rows fail on any fallback; the non-git command row
+// pins that the allow is scoped to the git target, and the built-in policy
+// would allow that command too. The generated-file deny is additionally
+// observed with the example's default cleared, so that row cannot be
+// satisfied by the default alone.
+func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
+	block := readmePermissionsDocument(t)
+	var doc struct {
+		Permissions json.RawMessage `json:"permissions"`
+	}
+	if err := json.Unmarshal(block, &doc); err != nil {
+		t.Fatalf("README permissions example is not a JSON document: %v", err)
+	}
+	if len(doc.Permissions) == 0 {
+		t.Fatal("README permissions example carries no permissions member")
+	}
+	policy := ResolvePermissionPolicy(doc.Permissions, nil)
+	if isBuiltInOnly(policy) {
+		t.Fatal("README permissions example fell back to the built-in policy instead of parsing")
+	}
+	for _, tc := range []struct {
+		name string
+		req  PermissionRequest
+		want bool
+	}{
+		{"git command allow", PermissionRequest{PermissionCommandRun, "git status"}, true},
+		{"non-git command falls to the example default deny", PermissionRequest{PermissionCommandRun, "echo hello"}, false},
+		{"generated file write deny", PermissionRequest{PermissionFileWrite, "/w/generated/x.go"}, false},
+		{"unmatched read falls to the example default deny", PermissionRequest{PermissionFileRead, "/w/plain.txt"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := policy.evaluate("/w", tc.req); got != tc.want {
+				t.Errorf("README example %s = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+
+	// The extracted generated-file deny must decide on its own: the built-in
+	// policy allows a plain workspace write, so clearing the example default
+	// on a test-local copy leaves that allow as the fallback and only the
+	// extracted rule can deny the target. The full-policy row above stays
+	// masked by the default by design; this observation is not.
+	generatedWrite := PermissionRequest{PermissionFileWrite, "/w/generated/x.go"}
+	if !(PermissionPolicy{}).evaluate("/w", generatedWrite) {
+		t.Fatal("built-in control: a plain workspace write must be allowed without any user level")
+	}
+	ruleOnly := policy
+	ruleOnly.global.hasDefault = false
+	if ruleOnly.evaluate("/w", generatedWrite) {
+		t.Error("extracted generated-file deny rule did not deny its target once the example default was cleared")
 	}
 }
