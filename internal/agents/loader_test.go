@@ -349,26 +349,33 @@ func namesOf(values []Resolved) []string {
 	return out
 }
 
+// TestParseWithCapabilitiesSelection pins capability and tool selection
+// against the declared universes: declared values are retained in order, an
+// empty capability list clears the inherited selection, and a non-declared
+// capability value, a duplicate capability and a wrong-typed capabilities
+// member each drop the definition with the retained invalid_agent_type
+// warning. Configured tool names are retained in order, duplicates included.
 func TestParseWithCapabilitiesSelection(t *testing.T) {
 	cfg, err := ParseWithCapabilities([]byte(`{
-  "plan": {"capabilities": ["cap-b", "cap-a"]},
+  "plan": {"capabilities": ["cap-b", "cap-a"], "tools": ["own_tool"]},
   "sweeper": {"capabilities": []},
   "plain": {},
   "unknown_cap": {"capabilities": ["ghost"]},
   "duplicate_cap": {"capabilities": ["cap-a", "cap-a"]},
+  "broken": {"capabilities": "not-a-list"},
   "custom_tools": {"tools": ["own_tool", "own_tool", "read_file"]}
 }`), []string{"cap-a", "cap-b"}, []string{"own_tool", "read_file"}, nil)
 	if err != nil {
 		t.Fatalf("ParseWithCapabilities: %v", err)
 	}
-	for _, drop := range []string{"unknown_cap", "duplicate_cap"} {
+	for _, drop := range []string{"unknown_cap", "duplicate_cap", "broken"} {
 		if _, err := cfg.Resolve(drop); err == nil {
 			t.Fatalf("Resolve(%s) succeeded, want dropped", drop)
 		}
 	}
 	warnings := cfg.Warnings()
-	if len(warnings) != 2 {
-		t.Fatalf("warnings = %#v, want two invalid_agent_type drops", warnings)
+	if len(warnings) != 3 {
+		t.Fatalf("warnings = %#v, want three invalid_agent_type drops", warnings)
 	}
 	for _, warning := range warnings {
 		if warning.Kind != "invalid_agent_type" {
@@ -382,6 +389,9 @@ func TestParseWithCapabilitiesSelection(t *testing.T) {
 	}
 	if want := []string{"cap-b", "cap-a"}; !reflect.DeepEqual(plan.Capabilities, want) {
 		t.Fatalf("plan capabilities = %q, want the selected order", plan.Capabilities)
+	}
+	if want := []string{"own_tool"}; !reflect.DeepEqual(plan.Tools, want) {
+		t.Fatalf("plan tools = %q, want the declared selection", plan.Tools)
 	}
 	// A custom type inherits through secondary and primary; the built-ins
 	// keep their locked fields and an empty capability default because this
@@ -428,49 +438,6 @@ func TestParseWithCapabilitiesRejectsEmptyToolNames(t *testing.T) {
 	}
 	if warnings[0].Message != "tool name is empty" {
 		t.Fatalf("warning message = %q, want the empty-tool-name rejection text", warnings[0].Message)
-	}
-}
-
-// TestParseWithCapabilitiesDeclaredUniverseRows proves the declared-universe
-// rules for the members that select capabilities and tools: a declared
-// capability value and a declared tool name are retained, while a
-// non-declared capability value, a wrong-typed capabilities member, and a
-// tool outside the declared universe each drop the definition with the
-// retained invalid_agent_type warning.
-func TestParseWithCapabilitiesDeclaredUniverseRows(t *testing.T) {
-	doc := []byte(`{
-  "capable": {"capabilities": ["cap-a"], "tools": ["own_tool"]},
-  "undeclared_cap": {"capabilities": ["anything-not-declared"]},
-  "broken": {"capabilities": "not-a-list"},
-  "undeclared_tool": {"tools": ["does_not_exist"]}
-}`)
-	cfg, err := ParseWithCapabilities(doc, []string{"cap-a"}, []string{"own_tool"}, nil)
-	if err != nil {
-		t.Fatalf("ParseWithCapabilities: %v", err)
-	}
-	capable, err := cfg.Resolve("capable")
-	if err != nil {
-		t.Fatalf("Resolve(capable): %v", err)
-	}
-	if want := []string{"cap-a"}; !reflect.DeepEqual(capable.Capabilities, want) {
-		t.Fatalf("capable capabilities = %q, want %q", capable.Capabilities, want)
-	}
-	if want := []string{"own_tool"}; !reflect.DeepEqual(capable.Tools, want) {
-		t.Fatalf("capable tools = %q, want %q", capable.Tools, want)
-	}
-	for _, name := range []string{"undeclared_cap", "broken", "undeclared_tool"} {
-		if _, err := cfg.Resolve(name); err == nil {
-			t.Fatalf("Resolve(%s) succeeded, want dropped", name)
-		}
-	}
-	warnings := cfg.Warnings()
-	if len(warnings) != 3 {
-		t.Fatalf("warnings = %#v, want three invalid_agent_type drops", warnings)
-	}
-	for _, warning := range warnings {
-		if warning.Kind != "invalid_agent_type" {
-			t.Fatalf("warning kind = %q, want invalid_agent_type", warning.Kind)
-		}
 	}
 }
 

@@ -79,7 +79,6 @@ func loadBundledTable() []entry {
 		}
 		seen[key] = true
 		out = append(out, entry{pattern: e.Pattern, adapt: Adaptation{
-			Name:                        e.Name,
 			ExcludeTools:                append([]string(nil), e.ExcludeTools...),
 			IncludeTools:                append([]string(nil), e.IncludeTools...),
 			Additions:                   cloneStringMap(e.Additions),

@@ -624,9 +624,11 @@ func readmePermissionsDocument(t *testing.T) []byte {
 // through the private level parser — no silent built-in fallback — and its
 // git allow, generated-file deny and default-deny rules must decide exactly
 // as written. The built-in policy would answer the deny and default rows the
-// opposite way, so those rows fail on any fallback. The generated-file deny
-// is additionally observed with the example's default cleared, so that row
-// cannot be satisfied by the default alone.
+// opposite way, so those rows fail on any fallback; the non-git command row
+// pins that the allow is scoped to the git target, and the built-in policy
+// would allow that command too. The generated-file deny is additionally
+// observed with the example's default cleared, so that row cannot be
+// satisfied by the default alone.
 func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
 	block := readmePermissionsDocument(t)
 	var doc struct {
@@ -648,6 +650,7 @@ func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
 		want bool
 	}{
 		{"git command allow", PermissionRequest{PermissionCommandRun, "git status"}, true},
+		{"non-git command falls to the example default deny", PermissionRequest{PermissionCommandRun, "echo hello"}, false},
 		{"generated file write deny", PermissionRequest{PermissionFileWrite, "/w/generated/x.go"}, false},
 		{"unmatched read falls to the example default deny", PermissionRequest{PermissionFileRead, "/w/plain.txt"}, false},
 	} {

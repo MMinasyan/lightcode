@@ -1,6 +1,7 @@
 package adaptation
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -9,17 +10,17 @@ import (
 func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 	// gpt-oss* is listed before gpt-* so the more specific family wins on overlap.
 	tbl := []entry{
-		{pattern: "gpt-oss*", adapt: Adaptation{Name: "gpt-oss"}},
-		{pattern: "gpt-*", adapt: Adaptation{Name: "gpt"}},
+		{pattern: "gpt-oss*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt-oss-addition"}}},
+		{pattern: "gpt-*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt-addition"}}},
 	}
 	cases := []struct {
 		id   string
-		want string // adaptation name, "" means nil
+		want string // tone addition marker, "" means nil
 	}{
-		{"gpt-oss-20b", "gpt-oss"},
-		{"gpt-oss-120b", "gpt-oss"}, // first match wins on overlap
-		{"gpt-5.4", "gpt"},
-		{"gpt-5.4-mini", "gpt"},
+		{"gpt-oss-20b", "gpt-oss-addition"},
+		{"gpt-oss-120b", "gpt-oss-addition"}, // first match wins on overlap
+		{"gpt-5.4", "gpt-addition"},
+		{"gpt-5.4-mini", "gpt-addition"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
@@ -27,29 +28,29 @@ func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 			if got == nil {
 				t.Fatalf("matchIn(%q) = nil, want %q", tc.id, tc.want)
 			}
-			if got.Name != tc.want {
-				t.Fatalf("matchIn(%q).Name = %q, want %q", tc.id, got.Name, tc.want)
+			if got.Additions["tone"] != tc.want {
+				t.Fatalf("matchIn(%q).Additions[tone] = %q, want %q", tc.id, got.Additions["tone"], tc.want)
 			}
 		})
 	}
 }
 
 func TestMatchInAbstention(t *testing.T) {
-	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{Name: "gpt"}}}
+	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt-addition"}}}}
 	for _, id := range []string{"claude-opus-4-8", "qwen3.7-plus", "", "gp"} {
 		if got := matchIn(tbl, id); got != nil {
-			t.Fatalf("matchIn(%q) = %q, want nil", id, got.Name)
+			t.Fatalf("matchIn(%q) = %+v, want nil", id, got)
 		}
 	}
 }
 
 func TestMatchInCaseInsensitive(t *testing.T) {
-	tbl := []entry{{pattern: "GPT-OSS*", adapt: Adaptation{Name: "gpt-oss"}}}
+	tbl := []entry{{pattern: "GPT-OSS*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt-oss-addition"}}}}
 	// Both the pattern (upper) and the input (mixed) are folded before matching.
 	for _, id := range []string{"gpt-oss-20b", "GPT-OSS-20B", "Gpt-Oss-20b"} {
 		got := matchIn(tbl, id)
-		if got == nil || got.Name != "gpt-oss" {
-			t.Fatalf("matchIn(%q) = %v, want gpt-oss", id, got)
+		if got == nil || got.Additions["tone"] != "gpt-oss-addition" {
+			t.Fatalf("matchIn(%q) = %+v, want the gpt-oss row", id, got)
 		}
 	}
 }
@@ -57,28 +58,27 @@ func TestMatchInCaseInsensitive(t *testing.T) {
 func TestMatchInSlashContainingBareID(t *testing.T) {
 	// A bare model id can itself contain slashes (coremodel.Parse cuts only the
 	// first '/'), so the wildcard must cross '/'.
-	tbl := []entry{{pattern: "deepseek*", adapt: Adaptation{Name: "deepseek"}}}
+	tbl := []entry{{pattern: "deepseek*", adapt: Adaptation{Additions: map[string]string{"tone": "deepseek-addition"}}}}
 	got := matchIn(tbl, "deepseek/deepseek-chat")
-	if got == nil || got.Name != "deepseek" {
-		t.Fatalf("matchIn(deepseek/deepseek-chat) = %v, want deepseek", got)
+	if got == nil || got.Additions["tone"] != "deepseek-addition" {
+		t.Fatalf("matchIn(deepseek/deepseek-chat) = %+v, want the deepseek row", got)
 	}
 }
 
 func TestMatchInIsAnchoredNotSubstring(t *testing.T) {
 	// The resolver is always fed the bare model id; a provider-prefixed string
 	// must not match a pattern that the bare id matches (documents "feed ref.Model").
-	tbl := []entry{{pattern: "gpt-5*", adapt: Adaptation{Name: "gpt5"}}}
-	if got := matchIn(tbl, "gpt-5.4"); got == nil || got.Name != "gpt5" {
-		t.Fatalf("matchIn(gpt-5.4) = %v, want gpt5", got)
+	tbl := []entry{{pattern: "gpt-5*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt5-addition"}}}}
+	if got := matchIn(tbl, "gpt-5.4"); got == nil || got.Additions["tone"] != "gpt5-addition" {
+		t.Fatalf("matchIn(gpt-5.4) = %+v, want the gpt-5 row", got)
 	}
 	if got := matchIn(tbl, "openai/gpt-5.4"); got != nil {
-		t.Fatalf("matchIn(openai/gpt-5.4) = %q, want nil (anchored, not substring)", got.Name)
+		t.Fatalf("matchIn(openai/gpt-5.4) = %+v, want nil (anchored, not substring)", got)
 	}
 }
 
 func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{
-		Name:                        "gpt",
 		ExcludeTools:                []string{"edit_file"},
 		IncludeTools:                []string{"apply_patch"},
 		Blocks:                      []string{"coach"},
@@ -93,7 +93,6 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 		t.Fatal("matchIn returned a pointer aliasing the table entry")
 	}
 	// Mutating every field of the result must not touch the table entry.
-	got.Name = "mutated"
 	got.ExcludeTools[0] = "mutated"
 	got.IncludeTools[0] = "mutated"
 	got.Blocks[0] = "mutated"
@@ -101,9 +100,6 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	got.Additions["tone"] = "mutated"
 	got.Additions["safety"] = "mutated"
 	got.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] = "mutated"
-	if tbl[0].adapt.Name != "gpt" {
-		t.Fatalf("Name leaked into the table: %q", tbl[0].adapt.Name)
-	}
 	if tbl[0].adapt.ExcludeTools[0] != "edit_file" {
 		t.Fatalf("ExcludeTools leaked into the table: %q", tbl[0].adapt.ExcludeTools[0])
 	}
@@ -131,7 +127,7 @@ func TestSectionAdditionResolution(t *testing.T) {
 		{"nil adapt", nil, "safety", ""},
 		{"active non-empty key", &Adaptation{Additions: map[string]string{"tone": "ACTIVE_TONE"}}, "tone", "ACTIVE_TONE"},
 		{"active key absent", &Adaptation{Additions: map[string]string{"safety": "ACTIVE_SAFETY"}}, "tone", ""},
-		{"nil Additions map", &Adaptation{Name: "empty"}, "tone", ""},
+		{"nil Additions map", &Adaptation{}, "tone", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,8 +202,8 @@ func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
 			if got == nil {
 				t.Fatalf("Match(%q) = nil, want gpt-codex", id)
 			}
-			if got.Name != codex.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, codex.Name)
+			if !reflect.DeepEqual(got.Additions, codex.Additions) {
+				t.Fatalf("Match(%q).Additions = %v, want the %s row additions", id, got.Additions, codex.Name)
 			}
 			if add := SectionAddition(got, "task_execution"); add != want {
 				t.Fatalf("SectionAddition(Match(%q), task_execution) differs from canonical text", id)
@@ -230,8 +226,8 @@ func TestShippedTableMatchesBundledGPTApplyPatchBroad(t *testing.T) {
 			if got == nil {
 				t.Fatalf("Match(%q) = nil, want gpt-apply-patch", id)
 			}
-			if got.Name != ap.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ap.Name)
+			if !reflect.DeepEqual(got.IncludeTools, ap.IncludeTools) {
+				t.Fatalf("Match(%q).IncludeTools = %v, want the %s row include_tools", id, got.IncludeTools, ap.Name)
 			}
 			if !slices.Contains(got.IncludeTools, "apply_patch") {
 				t.Errorf("Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
@@ -252,11 +248,8 @@ func TestShippedTableMatchesBundledGrok(t *testing.T) {
 			if got == nil {
 				t.Fatalf("Match(%q) = nil, want adaptation", id)
 			}
-			if got.Name != ge.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ge.Name)
-			}
-			if add := SectionAddition(got, "task_execution"); add == "" {
-				t.Errorf("Match(%q) should keep the prompt addition", id)
+			if add := SectionAddition(got, "task_execution"); add == "" || add != ge.Additions["task_execution"] {
+				t.Fatalf("Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
 			}
 			if slices.Contains(got.IncludeTools, "apply_patch") {
 				t.Errorf("grok should not include apply_patch (not V4A): %v", got.IncludeTools)
@@ -277,11 +270,8 @@ func TestShippedTableMatchesBundledGoogle(t *testing.T) {
 			if got == nil {
 				t.Fatalf("Match(%q) = nil, want google-task-execution", id)
 			}
-			if got.Name != ge.Name {
-				t.Fatalf("Match(%q).Name = %q, want %q", id, got.Name, ge.Name)
-			}
-			if add := SectionAddition(got, "task_execution"); add == "" {
-				t.Errorf("Match(%q) should keep the Google prompt addition", id)
+			if add := SectionAddition(got, "task_execution"); add == "" || add != ge.Additions["task_execution"] {
+				t.Fatalf("Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
 			}
 		})
 	}
@@ -303,7 +293,7 @@ func TestShippedTableLeavesOtherModelsBaseline(t *testing.T) {
 	} {
 		t.Run(id, func(t *testing.T) {
 			if got := Match(id); got != nil {
-				t.Fatalf("Match(%q) = %q, want nil", id, got.Name)
+				t.Fatalf("Match(%q) = %+v, want nil", id, got)
 			}
 		})
 	}

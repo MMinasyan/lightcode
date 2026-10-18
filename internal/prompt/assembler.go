@@ -79,7 +79,7 @@ type Spec struct {
 // per-session state, so one instance is shared across every unit. Simple/full
 // calls read current global and project rules; none skips rules reads. Every
 // call renders the caller's project root and session start, returning one
-// immutable prompt. Callers compare it with their own last installed prompt.
+// immutable prompt.
 type Service struct {
 	home string
 }
