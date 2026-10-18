@@ -30,7 +30,7 @@ func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N1}
+	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N2}
 	rt.writeQualifiedJSON(w, http.StatusOK, &health)
 }
 

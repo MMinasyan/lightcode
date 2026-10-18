@@ -56,16 +56,16 @@ func TestParseAcceptsEmptySkeleton(t *testing.T) {
 	}
 }
 
-func TestParsePreservesExactProviderOptionNumbers(t *testing.T) {
+func TestParsePreservesExactProviderExtraBodyNumbers(t *testing.T) {
 	cfg, err := Parse([]byte(` 
 {
   "providers": {
     "local": {
       "transport": {
         "base_url": "http://localhost:11434/v1",
-        "api_key_env": "",
-        "options": {"large": 90071992547409931234567890}
-      }
+        "api_key_env": ""
+      },
+      "extra_body": {"large": 90071992547409931234567890}
     }
   }
 }
@@ -75,10 +75,9 @@ func TestParsePreservesExactProviderOptionNumbers(t *testing.T) {
 		t.Fatal(err)
 	}
 	providers := cfg.Providers["local"].(map[string]any)
-	transport := providers["transport"].(map[string]any)
-	options := transport["options"].(map[string]any)
-	if got, ok := options["large"].(json.Number); !ok || got.String() != "90071992547409931234567890" {
-		t.Fatalf("provider option number = %#v (%T), want exact json.Number", options["large"], options["large"])
+	extraBody := providers["extra_body"].(map[string]any)
+	if got, ok := extraBody["large"].(json.Number); !ok || got.String() != "90071992547409931234567890" {
+		t.Fatalf("provider extra_body number = %#v (%T), want exact json.Number", extraBody["large"], extraBody["large"])
 	}
 }
 

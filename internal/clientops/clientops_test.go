@@ -105,7 +105,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -249,8 +249,8 @@ var dispatchCases = []dispatchCase{
 		body: `{"session_id":"0123456789abcdef0123456789abcdef","turn":1}`,
 	},
 	{
-		name: "GetConfiguration with opaque overflow extra_body and options numbers", operation: "GetConfiguration",
-		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","context_window":8192,"extra_body":{"n":9007199254740993},"source":"user"}]}]}`,
+		name: "GetConfiguration with opaque overflow extra_body numbers", operation: "GetConfiguration",
+		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993,"big":1e400},"models":[{"id":"m","context_window":8192,"extra_body":{"n":9007199254740993},"source":"user"}]}]}`,
 		method: "GET", path: "/v1/configuration",
 	},
 	{
@@ -304,17 +304,17 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "UpdateProviderDetail", operation: "UpdateProviderDetail",
-		params: `{"query":{"provider_id":"prov"},"body":{"options":{"k":1}}}`,
+		params: `{"query":{"provider_id":"prov"},"body":{"name":"Edited"}}`,
 		status: 200, response: `{"provider":{"id":"prov"}}`,
 		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
-		body: `{"options":{"k":1}}`,
+		body: `{"name":"Edited"}`,
 	},
 	{
-		name: "UpdateProviderDetail with opaque overflow extra_body and options", operation: "UpdateProviderDetail",
-		params: `{"query":{"provider_id":"prov"},"body":{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
-		status: 200, response: `{"provider":{"id":"prov","extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
+		name: "UpdateProviderDetail with opaque overflow extra_body", operation: "UpdateProviderDetail",
+		params: `{"query":{"provider_id":"prov"},"body":{"extra_body":{"n":9007199254740993,"big":1e400}}}`,
+		status: 200, response: `{"provider":{"id":"prov","extra_body":{"n":9007199254740993,"big":1e400}}}`,
 		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
-		body: `{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}`,
+		body: `{"extra_body":{"n":9007199254740993,"big":1e400}}`,
 	},
 	{
 		name: "DeleteProviderDetail", operation: "DeleteProviderDetail",
@@ -451,7 +451,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		if err != nil {

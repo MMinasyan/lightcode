@@ -160,13 +160,13 @@ func (e ErrorCode) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N1 HealthProtocolVersion = "1"
+	N2 HealthProtocolVersion = "2"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N1:
+	case N2:
 		return true
 	default:
 		return false
@@ -466,9 +466,7 @@ const (
 	ProviderFieldExtraBody           ProviderField = "extra_body"
 	ProviderFieldHeaders             ProviderField = "headers"
 	ProviderFieldHidden              ProviderField = "hidden"
-	ProviderFieldMaxTokensField      ProviderField = "max_tokens_field"
 	ProviderFieldName                ProviderField = "name"
-	ProviderFieldOptions             ProviderField = "options"
 	ProviderFieldProtocolMetadata    ProviderField = "protocol_metadata"
 	ProviderFieldSystemRole          ProviderField = "system_role"
 	ProviderFieldUsageInStream       ProviderField = "usage_in_stream"
@@ -489,11 +487,7 @@ func (e ProviderField) Valid() bool {
 		return true
 	case ProviderFieldHidden:
 		return true
-	case ProviderFieldMaxTokensField:
-		return true
 	case ProviderFieldName:
-		return true
-	case ProviderFieldOptions:
 		return true
 	case ProviderFieldProtocolMetadata:
 		return true
@@ -1290,10 +1284,8 @@ type Provider struct {
 	Hidden           bool                    `json:"hidden"`
 	Id               string                  `json:"id"`
 	KeySource        ProviderKeySource       `json:"key_source"`
-	MaxTokensField   string                  `json:"max_tokens_field"`
 	Models           []ModelView             `json:"models"`
 	Name             string                  `json:"name"`
-	Options          *map[string]interface{} `json:"options,omitempty"`
 	ProtocolMetadata *ProtocolMetadata       `json:"protocol_metadata,omitempty"`
 	SystemRole       SystemRole              `json:"system_role"`
 	UsageInStream    bool                    `json:"usage_in_stream"`
@@ -1317,9 +1309,7 @@ type ProviderEdit struct {
 	ExtraBody        *map[string]interface{} `json:"extra_body,omitempty"`
 	Headers          *map[string]string      `json:"headers,omitempty"`
 	Hidden           *bool                   `json:"hidden,omitempty"`
-	MaxTokensField   *string                 `json:"max_tokens_field,omitempty"`
 	Name             *string                 `json:"name,omitempty"`
-	Options          *map[string]interface{} `json:"options,omitempty"`
 	ProtocolMetadata *ProtocolMetadata       `json:"protocol_metadata,omitempty"`
 	SystemRole       *SystemRole             `json:"system_role,omitempty"`
 	UsageInStream    *bool                   `json:"usage_in_stream,omitempty"`

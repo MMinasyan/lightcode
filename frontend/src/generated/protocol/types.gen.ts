@@ -46,7 +46,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '1';
+    protocol_version: '2';
 };
 
 /**
@@ -505,7 +505,7 @@ export type ProtocolMetadata = {
  * The one provider field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer provider member.
  *
  */
-export type ProviderField = 'name' | 'base_url' | 'api_key_env' | 'headers' | 'options' | 'system_role' | 'usage_in_stream' | 'max_tokens_field' | 'extra_body' | 'discovery' | 'protocol_metadata' | 'hidden';
+export type ProviderField = 'name' | 'base_url' | 'api_key_env' | 'headers' | 'system_role' | 'usage_in_stream' | 'extra_body' | 'discovery' | 'protocol_metadata' | 'hidden';
 
 /**
  * The one model field vocabulary shared by the edit patch members and the field-reset path: every editable user-layer model member.
@@ -520,12 +520,8 @@ export type ProviderEdit = {
     headers?: {
         [key: string]: string;
     };
-    options?: {
-        [key: string]: unknown;
-    };
     system_role?: SystemRole;
     usage_in_stream?: boolean;
-    max_tokens_field?: string;
     extra_body?: {
         [key: string]: unknown;
     };
@@ -583,12 +579,8 @@ export type Provider = {
     user_headers: {
         [key: string]: string;
     };
-    options?: {
-        [key: string]: unknown;
-    };
     system_role: SystemRole;
     usage_in_stream: boolean;
-    max_tokens_field: string;
     extra_body?: {
         [key: string]: unknown;
     };

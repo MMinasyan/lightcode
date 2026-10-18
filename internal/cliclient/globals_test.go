@@ -201,7 +201,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/health" {
 					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N1})
+					_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N2})
 					return
 				}
 				if r.URL.Path == "/v1/events" {
@@ -223,7 +223,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			}))
 			defer server.Close()
 			dir := t.TempDir()
-			raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": owner, "protocol_version": string(protocol.N1), "credential": strings.Repeat("1", 64)})
+			raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": owner, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
 			if err := os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -287,14 +287,14 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 }
 
 // opaqueOverflowConfiguration is one valid configuration document whose
-// unused opaque extra_body and options members carry the overflow numeric
-// lexemes as exact bytes, plus its malformed-delivery sibling body.
+// unused opaque extra_body members carry the overflow numeric lexemes as
+// exact bytes, plus its malformed-delivery sibling body.
 const opaqueOverflowConfiguration = `{"configuration_revision":{"instance_id":"` + instance + `","generation":"2"},` +
 	`"settings":{"plugins":{}},"agents":[{"name":"primary","description":"primary agent"},{"name":"planner","description":"planning agent"}],` +
 	`"providers":[{"id":"prov","name":"Prov","connected":true,` +
-	`"extra_body":{"n":9007199254740993},"options":{"big":1e400},` +
+	`"extra_body":{"n":9007199254740993,"big":1e400},` +
 	`"models":[{"id":"m","name":"M","context_window":4096,"source":"user",` +
-	`"extra_body":{"n":9007199254740993},"options":{"big":1e400}}]}]}`
+	`"extra_body":{"n":9007199254740993,"big":1e400}}]}]}`
 
 // TestGlobalsAndAgentMenuOpaqueOverflowConfiguration drives the two
 // configuration consumers over the shared call decoder: the global read

@@ -54,7 +54,7 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 	f := &fixture{handlers: map[string]http.HandlerFunc{}, eventsOpen: make(chan struct{}, 16)}
 	f.handlers["/v1/health"] = func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
 	}
 	f.handlers["/v1/events"] = f.idleEvents
 	// Startup composition defaults: an empty open-root list and one created
@@ -267,7 +267,7 @@ func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
 func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Writer) *bridge {
 	t.Helper()
 	dataDir := t.TempDir()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"1","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"2","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
 	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600); err != nil {
 		t.Fatalf("write discovery record: %v", err)
@@ -500,7 +500,7 @@ func sseFrame(document string) string {
 }
 
 func healthBody() string {
-	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"2"}`, testInstance)
 }
 
 func hydrationBody(sessionID, workspace string) string {
@@ -1026,7 +1026,7 @@ func TestACPEventsAndRepair(t *testing.T) {
 	if err := json.Unmarshal(connected["params"], &health); err != nil {
 		t.Fatalf("runtime/connected params: %v", err)
 	}
-	if health["instance_id"] != testInstance || health["protocol_version"] != "1" {
+	if health["instance_id"] != testInstance || health["protocol_version"] != "2" {
 		t.Fatalf("runtime/connected params = %v, want the generated Health", health)
 	}
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))

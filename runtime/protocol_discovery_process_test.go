@@ -97,7 +97,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 
 		record := readDiscoveryRecord(t, recordPath)
 		health := healthSnapshot(t, record)
-		if health.InstanceId != record.InstanceId || health.ProtocolVersion != protocol.N1 {
+		if health.InstanceId != record.InstanceId || health.ProtocolVersion != protocol.N2 {
 			t.Fatalf("authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
 		}
 
@@ -163,7 +163,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		record := readDiscoveryRecord(t, recordPath)
 		before := readDiscoveryBytes(t, recordPath)
 		first := healthSnapshot(t, record)
-		if first.InstanceId != record.InstanceId || first.ProtocolVersion == "" || first.ProtocolVersion == protocol.N1 {
+		if first.InstanceId != record.InstanceId || first.ProtocolVersion == "" || first.ProtocolVersion == protocol.N2 {
 			t.Fatalf("incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
 		}
 
@@ -295,14 +295,14 @@ func runDiscoveryChild(t *testing.T, dataDir string) {
 		}
 		fmt.Println("published")
 		if mode == discoveryModeIncompatible {
-			ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "2")
+			ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "1")
 			fmt.Println("incompatible")
 		}
 	case discoveryModeHold:
 		// Ownership and the live listener only: the incumbent deliberately
 		// publishes nothing, leaving any existing record untouched.
 	case discoveryModeUnready:
-		ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "2")
+		ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "1")
 		if err := ps.PublishDiscovery(recordPath); err == nil {
 			t.Fatal("publication succeeded while authenticated health reported an incompatible version")
 		}
@@ -413,8 +413,8 @@ func readDiscoveryRecord(t *testing.T, path string) discoveryRecord {
 	if err := decodeOneDocument(data, &record); err != nil {
 		t.Fatalf("decode discovery record at %s: %v", path, err)
 	}
-	if record.ProtocolVersion != string(protocol.N1) {
-		t.Fatalf("discovery record protocol version = %q, want %q", record.ProtocolVersion, protocol.N1)
+	if record.ProtocolVersion != string(protocol.N2) {
+		t.Fatalf("discovery record protocol version = %q, want %q", record.ProtocolVersion, protocol.N2)
 	}
 	if len(record.InstanceId) != 32 || strings.Trim(record.InstanceId, "0123456789abcdef") != "" {
 		t.Fatalf("discovery instance %q is not 32 lowercase hex", record.InstanceId)

@@ -94,7 +94,7 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 	}))
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
-	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N1), "credential": strings.Repeat("1", 64)})
+	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
 	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}

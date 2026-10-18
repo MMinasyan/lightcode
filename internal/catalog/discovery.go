@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
-	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,13 +50,13 @@ type DiscoveryRecord struct {
 	Models               map[string]DiscoveredModel
 }
 
-// BoundTo reports whether the record belongs to the configured transport.
+// BoundTo reports whether the record belongs to the configured transport. A
+// record whose persisted fingerprint is empty is unbound.
 func (r DiscoveryRecord) BoundTo(transport Transport) bool {
 	if r.TransportFingerprint == "" {
 		return false
 	}
-	fingerprint := transportFingerprint(transport)
-	return fingerprint != "" && r.TransportFingerprint == fingerprint
+	return r.TransportFingerprint == transportFingerprint(transport)
 }
 
 // SameTransport reports whether two configured transports have the same
@@ -66,26 +64,13 @@ func (r DiscoveryRecord) BoundTo(transport Transport) bool {
 // provisional authorization header is excluded because callers pass the
 // captured configured transport, not the provisional fetch copy.
 func SameTransport(a, b Transport) bool {
-	aFingerprint := transportFingerprint(a)
-	bFingerprint := transportFingerprint(b)
-	return aFingerprint != "" && aFingerprint == bFingerprint
+	return transportFingerprint(a) == transportFingerprint(b)
 }
 
 // transportFingerprint returns the lowercase SHA-256 identity of a configured
-// transport. An empty result means the options could not be represented as
-// canonical JSON and is never a valid persisted fingerprint.
+// transport: its base URL, credential binding and configured headers — the
+// effective discovery inputs. Every configured transport yields one hash.
 func transportFingerprint(transport Transport) string {
-	options, err := canonicalJSONValue(transport.Options)
-	if err != nil {
-		return ""
-	}
-	if options == nil {
-		options = map[string]any{}
-	}
-	canonicalOptions, err := json.Marshal(options)
-	if err != nil {
-		return ""
-	}
 	headers := map[string]string{}
 	for name, value := range transport.Headers {
 		digest := sha256.Sum256([]byte(value))
@@ -95,125 +80,14 @@ func transportFingerprint(transport Transport) string {
 		BaseURL   string            `json:"base_url"`
 		APIKeyEnv string            `json:"api_key_env"`
 		Headers   map[string]string `json:"headers"`
-		Options   json.RawMessage   `json:"options"`
 	}{
 		BaseURL:   transport.BaseURL,
 		APIKeyEnv: transport.APIKeyEnv,
 		Headers:   headers,
-		Options:   canonicalOptions,
 	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return ""
-	}
+	data, _ := json.Marshal(payload)
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
-}
-
-// canonicalJSONValue normalizes JSON-shaped option values without converting
-// numbers through float64. encoding/json sorts object keys while preserving
-// array order, so the returned value can be serialized deterministically.
-func canonicalJSONValue(value any) (any, error) {
-	switch typed := value.(type) {
-	case nil:
-		return nil, nil
-	case string, bool:
-		return typed, nil
-	case json.Number:
-		return canonicalNumber(string(typed))
-	case float64:
-		if math.IsNaN(typed) || math.IsInf(typed, 0) {
-			return nil, fmt.Errorf("non-finite option number")
-		}
-		return canonicalNumber(strconv.FormatFloat(typed, 'g', -1, 64))
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, item := range typed {
-			canonical, err := canonicalJSONValue(item)
-			if err != nil {
-				return nil, err
-			}
-			out[key] = canonical
-		}
-		return out, nil
-	case []any:
-		out := make([]any, len(typed))
-		for i, item := range typed {
-			canonical, err := canonicalJSONValue(item)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = canonical
-		}
-		return out, nil
-	default:
-		return nil, fmt.Errorf("unsupported option type %T", value)
-	}
-}
-
-func canonicalNumber(value string) (json.Number, error) {
-	normalized, err := normalizeDecimal(value)
-	if err != nil {
-		return "", err
-	}
-	return json.Number(normalized), nil
-}
-
-func normalizeDecimal(value string) (string, error) {
-	if !json.Valid([]byte(value)) {
-		return "", fmt.Errorf("invalid option number %q", value)
-	}
-	start := 0
-	negative := false
-	if value[0] == '-' {
-		negative = true
-		start++
-	}
-	mantissa := value[start:]
-	exponent := new(big.Int)
-	if index := strings.IndexAny(mantissa, "eE"); index >= 0 {
-		exponentText := mantissa[index+1:]
-		if strings.HasPrefix(exponentText, "+") {
-			exponentText = exponentText[1:]
-		}
-		if _, ok := exponent.SetString(exponentText, 10); !ok {
-			return "", fmt.Errorf("invalid option number %q", value)
-		}
-		mantissa = mantissa[:index]
-	}
-	parts := strings.Split(mantissa, ".")
-	if len(parts) > 2 || parts[0] == "" || (len(parts) == 2 && parts[1] == "") {
-		return "", fmt.Errorf("invalid option number %q", value)
-	}
-	digits := parts[0]
-	if len(parts) == 2 {
-		digits += parts[1]
-	}
-	for _, digit := range digits {
-		if digit < '0' || digit > '9' {
-			return "", fmt.Errorf("invalid option number %q", value)
-		}
-	}
-	scale := new(big.Int).Set(exponent)
-	if len(parts) == 2 {
-		scale.Sub(scale, big.NewInt(int64(len(parts[1]))))
-	}
-	digits = strings.TrimLeft(digits, "0")
-	if digits == "" {
-		return "0", nil
-	}
-	for strings.HasSuffix(digits, "0") {
-		digits = strings.TrimSuffix(digits, "0")
-		scale.Add(scale, big.NewInt(1))
-	}
-	sign := ""
-	if negative {
-		sign = "-"
-	}
-	if scale.Sign() == 0 {
-		return sign + digits, nil
-	}
-	return sign + digits + "e" + scale.String(), nil
 }
 
 type discoveryCacheModel struct {
@@ -649,16 +523,12 @@ func WriteDiscoveryAttempt(home, providerID string, transport Transport, attempt
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
-	fingerprint := transportFingerprint(transport)
-	if fingerprint == "" {
-		return fmt.Errorf("compute discovery transport fingerprint")
-	}
 	if attemptedAt.IsZero() {
 		attemptedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return withDiscoveryLock(home, providerID, func() error {
-		return writeDiscoveryAttemptPayload(path, fingerprint, attemptedAt)
+		return writeDiscoveryAttemptPayload(path, transportFingerprint(transport), attemptedAt)
 	})
 }
 
@@ -672,17 +542,13 @@ func TryWriteDiscoveryAttempt(home, providerID string, transport Transport, atte
 	if !safeProviderID(providerID) {
 		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
-	fingerprint := transportFingerprint(transport)
-	if fingerprint == "" {
-		return false, fmt.Errorf("compute discovery transport fingerprint")
-	}
 	if attemptedAt.IsZero() {
 		attemptedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
 		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
-		return writeDiscoveryAttemptPayload(path, fingerprint, attemptedAt)
+		return writeDiscoveryAttemptPayload(path, transportFingerprint(transport), attemptedAt)
 	})
 }
 
@@ -721,16 +587,12 @@ func WriteDiscoveryCache(home, providerID string, transport Transport, discovere
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
-	fingerprint := transportFingerprint(transport)
-	if fingerprint == "" {
-		return fmt.Errorf("compute discovery transport fingerprint")
-	}
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return withDiscoveryLock(home, providerID, func() error {
-		return writeDiscoveryCachePayload(path, fingerprint, discovered, fetchedAt)
+		return writeDiscoveryCachePayload(path, transportFingerprint(transport), discovered, fetchedAt)
 	})
 }
 
@@ -744,17 +606,13 @@ func TryWriteDiscoveryCache(home, providerID string, transport Transport, discov
 	if !safeProviderID(providerID) {
 		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
-	fingerprint := transportFingerprint(transport)
-	if fingerprint == "" {
-		return false, fmt.Errorf("compute discovery transport fingerprint")
-	}
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
 	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
 		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
-		return writeDiscoveryCachePayload(path, fingerprint, discovered, fetchedAt)
+		return writeDiscoveryCachePayload(path, transportFingerprint(transport), discovered, fetchedAt)
 	})
 }
 

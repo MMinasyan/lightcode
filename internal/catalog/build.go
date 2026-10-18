@@ -220,9 +220,6 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	if _, ok := raw["usage_in_stream"]; !ok {
 		raw["usage_in_stream"] = true
 	}
-	if _, ok := raw["max_tokens_field"]; !ok {
-		raw["max_tokens_field"] = "max_tokens"
-	}
 	if _, ok := raw["discovery"]; !ok {
 		raw["discovery"] = true
 	}
@@ -236,9 +233,6 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	if ok {
 		if _, ok := transport["headers"]; !ok {
 			transport["headers"] = map[string]any{}
-		}
-		if _, ok := transport["options"]; !ok {
-			transport["options"] = map[string]any{}
 		}
 	}
 	modelsVal, exists := raw["models"]
@@ -402,7 +396,6 @@ func rawToProvider(providerID string, raw map[string]any, bundledProvider bool) 
 		Transport:        rawToTransport(transportRaw),
 		SystemRole:       SystemRole(stringValue(raw["system_role"], string(RoleSystem))),
 		UsageInStream:    boolValue(raw["usage_in_stream"], true),
-		MaxTokensField:   stringValue(raw["max_tokens_field"], "max_tokens"),
 		ExtraBody:        anyMapValue(raw["extra_body"]),
 		Discovery:        boolValue(raw["discovery"], true),
 		Hidden:           boolValue(raw["hidden"], false),
@@ -436,7 +429,6 @@ func rawToTransport(raw map[string]any) Transport {
 		BaseURL:   stringValue(raw["base_url"], ""),
 		APIKeyEnv: stringValue(raw["api_key_env"], ""),
 		Headers:   stringMapValue(raw["headers"]),
-		Options:   anyMapValue(raw["options"]),
 	}
 }
 

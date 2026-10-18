@@ -203,8 +203,8 @@ func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
 		wantEnum  []string
 	}{
 		{"/v1/providers/fields/{field}", "ProviderField", []string{
-			"name", "base_url", "api_key_env", "headers", "options", "system_role",
-			"usage_in_stream", "max_tokens_field", "extra_body", "discovery", "protocol_metadata", "hidden",
+			"name", "base_url", "api_key_env", "headers", "system_role",
+			"usage_in_stream", "extra_body", "discovery", "protocol_metadata", "hidden",
 		}},
 		{"/v1/providers/models/fields/{field}", "ModelField", []string{
 			"name", "context_window", "max_output_tokens", "input_modalities", "system_role",

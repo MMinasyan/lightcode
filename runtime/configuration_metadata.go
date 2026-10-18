@@ -187,7 +187,7 @@ func modelIdentityPresent(eff *catalog.Provider, rawModels map[string]any, model
 	return present
 }
 
-// writeProviderEditMembers writes the eight non-transport ProviderEdit
+// writeProviderEditMembers writes the seven non-transport ProviderEdit
 // members onto a raw provider map: every provided member replaces its whole
 // value exactly as supplied, zeros, falses, and whitespace included — the
 // pointer presence is the patch, and the catalog validators decide
@@ -202,9 +202,6 @@ func writeProviderEditMembers(pm map[string]any, patch protocol.ProviderEdit) {
 	}
 	if patch.UsageInStream != nil {
 		pm["usage_in_stream"] = *patch.UsageInStream
-	}
-	if patch.MaxTokensField != nil {
-		pm["max_tokens_field"] = *patch.MaxTokensField
 	}
 	if patch.ExtraBody != nil {
 		pm["extra_body"] = *patch.ExtraBody
@@ -407,9 +404,6 @@ func providerTransportRaw(patch protocol.ProviderEdit, baseURL string, headers m
 	if patch.Headers != nil {
 		writeTransportHeaders(transport, headers)
 	}
-	if patch.Options != nil {
-		transport["options"] = *patch.Options
-	}
 	return transport
 }
 
@@ -460,9 +454,6 @@ func (s *configurationService) editProviderUpdate(providerID string, patch proto
 			if patch.ApiKeyEnv != nil {
 				transport["api_key_env"] = env
 			}
-			if patch.Options != nil {
-				transport["options"] = *patch.Options
-			}
 			if patch.Headers != nil {
 				writeTransportHeaders(transport, headers)
 			}
@@ -509,7 +500,6 @@ var providerResetTransport = map[protocol.ProviderField]bool{
 	protocol.ProviderFieldBaseUrl:             true,
 	protocol.ProviderFieldEnvironmentVariable: true,
 	protocol.ProviderFieldHeaders:             true,
-	protocol.ProviderFieldOptions:             true,
 }
 
 // editProviderFieldReset builds the provider-field reset edit: the shared

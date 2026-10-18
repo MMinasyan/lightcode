@@ -109,7 +109,7 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
-	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N1), "credential": strings.Repeat("1", 64)})
+	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
 	path := filepath.Join(dir, "runtime.json")
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
@@ -122,7 +122,7 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 }
 func health(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: instance, ProtocolVersion: protocol.N1})
+	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: instance, ProtocolVersion: protocol.N2})
 }
 
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {

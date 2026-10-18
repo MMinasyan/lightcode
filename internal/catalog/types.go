@@ -45,7 +45,6 @@ type Transport struct {
 	BaseURL   string            `json:"base_url"`
 	APIKeyEnv string            `json:"api_key_env"`
 	Headers   map[string]string `json:"headers,omitempty"`
-	Options   map[string]any    `json:"options,omitempty"`
 }
 
 // Cost is per-million-token USD pricing.
@@ -89,7 +88,6 @@ type Provider struct {
 	Transport        Transport         `json:"transport"`
 	SystemRole       SystemRole        `json:"system_role"`
 	UsageInStream    bool              `json:"usage_in_stream"`
-	MaxTokensField   string            `json:"max_tokens_field"`
 	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
 	Discovery        bool              `json:"discovery"`
 	Hidden           bool              `json:"hidden,omitempty"`

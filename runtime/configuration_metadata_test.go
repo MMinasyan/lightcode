@@ -74,7 +74,7 @@ func metadataBundledFS() fstest.MapFS {
 const metadataConfigDocument = `{
   "providers": {
     "prov": {
-      "transport": {"base_url": "https://prov.test/v1", "api_key_env": "META_TEST_KEY", "headers": {"X-Trace": "t1"}, "options": {"retries": 3}},
+      "transport": {"base_url": "https://prov.test/v1", "api_key_env": "META_TEST_KEY", "headers": {"X-Trace": "t1"}},
       "discovery": false,
       "extra_body": {"side": 1, "big": 9007199254740993},
       "models": {
@@ -226,10 +226,8 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		BaseUrl:          &[]string{"https://new.test/v1"}[0],
 		ApiKeyEnv:        &[]string{"NEW_KEY"}[0],
 		Headers:          &map[string]string{"X-Custom": "c"},
-		Options:          &map[string]any{"retries": 2},
 		SystemRole:       &[]protocol.SystemRole{"user"}[0],
 		UsageInStream:    &[]bool{false}[0],
-		MaxTokensField:   &[]string{"max_completion_tokens"}[0],
 		ExtraBody:        &map[string]any{"side": json.Number("9007199254740993")},
 		Discovery:        &[]bool{false}[0],
 		ProtocolMetadata: &meta,
@@ -247,7 +245,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	}
 	if prov.Transport.BaseURL != "https://new.test/v1" || prov.Transport.APIKeyEnv != "NEW_KEY" ||
 		prov.Name != "Created" || prov.SystemRole != catalog.SystemRole("user") ||
-		prov.UsageInStream || prov.MaxTokensField != "max_completion_tokens" || prov.Discovery {
+		prov.UsageInStream || prov.Discovery {
 		t.Fatalf("created provider = %+v, want the provided members", prov)
 	}
 	if usableModelCount(prov) != 2 {
@@ -502,10 +500,8 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 	var prov struct {
 		Transport struct {
 			Headers map[string]string `json:"headers"`
-			Options map[string]any    `json:"options"`
 		} `json:"transport"`
-		ExtraBody      *map[string]any `json:"extra_body"`
-		MaxTokensField *string         `json:"max_tokens_field"`
+		ExtraBody *map[string]any `json:"extra_body"`
 	}
 	var providersRoot map[string]json.RawMessage
 	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &providersRoot); err != nil {
@@ -519,14 +515,6 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 	}
 	if prov.Transport.Headers["X-Trace"] != "t1" {
 		t.Fatalf("headers = %v, want the absent member untouched", prov.Transport.Headers)
-	}
-
-	// The provided empty max_tokens_field is refused by the raw validator —
-	// the wholesale value replaces the member and the catalog validation
-	// decides.
-	emptyString := ""
-	if _, err = svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{MaxTokensField: &emptyString})); err == nil || !errors.Is(err, ErrConfiguration) {
-		t.Fatalf("empty max_tokens_field = %v, want a rejected candidate", err)
 	}
 
 	// The headers exception: an empty provided object deletes the raw user
@@ -697,19 +685,9 @@ func TestMetadataEditUpdateBuiltinProvider(t *testing.T) {
 				t.Fatal("builtin usage_in_stream = true, want the override")
 			}
 		}},
-		{"max_tokens_field", protocol.ProviderEdit{MaxTokensField: &[]string{"max_completion_tokens"}[0]}, func(p *catalog.Provider) {
-			if p.MaxTokensField != "max_completion_tokens" {
-				t.Fatalf("builtin max_tokens_field = %q, want the override", p.MaxTokensField)
-			}
-		}},
 		{"protocol_metadata", protocol.ProviderEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(p *catalog.Provider) {
 			if p.ProtocolMetadata == nil || p.ProtocolMetadata.Family != "fam" {
 				t.Fatalf("builtin protocol_metadata = %+v, want the override", p.ProtocolMetadata)
-			}
-		}},
-		{"options", protocol.ProviderEdit{Options: &map[string]any{"retries": 1}}, func(p *catalog.Provider) {
-			if p.Transport.Options == nil || p.Transport.Options["retries"] != json.Number("1") {
-				t.Fatalf("builtin options = %v, want the override", p.Transport.Options)
 			}
 		}},
 	} {
@@ -911,11 +889,10 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	role := protocol.SystemRole("developer")
 	meta := protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}
 	discovery := false
-	mtf := "max_completion_tokens"
 	hidden := true
 	if _, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{
 		Name: &name, ExtraBody: &extra, SystemRole: &role, UsageInStream: &stream,
-		ProtocolMetadata: &meta, Discovery: &discovery, MaxTokensField: &mtf, Hidden: &hidden,
+		ProtocolMetadata: &meta, Discovery: &discovery, Hidden: &hidden,
 	})); err != nil {
 		t.Fatalf("override seed: %v", err)
 	}
@@ -930,7 +907,6 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 		protocol.ProviderFieldUsageInStream,
 		protocol.ProviderFieldProtocolMetadata,
 		protocol.ProviderFieldDiscovery,
-		protocol.ProviderFieldMaxTokensField,
 		protocol.ProviderFieldHidden,
 	} {
 		candidate, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field))
@@ -956,7 +932,6 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	// Transport resets remove exactly their own transport member.
 	for _, field := range []protocol.ProviderField{
 		protocol.ProviderFieldHeaders,
-		protocol.ProviderFieldOptions,
 	} {
 		if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field)); err != nil {
 			t.Fatalf("reset %q: %v", field, err)
@@ -1069,11 +1044,6 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	bundled := svc.current().catalog.Providers["bstatic"].Transport.Headers
 	if bundled["HTTP-Referer"] == "" || bundled["X-Title"] == "" || len(bundled) != 2 {
 		t.Fatalf("builtin reset headers = %v, want the bundled attribution headers restored", bundled)
-	}
-	generation++
-	drainMutationEvent(t, sub, strconv.Itoa(generation))
-	if _, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldOptions)); err != nil {
-		t.Fatalf("builtin absent-override reset: %v", err)
 	}
 	generation++
 	drainMutationEvent(t, sub, strconv.Itoa(generation))
@@ -1292,7 +1262,7 @@ func TestMetadataEditModelDelete(t *testing.T) {
 	// editor (without a reload) still publishes: the identity is effective,
 	// no user node remains, and the post-state carries no subject. The
 	// external write removes only "m" from the raw layer.
-	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY","headers":{"X-Trace":"t1"},"options":{"retries":3}},"discovery":false,"extra_body":{"side":1,"big":9007199254740993},"models":{"wide":{"context_window":8192}}},"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
+	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY","headers":{"X-Trace":"t1"}},"discovery":false,"extra_body":{"side":1,"big":9007199254740993},"models":{"wide":{"context_window":8192}}},"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
 	candidate, err = svc.mutate(context.Background(), svc.editModelDelete("prov", "m"))
 	if err != nil || candidate.snapshot.generation != 5 {
@@ -2504,11 +2474,11 @@ func TestMetadataEditFieldValuesExactAndFileAPIEquivalent(t *testing.T) {
 
 // TestMetadataEditPaddedInvalidValuesNeverBecomeValid pins the uniform
 // candidate governance for invalid padded values: the selected validators,
-// not the writers, decide them — an api_key_env, max_tokens_field, or
-// system_role carrying padding refuses the edit with the owning file
-// untouched, and the identical file-written member makes the provider
-// invalid in the published catalog (dropped with a warning) so the padded
-// value never becomes effective through either path.
+// not the writers, decide them — an api_key_env or system_role carrying
+// padding refuses the edit with the owning file untouched, and the identical
+// file-written member makes the provider invalid in the published catalog
+// (dropped with a warning) so the padded value never becomes effective
+// through either path.
 func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 	refusals := []struct {
 		name     string
@@ -2520,10 +2490,6 @@ func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 			func(doc string) string {
 				return strings.Replace(doc, `"api_key_env": "META_TEST_KEY"`, `"api_key_env": "  NEW_TEST_KEY  "`, 1)
 			}, `"api_key_env": "  NEW_TEST_KEY  "`},
-		{"padded max_tokens_field", protocol.ProviderEdit{MaxTokensField: &[]string{"  max_completion_tokens  "}[0]},
-			func(doc string) string {
-				return strings.Replace(doc, `"prov": {`, `"prov": {"max_tokens_field": "  max_completion_tokens  ",`, 1)
-			}, `"max_tokens_field": "  max_completion_tokens  "`},
 		{"padded system_role", protocol.ProviderEdit{SystemRole: &[]protocol.SystemRole{"  developer  "}[0]},
 			func(doc string) string {
 				return strings.Replace(doc, `"prov": {`, `"prov": {"system_role": "  developer  ",`, 1)
@@ -2557,6 +2523,45 @@ func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 			}
 			if data, rerr := os.ReadFile(h.configPath); rerr != nil || !strings.Contains(string(data), row.rawProbe) {
 				t.Fatalf("the raw file = (%q, %v), want the padded value retained", data, rerr)
+			}
+		})
+	}
+}
+
+// TestMetadataEditRetiredProviderControlsFollowUnknownFieldPolicy pins the
+// retired controls' shared unknown-field policy through the file path: a
+// user definition carrying max_tokens_field or transport.options is an
+// ordinary invalid provider, so the publication drops it under the shared
+// user_config_skip warning while the raw member stays in the file untouched.
+func TestMetadataEditRetiredProviderControlsFollowUnknownFieldPolicy(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		fileDoc  func(doc string) string
+		rawProbe string
+	}{
+		{"retired max_tokens_field", func(doc string) string {
+			return strings.Replace(doc, `"prov": {`, `"prov": {"max_tokens_field": "max_completion_tokens",`, 1)
+		}, `"max_tokens_field": "max_completion_tokens"`},
+		{"retired transport options", func(doc string) string {
+			return strings.Replace(doc, `"headers": {"X-Trace": "t1"}`, `"headers": {"X-Trace": "t1"}, "options": {"retries": 3}`, 1)
+		}, `"options": {"retries": 3}`},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h, svc, _ := newOverlayFixture(t)
+			writeServiceFile(t, h.configPath, row.fileDoc(metadataConfigDocument))
+			viaFile, err := svc.publish(context.Background())
+			if err != nil {
+				t.Fatalf("file-side publish of the retired member: %v", err)
+			}
+			if viaFile.snapshot.catalog.Providers["prov"] != nil {
+				t.Fatalf("the %s became effective through the file path", row.name)
+			}
+			warnings := viaFile.snapshot.catalogWarnings
+			if len(warnings) == 0 || warnings[0].Kind != "user_config_skip" || warnings[0].Provider != "prov" {
+				t.Fatalf("catalog warnings = %#v, want the shared user_config_skip drop", warnings)
+			}
+			if data, rerr := os.ReadFile(h.configPath); rerr != nil || !strings.Contains(string(data), row.rawProbe) {
+				t.Fatalf("the raw file = (%q, %v), want the retired member retained", data, rerr)
 			}
 		})
 	}
@@ -2713,16 +2718,19 @@ func TestMetadataEditProviderTargetUsesSharedRawObjectAccess(t *testing.T) {
 
 // TestMetadataEditInvalidResetFields pins the closed reset enums: a field
 // outside the shared vocabulary refuses invalid before any write, for the
-// provider and the model reset paths alike.
+// provider and the model reset paths alike — the retired provider field
+// literals included.
 func TestMetadataEditInvalidResetFields(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
 	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
-	_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", protocol.ProviderField("bogus")))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
-	_, err = svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ModelField("bogus")))
+	for _, field := range []protocol.ProviderField{"bogus", "options", "max_tokens_field"} {
+		_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("prov", field))
+		assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
+	}
+	_, err := svc.mutate(context.Background(), svc.editModelFieldReset("prov", "m", protocol.ModelField("bogus")))
 	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, harness.ErrInvalid)
 }
 

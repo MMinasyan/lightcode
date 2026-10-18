@@ -128,8 +128,8 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		if health.ProtocolVersion != protocol.N1 {
-			t.Fatalf("versioned health protocol = %q, want %q", health.ProtocolVersion, protocol.N1)
+		if health.ProtocolVersion != protocol.N2 {
+			t.Fatalf("versioned health protocol = %q, want %q", health.ProtocolVersion, protocol.N2)
 		}
 	})
 }
@@ -300,6 +300,44 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		}
 		if _, err := r.getProvider(ctx, "newp"); !errors.Is(err, catalog.ErrUnknownProvider) {
 			t.Fatalf("rejected creation wrote a provider: %v", err)
+		}
+
+		// The retired provider controls follow the shared strict boundary:
+		// the edit body's removed max_tokens_field and options members and
+		// the reset path's removed options enum are refused before any
+		// mutation, leaving the addressed provider and its revision
+		// untouched.
+		beforeRetired, err := r.getProvider(ctx, "validmods")
+		if err != nil {
+			t.Fatalf("read provider before the retired-control rows: %v", err)
+		}
+		retiredEdit := func(name, body string) {
+			t.Helper()
+			response := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/providers/detail?provider_id=validmods"), ps.credential, body)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
+			}
+			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
+				t.Fatalf("%s error = %+v, want invalid", name, typed)
+			}
+		}
+		retiredEdit("retired edit max_tokens_field", `{"provider":{"max_tokens_field":"max_completion_tokens"}}`)
+		retiredEdit("retired edit options", `{"provider":{"options":{"retries":3}}}`)
+		retiredReset := rawProtocol(t, http.MethodDelete, protocolTarget(ps, "/v1/providers/fields/options?provider_id=validmods"), ps.credential, "")
+		defer retiredReset.Body.Close()
+		if retiredReset.StatusCode != http.StatusBadRequest {
+			t.Fatalf("retired reset options = %d, want the typed invalid rejection 400", retiredReset.StatusCode)
+		}
+		if typed := decodeProtocolError(t, retiredReset); typed.Code != protocol.Invalid {
+			t.Fatalf("retired reset options error = %+v, want invalid", typed)
+		}
+		afterRetired, err := r.getProvider(ctx, "validmods")
+		if err != nil {
+			t.Fatalf("read provider after the retired-control rows: %v", err)
+		}
+		if !reflect.DeepEqual(beforeRetired, afterRetired) {
+			t.Fatalf("a retired-control refusal changed the provider:\nbefore %+v\nafter  %+v", beforeRetired, afterRetired)
 		}
 
 		// A null header value inside a declared typed map is not an opaque

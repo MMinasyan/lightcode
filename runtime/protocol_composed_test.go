@@ -536,10 +536,11 @@ func TestProtocolComposedFlow(t *testing.T) {
 		defer func() { _ = r.Close(ctx) }()
 
 		// The unauthorized-transport sibling: a strict record carrying a
-		// wrong credential for this live endpoint is no usable owner.
+		// compatible wire version and a wrong credential for this live
+		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"1","credential":%q}`, ps.Endpoint(), c.InstanceID(), wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N2, wrongCredential))
 		if _, err := client.Connect(ctx, foreign); !errors.Is(err, client.ErrNoRuntime) {
 			t.Fatalf("wrong-credential connect = %v, want ErrNoRuntime", err)
 		}

@@ -113,12 +113,8 @@ func (l *Loader) loadCapturedConnection(userRaw map[string]any, providerID strin
 	}
 	records, warnings := ReadDiscoveryCache(home)
 	if discovered != nil {
-		fingerprint := transportFingerprint(transport)
-		if fingerprint == "" {
-			return nil, nil, fmt.Errorf("compute discovery transport fingerprint")
-		}
 		records[providerID] = DiscoveryRecord{
-			TransportFingerprint: fingerprint,
+			TransportFingerprint: transportFingerprint(transport),
 			FetchedAt:            time.Now().UTC(),
 			AttemptedAt:          time.Now().UTC(),
 			Models:               discovered.Models,

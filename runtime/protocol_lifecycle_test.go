@@ -483,7 +483,7 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 		t.Fatalf("decode published record %s: %v", string(data), err)
 	}
 	if published.Endpoint != ps.Endpoint() || published.InstanceId != ps.instance ||
-		published.ProtocolVersion != string(protocol.N1) || published.Credential != ps.credential {
+		published.ProtocolVersion != string(protocol.N2) || published.Credential != ps.credential {
 		t.Fatalf("published record = %+v, want the endpoint, identity, wire version, and credential", published)
 	}
 

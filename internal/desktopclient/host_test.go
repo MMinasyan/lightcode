@@ -40,7 +40,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"1","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"2","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -69,7 +69,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
 	}
 }
 
@@ -839,7 +839,7 @@ func (f *gatedFixture) health(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+	fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
 }
 
 func (f *gatedFixture) events(w http.ResponseWriter, r *http.Request) {
@@ -963,7 +963,7 @@ func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
 	}
 	server := newFixture(t, failingHealth, parkedStream())
 	host := newHost(t, server)
@@ -1145,7 +1145,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	if err := json.Unmarshal([]byte(response.Body), &health); err != nil {
 		t.Fatalf("decode health body: %v", err)
 	}
-	if health.InstanceId != info.InstanceID || health.ProtocolVersion != protocol.N1 {
+	if health.InstanceId != info.InstanceID || health.ProtocolVersion != protocol.N2 {
 		t.Fatalf("health = %+v, want the connected owner", health)
 	}
 

@@ -357,13 +357,6 @@ func TestTransportFingerprintCanonicalIdentity(t *testing.T) {
 			"X-A":           "a-value",
 			"Authorization": "Bearer first-secret",
 		},
-		Options: map[string]any{
-			"nested": map[string]any{
-				"large":   json.Number("90071992547409931234567890"),
-				"decimal": json.Number("1.2300"),
-			},
-			"array": []any{json.Number("1"), "1", true},
-		},
 	}
 	equivalent := Transport{
 		BaseURL:   base.BaseURL,
@@ -372,13 +365,6 @@ func TestTransportFingerprintCanonicalIdentity(t *testing.T) {
 			"X-A":           "a-value",
 			"Authorization": "Bearer first-secret",
 			"X-B":           "b-value",
-		},
-		Options: map[string]any{
-			"array": []any{json.Number("1.0"), "1", true},
-			"nested": map[string]any{
-				"decimal": json.Number("1.23000"),
-				"large":   json.Number("90071992547409931234567890"),
-			},
 		},
 	}
 	if !SameTransport(base, equivalent) {
@@ -393,29 +379,22 @@ func TestTransportFingerprintCanonicalIdentity(t *testing.T) {
 	if SameTransport(base, changedConfiguredAuthorization) {
 		t.Fatal("different configured Authorization values shared a fingerprint")
 	}
-	if SameTransport(base, Transport{BaseURL: base.BaseURL, APIKeyEnv: "OTHER_KEY", Headers: base.Headers, Options: base.Options}) {
+	if SameTransport(base, Transport{BaseURL: base.BaseURL, APIKeyEnv: "OTHER_KEY", Headers: base.Headers}) {
 		t.Fatal("different API key environment names shared a fingerprint")
+	}
+	if SameTransport(base, Transport{BaseURL: "https://other.test/v1", APIKeyEnv: base.APIKeyEnv, Headers: base.Headers}) {
+		t.Fatal("different base URLs shared a fingerprint")
 	}
 	changedHeader := equivalent
 	changedHeader.Headers = map[string]string{"X-A": "changed"}
 	if SameTransport(base, changedHeader) {
 		t.Fatal("different header values shared a fingerprint")
 	}
-	changedArray := equivalent
-	changedArray.Options = map[string]any{"array": []any{true, "1", json.Number("1.0")}}
-	if SameTransport(base, changedArray) {
-		t.Fatal("different array order shared a fingerprint")
-	}
-	changedScalar := equivalent
-	changedScalar.Options = map[string]any{"array": []any{json.Number("1.0"), json.Number("1"), true}}
-	if SameTransport(base, changedScalar) {
-		t.Fatal("different scalar types shared a fingerprint")
-	}
 	if !SameTransport(
 		Transport{BaseURL: base.BaseURL, APIKeyEnv: base.APIKeyEnv},
-		Transport{BaseURL: base.BaseURL, APIKeyEnv: base.APIKeyEnv, Headers: map[string]string{}, Options: map[string]any{}},
+		Transport{BaseURL: base.BaseURL, APIKeyEnv: base.APIKeyEnv, Headers: map[string]string{}},
 	) {
-		t.Fatal("nil and empty transport maps did not share a fingerprint")
+		t.Fatal("nil and empty transport headers did not share a fingerprint")
 	}
 	if len(transportFingerprint(base)) != sha256.Size*2 || strings.ToLower(transportFingerprint(base)) != transportFingerprint(base) {
 		t.Fatalf("transport fingerprint = %q, want lowercase SHA-256 hex", transportFingerprint(base))
@@ -436,50 +415,6 @@ func TestTransportFingerprintIgnoresResolvedAPIKey(t *testing.T) {
 	}
 	if !firstSame || firstSame != secondSame {
 		t.Fatalf("SameTransport changed with resolved secret: before=%v after=%v", firstSame, secondSame)
-	}
-}
-
-func TestTransportFingerprintDecimalNormalization(t *testing.T) {
-	transportWithNumber := func(number string) Transport {
-		return Transport{Options: map[string]any{"number": json.Number(number)}}
-	}
-	for _, pair := range [][2]string{
-		{"1e+2", "100"},
-		{"123e-2", "1.23"},
-		{"-1.20e-2", "-0.012"},
-		{"-0e99999", "0"},
-		{"90071992547409931234567890e-10", "9007199254740993.123456789"},
-		{"1e+200000", "100e+199998"},
-		{"1e-200000", "100e-200002"},
-	} {
-		t.Run(pair[0]+"="+pair[1], func(t *testing.T) {
-			if !SameTransport(transportWithNumber(pair[0]), transportWithNumber(pair[1])) {
-				t.Fatalf("%s and %s did not normalize equally", pair[0], pair[1])
-			}
-		})
-	}
-	for _, pair := range [][2]string{
-		{"1.23e2", "0.0123"},
-		{"123e-2", "12300"},
-		{"-1.20e-2", "-0.120"},
-	} {
-		t.Run(pair[0]+"!="+pair[1], func(t *testing.T) {
-			if SameTransport(transportWithNumber(pair[0]), transportWithNumber(pair[1])) {
-				t.Fatalf("%s and %s collided", pair[0], pair[1])
-			}
-		})
-	}
-}
-
-func TestTransportFingerprintFloat64AndJSONNumber(t *testing.T) {
-	transportWithNumber := func(number any) Transport {
-		return Transport{Options: map[string]any{"number": number}}
-	}
-	if !SameTransport(transportWithNumber(float64(1.25)), transportWithNumber(json.Number("125e-2"))) {
-		t.Fatal("float64 and json.Number did not normalize equally")
-	}
-	if SameTransport(transportWithNumber(float64(1.25)), transportWithNumber(json.Number("126e-2"))) {
-		t.Fatal("unequal float64 and json.Number values shared a fingerprint")
 	}
 }
 
