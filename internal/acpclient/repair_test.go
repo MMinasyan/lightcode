@@ -145,11 +145,9 @@ func (f *frameFixture) serveEvents(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.WriteHeader(http.StatusOK)
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	// The stream identity is taken before the flush: GetEvents returns to the
+	// client on the flush, so the numbering by which the tests address markers
+	// would otherwise race the next request's handler.
 	f.mu.Lock()
 	f.opens++
 	open := f.opens
@@ -164,6 +162,11 @@ func (f *frameFixture) serveEvents(w http.ResponseWriter, r *http.Request) {
 		f.ends[open] = end
 	}
 	f.mu.Unlock()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 	if gate != nil || end != nil {
 		select {
 		case document := <-gate:

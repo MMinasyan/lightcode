@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
 )
 
@@ -31,7 +32,9 @@ import (
 // answering initialize, optional delay in seconds before sending the work-done
 // progress notification that marks the server ready (a negative delay
 // suppresses it entirely), a crash mode ("first" crashes only the very first
-// launch, "always" every launch, both after initialize and before readiness),
+// launch, "always" every launch, both after initialize and before readiness;
+// "after-open" lets the first launch become ready and then crashes it on its
+// first didOpen, with every later launch crashing before readiness),
 // and a stubborn flag that makes the server never answer the shutdown
 // request.
 const fakeServerScript = `#!/usr/bin/env python3
@@ -99,12 +102,15 @@ while True:
     elif method == "initialized":
         if ready_delay < 0:
             continue
-        if crash == "always" or (crash == "first" and first_launch):
+        if crash == "always" or (crash == "first" and first_launch) or (crash == "after-open" and not first_launch):
             sys.exit(1)
         if ready_delay:
             time.sleep(ready_delay)
         send({"jsonrpc": "2.0", "method": "$/progress",
               "params": {"token": 0, "value": {"kind": "end"}}})
+    elif method == "textDocument/didOpen":
+        if crash == "after-open":
+            sys.exit(1)
 `
 
 func newFakeServerInstance(t *testing.T, log, failMarker string, initDelay, readyDelay float64, crash, stubborn string) *instance {
@@ -535,13 +541,12 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 	}
 }
 
-// TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite proves the
-// retained-instance terminal admission on openFile: after permanent close wins
-// on a ready instance, openFile must return the unavailable error before
-// reading the file or sending didOpen — no protocol write reaches the server.
-// It fails with the pre-fix openFile, which reads the file and sends didOpen
-// over the still-live connection.
-func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
+// TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite proves
+// the retained-instance terminal admission on the canonical open: after
+// permanent close wins on a ready instance, openFileCanonical must return the
+// unavailable error before reading the file or sending didOpen — no protocol
+// write reaches the server.
+func TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
@@ -555,8 +560,8 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := inst.openFile(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("openFile after permanent close = %v, want the unavailable error", err)
+	if err := inst.openFileCanonical(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("openFileCanonical after permanent close = %v, want the unavailable error", err)
 	}
 	// No protocol write: the server saw the startup initialize/initialized
 	// requests but never a didOpen.
@@ -565,7 +570,7 @@ func TestOpenFileAfterPermanentCloseRefusesWithoutProtocolWrite(t *testing.T) {
 		t.Fatalf("read requests log: %v", err)
 	}
 	if strings.Contains(string(data), "textDocument/didOpen") {
-		t.Fatal("openFile after permanent close sent didOpen to the server")
+		t.Fatal("openFileCanonical after permanent close sent didOpen to the server")
 	}
 }
 
@@ -735,5 +740,132 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 	}
 	if procDone != fresh {
 		t.Fatal("shutdown replaced the newer attempt's procDone")
+	}
+}
+
+// TestSupersededShutdownKeepsReplacementDiagnostics is the stale-attempt
+// negative control: a teardown of an attempt that has been superseded must not
+// clear the replacement ready attempt's diagnostics. The stubborn server keeps
+// the shutdown open while the replacement attempt is installed and its
+// diagnostic cache seeded; when the superseded teardown finishes, that cache
+// must still hold the seeded error, and the captured attempt's process must
+// still be killed and reaped by its own watcher.
+func TestSupersededShutdownKeepsReplacementDiagnostics(t *testing.T) {
+	old := shutdownWait
+	shutdownWait = 200 * time.Millisecond
+	t.Cleanup(func() { shutdownWait = old })
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "1")
+
+	// Count every instance-owned process wait from before the initial launch:
+	// the captured attempt's watcher is the one that must reap it.
+	var waits atomic.Int64
+	oldWait := waitCommand
+	waitCommand = func(cmd *exec.Cmd) error { waits.Add(1); return oldWait(cmd) }
+	t.Cleanup(func() { waitCommand = oldWait })
+
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	inst.mu.Lock()
+	pid := inst.cmd.Process.Pid
+	inst.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() { inst.shutdown(); close(done) }()
+
+	// Wait until shutdown has captured the running attempt (the capture and
+	// the terminal transition share one lock hold), then install a ready
+	// replacement attempt while shutdown is blocked waiting for the server
+	// to answer.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		inst.mu.Lock()
+		state := inst.state
+		inst.mu.Unlock()
+		if state == stateShutdown {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shutdown never captured the attempt")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	replacementDone := make(chan struct{})
+	inst.mu.Lock()
+	inst.state = stateReady
+	inst.readyCh = make(chan struct{})
+	inst.procDone = replacementDone
+	inst.mu.Unlock()
+	// The replacement is the only owner of its attempt channel; close it for
+	// the helper's cleanup teardown so it never waits on a live attempt.
+	t.Cleanup(func() { close(replacementDone) })
+
+	uri := protocol.URIFromPath(filepath.Join(t.TempDir(), "replacement.go"))
+	severity := protocol.SeverityError
+	inst.diagMu.Lock()
+	inst.diagnostics = map[string][]protocol.Diagnostic{
+		uri: {{
+			Severity: &severity,
+			Message:  "replacement error",
+			Range:    protocol.Range{Start: protocol.Position{Line: 4}},
+		}},
+	}
+	inst.diagMu.Unlock()
+
+	<-done
+
+	diags := inst.fileDiagnostics(uri)
+	if len(diags) != 1 || diags[0].Message != "replacement error" {
+		t.Fatalf("diagnostics after the superseded shutdown = %+v, want the replacement attempt's cached error", diags)
+	}
+	// The captured attempt's process was killed and reaped inside the
+	// teardown: kill(pid, 0) returns ESRCH only once reaped, and the single
+	// wait is the watcher's own reap.
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("captured attempt process %d still alive after the superseded shutdown (kill err = %v)", pid, err)
+	}
+	if n := waits.Load(); n != 1 {
+		t.Fatalf("process waits = %d, want exactly 1 (the captured attempt's watcher reap)", n)
+	}
+}
+
+// TestStartWithCancelledContextLaunchesNothing proves the pre-spawn guard: a
+// start whose supplied context is already cancelled refuses the attempt
+// before binary resolution, pipes or spawn, ends it so the instance stays
+// claimable, and returns the context error. The startProbe seam counts
+// successful cmd.Start invocations, so the count does not depend on whether
+// the child writes its launch log before it is killed.
+func TestStartWithCancelledContextLaunchesNothing(t *testing.T) {
+	var starts atomic.Int64
+	oldProbe := startProbe
+	startProbe = func() { starts.Add(1) }
+	t.Cleanup(func() { startProbe = oldProbe })
+
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := inst.start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("start with a cancelled context: error = %v, want context.Canceled", err)
+	}
+	if n := starts.Load(); n != 0 {
+		t.Fatalf("successful cmd.Start invocations = %d, want 0", n)
+	}
+	if n := countLaunches(log); n != 0 {
+		t.Fatalf("server processes launched = %d, want 0", n)
+	}
+
+	// The refused attempt ended the launch it claimed, so the instance is
+	// claimable again: a live start still works.
+	if err := inst.waitReady(context.Background()); err != nil {
+		t.Fatalf("waitReady after the refused attempt: %v", err)
+	}
+	if n := countLaunches(log); n != 1 {
+		t.Fatalf("server processes launched = %d, want 1 after the live start", n)
 	}
 }

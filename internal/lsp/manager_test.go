@@ -41,7 +41,7 @@ func TestManagerForFileAndAllInstances(t *testing.T) {
 	}
 }
 
-func TestManagerConcurrentHandlersAndInstances(t *testing.T) {
+func TestManagerConcurrentHandlerAndInstances(t *testing.T) {
 	m := NewManager(t.TempDir(), t.TempDir())
 	def := server.ForExtension(".go")
 	inst := newInstance(def, m.projectRoot, m.home, context.Background(), nil)
@@ -50,7 +50,6 @@ func TestManagerConcurrentHandlersAndInstances(t *testing.T) {
 	m.mu.Unlock()
 
 	var warnings atomic.Int64
-	var signals atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -58,33 +57,26 @@ func TestManagerConcurrentHandlersAndInstances(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				m.SetWarningHandler(func(string, string) { warnings.Add(1) })
-				m.SetSignalHandler(func(string) { signals.Add(1) })
 				m.emitWarning("kind", "message")
-				m.emitSignal("signal")
 				_ = m.ForFile("main.go")
 				_ = m.AllInstances()
 			}
 		}()
 	}
 	wg.Wait()
-	if warnings.Load() == 0 || signals.Load() == 0 {
-		t.Fatalf("handlers were not called: warnings=%d signals=%d", warnings.Load(), signals.Load())
+	if warnings.Load() == 0 {
+		t.Fatalf("the warning handler was not called: warnings=%d", warnings.Load())
 	}
 }
 
-func TestManagerWarningAndSignalHandlers(t *testing.T) {
+func TestManagerWarningHandler(t *testing.T) {
 	m := NewManager(t.TempDir(), t.TempDir())
-	var warningKind, warningMessage, signal string
+	var warningKind, warningMessage string
 	m.SetWarningHandler(func(kind, message string) { warningKind, warningMessage = kind, message })
-	m.SetSignalHandler(func(content string) { signal = content })
 
 	m.emitWarning("kind", "message")
 	if warningKind != "kind" || warningMessage != "message" {
 		t.Fatalf("warning = %q/%q", warningKind, warningMessage)
-	}
-	m.emitSignal("hello")
-	if signal != "hello" {
-		t.Fatalf("signal = %q, want raw payload", signal)
 	}
 }
 
@@ -212,9 +204,9 @@ func TestStartServerAfterClosedRejectsBeforeStart(t *testing.T) {
 // TestStartServerAfterClosedSkipsInstall covers the LSP close-before-install
 // sibling: a server whose binary is missing and whose Install would otherwise
 // run must be rejected by the early admission check before any resource or
-// process start — no Install call, no instance mapping, no warning or signal,
-// and no process launch. The map-time closed check stays as the positive
-// sibling for starts admitted before close (TestStartServerCloseRaceMapped
+// process start — no Install call, no instance mapping, no warning, and no
+// process launch. The map-time closed check stays as the positive sibling for
+// starts admitted before close (TestStartServerCloseRaceMapped
 // InstanceIsTornDown).
 func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 	home := t.TempDir() // no fake binary anywhere: ResolveBinary finds nothing
@@ -230,9 +222,8 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 	}
 
 	m := NewManager(t.TempDir(), home)
-	var warnings, signals atomic.Int64
+	var warnings atomic.Int64
 	m.SetWarningHandler(func(string, string) { warnings.Add(1) })
-	m.SetSignalHandler(func(string) { signals.Add(1) })
 
 	m.CloseAdmission()
 	start := time.Now()
@@ -245,8 +236,8 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 	if installed {
 		t.Fatal("Install was called after CloseAdmission: the early admission check did not reject")
 	}
-	if warnings.Load() != 0 || signals.Load() != 0 {
-		t.Fatalf("warnings=%d signals=%d after rejected start, want none", warnings.Load(), signals.Load())
+	if warnings.Load() != 0 {
+		t.Fatalf("warnings=%d after rejected start, want none", warnings.Load())
 	}
 	m.mu.Lock()
 	_, mapped := m.instances[def.Name]
