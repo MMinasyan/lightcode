@@ -36,6 +36,9 @@ jobs:
       - name: Build Wails app
         run: $(go env GOPATH)/bin/wails build -tags webkit2_41
 
+      - name: Check Wails bindings
+        run: make check-wails-bindings
+
       - name: Vet
         run: go vet -tags webkit2_41 ./...
 

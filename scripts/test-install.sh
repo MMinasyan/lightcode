@@ -535,4 +535,64 @@ assert_equal_file "$spaced_prefix/bin/lightcode" "make-fixture-binary"
 assert_mode "$spaced_prefix/bin/lightcode" 755
 assert_no_staging_residue "$spaced_prefix/bin"
 
+# Captured Wails argv: the real root Makefile build and install recipes run
+# through a fake Wails CLI planted at the fixture HOME, which records its
+# arguments. No companion file is used here, so these calls exercise the
+# actual recipes, including the tagged build command and the unchanged
+# version-stamping flags. The record is cleared immediately before each target
+# so every assertion proves that target's own Wails call, never a previous one.
+make_wails_argv=$test_root/make-wails.argv
+make_wails_expected=$test_root/make-wails.expected
+mkdir -p "$make_home/go/bin"
+cat >"$make_home/go/bin/wails" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" >"$make_wails_argv"
+EOF
+chmod 755 "$make_home/go/bin/wails"
+
+cat >"$make_wails_expected" <<'EOF'
+build
+-tags
+webkit2_41
+-ldflags
+-X github.com/MMinasyan/lightcode/internal/version.Version=v1.2.3 -X github.com/MMinasyan/lightcode/internal/version.Commit=abc1234
+EOF
+
+run_make_real() {
+    out=$1
+    shift
+    (
+        PATH="$shim_dir:$PATH"
+        HOME="$make_home"
+        export PATH HOME
+        cd "$make_source_tree"
+        make -f "$root_dir/Makefile" "$@"
+    ) >"$out" 2>&1
+}
+
+run_make_real_expect_success() {
+    out=$1
+    shift
+    if ! run_make_real "$out" "$@"; then
+        cat "$out" >&2 || true
+        fail "expected real make target success"
+    fi
+}
+
+assert_wails_argv() {
+    [ -f "$make_wails_argv" ] || fail "Wails CLI was not invoked for this target"
+    assert_equal_file "$make_wails_argv" "$(cat "$make_wails_expected")"
+}
+
+make_real_prefix=$test_root/make-real-prefix
+rm -f "$make_wails_argv"
+run_make_real_expect_success "$test_root/make-real-build.out" VERSION=v1.2.3 COMMIT=abc1234 build
+assert_wails_argv
+rm -f "$make_wails_argv"
+run_make_real_expect_success "$test_root/make-real-install.out" VERSION=v1.2.3 COMMIT=abc1234 PREFIX="$make_real_prefix" install
+assert_wails_argv
+assert_equal_file "$make_real_prefix/bin/lightcode" "make-fixture-binary"
+assert_mode "$make_real_prefix/bin/lightcode" 755
+assert_no_staging_residue "$make_real_prefix/bin"
+
 printf 'installer tests passed\n'

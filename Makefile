@@ -8,7 +8,7 @@ VERSION_PKG := github.com/MMinasyan/lightcode/internal/version
 LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
 
 build:
-	~/go/bin/wails build -ldflags '$(LDFLAGS)'
+	~/go/bin/wails build -tags webkit2_41 -ldflags '$(LDFLAGS)'
 
 test:
 	go test ./...
@@ -62,7 +62,13 @@ generate-protocol:
 	cd frontend && npm run generate-protocol
 
 check-protocol: generate-protocol
-	sh scripts/check-protocol-generated.sh
+	sh scripts/check-generated-files.sh protocol/protocol.gen.go frontend/src/generated/protocol internal/clientops/operations.gen.go frontend/src/generated/native-invocations.json
 	cd frontend && npm run typecheck:protocol
 
-.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall generate-protocol check-protocol
+# Compares the Wails-generated Go bindings against the index. Prerequisite:
+# the real Wails build (which runs the models.ts normalizer) has produced the
+# tracked files under frontend/client-bindings/wailsjs/go.
+check-wails-bindings:
+	sh scripts/check-generated-files.sh frontend/client-bindings/wailsjs/go
+
+.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall generate-protocol check-protocol check-wails-bindings
