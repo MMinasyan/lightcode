@@ -549,6 +549,9 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			}
 		}
 
+		// The completed flow's model calls left their own arrival tokens;
+		// drain them so the wait below observes this Operation's first call.
+		drainCommandModelArrivals(e)
 		// The mounted interrupt control answers 204 against a further held
 		// Operation, which settles the terminal interruption.
 		intGate := make(chan struct{})

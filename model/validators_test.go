@@ -82,6 +82,24 @@ func richToolCallFixture() ToolCall {
 var benchRichOutput = richOutputFixture()
 var benchRichDelta = richDeltaFixture()
 var benchRichToolCall = richToolCallFixture()
+var benchRichRequest = Request{
+	Messages: []Message{
+		{Role: RoleUser, Content: []ContentPart{{Kind: PartText, Text: "hello", Extra: Extra{"u": json.RawMessage(`"v"`)}}}},
+		{
+			Role:    RoleAssistant,
+			Source:  fullRef,
+			Content: []ContentPart{{Kind: PartText, Text: "working"}, {Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}},
+			ToolCalls: []ToolCall{
+				richToolCallFixture(),
+			},
+			Extra: Extra{"reasoning_content": json.RawMessage(`"r"`)},
+		},
+	},
+	Tools: []ToolDefinition{
+		{Name: "read_file", Description: "reads", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)},
+		{Name: "echo", Description: "echoes", Parameters: json.RawMessage(`{"type":"object"}`)},
+	},
+}
 
 // requireEqualConstructorVerdict asserts the differential: the owning
 // constructor and the validation-only validator return the same acceptance
@@ -255,6 +273,167 @@ func TestValidateToolCallMatchesNewToolCall(t *testing.T) {
 	}
 }
 
+// TestValidateContentPartMatchesNewContentPart pins the ContentPart
+// differential over the cross-kind, unknown-kind, missing-wire-type and Extra
+// boundary shapes: identical verdicts and detail, and an input the validator
+// leaves exactly as it received it.
+func TestValidateContentPartMatchesNewContentPart(t *testing.T) {
+	rows := []struct {
+		name    string
+		part    ContentPart
+		wantErr bool
+	}{
+		{"rich text", ContentPart{Kind: PartText, Text: "hello", Extra: Extra{"k": json.RawMessage(`"v"`)}}, false},
+		{"empty text", ContentPart{Kind: PartText}, false},
+		{"image url", ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png"}, false},
+		{"opaque with extra", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"t": json.RawMessage(`{"n":1}`)}}, false},
+		{"text carrying url", ContentPart{Kind: PartText, Text: "a", URL: "u"}, true},
+		{"text carrying opaque wire type", ContentPart{Kind: PartText, Text: "a", OpaqueWireType: "thinking"}, true},
+		{"image carrying text", ContentPart{Kind: PartImageURL, URL: "u", Text: "a"}, true},
+		{"image carrying opaque wire type", ContentPart{Kind: PartImageURL, URL: "u", OpaqueWireType: "thinking"}, true},
+		{"opaque carrying text", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Text: "a"}, true},
+		{"opaque carrying url", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", URL: "u"}, true},
+		{"opaque without wire type", ContentPart{Kind: PartOpaque}, true},
+		{"unknown kind", ContentPart{Kind: PartKind("audio"), Text: "a"}, true},
+		{"malformed extra", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"raw": json.RawMessage("not json")}}, true},
+		{"empty extra value", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"e": json.RawMessage{}}}, true},
+		{"null extra value", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"n": json.RawMessage(`null`)}}, false},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			_, newErr := NewContentPart(row.part)
+			validateErr := ValidateContentPart(row.part)
+			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
+			if (newErr != nil) != row.wantErr {
+				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			}
+		})
+	}
+
+	// The validator mutates nothing: a value-equal sibling still compares
+	// equal after the call, extras included.
+	in := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
+	before := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
+	if err := ValidateContentPart(in); err != nil {
+		t.Fatalf("ValidateContentPart rejected the rich fixture: %v", err)
+	}
+	if !reflect.DeepEqual(in, before) {
+		t.Fatal("ValidateContentPart mutated its input")
+	}
+}
+
+// TestValidateToolDefinitionMatchesNewToolDefinition pins the ToolDefinition
+// differential: the name check precedes the parameter check, the parameter
+// shape is syntax-only (a huge number literal stays accepted), and an input
+// with parameter bytes is left exactly as the validator received it.
+func TestValidateToolDefinitionMatchesNewToolDefinition(t *testing.T) {
+	rows := []struct {
+		name    string
+		def     ToolDefinition
+		wantErr bool
+	}{
+		{"object parameters", ToolDefinition{Name: "f", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}, false},
+		{"object parameters with whitespace", ToolDefinition{Name: "f", Parameters: json.RawMessage("  {\"a\": 1}  ")}, false},
+		{"huge number literal is syntax-valid", ToolDefinition{Name: "f", Parameters: json.RawMessage(`{"n":1e1000}`)}, false},
+		{"empty name", ToolDefinition{Parameters: json.RawMessage(`{}`)}, true},
+		{"empty name precedes malformed parameters", ToolDefinition{Parameters: json.RawMessage(`{oops`)}, true},
+		{"empty parameters", ToolDefinition{Name: "f"}, true},
+		{"null parameters", ToolDefinition{Name: "f", Parameters: json.RawMessage(`null`)}, true},
+		{"array parameters", ToolDefinition{Name: "f", Parameters: json.RawMessage(`[1]`)}, true},
+		{"primitive parameters", ToolDefinition{Name: "f", Parameters: json.RawMessage(`"x"`)}, true},
+		{"malformed parameters", ToolDefinition{Name: "f", Parameters: json.RawMessage(`{oops`)}, true},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			_, newErr := NewToolDefinition(row.def)
+			validateErr := ValidateToolDefinition(row.def)
+			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
+			if (newErr != nil) != row.wantErr {
+				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			}
+		})
+	}
+
+	// The validator mutates nothing, parameter bytes included.
+	in := ToolDefinition{Name: "echo", Description: "d", Parameters: json.RawMessage(`{"deep":{"a":[1,2]}}`)}
+	before := ToolDefinition{Name: "echo", Description: "d", Parameters: json.RawMessage(`{"deep":{"a":[1,2]}}`)}
+	if err := ValidateToolDefinition(in); err != nil {
+		t.Fatalf("ValidateToolDefinition rejected the rich fixture: %v", err)
+	}
+	if !reflect.DeepEqual(in, before) {
+		t.Fatal("ValidateToolDefinition mutated its input")
+	}
+}
+
+// TestValidateRequestMatchesNewRequest pins the Request differential over the
+// message and tool passes: identical verdicts and detail, the message pass
+// first in index order, the per-tool validation ahead of the duplicate-name
+// rejection inside the tools pass, and an input the validator leaves exactly
+// as it received it.
+func TestValidateRequestMatchesNewRequest(t *testing.T) {
+	validMessage := func() Message {
+		return assistantMsg(t, func(m *Message) { m.Content = []ContentPart{{Kind: PartText, Text: "hi"}} })
+	}
+	validTool := func(name string) ToolDefinition {
+		return ToolDefinition{Name: name, Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}
+	}
+
+	rows := []struct {
+		name     string
+		req      Request
+		wantErr  bool
+		prefix   string // required leading text of the shared detail
+		contains string // required substring of the shared detail
+	}{
+		{"valid messages and tools", Request{Messages: []Message{validMessage()}, Tools: []ToolDefinition{validTool("echo")}}, false, "", ""},
+		{"empty request", Request{}, false, "", ""},
+		{"tools only capture shape", Request{Tools: []ToolDefinition{validTool("echo")}}, false, "", ""},
+		{"invalid message", Request{Messages: []Message{{Role: Role("bogus")}}}, true, "messages[0]:", ""},
+		{"invalid message part", Request{Messages: []Message{{Role: RoleUser, Content: []ContentPart{{Kind: PartText, URL: "u"}}}}}, true, "messages[0]: content[0]:", ""},
+		{"message error beats tool error", Request{Messages: []Message{{Role: Role("bogus")}}, Tools: []ToolDefinition{{}}}, true, "messages[0]:", ""},
+		{"invalid tool", Request{Tools: []ToolDefinition{{Name: "f"}}}, true, "tools[0]:", ""},
+		{"second tool invalid after a valid first", Request{Tools: []ToolDefinition{validTool("a"), {Name: "f"}}}, true, "tools[1]:", ""},
+		{"duplicate name", Request{Tools: []ToolDefinition{validTool("echo"), validTool("echo")}}, true, "", "duplicate tool definition name"},
+		{"duplicate reported after the second tool's own validation", Request{Tools: []ToolDefinition{validTool("echo"), {Name: "echo", Parameters: json.RawMessage(`{oops`)}}}, true, "tools[1]:", "malformed JSON parameters"},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			_, newErr := NewRequest(row.req)
+			validateErr := ValidateRequest(row.req)
+			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
+			if (newErr != nil) != row.wantErr {
+				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			}
+			if row.prefix != "" && !strings.HasPrefix(newErr.Error(), row.prefix) {
+				t.Fatalf("fixture %s error = %q, want the %q prefix", row.name, newErr, row.prefix)
+			}
+			if row.contains != "" && !strings.Contains(newErr.Error(), row.contains) {
+				t.Fatalf("fixture %s reached the wrong rule: %v, want a failure naming %q", row.name, newErr, row.contains)
+			}
+		})
+	}
+
+	// The validator mutates nothing: a value-equal sibling still compares
+	// equal after the call, nested reference types included.
+	in := Request{
+		Messages: []Message{validMessage()},
+		Tools:    []ToolDefinition{validTool("echo")},
+	}
+	before := Request{
+		Messages: []Message{validMessage()},
+		Tools:    []ToolDefinition{validTool("echo")},
+	}
+	if err := ValidateRequest(in); err != nil {
+		t.Fatalf("ValidateRequest rejected the rich fixture: %v", err)
+	}
+	if !reflect.DeepEqual(in, before) {
+		t.Fatal("ValidateRequest mutated its input")
+	}
+}
+
 // Benchmarks: the validation-only path against the owning constructor over
 // the same rich fixtures. The delta between each pair is the ownership work a
 // read-only check no longer pays; the constructor values are the baseline
@@ -308,6 +487,24 @@ func BenchmarkNewToolCall(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if _, err := NewToolCall(benchRichToolCall); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValidateRequest(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := ValidateRequest(benchRichRequest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNewRequest(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := NewRequest(benchRichRequest); err != nil {
 			b.Fatal(err)
 		}
 	}
