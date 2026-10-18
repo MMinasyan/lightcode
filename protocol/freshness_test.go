@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -288,14 +289,6 @@ const (
 	wailsBuildRun   = "wails build -tags webkit2_41"
 )
 
-// deliveryGate is one required workflow gate: its exact run command and
-// whether the tagged Wails build must precede it. Only the binding check
-// consumes what the build produced; check-protocol regenerates on its own.
-type deliveryGate struct {
-	run        string
-	afterWails bool
-}
-
 // workflowStep is the parsed subset of one GitHub Actions step the delivery
 // gate assertions act on.
 type workflowStep struct {
@@ -327,6 +320,18 @@ func parseWorkflow(t *testing.T, path string) workflowFile {
 		t.Fatalf("decoding workflow %s: %v", path, err)
 	}
 	return workflow
+}
+
+// parsedSteps returns one workflow job's parsed steps, failing the test when
+// the job is missing.
+func parsedSteps(t *testing.T, path, job string) []workflowStep {
+	t.Helper()
+	workflow := parseWorkflow(t, path)
+	parsed, ok := workflow.Jobs[job]
+	if !ok {
+		t.Fatalf("workflow %s has no %s job", path, job)
+	}
+	return parsed.Steps
 }
 
 // findRunStep returns the index of the first step whose trimmed run command is
@@ -372,209 +377,167 @@ func stepBypass(step workflowStep) string {
 	return ""
 }
 
-// deliveryGateProblems reports every delivery-gate wiring problem in one
-// workflow job: each gate must exist as an exact, unconditional run step, a
-// gate marked afterWails must follow the tagged Wails build, and each follower
-// step (packaging and upload) must come after every gate. Job-level conditions
-// are out of scope: the release build job's repository guard is not a step
-// bypass.
-func deliveryGateProblems(workflow workflowFile, job string, gates []deliveryGate, followers []string) []string {
-	parsed, ok := workflow.Jobs[job]
-	if !ok {
-		return []string{"workflow has no " + job + " job"}
-	}
-	steps := parsed.Steps
-	var problems []string
+// checkDeliveryGates checks the fixed delivery-gate wiring in one job's steps
+// and returns the first violation: make check-protocol and
+// make check-wails-bindings must be exact, unconditional run steps, the tagged
+// Wails build must be an unconditional step before the binding check, and both
+// gates must precede every Package release assets or Upload release assets step
+// the job declares. The protocol check has no ordering constraint against the
+// Wails build, and a job without publication steps (Test) skips that last rule.
+func checkDeliveryGates(steps []workflowStep) error {
 	wails := findContainingRunStep(steps, wailsBuildRun)
 	if wails < 0 {
-		problems = append(problems, "missing the tagged Wails build command")
-	} else if bypass := stepBypass(steps[wails]); bypass != "" {
-		problems = append(problems, "Wails build is "+bypass)
+		return fmt.Errorf("missing the tagged Wails build command")
 	}
-	for _, gate := range gates {
-		index := findRunStep(steps, gate.run)
+	if bypass := stepBypass(steps[wails]); bypass != "" {
+		return fmt.Errorf("Wails build is %s", bypass)
+	}
+	bindings := findRunStep(steps, bindingsGateRun)
+	if bindings < 0 {
+		return fmt.Errorf("missing the exact run step %s", bindingsGateRun)
+	}
+	if bypass := stepBypass(steps[bindings]); bypass != "" {
+		return fmt.Errorf("%s is %s", bindingsGateRun, bypass)
+	}
+	if bindings < wails {
+		return fmt.Errorf("%s runs before the Wails build", bindingsGateRun)
+	}
+	protocol := findRunStep(steps, protocolGateRun)
+	if protocol < 0 {
+		return fmt.Errorf("missing the exact run step %s", protocolGateRun)
+	}
+	if bypass := stepBypass(steps[protocol]); bypass != "" {
+		return fmt.Errorf("%s is %s", protocolGateRun, bypass)
+	}
+	for _, publication := range []string{"Package release assets", "Upload release assets"} {
+		index := findNamedStep(steps, publication)
 		if index < 0 {
-			problems = append(problems, "missing the exact run step "+gate.run)
 			continue
 		}
-		if bypass := stepBypass(steps[index]); bypass != "" {
-			problems = append(problems, gate.run+" is "+bypass)
-			continue
+		if protocol > index {
+			return fmt.Errorf("%s does not precede %s", protocolGateRun, publication)
 		}
-		if gate.afterWails && wails >= 0 && index < wails {
-			problems = append(problems, gate.run+" runs before the Wails build")
-		}
-	}
-	for _, follower := range followers {
-		index := findNamedStep(steps, follower)
-		if index < 0 {
-			problems = append(problems, "missing the "+follower+" step")
-			continue
-		}
-		for _, gate := range gates {
-			if gateIndex := findRunStep(steps, gate.run); gateIndex >= 0 && gateIndex > index {
-				problems = append(problems, gate.run+" does not precede "+follower)
-			}
+		if bindings > index {
+			return fmt.Errorf("%s does not precede %s", bindingsGateRun, publication)
 		}
 	}
-	return problems
-}
-
-// removeRunStep drops the step with the exact run command.
-func removeRunStep(workflow *workflowFile, job, run string) {
-	steps := workflow.Jobs[job].Steps
-	if index := findRunStep(steps, run); index >= 0 {
-		workflow.Jobs[job].Steps = append(steps[:index], steps[index+1:]...)
-	}
-}
-
-// mutateRunStep applies mutate to the step with the exact run command.
-func mutateRunStep(workflow *workflowFile, job, run string, mutate func(*workflowStep)) {
-	steps := workflow.Jobs[job].Steps
-	if index := findRunStep(steps, run); index >= 0 {
-		mutate(&steps[index])
-	}
-}
-
-// mutateContainingRunStep applies mutate to the step whose run command
-// contains want.
-func mutateContainingRunStep(workflow *workflowFile, job, want string, mutate func(*workflowStep)) {
-	steps := workflow.Jobs[job].Steps
-	if index := findContainingRunStep(steps, want); index >= 0 {
-		mutate(&steps[index])
-	}
-}
-
-// swapRunSteps swaps the exact run step with the containing run step.
-func swapRunSteps(workflow *workflowFile, job, run, containing string) {
-	steps := workflow.Jobs[job].Steps
-	first, second := findRunStep(steps, run), findContainingRunStep(steps, containing)
-	if first >= 0 && second >= 0 {
-		steps[first], steps[second] = steps[second], steps[first]
-	}
-}
-
-// moveRunStepToEnd moves the exact run step to the end of its job.
-func moveRunStepToEnd(workflow *workflowFile, job, run string) {
-	steps := workflow.Jobs[job].Steps
-	if index := findRunStep(steps, run); index >= 0 {
-		step := steps[index]
-		workflow.Jobs[job].Steps = append(append(steps[:index], steps[index+1:]...), step)
-	}
-}
-
-// moveRunStepBefore moves the exact run step to just before the containing run
-// step.
-func moveRunStepBefore(workflow *workflowFile, job, run, containing string) {
-	steps := workflow.Jobs[job].Steps
-	index, target := findRunStep(steps, run), findContainingRunStep(steps, containing)
-	if index < 0 || target < 0 {
-		return
-	}
-	step := steps[index]
-	steps = append(steps[:index], steps[index+1:]...)
-	if index < target {
-		target--
-	}
-	workflow.Jobs[job].Steps = append(steps[:target], append([]workflowStep{step}, steps[target:]...)...)
-}
-
-// boolPtr returns a pointer to value for optional workflow keys.
-func boolPtr(value bool) *bool {
-	return &value
+	return nil
 }
 
 // TestDeliveryGateWorkflowWiring parses the repository's Test and Release
 // workflows and requires the delivery gates to stay wired to their real
-// producers: the post-build Wails binding check and the protocol freshness
-// check are exact, unconditional run steps, the binding check follows the
-// tagged Wails build (check-protocol is free to precede it in Test), and the
-// release checks both follow the build and precede packaging and upload.
-// Mutation rows prove removed, conditionally skipped, allowed-to-fail,
-// suppressed and reordered gates are rejected, and that the accepted Test
-// order with the protocol check before the build is not over-constrained.
-// This verifies repository wiring, not GitHub branch protection or hosted
-// execution.
+// producers: make check-protocol and make check-wails-bindings are exact,
+// unconditional run steps, the binding check follows the tagged Wails build,
+// and the Release checks both precede packaging and upload. Neither workflow
+// constrains the protocol check against the Wails build, and the Release
+// workflow must still declare its two publication steps. Mutation rows prove
+// removed, conditionally skipped, allowed-to-fail, suppressed and reordered
+// gates are rejected, and that a protocol check before the build is accepted
+// in both workflows. This verifies repository wiring, not GitHub branch
+// protection or hosted execution.
 func TestDeliveryGateWorkflowWiring(t *testing.T) {
 	testPath := filepath.Join("..", ".github", "workflows", "test.yml")
 	releasePath := filepath.Join("..", ".github", "workflows", "release.yml")
-	// Only the binding check consumes the Wails build output; check-protocol
-	// regenerates on its own and may run before the build in Test. Release
-	// keeps both checks after the build.
-	testGates := []deliveryGate{{protocolGateRun, false}, {bindingsGateRun, true}}
-	releaseGates := []deliveryGate{{protocolGateRun, true}, {bindingsGateRun, true}}
-	releaseFollowers := []string{"Package release assets", "Upload release assets"}
 
-	if problems := deliveryGateProblems(parseWorkflow(t, testPath), "test", testGates, nil); len(problems) != 0 {
-		t.Errorf("test workflow: %s", strings.Join(problems, "; "))
+	testSteps := parsedSteps(t, testPath, "test")
+	if err := checkDeliveryGates(testSteps); err != nil {
+		t.Errorf("test workflow: %v", err)
 	}
-	if problems := deliveryGateProblems(parseWorkflow(t, releasePath), "build", releaseGates, releaseFollowers); len(problems) != 0 {
-		t.Errorf("release workflow: %s", strings.Join(problems, "; "))
+	releaseSteps := parsedSteps(t, releasePath, "build")
+	if err := checkDeliveryGates(releaseSteps); err != nil {
+		t.Errorf("release workflow: %v", err)
 	}
+	for _, publication := range []string{"Package release assets", "Upload release assets"} {
+		if findNamedStep(releaseSteps, publication) < 0 {
+			t.Errorf("release workflow is missing the %s step", publication)
+		}
+	}
+
+	// protocolBeforeWails moves the exact protocol gate step to just before the
+	// tagged Wails build: the order both workflows must accept.
+	protocolBeforeWails := func(steps []workflowStep) []workflowStep {
+		from := findRunStep(steps, protocolGateRun)
+		to := findContainingRunStep(steps, wailsBuildRun)
+		step := steps[from]
+		steps = slices.Delete(steps, from, from+1)
+		if from < to {
+			to--
+		}
+		return slices.Insert(steps, to, step)
+	}
+	allowedToFail := true
 
 	for _, mutation := range []struct {
-		name      string
-		path      string
-		job       string
-		gates     []deliveryGate
-		followers []string
-		accepted  bool
-		mutate    func(*workflowFile)
+		name   string
+		path   string
+		job    string
+		accept bool
+		mutate func([]workflowStep) []workflowStep
 	}{
-		{"protocol gate before the Wails build in Test is accepted", testPath, "test", testGates, nil, true, func(workflow *workflowFile) {
-			moveRunStepBefore(workflow, "test", protocolGateRun, wailsBuildRun)
+		{"protocol gate before the Wails build in Test is accepted", testPath, "test", true, protocolBeforeWails},
+		{"protocol gate before the Wails build in Release is accepted", releasePath, "build", true, protocolBeforeWails},
+		{"removed binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			index := findRunStep(steps, bindingsGateRun)
+			return slices.Delete(steps, index, index+1)
 		}},
-		{"protocol gate before the Wails build in Release is forbidden", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			moveRunStepBefore(workflow, "build", protocolGateRun, wailsBuildRun)
+		{"conditional binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			steps[findRunStep(steps, bindingsGateRun)].If = "${{ false }}"
+			return steps
 		}},
-		{"removed binding gate", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			removeRunStep(workflow, "test", bindingsGateRun)
+		{"continue-on-error binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			steps[findRunStep(steps, bindingsGateRun)].ContinueOnError = &allowedToFail
+			return steps
 		}},
-		{"conditional binding gate", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			mutateRunStep(workflow, "test", bindingsGateRun, func(step *workflowStep) { step.If = "${{ false }}" })
+		{"suppressed binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			steps[findRunStep(steps, bindingsGateRun)].Run += " || true"
+			return steps
 		}},
-		{"continue-on-error binding gate", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			mutateRunStep(workflow, "test", bindingsGateRun, func(step *workflowStep) { step.ContinueOnError = boolPtr(true) })
+		{"removed protocol gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			index := findRunStep(steps, protocolGateRun)
+			return slices.Delete(steps, index, index+1)
 		}},
-		{"suppressed binding gate", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			mutateRunStep(workflow, "test", bindingsGateRun, func(step *workflowStep) { step.Run += " || true" })
+		{"binding gate before the Wails build", testPath, "test", false, func(steps []workflowStep) []workflowStep {
+			bindings, wails := findRunStep(steps, bindingsGateRun), findContainingRunStep(steps, wailsBuildRun)
+			steps[bindings], steps[wails] = steps[wails], steps[bindings]
+			return steps
 		}},
-		{"removed protocol gate", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			removeRunStep(workflow, "test", protocolGateRun)
+		{"removed release binding gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			index := findRunStep(steps, bindingsGateRun)
+			return slices.Delete(steps, index, index+1)
 		}},
-		{"binding gate before the Wails build", testPath, "test", testGates, nil, false, func(workflow *workflowFile) {
-			swapRunSteps(workflow, "test", bindingsGateRun, wailsBuildRun)
+		{"continue-on-error release protocol gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			steps[findRunStep(steps, protocolGateRun)].ContinueOnError = &allowedToFail
+			return steps
 		}},
-		{"removed release binding gate", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			removeRunStep(workflow, "build", bindingsGateRun)
+		{"suppressed release protocol gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			steps[findRunStep(steps, protocolGateRun)].Run += " || true"
+			return steps
 		}},
-		{"continue-on-error release protocol gate", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			mutateRunStep(workflow, "build", protocolGateRun, func(step *workflowStep) { step.ContinueOnError = boolPtr(true) })
+		{"release binding gate after packaging", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			index := findRunStep(steps, bindingsGateRun)
+			step := steps[index]
+			return append(slices.Delete(steps, index, index+1), step)
 		}},
-		{"suppressed release protocol gate", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			mutateRunStep(workflow, "build", protocolGateRun, func(step *workflowStep) { step.Run += " || true" })
+		{"release binding gate before the Wails build", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			bindings, wails := findRunStep(steps, bindingsGateRun), findContainingRunStep(steps, wailsBuildRun)
+			steps[bindings], steps[wails] = steps[wails], steps[bindings]
+			return steps
 		}},
-		{"release binding gate after packaging", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			moveRunStepToEnd(workflow, "build", bindingsGateRun)
-		}},
-		{"release binding gate before the Wails build", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			swapRunSteps(workflow, "build", bindingsGateRun, wailsBuildRun)
-		}},
-		{"release Wails build allowed to fail", releasePath, "build", releaseGates, releaseFollowers, false, func(workflow *workflowFile) {
-			mutateContainingRunStep(workflow, "build", wailsBuildRun, func(step *workflowStep) { step.ContinueOnError = boolPtr(true) })
+		{"release Wails build allowed to fail", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
+			steps[findContainingRunStep(steps, wailsBuildRun)].ContinueOnError = &allowedToFail
+			return steps
 		}},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
-			workflow := parseWorkflow(t, mutation.path)
-			mutation.mutate(&workflow)
-			problems := deliveryGateProblems(workflow, mutation.job, mutation.gates, mutation.followers)
-			if mutation.accepted {
-				if len(problems) != 0 {
-					t.Fatalf("accepted workflow mutation reported problems: %s", strings.Join(problems, "; "))
+			steps := mutation.mutate(parsedSteps(t, mutation.path, mutation.job))
+			err := checkDeliveryGates(steps)
+			if mutation.accept {
+				if err != nil {
+					t.Fatalf("accepted workflow mutation reported %v", err)
 				}
 				return
 			}
-			if len(problems) == 0 {
+			if err == nil {
 				t.Fatal("mutated workflow was accepted")
 			}
 		})

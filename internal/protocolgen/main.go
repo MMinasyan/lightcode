@@ -300,11 +300,10 @@ func nativeOperation(doc *openapi3.T, item *openapi3.PathItem, declared *openapi
 		if schema.Value.Type == nil || !schema.Value.Type.Is("object") {
 			return operation{}, fmt.Errorf("request body schema is not one explicit object")
 		}
-		if declared.RequestBody.Value.Required {
-			op.body = modeRequired
-		} else {
-			op.body = modeOptional
+		if !declared.RequestBody.Value.Required {
+			return operation{}, fmt.Errorf("request body is optional, want required")
 		}
+		op.body = modeRequired
 	}
 	return op, nil
 }
@@ -414,9 +413,6 @@ import (
 {{- end}}
 	"context"
 	"encoding/json"
-{{- if .NeedsIO}}
-	"io"
-{{- end}}
 	"net/http"
 
 	"github.com/MMinasyan/lightcode/client"
@@ -473,12 +469,6 @@ func invokeGenerated(ctx context.Context, c *client.Client, operation string, pa
 		}
 {{- end}}
 {{- end}}
-{{- if .BodyOptional}}
-		var body io.Reader
-		if env.body != nil {
-			body = bytes.NewReader(env.body)
-		}
-{{- end}}
 		response, callErr := {{.Call}}
 		return response, {{.Expected}}, callErr
 {{end}}`
@@ -491,7 +481,6 @@ type armView struct {
 	QueryType     string
 	QueryRequired string
 	QueryOptional bool
-	BodyOptional  bool
 	Call          string
 	Expected      string
 }
@@ -501,7 +490,6 @@ type sourceData struct {
 	Names         []string
 	Arms          []armView
 	NeedsBytes    bool
-	NeedsIO       bool
 	NeedsProtocol bool
 }
 
@@ -513,9 +501,6 @@ func renderSource(operations []operation) ([]byte, error) {
 		data.Arms = append(data.Arms, arm(op))
 		if op.body != modeForbidden {
 			data.NeedsBytes = true
-		}
-		if op.body == modeOptional {
-			data.NeedsIO = true
 		}
 		if op.session != modeForbidden || op.field != modeForbidden || op.query != modeForbidden {
 			data.NeedsProtocol = true
@@ -548,7 +533,6 @@ func arm(op operation) armView {
 		Expected: strconv.Itoa(op.status),
 	}
 	view.NeedEnv = op.session != modeForbidden || op.field != modeForbidden || op.query != modeForbidden || op.body != modeForbidden
-	view.BodyOptional = op.body == modeOptional
 	if op.query != modeForbidden {
 		view.QueryType = op.id + "Params"
 		view.QueryOptional = op.query == modeOptional
@@ -577,11 +561,7 @@ func arm(op operation) armView {
 	name := "c." + op.id
 	if op.body != modeForbidden {
 		name += "WithBody"
-		if op.body == modeOptional {
-			arguments = append(arguments, "contentTypeJSON", "body")
-		} else {
-			arguments = append(arguments, "contentTypeJSON", "bytes.NewReader(env.body)")
-		}
+		arguments = append(arguments, "contentTypeJSON", "bytes.NewReader(env.body)")
 	}
 	view.Call = name + "(" + strings.Join(arguments, ", ") + ")"
 	return view

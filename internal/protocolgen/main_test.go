@@ -121,12 +121,13 @@ func TestSupportedAdditionGenerates(t *testing.T) {
 	}
 }
 
-// TestOptionalMembersGenerate proves the optional envelope modes derive from
-// the schema: an optional query binds only when present and an optional
-// request body passes a nil reader when absent, and the contract publishes
-// both as optional with the declared query primitive types.
-func TestOptionalMembersGenerate(t *testing.T) {
-	const addition = `  /v1/optional:
+// TestOptionalQueryMembersGenerate proves the optional query envelope modes
+// derive from the schema: a query mixing required and optional members binds
+// every member and requires the required ones, and an optional-only query
+// binds only when present through the nil-required guard. The contract
+// publishes both forms and neither operation declares a request body.
+func TestOptionalQueryMembersGenerate(t *testing.T) {
+	const mixedQuery = `  /v1/optional:
     post:
       operationId: Optional
       parameters:
@@ -140,50 +141,101 @@ func TestOptionalMembersGenerate(t *testing.T) {
           required: true
           schema:
             type: boolean
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
       responses:
         "200":
-          description: the optional operation
+          description: the mixed query operation
           content:
             application/json:
               schema:
                 type: object
 `
-	source, contract := generateFixture(t, fixtureHead+healthPath+eventsPath+addition)
-	if !strings.Contains(source, `"Optional": {`) && !strings.Contains(contract, `"Optional": {`) {
-		t.Fatalf("the optional operation is missing from the artifacts")
-	}
-	for _, want := range []string{
-		`bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberOptional)`,
-		`bindQuery(env.query, []string{"all"}, &query)`,
-		"var body io.Reader",
-		"if env.body != nil {",
-		"body = bytes.NewReader(env.body)",
-		"c.OptionalWithBody(ctx, &query, contentTypeJSON, body)",
-	} {
-		if !strings.Contains(source, want) {
-			t.Errorf("generated bindings are missing %q:\n%s", want, source)
-		}
-	}
-	for _, want := range []string{
-		`"body": "optional"`,
-		`"query": "required"`,
-		`"cursor": {
+	const optionalQuery = `  /v1/sessions/{id}/history:
+    get:
+      operationId: GetSessionHistory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: the optional query operation
+          content:
+            application/json:
+              schema:
+                type: object
+`
+	for _, tc := range []struct {
+		name     string
+		path     string
+		source   []string
+		contract []string
+	}{
+		{
+			name: "required and optional query members without a body",
+			path: mixedQuery,
+			source: []string{
+				`bindEnvelope(params, memberForbidden, memberForbidden, memberRequired, memberForbidden)`,
+				`bindQuery(env.query, []string{"all"}, &query)`,
+				`c.Optional(ctx, &query)`,
+			},
+			contract: []string{
+				`"Optional": {
+    "session_id": "forbidden",
+    "field": "forbidden",
+    "query": "required",
+    "body": "forbidden"`,
+				`"cursor": {
         "required": false,
         "type": "string"
       }`,
-		`"all": {
+				`"all": {
         "required": true,
         "type": "boolean"
       }`,
+			},
+		},
+		{
+			name: "an optional-only query binds only when present",
+			path: optionalQuery,
+			source: []string{
+				`bindEnvelope(params, memberRequired, memberForbidden, memberOptional, memberForbidden)`,
+				`if env.query != nil {`,
+				`bindQuery(env.query, nil, &query)`,
+				`c.GetSessionHistory(ctx, protocol.SessionID(env.session), &query)`,
+			},
+			contract: []string{
+				`"GetSessionHistory": {
+    "session_id": "required",
+    "field": "forbidden",
+    "query": "optional",
+    "body": "forbidden"`,
+				`"cursor": {
+        "required": false,
+        "type": "string"
+      }`,
+			},
+		},
 	} {
-		if !strings.Contains(contract, want) {
-			t.Errorf("invocation contract is missing %q:\n%s", want, contract)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			source, contract := generateFixture(t, fixtureHead+healthPath+eventsPath+tc.path)
+			for _, want := range tc.source {
+				if !strings.Contains(source, want) {
+					t.Errorf("generated bindings are missing %q:\n%s", want, source)
+				}
+			}
+			for _, want := range tc.contract {
+				if !strings.Contains(contract, want) {
+					t.Errorf("invocation contract is missing %q:\n%s", want, contract)
+				}
+			}
+		})
 	}
 }
 
@@ -484,6 +536,26 @@ func TestUnsupportedShapesWriteNothing(t *testing.T) {
       responses:
         "200":
           description: a text body
+          content:
+            application/json:
+              schema:
+                type: object
+`,
+		},
+		{
+			name: "an optional request body",
+			schema: base + `  /v1/other:
+    post:
+      operationId: Other
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: an optional body
           content:
             application/json:
               schema:
