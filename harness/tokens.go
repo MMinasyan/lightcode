@@ -3,8 +3,6 @@ package harness
 import (
 	_ "embed"
 	"encoding/base64"
-	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,38 +25,27 @@ var localEncoding = sync.OnceValues(func() (*tiktoken.Tiktoken, error) {
 })
 
 // newLocalEncoding constructs the pinned tiktoken-go cl100k_base encoding from
-// one rank table. Every nonempty line must be exactly one nonempty base64
-// token and one non-negative decimal rank, and token identities must be
-// unique; a duplicate rank identity is rejected by NewCoreBPE's reverse-map
-// size check. Anything else is rejected instead of partially loaded.
+// one rank table: every nonempty line is split into its base64 token and
+// decimal rank, decoding and conversion failures are returned as they come,
+// and the pinned library's construction rejects an inconsistent table. The
+// bundled digest-pinned asset is the only production input, so no further
+// table validation is imposed.
 func newLocalEncoding(data []byte) (*tiktoken.Tiktoken, error) {
 	ranks := make(map[string]int)
-	for index, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		if line == "" {
 			continue
 		}
-		tokenText, rankText, paired := strings.Cut(line, " ")
-		if !paired || tokenText == "" || rankText == "" || strings.Contains(rankText, " ") {
-			return nil, fmt.Errorf("malformed rank line %d", index+1)
-		}
+		tokenText, rankText, _ := strings.Cut(line, " ")
 		token, err := base64.StdEncoding.DecodeString(tokenText)
 		if err != nil {
-			return nil, fmt.Errorf("rank line %d: %w", index+1, err)
-		}
-		if len(token) == 0 {
-			return nil, fmt.Errorf("rank line %d: empty token", index+1)
+			return nil, err
 		}
 		rank, err := strconv.Atoi(rankText)
-		if err != nil || rank < 0 {
-			return nil, fmt.Errorf("rank line %d: invalid rank %q", index+1, rankText)
-		}
-		if _, duplicate := ranks[string(token)]; duplicate {
-			return nil, fmt.Errorf("rank line %d: duplicate token %q", index+1, tokenText)
+		if err != nil {
+			return nil, err
 		}
 		ranks[string(token)] = rank
-	}
-	if len(ranks) == 0 {
-		return nil, errors.New("empty rank table")
 	}
 	encoding := &tiktoken.Encoding{
 		Name:           tiktoken.MODEL_CL100K_BASE,

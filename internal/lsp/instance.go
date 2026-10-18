@@ -161,11 +161,13 @@ func (inst *instance) start(ctx context.Context) (chan struct{}, error) {
 	inst.procDone = make(chan struct{})
 	procDone := inst.procDone
 	inst.openedVer = make(map[string]int)
-	inst.mu.Unlock()
-
+	// The cache reset shares the hold that installs this attempt's handles:
+	// a capture can only ever see this attempt's state together with this
+	// attempt's diagnostics, never one without the other.
 	inst.diagMu.Lock()
 	inst.diagnostics = make(map[string][]protocol.Diagnostic)
 	inst.diagMu.Unlock()
+	inst.mu.Unlock()
 
 	rpc := jsonrpc.NewClient(stdin, stdout, stderr, func(method string, params json.RawMessage) {
 		// Bind the handler to this launch's ready channel so a notification
@@ -569,6 +571,38 @@ func (inst *instance) fileDiagnostics(uri string) []protocol.Diagnostic {
 	return inst.diagnostics[uri]
 }
 
+// captureDiagnostics takes an owned sample of the current attempt's
+// diagnostics for the given paths. The liveness requirement and the sample
+// share one instance-mutex hold: the instance must be ready with its current
+// process still running, and only then are the requested URIs' cached slices
+// copied out under the diagnostics lock, so a transition — a new attempt's
+// reset or a teardown's clear — can never land between the liveness decision
+// and the sample. The bool reports whether a live attempt supplied the sample;
+// false is the unavailable refusal.
+func (inst *instance) captureDiagnostics(paths []string) ([][]protocol.Diagnostic, bool) {
+	inst.mu.Lock()
+	if inst.state != stateReady || inst.procDone == nil {
+		inst.mu.Unlock()
+		return nil, false
+	}
+	// A process that has exited reads as not alive even before its watcher
+	// moves the state.
+	select {
+	case <-inst.procDone:
+		inst.mu.Unlock()
+		return nil, false
+	default:
+	}
+	inst.diagMu.RLock()
+	sample := make([][]protocol.Diagnostic, len(paths))
+	for i, p := range paths {
+		sample[i] = append([]protocol.Diagnostic(nil), inst.diagnostics[protocol.URIFromPath(p)]...)
+	}
+	inst.diagMu.RUnlock()
+	inst.mu.Unlock()
+	return sample, true
+}
+
 func (inst *instance) resetIdle() {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
@@ -611,22 +645,21 @@ func (inst *instance) killForTeardown() {
 		rpc.Close()
 	}
 
-	// Clear the captured attempt's handles only if it is still the current
-	// one — procDone is the field this teardown actually waited on and the
-	// identity of the attempt it captured.
+	// Clear the captured attempt's handles and diagnostics only if it is
+	// still the current one — procDone is the field this teardown actually
+	// waited on and the identity of the attempt it captured. The clear shares
+	// the identity check's hold, so a replacement attempt can neither lose
+	// its handles nor its diagnostics to a superseded teardown.
 	inst.mu.Lock()
 	if inst.procDone == procDone {
 		inst.rpc = nil
 		inst.cmd = nil
 		inst.openedVer = make(map[string]int)
-		inst.mu.Unlock()
-
 		inst.diagMu.Lock()
 		inst.diagnostics = make(map[string][]protocol.Diagnostic)
 		inst.diagMu.Unlock()
-	} else {
-		inst.mu.Unlock()
 	}
+	inst.mu.Unlock()
 }
 
 func (inst *instance) shutdown() {
@@ -663,20 +696,19 @@ func (inst *instance) shutdown() {
 		}
 	}
 
-	// Clear the captured attempt's handles only if it is still the current
-	// one — procDone is the field this shutdown actually waited on and the
-	// identity of the attempt it captured.
+	// Clear the captured attempt's handles and diagnostics only if it is
+	// still the current one — procDone is the field this shutdown actually
+	// waited on and the identity of the attempt it captured. The clear shares
+	// the identity check's hold, so a replacement attempt can neither lose
+	// its handles nor its diagnostics to a superseded shutdown.
 	inst.mu.Lock()
 	if inst.procDone == procDone {
 		inst.rpc = nil
 		inst.cmd = nil
 		inst.openedVer = make(map[string]int)
-		inst.mu.Unlock()
-
 		inst.diagMu.Lock()
 		inst.diagnostics = make(map[string][]protocol.Diagnostic)
 		inst.diagMu.Unlock()
-	} else {
-		inst.mu.Unlock()
 	}
+	inst.mu.Unlock()
 }

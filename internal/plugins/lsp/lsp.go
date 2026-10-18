@@ -52,9 +52,8 @@ const (
 
 	// diagnosticsDescription says the tool checks the files changed by this
 	// Session — every call recomputes the candidates, there is no
-	// since-the-previous-query cursor — and reports an asynchronous cache
-	// sample rather than proof that analysis of the latest edit finished.
-	diagnosticsDescription = "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings). Diagnostics are asynchronous and may not reflect the latest edit."
+	// since-the-previous-query cursor.
+	diagnosticsDescription = "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)."
 	diagnosticsParameters  = `{"type":"object","properties":{}}`
 
 	workspaceSymbolDescription = "Search for symbols by name across the project. Returns matching functions, types, variables, etc. with their file locations."

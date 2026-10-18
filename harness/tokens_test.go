@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/pkoukk/tiktoken-go"
 )
 
 // tokenizerColdChildEnv switches this test binary into the child mode of the
@@ -179,31 +181,25 @@ func TestLocalEncodingVectors(t *testing.T) {
 	}
 }
 
-// TestNewLocalEncodingRejectsMalformedData pins the construction contract: the
-// bundled rank table is all-or-nothing, so a malformed pair, invalid base64 or
-// rank, or a duplicate token or rank identity fails construction.
-func TestNewLocalEncodingRejectsMalformedData(t *testing.T) {
+// TestNewLocalEncodingDuplicateRankIsConstructionError pins the construction
+// contract's one rejection row: a rank table whose tokens carry duplicate rank
+// identities is rejected by the pinned library's construction (its reverse-map
+// size check), and the memoized construction failure selects the characters/3
+// fallback on the next estimate.
+func TestNewLocalEncodingDuplicateRankIsConstructionError(t *testing.T) {
 	tokenA := base64.StdEncoding.EncodeToString([]byte("ab"))
 	tokenB := base64.StdEncoding.EncodeToString([]byte("cd"))
-	if _, err := newLocalEncoding([]byte(tokenA + " 0\n" + tokenB + " 1\n")); err != nil {
-		t.Fatalf("well-formed rank table: %v", err)
+	table := []byte(tokenA + " 0\n" + tokenB + " 0\n")
+	if _, err := newLocalEncoding(table); err == nil {
+		t.Fatal("duplicate rank identities: construction succeeded, want the library's rejection")
 	}
-	for _, row := range []struct{ name, data string }{
-		{"no lines", ""},
-		{"blank lines only", "\n\n"},
-		{"missing rank", tokenA + "\n"},
-		{"empty rank", tokenA + " \n"},
-		{"extra rank", tokenA + " 0 1\n"},
-		{"invalid base64", "!!! 0\n"},
-		{"invalid rank", tokenA + " x\n"},
-		{"negative rank", tokenA + " -1\n"},
-		{"empty token", " 0\n"},
-		{"duplicate token", tokenA + " 0\n" + tokenA + " 1\n"},
-		{"duplicate rank", tokenA + " 0\n" + tokenB + " 0\n"},
-	} {
-		if _, err := newLocalEncoding([]byte(row.data)); err == nil {
-			t.Errorf("%s: construction succeeded, want rejection", row.name)
-		}
+
+	old := localEncoding
+	localEncoding = sync.OnceValues(func() (*tiktoken.Tiktoken, error) { return newLocalEncoding(table) })
+	t.Cleanup(func() { localEncoding = old })
+	// The latched failure is the fallback's input: 6 characters / 3.
+	if got := estimateTokens("abcdef", nil); got != 2 {
+		t.Fatalf("estimateTokens over the failed construction = %d, want the characters/3 fallback 2", got)
 	}
 }
 

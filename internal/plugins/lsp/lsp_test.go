@@ -616,6 +616,9 @@ func TestDiagnosticsNoCursorAcrossCalls(t *testing.T) {
 		if outcome.Result.Status != model.ResultSuccess {
 			t.Fatalf("call %d = %+v, want success", call, outcome.Result)
 		}
+		if outcome.Result.Content != "No errors found." {
+			t.Fatalf("call %d content = %q, want the clean no-error text", call, outcome.Result.Content)
+		}
 		waitForQuery(t, requests, uriA, call)
 		waitForQuery(t, requests, uriB, call)
 	}
@@ -888,8 +891,9 @@ func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
 }
 
 // TestWorkspaceSymbolAllFailedIsError: a server whose workspace/symbol reply
-// cannot be decoded contributes no symbols and must not surface as a clean
-// no-symbols result.
+// cannot be decoded contributes no symbols, so no instance answered and the
+// entry returns the fixed unavailability error, never a clean no-symbols
+// result.
 func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 	home := t.TempDir()
 	plantServer(t, home, "gopls", "gopls", 0, "", "1", "")
@@ -901,8 +905,8 @@ func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError {
-		t.Fatalf("undecodable symbol reply = %+v, want an error outcome carrying the failure", outcome.Result)
+	if outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available for the symbol query." {
+		t.Fatalf("undecodable symbol reply = %+v, want the fixed unavailability error", outcome.Result)
 	}
 }
 
@@ -962,14 +966,14 @@ func TestNormalizeContracts(t *testing.T) {
 	}
 }
 
-// TestDescriptionsAndPreparationShape: the updated diagnostics description,
-// the verbatim workspace_symbol schema, and the one workspace.inspect pair.
+// TestDescriptionsAndPreparationShape: the diagnostics description, the
+// verbatim workspace_symbol schema, and the one workspace.inspect pair.
 func TestDescriptionsAndPreparationShape(t *testing.T) {
 	diagDesc, err := diagnosticsTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
 	if err != nil {
 		t.Fatalf("diagnostics describe: %v", err)
 	}
-	if diagDesc.Definition.Description != "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings). Diagnostics are asynchronous and may not reflect the latest edit." {
+	if diagDesc.Definition.Description != "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)." {
 		t.Fatalf("diagnostics description = %q", diagDesc.Definition.Description)
 	}
 	if diagDesc.Definition.Name != "diagnostics" || !diagDesc.Available {

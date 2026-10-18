@@ -176,13 +176,16 @@ func TestWorkspaceSymbolReturnsCanceledNotSwallowed(t *testing.T) {
 }
 
 // TestGetDiagnosticsCanonicalCancellationReturnsPartial pins the cancellation
-// observation at the sync wait: a canceled caller gets the could-not-check
-// content accumulated so far with the cancellation error. The healthy file
-// synchronizes (its document sync proves the sample wait is under way) while
-// the missing leaf accumulates its refusal.
+// observation at the sample window: a canceled caller gets the could-not-check
+// content accumulated so far with the cancellation error. The instance mutex
+// gates the query — it cannot pass its first waitReady while the test holds
+// the lock — so the cancellation is issued before the query can reach the
+// sample window and the window's cancellation case, the only ready case when
+// the query gets there, is its outcome. The healthy file synchronizes (no
+// refusal line for it) while the missing leaf accumulates its refusal, so the
+// returned partial proves the query reached the window instead of the
+// nothing-synchronized gate.
 func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
-	reqLog := filepath.Join(t.TempDir(), "requests.log")
-	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 	if err := inst.waitReady(context.Background()); err != nil {
@@ -202,7 +205,9 @@ func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
 	missing := filepath.Join(dir, "missing.go")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan struct{})
+	inst.mu.Lock()
 	go func() {
 		defer close(done)
 		client := NewClient(m)
@@ -213,21 +218,18 @@ func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
 		if !strings.Contains(content, "(could not check)") {
 			t.Errorf("GetDiagnosticsCanonical canceled content = %q, want the partial could-not-check line", content)
 		}
+		if !strings.Contains(content, "missing.go") || strings.Contains(content, "healthy.go") {
+			t.Errorf("GetDiagnosticsCanonical canceled content = %q, want the missing leaf's refusal only", content)
+		}
 	}()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		data, _ := os.ReadFile(reqLog)
-		if strings.Contains(string(data), "textDocument/didOpen") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the healthy document sync never reached the server")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	cancel()
-	<-done
+	inst.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the canceled query never settled")
+	}
 }
 
 // TestGetDiagnosticsCanonicalRefusesReplacedSymlink pins the canonical read:
@@ -360,15 +362,8 @@ func TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck(t *testing.T) {
 	if !strings.Contains(got, "gone.go") || !strings.Contains(got, "notes.txt") {
 		t.Fatalf("GetDiagnosticsCanonical = %q, want the failed-path lines for the refused documents", got)
 	}
-	noErrorIdx := strings.Index(got, "No error diagnostics are currently reported for the synchronized files.")
-	firstRefusedIdx := strings.Index(got, "(could not check)")
-	lastRefusedIdx := strings.LastIndex(got, "(could not check)")
-	caveatIdx := strings.Index(got, "Diagnostics are asynchronous and may not reflect the latest edit.")
-	if noErrorIdx < 0 || firstRefusedIdx < 0 || caveatIdx < 0 {
-		t.Fatalf("GetDiagnosticsCanonical = %q, want the sampled no-error line, the refused lines and the caveat", got)
-	}
-	if noErrorIdx > firstRefusedIdx || lastRefusedIdx > caveatIdx {
-		t.Fatalf("GetDiagnosticsCanonical = %q, want the no-error line before the refused lines before the caveat", got)
+	if !strings.Contains(got, "(could not check)") {
+		t.Fatalf("GetDiagnosticsCanonical = %q, want the could-not-check rendering of the refused paths", got)
 	}
 }
 
