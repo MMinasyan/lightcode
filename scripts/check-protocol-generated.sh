@@ -4,9 +4,9 @@
 # untracked output may appear under the artifact paths.
 set -eu
 
-git diff --exit-code -- protocol/protocol.gen.go frontend/src/generated/protocol
+git diff --exit-code -- protocol/protocol.gen.go frontend/src/generated/protocol internal/clientops/operations.gen.go frontend/src/generated/native-invocations.json
 
-untracked=$(git ls-files --others --exclude-standard -- protocol/protocol.gen.go frontend/src/generated/protocol)
+untracked=$(git ls-files --others --exclude-standard -- protocol/protocol.gen.go frontend/src/generated/protocol internal/clientops/operations.gen.go frontend/src/generated/native-invocations.json)
 if [ -n "$untracked" ]; then
 	echo "untracked generated protocol artifacts:" >&2
 	printf '%s\n' "$untracked" >&2

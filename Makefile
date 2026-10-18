@@ -58,6 +58,7 @@ uninstall:
 
 generate-protocol:
 	go tool oapi-codegen --config protocol/oapi-codegen.yaml -o protocol/protocol.gen.go protocol/openapi.yaml
+	go run ./internal/protocolgen -schema protocol/openapi.yaml -out internal/clientops/operations.gen.go -native-contract-out frontend/src/generated/native-invocations.json
 	cd frontend && npm run generate-protocol
 
 check-protocol: generate-protocol

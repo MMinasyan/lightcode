@@ -22,6 +22,7 @@ import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 import { RuntimeConnection } from './connection';
 import { extractSettingsText } from './exactjson';
 import { invokeNative } from './results';
+import { assertNativeInvocations } from './nativecontract';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 const NEWER = '2026-10-02T10:00:00Z';
@@ -290,9 +291,24 @@ async function settle() {
 }
 
 afterEach(async () => {
+  // The mounted UI's recorded native invocations are asserted here, outside
+  // every application promise and catch, before clearAllMocks removes them: a
+  // violating envelope fails the teardown even when the application's own
+  // expected transport outcome still rendered. Tests that exercise only the
+  // generic invocation boundary without mounting UI acquire no such
+  // obligation. The DOM and mock cleanup stays in the finally block so an
+  // assertion failure cannot contaminate the next test.
+  const mountedUI = mounted.length > 0;
   for (const component of mounted.splice(0)) unmount(component);
-  document.body.innerHTML = '';
-  vi.clearAllMocks();
+  await tick();
+  try {
+    if (mountedUI) {
+      assertNativeInvocations(vi.mocked(Call).mock.calls);
+    }
+  } finally {
+    document.body.innerHTML = '';
+    vi.clearAllMocks();
+  }
 });
 
 describe('real generated stack over the byte bridge', () => {

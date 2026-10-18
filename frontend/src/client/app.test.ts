@@ -28,6 +28,7 @@ import { AppVersion, Call, PickDirectory, SetTitle } from '../../client-bindings
 import { BrowserOpenURL } from '../../client-bindings/wailsjs/runtime/runtime';
 import { SessionReader } from './reader';
 import { AttemptLedger } from './attempts';
+import { assertNativeInvocations } from './nativecontract';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 
@@ -264,17 +265,30 @@ async function settle() {
 }
 
 afterEach(async () => {
+  // The mounted UI's recorded native invocations are asserted here, outside
+  // every application promise and catch, before clearAllMocks removes them: a
+  // violating envelope fails the teardown even when the application's own
+  // expected outcome still rendered. The DOM and mock cleanup stays in the
+  // finally block so an assertion failure cannot contaminate the next test.
+  const mountedUI = mounted.length > 0;
   for (const component of mounted.splice(0)) {
     unmount(component);
   }
-  document.body.innerHTML = '';
-  vi.clearAllMocks();
-  // clearAllMocks does not reset implementations; a previous test's
-  // mockImplementation can leak into the next test.  Reset the two
-  // highest-traffic mocks to a neutral default so every test that needs
-  // specific behavior sets its own implementation explicitly.
-  vi.mocked(sdk.ListSessions).mockImplementation(async () => ok([]));
-  vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration()));
+  await tick();
+  try {
+    if (mountedUI) {
+      assertNativeInvocations(vi.mocked(Call).mock.calls);
+    }
+  } finally {
+    document.body.innerHTML = '';
+    vi.clearAllMocks();
+    // clearAllMocks does not reset implementations; a previous test's
+    // mockImplementation can leak into the next test.  Reset the two
+    // highest-traffic mocks to a neutral default so every test that needs
+    // specific behavior sets its own implementation explicitly.
+    vi.mocked(sdk.ListSessions).mockImplementation(async () => ok([]));
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration()));
+  }
 });
 
 describe('initial composition', () => {
