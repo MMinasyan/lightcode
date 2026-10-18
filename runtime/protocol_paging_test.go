@@ -41,7 +41,6 @@ func pageHeaders(n int) []harness.HistoryEntryHeader {
 		headers = append(headers, harness.HistoryEntryHeader{
 			EntryID:     pageEntryID(i),
 			OperationID: "op-1",
-			Sequence:    int64(i + 1),
 			Kind:        harness.EntryInput,
 			InputOrigin: harness.InputOriginUser,
 		})
@@ -195,8 +194,8 @@ func TestHistoryPagePureIndivisibleBoundary(t *testing.T) {
 	resultID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb99"
 	headers := pageHeaders(50)
 	headers = append(headers,
-		harness.HistoryEntryHeader{EntryID: assistantID, OperationID: "op-1", Sequence: 51, Kind: harness.EntryAssistant},
-		harness.HistoryEntryHeader{EntryID: resultID, OperationID: "op-1", Sequence: 52, Kind: harness.EntryToolResult},
+		harness.HistoryEntryHeader{EntryID: assistantID, OperationID: "op-1", Kind: harness.EntryAssistant},
+		harness.HistoryEntryHeader{EntryID: resultID, OperationID: "op-1", Kind: harness.EntryToolResult},
 	)
 
 	page1, older1, err := selectHistoryPage(convSessionID, headers, nil)

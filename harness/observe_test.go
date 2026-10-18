@@ -879,12 +879,12 @@ func TestObserveSuppression(t *testing.T) {
 	})
 }
 
-// TestObserveCurrentPair proves the cached-only publication read samples the
+// TestObserveCurrentPair proves the passive publication read samples the
 // pair current after later publications, rather than a pair captured at a
 // producer's lock time.
 func TestObserveCurrentPair(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use caches the view
+	if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use establishes the cell
 		t.Fatalf("ReadSessionView: %v", err)
 	}
 	c := cachedCoordinator(t, h, testSessionID)
@@ -907,7 +907,7 @@ func TestObserveCurrentPair(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("delayed emission facts = %d, want one", len(facts))
 	}
-	// The cached-only publication read used by passive publishers samples
+	// The passive publication read used by passive publishers samples
 	// the pair current at publication time, after the later publications
 	// above landed.
 	current := snapshotPair(t, h, testSessionID)
@@ -1566,7 +1566,8 @@ func TestObserveToolLifecycle(t *testing.T) {
 func TestObserveRematerializationNoHint(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the view
+	leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
+	if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
 		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	col := observeHarness(h)
@@ -1634,7 +1635,7 @@ func TestObserveRestartNoReplay(t *testing.T) {
 }
 
 // observationCountingStorage fails every read and counts every access: the
-// cached-only observation read must perform no storage work at all.
+// passive observation read must perform no storage work at all.
 type observationCountingStorage struct {
 	Storage
 	calls int
@@ -1655,19 +1656,27 @@ func (s *observationCountingStorage) ReadRegisters(ctx context.Context, sessionI
 	return s.Storage.ReadRegisters(ctx, sessionID)
 }
 
-// TestReadObservation pins the cached-only observation read: a warm valid
-// coordinator returns the identity (with its Workspace) and the current pair;
-// a cache miss, a deleted, and a corrupt Session report false without any
-// storage access; a cold Session is never materialized by the read.
+// TestReadObservation pins the passive observation read: a materialized
+// coordinator returns its retained identity (with its Workspace) and the
+// current pair whether or not its graph is resident; a never-materialized,
+// deleted, and corrupt Session report false without any storage access; a
+// cold Session is never materialized by the read.
 func TestReadObservation(t *testing.T) {
-	t.Run("valid warm coordinator", func(t *testing.T) {
+	t.Run("valid coordinator with a released graph", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use keeps the graph cached
+		if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil {
 			t.Fatalf("ReadSessionView: %v", err)
+		}
+		cell := cachedCoordinator(t, h, testSessionID)
+		cell.mu.Lock()
+		graphless := cell.graph == nil
+		cell.mu.Unlock()
+		if !graphless {
+			t.Fatalf("the read's graph stayed resident, want the released state")
 		}
 		identity, revision, ok := h.ReadObservation(testSessionID)
 		if !ok {
-			t.Fatal("ReadObservation on a warm coordinator reported unavailable")
+			t.Fatal("ReadObservation on a released established coordinator reported unavailable")
 		}
 		if identity.SessionID != testSessionID {
 			t.Fatalf("identity session = %q, want %q", identity.SessionID, testSessionID)
@@ -1680,14 +1689,14 @@ func TestReadObservation(t *testing.T) {
 		}
 	})
 
-	t.Run("cache miss performs no storage work", func(t *testing.T) {
+	t.Run("never materialized performs no storage work", func(t *testing.T) {
 		store := &observationCountingStorage{Storage: freshSessionStore(t)}
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 		if _, _, ok := h.ReadObservation(testSessionID); ok {
 			t.Fatal("ReadObservation on a never-materialized Session reported available")
 		}
 		if store.calls != 0 {
-			t.Fatalf("storage calls on a cache miss = %d, want zero", store.calls)
+			t.Fatalf("storage calls on a never-materialized read = %d, want zero", store.calls)
 		}
 		// The read left the registry cold: a repeat miss performs no work and
 		// the Session stays unmaterialized.

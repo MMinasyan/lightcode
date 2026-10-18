@@ -317,13 +317,14 @@ func toolFinishedEvent(scope protocol.Scope, callID string, status model.ToolRes
 // plugin scope opens — the Runtime supplies its neutral plugin-warning sink to
 // the composition — and its Harness handle is bound before work admission, so
 // no caller can observe it unarmed: facts and warning publications only exist
-// for admitted work. Every publication samples the subject's identity and
-// current revision inside the observation section through the cached-only
+// for admitted work. Every publication samples the subject's retained identity
+// and current revision inside the observation section through the passive
 // Harness read, so a notification delayed behind a later commit carries the
-// current state, never the producer's stale pair. A Harness fact whose
-// subject is unavailable suppresses only its hint while the durable commit
-// stands; every Session warning publication checks the subject before
-// mutating, so a deleted or unknown subject is never reintroduced.
+// current state, never the producer's stale pair, and a materialized Session
+// whose graph is not resident still names itself. A Harness fact whose subject
+// is unavailable suppresses only its hint while the durable commit stands;
+// every Session warning publication checks the subject before mutating, so a
+// deleted or unknown subject is never reintroduced.
 type observationAdapter struct {
 	obs      *observation
 	warnings *warningStore
@@ -338,7 +339,7 @@ func newObservationAdapter(obs *observation, warnings *warningStore) *observatio
 
 // observe is the Harness fact callback: one fact publishes at most one event.
 // The fact's own revision pair is superseded by the pair sampled at
-// publication time; a Session that is deleted, corrupt, or not cached
+// publication time; a Session that is deleted, corrupt, or unestablished
 // suppresses its hint; progress events carry the Operation's scope.
 func (a *observationAdapter) observe(fact harness.HarnessFact) {
 	if a == nil {
@@ -373,9 +374,10 @@ func (a *observationAdapter) observe(fact harness.HarnessFact) {
 	})
 }
 
-// readSubject samples one Session's identity through the cached-only
-// observation read. A test-constructed adapter without a bound Harness
-// suppresses the hint, mirroring the nil-store presentation drop.
+// readSubject samples one Session's retained identity and current revision
+// pair through the passive observation read. A test-constructed adapter
+// without a bound Harness suppresses the hint, mirroring the nil-store
+// presentation drop.
 func (a *observationAdapter) readSubject(sessionID string) (harness.SessionIdentity, harness.SessionRevision, bool) {
 	if a.h == nil {
 		return harness.SessionIdentity{}, harness.SessionRevision{}, false

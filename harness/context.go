@@ -45,7 +45,7 @@ func (h *Harness) contextSource(c *coordinator, operationID string) agent.Contex
 	}
 }
 
-// projectContext is the pure projection body: it snapshots the cached graph
+// projectContext is the pure projection body: it snapshots the resident graph
 // under the coordinator lock, releases it, and builds the messages without
 // touching steering or queued buffers. When the Session register's
 // CompactionEntryID is set, the projection is the system message, one
@@ -176,7 +176,7 @@ func signalProjectedText(content string) string {
 // interrupt: unselected items drain after the interrupted Operation's
 // terminal.
 func (h *Harness) Interrupt(ctx context.Context, sessionID string) error {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}

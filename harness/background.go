@@ -193,22 +193,22 @@ func (h *Harness) DeliverBackgroundCompletion(ctx context.Context, sessionID, co
 		return invalidInput("background completion content must be non-empty")
 	}
 	h.mu.Lock()
-	cached := h.sessions[sessionID]
+	owner := h.sessions[sessionID]
 	h.mu.Unlock()
-	if cached == nil { // registration necessarily cached the member's owning coordinator
+	if owner == nil { // registration necessarily installed the member's owning coordinator
 		return nil
 	}
-	cached.mu.Lock()
-	member, ok := h.claimBackgroundMember(cached, completionID)
-	cached.mu.Unlock()
+	owner.mu.Lock()
+	member, ok := h.claimBackgroundMember(owner, completionID)
+	owner.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	err := h.deliverBackgroundCompletion(ctx, cached, member, content)
+	err := h.deliverBackgroundCompletion(ctx, owner, member, content)
 	if err != nil {
 		h.recordStorageFailure(err)
 	}
-	h.finishBackgroundMember(cached, member)
+	h.finishBackgroundMember(owner, member)
 	return err
 }
 
@@ -219,7 +219,7 @@ func (h *Harness) DeliverBackgroundCompletion(ctx context.Context, sessionID, co
 // remains in the group through the whole attempt, so recursive readiness and
 // Stop cannot treat it as finished before delivery has resolved.
 func (h *Harness) deliverBackgroundCompletion(ctx context.Context, c *coordinator, member *backgroundMember, content string) error {
-	validated, release, err := h.acquireCoordinator(ctx, c.sessionID, true)
+	validated, release, err := h.acquireCoordinator(ctx, c.sessionID)
 	if err != nil {
 		return err
 	}
@@ -295,7 +295,7 @@ func (h *Harness) deliverIdleCompletion(c *coordinator, member *backgroundMember
 // deliverClosedCompletion commits one operationless background_completion
 // signal entry through the compare/commit/adopt/rematerialize pattern, with
 // the coordinator mutex held across the whole transaction: it re-reads and
-// decodes the parent register, compares its revision with the cached view —
+// decodes the parent register, compares its revision with the resident view —
 // decode failure is corruption and drift the revision-race conflict — inserts
 // the entry with related_member{kind, id} and the producer-bounded content,
 // and replaces the Session register with its unchanged payload and advanced
@@ -365,7 +365,7 @@ func (h *Harness) deliverClosedCompletion(c *coordinator, member *backgroundMemb
 	if err != nil {
 		h.markCorrupt(sessionID, err)
 		c.mu.Unlock()
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 			if rerr := h.rematerialize(settleCtx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 				return rerr
 			}
@@ -407,8 +407,12 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 	// though the Harness is shutting down, so the abandon branch is genuine
 	// unavailability only.
 	settleCtx := context.WithoutCancel(h.ctx)
-	_, release, err := h.acquireCoordinator(settleCtx, c.sessionID, true)
+	_, release, err := h.acquireCoordinator(settleCtx, c.sessionID)
 	if err != nil {
+		// The failed acquisition is the settlement's storage-class outcome:
+		// it is retained before the obligation is abandoned, so Wait reports
+		// the cause that stopped the settlement.
+		h.recordStorageFailure(err)
 		// validation failure takes the pending obligation for abandonment
 		c.mu.Lock()
 		info := c.pendingCompletion
@@ -450,10 +454,10 @@ func (h *Harness) childCompletionSettled(c *coordinator, settledOperationID stri
 }
 
 // abandonChildCompletion releases one pending completion's process-local
-// ownership without delivery: it looks up the parent's cached registry
-// member and, on a resolved coordinator, claim-finishes the completion —
-// no corruption validation is bypassed and no compensating write is made;
-// durable running child Operations remain for recovery.
+// ownership without delivery: it looks up the parent's registry member and, on
+// a resolved coordinator, claim-finishes the completion — no corruption
+// validation is bypassed and no compensating write is made; durable running
+// child Operations remain for recovery.
 func (h *Harness) abandonChildCompletion(parentID, completionID string) {
 	h.mu.Lock()
 	parent := h.sessions[parentID]
@@ -584,10 +588,9 @@ func liveBackground(c *coordinator) bool {
 // one's interval and returns its stored error. Member-stop errors are
 // collected during the stop and returned only after convergence; no
 // state-owning lock is ever held while waiting, and no error skips a wait.
-// The public entry is a metadata-only use: it validates the addressed Session
-// and then runs the stop body.
+// The public entry validates the addressed Session and then runs the stop body.
 func (h *Harness) Stop(ctx context.Context, sessionID string) error {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -599,7 +602,7 @@ func (h *Harness) Stop(ctx context.Context, sessionID string) error {
 // retained identity and its local group, run, and reservation handles, so a
 // caller that already holds a validated cell stops it directly. A specifically
 // addressed child still materializes through the recursive public Stop when it
-// is not cached: that wait is part of the stop, never skipped.
+// has no resident graph: that wait is part of the stop, never skipped.
 func (h *Harness) stopCoordinator(ctx context.Context, c *coordinator) error {
 	sessionID := c.sessionID
 	c.mu.Lock()
@@ -747,7 +750,7 @@ func (h *Harness) stopCoordinator(ctx context.Context, c *coordinator) error {
 // StopAll stops every established Session's background ownership group and
 // joins the collected errors. It snapshots the established cells — the ones
 // whose graph was validated at least once, so they own every local field
-// whether or not a graph is cached — and drives each stop body directly with
+// whether or not a graph is resident — and drives each stop body directly with
 // its retained identity and local handles: an idle corpus is never loaded to
 // be classified. It is idempotent: a stopped root with no live members and a
 // permanently closed child both stop again as no-ops.
@@ -780,7 +783,7 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 	if spawn == nil {
 		return invalidInput("job start requires a non-nil spawn callback")
 	}
-	c, release, err := h.acquireCoordinator(ctx, sessionID, true)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -848,7 +851,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
-	c, release, err := h.acquireCoordinator(ctx, req.ParentSessionID, true)
+	c, release, err := h.acquireCoordinator(ctx, req.ParentSessionID)
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
@@ -903,7 +906,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	})
 	if err != nil {
 		h.markCorrupt(req.ParentSessionID, err)
-		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 			if rerr := h.rematerialize(prepCtx, c, req.ParentSessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 				h.claimFinishBackgroundMember(c, member.completionID)
 				return LaunchChildResult{}, rerr
@@ -919,7 +922,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	// The committed child installs as a stable cell with its validated durable
 	// graph and a call-owned pin, so the pending completion and the execution
 	// are installed on the real child rather than on a failed-load placeholder.
-	childCoordinator, childRelease, err := h.acquireCoordinator(ctx, childID, true)
+	childCoordinator, childRelease, err := h.acquireCoordinator(ctx, childID)
 	if err != nil {
 		// the durable running Operation stays for recovery; no delivery
 		h.recordStorageFailure(err)
@@ -989,12 +992,12 @@ func (h *Harness) launchTransaction(tx Transaction, view SessionRecord, req Laun
 // delivery — and otherwise returns the handoff failure after the
 // interruption and the finish.
 func (h *Harness) settleRejectedChildLaunch(ctx context.Context, c *coordinator, member *backgroundMember, childID, operationID string, handoffErr error) error {
-	child, childRelease, err := h.acquireCoordinator(ctx, childID, true)
+	child, childRelease, err := h.acquireCoordinator(ctx, childID)
 	if err == nil {
 		defer childRelease()
 		settleCtx := context.WithoutCancel(h.ctx)
 		err = recoverRunningOperation(settleCtx, h.deps.Storage, childID, operationID)
-		if err == nil { // the cached child view predates the settlement commit
+		if err == nil { // the resident child view predates the settlement commit
 			err = h.rematerialize(settleCtx, child, childID)
 		}
 	}

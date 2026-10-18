@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -616,6 +617,159 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 		assertNoEvent(t, sub)
 		if after, _ := r.warnings.snapshot(); after != revision {
 			t.Fatalf("a late report advanced the store: %d → %d", revision, after)
+		}
+	})
+}
+
+// TestObservationStopAllJobFinishHints proves the StopAll publication path on
+// the real producer -> adapter -> subscription chain over a Session whose
+// graph is not resident: the stopping invalidation is queued by the time
+// StopAll enters the job stopper, and the member finish's job-scoped hint
+// carries the owning identity and an advanced pair that authoritative
+// hydration agrees with.
+func TestObservationStopAllJobFinishHints(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer func() {
+			if err := bg.r.Close(context.Background()); err != nil {
+				bg.t.Errorf("Close: %v", err)
+			}
+		}()
+		sub, err := bg.r.Subscribe(256)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		jobSession := bg.session("stopall-job")
+		workspace := sessionViewThroughRuntime(t, bg.r, jobSession).Header.Identity.Workspace
+		completionID := bg.startJob(jobSession, "0a1b2c3d")
+		stopper.addDelivery(jobSession, completionID, "job report")
+
+		// Twelve other idle Sessions are created after the job: under the
+		// pre-fix retention bound the job Session's graph is evicted, and
+		// under the one release rule it is released with its last use anyway.
+		for i := 0; i < 12; i++ {
+			bg.session(fmt.Sprintf("idle-%02d", i))
+		}
+
+		// Every queued hint before the stop belongs to the setup.
+		drainQueued := func() []Event {
+			var out []Event
+			for {
+				select {
+				case event, ok := <-sub.Events():
+					if !ok {
+						t.Fatal("the subscription closed before the drain finished")
+					}
+					out = append(out, event)
+					continue
+				default:
+				}
+				return out
+			}
+		}
+		drainQueued()
+
+		arrived := make(chan struct{})
+		gate := make(chan struct{})
+		releaseGate := sync.OnceFunc(func() { close(gate) })
+		stopper.armGate(arrived, gate)
+		// LIFO: this release runs before the deferred Runtime.Close, so a row
+		// that fails before releasing the stopper never strands StopAll behind
+		// the parked Job stop while Close waits for admitted work.
+		defer releaseGate()
+		stopDone := make(chan error, 1)
+		go func() {
+			stopDone <- bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				return h.StopAll(ctx)
+			})
+		}()
+		select {
+		case <-arrived: // StopAll published the stopping invalidation before entering the stopper
+		case <-time.After(10 * time.Second):
+			t.Fatal("the job stop never reached the stopper")
+		}
+
+		// The stopping invalidation is already queued: no polling.
+		var stopping protocol.SessionRevision
+		for _, event := range drainQueued() {
+			if eventKind(t, event) != "session_changed" {
+				continue
+			}
+			body, err := event.AsSessionChangedEvent()
+			if err != nil {
+				t.Fatalf("session event body: %v", err)
+			}
+			sessionID, ok := scopeSessionIdentity(t, body.Scope)
+			if !ok || sessionID != jobSession {
+				continue
+			}
+			if scopeKind(t, body.Scope) != "session" {
+				t.Fatalf("stopping invalidation scope = %+v, want the session granularity", body.Scope)
+			}
+			stopping = body.SessionRevision
+		}
+		if stopping.DurableRevision == "" {
+			t.Fatal("the owning Session's stopping invalidation was not queued when the stopper was entered")
+		}
+
+		releaseGate() // the delivery runs: the member finishes and StopAll converges
+		select {
+		case err := <-stopDone:
+			if err != nil {
+				t.Fatalf("StopAll: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("StopAll never converged")
+		}
+
+		// The member finish's job-scoped hint with its owning identity and an
+		// advanced pair.
+		finishPair := protocol.SessionRevision{}
+		for {
+			event, ok := nextEvent(t, sub)
+			if !ok {
+				t.Fatal("the subscription closed before the job finish hint")
+			}
+			if eventKind(t, event) != "session_changed" {
+				continue
+			}
+			body, err := event.AsSessionChangedEvent()
+			if err != nil {
+				t.Fatalf("session event body: %v", err)
+			}
+			if scopeKind(t, body.Scope) != "job" {
+				continue
+			}
+			jobScope, err := body.Scope.AsJobScope()
+			if err != nil {
+				t.Fatalf("job finish hint scope: %v", err)
+			}
+			if jobScope.JobId != "0a1b2c3d" {
+				continue
+			}
+			if jobScope.SessionId != jobSession || deref(jobScope.Workspace) != workspace {
+				t.Fatalf("job finish hint scope = %+v, want the owning session %q", body.Scope, jobSession)
+			}
+			finishPair = body.SessionRevision
+			break
+		}
+		if !lessPair(t, stopping, finishPair) {
+			t.Fatalf("job finish pair = %+v, want it advanced past the stopping pair %+v", finishPair, stopping)
+		}
+
+		// Authoritative hydration agrees: no member and a revision not older
+		// than the hint.
+		hydration, err := bg.r.buildHydration(ctx, jobSession)
+		if err != nil {
+			t.Fatalf("buildHydration: %v", err)
+		}
+		if len(hydration.Background) != 0 {
+			t.Fatalf("hydration background = %+v, want no member after the stop", hydration.Background)
+		}
+		if lessPair(t, hydration.SessionRevision, finishPair) {
+			t.Fatalf("hydration revision %+v is older than the job finish hint %+v", hydration.SessionRevision, finishPair)
 		}
 	})
 }

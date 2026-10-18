@@ -585,11 +585,8 @@ func historyPageFromView(sessionID string, view harness.HistoryReadView, cursor 
 	}
 	page := protocol.HistoryPage{
 		SessionRevision: wireRevision(view.Revision),
-		Items:           make([]protocol.ConversationItem, len(items)),
+		Items:           items, // projectConversation already returns an owned non-nil slice
 		OlderCursor:     older,
-	}
-	for i, item := range items {
-		page.Items[i] = item
 	}
 	return page, nil
 }

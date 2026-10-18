@@ -83,21 +83,18 @@ type OperationSummary struct {
 type HistoryEntryHeader struct {
 	EntryID     string
 	OperationID string
-	Sequence    int64
 	Kind        EntryKind
 	InputOrigin InputOrigin // meaningful only for an input
 }
 
-// HistoryReadView is the narrow history capture of one Session: identity, the
-// revision pair, the three scalar availability facts, the immutable entry
-// prefix, and the current compaction boundary, all captured under one
-// coordinator-mutex hold. It walks and copies no Operations, pending content,
-// background rows, or usage totals. The unexported prefix is an
-// appended-only-backed slice captured at its current length: later append and
-// graph replacement cannot rewrite it, and the caller's reference keeps it
-// alive.
+// HistoryReadView is the narrow history capture of one Session: the revision
+// pair, the three scalar availability facts, the immutable entry prefix, and
+// the current compaction boundary, all captured under one coordinator-mutex
+// hold. It walks and copies no Operations, pending content, background rows,
+// or usage totals. The unexported prefix is an appended-only-backed slice
+// captured at its current length: later append and graph replacement cannot
+// rewrite it, and the caller's reference keeps it alive.
 type HistoryReadView struct {
-	Identity      SessionIdentity
 	Revision      SessionRevision
 	ExecutionBusy bool
 	HasPending    bool
@@ -143,11 +140,10 @@ func (h *Harness) unavailableLocked(c *coordinator, sessionID string) error {
 }
 
 // withSessionRead runs one private capture callback against one Session: the
-// shared acquisition with its retention argument, then the shared
-// captureAvailable admission. The callback performs no I/O or plugin work and
-// is not an extension point.
-func (h *Harness) withSessionRead(ctx context.Context, sessionID string, cacheIdle bool, capture func(*coordinator) error) error {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, cacheIdle)
+// shared acquisition, then the shared captureAvailable admission. The callback
+// performs no I/O or plugin work and is not an extension point.
+func (h *Harness) withSessionRead(ctx context.Context, sessionID string, capture func(*coordinator) error) error {
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -174,7 +170,6 @@ func (h *Harness) captureAvailable(c *coordinator, sessionID string, capture fun
 // FIFO member, membership row, or usage total.
 func captureHistoryLocked(c *coordinator) HistoryReadView {
 	return HistoryReadView{
-		Identity:          c.graph.Session.Identity,
 		Revision:          sessionRevisionLocked(c),
 		ExecutionBusy:     c.graph.Session.State.CurrentOperationID != "" || c.run != nil || c.reserved != nil,
 		HasPending:        len(c.steering) > 0 || len(c.queued) > 0,
@@ -206,7 +201,7 @@ func captureSessionReadLocked(c *coordinator) SessionReadView {
 		view.Operations = append(view.Operations, ownOperationSummary(op))
 	}
 	// Warm coordinators append admissions, so the returned copy is sorted
-	// here; the cached graph keeps its own read order.
+	// here; the resident graph keeps its own read order.
 	sort.Slice(view.Operations, func(i, j int) bool {
 		return view.Operations[i].OperationID < view.Operations[j].OperationID
 	})
@@ -265,11 +260,11 @@ func ownOperationSummary(rec OperationRecord) OperationSummary {
 // copies no Operations, pending content, background rows, or usage totals. A
 // deleted Session returns the not-found class, a corrupt Session its typed
 // corruption error, and a storage or context failure passes through
-// unmodified. It is a real history use: the graph it loads stays cached once
-// idle.
+// unmodified. The graph it loads is released when the call ends; the returned
+// view retains its own entry prefix independently.
 func (h *Harness) ReadHistoryView(ctx context.Context, sessionID string) (HistoryReadView, error) {
 	var view HistoryReadView
-	if err := h.withSessionRead(ctx, sessionID, true, func(c *coordinator) error {
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
 		view = captureHistoryLocked(c)
 		return nil
 	}); err != nil {
@@ -282,11 +277,11 @@ func (h *Harness) ReadHistoryView(ctx context.Context, sessionID string) (Histor
 // hydration capture under one coordinator-mutex hold with the shared
 // unavailable check. A deleted Session returns the not-found class, a corrupt
 // Session its typed corruption error, and a storage or context failure passes
-// through unmodified. It is a real history use: the graph it loads stays
-// cached once idle.
+// through unmodified. The graph it loads is released when the call ends; the
+// returned view is an owned copy.
 func (h *Harness) ReadSessionView(ctx context.Context, sessionID string) (SessionReadView, error) {
 	var view SessionReadView
-	if err := h.withSessionRead(ctx, sessionID, true, func(c *coordinator) error {
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
 		view = captureSessionReadLocked(c)
 		return nil
 	}); err != nil {
@@ -308,7 +303,6 @@ func (v HistoryReadView) HistoryHeaders() []HistoryEntryHeader {
 		header := HistoryEntryHeader{
 			EntryID:     entry.Envelope.ID,
 			OperationID: entry.Envelope.OperationID,
-			Sequence:    entry.Envelope.Sequence,
 			Kind:        kind,
 		}
 		if entry.Input != nil {
@@ -374,11 +368,10 @@ func (v HistoryReadView) LatestContextUsage() *UsageCount {
 // directly inside that hold and the shared unavailable check runs there. A
 // deleted Session returns the not-found class, a corrupt Session its typed
 // corruption error, and a storage or context failure passes through
-// unmodified. It is a metadata-only use: a graph it loads itself is discarded
-// when the call releases it, and a cached graph it borrows keeps its place.
+// unmodified. The graph it loads is released when the call ends.
 func (h *Harness) ReadSessionHeader(ctx context.Context, sessionID string) (SessionHeader, error) {
 	var header SessionHeader
-	if err := h.withSessionRead(ctx, sessionID, false, func(c *coordinator) error {
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
 		header = sessionHeaderLocked(c)
 		return nil
 	}); err != nil {
@@ -409,14 +402,13 @@ func (h *Harness) ListSessionCandidates(ctx context.Context) ([]string, error) {
 
 // ListSessions enumerates the durable Session identities through the shared
 // candidate enumeration and returns each available Session's owned metadata
-// header in the sorted listing order. Every candidate is validated as a
-// metadata-only use, so the listing neither promotes nor retains the corpus:
-// a cold graph it loads is discarded when that candidate's call releases it.
-// A Session that fails validation is unavailable: absent from the returned
-// list while valid siblings stay listed, with its direct reads returning the
-// typed error. A malformed stored identity is never a candidate.
-// Enumeration, storage, and context failures propagate: no misleading
-// successful partial list is returned.
+// header in the sorted listing order. Every candidate is validated through an
+// ordinary use whose graph is released when that candidate's call ends, so
+// the listing retains no corpus. A Session that fails validation is
+// unavailable: absent from the returned list while valid siblings stay listed,
+// with its direct reads returning the typed error. A malformed stored identity
+// is never a candidate. Enumeration, storage, and context failures propagate:
+// no misleading successful partial list is returned.
 func (h *Harness) ListSessions(ctx context.Context) ([]SessionHeader, error) {
 	ids, err := h.ListSessionCandidates(ctx)
 	if err != nil {
@@ -424,7 +416,7 @@ func (h *Harness) ListSessions(ctx context.Context) ([]SessionHeader, error) {
 	}
 	headers := make([]SessionHeader, 0, len(ids))
 	for _, sessionID := range ids {
-		c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+		c, release, err := h.acquireCoordinator(ctx, sessionID)
 		if err != nil {
 			if isCorruption(err) || errors.Is(err, ErrNotFound) { // an unavailable Session stays absent
 				continue

@@ -1167,7 +1167,8 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the validated open view
+		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
 			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
@@ -1199,7 +1200,8 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches the validated idle view
+		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
 			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {
@@ -1266,7 +1268,8 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 	t.Run("failed agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use caches revision 1
+		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
+		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
 			t.Fatalf("ReadHistoryView: %v", err)
 		}
 		if err := store.Transact(context.Background(), func(tx Transaction) error {

@@ -77,64 +77,44 @@ func (h *Harness) emitFact(fact HarnessFact) {
 	h.deps.Observe(fact)
 }
 
-// readObservation samples one coordinator's current identity and revision
-// pair under the coordinator mutex, using the shared unavailable check (gone
-// and the sticky corruption marker, the latter read through the registry
-// mutex taken inside that hold — the permitted c.mu→h.mu order). The use is
-// claimed first, under the registry mutex, without inspecting the graph: a
-// cached-only observation never loads, so an evicted graph is a normal cache
-// miss and can never race an eviction. A deleted, corrupt, or graphless
-// coordinator reports false. No snapshot or history copy is built to read the
-// pair; the identity is copied by value from the cached graph.
+// readObservation samples one coordinator's retained identity and current
+// revision pair under the coordinator mutex, using the shared unavailable
+// check (gone and the sticky corruption marker, the latter read through the
+// registry mutex taken inside that hold — the permitted c.mu→h.mu order). It
+// samples directly, without taking a use: every graph write happens under
+// c.mu, canonical deletion sets gone under the same mutex before removing the
+// registry entry, and a never-loaded latch-free cell is removed only while
+// identity-empty — so an unknown, deleted, unestablished, or corrupt cell
+// reports false and an established graphless cell answers with its retained
+// identity and durable revision, while a resident graph supplies the pair's
+// current durable revision. It is the one availability-and-pair owner behind
+// the public observation read and every passive fact subject; no snapshot or
+// history copy is built, no use is claimed, and no registry entry is created.
 func (h *Harness) readObservation(c *coordinator) (SessionIdentity, SessionRevision, bool) {
-	release, ok := h.claimCoordinator(c)
-	if !ok {
-		return SessionIdentity{}, SessionRevision{}, false
-	}
-	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if h.unavailableLocked(c, c.sessionID) != nil {
 		return SessionIdentity{}, SessionRevision{}, false
 	}
-	if c.graph == nil { // a cached-only observation never loads a Session
+	if c.identity.SessionID == "" { // an unestablished cell names no Session
 		return SessionIdentity{}, SessionRevision{}, false
 	}
-	return c.graph.Session.Identity,
-		SessionRevision{DurableRevision: c.graph.Session.Revision, LocalRevision: c.localRev},
+	durable := c.durableRevision
+	if c.graph != nil {
+		durable = c.graph.Session.Revision
+	}
+	return c.identity,
+		SessionRevision{DurableRevision: durable, LocalRevision: c.localRev},
 		true
 }
 
-// factSubject samples one coordinator's retained identity for a passive fact:
-// the identity is published when a graph is validated and survives every graph
-// eviction, so a finish-time fact names its Session exactly like a fact emitted
-// with the graph resident. The use is claimed first and the availability check
-// still suppresses a deleted or corrupt subject; no load, snapshot, or
-// revision copy is built.
-func (h *Harness) factSubject(c *coordinator) (string, bool) {
-	release, ok := h.claimCoordinator(c)
-	if !ok {
-		return "", false
-	}
-	defer release()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if h.unavailableLocked(c, c.sessionID) != nil {
-		return "", false
-	}
-	if c.identity.SessionID == "" { // an unestablished cell names no Session
-		return "", false
-	}
-	return c.identity.SessionID, true
-}
-
-// ReadObservation reads one Session's current identity and revision pair
-// from the cached coordinator only: the registry is consulted under the
-// registry mutex and released, and the sample then follows the same
-// coordinator validity rule as the passive facts. A cache miss, a deleted, or
-// a corrupt Session reports false; no materialization, storage read, or
-// registry growth happens. It is the public cached observation read, never an
-// authoritative snapshot.
+// ReadObservation reads one Session's retained identity and current revision
+// pair: the registry is consulted under the registry mutex and released, and
+// the sample then follows the same coordinator validity rule as the passive
+// facts. A deleted, unestablished, or corrupt Session reports false; a
+// materialized Session answers even when its graph is not resident. No
+// materialization, storage read, or registry growth happens. It is the public
+// observation read, never an authoritative snapshot.
 func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRevision, bool) {
 	h.mu.Lock()
 	c := h.sessions[sessionID]
@@ -148,17 +128,17 @@ func (h *Harness) ReadObservation(sessionID string) (SessionIdentity, SessionRev
 // observeInvalidation emits one Session-scoped invalidation. It is the one
 // emission every durable Session advance and every coordinator-local
 // publication calls after releasing its lock and transaction; its subject is
-// the coordinator's retained identity, so an evicted graph still names its
+// the coordinator's retained identity, so a graphless cell still names its
 // Session.
 func (h *Harness) observeInvalidation(c *coordinator) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, ok := h.factSubject(c)
+	identity, _, ok := h.readObservation(c)
 	if !ok {
 		return
 	}
-	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID})
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: identity.SessionID})
 }
 
 // observeMemberInvalidation emits one Job-scoped invalidation for a job
@@ -170,11 +150,11 @@ func (h *Harness) observeMemberInvalidation(c *coordinator, jobID string) {
 	if h.deps.Observe == nil {
 		return
 	}
-	sessionID, ok := h.factSubject(c)
+	identity, _, ok := h.readObservation(c)
 	if !ok {
 		return
 	}
-	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: sessionID, JobID: jobID})
+	h.emitFact(HarnessFact{Kind: FactInvalidation, SessionID: identity.SessionID, JobID: jobID})
 }
 
 // emitToolResultFacts delivers one finished fact per committed tool-result

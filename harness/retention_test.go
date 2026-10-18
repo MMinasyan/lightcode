@@ -5,24 +5,41 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/model"
 )
 
-// TestRetentionBoundsInactiveGraphs proves the inactive-graph bound and the
-// survival of every local fact: with more than eight idle Sessions the oldest
-// graphs are cleared while their cells, local revisions, groups, and buffers
-// stay, a Session with a live member is bounded exactly like an idle one, an
-// evicted Session remains fully usable through its own re-materialization, a
-// metadata archive adoption still commits against the evicted cell, and a
-// live member's completion still delivers under pressure.
-func TestRetentionBoundsInactiveGraphs(t *testing.T) {
+// The graph-lifetime rows pin the one retention rule: a Session graph is
+// resident exactly while a use holds it and is released at the final use
+// release, while the stable cell, its retained identity and revision, and
+// every local field survive. The rows cover the rule's semantic axes: the
+// final release leaves no idle graph, overlapping uses retain until the
+// actual last release, execution and successor uses stay pinned, metadata
+// enumeration and StopAll leave no resident corpus, sticky corruption
+// survives, a failed first load stays retryable, deletion and refresh still
+// answer, a cancelled member finish settles the child completion, and a
+// graphless child still renders its completion.
+//
+// Every fixture that observes a released graph holds no inspection lease
+// across the release window; a lease a fixture does hold is explicit and is
+// released by the fixture itself.
+
+// TestFinalReleaseLeavesNoIdleGraph proves the rule and the survival of every
+// local fact: a released graph is gone while its cell, local revisions,
+// groups, and buffers stay, and the graphless cell remains fully usable
+// through its own re-materialization, a metadata archive adoption, and a live
+// member's completion delivery.
+func TestFinalReleaseLeavesNoIdleGraph(t *testing.T) {
 	store := emptyStore(t)
 	h := newTestHarness(t, store, newPrepareStub(modelPrepared(quickModel())).prepare)
 	h.deps.Jobs = &gatedJobStopper{}
 	ctx := context.Background()
 
-	// The idle subject is created first, so the pressure below evicts it.
 	idle := createSession(t, h)
 
 	// The first subject carries a live job member.
@@ -43,7 +60,8 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	}
 
 	// The second subject carries a running Operation that owns no execution
-	// and one buffered steering item beside it.
+	// and one buffered steering item beside it, driven under the fixture's own
+	// explicit lease.
 	buffered := createSession(t, h)
 	bufferedC, bufferedLease := leaseCoordinatorNow(t, h, buffered)
 	reservation, err := h.reserve(ctx, bufferedC)
@@ -79,29 +97,10 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	if bufferedSteering != 1 {
 		t.Fatalf("steering items = %d, want one", bufferedSteering)
 	}
-	bufferedLease()
+	bufferedLease() // the explicit lease ends: the graph releases with it
 
-	// Eight more idle Sessions fill the inactive cache and push the oldest
-	// graphs out: a live member owns no graph residency, so its Session is
-	// evicted like any other inactive one.
-	newest := make([]string, 0, inactiveGraphLimit)
-	for i := 0; i < inactiveGraphLimit; i++ {
-		newest = append(newest, createSession(t, h))
-	}
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, newest) {
-		t.Fatalf("inactive cache = %v, want the eight newest identities %v", got, newest)
-	}
-	for _, evicted := range []string{idle, subject, buffered} {
-		c := cachedCoordinator(t, h, evicted)
-		h.mu.Lock()
-		cached := c.cached
-		h.mu.Unlock()
-		if cached {
-			t.Fatalf("the oldest inactive graph of %q was not evicted", evicted)
-		}
-	}
-
-	// The cells are the same objects and keep every local fact.
+	// Every released graph is gone; the cells are the same objects and keep
+	// every local fact.
 	for _, row := range []struct {
 		id       string
 		cell     *coordinator
@@ -113,14 +112,18 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 		{buffered, bufferedC, bufferedRev, 0, 1},
 	} {
 		if again := cachedCoordinator(t, h, row.id); again != row.cell {
-			t.Fatalf("the evicted cell of %q was replaced", row.id)
+			t.Fatalf("the released cell of %q was replaced", row.id)
 		}
 		row.cell.mu.Lock()
+		graph := row.cell.graph
 		revision, members, steering := row.cell.localRev, 0, len(row.cell.steering)
 		if row.cell.group != nil {
 			members = len(row.cell.group.members)
 		}
 		row.cell.mu.Unlock()
+		if graph != nil {
+			t.Fatalf("the released graph of %q stayed resident", row.id)
+		}
 		if revision != row.revision {
 			t.Fatalf("local revision of %q = %d, want the retained %d", row.id, revision, row.revision)
 		}
@@ -129,23 +132,36 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 				row.id, members, steering, row.members, row.steering)
 		}
 	}
+	idleC := cachedCoordinator(t, h, idle)
+	idleC.mu.Lock()
+	idleGraph := idleC.graph
+	idleC.mu.Unlock()
+	if idleGraph != nil {
+		t.Fatalf("the idle Session's released graph stayed resident")
+	}
 
-	// An evicted Session stays usable: a real history use re-materializes and
-	// caches its graph, and a metadata archive adoption commits against the
+	// A graphless Session stays usable: a real history use re-materializes and
+	// releases its graph, and a metadata archive adoption commits against the
 	// same cell.
 	if _, err := h.ReadHistoryView(ctx, idle); err != nil {
-		t.Fatalf("ReadHistoryView of the evicted Session: %v", err)
+		t.Fatalf("ReadHistoryView of the graphless Session: %v", err)
+	}
+	idleC.mu.Lock()
+	regrown := idleC.graph
+	idleC.mu.Unlock()
+	if regrown != nil {
+		t.Fatalf("the real history use left its graph resident after the call")
 	}
 	archived, err := h.ArchiveSession(ctx, idle)
 	if err != nil || archived.State.Lifecycle != LifecycleArchived {
-		t.Fatalf("ArchiveSession of the evicted Session = %+v err %v, want the committed archive", archived, err)
+		t.Fatalf("ArchiveSession of the graphless Session = %+v err %v, want the committed archive", archived, err)
 	}
 
-	// The live member's completion still delivers from the evicted cell, and
-	// the delivery's own re-materialization leaves the Session's graph as the
-	// newest inactive cache entry.
+	// The live member's completion still delivers from the graphless cell; the
+	// delivered execution's own use releases as it settles, leaving no
+	// resident graph behind.
 	if err := h.DeliverBackgroundCompletion(ctx, subject, completionID, "job done"); err != nil {
-		t.Fatalf("DeliverBackgroundCompletion under pressure: %v", err)
+		t.Fatalf("DeliverBackgroundCompletion from the graphless cell: %v", err)
 	}
 	if got := runtimeInputTextRaw(t, store, subject); got != "job done" {
 		t.Fatalf("delivered completion text = %q, want the job's own content", got)
@@ -159,42 +175,74 @@ func TestRetentionBoundsInactiveGraphs(t *testing.T) {
 	if remaining != 0 {
 		t.Fatalf("the finished job member stayed live: %d members", remaining)
 	}
-	if got := cachedGraphIDs(h); got[len(got)-1] != subject {
-		deadline := time.Now().Add(10 * time.Second) // the delivered execution's own pin ends asynchronously
-		for {
-			got = cachedGraphIDs(h)
-			if len(got) > 0 && got[len(got)-1] == subject {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("inactive cache after the member finish = %v, want %q as the newest entry", got, subject)
-			}
-			time.Sleep(time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second) // the delivered execution's own pin ends asynchronously
+	for {
+		subjectC.mu.Lock()
+		graph := subjectC.graph
+		subjectC.mu.Unlock()
+		if graph == nil {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the delivered execution left its graph resident")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
-// TestLatchedGraphLeavesTheInactiveCache proves the availability rule at the
-// cache boundary: a warm Session whose cell latches corruption through a real
-// Fork discovery leaves the inactive cache on its genuine release — its cell,
-// its latch, and its local state stay — and the unavailable graph cannot evict
-// a valid sibling's cached history.
-func TestLatchedGraphLeavesTheInactiveCache(t *testing.T) {
+// TestOverlappingUsesRetainTheGraphUntilTheFinalRelease proves the one
+// retention decision at the release boundary: an overlapping use keeps the
+// graph resident through an earlier release, and the actual last release
+// clears it while the cell, its retained identity, and its revision pair stay.
+func TestOverlappingUsesRetainTheGraphUntilTheFinalRelease(t *testing.T) {
+	store := freshSessionStore(t)
+	h := newTestHarness(t, store, nil)
+	ctx := context.Background()
+
+	cell, lease := leaseCoordinatorNow(t, h, testSessionID) // the interval the test controls
+	if _, err := h.ReadHistoryView(ctx, testSessionID); err != nil {
+		t.Fatalf("ReadHistoryView: %v", err)
+	}
+	cell.mu.Lock()
+	resident := cell.graph != nil
+	cell.mu.Unlock()
+	if !resident {
+		t.Fatalf("the overlapping real use's release cleared the graph although the controlled use was still held")
+	}
+
+	lease()
+	cell.mu.Lock()
+	cleared, identity, revision := cell.graph == nil, cell.identity, cell.durableRevision
+	cell.mu.Unlock()
+	if !cleared {
+		t.Fatalf("the final release left the graph resident")
+	}
+	if identity.SessionID != testSessionID || revision <= 0 {
+		t.Fatalf("the released cell = identity %+v revision %d, want the retained established values", identity, revision)
+	}
+	if _, pair, ok := h.ReadObservation(testSessionID); !ok || pair.DurableRevision != revision {
+		t.Fatalf("ReadObservation of the released cell = %+v %v, want the retained revision %d", pair, ok, revision)
+	}
+}
+
+// TestLatchedCellSurvivesItsGraphRelease proves the availability rule at the
+// release boundary: a warm Session whose cell latches corruption through a
+// real Fork discovery keeps the sticky latch and its stable cell when the
+// graph is released, later reads answer the corruption class, and a metadata
+// transition that latches a warm borrowed cell leaves no resident graph
+// either.
+func TestLatchedCellSurvivesItsGraphRelease(t *testing.T) {
 	store := emptyStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 	ctx := context.Background()
 
-	source := createSession(t, h) // cached first, so it is the oldest entry
-	older := make([]string, 0, 7)
-	for i := 0; i < 7; i++ {
-		older = append(older, createSession(t, h))
-	}
-	sourceCell, sourceLease := leaseCoordinatorNow(t, h, source) // the interval whose genuine release the test controls
-	h.mu.Lock()
-	cachedBefore := sourceCell.cached
-	h.mu.Unlock()
-	if !cachedBefore {
-		t.Fatalf("the source's graph was not cached before the discovery")
+	source := createSession(t, h)
+	sourceCell, sourceLease := leaseCoordinatorNow(t, h, source) // the interval whose release the test controls
+	sourceCell.mu.Lock()
+	residentBefore := sourceCell.graph != nil
+	sourceCell.mu.Unlock()
+	if !residentBefore {
+		t.Fatalf("the source's graph was not resident before the discovery")
 	}
 
 	// The real discovery is Fork's store-wide transaction failing on the
@@ -216,41 +264,29 @@ func TestLatchedGraphLeavesTheInactiveCache(t *testing.T) {
 		t.Fatalf("the Fork discovery did not latch the source cell")
 	}
 
-	// One more idle Session fills the cache while the latched cell's node is
-	// gone, and the latched interval's final genuine release then runs.
-	createSession(t, h)
-	sourceLease()
-
+	sourceLease() // the latched interval's genuine final release
+	sourceCell.mu.Lock()
+	graph := sourceCell.graph
+	sourceCell.mu.Unlock()
 	h.mu.Lock()
-	cachedAfter, node, registered := sourceCell.cached, sourceCell.lruNode, h.sessions[source] == sourceCell
-	olderCached := false
-	if c := h.sessions[older[0]]; c != nil {
-		olderCached = c.cached && c.lruNode != nil
-	}
+	registered := h.sessions[source] == sourceCell
 	h.mu.Unlock()
 	if !registered || sourceCell.corru == nil {
 		t.Fatalf("the latched cell did not survive its release (registered %v)", registered)
 	}
-	if !olderCached {
-		t.Fatalf("the unavailable graph evicted the oldest valid cached history %q", older[0])
-	}
-	if got := cachedGraphIDs(h); len(got) != inactiveGraphLimit {
-		t.Fatalf("inactive cache = %v, want the bound %d", got, inactiveGraphLimit)
-	}
-	if cachedAfter || node != nil {
-		t.Fatalf("the latched graph stayed cached after its release (cached %v node %v)", cachedAfter, node)
+	if graph != nil {
+		t.Fatalf("the latched graph stayed resident after its release")
 	}
 	if _, err := h.ReadSessionHeader(ctx, source); !isCorruption(err) {
 		t.Fatalf("the latched Session read = %v, want the sticky corruption class", err)
 	}
 
-	// A metadata borrow of a latched cached graph leaves it out of the cache
-	// too: the latch lands through the metadata transition itself, so the
-	// borrow's own release must not preserve the unavailable graph in place.
+	// A metadata transition that latches a warm cell leaves it without a
+	// resident graph too: the latch lands through the transition itself.
 	borrowStore := emptyStore(t)
 	borrowHarness := newTestHarness(t, borrowStore, nil)
 	borrowedSource := createSession(t, borrowHarness)
-	if _, err := borrowHarness.ReadHistoryView(ctx, borrowedSource); err != nil { // cached with its node in place
+	if _, err := borrowHarness.ReadHistoryView(ctx, borrowedSource); err != nil {
 		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	foreignCorruptRegister(t, borrowStore, borrowedSource)
@@ -259,60 +295,18 @@ func TestLatchedGraphLeavesTheInactiveCache(t *testing.T) {
 	}
 	borrowHarness.mu.Lock()
 	borrowedCell := borrowHarness.sessions[borrowedSource]
-	latchedBorrow, cachedBorrow, nodeBorrow := borrowedCell.corru, borrowedCell.cached, borrowedCell.lruNode
 	borrowHarness.mu.Unlock()
-	if borrowedCell == nil || latchedBorrow == nil {
+	if borrowedCell == nil || borrowedCell.corru == nil {
 		t.Fatalf("the metadata transition did not latch the borrowed cell")
 	}
-	if cachedBorrow || nodeBorrow != nil {
-		t.Fatalf("the metadata borrow kept the latched graph cached (cached %v node %v)", cachedBorrow, nodeBorrow)
+	borrowedCell.mu.Lock()
+	borrowedGraph := borrowedCell.graph
+	borrowedCell.mu.Unlock()
+	if borrowedGraph != nil {
+		t.Fatalf("the metadata transition left the latched graph resident")
 	}
-	if got := cachedGraphIDs(borrowHarness); len(got) != 0 {
-		t.Fatalf("inactive cache = %v, want the latched graph out of it", got)
-	}
-}
-
-// TestBorrowedCacheEvictsTheJustReleasedGraph proves the bound's fallback
-// victim: with all eight older cached entries borrowed, a ninth Session's
-// genuine release makes its own graph the eviction victim while every borrowed
-// graph survives.
-func TestBorrowedCacheEvictsTheJustReleasedGraph(t *testing.T) {
-	h := newTestHarness(t, emptyStore(t), nil)
-
-	borrowed := make([]string, 0, inactiveGraphLimit)
-	releases := make([]func(), 0, inactiveGraphLimit)
-	for i := 0; i < inactiveGraphLimit; i++ {
-		id := createSession(t, h)
-		_, release := leaseCoordinatorNow(t, h, id) // a metadata borrow of every cached graph
-		borrowed = append(borrowed, id)
-		releases = append(releases, release)
-	}
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, borrowed) {
-		t.Fatalf("inactive cache = %v, want all eight borrowed entries %v", got, borrowed)
-	}
-
-	ninth := createSession(t, h) // the genuine release of a ninth graph
-	h.mu.Lock()
-	ninthCell := h.sessions[ninth]
-	victim := ninthCell != nil && !ninthCell.cached && ninthCell.lruNode == nil
-	h.mu.Unlock()
-	if !victim {
-		t.Fatalf("the just-released ninth graph was not the eviction victim")
-	}
-	for _, id := range borrowed {
-		h.mu.Lock()
-		c := h.sessions[id]
-		survived := c != nil && c.cached && c.lruNode != nil
-		h.mu.Unlock()
-		if !survived {
-			t.Fatalf("the borrowed cached graph of %q was evicted", id)
-		}
-	}
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, borrowed) {
-		t.Fatalf("inactive cache after the fallback eviction = %v, want the borrowed %v", got, borrowed)
-	}
-	for _, release := range releases {
-		release()
+	if _, err := borrowHarness.ReadSessionHeader(ctx, borrowedSource); !isCorruption(err) {
+		t.Fatalf("the latched borrowed Session read = %v, want the sticky corruption class", err)
 	}
 }
 
@@ -399,25 +393,27 @@ func (s cancelledReadStore) ReadEntries(ctx context.Context, sessionID string, a
 	return s.Storage.ReadEntries(ctx, sessionID, after)
 }
 
-// TestCancelledMemberFinishSettlesTheChildCompletion proves the loss scenario
-// the member-finish ordering and the settlement context close together: a
-// child Session owns a live Job member and its own pending completion, the
-// Harness is canceled, and the child's graph is not resident when the member
-// finish triggers the settlement. The child's terminal completion still
-// renders and reaches the parent as its durable closed-path record instead of
-// being abandoned.
-//
-// The pressure is deterministic: every older cache entry is borrowed, so the
-// child's own release is the fallback eviction victim, and the canceled
-// Harness makes the settlement's cold load the load that fails under a
-// canceled context — while a live Harness would keep it resident.
-func TestCancelledMemberFinishSettlesTheChildCompletion(t *testing.T) {
-	store := completionChildGraph(completionParentID, false, OperationSuccess, "", "child text").storage(t)
-	addRootSession(t, store, completionParentID)
-	h, cancel := newCancelableHarness(t, cancelledReadStore{Storage: store}, PreparedExecution{}, nil)
-	defer cancel()
-	ctx := context.Background()
+// cancelledCompletionFixture is the shared cancelled child-with-Job
+// completion fixture: the child and parent cells with the child's job member
+// and pending completion installed, the parent's graph pinned by the test's
+// own controlled lease, and the Harness already canceled. The child's own
+// admission lease is released before the cancellation, so the settlement
+// meets the production graphless child; the parent's graph and eight more
+// idle borrowed Sessions are the older entries a pre-fix fallback eviction
+// skips, making the child's delivery release the eviction victim.
+type cancelledCompletionFixture struct {
+	h      *Harness
+	child  *coordinator
+	parent *coordinator
+	job    *backgroundMember
+}
 
+func newCancelledCompletionFixture(t *testing.T, storage Storage, store *graphStorage) *cancelledCompletionFixture {
+	t.Helper()
+	ctx := context.Background()
+	addRootSession(t, store, completionParentID)
+	h, cancel := newCancelableHarness(t, storage, PreparedExecution{}, nil)
+	t.Cleanup(cancel)
 	if _, err := h.ReadHistoryView(ctx, completionChildID); err != nil {
 		t.Fatalf("child ReadHistoryView: %v", err)
 	}
@@ -426,81 +422,175 @@ func TestCancelledMemberFinishSettlesTheChildCompletion(t *testing.T) {
 	}
 	child := cachedCoordinator(t, h, completionChildID)
 	parent := cachedCoordinator(t, h, completionParentID)
-	parentMember, err := admitLocked(h, parent, memberChild, completionChildID, 0)
+
+	// The parent's own controlled lease pins its graph through the
+	// settlement; the child's covers only the admissions.
+	parentLease, parentRelease := leaseCoordinatorNow(t, h, completionParentID)
+	t.Cleanup(parentRelease)
+	childLease, childRelease := leaseCoordinatorNow(t, h, completionChildID)
+	parentMember, err := admitLocked(h, parentLease, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("child member admission: %v", err)
 	}
-	jobMember, err := admitLocked(h, child, memberJob, jobFixtureID, 0)
+	jobMember, err := admitLocked(h, childLease, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("job member admission: %v", err)
 	}
-	child.mu.Lock()
-	child.pendingCompletion = &launchInfo{completionID: parentMember.completionID, outputLimit: 1024}
-	child.mu.Unlock()
+	childLease.mu.Lock()
+	childLease.pendingCompletion = &launchInfo{completionID: parentMember.completionID, outputLimit: 1024}
+	childLease.mu.Unlock()
+	childRelease()
 
-	// The parent's graph and eight more idle Sessions are the borrowed older
-	// entries the fallback eviction skips.
-	borrowed := make([]func(), 0, inactiveGraphLimit+1)
-	_, parentRelease := leaseCoordinatorNow(t, h, completionParentID)
-	borrowed = append(borrowed, parentRelease)
-	for i := 0; i < inactiveGraphLimit; i++ {
+	borrowed := make([]func(), 0, 8)
+	for i := 0; i < 8; i++ {
 		id := createSession(t, h)
 		_, release := leaseCoordinatorNow(t, h, id)
 		borrowed = append(borrowed, release)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		for _, release := range borrowed {
 			release()
 		}
-	}()
+	})
 
 	cancel()
-
-	// The job's own completion finishes the member; the child's pending
-	// completion must settle from that finish. The observer is installed after
-	// the admissions, so the collected facts are the finish-time ones.
-	col := observeHarness(h)
-	if err := h.DeliverBackgroundCompletion(ctx, completionChildID, jobMember.completionID, "job done"); err != nil {
-		t.Fatalf("job completion delivery: %v", err)
-	}
-	jobFacts := 0
-	for _, fact := range col.invalidations() {
-		if fact.SessionID == completionChildID && fact.JobID == jobFixtureID {
-			jobFacts++
-		}
-	}
-	if jobFacts != 1 {
-		t.Fatalf("child job invalidations = %d, want the member finish's one fact from the evicted graph", jobFacts)
-	}
-	signals := storedSignals(t, store, completionParentID)
-	if len(signals) != 1 || signals[0].Content != "child text" {
-		t.Fatalf("parent signals = %+v, want the child's rendered completion as the closed-path record", signals)
-	}
-	if childSignals := storedSignals(t, store, completionChildID); len(childSignals) != 1 || childSignals[0].Content != "job done" {
-		t.Fatalf("child signals = %+v, want the job's own completion record", childSignals)
-	}
-	parent.mu.Lock()
-	remaining := 0
-	if parent.group != nil {
-		remaining = len(parent.group.members)
-	}
-	parent.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("the child member stayed live after the settlement: %d members", remaining)
-	}
-	child.mu.Lock()
-	pending := child.pendingCompletion
-	child.mu.Unlock()
-	if pending != nil {
-		t.Fatalf("the pending completion was not consumed: %+v", pending)
-	}
+	return &cancelledCompletionFixture{h: h, child: child, parent: parent, job: jobMember}
 }
 
-// TestStopAllClosesAnIdleEvictedChildWithoutLoading proves the classification
-// rule: an established idle child whose graph cache pressure evicted is closed
-// by StopAll through its retained identity and local handles — no graph load
-// and no storage read — while the parent's established cell stays.
-func TestStopAllClosesAnIdleEvictedChildWithoutLoading(t *testing.T) {
+// TestCancelledMemberFinishSettlesTheChildCompletion proves the loss scenario
+// the member-finish ordering and the settlement context close together: a
+// child Session owns a live Job member and its own pending completion, the
+// Harness is canceled, and the child's graph is not resident when the member
+// finish triggers the settlement. The child's terminal completion still
+// renders and reaches the parent as its durable closed-path record instead of
+// being abandoned; a storage failure on that settlement's graph reload is
+// retained and reported by Wait, with no retry, fallback write, or silent
+// abandonment.
+func TestCancelledMemberFinishSettlesTheChildCompletion(t *testing.T) {
+	t.Run("the settlement delivers the durable closed-path record", func(t *testing.T) {
+		store := completionChildGraph(completionParentID, false, OperationSuccess, "", "child text").storage(t)
+		f := newCancelledCompletionFixture(t, cancelledReadStore{Storage: store}, store)
+
+		// The observer is installed after the admissions, so the collected
+		// facts are the finish-time ones.
+		col := observeHarness(f.h)
+		if err := f.h.DeliverBackgroundCompletion(context.Background(), completionChildID, f.job.completionID, "job done"); err != nil {
+			t.Fatalf("job completion delivery: %v", err)
+		}
+		jobFacts := 0
+		for _, fact := range col.invalidations() {
+			if fact.SessionID == completionChildID && fact.JobID == jobFixtureID {
+				jobFacts++
+			}
+		}
+		if jobFacts != 1 {
+			t.Fatalf("child job invalidations = %d, want the member finish's one fact from the graphless cell", jobFacts)
+		}
+		signals := storedSignals(t, store, completionParentID)
+		if len(signals) != 1 || signals[0].Content != "child text" {
+			t.Fatalf("parent signals = %+v, want the child's rendered completion as the closed-path record", signals)
+		}
+		if childSignals := storedSignals(t, store, completionChildID); len(childSignals) != 1 || childSignals[0].Content != "job done" {
+			t.Fatalf("child signals = %+v, want the job's own completion record", childSignals)
+		}
+		f.parent.mu.Lock()
+		remaining := 0
+		if f.parent.group != nil {
+			remaining = len(f.parent.group.members)
+		}
+		f.parent.mu.Unlock()
+		if remaining != 0 {
+			t.Fatalf("the child member stayed live after the settlement: %d members", remaining)
+		}
+		f.child.mu.Lock()
+		pending := f.child.pendingCompletion
+		f.child.mu.Unlock()
+		if pending != nil {
+			t.Fatalf("the pending completion was not consumed: %+v", pending)
+		}
+	})
+
+	t.Run("the settlement's storage failure is retained for Wait", func(t *testing.T) {
+		store := completionChildGraph(completionParentID, false, OperationSuccess, "", "child text").storage(t)
+		f := newCancelledCompletionFixture(t, store, store)
+
+		// The entry hook runs under the store lock and arms the following
+		// graph reload's register read with a distinct storage failure on the
+		// child's operationless Job-completion signal insertion. The inserting
+		// transaction reads the singular register and finishes; the settlement's
+		// reload uses ReadRegisters and fails.
+		distinct := fmt.Errorf("%w: child register reload down", ErrStorage)
+		store.entryHook = func(draft EntryDraft) error {
+			if draft.SessionID == completionChildID && draft.Kind == EntrySignal {
+				store.registersErr = distinct
+			}
+			return nil
+		}
+
+		// The observer pauses the producer after the abandoned parent member's
+		// done closes, so Wait can be asserted while the producer is still
+		// parked after that finish.
+		arrived := make(chan struct{})
+		releaseObserver := make(chan struct{})
+		var once sync.Once
+		f.h.deps.Observe = func(fact HarnessFact) {
+			if fact.Kind != FactInvalidation || fact.SessionID != completionParentID {
+				return
+			}
+			once.Do(func() { close(arrived) })
+			<-releaseObserver
+		}
+
+		producer := make(chan error, 1)
+		go func() {
+			producer <- f.h.DeliverBackgroundCompletion(context.Background(), completionChildID, f.job.completionID, "job done")
+		}()
+		select {
+		case <-arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the abandoned parent member never finished")
+		}
+
+		// The storage cause is retained before the abandonment finishes the
+		// parent member; the public wait reports it while the producer is
+		// still parked after that finish.
+		if err := f.h.Wait(context.Background()); !errors.Is(err, ErrStorage) || !strings.Contains(err.Error(), "child register reload down") {
+			t.Fatalf("Wait while the producer is parked = %v, want the retained storage cause", err)
+		}
+
+		close(releaseObserver)
+		select {
+		case err := <-producer:
+			if err != nil {
+				t.Fatalf("job completion delivery: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the producer never joined")
+		}
+
+		// One attempt, no retry and no fallback write: the child's own signal
+		// is durable, the obligation is abandoned, and the parent received
+		// nothing.
+		if childSignals := storedSignals(t, store, completionChildID); len(childSignals) != 1 || childSignals[0].Content != "job done" {
+			t.Fatalf("child signals = %+v, want the job's own completion record", childSignals)
+		}
+		if parentSignals := storedSignals(t, store, completionParentID); len(parentSignals) != 0 {
+			t.Fatalf("parent signals = %+v, want none after the abandoned settlement", parentSignals)
+		}
+		f.child.mu.Lock()
+		pending := f.child.pendingCompletion
+		f.child.mu.Unlock()
+		if pending != nil {
+			t.Fatalf("the abandoned obligation survived: %+v", pending)
+		}
+	})
+}
+
+// TestStopAllClosesAnIdleGraphlessChildWithoutLoading proves the
+// classification rule: an established idle child whose graph was released is
+// closed by StopAll through its retained identity and local handles — no graph
+// load and no storage read — while the parent's established cell stays.
+func TestStopAllClosesAnIdleGraphlessChildWithoutLoading(t *testing.T) {
 	store := completionChildGraph(completionParentID, false, OperationSuccess, "", "").storage(t)
 	addRootSession(t, store, completionParentID)
 	counting := &observationCountingStorage{Storage: store}
@@ -513,15 +603,14 @@ func TestStopAllClosesAnIdleEvictedChildWithoutLoading(t *testing.T) {
 	if _, err := h.ReadHistoryView(ctx, completionChildID); err != nil {
 		t.Fatalf("child ReadHistoryView: %v", err)
 	}
-	for i := 0; i < inactiveGraphLimit; i++ {
-		createSession(t, h)
-	}
 	h.mu.Lock()
 	child := h.sessions[completionChildID]
-	evicted := child != nil && !child.cached
 	h.mu.Unlock()
-	if !evicted {
-		t.Fatalf("the idle child's graph was not evicted under pressure")
+	child.mu.Lock()
+	graphless := child.graph == nil
+	child.mu.Unlock()
+	if !graphless {
+		t.Fatalf("the idle child's graph stayed resident after its read")
 	}
 
 	before := counting.calls
@@ -535,15 +624,14 @@ func TestStopAllClosesAnIdleEvictedChildWithoutLoading(t *testing.T) {
 	closed := child.bgState == bgClosed
 	child.mu.Unlock()
 	if !closed {
-		t.Fatalf("the idle evicted child was not closed by StopAll")
+		t.Fatalf("the idle graphless child was not closed by StopAll")
 	}
 }
 
-// TestMetadataListingDoesNotRetainOrPromote proves the metadata working set: a
-// fifteen-Session listing neither retains nor promotes the corpus, a real
-// history use caches its graph as the newest inactive entry, and a metadata
-// borrow of that cached graph keeps its position.
-func TestMetadataListingDoesNotRetainOrPromote(t *testing.T) {
+// TestMetadataListingLeavesNoResidentCorpus proves the metadata working set
+// under the one rule: a fifteen-Session listing leaves no resident graph, a
+// real history use releases the graph it loads, and every cell survives.
+func TestMetadataListingLeavesNoResidentCorpus(t *testing.T) {
 	h := newTestHarness(t, emptyStore(t), nil)
 	ctx := context.Background()
 
@@ -551,79 +639,38 @@ func TestMetadataListingDoesNotRetainOrPromote(t *testing.T) {
 	for i := 0; i < 15; i++ {
 		ids = append(ids, createSession(t, h))
 	}
-	before := cachedGraphIDs(h)
-	if len(before) != inactiveGraphLimit {
-		t.Fatalf("inactive cache = %d entries, want the bound %d", len(before), inactiveGraphLimit)
+	assertNoResidentGraphs := func(step string) {
+		t.Helper()
+		h.mu.Lock()
+		cells := make([]*coordinator, 0, len(ids))
+		for _, id := range ids {
+			cells = append(cells, h.sessions[id])
+		}
+		h.mu.Unlock()
+		for i, c := range cells {
+			if c == nil {
+				t.Fatalf("%s dropped the established cell of %q", step, ids[i])
+			}
+			c.mu.Lock()
+			graph := c.graph
+			c.mu.Unlock()
+			if graph != nil {
+				t.Fatalf("%s left the graph of %q resident", step, ids[i])
+			}
+		}
 	}
-	if !reflect.DeepEqual(before, ids[7:]) {
-		t.Fatalf("inactive cache = %v, want the newest eight identities %v", before, ids[7:])
-	}
+	assertNoResidentGraphs("the creation series")
 
 	headers, err := h.ListSessions(ctx)
 	if err != nil || len(headers) != len(ids) {
 		t.Fatalf("ListSessions = %d rows err %v, want all %d", len(headers), err, len(ids))
 	}
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, before) {
-		t.Fatalf("listing changed the cached set: %v -> %v", before, got)
-	}
-	h.mu.Lock()
-	for _, id := range ids[:7] {
-		if c := h.sessions[id]; c != nil && c.cached {
-			h.mu.Unlock()
-			t.Fatalf("listing retained the graph of the uncached Session %q", id)
-		}
-	}
-	h.mu.Unlock()
+	assertNoResidentGraphs("the metadata listing")
 
-	// A real history use caches its graph as the newest entry, evicting the
-	// oldest one, and a metadata borrow afterwards keeps that position.
-	oldest := ids[0]
-	if _, err := h.ReadHistoryView(ctx, oldest); err != nil {
+	if _, err := h.ReadHistoryView(ctx, ids[0]); err != nil {
 		t.Fatalf("ReadHistoryView: %v", err)
 	}
-	want := append(append([]string{}, before[1:]...), oldest)
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, want) {
-		t.Fatalf("after the real history use the cache = %v, want %v", got, want)
-	}
-	if _, err := h.ReadSessionHeader(ctx, oldest); err != nil {
-		t.Fatalf("ReadSessionHeader: %v", err)
-	}
-	if got := cachedGraphIDs(h); !reflect.DeepEqual(got, want) {
-		t.Fatalf("a metadata borrow moved the cached set: %v -> %v", want, got)
-	}
-}
-
-// TestOverlappingHistoryRetainsAMetadataLoad proves the shared-interval rule
-// on cells that start without a graph: a graph a metadata use loaded is kept
-// when a real history use overlapped that interval, while a metadata-only
-// interval discards the load it made itself.
-func TestOverlappingHistoryRetainsAMetadataLoad(t *testing.T) {
-	store := freshSessionStore(t)
-	aloneID := hexID(9)
-	addRootSession(t, store, aloneID)
-	h := newTestHarness(t, store, nil)
-	ctx := context.Background()
-
-	metaCell, metaRelease := leaseCoordinatorNow(t, h, testSessionID)
-	if _, err := h.ReadHistoryView(ctx, testSessionID); err != nil { // the overlapping real use
-		t.Fatalf("ReadHistoryView: %v", err)
-	}
-	metaRelease() // the metadata interval releases last
-	h.mu.Lock()
-	kept := metaCell.cached
-	h.mu.Unlock()
-	if !kept {
-		t.Fatalf("an overlapping real history use did not keep the metadata load")
-	}
-
-	aloneCell, aloneRelease := leaseCoordinatorNow(t, h, aloneID)
-	aloneRelease()
-	h.mu.Lock()
-	discarded := !aloneCell.cached
-	h.mu.Unlock()
-	if !discarded {
-		t.Fatalf("a metadata-only interval retained the graph it loaded")
-	}
+	assertNoResidentGraphs("the real history use")
 }
 
 // TestFailedFirstLookupLeavesNoCell proves the never-loaded cleanup and the
@@ -676,8 +723,8 @@ func TestFailedFirstLookupLeavesNoCell(t *testing.T) {
 }
 
 // TestStopAllDoesNotLoadIdleCorpus proves the shutdown enumeration row: an
-// idle established corpus is stopped without a single storage read, and every
-// cell survives the stop.
+// idle established corpus is stopped without a single storage read, every cell
+// survives the stop, and no graph is left resident.
 func TestStopAllDoesNotLoadIdleCorpus(t *testing.T) {
 	counting := &observationCountingStorage{Storage: emptyStore(t)}
 	h := newTestHarness(t, counting, nil)
@@ -695,13 +742,22 @@ func TestStopAllDoesNotLoadIdleCorpus(t *testing.T) {
 		t.Fatalf("StopAll over an idle corpus performed %d storage reads, want none", counting.calls-before)
 	}
 	h.mu.Lock()
+	cells := make([]*coordinator, 0, len(ids))
 	for _, id := range ids {
-		if h.sessions[id] == nil {
-			h.mu.Unlock()
-			t.Fatalf("StopAll dropped the established cell of %q", id)
-		}
+		cells = append(cells, h.sessions[id])
 	}
 	h.mu.Unlock()
+	for i, c := range cells {
+		if c == nil {
+			t.Fatalf("StopAll dropped the established cell of %q", ids[i])
+		}
+		c.mu.Lock()
+		graph := c.graph
+		c.mu.Unlock()
+		if graph != nil {
+			t.Fatalf("StopAll left the graph of %q resident", ids[i])
+		}
+	}
 	if _, err := h.ReadSessionHeader(ctx, ids[0]); err != nil {
 		t.Fatalf("read after StopAll: %v", err)
 	}
@@ -756,15 +812,38 @@ func TestSweepCandidateScanOverAColdCorpus(t *testing.T) {
 	}
 }
 
-// TestExecutionPinsSurvivePressureAndSuccessorDrain proves the execution
-// retention under pressure: an installed run keeps its Session's graph out of
-// the inactive set, cache pressure cannot evict it, and the post-terminal
-// drain's successor continues on the same pinned graph until both Operations
-// settle and the Session goes idle.
-func TestExecutionPinsSurvivePressureAndSuccessorDrain(t *testing.T) {
+// TestExecutionUsePinsTheGraphThroughSuccessorDrain proves the execution
+// retention: an installed run keeps its Session's graph resident, and the
+// post-terminal drain's successor continues on that same pinned graph until
+// both Operations settle and the Session goes idle, when the final release
+// clears it.
+func TestExecutionUsePinsTheGraphThroughSuccessorDrain(t *testing.T) {
 	store := emptyStore(t)
-	release := make(chan struct{})
-	h := newTestHarness(t, store, newPrepareStub(modelPrepared(parkedModel(release))).prepare)
+	first := make(chan struct{})
+	second := make(chan struct{})
+	secondArrived := make(chan struct{}, 1)
+	var attempts atomic.Int32
+	modelFn := func(ctx context.Context, _ model.Request) (model.Stream, error) {
+		if attempts.Add(1) == 1 {
+			select {
+			case <-first:
+				return completedTurnStream(), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		select {
+		case secondArrived <- struct{}{}:
+		default:
+		}
+		select {
+		case <-second:
+			return completedTurnStream(), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	h := newTestHarness(t, store, newPrepareStub(modelPrepared(modelFn)).prepare)
 
 	session := createSession(t, h)
 	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "first"); err != nil {
@@ -774,47 +853,52 @@ func TestExecutionPinsSurvivePressureAndSuccessorDrain(t *testing.T) {
 		t.Fatalf("queued submit: %v", err)
 	}
 	cell := cachedCoordinator(t, h, session)
-
-	for i := 0; i < inactiveGraphLimit; i++ {
-		createSession(t, h)
-	}
-	h.mu.Lock()
-	pinned, node := cell.cached, cell.lruNode
-	h.mu.Unlock()
-	if !pinned || node != nil {
-		t.Fatalf("the running Session = cached %v node %v, want a pinned graph outside the inactive set", pinned, node)
+	cell.mu.Lock()
+	pinned := cell.graph
+	cell.mu.Unlock()
+	if pinned == nil {
+		t.Fatalf("the running Session's graph was not resident")
 	}
 
-	close(release) // the first turn settles and its drain admits the queued successor
+	close(first) // the first turn settles and its drain admits the queued successor
+	select {
+	case <-secondArrived: // the successor is parked at its model boundary
+	case <-time.After(10 * time.Second):
+		t.Fatal("the successor never reached its model boundary")
+	}
+	cell.mu.Lock()
+	successorGraph := cell.graph
+	cell.mu.Unlock()
+	if successorGraph != pinned {
+		t.Fatalf("the successor continued on a different graph than the pinned one")
+	}
+
+	close(second)
 	awaitHarnessQuiet(t, h, session)
 	for _, id := range []string{"op-1", "op-2"} {
 		if rec := settledOperation(t, store, session, id); rec.State.Status != OperationSuccess {
 			t.Fatalf("operation %q = %+v, want the settled success", id, rec.State)
 		}
 	}
-	h.mu.Lock()
-	stillCached := cell.cached
-	h.mu.Unlock()
-	if !stillCached {
-		t.Fatalf("the Session's graph was evicted although its execution interval was cache-eligible")
-	}
-	if got := cachedGraphIDs(h); got[len(got)-1] != session {
-		t.Fatalf("inactive cache after the drain = %v, want %q as the newest entry", got, session)
+	cell.mu.Lock()
+	stillResident := cell.graph
+	cell.mu.Unlock()
+	if stillResident != nil {
+		t.Fatalf("the Session's graph stayed resident after both Operations settled")
 	}
 }
 
-// TestChildCompletionRendersThroughAnEvictedGraph proves the pending child
-// completion's own retention: with the child's idle graph evicted by cache
-// pressure, the settlement trigger re-materializes it for rendering and the
-// parent still receives the completion.
-func TestChildCompletionRendersThroughAnEvictedGraph(t *testing.T) {
+// TestChildCompletionRendersThroughAGraphlessChild proves the pending child
+// completion's own re-materialization: with the child's released graph gone,
+// the settlement trigger loads it for rendering and the parent still receives
+// the completion.
+func TestChildCompletionRendersThroughAGraphlessChild(t *testing.T) {
 	store := completionChildGraph(completionParentID, false, OperationSuccess, "", "child text").storage(t)
 	addRootSession(t, store, completionParentID)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 	ctx := context.Background()
 
-	// Warm both Sessions with real reads, so the pressure below evicts idle
-	// graphs only.
+	// Warm both Sessions with real reads; each graph is released with its call.
 	if _, err := h.ReadHistoryView(ctx, completionParentID); err != nil {
 		t.Fatalf("parent ReadHistoryView: %v", err)
 	}
@@ -822,7 +906,14 @@ func TestChildCompletionRendersThroughAnEvictedGraph(t *testing.T) {
 		t.Fatalf("child ReadHistoryView: %v", err)
 	}
 	child := cachedCoordinator(t, h, completionChildID)
-	parent := cachedCoordinator(t, h, completionParentID)
+	parent := leaseCoordinator(t, h, completionParentID) // the fixture's explicit parent pin
+	child.mu.Lock()
+	childGraph := child.graph
+	child.mu.Unlock()
+	if childGraph != nil {
+		t.Fatalf("the child's released graph stayed resident")
+	}
+
 	member, err := admitLocked(h, parent, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("child member admission: %v", err)
@@ -830,16 +921,6 @@ func TestChildCompletionRendersThroughAnEvictedGraph(t *testing.T) {
 	child.mu.Lock()
 	child.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: 1024}
 	child.mu.Unlock()
-
-	for i := 0; i < inactiveGraphLimit; i++ {
-		createSession(t, h)
-	}
-	h.mu.Lock()
-	evicted := !child.cached
-	h.mu.Unlock()
-	if !evicted {
-		t.Fatalf("the idle child graph was not evicted under pressure")
-	}
 
 	h.childCompletionSettled(child, "")
 	if got := runtimeInputTextRaw(t, store, completionParentID); got != "child text" {

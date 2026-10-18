@@ -24,7 +24,9 @@ const (
 	childFixtureOp     = "child-op"
 )
 
-// cachedCoordinator returns the registry-cached coordinator of one Session.
+// cachedCoordinator returns the registry coordinator of one Session. It takes
+// no use: a fixture that inspects or mutates the coordinator's graph state
+// takes its own explicit lease instead.
 func cachedCoordinator(t *testing.T, h *Harness, sessionID string) *coordinator {
 	t.Helper()
 	h.mu.Lock()
@@ -184,7 +186,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 		defer cancel()
 		session := createSession(t, h)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -229,7 +231,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -260,7 +262,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -307,7 +309,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -365,7 +367,7 @@ func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 	defer cancel()
 	session := createSession(t, h)
 	watch := watchSettlements(store)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -456,7 +458,7 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -538,7 +540,7 @@ func TestDeliverBackgroundCompletionReserveFailureTakesClosedPath(t *testing.T) 
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -633,7 +635,7 @@ func TestClosedDeliveryCommitsBeforeDoneCloses(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -686,7 +688,7 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -763,7 +765,7 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	memberA, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("child admission: %v", err)

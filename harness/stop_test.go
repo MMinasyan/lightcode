@@ -200,14 +200,16 @@ func inputTexts(t *testing.T, store *graphStorage, sessionID string) []string {
 }
 
 // waitQuiet polls one coordinator until its retired execution slot is
-// released and no Operation is current: deliveries resolving after this point
+// released and no Operation is current: a graphless cell (its last use
+// released) is quiet by construction, and a resident graph reports the
+// durable current Operation. Deliveries resolving after this point
 // deterministically take the idle-admission mode.
 func waitQuiet(t *testing.T, c *coordinator) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		c.mu.Lock()
-		quiet := c.run == nil && c.graph.Session.State.CurrentOperationID == ""
+		quiet := c.run == nil && (c.graph == nil || c.graph.Session.State.CurrentOperationID == "")
 		c.mu.Unlock()
 		if quiet {
 			return
@@ -472,10 +474,10 @@ func TestSubmitRejectsClosedActiveChild(t *testing.T) {
 // TestStopGatedLaunchWaitsForMaterialization proves the materialization-window
 // row under the stable-cell protocol: a child Stop that lands while the
 // launch's child load is parked shares the child's one stable cell and waits
-// for that load — it neither skips the addressed child nor starts a second
-// load — and once released the child is permanently closed, its Operation
-// reaches a terminal, and the parent receives the completion before the stop
-// returns. The closed-entry interruption outcome itself is pinned by
+// for that load — it neither skips the addressed child nor adds more than its
+// own one reload — and once released the child is permanently closed, its
+// Operation reaches a terminal, and the parent receives the completion before
+// the stop returns. The closed-entry interruption outcome itself is pinned by
 // TestStopRacingStartSettlesWithoutStarting, whose stop completes before the
 // launch resumes.
 func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
@@ -530,8 +532,11 @@ func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
 	if err := <-launchDone; err != nil {
 		t.Fatalf("LaunchChildSession = %v, want the launch to succeed", err)
 	}
-	if got := gate.readCount(); got != sharedLoads {
-		t.Fatalf("register reads after the stop joined = %d, want the same %d: no second child load", got, sharedLoads)
+	// The stop's own acquisition joins the launch's just-published graph when
+	// it arrives in time, or — under the one release rule — loads the child
+	// once itself; it never loads more than that one.
+	if got := gate.readCount(); got != sharedLoads && got != sharedLoads+1 {
+		t.Fatalf("register reads after the stop joined = %d, want at most the stop's own one load beyond %d", got, sharedLoads)
 	}
 	if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status == OperationRunning || rec.State.Terminal == nil {
 		t.Fatalf("child operation state = %+v, want a terminal settlement", rec.State)

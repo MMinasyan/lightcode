@@ -182,7 +182,7 @@ type captureOutcome struct {
 // records whether it executed. Its own lease covers the park exactly like a
 // production reader's use.
 func parkedCaptureReader(ctx context.Context, h *Harness, sessionID string, acquired chan<- struct{}, release <-chan struct{}, out chan<- captureOutcome) {
-	c, lease, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, lease, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		out <- captureOutcome{err: err}
 		return
@@ -291,107 +291,85 @@ func runMarkWindow(t *testing.T, ctx context.Context, h *Harness, stub *prepareS
 // whose acquisition passed before the real Fork transition stuck the
 // corruption marker on the warm source must still refuse its capture — the
 // capture callback never executes — because the availability decision runs
-// inside the capture hold. Both rows share the window; each also proves the
-// pre-marker nearest valid sibling — the same warm coordinator captures its
-// complete state and the copy is owned.
+// inside the capture hold. The row also proves both pre-marker ownership
+// observations: the same warm coordinator captures its complete owned state —
+// the composed Session view and the Operation record — and mutating either
+// returned copy cannot reach the coordinator.
 func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
-	t.Run("a parked capture after the mark is refused and its callback never runs", func(t *testing.T) {
-		ctx := context.Background()
-		h, _, stub, c, _ := warmCorruptFixture(t)
+	ctx := context.Background()
+	h, _, stub, c, _ := warmCorruptFixture(t)
 
-		view, err := h.ReadSessionView(ctx, testSessionID)
-		if err != nil {
-			t.Fatalf("pre-marker ReadSessionView: %v", err)
+	view, err := h.ReadSessionView(ctx, testSessionID)
+	if err != nil {
+		t.Fatalf("pre-marker ReadSessionView: %v", err)
+	}
+	if len(view.Operations) != 1 || view.Operations[0].OperationID != testOpID ||
+		view.Operations[0].Status != OperationSuccess {
+		t.Fatalf("pre-marker operations = %+v, want the settled %s", view.Operations, testOpID)
+	}
+	if view.History.ExecutionBusy {
+		t.Fatalf("pre-marker view = busy, want the idle post-settlement state")
+	}
+	// The captured copy is owned: mutating it cannot reach the coordinator.
+	view.Operations[0].Status = OperationRunning
+	facts := view.History.HistoryFacts(historyHeaderIDs(view.History.HistoryHeaders()))
+	inputText := ""
+	for _, fact := range facts {
+		if fact.Input != nil {
+			inputText = fact.Input.Content[0].Text
+			fact.Input.Content[0].Text = "mutated"
 		}
-		if len(view.Operations) != 1 || view.Operations[0].OperationID != testOpID ||
-			view.Operations[0].Status != OperationSuccess {
-			t.Fatalf("pre-marker operations = %+v, want the settled %s", view.Operations, testOpID)
-		}
-		if view.History.ExecutionBusy {
-			t.Fatalf("pre-marker view = busy, want the idle post-settlement state")
-		}
-		// The captured copy is owned: mutating it cannot reach the coordinator.
-		view.Operations[0].Status = OperationRunning
-		facts := view.History.HistoryFacts(historyHeaderIDs(view.History.HistoryHeaders()))
-		inputText := ""
-		for _, fact := range facts {
-			if fact.Input != nil {
-				inputText = fact.Input.Content[0].Text
-				fact.Input.Content[0].Text = "mutated"
-			}
-		}
-		if inputText == "" {
-			t.Fatal("pre-marker view carries no input fact to mutate")
-		}
-		again, err := h.ReadSessionView(ctx, testSessionID)
-		if err != nil {
-			t.Fatalf("pre-marker reread: %v", err)
-		}
-		rereadFacts := again.History.HistoryFacts(historyHeaderIDs(again.History.HistoryHeaders()))
-		for _, fact := range rereadFacts {
-			if fact.Input != nil && fact.Input.Content[0].Text == "mutated" {
-				t.Fatalf("a mutation of the returned view reached the coordinator: %+v", again)
-			}
-		}
-		if again.Operations[0].Status != OperationSuccess {
+	}
+	if inputText == "" {
+		t.Fatal("pre-marker view carries no input fact to mutate")
+	}
+	again, err := h.ReadSessionView(ctx, testSessionID)
+	if err != nil {
+		t.Fatalf("pre-marker reread: %v", err)
+	}
+	rereadFacts := again.History.HistoryFacts(historyHeaderIDs(again.History.HistoryHeaders()))
+	for _, fact := range rereadFacts {
+		if fact.Input != nil && fact.Input.Content[0].Text == "mutated" {
 			t.Fatalf("a mutation of the returned view reached the coordinator: %+v", again)
 		}
+	}
+	if again.Operations[0].Status != OperationSuccess {
+		t.Fatalf("a mutation of the returned view reached the coordinator: %+v", again)
+	}
 
-		reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
-			SourceSessionID: testSessionID,
-			BoundaryEntryID: hexID(1),
-			OperationID:     "op-fork-1",
-			Content:         admissionContent("fork"),
-		})
+	// The same window pins the Operation record's own ownership.
+	rec, err := h.ReadOperation(ctx, testSessionID, testOpID)
+	if err != nil {
+		t.Fatalf("pre-marker ReadOperation: %v", err)
+	}
+	if rec.Admission.OperationID != testOpID || rec.State.Status != OperationSuccess {
+		t.Fatalf("pre-marker record = %+v, want the settled %s", rec, testOpID)
+	}
+	rec.State.Status = OperationFailure
+	reread, err := h.ReadOperation(ctx, testSessionID, testOpID)
+	if err != nil {
+		t.Fatalf("pre-marker reread: %v", err)
+	}
+	if reread.State.Status != OperationSuccess {
+		t.Fatalf("a mutation of the returned record reached the coordinator: %+v", reread)
+	}
 
-		outcome := receiveBounded(t, reader, "the parked capture never completed")
-		assertCaptureCorruption(t, outcome.err, testSessionID, "captureAvailable")
-		if outcome.callbackRan {
-			t.Fatal("the capture callback executed after the mark")
-		}
-		forkErr := receiveBounded(t, forkDone, "Fork never completed")
-		if !isCorruption(forkErr) {
-			t.Fatalf("Fork = %v, want its own register-decode corruption", forkErr)
-		}
+	reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
+		SourceSessionID: testSessionID,
+		BoundaryEntryID: hexID(1),
+		OperationID:     "op-fork-1",
+		Content:         admissionContent("fork"),
 	})
 
-	t.Run("the parked capture's pre-marker Operation ownership holds", func(t *testing.T) {
-		ctx := context.Background()
-		h, _, stub, c, _ := warmCorruptFixture(t)
-
-		rec, err := h.ReadOperation(ctx, testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("pre-marker ReadOperation: %v", err)
-		}
-		if rec.Admission.OperationID != testOpID || rec.State.Status != OperationSuccess {
-			t.Fatalf("pre-marker record = %+v, want the settled %s", rec, testOpID)
-		}
-		rec.State.Status = OperationFailure
-		reread, err := h.ReadOperation(ctx, testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("pre-marker reread: %v", err)
-		}
-		if reread.State.Status != OperationSuccess {
-			t.Fatalf("a mutation of the returned record reached the coordinator: %+v", reread)
-		}
-
-		reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
-			SourceSessionID: testSessionID,
-			BoundaryEntryID: hexID(1),
-			OperationID:     "op-fork-2",
-			Content:         admissionContent("fork"),
-		})
-
-		outcome := receiveBounded(t, reader, "the parked capture never completed")
-		assertCaptureCorruption(t, outcome.err, testSessionID, "captureAvailable")
-		if outcome.callbackRan {
-			t.Fatal("the capture callback executed after the mark")
-		}
-		forkErr := receiveBounded(t, forkDone, "Fork never completed")
-		if !isCorruption(forkErr) {
-			t.Fatalf("Fork = %v, want its own register-decode corruption", forkErr)
-		}
-	})
+	outcome := receiveBounded(t, reader, "the parked capture never completed")
+	assertCaptureCorruption(t, outcome.err, testSessionID, "captureAvailable")
+	if outcome.callbackRan {
+		t.Fatal("the capture callback executed after the mark")
+	}
+	forkErr := receiveBounded(t, forkDone, "Fork never completed")
+	if !isCorruption(forkErr) {
+		t.Fatalf("Fork = %v, want its own register-decode corruption", forkErr)
+	}
 }
 
 // TestCaptureAvailabilityFamily pins the surrounding semantic rows of the

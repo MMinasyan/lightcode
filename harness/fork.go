@@ -60,7 +60,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return res, err
 	}
 
-	c, release, err := h.acquireCoordinator(ctx, req.SourceSessionID, true)
+	c, release, err := h.acquireCoordinator(ctx, req.SourceSessionID)
 	if err != nil {
 		return ForkResult{}, err
 	}
@@ -115,9 +115,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 	// use, so the destination graph stays live across the call's release.
 	dest := &coordinator{sessionID: destID, graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}, bgState: bgOpen}
 	dest.identity = commit.session.Identity
-	dest.cached = true
 	dest.everLoaded = true
-	dest.intervalCache = true
 	dest.uses = 1
 	h.mu.Lock()
 	h.sessions[destID] = dest

@@ -242,7 +242,7 @@ func TestNarrowReadsCopyOnlyTheirOwnState(t *testing.T) {
 	if _, err := h.ReadHistoryView(ctx, testSessionID); err != nil {
 		t.Fatalf("warm ReadHistoryView: %v", err)
 	}
-	c := cachedCoordinator(t, h, testSessionID)
+	c := leaseCoordinator(t, h, testSessionID) // the fixture's explicit warm-view lease
 	measure := func() (header, history float64) {
 		header = testing.AllocsPerRun(200, func() {
 			if _, err := h.ReadSessionHeader(ctx, testSessionID); err != nil {
@@ -394,11 +394,8 @@ func TestHistoryViewFactUnionAndOwnership(t *testing.T) {
 		}
 		headers := view.HistoryHeaders()
 		for i, header := range headers {
-			if header.EntryID == "" || header.Sequence == 0 {
+			if header.EntryID == "" {
 				t.Fatalf("header[%d] = %+v, want the committed envelope identity", i, header)
-			}
-			if i > 0 && header.Sequence <= headers[i-1].Sequence {
-				t.Fatalf("header[%d] sequence %d does not follow %d, want ascending sequence order", i, header.Sequence, headers[i-1].Sequence)
 			}
 			if header.Kind != EntryInput && header.InputOrigin != "" {
 				t.Fatalf("header[%d] = %+v, want no input origin on a non-input kind", i, header)
@@ -593,8 +590,8 @@ func TestHistoryViewAccessorsPure(t *testing.T) {
 	view := HistoryReadView{prefix: []graphEntry{inputEntryValue, hook, assistantValue}}
 
 	wantHeaders := []HistoryEntryHeader{
-		{EntryID: "input-1", Sequence: 1, Kind: EntryInput, InputOrigin: InputOriginUser},
-		{EntryID: "assistant-1", Sequence: 3, Kind: EntryAssistant},
+		{EntryID: "input-1", Kind: EntryInput, InputOrigin: InputOriginUser},
+		{EntryID: "assistant-1", Kind: EntryAssistant},
 	}
 	if headers := view.HistoryHeaders(); !reflect.DeepEqual(headers, wantHeaders) {
 		t.Fatalf("headers = %+v, want %+v (hook evidence excluded)", headers, wantHeaders)
@@ -726,7 +723,7 @@ func TestHistoryViewRetainedCaptureStable(t *testing.T) {
 
 	const futureAssistantID = "fffffffffffffffffffffffffffffff1"
 	const futureResultID = "fffffffffffffffffffffffffffffff2"
-	c := cachedCoordinator(t, h, testSessionID)
+	c := leaseCoordinator(t, h, testSessionID) // the fixture's explicit live-view lease
 	c.mu.Lock()
 	c.graph.Operations = append(c.graph.Operations, validOperationRecord())
 	c.graph.Session.Revision++

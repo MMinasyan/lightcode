@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"container/list"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,11 +12,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/model"
 )
-
-// inactiveGraphLimit bounds the inactive Session graphs one Harness retains:
-// a count bound over the heavyweight decoded graphs only. Every coordinator
-// stays for its Session's lifetime; eviction clears its graph alone.
-const inactiveGraphLimit = 8
 
 // JobStopper is the job-stop seam: the Harness cannot import plugin packages,
 // so the interface is declared at its consumer. Nil is legal; StartJob rejects
@@ -194,10 +188,6 @@ type Harness struct {
 
 	mu       sync.Mutex
 	sessions map[string]*coordinator
-	// lru orders the inactive cached Session graphs, oldest first, bounded by
-	// inactiveGraphLimit. A graph with positive uses leaves the list: it is
-	// not inactive, and no eviction may reach it.
-	lru *list.List
 
 	// storageFailure retains the first storage-class failure that stopped
 	// admitted work; Wait returns it after all process-local work has ended.
@@ -230,27 +220,29 @@ type activeExecution struct {
 }
 
 // coordinator is the one per-Session authority: the retained identity, the
-// validated Session graph while one is cached, a sticky corruption marker,
+// validated Session graph while one is resident, a sticky corruption marker,
 // the single admission/fork reservation, the two process-local message FIFOs,
 // and the optional active execution. The cell itself is stable for its
-// Session's lifetime; only the graph is evictable, and all of the remaining
-// local state survives every graph eviction.
+// Session's lifetime; the graph is resident only while a use holds it, and
+// every remaining local field survives every graph release.
 type coordinator struct {
 	// sessionID is the durable identity, fixed when the cell is installed:
 	// release cleanup and lookup never need the graph.
 	sessionID string
 
 	// The following fields belong to the Harness registry mutex.
-	uses          int           // current uses; the graph may be cleared only at zero
-	intervalCache bool          // the current use interval carried a cache-eligible use
-	cached        bool          // a graph is installed right now
-	everLoaded    bool          // a graph was validated for this cell at least once
-	lruNode       *list.Element // the inactive-cache node; nil whenever the cell is not cached-idle
-	corru         error         // sticky semantic corruption latch
+	uses       int   // current uses; the graph may be cleared only at zero
+	everLoaded bool  // a graph was validated for this cell at least once
+	corru      error // sticky semantic corruption latch
 
 	mu       sync.Mutex
 	graph    *sessionGraph
 	identity SessionIdentity
+	// durableRevision is the last resident graph's Session register revision,
+	// captured when that graph is released. An observation of a graphless
+	// established cell answers with it; while a graph is resident the graph's
+	// own current revision is the value.
+	durableRevision int64
 
 	reserved chan struct{} // non-nil while one reservation is held; closed on release
 
@@ -284,7 +276,7 @@ func New(ctx context.Context, deps Dependencies) (*Harness, error) {
 	if deps.Storage == nil || deps.Prepare == nil {
 		return nil, invalidInput("harness construction requires non-nil storage and preparation dependencies")
 	}
-	return &Harness{ctx: ctx, deps: deps, sessions: map[string]*coordinator{}, lru: list.New()}, nil
+	return &Harness{ctx: ctx, deps: deps, sessions: map[string]*coordinator{}}, nil
 }
 
 // CreateSession creates one Workspace-bound root Session with a random
@@ -325,13 +317,10 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 		return SessionRecord{}, err
 	}
 	// The committed creation installs the stable cell with its committed graph
-	// and a call-owned pin: the Session is cache-eligible from its creation,
-	// and the release returns it to the inactive cache.
+	// and a call-owned pin; the release clears the graph and retains the cell.
 	created := &coordinator{sessionID: sessionID, graph: &sessionGraph{Session: record}, bgState: bgOpen}
 	created.identity = record.Identity
-	created.cached = true
 	created.everLoaded = true
-	created.intervalCache = true
 	created.uses = 1
 	h.mu.Lock()
 	h.sessions[sessionID] = created
@@ -345,13 +334,13 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 // one Session. The shared unavailable check runs inside the same
 // coordinator-mutex hold that copies the record, so a deletion or a corruption
 // marker that committed after materialization resolves to ErrNotFound or the
-// typed corruption error rather than a stale cached read.
+// typed corruption error rather than a stale resident read.
 func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID string) (OperationRecord, error) {
 	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
 	}
 	var record OperationRecord
-	if err := h.withSessionRead(ctx, sessionID, true, func(c *coordinator) error {
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
 		rec, ok := c.graph.Operation(operationID)
 		if !ok {
 			return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
@@ -371,7 +360,7 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 	if agentType == "" {
 		return SessionRecord{}, invalidInput("agent type must be non-empty")
 	}
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
@@ -426,7 +415,7 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -464,7 +453,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	c, release, err := h.acquireCoordinator(ctx, req.SessionID, true)
+	c, release, err := h.acquireCoordinator(ctx, req.SessionID)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -558,7 +547,7 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 	if err := validateOperationIdentity(req.OperationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
 	}
-	c, release, err := h.acquireCoordinator(ctx, req.SessionID, true)
+	c, release, err := h.acquireCoordinator(ctx, req.SessionID)
 	if err != nil {
 		return OperationRecord{}, err
 	}
@@ -614,7 +603,7 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 // time, preserving history, usage, context, lineage, and Agent type.
 // Reopening an already open Session is a no-write success.
 func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionRecord, error) {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
@@ -673,7 +662,7 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -694,7 +683,7 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 // Session is rejected; archiving an already archived Session is a no-write
 // success.
 func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (SessionRecord, error) {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
@@ -761,7 +750,7 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -783,7 +772,7 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 // coordinator and later materialization both return ErrNotFound. Deleting an
 // open or absent Session is rejected without a write.
 func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -820,7 +809,7 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return rerr
 				}
@@ -853,7 +842,7 @@ func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy Swe
 	if now.IsZero() {
 		return false, invalidInput("sweep time must not be zero")
 	}
-	c, release, err := h.acquireCoordinator(ctx, sessionID, false)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -1018,20 +1007,14 @@ func (c *coordinator) invalidate() {
 }
 
 // removeCoordinator drops one invalidated coordinator after its canonical
-// deletion commit: the registry entry and its inactive-cache node go, so no
-// later materialization or eviction reaches it. A caller already holding the
-// coordinator keeps it, and its gone flag, until its uses release; the graph
-// pointer is left alone, because the registry mutex may clear it only at zero
-// uses.
+// deletion commit: the registry entry goes, so no later materialization
+// reaches it. A caller already holding the coordinator keeps it, and its gone
+// flag, until its uses release; the graph pointer is left alone, because the
+// cell is no longer reachable through the registry and dies with its last
+// holder.
 func (h *Harness) removeCoordinator(sessionID string) {
 	h.mu.Lock()
-	if c := h.sessions[sessionID]; c != nil {
-		delete(h.sessions, sessionID)
-		if c.lruNode != nil {
-			h.lru.Remove(c.lruNode)
-			c.lruNode = nil
-		}
-	}
+	delete(h.sessions, sessionID)
 	h.mu.Unlock()
 }
 
@@ -1057,15 +1040,11 @@ func notFoundSession(sessionID string) error {
 // all. A persisted semantic violation latches on the stable cell and makes the
 // Session unavailable in this Harness instance; other Sessions remain usable.
 // A deleted coordinator stays absent to every holder: it resolves to the
-// not-found class instead of a stale cached read.
-//
-// cacheIdle selects retention only, never validation, availability, or errors:
-// a cache-eligible caller keeps a valid graph cached when its interval goes
-// idle, while a metadata-only caller discards a graph it loaded itself and
-// never promotes a cached one. The returned release drops the use, and must be
-// called after the caller leaves the coordinator mutex for the last time.
-func (h *Harness) acquireCoordinator(ctx context.Context, sessionID string, cacheIdle bool) (*coordinator, func(), error) {
-	c := h.claimCell(sessionID, cacheIdle)
+// not-found class instead of a stale resident read. The returned release drops
+// the use, clears the graph at the final release, and must be called after the
+// caller leaves the coordinator mutex for the last time.
+func (h *Harness) acquireCoordinator(ctx context.Context, sessionID string) (*coordinator, func(), error) {
+	c := h.claimCell(sessionID)
 	if err := h.loadGraph(ctx, c, sessionID, false); err != nil {
 		h.releaseUse(c)
 		return nil, nil, err
@@ -1082,21 +1061,13 @@ func (h *Harness) acquireCoordinator(ctx context.Context, sessionID string, cach
 func (h *Harness) retainGraph(c *coordinator) func() {
 	h.mu.Lock()
 	c.uses++
-	c.intervalCache = true // execution/member/completion retention is cache-eligible
-	if c.lruNode != nil {  // a graph with positive uses is never an inactive-cache candidate
-		h.lru.Remove(c.lruNode)
-		c.lruNode = nil
-	}
 	h.mu.Unlock()
 	return func() { h.releaseUse(c) }
 }
 
 // claimCell returns one Session's stable coordinator with one use claimed and
-// the registry mutex released. A cache-eligible claim removes the cell's
-// inactive-cache node: the graph is in use, and the final release of the
-// interval restores its recency. A metadata-only claim leaves the node in
-// place, so borrowing a cached graph never changes its position.
-func (h *Harness) claimCell(sessionID string, cacheEligible bool) *coordinator {
+// the registry mutex released.
+func (h *Harness) claimCell(sessionID string) *coordinator {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	c := h.sessions[sessionID]
@@ -1105,98 +1076,41 @@ func (h *Harness) claimCell(sessionID string, cacheEligible bool) *coordinator {
 		h.sessions[sessionID] = c
 	}
 	c.uses++
-	if cacheEligible {
-		c.intervalCache = true
-		if c.lruNode != nil {
-			h.lru.Remove(c.lruNode)
-			c.lruNode = nil
-		}
-	}
 	return c
 }
 
-// claimCoordinator claims one already-registered coordinator for a cached-only
-// observation: the use is incremented under the registry mutex without
-// inspecting the graph, so the caller may then inspect under the coordinator
-// mutex without loading. It reports false when the cell is no longer the
-// registry's entry.
-func (h *Harness) claimCoordinator(c *coordinator) (func(), bool) {
-	h.mu.Lock()
-	if h.sessions[c.sessionID] != c {
-		h.mu.Unlock()
-		return nil, false
-	}
-	c.uses++
-	h.mu.Unlock()
-	return func() { h.releaseUse(c) }, true
-}
-
-// releaseUse drops one use. The final release is the single retention
-// decision, and it runs entirely under the registry mutex: no
-// coordinator-mutex-owned field is inspected there. The last use of a
-// metadata-only cold graph discards that graph; the last use of a
-// cache-eligible interval makes the graph the newest inactive cache entry and
-// evicts the oldest zero-use entries past the count bound; a graph borrowed by
-// metadata keeps its place. A corruption-latched cell is never cached: its
-// graph leaves the cache whether the interval was cache-eligible or a metadata
-// borrow, while the stable cell, its latch, and every local field stay. A
-// never-loaded cell with no latch leaves the registry, and an established cell
-// keeps every local field and is simply without a graph. The gone half of
-// availability needs no check here: canonical deletion removes the registry
-// entry — and its cache node — before any final release of the deleted cell
-// can run, so a gone graph never reaches the insertion.
+// releaseUse drops one use. The final release is the single graph owner: it
+// runs under the coordinator mutex and then the registry mutex — the existing
+// allowed direction, never the reverse — captures the resident graph's durable
+// Session revision into the cell's retained value, and clears the graph. Every
+// graph, whatever the caller kind, is cleared at its final use release; a
+// graph with a positive use count is never cleared. The stable cell, its
+// retained identity and revision, its sticky latch, and every local field
+// stay. A never-loaded latch-free cell leaves the registry, and a cell removed
+// by canonical deletion is left alone: its graph dies with its last holder.
 func (h *Harness) releaseUse(c *coordinator) {
+	c.mu.Lock()
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	c.uses--
 	if c.uses > 0 {
+		h.mu.Unlock()
+		c.mu.Unlock()
 		return
 	}
-	cacheEligible := c.intervalCache
-	c.intervalCache = false
 	if h.sessions[c.sessionID] != c {
-		return // canonically deleted: the registry entry and the cache node are already gone
+		h.mu.Unlock()
+		c.mu.Unlock()
+		return // canonically deleted: the registry entry is already gone
 	}
-	switch {
-	case !c.cached:
-		if !c.everLoaded && c.corru == nil { // a failed first lookup leaves no cell behind
-			delete(h.sessions, c.sessionID)
-		}
-	case c.corru != nil: // an unavailable graph is never an inactive cache entry
-		if c.lruNode != nil {
-			h.lru.Remove(c.lruNode)
-			c.lruNode = nil
-		}
+	if c.graph != nil {
+		c.durableRevision = c.graph.Session.Revision
 		c.graph = nil
-		c.cached = false
-	case cacheEligible:
-		c.lruNode = h.lru.PushBack(c) // a cache-eligible claim removed the node, so the tail is free
-		h.evictInactiveLocked()
-	case c.lruNode != nil:
-		// a metadata borrow of a cached graph preserves its position and recency
-	default: // a metadata-only cold graph is discarded instead of entering the cache
-		c.graph = nil
-		c.cached = false
 	}
-}
-
-// evictInactiveLocked clears the graphs of the oldest zero-use cache entries
-// while the bound is exceeded, by clearing graph alone: the cell, its retained
-// identity, and every local field stay. A borrowed older entry is skipped; the
-// just-released tail node is always zero-use, so the scan always reaches that
-// victim when every older entry is borrowed.
-func (h *Harness) evictInactiveLocked() {
-	for h.lru.Len() > inactiveGraphLimit {
-		victim := h.lru.Front()
-		for victim.Value.(*coordinator).uses > 0 { // borrowed older entries are never victims
-			victim = victim.Next()
-		}
-		c := victim.Value.(*coordinator)
-		h.lru.Remove(victim)
-		c.lruNode = nil
-		c.graph = nil // zero uses: no loader may write, so the registry mutex may clear it
-		c.cached = false
+	if !c.everLoaded && c.corru == nil { // a failed first lookup leaves no cell behind
+		delete(h.sessions, c.sessionID)
 	}
+	h.mu.Unlock()
+	c.mu.Unlock()
 }
 
 // loadGraph validates one Session's durable graph and publishes it under the
@@ -1228,7 +1142,6 @@ func (h *Harness) loadGraph(ctx context.Context, c *coordinator, sessionID strin
 	c.graph = graph
 	c.identity = graph.Session.Identity
 	h.mu.Lock()
-	c.cached = true
 	c.everLoaded = true
 	h.mu.Unlock()
 	return nil
@@ -1547,7 +1460,7 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 		return nil
 	})
 	if existing {
-		if foreign { // a foreign writer changed the durable state under the cached view
+		if foreign { // a foreign writer changed the durable state under the resident view
 			if rerr := h.rematerialize(ctx, c, req.SessionID); rerr != nil {
 				return OperationRecord{}, false, rerr
 			}
@@ -1556,7 +1469,7 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 	}
 	if err != nil {
 		h.markCorrupt(req.SessionID, err)
-		if foreign { // the transaction proved the cached view stale; refresh it before the error returns
+		if foreign { // the transaction proved the resident view stale; refresh it before the error returns
 			if rerr := h.rematerialize(ctx, c, req.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 				return OperationRecord{}, false, rerr
 			}
@@ -1869,7 +1782,7 @@ func (h *Harness) snapshotCoordinators() []*coordinator {
 // snapshotEstablishedCoordinators copies the registry's established cells
 // under h.mu and returns them with h.mu released: an established cell is one
 // whose Session graph was validated at least once, so it owns the local state
-// a stop can join, whether or not a graph is cached right now. A failed
+// a stop can join, whether or not a graph is resident right now. A failed
 // never-loaded lookup owns nothing. The caller drives each stop body directly,
 // with the cell's retained identity and its local group, run, and reservation
 // handles; no graph and no storage read is involved, so an idle corpus is

@@ -609,7 +609,7 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 // observation; the gate consumes their single scalar fact.
 func TestCodeRevertGateAxes(t *testing.T) {
 	const sessionID = "0123456789abcdef0123456789abcdef"
-	base := harness.HistoryReadView{Identity: harness.SessionIdentity{SessionID: sessionID}}
+	base := harness.HistoryReadView{}
 	cases := []struct {
 		name    string
 		mutate  func(*harness.HistoryReadView)
