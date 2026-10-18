@@ -657,6 +657,38 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 	})
 }
 
+func TestGraphValidatorSessionUsageOverflowAcrossOperations(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		first    int64
+		overflow bool
+	}{
+		{name: "representable session total", first: math.MaxInt64 - 1},
+		{name: "session-only overflow", first: math.MaxInt64, overflow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := benchValidatorFixture(2)
+			ref := testModelRef()
+			for i, count := range []int64{tc.first, 1} {
+				usage := UsageCount{InputTokens: count}
+				fixture.entries[4*i+3].settlement.Model = &ref
+				fixture.entries[4*i+3].settlement.Usage = &usage
+				fixture.ops[i].State.Usage = UsageTotals{ByModel: []ModelUsage{{Model: ref, Usage: usage}}}
+			}
+			fixture.session.State.Usage = UsageTotals{ByModel: []ModelUsage{{Model: ref, Usage: UsageCount{InputTokens: math.MaxInt64}}}}
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			if tc.overflow {
+				corrupt := wantCorruption(t, err)
+				if !strings.Contains(corrupt.Error(), "session usage overflows:") {
+					t.Fatalf("overflow = %v, want the Session accumulator's rejection", corrupt)
+				}
+			} else if err != nil {
+				t.Fatalf("representable total rejected: %v", err)
+			}
+		})
+	}
+}
+
 // TestGraphValidatorSurfacesCorruption proves persisted semantic violations
 // surface as CorruptionError for the owning Session while a valid sibling
 // stays usable in isolation.

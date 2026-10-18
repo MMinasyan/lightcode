@@ -349,6 +349,13 @@ type prepEnv struct {
 	// so a test may set them after construction.
 	failAgentFactory bool
 	agentCloseErr    error
+
+	// agGateArrived and agGateRelease arm the Agent-scope factory to park its
+	// opening: the factory signals arrival, then waits for release with no
+	// cancellation exit, immediately before returning its valid Instance. A
+	// test sets both after newPrepEnv and before its single Submit.
+	agGateArrived chan struct{}
+	agGateRelease chan struct{}
 }
 
 func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
@@ -440,6 +447,13 @@ func (e *prepEnv) plugins() []Plugin {
 				}
 				e.agOpens.Add(1)
 				e.events.add("ag-open")
+				if e.agGateArrived != nil {
+					select {
+					case e.agGateArrived <- struct{}{}:
+					default:
+					}
+					<-e.agGateRelease
+				}
 				return Instance{
 					Values: map[string]any{"ag.native": loudGreeter{word: "ag"}, "arg.agent": e.argHooks[3]},
 					Close: func() error {
@@ -552,7 +566,11 @@ func (e *prepEnv) awaitTerminal(sessionID, operationID string, want harness.Oper
 			return rec
 		}
 		if time.Now().After(deadline) {
-			e.t.Fatalf("operation %q never settled to %v (err %v, state %+v)", operationID, want, err, rec.State)
+			var detail string
+			if rec.State.Terminal != nil {
+				detail = rec.State.Terminal.Detail
+			}
+			e.t.Fatalf("operation %q never settled to %v (err %v, status %v, detail %q)", operationID, want, err, rec.State.Status, detail)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1463,6 +1481,43 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 				t.Fatalf("Wait error = %v, want the retained cleanup failure %v", err, errExecClose)
 			}
 		})
+	})
+}
+
+// TestPreparationInterruptBeforeAgentScopeEntrySettlesInterruption proves on
+// both stores that an interrupt landing after the admission commit and before
+// the Agent-scope guard admits its call settles the durable Operation as the
+// interruption: the parked Agent-scope factory holds the opening open, the
+// real Runtime interrupt cancels the execution context and the Agent scope
+// derived from it, and the released opening reaches enter with a canceled
+// caller on an unavailable derived scope.
+func TestPreparationInterruptBeforeAgentScopeEntrySettlesInterruption(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		arrived := make(chan struct{}, 1)
+		release := make(chan struct{})
+		releaseGate := sync.OnceFunc(func() { close(release) })
+		defer releaseGate() // a failing assertion never parks the opening or the owner's shutdown
+		e.agGateArrived, e.agGateRelease = arrived, release
+		session := e.session("deep")
+		e.admit(session, "op-int", "interrupt me")
+		select {
+		case <-arrived: // the opening is parked inside the Agent-scope factory
+		case <-time.After(10 * time.Second):
+			t.Fatal("the Agent-scope opening never parked")
+		}
+		if err := e.r.interruptSession(context.Background(), session); err != nil {
+			t.Fatalf("interruptSession: %v", err)
+		}
+		releaseGate()
+		rec := e.awaitTerminal(session, "op-int", harness.OperationInterruption)
+		if rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, ErrClosed.Error()) {
+			t.Fatalf("terminal detail = %q, want the interruption identity, not the closed-scope failure", rec.State.Terminal.Detail)
+		}
+		e.awaitEvent("ag-close", "op-close") // the parked opening still disposed both scopes
+		if err := e.converge(); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
 	})
 }
 

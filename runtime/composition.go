@@ -673,13 +673,19 @@ func (s *scope) unavailableLocked() bool {
 
 // enter admits one call against the caller's context, returning the derived
 // call context and its once-only release. A closed or owner-canceled scope
-// rejects with ErrClosed and a canceled caller context is rejected with its
-// own error before work is registered.
+// rejects with the caller's own error when the caller is canceled too — the
+// caller's error is selected after observing unavailability — and with
+// ErrClosed otherwise; a canceled caller context against a live scope is
+// rejected with its own error before work is registered.
 func (s *scope) enter(ctx context.Context) (context.Context, func(), error) {
 	s.mu.Lock()
 	if s.unavailableLocked() {
+		err := ctx.Err()
+		if err == nil {
+			err = ErrClosed
+		}
 		s.mu.Unlock()
-		return nil, nil, ErrClosed
+		return nil, nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		s.mu.Unlock()

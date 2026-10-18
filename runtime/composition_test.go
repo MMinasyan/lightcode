@@ -654,6 +654,52 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 			t.Errorf("close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
 		}
 	})
+
+	t.Run("canceled caller on a live scope keeps its own error", func(t *testing.T) {
+		f := openGuardFixture(t, context.Background())
+		caller, cancelCaller := context.WithCancel(context.Background())
+		cancelCaller()
+		if _, _, err := f.ws.enter(caller); !errors.Is(err, context.Canceled) {
+			t.Errorf("enter from a canceled caller on a live scope: %v, want context.Canceled", err)
+		}
+		// Rejected admissions registered no work, so closure joins and
+		// disposes synchronously with no registered call to wait on.
+		if err := f.ws.close(); !errors.Is(err, errCloser) {
+			t.Errorf("close after rejected admission: %v, want prompt completion with the shared cleanup error", err)
+		}
+		if err := f.rt.close(); err != nil {
+			t.Errorf("runtime close: %v", err)
+		}
+	})
+
+	t.Run("canceled caller keeps its identity on a scope derived from it", func(t *testing.T) {
+		// The owner context derives from the caller context, as every
+		// execution's scope derives from the canceled execution context.
+		caller, cancelCaller := context.WithCancel(context.Background())
+		owner, cancelOwner := context.WithCancel(caller)
+		defer cancelOwner()
+		f := openGuardFixture(t, owner)
+		cancelCaller() // cancels both the caller and the scope derived from it
+		if _, _, err := f.ws.enter(caller); !errors.Is(err, context.Canceled) {
+			t.Errorf("enter from a canceled caller on its canceled derived scope: %v, want context.Canceled", err)
+		}
+		if _, _, err := f.rt.enter(caller); !errors.Is(err, context.Canceled) {
+			t.Errorf("enter from a canceled caller on a canceled derived ancestor scope: %v, want context.Canceled", err)
+		}
+		// A live caller on the same canceled scope still sees its own closed
+		// identity.
+		if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
+			t.Errorf("enter from a live caller on the canceled derived scope: %v, want ErrClosed", err)
+		}
+		// Rejected admissions registered no work, so closure joins and
+		// disposes synchronously with no registered call to wait on.
+		if err := f.ws.close(); !errors.Is(err, errCloser) {
+			t.Errorf("close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
+		}
+		if err := f.rt.close(); err != nil {
+			t.Errorf("runtime close: %v", err)
+		}
+	})
 }
 
 // workspaceFixture drives shared Workspace construction with per-key gates:

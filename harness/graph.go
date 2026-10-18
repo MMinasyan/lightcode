@@ -231,17 +231,17 @@ func (v *graphValidation) run() error {
 	// preserving sequence order, so per-Operation scans traverse only their own
 	// operation's entries instead of rescanning the whole history. It is a
 	// transient index into graph.Entries: indexes only, no payload copies, and
-	// it is discarded with the validation pass that built it. Entries without
-	// an owning Operation group under the empty ID, keeping those entries
-	// visible to the Session-wide checks and to any scan exactly as the
-	// per-entry ownership filter did.
-	v.entriesByOp = make(map[string][]int, len(v.graph.Operations)+1)
+	// it is discarded with the validation pass that built it. Operationless
+	// entries remain available to the Session-wide checks on graph.Entries.
+	v.entriesByOp = make(map[string][]int, len(v.graph.Operations))
 	for i, entry := range v.graph.Entries {
 		if _, dup := v.entryByID[entry.Envelope.ID]; dup {
 			return v.corrupt("duplicate entry id %q", entry.Envelope.ID)
 		}
 		v.entryByID[entry.Envelope.ID] = entry
-		v.entriesByOp[entry.Envelope.OperationID] = append(v.entriesByOp[entry.Envelope.OperationID], i)
+		if opID := entry.Envelope.OperationID; opID != "" {
+			v.entriesByOp[opID] = append(v.entriesByOp[opID], i)
+		}
 	}
 	if err := v.validateSessionState(); err != nil {
 		return err
@@ -777,8 +777,8 @@ func (v *graphValidation) validatePendingCalls(opID string, published []publishe
 // usage-bearing producer entries — assistant usages, terminal
 // no-output-settlement usage pairs, and committed compaction usage — and
 // requires exact agreement. Counts accumulate per model identity into maps
-// and each total materializes exactly once, so the pass stays linear in
-// usage-bearing entries under any number of distinct model identities.
+// and each total materializes exactly once: accumulation is linear in entries,
+// followed by sorting each total's distinct model identities.
 func (v *graphValidation) validateUsage() error {
 	sessionCounts := make(map[model.ModelRef]UsageCount)
 	perOperation := make(map[string]map[model.ModelRef]UsageCount, len(v.graph.Operations))
