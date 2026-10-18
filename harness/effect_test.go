@@ -42,10 +42,7 @@ func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request)
 	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID
 }
 
@@ -275,15 +272,15 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if session.Session.State.CurrentOperationID != testOpID {
-		t.Fatalf("current operation %q, want the still-running %q", session.Session.State.CurrentOperationID, testOpID)
+	if view.Header.CurrentOperationID != testOpID {
+		t.Fatalf("current operation %q, want the still-running %q", view.Header.CurrentOperationID, testOpID)
 	}
-	if !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
+	if !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
 	}
 
 	// The second context projection reads the entry the first effect committed.
@@ -350,12 +347,12 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if session.Session.State.CurrentOperationID != testOpID || !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session state = %+v, want the running operation and updated usage", session.Session.State)
+	if view.Header.CurrentOperationID != testOpID || !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session view = %+v, want the running operation and updated usage", view)
 	}
 }
 
@@ -572,12 +569,12 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	if !usageTotalsEqual(rec.State.Usage, want) {
 		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
 	}
-	session, err := h.SnapshotSession(context.Background(), sessionID)
+	view, err := h.ReadSessionView(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionView: %v", err)
 	}
-	if !usageTotalsEqual(session.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", session.Session.State.Usage, want)
+	if !usageTotalsEqual(view.TotalUsage, want) {
+		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
 	}
 }
 
@@ -708,10 +705,7 @@ func projectionTestGraph() *testGraph {
 func TestContextSourceProjectsFullHistory(t *testing.T) {
 	store := projectionTestGraph().storage(t)
 	h := newTestHarness(t, store, nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	msgs, err := h.contextSource(c, testOpID)(context.Background())
 	if err != nil {
 		t.Fatalf("context projection: %v", err)
@@ -1026,10 +1020,7 @@ func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmissio
 	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID, prepared, cancel
 }
 

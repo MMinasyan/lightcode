@@ -424,12 +424,16 @@ func TestPublicTurnLifecycle(t *testing.T) {
 		if len(first.State.Usage.ByModel) != 1 || first.State.Usage.ByModel[0] != want.ByModel[0] {
 			t.Fatalf("operation usage = %+v, want the reported counts", first.State.Usage)
 		}
-		sessionSnap, err := f.h.SnapshotSession(context.Background(), session)
-		if err != nil || sessionSnap.Session.State.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v", sessionSnap, err)
+		sessionHeader, err := f.h.ReadSessionHeader(context.Background(), session)
+		if err != nil || sessionHeader.CurrentOperationID != "" {
+			t.Fatalf("session after convergence = %+v err %v", sessionHeader, err)
 		}
-		if len(sessionSnap.Session.State.Usage.ByModel) != 1 || sessionSnap.Session.State.Usage.ByModel[0] != want.ByModel[0] {
-			t.Fatalf("session usage = %+v, want the same totals", sessionSnap.Session.State.Usage)
+		sessionView, err := f.h.ReadSessionView(context.Background(), session)
+		if err != nil {
+			t.Fatalf("ReadSessionView: %v", err)
+		}
+		if len(sessionView.TotalUsage.ByModel) != 1 || sessionView.TotalUsage.ByModel[0] != want.ByModel[0] {
+			t.Fatalf("session usage = %+v, want the same totals", sessionView.TotalUsage)
 		}
 		second, err := f.h.ReadOperation(context.Background(), session, "op-2")
 		if err != nil || second.State.Status != harness.OperationFailure ||
@@ -489,11 +493,7 @@ func TestPublicSteeringContinuation(t *testing.T) {
 		if err != nil || successor.State.Status != harness.OperationSuccess {
 			t.Fatalf("steering operation = %+v err %v, want the successor's success", successor, err)
 		}
-		snap, err := f.h.SnapshotSession(context.Background(), session)
-		if err != nil {
-			t.Fatalf("snapshot: %v", err)
-		}
-		for _, fact := range snap.Facts {
+		for _, fact := range readHistoryFacts(t, f.h, session) {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "steer" {
 				if fact.OperationID != "op-2" {
 					t.Fatalf("steering input owned by %q, want its own Operation op-2", fact.OperationID)
@@ -1574,11 +1574,7 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 				successor.State.Terminal == nil || successor.State.Terminal.Detail != "successor settled" {
 				t.Fatalf("successor operation = %+v err %v, want the boundary input's own Operation at its terminal", successor, err)
 			}
-			snap, err := f.h.SnapshotSession(context.Background(), session)
-			if err != nil {
-				t.Fatalf("snapshot: %v", err)
-			}
-			for _, fact := range snap.Facts {
+			for _, fact := range readHistoryFacts(t, f.h, session) {
 				if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "at-boundary" {
 					if fact.OperationID != "op-2" {
 						t.Fatalf("boundary input owned by %q, want its own Operation op-2", fact.OperationID)
@@ -2788,14 +2784,13 @@ func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 	})
 }
 
-// TestPublicDeleteVsMaterialization proves the delete-vs-materialization
-// contract through public operations on one live Harness: an archived Session
-// is seeded before the Harness exists; its first materialization captures its
-// valid pre-deletion register and entry state, then parks while a concurrent
-// DeleteSession materializes and deletes the same Session; released, the first
-// materialization completes validation on the captured pre-deletion data,
-// finds the registry generation changed, retries, and resolves to ErrNotFound
-// — never installing or serving a stale coordinator.
+// TestPublicDeleteVsMaterialization proves the delete-vs-load row under the
+// stable-cell protocol: a read parked inside its Session's first load holds
+// that Session's cell, so a concurrent canonical deletion waits for the load
+// and never observes a partially published graph; the parked read resolves
+// either to its pre-deletion capture or to the not-found class, the deletion
+// then commits, and no later read, listing, or registry lookup resurrects the
+// deleted Session.
 func TestPublicDeleteVsMaterialization(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		session := seedArchivedSession(t, store) // seeded before the live Harness is constructed
@@ -2805,19 +2800,35 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		ctx := context.Background()
 
 		readDone := make(chan error, 1)
-		go func() { _, err := f.h.ReadSessionHeader(ctx, session); readDone <- err }() // the first materialization
-		<-gated.started                                                                // parked after capturing its valid pre-deletion state
+		go func() { _, err := f.h.ReadSessionHeader(ctx, session); readDone <- err }() // the first load
+		<-gated.started                                                                // parked inside the load, holding the Session's cell
 
-		if err := f.h.DeleteSession(ctx, session); err != nil { // materializes and deletes the same Session
-			t.Fatalf("delete of the seeded session: %v", err)
+		deleteDone := make(chan error, 1)
+		go func() { deleteDone <- f.h.DeleteSession(ctx, session) }() // the canonical deletion of the same Session
+		select {
+		case err := <-deleteDone:
+			t.Fatalf("delete returned (%v) while the load still held the Session's cell", err)
+		case <-time.After(200 * time.Millisecond):
 		}
 
 		close(gated.release) // validation now completes on the captured pre-deletion value
-		if err := <-readDone; !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("materialization across a deletion = err %v, want ErrNotFound", err)
+		if err := <-readDone; err != nil && !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("load across a deletion = err %v, want the pre-deletion capture or ErrNotFound", err)
+		}
+		if err := <-deleteDone; err != nil {
+			t.Fatalf("delete after the load released the cell = %v, want nil", err)
 		}
 		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
 			t.Fatalf("later materialization installed a stale coordinator: err %v, want ErrNotFound", err)
+		}
+		listed, err := f.h.ListSessions(ctx)
+		if err != nil {
+			t.Fatalf("ListSessions: %v", err)
+		}
+		for _, row := range listed {
+			if row.Identity.SessionID == session {
+				t.Fatalf("the deleted Session stayed listed: %+v", row)
+			}
 		}
 	})
 }
@@ -5335,9 +5346,13 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 
 		// the fork's own turn settled through its model-originated terminal
-		snapshot, err := f2.h.SnapshotSession(ctx, dest)
-		if err != nil || snapshot.Session.State.CurrentOperationID != "" || len(snapshot.Session.State.Usage.ByModel) != 0 {
-			t.Fatalf("fork session after convergence = %+v err %v, want it settled with zero usage", snapshot, err)
+		destHeader, err := f2.h.ReadSessionHeader(ctx, dest)
+		if err != nil || destHeader.CurrentOperationID != "" {
+			t.Fatalf("fork session after convergence = %+v err %v, want it settled", destHeader, err)
+		}
+		destView, err := f2.h.ReadSessionView(ctx, dest)
+		if err != nil || len(destView.TotalUsage.ByModel) != 0 {
+			t.Fatalf("fork session usage = %+v err %v, want zero usage", destView.TotalUsage, err)
 		}
 		rec, err := f2.h.ReadOperation(ctx, dest, "fork-1")
 		if err != nil || rec.State.Status != harness.OperationFailure ||
@@ -6381,16 +6396,28 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		// inherits none of the source's usage: the source's compact-model
 		// piece counts never reach the destination, whose only totals are its
 		// own fork turn's conversation counts.
-		snap, err := f.h.SnapshotSession(ctx, dest)
+		destReg, err := f.store.ReadRegister(ctx, harness.RegisterKey{SessionID: dest, Kind: harness.RegisterSession})
 		if err != nil {
-			t.Fatalf("SnapshotSession(dest): %v", err)
+			t.Fatalf("destination session register: %v", err)
 		}
-		if snap.Session.State.CompactionEntryID != copied.ID {
-			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", snap.Session.State.CompactionEntryID, copied.ID)
+		var destState struct {
+			State struct {
+				CompactionEntryID string `json:"compaction_entry_id"`
+			} `json:"state"`
 		}
-		for _, mu := range snap.Session.State.Usage.ByModel {
+		if err := json.Unmarshal(destReg.Payload, &destState); err != nil {
+			t.Fatalf("decode destination session register: %v", err)
+		}
+		if destState.State.CompactionEntryID != copied.ID {
+			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", destState.State.CompactionEntryID, copied.ID)
+		}
+		destView, err := f.h.ReadSessionView(ctx, dest)
+		if err != nil {
+			t.Fatalf("ReadSessionView(dest): %v", err)
+		}
+		for _, mu := range destView.TotalUsage.ByModel {
 			if mu.Model == compactModelRef {
-				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", snap.Session.State.Usage)
+				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
 			}
 		}
 		// The fork's own turn projected at the copied summary.

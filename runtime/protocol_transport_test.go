@@ -208,7 +208,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			// independent pre-request snapshot (facts, pending queues, and
 			// revisions) is the baseline the rejection must leave
 			// untouched.
-			before := snapshotThroughRuntime(t, r, session)
+			before := sessionViewThroughRuntime(t, r, session)
 			response := submit(body)
 			if response.StatusCode != http.StatusBadRequest {
 				response.Body.Close()
@@ -217,7 +217,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
 				t.Fatalf("%s error = %+v, want the typed invalid body", name, typed)
 			}
-			after := snapshotThroughRuntime(t, r, session)
+			after := sessionViewThroughRuntime(t, r, session)
 			if !reflect.DeepEqual(before, after) {
 				t.Fatalf("%s changed the Session snapshot (pending queues, facts, or revisions)", name)
 			}
@@ -739,7 +739,7 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 // store-wide transaction on the corrupted register, sticks the sticky marker
 // on the warm source, and answers its typed corrupt response naming the
 // session; the mounted hydration over HTTP — GET /v1/sessions/{id}/hydration,
-// built on the same SnapshotSession capture — then refuses with the same typed
+// built on the same composed Session read — then refuses with the same typed
 // corrupt body and session identity while the valid sibling still hydrates
 // and stays listed. This complements the cold corrupt hydration answer inside
 // TestProtocolServerErrorClasses: the cold row seeds an undecodable register

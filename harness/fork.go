@@ -60,15 +60,16 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return res, err
 	}
 
-	c, err := h.coordinatorFor(ctx, req.SourceSessionID)
-	if err != nil {
-		return ForkResult{}, err
-	}
-	release, err := h.reserve(ctx, c)
+	c, release, err := h.acquireCoordinator(ctx, req.SourceSessionID)
 	if err != nil {
 		return ForkResult{}, err
 	}
 	defer release()
+	admissionRelease, err := h.reserve(ctx, c)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	defer admissionRelease()
 	c.mu.Lock()
 	if c.gone { // a deletion committed while this call waited or relocked
 		c.mu.Unlock()
@@ -109,10 +110,17 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return ForkResult{}, publicationError(ctx, txErr)
 	}
 
-	dest := &coordinator{graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}, bgState: bgOpen}
+	// The committed destination installs as a stable cell with its committed
+	// graph and a call-owned pin; the destination execution retains its own
+	// use, so the destination graph stays live across the call's release.
+	dest := &coordinator{sessionID: destID, graph: &sessionGraph{Session: commit.session, Operations: []OperationRecord{commit.operation}, Entries: commit.entries}, bgState: bgOpen}
+	dest.identity = commit.session.Identity
+	dest.everLoaded = true
+	dest.uses = 1
 	h.mu.Lock()
 	h.sessions[destID] = dest
 	h.mu.Unlock()
+	defer h.releaseUse(dest)
 	h.observeInvalidation(dest)                       // the durable fork destination creation
 	h.startExecution(dest, req.OperationID, prepared) // destination execution starts after commit
 	return ForkResult{Session: ownSessionRecord(commit.session), Operation: ownOperationRecord(commit.operation)}, nil

@@ -24,7 +24,9 @@ const (
 	childFixtureOp     = "child-op"
 )
 
-// cachedCoordinator returns the registry-cached coordinator of one Session.
+// cachedCoordinator returns the registry coordinator of one Session. It takes
+// no use: a fixture that inspects or mutates the coordinator's graph state
+// takes its own explicit lease instead.
 func cachedCoordinator(t *testing.T, h *Harness, sessionID string) *coordinator {
 	t.Helper()
 	h.mu.Lock()
@@ -184,7 +186,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 		defer cancel()
 		session := createSession(t, h)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -229,7 +231,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -260,7 +262,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -307,7 +309,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 		watch := watchSettlements(store)
-		c := cachedCoordinator(t, h, session)
+		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -338,10 +340,7 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 // content is rejected before any obligation is claimed.
 func TestDeliverBackgroundCompletionEmptyContentRejected(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -368,7 +367,7 @@ func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 	defer cancel()
 	session := createSession(t, h)
 	watch := watchSettlements(store)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -415,10 +414,7 @@ func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 func TestDeliverBackgroundCompletionCorruptParent(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	childMember, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("child admission: %v", err)
@@ -462,7 +458,7 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -544,7 +540,7 @@ func TestDeliverBackgroundCompletionReserveFailureTakesClosedPath(t *testing.T) 
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -597,10 +593,7 @@ func TestDeliverBackgroundCompletionAdmissionFailuresFinal(t *testing.T) {
 			h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 				return validPrepared(), nil
 			})
-			c, err := h.coordinatorFor(context.Background(), testSessionID)
-			if err != nil {
-				t.Fatalf("coordinatorFor: %v", err)
-			}
+			c := leaseCoordinator(t, h, testSessionID)
 			member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 			if err != nil {
 				t.Fatalf("admission: %v", err)
@@ -642,7 +635,7 @@ func TestClosedDeliveryCommitsBeforeDoneCloses(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -695,7 +688,7 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, PreparedExecution{}, nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
@@ -772,7 +765,7 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 	defer cancel()
 	session := createSession(t, h)
-	c := cachedCoordinator(t, h, session)
+	c := leaseCoordinator(t, h, session)
 	memberA, err := admitLocked(h, c, memberChild, completionChildID, 0)
 	if err != nil {
 		t.Fatalf("child admission: %v", err)
@@ -862,10 +855,7 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		script := newModelScript()
 		h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -894,10 +884,7 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		script := newModelScript()
 		h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -932,10 +919,7 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		script := newModelScript()
 		h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 		defer cancel()
-		c, err := h.coordinatorFor(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("coordinatorFor: %v", err)
-		}
+		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("admission: %v", err)
@@ -986,14 +970,8 @@ func TestJobCompletionWaitsForChildSuccessorRetirement(t *testing.T) {
 			h, cancel := newCancelableHarness(t, store, PreparedExecution{}, stub.prepare)
 			defer cancel()
 			watch := watchSettlements(store)
-			cP, err := h.coordinatorFor(context.Background(), completionParentID)
-			if err != nil {
-				t.Fatalf("parent coordinator: %v", err)
-			}
-			cC, err := h.coordinatorFor(context.Background(), completionChildID)
-			if err != nil {
-				t.Fatalf("child coordinator: %v", err)
-			}
+			cP := leaseCoordinator(t, h, completionParentID)
+			cC := leaseCoordinator(t, h, completionChildID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
 			if err != nil {
 				t.Fatalf("child member admission: %v", err)
@@ -1078,14 +1056,8 @@ func TestChildCompletionSettledAbandonment(t *testing.T) {
 		store := completionChildGraph(completionParentID, true, OperationRunning, "", "hi").storage(t)
 		addRootSession(t, store, completionParentID)
 		h := newTestHarness(t, store, nil)
-		cC, err := h.coordinatorFor(context.Background(), completionChildID)
-		if err != nil {
-			t.Fatalf("child coordinator: %v", err)
-		}
-		cP, err := h.coordinatorFor(context.Background(), completionParentID)
-		if err != nil {
-			t.Fatalf("parent coordinator: %v", err)
-		}
+		cC := leaseCoordinator(t, h, completionChildID)
+		cP := leaseCoordinator(t, h, completionParentID)
 		member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
 		if err != nil {
 			t.Fatalf("member admission: %v", err)
@@ -1153,14 +1125,8 @@ func TestChildCompletionRendersParentFacingText(t *testing.T) {
 			h, cancel := newCancelableHarness(t, store, modelPrepared(script.model), nil)
 			defer cancel()
 			watch := watchSettlements(store)
-			cC, err := h.coordinatorFor(context.Background(), completionChildID)
-			if err != nil {
-				t.Fatalf("child coordinator: %v", err)
-			}
-			cP, err := h.coordinatorFor(context.Background(), completionParentID)
-			if err != nil {
-				t.Fatalf("parent coordinator: %v", err)
-			}
+			cC := leaseCoordinator(t, h, completionChildID)
+			cP := leaseCoordinator(t, h, completionParentID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
 			if err != nil {
 				t.Fatalf("member admission: %v", err)
@@ -1207,14 +1173,8 @@ func TestChildCompletionTruncatesAtOutputLimit(t *testing.T) {
 			store := completionChildGraph(completionParentID, false, OperationSuccess, "", text).storage(t)
 			addRootSession(t, store, completionParentID)
 			h := newTestHarness(t, store, nil)
-			cC, err := h.coordinatorFor(context.Background(), completionChildID)
-			if err != nil {
-				t.Fatalf("child coordinator: %v", err)
-			}
-			cP, err := h.coordinatorFor(context.Background(), completionParentID)
-			if err != nil {
-				t.Fatalf("parent coordinator: %v", err)
-			}
+			cC := leaseCoordinator(t, h, completionChildID)
+			cP := leaseCoordinator(t, h, completionParentID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
 			if err != nil {
 				t.Fatalf("member admission: %v", err)

@@ -392,10 +392,7 @@ func TestInterruptLeavesBackgroundGroupOpen(t *testing.T) {
 	if err := h.StartJob(context.Background(), session, "feedface", spawnRecord(&second, nil)); err != nil {
 		t.Fatalf("StartJob after the interrupt = %v, want the group still admitting", err)
 	}
-	c, err := h.coordinatorFor(context.Background(), session)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session)
 	c.mu.Lock()
 	members := len(c.group.members)
 	_, firstLive := c.group.members[first[0]]

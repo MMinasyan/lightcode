@@ -130,11 +130,16 @@ type lifecycleDelivery struct {
 }
 
 // lifecycleStopper is the delivering job-stop seam: StopJob delivers every
-// armed completion through the armed Harness, in one sequential pass.
+// armed completion through the armed Harness, in one sequential pass. An
+// optional armed gate signals arrival at StopJob entry and parks the stop
+// until the gate is released, so a row can observe the publications that
+// precede the delivery.
 type lifecycleStopper struct {
 	mu         sync.Mutex
 	h          *harness.Harness
 	deliveries []lifecycleDelivery
+	arrived    chan struct{} // optional: receives one signal at StopJob entry
+	gate       chan struct{} // optional: parks StopJob until closed
 }
 
 func newLifecycleStopper() *lifecycleStopper {
@@ -145,6 +150,14 @@ func (s *lifecycleStopper) arm(h *harness.Harness) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.h = h
+}
+
+// armGate installs one optional stop barrier: StopJob signals arrived at its
+// entry and then parks until gate closes, before any delivery runs.
+func (s *lifecycleStopper) armGate(arrived, gate chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arrived, s.gate = arrived, gate
 }
 
 func (s *lifecycleStopper) addDelivery(sessionID, completionID, content string) {
@@ -158,7 +171,14 @@ func (s *lifecycleStopper) StopJob(sessionID, jobID string) {
 	deliveries := s.deliveries
 	s.deliveries = nil
 	h := s.h
+	arrived, gate := s.arrived, s.gate
 	s.mu.Unlock()
+	if arrived != nil {
+		arrived <- struct{}{}
+	}
+	if gate != nil {
+		<-gate
+	}
 	if h == nil {
 		return
 	}

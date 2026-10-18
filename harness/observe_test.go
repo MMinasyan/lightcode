@@ -66,14 +66,14 @@ func observeHarness(h *Harness) *factCollector {
 }
 
 // snapshotPair reads one Session's current revision pair through the landed
-// public snapshot.
+// metadata read.
 func snapshotPair(t *testing.T, h *Harness, sessionID string) SessionRevision {
 	t.Helper()
-	snap, err := h.SnapshotSession(context.Background(), sessionID)
+	header, err := h.ReadSessionHeader(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+		t.Fatalf("ReadSessionHeader: %v", err)
 	}
-	return SessionRevision{DurableRevision: snap.Session.Revision, LocalRevision: snap.LocalRevision}
+	return header.Revision
 }
 
 // wantPairAt asserts that one Session's current revision pair equals the
@@ -89,16 +89,16 @@ func wantPairAt(t *testing.T, h *Harness, sessionID string, durable int64, local
 
 // awaitHarnessQuiet waits until one Session has no current Operation and no
 // installed run, the deterministic post-terminal barrier.
-func awaitHarnessQuiet(t *testing.T, h *Harness, sessionID string) SessionSnapshot {
+func awaitHarnessQuiet(t *testing.T, h *Harness, sessionID string) SessionReadView {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		snap, err := h.SnapshotSession(context.Background(), sessionID)
+		view, err := h.ReadSessionView(context.Background(), sessionID)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy && snap.Session.State.CurrentOperationID == "" {
-			return snap
+		if !view.History.ExecutionBusy && view.Header.CurrentOperationID == "" {
+			return view
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session %s never went quiet", sessionID)
@@ -281,11 +281,11 @@ func TestObserveRunLifecycle(t *testing.T) {
 		}
 		// The queued successor was installed by the drain and is parked at
 		// gate2: the predecessor's tail must not have cleared its slot.
-		snap, err := h.SnapshotSession(context.Background(), session)
+		view, err := h.ReadSessionView(context.Background(), session)
 		if err != nil {
-			t.Fatalf("SnapshotSession: %v", err)
+			t.Fatalf("ReadSessionView: %v", err)
 		}
-		if !snap.ExecutionBusy {
+		if !view.History.ExecutionBusy {
 			t.Fatalf("the drain-installed successor slot was cleared by its predecessor")
 		}
 		close(gate2)
@@ -294,8 +294,8 @@ func TestObserveRunLifecycle(t *testing.T) {
 		if len(facts) < 2 {
 			t.Fatalf("successor facts = %d, want at least the successor's retire and the predecessor's release", len(facts))
 		}
-		if final.Session.Revision <= base.DurableRevision || final.LocalRevision <= base.LocalRevision {
-			t.Fatalf("successor pair = %+v, want the successor's durable admission and its local publications over %+v", final, base)
+		if final.Header.Revision.DurableRevision <= base.DurableRevision || final.Header.Revision.LocalRevision <= base.LocalRevision {
+			t.Fatalf("successor pair = %+v, want the successor's durable admission and its local publications over %+v", final.Header.Revision, base)
 		}
 	})
 }
@@ -669,14 +669,14 @@ func TestObserveDurableAdvances(t *testing.T) {
 		if _, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess}); err != nil {
 			t.Fatalf("terminal settlement: %v", err)
 		}
-		snap, err := h.SnapshotSession(context.Background(), testSessionID)
-		if err != nil || len(snap.Facts) == 0 || snap.Facts[0].Kind != EntryInput {
-			t.Fatalf("source facts = %+v err %v", snap.Facts, err)
+		sourceFacts := readSessionFacts(t, h, testSessionID)
+		if len(sourceFacts) == 0 || sourceFacts[0].Kind != EntryInput {
+			t.Fatalf("source facts = %+v", sourceFacts)
 		}
 		col := observeHarness(h)
 		res, err := h.Fork(context.Background(), ForkRequest{
 			SourceSessionID: testSessionID,
-			BoundaryEntryID: snap.Facts[0].EntryID,
+			BoundaryEntryID: sourceFacts[0].EntryID,
 			OperationID:     "fork-op-1",
 			Content:         admissionContent("forked"),
 		})
@@ -703,16 +703,16 @@ func TestObserveDurableAdvances(t *testing.T) {
 		final := awaitHarnessQuiet(t, h, dest)
 		settled := false
 		for _, op := range final.Operations {
-			if op.Admission.OperationID == "fork-op-1" {
-				settled = op.State.Status == OperationSuccess && op.State.Terminal != nil
+			if op.OperationID == "fork-op-1" {
+				settled = op.Status == OperationSuccess && op.SettledAt != nil
 			}
 		}
 		if !settled {
 			t.Fatalf("fork destination operations = %+v, want the fork Operation settled success", final.Operations)
 		}
-		if final.Session.Revision <= 2 || final.LocalRevision <= 1 {
+		if final.Header.Revision.DurableRevision <= 2 || final.Header.Revision.LocalRevision <= 1 {
 			t.Fatalf("completed destination pair = {%d %d}, want the settlement's durable advance and the drain's local publications over the held {2 1}",
-				final.Session.Revision, final.LocalRevision)
+				final.Header.Revision.DurableRevision, final.Header.Revision.LocalRevision)
 		}
 	})
 }
@@ -879,13 +879,13 @@ func TestObserveSuppression(t *testing.T) {
 	})
 }
 
-// TestObserveCurrentPair proves the cached-only publication read samples the
+// TestObserveCurrentPair proves the passive publication read samples the
 // pair current after later publications, rather than a pair captured at a
 // producer's lock time.
 func TestObserveCurrentPair(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-		t.Fatalf("ReadSession: %v", err)
+	if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil { // a real history use establishes the cell
+		t.Fatalf("ReadSessionView: %v", err)
 	}
 	c := cachedCoordinator(t, h, testSessionID)
 	col := observeHarness(h)
@@ -907,7 +907,7 @@ func TestObserveCurrentPair(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("delayed emission facts = %d, want one", len(facts))
 	}
-	// The cached-only publication read used by passive publishers samples
+	// The passive publication read used by passive publishers samples
 	// the pair current at publication time, after the later publications
 	// above landed.
 	current := snapshotPair(t, h, testSessionID)
@@ -1012,7 +1012,7 @@ func (p *transactionProbe) observe(fact HarnessFact) {
 		p.readErrs = append(p.readErrs, err)
 		p.mu.Unlock()
 	}
-	if _, err := p.h.SnapshotSession(context.Background(), fact.SessionID); err != nil {
+	if _, err := p.h.ReadSessionView(context.Background(), fact.SessionID); err != nil {
 		p.mu.Lock()
 		p.readErrs = append(p.readErrs, err)
 		p.mu.Unlock()
@@ -1364,12 +1364,9 @@ func TestObserveRefusalFacts(t *testing.T) {
 	}
 	// Final refusal retention: the committed assistant entry keeps the
 	// fragments joined in arrival order.
-	snap, err := h.SnapshotSession(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
-	}
+	facts := readSessionFacts(t, h, sessionID)
 	retained := false
-	for _, fact := range snap.Facts {
+	for _, fact := range facts {
 		if fact.Assistant == nil {
 			continue
 		}
@@ -1379,7 +1376,7 @@ func TestObserveRefusalFacts(t *testing.T) {
 		retained = true
 	}
 	if !retained {
-		t.Fatalf("no committed assistant fact in %+v", snap.Facts)
+		t.Fatalf("no committed assistant fact in %+v", facts)
 	}
 }
 
@@ -1569,8 +1566,9 @@ func TestObserveToolLifecycle(t *testing.T) {
 func TestObserveRematerializationNoHint(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(parkedPrepared()).prepare)
-	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-		t.Fatalf("ReadSession: %v", err)
+	leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
+	if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
+		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	col := observeHarness(h)
 	advanceSessionRevision(t, store, testSessionID) // the foreign writer
@@ -1619,8 +1617,8 @@ func TestObserveRestartNoReplay(t *testing.T) {
 	if _, err := restarted.ReadSessionHeader(context.Background(), testSessionID); err != nil {
 		t.Fatalf("ReadSession: %v", err)
 	}
-	if _, err := restarted.SnapshotSession(context.Background(), testSessionID); err != nil {
-		t.Fatalf("SnapshotSession: %v", err)
+	if _, err := restarted.ReadHistoryView(context.Background(), testSessionID); err != nil {
+		t.Fatalf("ReadHistoryView: %v", err)
 	}
 	if _, err := restarted.ListSessions(context.Background()); err != nil {
 		t.Fatalf("ListSessions: %v", err)
@@ -1637,7 +1635,7 @@ func TestObserveRestartNoReplay(t *testing.T) {
 }
 
 // observationCountingStorage fails every read and counts every access: the
-// cached-only observation read must perform no storage work at all.
+// passive observation read must perform no storage work at all.
 type observationCountingStorage struct {
 	Storage
 	calls int
@@ -1658,19 +1656,27 @@ func (s *observationCountingStorage) ReadRegisters(ctx context.Context, sessionI
 	return s.Storage.ReadRegisters(ctx, sessionID)
 }
 
-// TestReadObservation pins the cached-only observation read: a warm valid
-// coordinator returns the identity (with its Workspace) and the current pair;
-// a cache miss, a deleted, and a corrupt Session report false without any
-// storage access; a cold Session is never materialized by the read.
+// TestReadObservation pins the passive observation read: a materialized
+// coordinator returns its retained identity (with its Workspace) and the
+// current pair whether or not its graph is resident; a never-materialized,
+// deleted, and corrupt Session report false without any storage access; a
+// cold Session is never materialized by the read.
 func TestReadObservation(t *testing.T) {
-	t.Run("valid warm coordinator", func(t *testing.T) {
+	t.Run("valid coordinator with a released graph", func(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-			t.Fatalf("ReadSession: %v", err)
+		if _, err := h.ReadSessionView(context.Background(), testSessionID); err != nil {
+			t.Fatalf("ReadSessionView: %v", err)
+		}
+		cell := cachedCoordinator(t, h, testSessionID)
+		cell.mu.Lock()
+		graphless := cell.graph == nil
+		cell.mu.Unlock()
+		if !graphless {
+			t.Fatalf("the read's graph stayed resident, want the released state")
 		}
 		identity, revision, ok := h.ReadObservation(testSessionID)
 		if !ok {
-			t.Fatal("ReadObservation on a warm coordinator reported unavailable")
+			t.Fatal("ReadObservation on a released established coordinator reported unavailable")
 		}
 		if identity.SessionID != testSessionID {
 			t.Fatalf("identity session = %q, want %q", identity.SessionID, testSessionID)
@@ -1683,14 +1689,14 @@ func TestReadObservation(t *testing.T) {
 		}
 	})
 
-	t.Run("cache miss performs no storage work", func(t *testing.T) {
+	t.Run("never materialized performs no storage work", func(t *testing.T) {
 		store := &observationCountingStorage{Storage: freshSessionStore(t)}
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 		if _, _, ok := h.ReadObservation(testSessionID); ok {
 			t.Fatal("ReadObservation on a never-materialized Session reported available")
 		}
 		if store.calls != 0 {
-			t.Fatalf("storage calls on a cache miss = %d, want zero", store.calls)
+			t.Fatalf("storage calls on a never-materialized read = %d, want zero", store.calls)
 		}
 		// The read left the registry cold: a repeat miss performs no work and
 		// the Session stays unmaterialized.

@@ -189,11 +189,6 @@ type Harness struct {
 	mu       sync.Mutex
 	sessions map[string]*coordinator
 
-	// generation counts post-commit coordinator removals: a materialization
-	// that spans one retries against the current registry instead of
-	// installing a stale coordinator for an absent Session.
-	generation int
-
 	// storageFailure retains the first storage-class failure that stopped
 	// admitted work; Wait returns it after all process-local work has ended.
 	storageFailure error
@@ -224,13 +219,30 @@ type activeExecution struct {
 	cancel  context.CancelFunc // cancels execCtx; idempotent, so a retiring predecessor's cancel is a harmless no-op
 }
 
-// coordinator is the one per-Session authority: the validated Session view,
-// a sticky corruption marker, the single admission/fork reservation, the two
-// process-local message FIFOs, and the optional active execution.
+// coordinator is the one per-Session authority: the retained identity, the
+// validated Session graph while one is resident, a sticky corruption marker,
+// the single admission/fork reservation, the two process-local message FIFOs,
+// and the optional active execution. The cell itself is stable for its
+// Session's lifetime; the graph is resident only while a use holds it, and
+// every remaining local field survives every graph release.
 type coordinator struct {
-	mu    sync.Mutex
-	graph *sessionGraph
-	corru error
+	// sessionID is the durable identity, fixed when the cell is installed:
+	// release cleanup and lookup never need the graph.
+	sessionID string
+
+	// The following fields belong to the Harness registry mutex.
+	uses       int   // current uses; the graph may be cleared only at zero
+	everLoaded bool  // a graph was validated for this cell at least once
+	corru      error // sticky semantic corruption latch
+
+	mu       sync.Mutex
+	graph    *sessionGraph
+	identity SessionIdentity
+	// durableRevision is the last resident graph's Session register revision,
+	// captured when that graph is released. An observation of a graphless
+	// established cell answers with it; while a graph is resident the graph's
+	// own current revision is the value.
+	durableRevision int64
 
 	reserved chan struct{} // non-nil while one reservation is held; closed on release
 
@@ -304,10 +316,16 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	}); err != nil {
 		return SessionRecord{}, err
 	}
-	created := &coordinator{graph: &sessionGraph{Session: record}, bgState: bgOpen}
+	// The committed creation installs the stable cell with its committed graph
+	// and a call-owned pin; the release clears the graph and retains the cell.
+	created := &coordinator{sessionID: sessionID, graph: &sessionGraph{Session: record}, bgState: bgOpen}
+	created.identity = record.Identity
+	created.everLoaded = true
+	created.uses = 1
 	h.mu.Lock()
 	h.sessions[sessionID] = created
 	h.mu.Unlock()
+	defer h.releaseUse(created)
 	h.observeInvalidation(created) // the durable creation is the first Session publication
 	return ownSessionRecord(record), nil
 }
@@ -316,25 +334,23 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 // one Session. The shared unavailable check runs inside the same
 // coordinator-mutex hold that copies the record, so a deletion or a corruption
 // marker that committed after materialization resolves to ErrNotFound or the
-// typed corruption error rather than a stale cached read.
+// typed corruption error rather than a stale resident read.
 func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID string) (OperationRecord, error) {
 	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
 	}
-	c, err := h.coordinatorFor(ctx, sessionID)
-	if err != nil {
+	var record OperationRecord
+	if err := h.withSessionRead(ctx, sessionID, func(c *coordinator) error {
+		rec, ok := c.graph.Operation(operationID)
+		if !ok {
+			return fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		}
+		record = ownOperationRecord(rec)
+		return nil
+	}); err != nil {
 		return OperationRecord{}, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := h.unavailableLocked(c, sessionID); err != nil {
-		return OperationRecord{}, err
-	}
-	rec, ok := c.graph.Operation(operationID)
-	if !ok {
-		return OperationRecord{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
-	}
-	return ownOperationRecord(rec), nil
+	return record, nil
 }
 
 // ChangeAgentType changes the current Agent type of an open Session. It
@@ -344,10 +360,11 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 	if agentType == "" {
 		return SessionRecord{}, invalidInput("agent type must be non-empty")
 	}
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
+	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
 			return SessionRecord{}, err
@@ -398,7 +415,7 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -436,15 +453,16 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	c, err := h.coordinatorFor(ctx, req.SessionID)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	release, err := h.reserve(ctx, c) // the reservation precedes every routing decision
+	c, release, err := h.acquireCoordinator(ctx, req.SessionID)
 	if err != nil {
 		return SubmitResult{}, err
 	}
 	defer release()
+	admissionRelease, err := h.reserve(ctx, c) // the reservation precedes every routing decision
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	defer admissionRelease()
 	c.mu.Lock()
 	if c.gone { // a deletion committed after materialization: no buffer or admission on the absent Session
 		c.mu.Unlock()
@@ -529,10 +547,11 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 	if err := validateOperationIdentity(req.OperationID, "operation id"); err != nil {
 		return OperationRecord{}, invalidInput("operation id: %v", err)
 	}
-	c, err := h.coordinatorFor(ctx, req.SessionID)
+	c, release, err := h.acquireCoordinator(ctx, req.SessionID)
 	if err != nil {
 		return OperationRecord{}, err
 	}
+	defer release()
 	// resolve-or-guard runs before the reservation and again under it: the
 	// existing same-kind resolution precedes the idle guard on both passes.
 	resolve := func() (OperationRecord, bool, error) {
@@ -556,11 +575,11 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 	if err != nil || existing {
 		return rec, err
 	}
-	release, err := h.reserve(ctx, c)
+	admissionRelease, err := h.reserve(ctx, c)
 	if err != nil {
 		return OperationRecord{}, err
 	}
-	defer release()
+	defer admissionRelease()
 	rec, existing, err = resolve() // the re-evaluation under the reservation
 	if err != nil || existing {
 		return rec, err
@@ -584,10 +603,11 @@ func (h *Harness) Compact(ctx context.Context, req CompactRequest) (OperationRec
 // time, preserving history, usage, context, lineage, and Agent type.
 // Reopening an already open Session is a no-write success.
 func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionRecord, error) {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
+	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
 			return SessionRecord{}, err
@@ -642,7 +662,7 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -663,10 +683,11 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 // Session is rejected; archiving an already archived Session is a no-write
 // success.
 func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (SessionRecord, error) {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
+	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
 			return SessionRecord{}, err
@@ -729,7 +750,7 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return SessionRecord{}, rerr
 				}
@@ -751,10 +772,11 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 // coordinator and later materialization both return ErrNotFound. Deleting an
 // open or absent Session is rejected without a write.
 func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return err
 	}
+	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
 			return err
@@ -787,7 +809,7 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
-			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 					return rerr
 				}
@@ -820,10 +842,11 @@ func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy Swe
 	if now.IsZero() {
 		return false, invalidInput("sweep time must not be zero")
 	}
-	c, err := h.coordinatorFor(ctx, sessionID)
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return false, err
 	}
+	defer release()
 	return h.sweepOne(ctx, c, sessionID, policy, now)
 }
 
@@ -983,14 +1006,15 @@ func (c *coordinator) invalidate() {
 	c.gone = true
 }
 
-// removeCoordinator drops one invalidated coordinator from the registry and
-// bumps the registry generation, so a materialization that started before the
-// removal retries against the post-deletion state instead of installing a
-// stale coordinator for an absent Session.
+// removeCoordinator drops one invalidated coordinator after its canonical
+// deletion commit: the registry entry goes, so no later materialization
+// reaches it. A caller already holding the coordinator keeps it, and its gone
+// flag, until its uses release; the graph pointer is left alone, because the
+// cell is no longer reachable through the registry and dies with its last
+// holder.
 func (h *Harness) removeCoordinator(sessionID string) {
 	h.mu.Lock()
 	delete(h.sessions, sessionID)
-	h.generation++
 	h.mu.Unlock()
 }
 
@@ -1007,71 +1031,125 @@ func notFoundSession(sessionID string) error {
 	return fmt.Errorf("%w: session %q not found", ErrNotFound, sessionID)
 }
 
-// coordinatorFor returns the materialized coordinator of one Session,
-// validating its graph on first materialization. A persisted semantic
-// violation caches a sticky corruption marker that makes the Session
-// unavailable in this Harness instance; other Sessions remain usable. A
-// deleted coordinator stays absent to every holder: it resolves to the
-// not-found class instead of a stale cached read.
-func (h *Harness) coordinatorFor(ctx context.Context, sessionID string) (*coordinator, error) {
-	for {
-		h.mu.Lock()
-		c := h.sessions[sessionID]
-		if c != nil {
-			corru := c.corru
-			h.mu.Unlock()
-			if err := c.goneErr(sessionID); err != nil {
-				return nil, err
-			}
-			if corru != nil {
-				return nil, corru
-			}
-			return c, nil
-		}
-		generation := h.generation // captured on the cache miss: a removal during validation must force a retry
-		h.mu.Unlock()
-		graph, err := validateSessionGraph(ctx, h.deps.Storage, sessionID)
-		if err != nil {
-			h.markCorrupt(sessionID, err)
-			return nil, err
-		}
-		h.mu.Lock()
-		if h.generation != generation { // a post-commit coordinator removal landed during validation: retry against the current registry
-			h.mu.Unlock()
-			continue
-		}
-		c = h.sessions[sessionID]
-		if c == nil {
-			c = &coordinator{graph: graph, bgState: bgOpen}
-			h.sessions[sessionID] = c
-		}
-		corru := c.corru
-		h.mu.Unlock()
-		if err := c.goneErr(sessionID); err != nil {
-			return nil, err
-		}
-		if corru != nil {
-			return nil, corru
-		}
-		return c, nil
+// acquireCoordinator acquires one Session's coordinator with one use held and
+// its validated graph installed. The cell and the use are claimed under the
+// registry mutex, which is released before the coordinator mutex is taken:
+// the two are never nested. A missing cell is installed empty before its first
+// load, so concurrent acquirers share one stable cell, and a missing graph is
+// validated and published under that cell's mutex, so one load serves them
+// all. A persisted semantic violation latches on the stable cell and makes the
+// Session unavailable in this Harness instance; other Sessions remain usable.
+// A deleted coordinator stays absent to every holder: it resolves to the
+// not-found class instead of a stale resident read. The returned release drops
+// the use, clears the graph at the final release, and must be called after the
+// caller leaves the coordinator mutex for the last time.
+func (h *Harness) acquireCoordinator(ctx context.Context, sessionID string) (*coordinator, func(), error) {
+	c := h.claimCell(sessionID)
+	if err := h.loadGraph(ctx, c, sessionID, false); err != nil {
+		h.releaseUse(c)
+		return nil, nil, err
 	}
+	return c, func() { h.releaseUse(c) }, nil
 }
 
-// goneErr reports the coordinator's post-deletion absence. The flag is set
-// under the coordinator mutex by the deletion invalidation and read here with
-// the registry lookup released, so no lock is ever held across the other.
-func (c *coordinator) goneErr(sessionID string) error {
-	c.mu.Lock()
-	gone := c.gone
-	c.mu.Unlock()
-	if gone {
-		return notFoundSession(sessionID)
+// retainGraph extends the use its caller already holds on one coordinator, for
+// work that outlives that caller: execution retention through execute,
+// terminal settlement, disposal, the post-terminal drain, and child
+// completion. The claim increments the use count under the registry mutex
+// without inspecting the graph — the caller's own use already pins the cell —
+// and the returned release is the ordinary use release.
+func (h *Harness) retainGraph(c *coordinator) func() {
+	h.mu.Lock()
+	c.uses++
+	h.mu.Unlock()
+	return func() { h.releaseUse(c) }
+}
+
+// claimCell returns one Session's stable coordinator with one use claimed and
+// the registry mutex released.
+func (h *Harness) claimCell(sessionID string) *coordinator {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c := h.sessions[sessionID]
+	if c == nil {
+		c = &coordinator{sessionID: sessionID, bgState: bgOpen}
+		h.sessions[sessionID] = c
 	}
+	c.uses++
+	return c
+}
+
+// releaseUse drops one use. The final release is the single graph owner: it
+// runs under the coordinator mutex and then the registry mutex — the existing
+// allowed direction, never the reverse — captures the resident graph's durable
+// Session revision into the cell's retained value, and clears the graph. Every
+// graph, whatever the caller kind, is cleared at its final use release; a
+// graph with a positive use count is never cleared. The stable cell, its
+// retained identity and revision, its sticky latch, and every local field
+// stay. A never-loaded latch-free cell leaves the registry, and a cell removed
+// by canonical deletion is left alone: its graph dies with its last holder.
+func (h *Harness) releaseUse(c *coordinator) {
+	c.mu.Lock()
+	h.mu.Lock()
+	c.uses--
+	if c.uses > 0 {
+		h.mu.Unlock()
+		c.mu.Unlock()
+		return
+	}
+	if h.sessions[c.sessionID] != c {
+		h.mu.Unlock()
+		c.mu.Unlock()
+		return // canonically deleted: the registry entry is already gone
+	}
+	if c.graph != nil {
+		c.durableRevision = c.graph.Session.Revision
+		c.graph = nil
+	}
+	if !c.everLoaded && c.corru == nil { // a failed first lookup leaves no cell behind
+		delete(h.sessions, c.sessionID)
+	}
+	h.mu.Unlock()
+	c.mu.Unlock()
+}
+
+// loadGraph validates one Session's durable graph and publishes it under the
+// coordinator mutex: the cold load and the stale-view refresh share this
+// validation and publication. The availability check runs before the
+// validation and again before the validated graph is adopted, so a deletion or
+// a corruption latch that landed meanwhile refuses the load instead of being
+// overwritten; a persisted semantic violation latches on the stable cell,
+// while storage and context failures leave it retryable. A cold load of an
+// already-published graph keeps that graph; only a refresh replaces a present
+// one. Storage I/O uses the supplied context.
+func (h *Harness) loadGraph(ctx context.Context, c *coordinator, sessionID string, replace bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return err
+	}
+	if !replace && c.graph != nil {
+		return nil
+	}
+	graph, err := validateSessionGraph(ctx, h.deps.Storage, sessionID)
+	if err != nil {
+		h.markCorrupt(sessionID, err)
+		return err
+	}
+	if err := h.unavailableLocked(c, sessionID); err != nil {
+		return err
+	}
+	c.graph = graph
+	c.identity = graph.Session.Identity
+	h.mu.Lock()
+	c.everLoaded = true
+	h.mu.Unlock()
 	return nil
 }
 
 // markCorrupt makes one Session unavailable in this Harness instance when a
-// persisted semantic violation is detected outside first materialization.
+// persisted semantic violation is detected for it: the latch sticks on the
+// Session's stable cell, so no later read, load, or refresh clears it.
 func (h *Harness) markCorrupt(sessionID string, err error) {
 	var corrupt *CorruptionError
 	if !errors.As(err, &corrupt) {
@@ -1382,7 +1460,7 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 		return nil
 	})
 	if existing {
-		if foreign { // a foreign writer changed the durable state under the cached view
+		if foreign { // a foreign writer changed the durable state under the resident view
 			if rerr := h.rematerialize(ctx, c, req.SessionID); rerr != nil {
 				return OperationRecord{}, false, rerr
 			}
@@ -1391,7 +1469,7 @@ func (h *Harness) publishAdmission(ctx context.Context, c *coordinator, view Ses
 	}
 	if err != nil {
 		h.markCorrupt(req.SessionID, err)
-		if foreign { // the transaction proved the cached view stale; refresh it before the error returns
+		if foreign { // the transaction proved the resident view stale; refresh it before the error returns
 			if rerr := h.rematerialize(ctx, c, req.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
 				return OperationRecord{}, false, rerr
 			}
@@ -1537,30 +1615,28 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 	return record, committed, graphEntry{Envelope: inserted, Input: &input}, nil
 }
 
-// rematerialize replaces the coordinator's validated view after a foreign
-// writer changed the durable state under it.
+// rematerialize refreshes the coordinator's validated view after a foreign
+// writer changed the durable state under it: the owned cell revalidates and
+// republishes its graph under the coordinator mutex, with the caller's use
+// still held, exactly like a cold load.
 func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID string) error {
-	graph, err := validateSessionGraph(ctx, h.deps.Storage, sessionID)
-	if err != nil {
-		h.markCorrupt(sessionID, err)
-		return err
-	}
-	c.mu.Lock()
-	c.graph = graph
-	c.mu.Unlock()
-	return nil
+	return h.loadGraph(ctx, c, sessionID, true)
 }
 
 // startExecution installs the coordinator's active execution with its own
 // execution context — a child of the Harness context — and starts the Agent
-// composition on it after the admission commit. Interrupt cancels that
-// context; the execution slot releases, and the post-terminal buffer drain
-// completes, before the execution's done channel closes. After execute, the
-// storage failure latch, and the drain have returned, the tail clears the run
-// slot only when it is still this run — a drain-installed successor owns the
-// slot and a distinct context — then cancels the execution context, runs the
-// child completion settlement for this operation, and closes done.
+// composition on it after the admission commit. The execution holds its own
+// graph use from here through execute, terminal settlement, disposal, and the
+// post-terminal drain, so the caller's use never has to outlive its call.
+// Interrupt cancels that context; the execution slot releases, and the
+// post-terminal buffer drain completes, before the execution's done channel
+// closes. After execute, the storage failure latch, and the drain have
+// returned, the tail clears the run slot only when it is still this run — a
+// drain-installed successor owns the slot and a distinct context — then
+// cancels the execution context, runs the child completion settlement for this
+// operation, drops its use, and closes done.
 func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
+	release := h.retainGraph(c)
 	execCtx, cancel := context.WithCancel(h.ctx)
 	run := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
 	c.mu.Lock()
@@ -1584,6 +1660,7 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 		}
 		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
 		h.childCompletionSettled(c, operationID)
+		release()
 		close(run.done)
 	}()
 }
@@ -1697,6 +1774,26 @@ func (h *Harness) snapshotCoordinators() []*coordinator {
 	cs := make([]*coordinator, 0, len(h.sessions))
 	for _, c := range h.sessions {
 		cs = append(cs, c)
+	}
+	h.mu.Unlock()
+	return cs
+}
+
+// snapshotEstablishedCoordinators copies the registry's established cells
+// under h.mu and returns them with h.mu released: an established cell is one
+// whose Session graph was validated at least once, so it owns the local state
+// a stop can join, whether or not a graph is resident right now. A failed
+// never-loaded lookup owns nothing. The caller drives each stop body directly,
+// with the cell's retained identity and its local group, run, and reservation
+// handles; no graph and no storage read is involved, so an idle corpus is
+// never loaded to be classified.
+func (h *Harness) snapshotEstablishedCoordinators() []*coordinator {
+	h.mu.Lock()
+	cs := make([]*coordinator, 0, len(h.sessions))
+	for _, c := range h.sessions {
+		if c.everLoaded {
+			cs = append(cs, c)
+		}
 	}
 	h.mu.Unlock()
 	return cs

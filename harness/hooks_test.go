@@ -65,10 +65,7 @@ func newHookHarness(t *testing.T, exec Execution) (*Harness, *graphStorage, *coo
 	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
 		t.Fatalf("disposition %q, want admitted", disposition)
 	}
-	c, err := h.coordinatorFor(context.Background(), session.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("coordinator: %v", err)
-	}
+	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID
 }
 

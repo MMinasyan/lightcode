@@ -51,10 +51,7 @@ func TestDependenciesAcceptJobStopper(t *testing.T) {
 // the unclaimed state; the coordinator's lifecycle starts open.
 func TestAdmitBackgroundMemberInitializesGroup(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	if c.bgState != bgOpen {
 		t.Fatalf("fresh coordinator bgState = %q, want open", c.bgState)
 	}
@@ -115,16 +112,13 @@ func TestCreateSessionStartsOpenLifecycle(t *testing.T) {
 // for it.
 func TestAdmitBackgroundMemberCapRejection(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	for i := 0; i < 2; i++ {
 		if _, err := admitLocked(h, c, memberChild, "child", 2); err != nil {
 			t.Fatalf("admission %d: %v", i+1, err)
 		}
 	}
-	_, err = admitLocked(h, c, memberChild, "child", 2)
+	_, err := admitLocked(h, c, memberChild, "child", 2)
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("third admission = %v, want ErrInvalid", err)
 	}
@@ -146,10 +140,7 @@ func TestAdmitBackgroundMemberClosedAndArchivedRejection(t *testing.T) {
 	archived.State.Lifecycle = LifecycleArchived
 	archived.State.ArchivedAt = &now
 	h := newTestHarness(t, (&testGraph{session: archived}).storage(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	for _, kind := range []memberKind{memberChild, memberJob} {
 		_, err := admitLocked(h, c, kind, "member", 0)
 		want := invalidInput("session %q is archived; admission requires an open Session", testSessionID)
@@ -162,10 +153,7 @@ func TestAdmitBackgroundMemberClosedAndArchivedRejection(t *testing.T) {
 	}
 
 	h2 := newTestHarness(t, freshSessionStore(t), nil)
-	c2, err := h2.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c2 := leaseCoordinator(t, h2, testSessionID)
 	for _, state := range []bgState{bgStopping, bgClosed} {
 		c2.mu.Lock()
 		c2.bgState = state
@@ -195,10 +183,7 @@ func TestAdmitBackgroundMemberAfterHarnessCancellation(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	cancel()
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	c.mu.Lock()
 	_, admitErr := h.admitBackgroundMember(c, memberChild, "child", 0)
 	c.mu.Unlock()
@@ -215,10 +200,7 @@ func TestAdmitBackgroundMemberAfterHarnessCancellation(t *testing.T) {
 // returns not-claimed.
 func TestClaimBackgroundMember(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	if m, ok := claimLocked(h, c, "absent"); m != nil || ok {
 		t.Fatalf("unknown claim = (%v, %v), want (nil, false)", m, ok)
 	}
@@ -248,10 +230,7 @@ func TestClaimBackgroundMember(t *testing.T) {
 // removes the member and closes done; a second finish is a no-op.
 func TestFinishBackgroundMember(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	c, err := h.coordinatorFor(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("coordinatorFor: %v", err)
-	}
+	c := leaseCoordinator(t, h, testSessionID)
 	m, err := admitLocked(h, c, memberChild, "child-1", 0)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
