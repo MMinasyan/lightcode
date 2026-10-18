@@ -696,6 +696,34 @@ func TestBuildSkipsReservedKeyViolationWithWarning(t *testing.T) {
 	}
 }
 
+func TestBuildSkipsRetiredProviderControlsWithWarning(t *testing.T) {
+	result := Build(BuildInputs{
+		UserRaw: map[string]any{
+			"retired": map[string]any{
+				"transport": map[string]any{
+					"base_url": "https://retired.test/v1", "api_key_env": "RETIRED_API_KEY",
+					"options": map[string]any{"retries": float64(3)},
+				},
+				"max_tokens_field": "max_completion_tokens",
+				"models":           map[string]any{"m": map[string]any{"context_window": float64(4096)}},
+			},
+			"valid": map[string]any{
+				"transport": map[string]any{"base_url": "http://valid.test/v1", "api_key_env": ""},
+				"models":    map[string]any{"m": map[string]any{"context_window": float64(4096)}},
+			},
+		},
+	})
+	if !hasWarningForProvider(result.Warnings, "user_config_skip", "retired") {
+		t.Fatalf("warnings = %#v, want user_config_skip for the retired controls", result.Warnings)
+	}
+	if _, ok := result.Catalog.Providers["retired"]; ok {
+		t.Fatal("a provider carrying retired controls stayed effective")
+	}
+	if _, ok := result.Catalog.Providers["valid"]; !ok {
+		t.Fatalf("valid sibling was omitted: %#v", result.Warnings)
+	}
+}
+
 func TestBuildDiscoveryUpdatesBundledCostFields(t *testing.T) {
 	// Bundled model has cost with input=10, output=20.
 	// Discovery cache has updated cost with input=15, output=30.

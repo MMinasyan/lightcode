@@ -29,6 +29,11 @@ const tiktokenPkg = "github.com/pkoukk/tiktoken-go"
 // and client.
 const oapiRuntimePkg = "github.com/oapi-codegen/runtime"
 
+// kinOpenAPIPkg is the one third-party dependency the private protocol build
+// command permits: the pinned schema loader that derives the native operation
+// bindings and their invocation contract from the committed schema.
+const kinOpenAPIPkg = "github.com/getkin/kin-openapi/openapi3"
+
 // retiredPackageRoots is the one uniform rejection rule for the retired legacy
 // package roots selected by this modernization: no tracked production file may
 // live under one of these internal package trees or import one. The list is not
@@ -296,6 +301,10 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != clientPkg && imp != protocolPkg && !std[imp] {
 				problems = append(problems, rel+": internal/clientops imports "+imp+"; the shared typed invocation helper may import only the standard library, "+clientPkg+", and "+protocolPkg)
 			}
+		case "internal/protocolgen":
+			if imp != kinOpenAPIPkg && !std[imp] {
+				problems = append(problems, rel+": internal/protocolgen imports "+imp+"; the private protocol build command may import only the standard library and "+kinOpenAPIPkg)
+			}
 		case "internal/acpclient":
 			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != clientopsPkg && imp != versionPkg && !std[imp] {
 				problems = append(problems, rel+": internal/acpclient imports "+imp+"; the target ACP bridge may import only the standard library, "+clientPkg+", "+protocolPkg+", "+clienthostPkg+", "+clientopsPkg+", and the native version helper")
@@ -326,7 +335,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 // TestDependencyRulesRejectNonStdlibDotlessImports proves the allowlists use authoritative standard-library membership, not a dot-in-path shape: the cgo pseudo-import "C" and a dotless path outside the stdlib set fail every package row, while ordinary stdlib imports, the model dependency on agent's side, and internal/storage's dependency on harness still pass. The foundation's own reverse and skipping edges — model or agent reaching harness, any target package reaching internal/storage, and the driver reaching a target package — are each rejected exactly once.
 func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	std := standardLibraryImports(t)
-	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go"} {
+	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go", "internal/storage/x.go", "internal/toolargs/x.go", "protocol/x.go", "client/x.go", "internal/terminal/x.go", "internal/hostprocess/x.go", "internal/clienthost/x.go", "internal/clientview/x.go", "internal/clientops/x.go", "internal/protocolgen/x.go", "internal/acpclient/x.go", "internal/cliclient/x.go", "internal/desktopclient/x.go"} {
 		for _, imp := range []string{"C", "notreal/pkg"} {
 			if problems := checkTrackedGoFile(rel, []string{imp}, std); len(problems) != 1 {
 				t.Errorf("%s importing %q: %d problems, want 1: %v", rel, imp, len(problems), problems)
@@ -765,6 +774,36 @@ func TestDependencyRulesClientViewIsolation(t *testing.T) {
 	} {
 		if problems := checkTrackedGoFile("internal/clientview/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/clientview importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+}
+
+// TestDependencyRulesProtocolGenIsolation enforces the private protocol build
+// command's exact allowlist: the standard library and the pinned schema loader
+// only. The foundation, the Runtime, the target clients and the generated
+// contracts are its nearest forbidden siblings, and another subpackage of the
+// same loader module is not an allowed edge either.
+func TestDependencyRulesProtocolGenIsolation(t *testing.T) {
+	std := standardLibraryImports(t)
+	if problems := checkTrackedGoFile("internal/protocolgen/x.go", []string{
+		"context", "encoding/json", "flag", "fmt", "go/format", "os", "sort", "strconv", "strings", "text/template",
+		kinOpenAPIPkg,
+	}, std); len(problems) != 0 {
+		t.Errorf("allowed internal/protocolgen imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
+		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/config",
+		publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins",
+		publicModule + "/internal/terminal", publicModule + "/internal/cli",
+		publicModule + "/internal/clienthost", publicModule + "/internal/clientview",
+		publicModule + "/internal/clientops", publicModule + "/internal/desktopclient",
+		publicModule + "/internal/acpclient", publicModule + "/internal/cliclient",
+		publicModule + "/client", publicModule + "/protocol",
+		oapiRuntimePkg, tiktokenPkg, "github.com/getkin/kin-openapi/openapi3filter",
+	} {
+		if problems := checkTrackedGoFile("internal/protocolgen/x.go", []string{imp}, std); len(problems) != 1 {
+			t.Errorf("internal/protocolgen importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
 }

@@ -26,6 +26,9 @@ import (
 const (
 	testInstance   = "0123456789abcdef0123456789abcdef"
 	testCredential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	// testVersion is the current wire identity every compatible fixture
+	// speaks; the incompatible rows keep the literal old "1".
+	testVersion = string(protocol.N2)
 )
 
 // recordContent builds one private four-field discovery document.
@@ -227,8 +230,8 @@ func writeFrames(frames string) http.HandlerFunc {
 // mode-0600 single document with the exact four fields and a loopback HTTP
 // endpoint; every deviation is one ErrNoRuntime.
 func TestConnectStrictDiscovery(t *testing.T) {
-	server := newFixture(t, jsonHealth(testInstance, "1"), nil)
-	valid := recordContent(server.URL, testInstance, "1", testCredential)
+	server := newFixture(t, jsonHealth(testInstance, testVersion), nil)
+	valid := recordContent(server.URL, testInstance, testVersion, testCredential)
 
 	t.Run("valid record connects", func(t *testing.T) {
 		c := connectFixture(t, writeDiscoveryContent(t, valid))
@@ -267,22 +270,22 @@ func TestConnectStrictDiscovery(t *testing.T) {
 		{"unknown member", strings.TrimSuffix(valid, "}") + `,"extra":1}`},
 		{"trailing document", valid + valid},
 		{"null document", "null"},
-		{"missing member", fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"1"}`, server.URL, testInstance)},
-		{"wrong member type", fmt.Sprintf(`{"endpoint":1,"instance_id":%q,"protocol_version":"1","credential":%q}`, testInstance, testCredential)},
-		{"endpoint with userinfo", recordContent("http://user@"+strings.TrimPrefix(server.URL, "http://"), testInstance, "1", testCredential)},
-		{"endpoint with path", recordContent(server.URL+"/", testInstance, "1", testCredential)},
-		{"endpoint with query", recordContent(server.URL+"?x=1", testInstance, "1", testCredential)},
-		{"endpoint with fragment", recordContent(server.URL+"#frag", testInstance, "1", testCredential)},
-		{"endpoint is https", recordContent("https://"+strings.TrimPrefix(server.URL, "http://"), testInstance, "1", testCredential)},
-		{"endpoint host is localhost", recordContent("http://localhost:"+strings.TrimPrefix(server.URL, "http://127.0.0.1:"), testInstance, "1", testCredential)},
-		{"endpoint has no port", recordContent("http://127.0.0.1", testInstance, "1", testCredential)},
-		{"endpoint port is not numeric", recordContent("http://127.0.0.1:notaport", testInstance, "1", testCredential)},
-		{"endpoint port is zero", recordContent("http://127.0.0.1:0", testInstance, "1", testCredential)},
-		{"endpoint port overflows", recordContent("http://127.0.0.1:99999999999999999999", testInstance, "1", testCredential)},
-		{"instance is uppercase hex", recordContent(server.URL, strings.ToUpper(testInstance), "1", testCredential)},
-		{"instance is short", recordContent(server.URL, testInstance[:31], "1", testCredential)},
-		{"credential is short", recordContent(server.URL, testInstance, "1", testCredential[:63])},
-		{"credential is uppercase hex", recordContent(server.URL, testInstance, "1", strings.ToUpper(testCredential))},
+		{"missing member", fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q}`, server.URL, testInstance, testVersion)},
+		{"wrong member type", fmt.Sprintf(`{"endpoint":1,"instance_id":%q,"protocol_version":%q,"credential":%q}`, testInstance, testVersion, testCredential)},
+		{"endpoint with userinfo", recordContent("http://user@"+strings.TrimPrefix(server.URL, "http://"), testInstance, testVersion, testCredential)},
+		{"endpoint with path", recordContent(server.URL+"/", testInstance, testVersion, testCredential)},
+		{"endpoint with query", recordContent(server.URL+"?x=1", testInstance, testVersion, testCredential)},
+		{"endpoint with fragment", recordContent(server.URL+"#frag", testInstance, testVersion, testCredential)},
+		{"endpoint is https", recordContent("https://"+strings.TrimPrefix(server.URL, "http://"), testInstance, testVersion, testCredential)},
+		{"endpoint host is localhost", recordContent("http://localhost:"+strings.TrimPrefix(server.URL, "http://127.0.0.1:"), testInstance, testVersion, testCredential)},
+		{"endpoint has no port", recordContent("http://127.0.0.1", testInstance, testVersion, testCredential)},
+		{"endpoint port is not numeric", recordContent("http://127.0.0.1:notaport", testInstance, testVersion, testCredential)},
+		{"endpoint port is zero", recordContent("http://127.0.0.1:0", testInstance, testVersion, testCredential)},
+		{"endpoint port overflows", recordContent("http://127.0.0.1:99999999999999999999", testInstance, testVersion, testCredential)},
+		{"instance is uppercase hex", recordContent(server.URL, strings.ToUpper(testInstance), testVersion, testCredential)},
+		{"instance is short", recordContent(server.URL, testInstance[:31], testVersion, testCredential)},
+		{"credential is short", recordContent(server.URL, testInstance, testVersion, testCredential[:63])},
+		{"credential is uppercase hex", recordContent(server.URL, testInstance, testVersion, strings.ToUpper(testCredential))},
 		{"version is empty", recordContent(server.URL, testInstance, "", testCredential)},
 	}
 	for _, tc := range cases {
@@ -301,8 +304,8 @@ func TestConnectHealthClassification(t *testing.T) {
 	other := strings.Repeat("a", 32)
 
 	t.Run("health instance differs", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(other, "1"), nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		server := newFixture(t, jsonHealth(other, testVersion), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertNoRuntime(t, err)
 	})
 
@@ -321,27 +324,27 @@ func TestConnectHealthClassification(t *testing.T) {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(w, tc.body)
 				}, nil)
-				_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+				_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 				assertNoRuntime(t, err)
 			})
 		}
 	})
 
 	t.Run("live version differs", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(testInstance, "2"), nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, "1"), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertIncompatible(t, err)
 	})
 
 	t.Run("record and live versions differ", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(testInstance, "2"), nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "2", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, "1"), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
 		assertIncompatible(t, err)
 	})
 
 	t.Run("record version disagrees with a live compatible owner", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(testInstance, "1"), nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "2", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, testVersion), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
 		assertNoRuntime(t, err)
 	})
 
@@ -349,7 +352,7 @@ func TestConnectHealthClassification(t *testing.T) {
 		server := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "no", http.StatusInternalServerError)
 		}, nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertNoRuntime(t, err)
 	})
 
@@ -358,7 +361,7 @@ func TestConnectHealthClassification(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"instance_id":`)
 		}, nil)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertNoRuntime(t, err)
 	})
 
@@ -371,11 +374,11 @@ func TestConnectHealthClassification(t *testing.T) {
 		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, _ *http.Request) {
 			redirected = true
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"1"}`, testInstance)
+			fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":%q}`, testInstance, testVersion)
 		})
 		server := httptest.NewServer(mux)
 		t.Cleanup(server.Close)
-		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertNoRuntime(t, err)
 		if redirected {
 			t.Fatal("the readiness probe followed the redirect")
@@ -388,7 +391,7 @@ func TestConnectHealthClassification(t *testing.T) {
 			close(arrived)
 			<-r.Context().Done()
 		}, nil)
-		path := writeDiscovery(t, server.URL, testInstance, "1", testCredential)
+		path := writeDiscovery(t, server.URL, testInstance, testVersion, testCredential)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
@@ -414,8 +417,8 @@ func TestEventsFrames(t *testing.T) {
 			": keepalive\n\n" +
 			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
 			notificationFrame(t, sessionChangedEvent(t, testInstance, "2", "0"))
-		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
 		if !errors.Is(err, client.ErrResyncRequired) {
@@ -468,8 +471,8 @@ func TestEventsFrames(t *testing.T) {
 			t.Fatalf("build tool_finished: %v", err)
 		}
 		frames := notificationFrame(t, delta) + notificationFrame(t, refusal) + notificationFrame(t, started) + notificationFrame(t, finished)
-		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
 		if !errors.Is(err, client.ErrResyncRequired) {
@@ -504,8 +507,8 @@ func TestEventsFrames(t *testing.T) {
 		frames := notificationFrame(t, scopeOpenedEvent(t, workspaceEventScope())) +
 			notificationFrame(t, scopeOpenedEvent(t, agentEventScope())) +
 			notificationFrame(t, job)
-		server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(frames))
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
 		if !errors.Is(err, client.ErrResyncRequired) {
@@ -557,8 +560,8 @@ func TestEventsFrames(t *testing.T) {
 	}
 	for _, tc := range malformed {
 		t.Run(tc.name, func(t *testing.T) {
-			server := newFixture(t, jsonHealth(testInstance, "1"), writeFrames(tc.frame))
-			c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+			server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(tc.frame))
+			c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 			events, errs := c.Events(context.Background())
 			delivered, err := drainEvents(events, errs)
 			if !errors.Is(err, client.ErrResyncRequired) {
@@ -571,10 +574,10 @@ func TestEventsFrames(t *testing.T) {
 	}
 
 	t.Run("status failure", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(testInstance, "1"), func(w http.ResponseWriter, _ *http.Request) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "no", http.StatusInternalServerError)
 		})
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
 		if !errors.Is(err, client.ErrResyncRequired) {
@@ -587,7 +590,7 @@ func TestEventsFrames(t *testing.T) {
 
 	t.Run("queue overflow", func(t *testing.T) {
 		const total = 300
-		server := newFixture(t, jsonHealth(testInstance, "1"), func(w http.ResponseWriter, r *http.Request) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			flusher, _ := w.(http.Flusher)
@@ -603,7 +606,7 @@ func TestEventsFrames(t *testing.T) {
 				}
 			}
 		})
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		// The caller never reads, so the bounded queue overflows on frame 257
 		// and the stream ends with the resync signal alone.
@@ -617,7 +620,7 @@ func TestEventsFrames(t *testing.T) {
 	})
 
 	t.Run("caller cancellation", func(t *testing.T) {
-		server := newFixture(t, jsonHealth(testInstance, "1"), func(w http.ResponseWriter, r *http.Request) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			if flusher, ok := w.(http.Flusher); ok {
@@ -625,7 +628,7 @@ func TestEventsFrames(t *testing.T) {
 			}
 			<-r.Context().Done()
 		})
-		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		ctx, cancel := context.WithCancel(context.Background())
 		events, errs := c.Events(ctx)
 		cancel()

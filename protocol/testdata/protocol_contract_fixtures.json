@@ -514,26 +514,26 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"1\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\"}"
     }
    ],
    "reject": [
     {
      "name": "foreign-version",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"1\"}"
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"1\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"2\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"1\"}"
+     "json": "{\"protocol_version\":\"2\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"1\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\",\"extra\":true}"
     }
    ]
   },
@@ -956,21 +956,30 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}"
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[]}"
     },
     {
      "name": "with-extras",
-     "json": "{\"id\":\"prov\",\"name\":\"Provider\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"https://provider.test/v1\",\"api_key_env\":\"\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"max_tokens\",\"discovery\":false,\"hidden\":false,\"models\":[],\"options\":{\"a\":1},\"extra_body\":{\"temperature\":0.1},\"protocol_metadata\":{\"family\":\"openai\"}}"
+     "json": "{\"id\":\"prov\",\"name\":\"Provider\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"https://provider.test/v1\",\"api_key_env\":\"\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[],\"extra_body\":{\"temperature\":0.1},\"protocol_metadata\":{\"family\":\"openai\"}}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "retired-max-tokens-field",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[],\"max_tokens_field\":\"max_tokens\"}"
+    },
+    {
+     "name": "retired-options",
+     "json": "{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[],\"options\":{\"retries\":3}}"
+    }
+   ]
   },
   {
    "schema": "ProviderDetail",
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"provider\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"provider\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[]}}"
     }
    ],
    "reject": []
@@ -999,6 +1008,14 @@
     {
      "name": "non-string",
      "json": "7"
+    },
+    {
+     "name": "retired-options",
+     "json": "\"options\""
+    },
+    {
+     "name": "retired-max-tokens-field",
+     "json": "\"max_tokens_field\""
     }
    ]
   },
@@ -1038,13 +1055,21 @@
     },
     {
      "name": "full-patch",
-     "json": "{\"name\":\"Renamed\",\"base_url\":\"https://edited.test/v1\",\"api_key_env\":\"EDITED_KEY\",\"headers\":{\"X-Edit\":\"1\"},\"options\":{\"a\":1},\"system_role\":\"user\",\"usage_in_stream\":true,\"max_tokens_field\":\"max_completion_tokens\",\"extra_body\":{\"temperature\":0.1},\"discovery\":true,\"protocol_metadata\":{\"family\":\"openai\"},\"hidden\":false}"
+     "json": "{\"name\":\"Renamed\",\"base_url\":\"https://edited.test/v1\",\"api_key_env\":\"EDITED_KEY\",\"headers\":{\"X-Edit\":\"1\"},\"system_role\":\"user\",\"usage_in_stream\":true,\"extra_body\":{\"temperature\":0.1},\"discovery\":true,\"protocol_metadata\":{\"family\":\"openai\"},\"hidden\":false}"
     }
    ],
    "reject": [
     {
      "name": "unknown-field",
      "json": "{\"nope\":true}"
+    },
+    {
+     "name": "retired-options",
+     "json": "{\"options\":{\"retries\":3}}"
+    },
+    {
+     "name": "retired-max-tokens-field",
+     "json": "{\"max_tokens_field\":\"max_tokens\"}"
     }
    ]
   },
@@ -1073,7 +1098,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"max_tokens_field\":\"fixture\",\"discovery\":false,\"hidden\":false,\"models\":[]}}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"id\":\"fixture\",\"name\":\"fixture\",\"builtin\":false,\"connected\":false,\"key_source\":\"none\",\"base_url\":\"fixture\",\"api_key_env\":\"fixture\",\"headers\":{},\"user_headers\":{},\"system_role\":\"system\",\"usage_in_stream\":false,\"discovery\":false,\"hidden\":false,\"models\":[]}}"
     },
     {
      "name": "null-result",

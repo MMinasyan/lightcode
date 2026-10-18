@@ -32,8 +32,7 @@ const configurationProvidersDocument = `{
   "providers": {
     "prov": {
       "transport": {"base_url": "https://prov.test/v1", "api_key_env": "SHELL_TEST_KEY",
-                    "headers": {"X-Trace": "t1", "Authorization": "Bearer forged", "Proxy-Authorization": "forged2", "  authorization  ": "forged3"},
-                    "options": {"retries": 3, "flag": true}},
+                    "headers": {"X-Trace": "t1", "Authorization": "Bearer forged", "Proxy-Authorization": "forged2", "  authorization  ": "forged3"}},
       "discovery": false,
       "extra_body": {"side": "value", "big": 9007199254740993},
       "protocol_metadata": {"family": "testfam", "must_preserve": ["x_keep"], "drop": ["x_drop"]},
@@ -1002,13 +1001,6 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 				t.Fatalf("%s: prov extra_body side = %v, want the captured value", where, got)
 			}
 			exactJSONMember(where, "extra_body.big", (*view.ExtraBody)["big"], "9007199254740993")
-			if view.Options == nil {
-				t.Fatalf("%s: prov options missing, want the captured transport options", where)
-			}
-			exactJSONMember(where, "options.retries", (*view.Options)["retries"], "3")
-			if got := (*view.Options)["flag"]; got != true {
-				t.Fatalf("%s: prov options flag = %v, want the captured value", where, got)
-			}
 			if view.ProtocolMetadata == nil || view.ProtocolMetadata.Family == nil || *view.ProtocolMetadata.Family != "testfam" {
 				t.Fatalf("%s: prov protocol metadata family = %+v, want testfam", where, view.ProtocolMetadata)
 			}
@@ -1027,11 +1019,7 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 		prov := findProvider(configView.Providers, "prov")
 		checkExtras("getConfiguration", prov)
 		// The remaining provider/model fields the sidecar fixture carries:
-		// the retained max-tokens field name, the effective system role, and
-		// the streamed-usage flag.
-		if prov.MaxTokensField != "max_tokens" {
-			t.Fatalf("prov max_tokens_field = %q, want the effective default", prov.MaxTokensField)
-		}
+		// the effective system role and the streamed-usage flag.
 		if prov.SystemRole != protocol.SystemRole("system") || !prov.UsageInStream {
 			t.Fatalf("prov system_role = %q usage_in_stream = %v, want the effective defaults", prov.SystemRole, prov.UsageInStream)
 		}
@@ -1065,7 +1053,6 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 		}
 		(*detail.Provider.ExtraBody)["side"] = "mutated"
 		(*detail.Provider.ExtraBody)["big"] = nil
-		(*detail.Provider.Options)["retries"] = "mutated"
 		*detail.Provider.ProtocolMetadata.Family = "mutated"
 		(*detail.Provider.ProtocolMetadata.MustPreserve)[0] = "mutated"
 		(*detail.Provider.ProtocolMetadata.Drop)[0] = "mutated"

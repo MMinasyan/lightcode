@@ -22,6 +22,7 @@ import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 import { RuntimeConnection } from './connection';
 import { extractSettingsText } from './exactjson';
 import { invokeNative } from './results';
+import { assertNativeInvocations } from './nativecontract';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 const NEWER = '2026-10-02T10:00:00Z';
@@ -290,9 +291,24 @@ async function settle() {
 }
 
 afterEach(async () => {
+  // The mounted UI's recorded native invocations are asserted here, outside
+  // every application promise and catch, before clearAllMocks removes them: a
+  // violating envelope fails the teardown even when the application's own
+  // expected transport outcome still rendered. Tests that exercise only the
+  // generic invocation boundary without mounting UI acquire no such
+  // obligation. The DOM and mock cleanup stays in the finally block so an
+  // assertion failure cannot contaminate the next test.
+  const mountedUI = mounted.length > 0;
   for (const component of mounted.splice(0)) unmount(component);
-  document.body.innerHTML = '';
-  vi.clearAllMocks();
+  await tick();
+  try {
+    if (mountedUI) {
+      assertNativeInvocations(vi.mocked(Call).mock.calls);
+    }
+  } finally {
+    document.body.innerHTML = '';
+    vi.clearAllMocks();
+  }
 });
 
 describe('real generated stack over the byte bridge', () => {
@@ -685,7 +701,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
     const rawDetail = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
       + '"provider":{"id":"prov1","name":"Prov One","builtin":false,"connected":true,"key_source":"managed",'
       + '"base_url":"http://127.0.0.1:1/v1","api_key_env":"PROV1_KEY","headers":{},"user_headers":{},'
-      + '"system_role":"system","usage_in_stream":false,"max_tokens_field":"max_tokens","discovery":true,"hidden":false,'
+      + '"system_role":"system","usage_in_stream":false,"discovery":true,"hidden":false,'
       + '"protocol_metadata":{"limit":9007199254740993,"rate":1e400},'
       + '"models":[{"id":"m1","name":"Model One","context_window":9007199254740993,"max_output_tokens":1e400,'
       + '"input_modalities":["text"],"system_role":"system","usage_in_stream":false,"hidden":false,"source":"user",'
@@ -768,7 +784,7 @@ describe('the shared invocation boundary', () => {
 
   it('passes well-formed opaque overflow lexemes through the syntax check unchanged', async () => {
     vi.mocked(Call).mockResolvedValue(json(200, {}));
-    const params = '{"body":{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}}';
+    const params = '{"body":{"extra_body":{"n":9007199254740993,"big":1e400}}}';
     const result = await invokeNative(() => handle, 'edit', 'UpdateProviderDetail', params, JSON.parse);
     expect(result.kind).toBe('ok');
     expect(Call).toHaveBeenCalledExactlyOnceWith('1', 'UpdateProviderDetail', params);

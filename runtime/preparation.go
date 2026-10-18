@@ -577,9 +577,8 @@ func (p *preparation) concreteTransport(provider *catalog.Provider, entry *catal
 // streamed-usage flag as the catalog build already resolved them; sidecar
 // extra-body layers re-encoded with raw numbers preserved; the same-provider
 // source-family map from the provider's models; and the retained opt-in
-// wire-debug directory. Transport.Options stays catalog/config data feeding
-// the discovery fingerprint and is never copied here; no timeout input or
-// HTTP option exists.
+// wire-debug directory. No transport option feeds this conversion; no timeout
+// input or HTTP option exists.
 func (p *preparation) resolveTransport(provider *catalog.Provider, entry *catalog.Model, ref model.ModelRef, apiKey string) (model.ResolvedTransport, error) {
 	resolved := model.ResolvedTransport{
 		Model:          ref,

@@ -28,6 +28,7 @@ import { AppVersion, Call, PickDirectory, SetTitle } from '../../client-bindings
 import { BrowserOpenURL } from '../../client-bindings/wailsjs/runtime/runtime';
 import { SessionReader } from './reader';
 import { AttemptLedger } from './attempts';
+import { assertNativeInvocations } from './nativecontract';
 
 const INSTANCE = '0123456789abcdef0123456789abcdef';
 
@@ -264,17 +265,30 @@ async function settle() {
 }
 
 afterEach(async () => {
+  // The mounted UI's recorded native invocations are asserted here, outside
+  // every application promise and catch, before clearAllMocks removes them: a
+  // violating envelope fails the teardown even when the application's own
+  // expected outcome still rendered. The DOM and mock cleanup stays in the
+  // finally block so an assertion failure cannot contaminate the next test.
+  const mountedUI = mounted.length > 0;
   for (const component of mounted.splice(0)) {
     unmount(component);
   }
-  document.body.innerHTML = '';
-  vi.clearAllMocks();
-  // clearAllMocks does not reset implementations; a previous test's
-  // mockImplementation can leak into the next test.  Reset the two
-  // highest-traffic mocks to a neutral default so every test that needs
-  // specific behavior sets its own implementation explicitly.
-  vi.mocked(sdk.ListSessions).mockImplementation(async () => ok([]));
-  vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration()));
+  await tick();
+  try {
+    if (mountedUI) {
+      assertNativeInvocations(vi.mocked(Call).mock.calls);
+    }
+  } finally {
+    document.body.innerHTML = '';
+    vi.clearAllMocks();
+    // clearAllMocks does not reset implementations; a previous test's
+    // mockImplementation can leak into the next test.  Reset the two
+    // highest-traffic mocks to a neutral default so every test that needs
+    // specific behavior sets its own implementation explicitly.
+    vi.mocked(sdk.ListSessions).mockImplementation(async () => ok([]));
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => ok(makeHydration()));
+  }
 });
 
 describe('initial composition', () => {
@@ -1590,7 +1604,6 @@ function providerFixture(overrides: Record<string, unknown> = {}) {
     user_headers: {},
     system_role: 'system',
     usage_in_stream: false,
-    max_tokens_field: 'max_tokens',
     discovery: true,
     hidden: false,
     models: [modelFixture()],
@@ -2818,7 +2831,7 @@ describe('provider and model tasks', () => {
     await settle();
     (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
     await settle();
-    await changeInput(target, 'provider options', '{not json');
+    await changeInput(target, 'provider extra_body', '{not json');
     await settle();
     await settle();
     // The malformed composed invocation text is a known local rejection: no
@@ -2826,7 +2839,29 @@ describe('provider and model tasks', () => {
     expect(vi.mocked(sdk.UpdateProviderDetail)).not.toHaveBeenCalled();
     expect(target.textContent).toContain('Provider edit failed');
     expect(target.textContent).not.toContain('Outcome unknown');
-    expect((target.querySelector('[aria-label="provider options"]') as HTMLTextAreaElement).value).toBe('{not json');
+    expect((target.querySelector('[aria-label="provider extra_body"]') as HTMLTextAreaElement).value).toBe('{not json');
+  });
+
+  it('renders no retired provider controls beside the live members', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.ListProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [providerFixture()] }));
+    vi.mocked(sdk.GetProviderDetail).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Providers"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Select provider prov1"]') as HTMLElement).click();
+    await settle();
+    // The retired controls have no row and no reset affordance...
+    expect(target.querySelector('[aria-label="provider max_tokens_field"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Reset provider max_tokens_field"]')).toBeNull();
+    expect(target.querySelector('[aria-label="provider options"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Reset provider options"]')).toBeNull();
+    // ...while the live provider and model members stay mounted.
+    expect(target.querySelector('[aria-label="provider extra_body"]')).not.toBeNull();
+    expect(target.querySelector('[aria-label="provider api_key_env"]')).not.toBeNull();
+    expect(target.querySelector('[aria-label="m1 max_output_tokens"]')).not.toBeNull();
   });
 
   it('resets one provider field through the generated reset path', async () => {
@@ -3137,7 +3172,7 @@ describe('provider exact reads', () => {
   const RAW_DETAIL = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
     + '"provider":{"id":"prov1","name":"Prov One","builtin":false,"connected":true,"key_source":"managed",'
     + '"base_url":"http://127.0.0.1:1/v1","api_key_env":"PROV1_KEY","headers":{},"user_headers":{},'
-    + '"system_role":"system","usage_in_stream":false,"max_tokens_field":"max_tokens","discovery":true,"hidden":false,'
+    + '"system_role":"system","usage_in_stream":false,"discovery":true,"hidden":false,'
     + '"protocol_metadata":{"limit":9007199254740993,"rate":1e400},'
     + '"models":[{"id":"m1","name":"Model One","context_window":9007199254740993,"max_output_tokens":1e400,'
     + '"input_modalities":["text"],"system_role":"system","usage_in_stream":false,"hidden":false,"source":"user",'

@@ -7,8 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/getkin/kin-openapi/openapi3"
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/clientops"
@@ -100,7 +105,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -244,8 +249,8 @@ var dispatchCases = []dispatchCase{
 		body: `{"session_id":"0123456789abcdef0123456789abcdef","turn":1}`,
 	},
 	{
-		name: "GetConfiguration with opaque overflow extra_body and options numbers", operation: "GetConfiguration",
-		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","context_window":8192,"extra_body":{"n":9007199254740993},"source":"user"}]}]}`,
+		name: "GetConfiguration with opaque overflow extra_body numbers", operation: "GetConfiguration",
+		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993,"big":1e400},"models":[{"id":"m","context_window":8192,"extra_body":{"n":9007199254740993},"source":"user"}]}]}`,
 		method: "GET", path: "/v1/configuration",
 	},
 	{
@@ -299,17 +304,17 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "UpdateProviderDetail", operation: "UpdateProviderDetail",
-		params: `{"query":{"provider_id":"prov"},"body":{"options":{"k":1}}}`,
+		params: `{"query":{"provider_id":"prov"},"body":{"name":"Edited"}}`,
 		status: 200, response: `{"provider":{"id":"prov"}}`,
 		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
-		body: `{"options":{"k":1}}`,
+		body: `{"name":"Edited"}`,
 	},
 	{
-		name: "UpdateProviderDetail with opaque overflow extra_body and options", operation: "UpdateProviderDetail",
-		params: `{"query":{"provider_id":"prov"},"body":{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
-		status: 200, response: `{"provider":{"id":"prov","extra_body":{"n":9007199254740993},"options":{"big":1e400}}}`,
+		name: "UpdateProviderDetail with opaque overflow extra_body", operation: "UpdateProviderDetail",
+		params: `{"query":{"provider_id":"prov"},"body":{"extra_body":{"n":9007199254740993,"big":1e400}}}`,
+		status: 200, response: `{"provider":{"id":"prov","extra_body":{"n":9007199254740993,"big":1e400}}}`,
 		method: "PUT", path: "/v1/providers/detail", rawQuery: "provider_id=prov",
-		body: `{"extra_body":{"n":9007199254740993},"options":{"big":1e400}}`,
+		body: `{"extra_body":{"n":9007199254740993,"big":1e400}}`,
 	},
 	{
 		name: "DeleteProviderDetail", operation: "DeleteProviderDetail",
@@ -446,7 +451,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"1"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		if err != nil {
@@ -527,10 +532,145 @@ func TestCallRejectsForbiddenEnvelope(t *testing.T) {
 // coverage lives in the invocation-table test.
 func TestOperationNames(t *testing.T) {
 	names := clientops.OperationNames()
+	if len(names) == 0 {
+		t.Fatal("OperationNames() is empty")
+	}
+	first := names[0]
 	names[0] = "Mutated"
-	if again := clientops.OperationNames(); again[0] != "GetHealth" {
+	if again := clientops.OperationNames(); again[0] != first {
 		t.Fatalf("OperationNames() returned shared state: %q", again[0])
 	}
+}
+
+// TestInvocationSurfaceMatchesSchema derives the native operation set from the
+// committed schema itself — every declared operation whose success content is
+// not the event stream — and requires the advertisement, the captured dispatch
+// table and that derived set to agree in both directions. A schema addition
+// without a dispatch case, or a dispatch case for an operation the schema does
+// not declare, fails here independently of the generated table.
+func TestInvocationSurfaceMatchesSchema(t *testing.T) {
+	doc := schemaDocument(t)
+	declared := map[string]bool{}
+	streamed := map[string]bool{}
+	for _, path := range sortedKeys(doc.Paths.Map()) {
+		item := doc.Paths.Map()[path]
+		methods := item.Operations()
+		for _, method := range sortedKeys(methods) {
+			operation := methods[method]
+			if operation.OperationID == "" {
+				t.Fatalf("%s %s: operation has no operationId", method, path)
+			}
+			if declared[operation.OperationID] || streamed[operation.OperationID] {
+				t.Fatalf("operation %q is declared twice", operation.OperationID)
+			}
+			if operationDeclaresStream(t, operation) {
+				streamed[operation.OperationID] = true
+				continue
+			}
+			declared[operation.OperationID] = true
+		}
+	}
+	if len(declared) == 0 || len(streamed) == 0 {
+		t.Fatalf("schema declares %d native operations and %d event streams; both sets must be non-empty", len(declared), len(streamed))
+	}
+	names := clientops.OperationNames()
+	if !sort.StringsAreSorted(names) {
+		t.Errorf("OperationNames() is not sorted: %v", names)
+	}
+	advertised := map[string]bool{}
+	for _, name := range names {
+		if !declared[name] {
+			t.Errorf("advertised operation %q is not a declared native operation", name)
+		}
+		if advertised[name] {
+			t.Errorf("advertised operation %q appears twice", name)
+		}
+		advertised[name] = true
+	}
+	dispatched := map[string]bool{}
+	for _, tc := range dispatchCases {
+		if !declared[tc.operation] {
+			t.Errorf("dispatch case %q names %q, which is not a declared native operation", tc.name, tc.operation)
+		}
+		dispatched[tc.operation] = true
+	}
+	for name := range declared {
+		if !advertised[name] {
+			t.Errorf("declared native operation %q is not advertised", name)
+		}
+		if !dispatched[name] {
+			t.Errorf("declared native operation %q has no dispatch case", name)
+		}
+	}
+	for name := range streamed {
+		if advertised[name] {
+			t.Errorf("declared event stream %q is advertised as a native operation", name)
+		}
+	}
+	// The test-only native invocation contract is the second generated
+	// artifact: its root must name exactly the schema's native operations and
+	// carry no stream entry.
+	contractData, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "generated", "native-invocations.json"))
+	if err != nil {
+		t.Fatalf("reading the native invocation contract: %v", err)
+	}
+	var contract map[string]json.RawMessage
+	if err := json.Unmarshal(contractData, &contract); err != nil {
+		t.Fatalf("decoding the native invocation contract: %v", err)
+	}
+	for name := range declared {
+		if _, ok := contract[name]; !ok {
+			t.Errorf("declared native operation %q is missing from the native invocation contract", name)
+		}
+	}
+	for name := range contract {
+		if !declared[name] {
+			t.Errorf("the native invocation contract names %q, which is not a declared native operation", name)
+		}
+	}
+}
+
+// operationDeclaresStream reports whether one declared operation's success
+// content is the event stream.
+func operationDeclaresStream(t *testing.T, operation *openapi3.Operation) bool {
+	t.Helper()
+	for status, response := range operation.Responses.Map() {
+		if len(status) != 3 || status[0] != '2' {
+			continue
+		}
+		if response.Value == nil {
+			t.Fatalf("operation %s success status %s is unresolved", operation.OperationID, status)
+		}
+		if response.Value.Content["text/event-stream"] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaDocument loads and validates the committed protocol schema for the
+// calling test.
+func schemaDocument(t *testing.T) *openapi3.T {
+	t.Helper()
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromFile(filepath.Join("..", "..", "protocol", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("loading the protocol schema: %v", err)
+	}
+	if err := doc.Validate(context.Background()); err != nil {
+		t.Fatalf("validating the protocol schema: %v", err)
+	}
+	return doc
+}
+
+// sortedKeys returns one string-keyed map's keys in sorted order.
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // TestInvokeMapsDeclaredErrors drives the shared response owner over the

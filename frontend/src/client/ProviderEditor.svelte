@@ -17,10 +17,10 @@
   // schema requires; the shared field block renders one row per descriptor.
   const fieldsOf = (kind, ...members) => members.map((member) => [kind, member]);
   const PROVIDER_FIELDS = [
-    ...fieldsOf('text', 'name', 'base_url', 'api_key_env', 'max_tokens_field'),
+    ...fieldsOf('text', 'name', 'base_url', 'api_key_env'),
     ['role', 'system_role'],
     ...fieldsOf('bool', 'usage_in_stream', 'discovery', 'hidden'),
-    ...fieldsOf('json', 'headers', 'options', 'extra_body', 'protocol_metadata'),
+    ...fieldsOf('json', 'headers', 'extra_body', 'protocol_metadata'),
   ];
   const MODEL_FIELDS = [
     ['text', 'name'],

@@ -92,7 +92,7 @@ func runChild() {
 	case roleFail:
 		os.Exit(2)
 	case roleIncompatible:
-		runShapedChild(dataDir, configPath, "2", false)
+		runShapedChild(dataDir, configPath, "1", false)
 	case roleParked:
 		runShapedChild(dataDir, configPath, "", true)
 	default:
@@ -619,7 +619,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 		t.Fatalf("client instance %q, record %q", clients[0].InstanceID(), record.InstanceID)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N1 {
+	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
 		t.Fatalf("authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
 	}
 
@@ -685,7 +685,7 @@ func TestClientHostIncompatibleIncumbent(t *testing.T) {
 		t.Fatal("the incompatible record changed across the probe")
 	}
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N1 {
+	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
 		t.Fatalf("the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	}
 	incumbent.stopAndJoin(t)
@@ -768,7 +768,7 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 		t.Fatalf("record endpoint = %q, want the surviving owner %q", record.Endpoint, endpoint)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N1 {
+	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
 		t.Fatalf("the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	}
 	pid := attemptPID(t, attempts[0])
@@ -808,7 +808,7 @@ func TestClientHostHealthTimeoutPreservesHolder(t *testing.T) {
 	}
 
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N1 {
+	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
 		t.Fatalf("the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	}
 	if after := readFile(t, recordPath); !bytes.Equal(after, before) {

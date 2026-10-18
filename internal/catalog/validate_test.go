@@ -37,6 +37,24 @@ func TestValidateRawStrictRejectsUnknownProviderKey(t *testing.T) {
 	}
 }
 
+// TestValidateRawStrictRejectsRetiredProviderControls pins the retired
+// controls' shared unknown-field policy: the removed max_tokens_field and
+// transport.options members are ordinary unknown members now, refused by the
+// same strict check as any other forged key.
+func TestValidateRawStrictRejectsRetiredProviderControls(t *testing.T) {
+	raw := validRawProvider()
+	raw["max_tokens_field"] = "max_completion_tokens"
+	if errs := ValidateRaw("openai", raw, true); !hasValidationError(errs, "max_tokens_field") {
+		t.Fatalf("ValidateRaw errors = %#v, want the retired max_tokens_field refused as unknown", errs)
+	}
+
+	raw = validRawProvider()
+	raw["transport"].(map[string]any)["options"] = map[string]any{"retries": float64(3)}
+	if errs := ValidateRaw("openai", raw, true); !hasValidationError(errs, "transport.options") {
+		t.Fatalf("ValidateRaw errors = %#v, want the retired transport.options refused as unknown", errs)
+	}
+}
+
 func TestValidateRawReportsMissingRequiredTransportBaseURL(t *testing.T) {
 	raw := validRawProvider()
 	delete(raw["transport"].(map[string]any), "base_url")
@@ -148,7 +166,6 @@ func validRawProvider() map[string]any {
 			"base_url":    "https://api.openai.com/v1",
 			"api_key_env": "OPENAI_API_KEY",
 			"headers":     map[string]any{"OpenAI-Beta": "assistants=v2"},
-			"options":     map[string]any{"timeout": float64(60)},
 		},
 		"system_role":     "system",
 		"usage_in_stream": true,

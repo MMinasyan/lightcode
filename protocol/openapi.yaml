@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "1" is the protocol identity, independent of the binary
+# Wire version "2" is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "1"
+  version: "2"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -878,7 +878,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "1"
+            - "2"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -2001,10 +2001,8 @@ components:
         - BaseUrl
         - EnvironmentVariable
         - Headers
-        - Options
         - SystemRole
         - UsageInStream
-        - MaxTokensField
         - ExtraBody
         - Discovery
         - ProtocolMetadata
@@ -2014,10 +2012,8 @@ components:
         - base_url
         - api_key_env
         - headers
-        - options
         - system_role
         - usage_in_stream
-        - max_tokens_field
         - extra_body
         - discovery
         - protocol_metadata
@@ -2055,14 +2051,10 @@ components:
           type: object
           additionalProperties:
             type: string
-        options:
-          type: object
         system_role:
           $ref: "#/components/schemas/SystemRole"
         usage_in_stream:
           type: boolean
-        max_tokens_field:
-          type: string
         extra_body:
           type: object
         discovery:
@@ -2161,7 +2153,6 @@ components:
         - user_headers
         - system_role
         - usage_in_stream
-        - max_tokens_field
         - discovery
         - hidden
         - models
@@ -2193,14 +2184,10 @@ components:
           type: object
           additionalProperties:
             type: string
-        options:
-          type: object
         system_role:
           $ref: "#/components/schemas/SystemRole"
         usage_in_stream:
           type: boolean
-        max_tokens_field:
-          type: string
         extra_body:
           type: object
         discovery:

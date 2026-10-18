@@ -84,7 +84,6 @@ func ValidateRaw(provID string, raw map[string]any, strict bool) []ValidationErr
 	}
 	validateRawSystemRole(add, "", "system_role", raw["system_role"])
 	validateRawBool(add, "", "usage_in_stream", raw["usage_in_stream"])
-	validateRawMaxTokensField(add, raw["max_tokens_field"])
 	validateRawBool(add, "", "discovery", raw["discovery"])
 	validateRawBool(add, "", "hidden", raw["hidden"])
 	validateRawExtraBody(add, "", "extra_body", raw["extra_body"])
@@ -140,9 +139,6 @@ func ValidateEffective(p *Provider) []ValidationError {
 	if !validSystemRole(p.SystemRole) {
 		add("", "system_role", "must be system, user, or developer")
 	}
-	if p.MaxTokensField != "" && !validMaxTokensField(p.MaxTokensField) {
-		add("", "max_tokens_field", "must be max_tokens or max_completion_tokens")
-	}
 	for _, key := range CheckReservedKeys(p.ExtraBody) {
 		add("", "extra_body."+key, "reserved request body key")
 	}
@@ -176,7 +172,7 @@ func ValidateEffective(p *Provider) []ValidationError {
 
 func validateRawTransport(add func(string, string, string), transport map[string]any) {
 	for key := range transport {
-		if key != "base_url" && key != "api_key_env" && key != "headers" && key != "options" {
+		if key != "base_url" && key != "api_key_env" && key != "headers" {
 			add("", "transport."+key, "unknown transport field")
 		}
 	}
@@ -204,11 +200,6 @@ func validateRawTransport(add func(string, string, string), transport map[string
 					add("", "transport.headers."+key, "must be a string")
 				}
 			}
-		}
-	}
-	if options, ok := transport["options"]; ok {
-		if _, ok := validationObject(options); !ok {
-			add("", "transport.options", "must be an object")
 		}
 	}
 }
@@ -256,16 +247,6 @@ func validateRawSystemRole(add func(string, string, string), model, field string
 	}
 	if !validSystemRole(SystemRole(s)) {
 		add(model, field, "must be system, user, or developer")
-	}
-}
-
-func validateRawMaxTokensField(add func(string, string, string), value any) {
-	if value == nil {
-		return
-	}
-	s, ok := value.(string)
-	if !ok || !validMaxTokensField(s) {
-		add("", "max_tokens_field", "must be max_tokens or max_completion_tokens")
 	}
 }
 
@@ -426,7 +407,7 @@ func validateURL(add func(string, string, string), model, field, raw string) {
 
 func allowedRawProviderKey(key string) bool {
 	switch key {
-	case "id", "name", "transport", "system_role", "usage_in_stream", "max_tokens_field", "extra_body", "discovery", "hidden", "protocol_metadata", "models":
+	case "id", "name", "transport", "system_role", "usage_in_stream", "extra_body", "discovery", "hidden", "protocol_metadata", "models":
 		return true
 	default:
 		return false
@@ -445,15 +426,6 @@ func allowedRawModelKey(key string) bool {
 func validSystemRole(role SystemRole) bool {
 	switch role {
 	case RoleSystem, RoleUser, RoleDeveloper:
-		return true
-	default:
-		return false
-	}
-}
-
-func validMaxTokensField(field string) bool {
-	switch field {
-	case "max_tokens", "max_completion_tokens":
 		return true
 	default:
 		return false

@@ -38,7 +38,7 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/health":
-			_ = json.NewEncoder(w).Encode(map[string]string{"instance_id": instance, "protocol_version": string(protocol.N1)})
+			_ = json.NewEncoder(w).Encode(map[string]string{"instance_id": instance, "protocol_version": string(protocol.N2)})
 		case "/v1/configuration":
 			w.WriteHeader(status)
 			_, _ = w.Write(body)
@@ -58,7 +58,7 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		}
 	})
 	dir := t.TempDir()
-	record, err := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N1), "credential": credential})
+	record, err := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": credential})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,13 +198,13 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 }
 
 // TestRunModelsOpaqueOverflowFieldsRenders proves unused opaque extra_body
-// and options numbers beyond Number precision, delivered as their exact raw
-// lexemes through the shared invocation, do not disturb the utility's
-// retained output.
+// numbers beyond Number precision, delivered as their exact raw lexemes
+// through the shared invocation, do not disturb the utility's retained
+// output.
 func TestRunModelsOpaqueOverflowFieldsRenders(t *testing.T) {
 	// Raw JSON supplies the overflow lexemes exactly; a generated struct
 	// cannot carry them.
-	raw := `{"configuration_revision":{"instance_id":"` + strings.Repeat("a", 32) + `","generation":"1"},"settings":{},"agents":[{"name":"primary","model":"prov/m"}],"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993},"options":{"big":1e400},"models":[{"id":"m","name":"M","context_window":4096,"source":"user","extra_body":{"n":9007199254740993},"options":{"big":1e400}}]}]}`
+	raw := `{"configuration_revision":{"instance_id":"` + strings.Repeat("a", 32) + `","generation":"1"},"settings":{},"agents":[{"name":"primary","model":"prov/m"}],"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993,"big":1e400},"models":[{"id":"m","name":"M","context_window":4096,"source":"user","extra_body":{"n":9007199254740993,"big":1e400}}]}]}`
 	opts := modelsEndpoint(t, http.StatusOK, []byte(raw))
 	var out, diagnostics bytes.Buffer
 	if err := clienthost.RunModels(context.Background(), opts, "", false, false, &out, &diagnostics); err != nil {

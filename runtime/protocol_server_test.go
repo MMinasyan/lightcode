@@ -305,8 +305,8 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		if health.JSON200 == nil || health.HTTPResponse.StatusCode != http.StatusOK {
 			t.Fatalf("health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
 		}
-		if health.JSON200.InstanceId != ps.instance || health.JSON200.ProtocolVersion != protocol.N1 {
-			t.Fatalf("health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N1)
+		if health.JSON200.InstanceId != ps.instance || health.JSON200.ProtocolVersion != protocol.N2 {
+			t.Fatalf("health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N2)
 		}
 
 		workspace := filepath.Join(e.home, "mounted")
