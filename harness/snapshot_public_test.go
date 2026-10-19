@@ -50,17 +50,14 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         script.effect,
-				CompactModel:  script.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
-						Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
-					}}
-				},
-			}, nil
+			exec := publicExecution(script.effect, script.effect)
+			exec.Tool = func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
+					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
+				}}
+			}
+			return exec, nil
 		},
 	}
 }
@@ -1046,16 +1043,7 @@ func backgroundPrepared(gate, arrived chan struct{}) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         parkingModelFn(gate, arrived),
-				CompactModel:  parkingModelFn(gate, arrived),
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-						Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"},
-					}}
-				},
-			}, nil
+			return publicExecution(parkingModelFn(gate, arrived), parkingModelFn(gate, arrived)), nil
 		},
 	}
 }

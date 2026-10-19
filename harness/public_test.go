@@ -65,6 +65,20 @@ func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
 	return json.Marshal(obj)
 }
 
+// publicExecution is the suite's ordinary opened execution: the two actual
+// model callbacks, the suite's required normalizer, and the immediate
+// "no tools" result plan.
+func publicExecution(conversation, compact func(context.Context, model.Request) (model.Stream, error)) harness.Execution {
+	return harness.Execution{
+		Model:         conversation,
+		CompactModel:  compact,
+		NormalizeTool: publicNormalize,
+		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+		},
+	}
+}
+
 // publicPermission is one built-in-allowed declaration for the suite's
 // effect-producing fixture plans: command.run allows any target.
 var publicPermission = []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}}
@@ -262,14 +276,7 @@ func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harne
 	prepared := harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         modelFn,
-				CompactModel:  modelFn,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(modelFn, modelFn), nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -622,14 +629,7 @@ func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         script.effect,
-				CompactModel:  script.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(script.effect, script.effect), nil
 		},
 	}
 }
@@ -5085,14 +5085,7 @@ func racePrepared(f *publicFixture) harness.PreparedExecution {
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			f.opens.Add(1)
-			return harness.Execution{
-				Model:         f.model.effect,
-				CompactModel:  f.model.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(f.model.effect, f.model.effect), nil
 		},
 	}
 }

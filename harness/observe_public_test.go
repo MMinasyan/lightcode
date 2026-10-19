@@ -88,12 +88,9 @@ func newObservedPublicHarnessWithTool(t *testing.T, store harness.Storage, scrip
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool:          tool,
-					}, nil
+					exec := publicExecution(script.effect, script.effect)
+					exec.Tool = tool
+					return exec, nil
 				},
 			}, nil
 		},

@@ -44,15 +44,9 @@ func newAttemptTableFixture(t *testing.T, store harness.Storage, conversationFn,
 		return harness.PreparedExecution{
 			Capture: publicCapture(),
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-				return harness.Execution{
-					Model:         conversationFn,
-					CompactModel:  compactFn,
-					NormalizeTool: publicNormalize,
-					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-						return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-					},
-					Retry: retry,
-				}, nil
+				exec := publicExecution(conversationFn, compactFn)
+				exec.Retry = retry
+				return exec, nil
 			},
 		}, nil
 	}})
