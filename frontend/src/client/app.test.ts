@@ -397,12 +397,12 @@ describe('initial composition', () => {
     vi.mocked(sdk.GetWarnings).mockResolvedValue(ok({ warnings_revision: { instance_id: INSTANCE, revision: '1' }, warnings: [] }));
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(makeHydration()));
     // The boot list is held; a repair then completes while it is parked.
-    let releaseList: (value: unknown) => void = () => {};
+    const { promise: listGate, resolve: releaseList } = Promise.withResolvers();
     let listCalls = 0;
     vi.mocked(sdk.ListSessions).mockImplementation(async () => {
       listCalls += 1;
       if (listCalls === 1) {
-        return new Promise((resolve) => { releaseList = resolve; });
+        return listGate;
       }
       return ok([rootSession('root1', NEWER)]);
     });
@@ -645,8 +645,7 @@ describe('composer', () => {
   });
 
   it('forms independent work from unchanged text while a response is held', async () => {
-    let releaseFirst: (value: unknown) => void = () => {};
-    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: firstGate, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.SubmitSession)
       .mockImplementationOnce(() => firstGate as never)
       .mockResolvedValue(ok({ disposition: 'queued' }));
@@ -723,8 +722,8 @@ describe('composer', () => {
   });
 
   it('never clears a newer draft on a late success', async () => {
-    let resolveSubmit: (value: unknown) => void = () => {};
-    vi.mocked(sdk.SubmitSession).mockImplementationOnce(() => new Promise((resolve) => { resolveSubmit = resolve; }));
+    const { promise: submitGate, resolve: resolveSubmit } = Promise.withResolvers();
+    vi.mocked(sdk.SubmitSession).mockImplementationOnce(() => submitGate);
     const { target } = await mountBasic();
     typeInto(target, 'first');
     await settle();
@@ -748,8 +747,8 @@ describe('composer', () => {
   });
 
   it('keeps an unknown attempt against its own session when the root switches and does not resend', async () => {
-    let resolveSubmit: (value: unknown) => void = () => {};
-    vi.mocked(sdk.SubmitSession).mockImplementationOnce(() => new Promise((_resolve, reject) => { resolveSubmit = reject; }));
+    const { promise: submitGate, reject: resolveSubmit } = Promise.withResolvers();
+    vi.mocked(sdk.SubmitSession).mockImplementationOnce(() => submitGate);
     const { target } = await mountBasic();
     typeInto(target, 'delayed');
     await settle();
@@ -815,8 +814,8 @@ describe('controls', () => {
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(activeHydration()));
     const { target } = await mountApp(connection);
     await settle();
-    let resolveInterrupt: (value: unknown) => void = () => {};
-    vi.mocked(sdk.InterruptSession).mockImplementationOnce(() => new Promise((resolve) => { resolveInterrupt = resolve; }));
+    const { promise: interruptGate, resolve: resolveInterrupt } = Promise.withResolvers();
+    vi.mocked(sdk.InterruptSession).mockImplementationOnce(() => interruptGate);
     (target.querySelector('.interrupt') as HTMLElement).click();
     // Move the selection to root2 while the root1 control is in flight.
     await selectRoot2(target);
@@ -832,8 +831,8 @@ describe('controls', () => {
     // ...with no view adoption into root2: the displayed session stays root2.
     expect(target.querySelector('.toolbar')?.textContent).toContain('root2');
     // An unknown transport outcome is likewise reported for its address.
-    let resolveStop: (value: unknown) => void = () => {};
-    vi.mocked(sdk.StopSession).mockImplementationOnce(() => new Promise((_resolve, reject) => { resolveStop = reject; }));
+    const { promise: stopGate, reject: resolveStop } = Promise.withResolvers();
+    vi.mocked(sdk.StopSession).mockImplementationOnce(() => stopGate);
     (target.querySelector('.stop') as HTMLElement).click();
     resolveStop(new Error('stop lost'));
     await settle();
@@ -980,8 +979,8 @@ describe('keyboard pickers', () => {
       configuration_revision: { instance_id: INSTANCE, generation: '1' },
       models: [{ ref: 'prov/a', provider: 'prov', provider_name: 'Provider', model: 'a', display_name: 'Model A', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' }],
     }));
-    let resolveModel: (value: unknown) => void = () => {};
-    vi.mocked(sdk.SetAgentTypeModel).mockImplementation(() => new Promise((resolve) => { resolveModel = resolve; }));
+    const { promise: modelGate, resolve: resolveModel } = Promise.withResolvers();
+    vi.mocked(sdk.SetAgentTypeModel).mockImplementation(() => modelGate);
     const { target } = await mountBasic();
     const opensBefore = target ? 0 : 0;
     void opensBefore;
@@ -1428,9 +1427,9 @@ describe('repair', () => {
     connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
     // Gate the repair's fresh hydration so the second loss lands strictly
     // before the read completes.
-    let settleRead: (value: unknown) => void = () => {};
+    const { promise: readGate, resolve: settleRead } = Promise.withResolvers();
     vi.mocked(sdk.GetSessionHydration).mockImplementationOnce(
-      () => new Promise((resolve) => { settleRead = resolve; }),
+      () => readGate,
     );
     // A genuinely current (installed generation '1') loss.
     connection.failureHandler?.(new Error('first loss'), '1');
@@ -1489,9 +1488,9 @@ describe('repair', () => {
     const opensBefore = connection.openMock.mock.calls.length;
     const readsAtBoot = vi.mocked(sdk.GetSessionHydration).mock.calls.length;
     connection.openMock.mockResolvedValue({ instance_id: INSTANCE, generation: '2', workspace: '/ws' });
-    let settleRead: (value: unknown) => void = () => {};
+    const { promise: readGate, resolve: settleRead } = Promise.withResolvers();
     vi.mocked(sdk.GetSessionHydration).mockImplementationOnce(
-      () => new Promise((resolve) => { settleRead = resolve; }),
+      () => readGate,
     );
     connection.failureHandler?.(new Error('stream lost'), '1');
     await vi.waitFor(() => expect(vi.mocked(sdk.GetSessionHydration).mock.calls.length).toBe(readsAtBoot + 1));
@@ -1521,8 +1520,7 @@ describe('repair', () => {
     await vi.waitFor(() => expect(target.textContent).toContain('root1'));
     // A configuration update arrives and its own read is held while the user
     // navigates to another root.
-    let releaseConfiguration: (value: unknown) => void = () => {};
-    const held = new Promise((resolve) => { releaseConfiguration = resolve; });
+    const { promise: held, resolve: releaseConfiguration } = Promise.withResolvers();
     let reads = 0;
     vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
       reads += 1;
@@ -1658,6 +1656,16 @@ function bodyOf(call: string): string {
   return call.slice(at + marker.length, call.length - 1);
 }
 
+// The owned-input Fork action shared by the replacement and restore scenarios:
+// open the dialog for i-owned and, when asked, enable the rewind toggle before
+// submitting.
+async function openOwnedFork(target: HTMLElement, rewind: boolean) {
+  (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+  await settle();
+  if (rewind) await toggleCheckbox(target, 'Rewind code before Fork', true);
+  (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
+}
+
 describe('repair projection ownership', () => {
   function ownedHydration() {
     return makeHydration({
@@ -1772,10 +1780,8 @@ describe('repair projection ownership', () => {
     const connection = fakeConnection();
     basicMocks(connection);
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(ok(ownedHydration()));
-    let releaseSubmit: (value: unknown) => void = () => {};
-    const submitGate = new Promise((_resolve, reject) => { releaseSubmit = reject; });
-    let releaseFork: (value: unknown) => void = () => {};
-    const forkGate = new Promise((_resolve, reject) => { releaseFork = reject; });
+    const { promise: submitGate, reject: releaseSubmit } = Promise.withResolvers();
+    const { promise: forkGate, reject: releaseFork } = Promise.withResolvers();
     vi.mocked(sdk.SubmitSession).mockImplementationOnce(() => submitGate as never);
     vi.mocked(sdk.ForkSession).mockImplementationOnce(() => forkGate as never);
     const { target } = await mountApp(connection);
@@ -1812,15 +1818,13 @@ describe('repair projection ownership', () => {
     const prov1 = providerFixture({ connected: false, key_source: 'external' });
     const prov2 = providerFixture({ id: 'prov2', name: 'Prov Two' });
     vi.mocked(sdk.ListProviders).mockResolvedValue(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [prov1, prov2] }));
-    let releaseRead: (value: unknown) => void = () => {};
-    const readGate = new Promise((resolve) => { releaseRead = resolve; });
+    const { promise: readGate, resolve: releaseRead } = Promise.withResolvers();
     vi.mocked(sdk.GetProviderDetail).mockImplementation(async (params: string) => {
       const id = (JSON.parse(params) as { query: { provider_id: string } }).query.provider_id;
       if (id === 'prov2') return readGate as never;
       return ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: prov1 });
     });
-    let releaseMutation: (value: unknown) => void = () => {};
-    const mutationGate = new Promise((resolve) => { releaseMutation = resolve; });
+    const { promise: mutationGate, resolve: releaseMutation } = Promise.withResolvers();
     vi.mocked(sdk.ConnectProvider).mockImplementationOnce(() => mutationGate as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -1901,8 +1905,7 @@ describe('workspace navigation', () => {
       { root: '/ws2', display_name: 'ws2' },
       { root: '/ws3', display_name: 'ws3' },
     ]));
-    let releaseStale: (value: unknown) => void = () => {};
-    const staleGate = new Promise((resolve) => { releaseStale = resolve; });
+    const { promise: staleGate, resolve: releaseStale } = Promise.withResolvers();
     vi.mocked(sdk.ListSessions).mockImplementation(async (options) => {
       const workspace = (JSON.parse(options) as { query: { workspace: string } }).query.workspace;
       if (workspace === '/ws2') return staleGate as never;
@@ -1935,8 +1938,7 @@ describe('workspace navigation', () => {
       { root: '/ws', display_name: 'ws' },
       { root: '/ws2', display_name: 'ws2' },
     ]));
-    let releasePick: (value: string) => void = () => {};
-    const pickGate = new Promise<string>((resolve) => { releasePick = resolve; });
+    const { promise: pickGate, resolve: releasePick } = Promise.withResolvers<string>();
     vi.mocked(PickDirectory).mockImplementationOnce(() => pickGate as never);
     const { target } = await mountApp(connection);
     (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
@@ -1961,8 +1963,7 @@ describe('workspace navigation', () => {
     const connection = fakeConnection();
     basicMocks(connection);
     vi.mocked(sdk.ListWorkspaces).mockResolvedValue(ok([{ root: '/ws', display_name: 'ws' }]));
-    let rejectPick: (error: Error) => void = () => {};
-    const pickGate = new Promise<string>((_resolve, reject) => { rejectPick = reject; });
+    const { promise: pickGate, reject: rejectPick } = Promise.withResolvers<string>();
     vi.mocked(PickDirectory).mockImplementationOnce(() => pickGate as never);
     const { target } = await mountApp(connection);
     (target.querySelector('[aria-label="Select workspace"]') as HTMLElement).click();
@@ -2026,27 +2027,13 @@ describe('session picker tasks', () => {
     expect(target.textContent).not.toContain('Delete outcome unknown');
   });
 
-  it('reports a lost Delete as outcome unknown and never as success', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
+  it.each([
+    ['reports a lost Delete as outcome unknown and never as success', () => Promise.reject(new Error('delete lost'))],
+    ['reports an invalid-delivery Delete as outcome unknown and never as success', () => Promise.resolve(receivedInvalid('delete body undecodable'))],
+  ])('%s', async (_title, deleteOutcome) => {
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(ok(rootSession('root2', OLDER)));
-    vi.mocked(sdk.DeleteSession).mockRejectedValue(new Error('delete lost'));
-    const { target } = await mountApp(connection);
-    await openPicker(target);
-    (target.querySelector('[aria-label="Delete session root2"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    expect(vi.mocked(sdk.ArchiveSession)).toHaveBeenCalledWith('{"session_id":"root2"}');
-    expect(target.textContent).toContain('Delete outcome unknown for session root2; nothing was retransmitted.');
-    expect(vi.mocked(sdk.DeleteSession)).toHaveBeenCalledTimes(1);
-  });
-
-  it('reports an invalid-delivery Delete as outcome unknown and never as success', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    vi.mocked(sdk.ArchiveSession).mockResolvedValue(ok(rootSession('root2', OLDER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(receivedInvalid('delete body undecodable'));
-    const { target } = await mountApp(connection);
+    vi.mocked(sdk.DeleteSession).mockImplementation(deleteOutcome);
+    const { target } = await mountBasic();
     await openPicker(target);
     (target.querySelector('[aria-label="Delete session root2"]') as HTMLElement).click();
     await settle();
@@ -2095,8 +2082,7 @@ describe('session picker tasks', () => {
   it('invalidates an older list after a deletion, including a nonselected one', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseFirstDeleteList: (value: unknown) => void = () => {};
-    const firstDeleteList = new Promise((resolve) => { releaseFirstDeleteList = resolve; });
+    const { promise: firstDeleteList, resolve: releaseFirstDeleteList } = Promise.withResolvers();
     let openCalls = 0;
     vi.mocked(sdk.ListSessions).mockImplementation(async (options) => {
       const lifecycle = (JSON.parse(options) as { query: { lifecycle: string } }).query.lifecycle;
@@ -2143,8 +2129,7 @@ describe('session picker tasks', () => {
       }
       return ok([]);
     });
-    let releaseDelete: (value: unknown) => void = () => {};
-    const deleteGate = new Promise((resolve) => { releaseDelete = resolve; });
+    const { promise: deleteGate, resolve: releaseDelete } = Promise.withResolvers();
     vi.mocked(sdk.DeleteSession).mockImplementationOnce(() => deleteGate as never);
     const { target } = await mountApp(connection);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
@@ -2170,8 +2155,7 @@ describe('session picker tasks', () => {
     const connection = fakeConnection();
     basicMocks(connection);
     let openListCalls = 0;
-    let releaseStage: (value: unknown) => void = () => {};
-    const stageGate = new Promise((resolve) => { releaseStage = resolve; });
+    const { promise: stageGate, resolve: releaseStage } = Promise.withResolvers();
     vi.mocked(sdk.ListSessions).mockImplementation(async (options) => {
       const lifecycle = (JSON.parse(options) as { query: { lifecycle: string } }).query.lifecycle;
       if (lifecycle === 'archived') {
@@ -2327,8 +2311,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
 
   it('adopts only the newest resume when the later Reopen settles first', async () => {
     const connection = archivedConnection();
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(ok(rootSession('arch9', OLDER)));
@@ -2350,10 +2333,8 @@ describe('resume selection intent', () => {  function archivedSession(id: string
 
   it('keeps the newest resume intent when the earlier Reopen settles first', async () => {
     const connection = archivedConnection();
-    let releaseFirst: (value: unknown) => void = () => {};
-    let releaseSecond: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession)
       .mockImplementationOnce(() => first as never)
       .mockImplementationOnce(() => second as never);
@@ -2377,8 +2358,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
 
   it('a rejected or lost newest resume keeps the prior root and never adopts a stale success', async () => {
     const connection = archivedConnection();
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(httpError(404, { code: 'not_found', message: 'no longer archived' }));
@@ -2397,8 +2377,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
     expect(hydratedIDs()).not.toContain('arch8');
     expect(target.querySelector('.toolbar')?.textContent).toContain('root1');
     // A lost newest resume behaves the same.
-    let releaseSecond: (value: unknown) => void = () => {};
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession)
       .mockImplementationOnce(() => second as never)
       .mockRejectedValueOnce(new Error('reopen lost'));
@@ -2422,8 +2401,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
       { root: '/ws2', display_name: 'ws2' },
     ]));
     vi.mocked(sdk.CreateSession).mockResolvedValue(ok(rootSession('root-new', NEWER)));
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession).mockImplementationOnce(() => first as never);
     const { target } = await mountApp(connection);
     await openArchived(target);
@@ -2440,8 +2418,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
     expect(hydratedIDs()).not.toContain('arch8');
     expect(target.querySelector('.toolbar')?.textContent).toContain('root2');
     // A Workspace composition supersedes a parked resume too.
-    let releaseSecond: (value: unknown) => void = () => {};
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession).mockImplementationOnce(() => second as never);
     await reopenArchived(target);
     (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
@@ -2457,8 +2434,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
     expect(hydratedIDs()).not.toContain('arch8');
     expect(target.textContent).toContain('/ws2');
     // A picker New that succeeds supersedes a parked resume as well.
-    let releaseThird: (value: unknown) => void = () => {};
-    const third = new Promise((resolve) => { releaseThird = resolve; });
+    const { promise: third, resolve: releaseThird } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession).mockImplementationOnce(() => third as never);
     await reopenArchived(target);
     (target.querySelector('[aria-label="Resume session arch8"]') as HTMLElement).click();
@@ -2493,8 +2469,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
       conversation: { items: [inputItem('i-old', 'user', 'op-old'), inputItem('i-new', 'user', 'op-new')] },
       operations: [runningOperation('op-old')],
     });
-    let releaseParked: (value: unknown) => void = () => {};
-    const parked = new Promise((resolve) => { releaseParked = resolve; });
+    const { promise: parked, resolve: releaseParked } = Promise.withResolvers();
     vi.mocked(sdk.GetSessionHydration)
       .mockResolvedValueOnce(ok(initial))
       .mockImplementationOnce(() => parked as never)
@@ -2537,8 +2512,7 @@ describe('resume selection intent', () => {  function archivedSession(id: string
         ? ok([rootSession('root1', NEWER), rootSession('root2', OLDER)])
         : ok([{ ...rootSession('arch8', OLDER), lifecycle: 'archived' as const }]);
     });
-    let releaseResume: (value: unknown) => void = () => {};
-    const resumeGate = new Promise((resolve) => { releaseResume = resolve; });
+    const { promise: resumeGate, resolve: releaseResume } = Promise.withResolvers();
     vi.mocked(sdk.ReopenSession).mockImplementationOnce(() => resumeGate as never);
     const { target } = await mountApp(connection);
     await openArchived(target);
@@ -2651,8 +2625,7 @@ describe('settings editor', () => {
 
   it('gates every authored control while a save is pending and sends the complete body with no precondition', async () => {
     const connection = settingsRawConnection();
-    let releaseSave: (value: unknown) => void = () => {};
-    const gate = new Promise((resolve) => { releaseSave = resolve; });
+    const { promise: gate, resolve: releaseSave } = Promise.withResolvers();
     vi.mocked(sdk.UpdateConfigurationSettings).mockImplementationOnce(() => gate as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -2737,8 +2710,7 @@ describe('host-local appearance and version', () => {
 
   it('keeps the host-local rows live while the Runtime settings read is pending', async () => {
     const connection = settingsRawConnection();
-    let release: (value: unknown) => void = () => {};
-    const gate = new Promise((resolve) => { release = resolve; });
+    const { promise: gate, resolve: release } = Promise.withResolvers();
     let reads = 0;
     // The boot global read resolves; the editor's own exact read stays parked.
     vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
@@ -3279,8 +3251,7 @@ describe('provider discovery supersession and busy controls', () => {
 
   it('publishes only the newest model-discovery response for the same provider', async () => {
     const connection = editorConnection([providerFixture()]);
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.DiscoverProviderModelCandidates)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(ok([candidate('cand-new')]));
@@ -3303,10 +3274,8 @@ describe('provider discovery supersession and busy controls', () => {
 
   it('discards an earlier provider discovery success after the selection moves', async () => {
     const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
-    let releaseFirst: (value: unknown) => void = () => {};
-    let releaseSecond: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.DiscoverProviderModelCandidates)
       .mockImplementationOnce(() => first as never)
       .mockImplementationOnce(() => second as never);
@@ -3335,8 +3304,7 @@ describe('provider discovery supersession and busy controls', () => {
 
   it('discards an earlier provider discovery error after the selection moves', async () => {
     const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.DiscoverProviderModelCandidates).mockImplementationOnce(() => first as never);
     const { target } = await mountApp(connection);
     await openProviderEditor(target);
@@ -3354,8 +3322,7 @@ describe('provider discovery supersession and busy controls', () => {
 
   it('invalidates an earlier discovery request across an A-to-B-to-A selection move', async () => {
     const connection = editorConnection([providerFixture(), providerFixture({ id: 'prov2', name: 'Prov Two' })]);
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.DiscoverProviderModelCandidates)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(ok([candidate('cand-new')]));
@@ -3411,10 +3378,8 @@ describe('provider discovery supersession and busy controls', () => {
 
   it('keeps provider and model controls disabled through a parked mutation and its parked refresh', async () => {
     const connection = editorConnection([providerFixture()]);
-    let releaseWrite: (value: unknown) => void = () => {};
-    const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
-    let releaseRefresh: (value: unknown) => void = () => {};
-    const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+    const { promise: writeGate, resolve: releaseWrite } = Promise.withResolvers();
+    const { promise: refreshGate, resolve: releaseRefresh } = Promise.withResolvers();
     vi.mocked(sdk.UpdateProviderDetail).mockImplementationOnce(() => writeGate as never);
     vi.mocked(sdk.GetProviderDetail)
       .mockResolvedValueOnce(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }))
@@ -3448,10 +3413,8 @@ describe('provider discovery supersession and busy controls', () => {
   it('keeps the connect form disabled through its mutation and the provider-list refresh', async () => {
     const disconnected = providerFixture({ connected: false, key_source: 'external' });
     const connection = editorConnection([disconnected]);
-    let releaseConnect: (value: unknown) => void = () => {};
-    const connectGate = new Promise((resolve) => { releaseConnect = resolve; });
-    let releaseList: (value: unknown) => void = () => {};
-    const listGate = new Promise((resolve) => { releaseList = resolve; });
+    const { promise: connectGate, resolve: releaseConnect } = Promise.withResolvers();
+    const { promise: listGate, resolve: releaseList } = Promise.withResolvers();
     vi.mocked(sdk.ConnectProvider).mockImplementationOnce(() => connectGate as never);
     vi.mocked(sdk.ListProviders)
       .mockImplementationOnce(async () => ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, providers: [disconnected] }))
@@ -3483,8 +3446,7 @@ describe('provider discovery supersession and busy controls', () => {
   it('keeps the create form and candidate selection disabled while the create is parked', async () => {
     const connection = editorConnection([]);
     vi.mocked(sdk.DiscoverProviderCandidates).mockResolvedValue(ok([candidate('cand-1')]));
-    let releaseCreate: (value: unknown) => void = () => {};
-    const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+    const { promise: createGate, resolve: releaseCreate } = Promise.withResolvers();
     vi.mocked(sdk.CreateProvider).mockImplementationOnce(() => createGate as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -3514,10 +3476,8 @@ describe('provider discovery supersession and busy controls', () => {
   it('keeps the upsert form and candidate selection disabled while the upsert is parked', async () => {
     const connection = editorConnection([providerFixture()]);
     vi.mocked(sdk.DiscoverProviderModelCandidates).mockResolvedValue(ok([candidate('cand-9')]));
-    let releaseUpsert: (value: unknown) => void = () => {};
-    const upsertGate = new Promise((resolve) => { releaseUpsert = resolve; });
-    let releaseDetail: (value: unknown) => void = () => {};
-    const detailGate = new Promise((resolve) => { releaseDetail = resolve; });
+    const { promise: upsertGate, resolve: releaseUpsert } = Promise.withResolvers();
+    const { promise: detailGate, resolve: releaseDetail } = Promise.withResolvers();
     vi.mocked(sdk.UpdateProviderModel).mockImplementationOnce(() => upsertGate as never);
     vi.mocked(sdk.GetProviderDetail)
       .mockResolvedValueOnce(ok({ configuration_revision: { instance_id: INSTANCE, generation: '1' }, provider: providerFixture() }))
@@ -3570,8 +3530,7 @@ describe('file viewer', () => {
   it('ignores a superseded viewer reply and keeps the newest read', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.ReadWorkspaceFile)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(ok({ content: 'second body', canonical_path: '/ws/b.ts', truncated: false }));
@@ -3745,8 +3704,7 @@ describe('code snapshots', () => {
     vi.mocked(sdk.GetSessionCodeSnapshots).mockResolvedValue(ok([
       { operation_id: 'op1', group_item_id: 'group1', files: [{ path: 'a.ts', existed: true }] },
     ]));
-    let releaseRevert: (value: unknown) => void = () => {};
-    const revertGate = new Promise((_resolve, reject) => { releaseRevert = reject; });
+    const { promise: revertGate, reject: releaseRevert } = Promise.withResolvers();
     vi.mocked(sdk.RevertSessionCode).mockImplementationOnce(() => revertGate as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -3843,13 +3801,6 @@ describe('replacement Fork and ordered rewind', () => {
       ...overrides,
     })));
     return connection;
-  }
-
-  async function openOwnedFork(target: HTMLElement, rewind: boolean) {
-    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
-    await settle();
-    if (rewind) await toggleCheckbox(target, 'Rewind code before Fork', true);
-    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
   }
 
   it('exposes Fork only on root user-origin inputs, with rewind only for an owned input', async () => {
@@ -3990,8 +3941,7 @@ describe('replacement Fork and ordered rewind', () => {
 
   it('shows a known partial restore failure before still issuing Fork', async () => {
     const connection = forkConnection();
-    let releaseFork: (value: unknown) => void = () => {};
-    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    const { promise: forkGate, resolve: releaseFork } = Promise.withResolvers();
     vi.mocked(sdk.RevertSessionCode).mockResolvedValue(httpError(409, {
       restored: ['a.ts'],
       skipped: [{ path: 'b.ts', reason: 'io' }],
@@ -4035,8 +3985,7 @@ describe('replacement Fork and ordered rewind', () => {
 
   it('a late non-adopted destination still reports the earlier restore effects', async () => {
     const connection = forkConnection();
-    let releaseFork: (value: unknown) => void = () => {};
-    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    const { promise: forkGate, resolve: releaseFork } = Promise.withResolvers();
     vi.mocked(sdk.RevertSessionCode).mockResolvedValue(httpError(409, {
       restored: ['a.ts'],
       skipped: [],
@@ -4113,10 +4062,8 @@ describe('replacement Fork and ordered rewind', () => {
   it('a held Retry of an unknown Fork transitions to pending and permits no second retry while its response is held', async () => {
     const connection = forkConnection();
     vi.mocked(sdk.RevertSessionCode).mockResolvedValue(ok({ restored: [], skipped: [] }));
-    let releaseFork: (value: unknown) => void = () => {};
-    let releaseRetry: (value: unknown) => void = () => {};
-    const firstGate = new Promise((resolve) => { releaseFork = resolve; });
-    const retryGate = new Promise((resolve) => { releaseRetry = resolve; });
+    const { promise: firstGate, resolve: releaseFork } = Promise.withResolvers();
+    const { promise: retryGate, resolve: releaseRetry } = Promise.withResolvers();
     vi.mocked(sdk.ForkSession)
       .mockImplementationOnce(() => firstGate as never)
       .mockImplementationOnce(() => retryGate as never);
@@ -4160,10 +4107,8 @@ describe('replacement Fork and ordered rewind', () => {
 
   it('a held Retry of a rejected Fork transitions to pending and its release reports the final outcome beside the newer draft', async () => {
     const connection = forkConnection();
-    let releaseFork: (value: unknown) => void = () => {};
-    let releaseRetry: (value: unknown) => void = () => {};
-    const firstGate = new Promise((resolve) => { releaseFork = resolve; });
-    const retryGate = new Promise((resolve) => { releaseRetry = resolve; });
+    const { promise: firstGate, resolve: releaseFork } = Promise.withResolvers();
+    const { promise: retryGate, resolve: releaseRetry } = Promise.withResolvers();
     vi.mocked(sdk.ForkSession)
       .mockImplementationOnce(() => firstGate as never)
       .mockImplementationOnce(() => retryGate as never);
@@ -4202,8 +4147,7 @@ describe('replacement Fork and ordered rewind', () => {
 
   it('never adopts a late destination over a moved selection and keeps a newer replacement draft', async () => {
     const connection = forkConnection();
-    let releaseFork: (value: unknown) => void = () => {};
-    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    const { promise: forkGate, resolve: releaseFork } = Promise.withResolvers();
     vi.mocked(sdk.ForkSession).mockImplementationOnce(() => forkGate as never);
     const { target } = await mountApp(connection);
     await openOwnedFork(target, false);
@@ -4262,44 +4206,29 @@ describe('restore outcomes through the fork path', () => {
     return connection;
   }
 
-  async function submitRewindFork(target: HTMLElement) {
-    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
-    await settle();
-    await toggleCheckbox(target, 'Rewind code before Fork', true);
-    (target.querySelector('[aria-label="Submit fork"]') as HTMLElement).click();
-  }
-
   it('warns on a plain pre-traversal restore rejection and still issues Fork', async () => {
     const connection = forkConnection();
     vi.mocked(sdk.RevertSessionCode).mockResolvedValue(httpError(404, { code: 'not_found', message: 'no snapshot group' }));
     const { target } = await mountApp(connection);
-    await submitRewindFork(target);
+    await openOwnedFork(target, true);
     await settle();
     await settle();
     await settle();
     expect(vi.mocked(sdk.ForkSession)).toHaveBeenCalledTimes(1);
   });
 
-  it('treats a malformed 2xx restore body as outcome unknown and never sends Fork', async () => {
-    const connection = forkConnection();
-    vi.mocked(sdk.RevertSessionCode).mockResolvedValue(ok({}));
-    const { target } = await mountApp(connection);
-    await submitRewindFork(target);
-    await settle();
-    await settle();
-    expect(vi.mocked(sdk.ForkSession)).not.toHaveBeenCalled();
-    expect(target.textContent).toContain('Rewind outcome unknown');
-  });
-
-  it('treats a 2xx restore body carrying an error member as outcome unknown and never sends Fork', async () => {
-    const connection = forkConnection();
-    vi.mocked(sdk.RevertSessionCode).mockResolvedValue(ok({
+  it.each([
+    ['treats a malformed 2xx restore body as outcome unknown and never sends Fork', ok({})],
+    ['treats a 2xx restore body carrying an error member as outcome unknown and never sends Fork', ok({
       restored: ['a.ts'],
       skipped: [],
       error: { code: 'storage', message: 'partial failure' },
-    }));
+    })],
+  ])('%s', async (_title, restoreBody) => {
+    const connection = forkConnection();
+    vi.mocked(sdk.RevertSessionCode).mockResolvedValue(restoreBody);
     const { target } = await mountApp(connection);
-    await submitRewindFork(target);
+    await openOwnedFork(target, true);
     await settle();
     await settle();
     expect(vi.mocked(sdk.ForkSession)).not.toHaveBeenCalled();
@@ -4310,8 +4239,7 @@ describe('restore outcomes through the fork path', () => {
 describe('viewer supersession with an error', () => {
   it('ignores a superseded viewer error and keeps the newest read', async () => {    const connection = fakeConnection();
     basicMocks(connection);
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.ReadWorkspaceFile)
       .mockImplementationOnce(() => first as never)
       .mockResolvedValueOnce(ok({ content: 'fresh body', canonical_path: '/ws/b.ts', truncated: false }));
@@ -4344,8 +4272,7 @@ describe('editor read supersession', () => {
       configuration_revision: { instance_id: INSTANCE, generation: '1' },
       providers: [prov1, prov2],
     }));
-    let releaseFirst: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
     vi.mocked(sdk.GetProviderDetail).mockImplementation(async (params: string) => {
       const id = (JSON.parse(params) as { query: { provider_id: string } }).query.provider_id;
       if (id === 'prov1') return first as never;
@@ -4382,8 +4309,7 @@ describe('read lifetime boundaries', () => {
   it('releases its own viewer loading when a superseded read settles without a newer read', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseRead: (value: unknown) => void = () => {};
-    const read = new Promise((resolve) => { releaseRead = resolve; });
+    const { promise: read, resolve: releaseRead } = Promise.withResolvers();
     vi.mocked(sdk.ReadWorkspaceFile).mockImplementationOnce(() => read as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -4405,10 +4331,8 @@ describe('read lifetime boundaries', () => {
   it('lets no older same-stamp viewer reply publish over or clear a newer read', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseFirst: (value: unknown) => void = () => {};
-    let releaseSecond: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.ReadWorkspaceFile)
       .mockImplementationOnce(() => first as never)
       .mockImplementationOnce(() => second as never);
@@ -4439,8 +4363,7 @@ describe('read lifetime boundaries', () => {
   it('a superseded settings read publishes nothing and a reopen reads fresh', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseText: (value: unknown) => void = () => {};
-    const textRead = new Promise((resolve) => { releaseText = resolve; });
+    const { promise: textRead, resolve: releaseText } = Promise.withResolvers();
     let configCalls = 0;
     vi.mocked(sdk.GetConfiguration).mockImplementation(async () => {
       configCalls += 1;
@@ -4475,10 +4398,8 @@ describe('read lifetime boundaries', () => {
   it('a reopened model dialog discards an older same-stamp read and keeps the newer loading', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseFirst: (value: unknown) => void = () => {};
-    let releaseSecond: (value: unknown) => void = () => {};
-    const first = new Promise((resolve) => { releaseFirst = resolve; });
-    const second = new Promise((resolve) => { releaseSecond = resolve; });
+    const { promise: first, resolve: releaseFirst } = Promise.withResolvers();
+    const { promise: second, resolve: releaseSecond } = Promise.withResolvers();
     vi.mocked(sdk.ListModels)
       .mockImplementationOnce(() => first as never)
       .mockImplementationOnce(() => second as never);
@@ -4649,8 +4570,7 @@ describe('loaded snapshot identity', () => {
   it('invalidates a pending retained read when its draft target changes', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseRead: (value: unknown) => void = () => {};
-    const pending = new Promise((resolve) => { releaseRead = resolve; });
+    const { promise: pending, resolve: releaseRead } = Promise.withResolvers();
     vi.mocked(sdk.GetRetainedCodeSnapshots).mockImplementationOnce(() => pending as never);
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -4737,8 +4657,7 @@ describe('session mutation commits', () => {
   it('a stale archive completion cannot clear a newer selection', async () => {
     const connection = fakeConnection();
     basicMocks(connection);
-    let releaseArchive: (value: unknown) => void = () => {};
-    const pending = new Promise((resolve) => { releaseArchive = resolve; });
+    const { promise: pending, resolve: releaseArchive } = Promise.withResolvers();
     vi.mocked(sdk.ArchiveSession).mockImplementationOnce(() => pending as never);
     vi.mocked(sdk.DeleteSession).mockResolvedValue(noContent());
     const { target } = await mountApp(connection);
@@ -4906,8 +4825,7 @@ describe('selection-bound Fork source', () => {
       conversation: { items: [inputItem('i-owned', 'user', 'op-owned')] },
       operations: [runningOperation('op-owned')],
     })));
-    let releaseFork: (value: unknown) => void = () => {};
-    const forkGate = new Promise((resolve) => { releaseFork = resolve; });
+    const { promise: forkGate, resolve: releaseFork } = Promise.withResolvers();
     vi.mocked(sdk.ForkSession).mockImplementationOnce(() => forkGate as never);
     const { target } = await mountApp(connection);
     (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
@@ -5007,11 +4925,11 @@ describe('composition failure outcomes', () => {
       vi.mocked(sdk.ListWorkspaces).mockResolvedValue(ok([
         { root: '/wsB', display_name: 'B' },
       ]));
-      let releaseInitial: (value: unknown) => void = () => {};
-      let releasePicker: (reason?: unknown) => void = () => {};
+      const { promise: initialGate, resolve: releaseInitial } = Promise.withResolvers();
+      const { promise: pickerGate, reject: releasePicker } = Promise.withResolvers();
       vi.mocked(sdk.CreateSession)
-        .mockImplementationOnce(() => new Promise((resolve) => { releaseInitial = resolve; }) as never)
-        .mockImplementationOnce(() => new Promise((_resolve, reject) => { releasePicker = reject; }) as never)
+        .mockImplementationOnce(() => initialGate as never)
+        .mockImplementationOnce(() => pickerGate as never)
         .mockResolvedValue(ok(rootSession('b-1', NEWER)));
       vi.mocked(sdk.GetSessionHydration).mockImplementation(async (options) => {
         const id = (JSON.parse(options) as { session_id: string }).session_id;
