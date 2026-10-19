@@ -307,16 +307,13 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		t.Fatalf("empty-headers create: %v", err)
 	}
 	drainMutationEvent(t, sub, "3")
-	var rawProviders map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
-		t.Fatalf("decode providers: %v", err)
-	}
+	createdProvider := metadataRawProvider(t, h.configPath, "noheaders")
 	var createdTransport map[string]json.RawMessage
-	if err := json.Unmarshal(rawProviders["noheaders"]["transport"], &createdTransport); err != nil {
+	if err := json.Unmarshal(createdProvider["transport"], &createdTransport); err != nil {
 		t.Fatalf("decode created transport: %v", err)
 	}
 	if _, present := createdTransport["headers"]; present {
-		t.Fatalf("created transport = %s, want the empty provided headers member absent", rawProviders["noheaders"]["transport"])
+		t.Fatalf("created transport = %s, want the empty provided headers member absent", createdProvider["transport"])
 	}
 }
 
@@ -421,11 +418,7 @@ func TestMetadataEditCreateRegistersIncompleteMetadata(t *testing.T) {
 			var transport struct {
 				APIKeyEnv string `json:"api_key_env"`
 			}
-			var rawProviders map[string]map[string]json.RawMessage
-			if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
-				t.Fatalf("decode providers: %v", err)
-			}
-			if err := json.Unmarshal(rawProviders[row.id]["transport"], &transport); err != nil {
+			if err := json.Unmarshal(metadataRawProvider(t, h.configPath, row.id)["transport"], &transport); err != nil {
 				t.Fatalf("decode created transport: %v", err)
 			}
 			wantEnv := ""
@@ -524,17 +517,13 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 		t.Fatalf("empty headers patch: %v", err)
 	}
 	drainMutationEvent(t, sub, "4")
-	root := fileRoot(t, h.configPath)
+	rawProvider := metadataRawProvider(t, h.configPath, "prov")
 	var transport map[string]json.RawMessage
-	var rawProviders map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
-		t.Fatalf("decode providers: %v", err)
-	}
-	if err := json.Unmarshal(rawProviders["prov"]["transport"], &transport); err != nil {
+	if err := json.Unmarshal(rawProvider["transport"], &transport); err != nil {
 		t.Fatalf("decode transport: %v", err)
 	}
 	if _, present := transport["headers"]; present {
-		t.Fatalf("raw transport = %s, want the headers member deleted", rawProviders["prov"]["transport"])
+		t.Fatalf("raw transport = %s, want the headers member deleted", rawProvider["transport"])
 	}
 
 	// The wholesale header replacement: a provided map replaces the whole
@@ -544,11 +533,9 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 		t.Fatalf("wholesale headers patch: %v", err)
 	}
 	drainMutationEvent(t, sub, "5")
-	if err := json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders); err != nil {
-		t.Fatalf("decode providers: %v", err)
-	}
 	transport = nil
-	if err := json.Unmarshal(rawProviders["prov"]["transport"], &transport); err != nil {
+	rawProvider = metadataRawProvider(t, h.configPath, "prov")
+	if err := json.Unmarshal(rawProvider["transport"], &transport); err != nil {
 		t.Fatalf("decode transport: %v", err)
 	}
 	var headersMember map[string]string
@@ -915,17 +902,9 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 		}
 		generation++
 		drainMutationEvent(t, sub, strconv.Itoa(generation))
-		root := fileRoot(t, h.configPath)
-		var prov map[string]json.RawMessage
-		var providers map[string]json.RawMessage
-		if err := json.Unmarshal(root["providers"], &providers); err != nil {
-			t.Fatalf("decode providers: %v", err)
-		}
-		if err := json.Unmarshal(providers["prov"], &prov); err != nil {
-			t.Fatalf("decode prov: %v", err)
-		}
+		prov := metadataRawProvider(t, h.configPath, "prov")
 		if _, present := prov[string(field)]; present {
-			t.Fatalf("reset %q left the raw override: %s", field, providers["prov"])
+			t.Fatalf("reset %q left the raw override: %s", field, prov)
 		}
 	}
 
@@ -938,17 +917,13 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 		}
 		generation++
 		drainMutationEvent(t, sub, strconv.Itoa(generation))
-		root := fileRoot(t, h.configPath)
-		var rawProviders map[string]map[string]json.RawMessage
-		if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
-			t.Fatalf("decode providers: %v", err)
-		}
+		rawProvider := metadataRawProvider(t, h.configPath, "prov")
 		var transport map[string]json.RawMessage
-		if err := json.Unmarshal(rawProviders["prov"]["transport"], &transport); err != nil {
+		if err := json.Unmarshal(rawProvider["transport"], &transport); err != nil {
 			t.Fatalf("decode transport: %v", err)
 		}
 		if _, present := transport[string(field)]; present {
-			t.Fatalf("reset %q left the raw transport override: %s", field, rawProviders["prov"]["transport"])
+			t.Fatalf("reset %q left the raw transport override: %s", field, rawProvider["transport"])
 		}
 	}
 
@@ -1285,11 +1260,7 @@ func TestMetadataEditModelDelete(t *testing.T) {
 // owning file and publishes the next generation under the one shared
 // successful-edit rule.
 func TestMetadataEditResetModelFields(t *testing.T) {
-	h := newMetadataHarness(t)
-	unsetenv(t, "DISCO_TEST_KEY") // never ready: no network anywhere below
-	seedDiscoveredModel(t, h)
-	writeServiceFile(t, h.configPath, metadataConfigDocument)
-	svc, sub := metadataService(t, h)
+	h, svc, sub := newOverlayFixture(t)
 
 	// The user-model context_window reset lands: removing the sole window
 	// leaves a valid incomplete model that cannot make a new admission
@@ -1341,13 +1312,8 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 		}
 		generation++
 		drainMutationEvent(t, sub, strconv.Itoa(generation))
-		root := fileRoot(t, h.configPath)
-		var rawProviders map[string]map[string]json.RawMessage
-		if err := json.Unmarshal(root["providers"], &rawProviders); err != nil {
-			t.Fatalf("decode providers: %v", err)
-		}
 		var rawModels map[string]json.RawMessage
-		if err := json.Unmarshal(rawProviders["prov"]["models"], &rawModels); err != nil {
+		if err := json.Unmarshal(metadataRawProvider(t, h.configPath, "prov")["models"], &rawModels); err != nil {
 			t.Fatalf("decode models: %v", err)
 		}
 		var rawModel map[string]json.RawMessage
@@ -1434,11 +1400,7 @@ func seedDiscoveredModel(t *testing.T, h *serviceHarness) {
 // identity members are locked and which is not deletable, while its
 // correctable members land and its overrides reset to the discovered value.
 func TestMetadataEditDiscoveredModelSource(t *testing.T) {
-	h := newMetadataHarness(t)
-	unsetenv(t, "DISCO_TEST_KEY") // never ready: no network anywhere below
-	seedDiscoveredModel(t, h)
-	writeServiceFile(t, h.configPath, metadataConfigDocument)
-	svc, sub := metadataService(t, h)
+	_, svc, sub := newOverlayFixture(t)
 
 	entry := svc.current().catalog.Providers["disco"].Models["disc-model"]
 	if entry == nil || entry.Source != catalog.SourceDiscovered {
@@ -1885,11 +1847,7 @@ func metadataRawModel(t *testing.T, configPath, providerID, modelID string) map[
 // stays invalid. The connected keyless provider's model leaves and rejoins
 // the visible picker while staying in the full list.
 func TestMetadataEditHiddenVisibility(t *testing.T) {
-	h := newMetadataHarness(t)
-	unsetenv(t, "DISCO_TEST_KEY") // never ready: no network anywhere below
-	seedDiscoveredModel(t, h)
-	writeServiceFile(t, h.configPath, metadataConfigDocument)
-	svc, sub := metadataService(t, h)
+	h, svc, sub := newOverlayFixture(t)
 
 	// Provider custom + builtin, TRUE and FALSE: every completed synchronous
 	// mutation publishes exactly its own generation's event and nothing is
@@ -2247,10 +2205,10 @@ func TestRuntimeMetadataCorruptRawTypesTypedFailure(t *testing.T) {
 
 // --- supplied field values: exact truth and file/API equality ---
 
-// newOverlayFixture seeds one identically configured service over the
-// metadata fixture and its discovered record, so one instance can receive
-// an overlay through the edit API and the other through a hand-edited file
-// plus reload over the same input.
+// newOverlayFixture seeds the metadata fixture with its discovered record and
+// publishes one identically configured service: the metadata document, the
+// bundled disco record, and the subscribed service with its attached warning
+// store.
 func newOverlayFixture(t *testing.T) (*serviceHarness, *configurationService, *Subscription) {
 	t.Helper()
 	h := newMetadataHarness(t)

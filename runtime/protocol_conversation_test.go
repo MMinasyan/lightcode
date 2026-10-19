@@ -718,25 +718,6 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 	})
 }
 
-// awaitArrival waits for the scripted model function's attempt counter to
-// reach want: the barrier proving every earlier effect committed.
-func awaitArrival(t *testing.T, arrivals <-chan int, want int, name string) {
-	t.Helper()
-	deadline := time.After(10 * time.Second)
-	last := 0
-	for {
-		select {
-		case attempt := <-arrivals:
-			last = attempt
-			if attempt >= want {
-				return
-			}
-		case <-deadline:
-			t.Fatalf("%s never arrived (last attempt %d)", name, last)
-		}
-	}
-}
-
 // projectSessionItems reads one Session through the Runtime and projects its
 // complete conversation.
 func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.ConversationItem {
@@ -859,6 +840,47 @@ func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 	})
 }
 
+// twoReadCallTurnEvents returns the two-call assistant turn shared by the
+// interrupted projection and the paging attachment rows: one assistant turn
+// publishing read calls call-1 and call-2 indivisibly.
+func twoReadCallTurnEvents() []string {
+	return []string{
+		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+	}
+}
+
+// parkedReadCallPrepare builds the prepared-tool callback shared by the
+// interrupted projection and the paging attachment rows: the started call-1
+// parks its execution until the release channel or the run's cancellation
+// releases it — the returned real outcome wins the cancellation race — while
+// every other call settles immediately.
+func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struct{}) func(context.Context, model.ToolCall) harness.PreparedTool {
+	return func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+		if call.ID != "call-1" {
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+			}
+		}
+		return harness.PreparedTool{
+			Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+			Execute: func(execCtx context.Context) harness.ToolOutcome {
+				select {
+				case toolStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseTool: // never released on the main path
+				case <-execCtx.Done(): // the interrupt releases the started call
+				}
+				// A returned real outcome wins the cancellation race.
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+			},
+		}
+	}
+}
+
 // TestConversationProjectionSyntheticInterruptedResult proves, over real
 // facts, the interrupted synthetic terminal result: an unstarted published
 // call's reserved identity receives the fixed interrupted outcome — present
@@ -879,37 +901,12 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 			if lastMessageRole(body) == "tool" {
 				return textTurnEvents("never reached")
 			}
-			return []string{
-				`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
-				`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-			}
+			return twoReadCallTurnEvents()
 		})
 		// The started call parks its execution until the run's cancellation
 		// releases it and returns its real outcome; the unstarted call never
 		// begins.
-		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			if call.ID != "call-1" {
-				return harness.PreparedTool{
-					Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
-				}
-			}
-			return harness.PreparedTool{
-				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Execute: func(execCtx context.Context) harness.ToolOutcome {
-					select {
-					case toolStarted <- struct{}{}:
-					default:
-					}
-					select {
-					case <-releaseTool: // never released on the main path
-					case <-execCtx.Done(): // the interrupt releases the started call
-					}
-					// A returned real outcome wins the cancellation race.
-					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
-				},
-			}
-		})
+		bg.tools.setPrepare(parkedReadCallPrepare(releaseTool, toolStarted))
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		select {
 		case <-toolStarted:

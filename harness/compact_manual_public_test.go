@@ -48,14 +48,7 @@ func newCompactManualFixture(t *testing.T, store harness.Storage, conversation, 
 	f.defaultPrep = harness.PreparedExecution{
 		Capture: compactManualCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         conversation.effect,
-				CompactModel:  compact.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(conversation.effect, compact.effect), nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())

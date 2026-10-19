@@ -396,11 +396,6 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 	admission := wireObject(t, raw)["admission"]
 	mutatedAdmission := setKey(admission, "admitted_entry", json.RawMessage(`{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"}`))
 	mutated := setKey(raw, "admission", mutatedAdmission)
-	if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: mutated}); err == nil {
-		t.Fatalf("compact payload with an admitted entry decoded")
-	} else if !strings.Contains(err.Error(), "admitted_entry") {
-		t.Fatalf("error %v, want the admitted_entry member named", err)
-	}
 
 	// A message payload without the member rejects.
 	messageRaw, err := encodeOperationRegister(validOperationRecord())
@@ -408,9 +403,6 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 		t.Fatalf("encode message register: %v", err)
 	}
 	messageless := setKey(messageRaw, "admission", deleteKey(t, wireObject(t, messageRaw)["admission"], "admitted_entry"))
-	if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: messageless}); err == nil {
-		t.Fatalf("message payload without its admitted entry decoded")
-	}
 
 	// An unknown kind rejects on both directions.
 	unknown := compactOperationRecord(testOpID)
@@ -419,8 +411,28 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 		t.Fatalf("unknown request kind encoded")
 	}
 	unknownWire := setKey(raw, "admission", setKey(admission, "request_kind", json.RawMessage(`"bogus"`)))
-	if _, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: unknownWire}); err == nil {
-		t.Fatalf("unknown request kind decoded")
+
+	// The raw payloads above bypass the production encoder: each names one
+	// invalid persisted state the decoder must refuse.
+	rejections := []struct {
+		name     string
+		payload  json.RawMessage
+		wantText string
+	}{
+		{"compact payload carrying the admitted entry", mutated, "admitted_entry"},
+		{"message payload without the admitted entry", messageless, ""},
+		{"unknown request kind", unknownWire, ""},
+	}
+	for _, tc := range rejections {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: tc.payload})
+			if err == nil {
+				t.Fatalf("%s decoded", tc.name)
+			}
+			if tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("error %v, want the %s member named", err, tc.wantText)
+			}
+		})
 	}
 }
 

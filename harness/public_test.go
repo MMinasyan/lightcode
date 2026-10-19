@@ -65,6 +65,20 @@ func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
 	return json.Marshal(obj)
 }
 
+// publicExecution is the suite's ordinary opened execution: the two actual
+// model callbacks, the suite's required normalizer, and the immediate
+// "no tools" result plan.
+func publicExecution(conversation, compact func(context.Context, model.Request) (model.Stream, error)) harness.Execution {
+	return harness.Execution{
+		Model:         conversation,
+		CompactModel:  compact,
+		NormalizeTool: publicNormalize,
+		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+		},
+	}
+}
+
 // publicPermission is one built-in-allowed declaration for the suite's
 // effect-producing fixture plans: command.run allows any target.
 var publicPermission = []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}}
@@ -262,14 +276,7 @@ func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harne
 	prepared := harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         modelFn,
-				CompactModel:  modelFn,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(modelFn, modelFn), nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -622,14 +629,7 @@ func scriptPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return harness.Execution{
-				Model:         script.effect,
-				CompactModel:  script.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(script.effect, script.effect), nil
 		},
 	}
 }
@@ -5085,14 +5085,7 @@ func racePrepared(f *publicFixture) harness.PreparedExecution {
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			f.opens.Add(1)
-			return harness.Execution{
-				Model:         f.model.effect,
-				CompactModel:  f.model.effect,
-				NormalizeTool: publicNormalize,
-				Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-					return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-				},
-			}, nil
+			return publicExecution(f.model.effect, f.model.effect), nil
 		},
 	}
 }
@@ -5368,17 +5361,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 func TestPublicForkArchivedSource(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f2.close()
@@ -5502,17 +5485,7 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 func TestPublicForkExistingLookup(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		forkReq := harness.ForkRequest{
 			SourceSessionID: source,
@@ -5699,17 +5672,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 func TestPublicForkFirstWriterRace(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 
 		t.Run("matching first destination is returned", func(t *testing.T) {
@@ -5792,17 +5755,7 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 func TestPublicForkSourceRevisionRace(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		before := snapshotSession(t, store, source)
 
@@ -5865,17 +5818,7 @@ func mustForeignPayload(t *testing.T, snap sessionSnapshot) json.RawMessage {
 func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
@@ -5945,17 +5888,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		before := snapshotSession(t, store, source)
 

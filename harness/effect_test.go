@@ -25,16 +25,18 @@ func executeDirect(h *Harness, c *coordinator, execCtx context.Context, operatio
 	return h.finishExecution(c, run, operationID, res, err, closeExecution)
 }
 
-// newEffectHarness admits one running Operation ("op-1") with the given
-// prepared physical model request function and returns the pieces the effect
-// fixtures need.
-func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request) (model.Stream, error)) (*Harness, *graphStorage, *coordinator, string) {
+// newAdmittedHarness admits one running Operation ("op-1") over a fresh empty
+// store under the given Harness context and prepared execution: the shared
+// admission construction of the effect and opener fixtures.
+func newAdmittedHarness(t *testing.T, hctx context.Context, prepared PreparedExecution) (*Harness, *graphStorage, *coordinator, string) {
 	t.Helper()
 	store := emptyStore(t)
-	prepared := modelPrepared(modelFn)
-	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
+	h, err := New(hctx, Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
-	})
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
@@ -44,6 +46,14 @@ func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request)
 	}
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID
+}
+
+// newEffectHarness admits one running Operation ("op-1") with the given
+// prepared physical model request function and returns the pieces the effect
+// fixtures need.
+func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request) (model.Stream, error)) (*Harness, *graphStorage, *coordinator, string) {
+	t.Helper()
+	return newAdmittedHarness(t, context.Background(), modelPrepared(modelFn))
 }
 
 // invokeModelEffect drives one model effect with a validated request; a nil
@@ -1004,24 +1014,10 @@ func (s *toolSpy) dispatched() []string {
 // pieces the execution fixtures need.
 func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmission) (Execution, error)) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
 	t.Helper()
-	store := emptyStore(t)
 	prepared := PreparedExecution{Capture: testCapture(), Open: open}
 	hctx, cancel := context.WithCancel(context.Background())
-	h, err := New(hctx, Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) {
-		return prepared, nil
-	}})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
-		t.Fatalf("disposition %q, want admitted", disposition)
-	}
-	c := leaseCoordinator(t, h, session.Identity.SessionID)
-	return h, store, c, session.Identity.SessionID, prepared, cancel
+	h, store, c, sessionID := newAdmittedHarness(t, hctx, prepared)
+	return h, store, c, sessionID, prepared, cancel
 }
 
 // newExecutionHarness admits one running Operation ("op-1") under a cancelable
