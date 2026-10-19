@@ -426,6 +426,24 @@ func wantCorruption(t *testing.T, err error) *CorruptionError {
 // coherent durable shapes and returns the owned decoded view: the Session
 // record, Operation records in read order, and committed-order typed entries.
 func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
+	// singleCallGraph builds the coherent fixture whose one published
+	// assistant call stays pending with the supplied reserved result entry ID.
+	singleCallGraph := func(resultEntryID string) *testGraph {
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		call := validToolCallRecord()
+		call.ResultEntryID = resultEntryID
+		assistant.ToolCalls = []toolCallRecord{call}
+		fixture.entries[1].assistant = &assistant
+		fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+			CallID:         "call-1",
+			ResultEntryID:  resultEntryID,
+		}}
+		return fixture
+	}
+
 	t.Run("running session", func(t *testing.T) {
 		fixture := validTestGraph()
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
@@ -464,19 +482,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 	})
 
 	t.Run("pending tool call", func(t *testing.T) {
-		fixture := validTestGraph()
-		assistant := validAssistantEntry(testOpID)
-		assistant.EntryID = hexID(2)
-		call := validToolCallRecord()
-		call.ResultEntryID = hexID(3)
-		assistant.ToolCalls = []toolCallRecord{call}
-		fixture.entries[1].assistant = &assistant
-		op := &fixture.ops[0]
-		op.State.PendingToolCalls = []PendingToolCall{{
-			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
-			CallID:         "call-1",
-			ResultEntryID:  hexID(3),
-		}}
+		fixture := singleCallGraph(hexID(3))
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		if err != nil {
 			t.Fatalf("valid pending shape rejected: %v", err)
@@ -565,19 +571,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 	})
 
 	t.Run("settled hook results", func(t *testing.T) {
-		fixture := validTestGraph()
-		assistant := validAssistantEntry(testOpID)
-		assistant.EntryID = hexID(2)
-		call := validToolCallRecord()
-		call.ResultEntryID = hexID(4)
-		assistant.ToolCalls = []toolCallRecord{call}
-		fixture.entries[1].assistant = &assistant
-		op := &fixture.ops[0]
-		op.State.PendingToolCalls = []PendingToolCall{{
-			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
-			CallID:         "call-1",
-			ResultEntryID:  hexID(4),
-		}}
+		fixture := singleCallGraph(hexID(4))
 		first := hookResultEntry{
 			SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID,
 			HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded,
@@ -602,20 +596,8 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 	})
 
 	t.Run("running hook effect", func(t *testing.T) {
-		fixture := validTestGraph()
-		assistant := validAssistantEntry(testOpID)
-		assistant.EntryID = hexID(2)
-		call := validToolCallRecord()
-		call.ResultEntryID = hexID(3)
-		assistant.ToolCalls = []toolCallRecord{call}
-		fixture.entries[1].assistant = &assistant
-		op := &fixture.ops[0]
-		op.State.PendingToolCalls = []PendingToolCall{{
-			AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
-			CallID:         "call-1",
-			ResultEntryID:  hexID(3),
-		}}
-		op.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		fixture := singleCallGraph(hexID(3))
+		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		if err != nil {
 			t.Fatalf("valid hook-effect shape rejected: %v", err)
@@ -1449,9 +1431,6 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture := validTestGraph()
 			tc.mutate(t, fixture)
 			store := fixture.storage(t)
-			if tc.name == "orphan entries without session register" {
-				delete(store.registers, testSessionID)
-			}
 			corrupt := wantCorruption(t, func() error {
 				_, err := validateFixture(t, store, testSessionID)
 				return err
@@ -1614,10 +1593,8 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			env:        Entry{SessionID: testSessionID, ID: hexID(4), Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime},
 			toolResult: &copiedResult,
 		})
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fork.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fork.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("copied tool result pointing at an owned assistant", func(t *testing.T) {
@@ -1633,10 +1610,8 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			env:        Entry{SessionID: testSessionID, ID: hexID(4), Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime},
 			toolResult: &copiedResult,
 		})
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fork.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fork.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("owned signal resolves its related operation", func(t *testing.T) {
@@ -1661,10 +1636,8 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			env:    Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntrySignal, Sequence: 3, CommittedAt: testTime},
 			signal: &owned,
 		})
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 }
 
@@ -1715,10 +1688,8 @@ func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
 		fixture.entries = []testEntry{
 			{env: Entry{SessionID: testSessionID, ID: hexID(9), Kind: EntrySignal, Sequence: 1, CommittedAt: testTime}, signal: &copied},
 		}
-		corrupt := wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		corrupt := wantCorruption(t, err)
 		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
 			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
 		}
@@ -1784,10 +1755,8 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	t.Run("dangling projection reference corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.session.State.CompactionEntryID = otherEntry()
-		corrupt := wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		corrupt := wantCorruption(t, err)
 		if !strings.Contains(corrupt.Detail, "compaction") {
 			t.Fatalf("corruption detail = %q, want the compaction rule", corrupt.Detail)
 		}
@@ -1796,28 +1765,22 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	t.Run("projection naming a non-compaction entry corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.session.State.CompactionEntryID = hexID(2)
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("boundary naming no in-session entry corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.entries = append(fixture.entries, compactionAt(hexID(3), otherEntry(), testOpID, 3))
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("boundary at the compaction sequence corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.entries = append(fixture.entries, compactionAt(hexID(3), hexID(3), testOpID, 3))
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("boundary after the compaction sequence corrupts", func(t *testing.T) {
@@ -1828,10 +1791,8 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			compactionAt(hexID(3), hexID(4), testOpID, 3),
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntrySignal, Sequence: 4, CommittedAt: testTime}, signal: &signal},
 		)
-		wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		wantCorruption(t, err)
 	})
 
 	t.Run("two compaction entries of one operation validate", func(t *testing.T) {
@@ -1903,10 +1864,8 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	t.Run("root session rejects an operationless compaction entry", func(t *testing.T) {
 		fixture := &testGraph{session: validSessionRecord()}
 		fixture.entries = []testEntry{compactionAt(hexID(3), hexID(2), "", 1)}
-		corrupt := wantCorruption(t, func() error {
-			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		corrupt := wantCorruption(t, err)
 		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
 			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
 		}
@@ -1919,53 +1878,62 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 func TestGraphValidatorCompactionUsage(t *testing.T) {
 	otherRef := model.ModelRef{Provider: "other", Model: "m2"}
 
-	t.Run("compaction usage joins the totals", func(t *testing.T) {
-		assistantUsage := UsageCount{InputTokens: 1, CachedInputTokens: 2, OutputTokens: 3}
-		compactionUsage := UsageCount{InputTokens: 4, CachedInputTokens: 5, OutputTokens: 6}
-		fixture := validTestGraph()
-		assistant := validAssistantEntry(testOpID)
-		assistant.EntryID = hexID(2)
-		assistant.Usage = &assistantUsage
-		fixture.entries[1].assistant = &assistant
-		compaction := validCompactionEntry(testOpID)
-		compaction.EntryID = hexID(3)
-		compaction.BoundaryEntryID = hexID(2)
-		compaction.Model = otherRef
-		compaction.Usage = &compactionUsage
-		fixture.entries = append(fixture.entries, testEntry{
-			env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
-			compaction: &compaction,
-		})
-		merged, err := addUsageTotals(
-			UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: assistantUsage}}},
-			UsageTotals{ByModel: []ModelUsage{{Model: otherRef, Usage: compactionUsage}}},
-		)
-		if err != nil {
-			t.Fatalf("merge: %v", err)
-		}
-		fixture.ops[0].State.Usage = merged
-		fixture.session.State.Usage = merged
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("valid compaction usage rejected: %v", err)
-		}
-	})
-
-	t.Run("compaction usage missing from the totals corrupts", func(t *testing.T) {
-		fixture := validTestGraph()
-		compaction := validCompactionEntry(testOpID)
-		compaction.EntryID = hexID(3)
-		compaction.BoundaryEntryID = hexID(2)
-		compaction.Model = otherRef
-		compaction.Usage = testUsage(5)
-		fixture.entries = append(fixture.entries, testEntry{
-			env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
-			compaction: &compaction,
-		})
-		wantCorruption(t, func() error {
+	cases := []struct {
+		name    string
+		mutate  func(t *testing.T, fixture *testGraph, compaction *compactionEntry)
+		corrupt bool
+	}{
+		{
+			name: "compaction usage joins the totals",
+			mutate: func(t *testing.T, fixture *testGraph, compaction *compactionEntry) {
+				assistantUsage := UsageCount{InputTokens: 1, CachedInputTokens: 2, OutputTokens: 3}
+				compactionUsage := UsageCount{InputTokens: 4, CachedInputTokens: 5, OutputTokens: 6}
+				assistant := validAssistantEntry(testOpID)
+				assistant.EntryID = hexID(2)
+				assistant.Usage = &assistantUsage
+				fixture.entries[1].assistant = &assistant
+				compaction.Usage = &compactionUsage
+				merged, err := addUsageTotals(
+					UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: assistantUsage}}},
+					UsageTotals{ByModel: []ModelUsage{{Model: otherRef, Usage: compactionUsage}}},
+				)
+				if err != nil {
+					t.Fatalf("merge: %v", err)
+				}
+				fixture.ops[0].State.Usage = merged
+				fixture.session.State.Usage = merged
+			},
+		},
+		{
+			name: "compaction usage missing from the totals corrupts",
+			mutate: func(t *testing.T, fixture *testGraph, compaction *compactionEntry) {
+				compaction.Usage = testUsage(5)
+			},
+			corrupt: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := validTestGraph()
+			compaction := validCompactionEntry(testOpID)
+			compaction.EntryID = hexID(3)
+			compaction.BoundaryEntryID = hexID(2)
+			compaction.Model = otherRef
+			tc.mutate(t, fixture, &compaction)
+			fixture.entries = append(fixture.entries, testEntry{
+				env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
+				compaction: &compaction,
+			})
 			_, err := validateFixture(t, fixture.storage(t), testSessionID)
-			return err
-		}())
-	})
+			if tc.corrupt {
+				wantCorruption(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid compaction usage rejected: %v", err)
+			}
+		})
+	}
 }
 
 // TestForkCopyCompactionEntries proves the fork copy of compaction entries:

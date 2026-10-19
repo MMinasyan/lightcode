@@ -5368,17 +5368,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 func TestPublicForkArchivedSource(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f2.close()
@@ -5502,17 +5492,7 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 func TestPublicForkExistingLookup(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		forkReq := harness.ForkRequest{
 			SourceSessionID: source,
@@ -5699,17 +5679,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 func TestPublicForkFirstWriterRace(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 
 		t.Run("matching first destination is returned", func(t *testing.T) {
@@ -5792,17 +5762,7 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 func TestPublicForkSourceRevisionRace(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		before := snapshotSession(t, store, source)
 
@@ -5865,17 +5825,7 @@ func mustForeignPayload(t *testing.T, snap sessionSnapshot) json.RawMessage {
 func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
@@ -5945,17 +5895,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
-		script := newScriptModel()
-		f := newPublicFixture(t, store, script, nil)
-		defer f.close()
-		source := createSession(t, f.h)
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
-		}
-		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		before := snapshotSession(t, store, source)
 
