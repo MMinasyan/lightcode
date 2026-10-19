@@ -148,31 +148,7 @@ func TestStartServerAfterClosedRejectsBeforeStart(t *testing.T) {
 	// rejected before instance.start: permanent close refuses before OS start,
 	// so no process is ever launched after close. The old launched-then-killed
 	// path is gone.
-	home := t.TempDir()
-	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	real := filepath.Join(cacheDir, "fake-lsp.py")
-	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A wrapper records the launched process's pid before exec'ing the real
-	// script, so the test can assert no process was ever launched.
-	wrapper := filepath.Join(cacheDir, "fake-lsp")
-	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
-	t.Setenv("FAKE_PIDFILE", pidfile)
-
-	log := filepath.Join(t.TempDir(), "launches.log")
-	def := &server.Definition{
-		Name:    "fake",
-		Command: "fake-lsp",
-		Args:    []string{log, "", "0", "0", "", "1"},
-	}
+	home, pidfile, _, def := newPIDRecordingFakeServer(t, "0")
 
 	m := NewManager(t.TempDir(), home)
 	m.mu.Lock()
@@ -255,31 +231,7 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 // stateFailed. Removing the provisional map insertion makes close miss the
 // instance and the released start launch it — the regression this test pins.
 func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing.T) {
-	home := t.TempDir()
-	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	real := filepath.Join(cacheDir, "fake-lsp.py")
-	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The wrapper records the launched process's pid before exec'ing the real
-	// script, so the test can assert no process was ever launched.
-	wrapper := filepath.Join(cacheDir, "fake-lsp")
-	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
-	t.Setenv("FAKE_PIDFILE", pidfile)
-
-	log := filepath.Join(t.TempDir(), "launches.log")
-	def := &server.Definition{
-		Name:    "fake",
-		Command: "fake-lsp",
-		Args:    []string{log, "", "0", "0", "", "1"},
-	}
+	home, pidfile, log, def := newPIDRecordingFakeServer(t, "0")
 
 	m := NewManager(t.TempDir(), home)
 	t.Cleanup(func() { m.ShutdownAll() })
@@ -350,33 +302,11 @@ func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing
 // On the old branch the instance was mapped only after start completed, so
 // ShutdownAll's snapshot missed it and the process survived the call.
 func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
-	home := t.TempDir()
 	requestsLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", requestsLog)
-	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	real := filepath.Join(cacheDir, "fake-lsp.py")
-	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	wrapper := filepath.Join(cacheDir, "fake-lsp")
-	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
-	t.Setenv("FAKE_PIDFILE", pidfile)
-
 	// init_delay holds the start in the initialize call after the process has
 	// launched and the instance has been provisionally mapped.
-	log := filepath.Join(t.TempDir(), "launches.log")
-	def := &server.Definition{
-		Name:    "fake",
-		Command: "fake-lsp",
-		Args:    []string{log, "", "2", "0", "", "1"},
-	}
+	home, pidfile, _, def := newPIDRecordingFakeServer(t, "2")
 
 	m := NewManager(t.TempDir(), home)
 	started := make(chan struct{})

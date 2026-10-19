@@ -147,6 +147,37 @@ func newFakeServerInstanceWithLifetime(t *testing.T, log, failMarker string, ini
 	return inst
 }
 
+// newPIDRecordingFakeServer builds the fake server behind a shell wrapper
+// that records the launched process's pid before exec'ing the real script, so
+// a test can observe whether a process was launched and whether it was
+// reaped. The pidfile and the launch log use separate temporary directories.
+func newPIDRecordingFakeServer(t *testing.T, initDelay string) (home, pidfile, log string, def *server.Definition) {
+	t.Helper()
+	home = t.TempDir()
+	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(cacheDir, "fake-lsp.py")
+	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(cacheDir, "fake-lsp")
+	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidfile = filepath.Join(t.TempDir(), "lsp.pid")
+	t.Setenv("FAKE_PIDFILE", pidfile)
+	log = filepath.Join(t.TempDir(), "launches.log")
+	def = &server.Definition{
+		Name:    "fake",
+		Command: "fake-lsp",
+		Args:    []string{log, "", initDelay, "0", "", "1"},
+	}
+	return home, pidfile, log, def
+}
+
 func countLaunches(log string) int {
 	b, err := os.ReadFile(log)
 	if err != nil {
@@ -435,31 +466,8 @@ func TestStartRefusedWhileReady(t *testing.T) {
 // between cmd.Start and the post-launch attempt-identity recheck, and the
 // waitCommand seam counts exactly one wait on this side of the handoff.
 func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
-	home := t.TempDir()
-	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	real := filepath.Join(cacheDir, "fake-lsp.py")
-	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The wrapper records the launched process's pid before exec'ing the real
-	// script, so the test can assert the close loser was actually reaped.
-	wrapper := filepath.Join(cacheDir, "fake-lsp")
-	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	pidfile := filepath.Join(t.TempDir(), "lsp.pid")
-	t.Setenv("FAKE_PIDFILE", pidfile)
-
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newInstance(&server.Definition{
-		Name:    "fake",
-		Command: "fake-lsp",
-		Args:    []string{log, "", "0", "0", "", "1"},
-	}, t.TempDir(), home, context.Background(), nil)
+	home, pidfile, log, def := newPIDRecordingFakeServer(t, "0")
+	inst := newInstance(def, t.TempDir(), home, context.Background(), nil)
 	t.Cleanup(func() { inst.shutdown() })
 
 	// Count every instance-owned process wait through the seam.

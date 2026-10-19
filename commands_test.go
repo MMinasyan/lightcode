@@ -209,9 +209,7 @@ func TestDispatchUnexpectedPositionals(t *testing.T) {
 }
 
 func TestDispatchVersion(t *testing.T) {
-	oldV, oldC := version.Version, version.Commit
-	version.Version, version.Commit = "v9.9.9", "abcdef1"
-	defer func() { version.Version, version.Commit = oldV, oldC }()
+	setVersion(t, "v9.9.9", "abcdef1")
 
 	for _, argv := range [][]string{
 		{"lightcode", "version"},
@@ -233,9 +231,7 @@ func TestDispatchVersion(t *testing.T) {
 }
 
 func TestDispatchVersionJSON(t *testing.T) {
-	oldV, oldC := version.Version, version.Commit
-	version.Version, version.Commit = "v9.9.9", "abcdef1"
-	defer func() { version.Version, version.Commit = oldV, oldC }()
+	setVersion(t, "v9.9.9", "abcdef1")
 
 	_, code, stdout, stderr := capture(t, []string{"lightcode", "version", "--json"})
 	if code != 0 || stderr != "" {
