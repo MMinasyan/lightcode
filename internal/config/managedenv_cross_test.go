@@ -16,7 +16,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	newMgr := func() *ManagedEnv {
-		return &ManagedEnv{path: envPath, managed: map[string]struct{}{}}
+		return NewManagedEnvForTest(envPath)
 	}
 
 	keys := []string{"LIGHTCODE_TEST_A", "LIGHTCODE_TEST_B", "LIGHTCODE_TEST_C"}

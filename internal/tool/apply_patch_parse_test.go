@@ -263,78 +263,73 @@ func TestParsePatchPreservesCRInUpdateHunk(t *testing.T) {
 	}
 }
 
-func TestParsePatchDuplicatePath(t *testing.T) {
-	input := "*** Begin Patch\n*** Add File: a\n+x\n*** Add File: a\n+y\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchDupPath) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchDupPath)
+func TestParsePatchRefusals(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		sentinel error
+		contains string
+	}{
+		{
+			name:     "TestParsePatchDuplicatePath",
+			input:    "*** Begin Patch\n*** Add File: a\n+x\n*** Add File: a\n+y\n*** End Patch",
+			sentinel: errApplyPatchDupPath,
+			contains: "a",
+		},
+		{
+			name:     "TestParsePatchMoveDestDuplicatesExistingPath",
+			input:    "*** Begin Patch\n*** Add File: b\n+z\n*** Update File: a\n*** Move to: b\n@@\n-x\n+y\n*** End Patch",
+			sentinel: errApplyPatchDupPath,
+		},
+		{
+			name:     "TestParsePatchAddFileBadBodyLine",
+			input:    "*** Begin Patch\n*** Add File: a\nbad\n*** End Patch",
+			sentinel: errApplyPatchAddBody,
+		},
+		{
+			name:     "TestParsePatchAddFileEmptyBody",
+			input:    "*** Begin Patch\n*** Add File: a\n*** End Patch",
+			contains: "no content",
+		},
+		{
+			name:     "TestParsePatchUpdateNoHunks",
+			input:    "*** Begin Patch\n*** Update File: a\n*** End Patch",
+			contains: "no hunks",
+		},
+		{
+			name:     "TestParsePatchHunkBadLine",
+			input:    "*** Begin Patch\n*** Update File: a\n@@\nctx\nbad\n*** End Patch",
+			sentinel: errApplyPatchHunkLine,
+		},
+		{
+			name:     "TestParsePatchHunkEmptyLine",
+			input:    "*** Begin Patch\n*** Update File: a\n@@\nctx\n\nmore\n*** End Patch",
+			sentinel: errApplyPatchHunkLine,
+		},
+		{
+			name:     "TestParsePatchMissingHeaderBeforeHunk",
+			input:    "*** Begin Patch\n@@\nctx\n*** End Patch",
+			sentinel: errApplyPatchHunkExpected,
+		},
+		{
+			name:     "TestParsePatchUnknownHeader",
+			input:    "*** Begin Patch\n*** Rename File: a\n*** End Patch",
+			sentinel: errApplyPatchUnknownHead,
+		},
 	}
-	if !strings.Contains(err.Error(), "a") {
-		t.Fatalf("err = %q, want it to mention the duplicated path", err)
-	}
-}
-
-func TestParsePatchMoveDestDuplicatesExistingPath(t *testing.T) {
-	input := "*** Begin Patch\n*** Add File: b\n+z\n*** Update File: a\n*** Move to: b\n@@\n-x\n+y\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchDupPath) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchDupPath)
-	}
-}
-
-func TestParsePatchAddFileBadBodyLine(t *testing.T) {
-	input := "*** Begin Patch\n*** Add File: a\nbad\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchAddBody) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchAddBody)
-	}
-}
-
-func TestParsePatchAddFileEmptyBody(t *testing.T) {
-	input := "*** Begin Patch\n*** Add File: a\n*** End Patch"
-	_, err := parsePatch(input)
-	if err == nil || !strings.Contains(err.Error(), "no content") {
-		t.Fatalf("parsePatch err = %v, want a no-content error", err)
-	}
-}
-
-func TestParsePatchUpdateNoHunks(t *testing.T) {
-	input := "*** Begin Patch\n*** Update File: a\n*** End Patch"
-	_, err := parsePatch(input)
-	if err == nil || !strings.Contains(err.Error(), "no hunks") {
-		t.Fatalf("parsePatch err = %v, want a no-hunks error", err)
-	}
-}
-
-func TestParsePatchHunkBadLine(t *testing.T) {
-	input := "*** Begin Patch\n*** Update File: a\n@@\nctx\nbad\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchHunkLine) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchHunkLine)
-	}
-}
-
-func TestParsePatchHunkEmptyLine(t *testing.T) {
-	input := "*** Begin Patch\n*** Update File: a\n@@\nctx\n\nmore\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchHunkLine) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchHunkLine)
-	}
-}
-
-func TestParsePatchMissingHeaderBeforeHunk(t *testing.T) {
-	input := "*** Begin Patch\n@@\nctx\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchHunkExpected) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchHunkExpected)
-	}
-}
-
-func TestParsePatchUnknownHeader(t *testing.T) {
-	input := "*** Begin Patch\n*** Rename File: a\n*** End Patch"
-	_, err := parsePatch(input)
-	if !errors.Is(err, errApplyPatchUnknownHead) {
-		t.Fatalf("parsePatch err = %v, want %v", err, errApplyPatchUnknownHead)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parsePatch(tc.input)
+			if err == nil {
+				t.Fatal("parsePatch err = nil, want non-nil")
+			}
+			if tc.sentinel != nil && !errors.Is(err, tc.sentinel) {
+				t.Fatalf("parsePatch err = %v, want %v", err, tc.sentinel)
+			}
+			if tc.contains != "" && !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("parsePatch err = %q, want it to contain %q", err.Error(), tc.contains)
+			}
+		})
 	}
 }
 

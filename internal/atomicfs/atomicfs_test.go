@@ -103,103 +103,75 @@ func TestCreateExclusiveRefusesOverwrite(t *testing.T) {
 	}
 }
 
-// TestWriteSyncFailureBeforePublicationAborts proves a pre-publication temp
-// sync failure is an ordinary failed write: Write returns the error, leaves
-// no temp behind, and does not publish the file.
-func TestWriteSyncFailureBeforePublicationAborts(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rec.json")
+// TestPrePublicationSyncFailureRows covers both publishers with absent and
+// present destinations. A pre-publication temp sync failure is an ordinary
+// failed write: the publisher returns the error, leaves no temp behind, and
+// publishes nothing. A present destination also distinguishes removing the
+// temp from removing the target: only it can see the old complete contents
+// survive the failed replacement.
+func TestPrePublicationSyncFailureRows(t *testing.T) {
+	writePublisher := func(path string, data []byte, mode os.FileMode) (bool, error) {
+		err := Write(path, data, mode)
+		return err == nil, err
+	}
+	cases := []struct {
+		name        string
+		publish     func(string, []byte, os.FileMode) (bool, error)
+		present     bool
+		wantErrPart string
+	}{
+		{"TestWriteSyncFailureBeforePublicationAborts", writePublisher, false, "sync temp"},
+		{"TestWriteSyncFailureBeforePublicationPreservesExistingContent", writePublisher, true, ""},
+		{"TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent", CreateExclusive, true, ""},
+		{"TestCreateExclusiveSyncFailureBeforePublicationAborts", CreateExclusive, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "rec.json")
 
-	injected := errors.New("injected temp sync failure")
-	SyncFileFunc = func(*os.File) error { return injected }
-	defer func() { SyncFileFunc = nil }()
+			if tc.present {
+				created, err := tc.publish(path, []byte("original"), 0o600)
+				if err != nil || !created {
+					t.Fatalf("seed publish: (%v, %v)", created, err)
+				}
+			}
 
-	err := Write(path, []byte("data"), 0o600)
-	if err == nil {
-		t.Fatal("Write succeeded; want the injected temp sync failure")
-	}
-	if !strings.Contains(err.Error(), "sync temp") {
-		t.Fatalf("error = %v, want a temp sync error", err)
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatalf("path exists after the aborted write: %v", statErr)
-	}
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 0 {
-		t.Fatalf("leftover entries after the aborted write: %v", entries)
-	}
-}
+			injected := errors.New("injected temp sync failure")
+			SyncFileFunc = func(*os.File) error { return injected }
+			defer func() { SyncFileFunc = nil }()
 
-// TestWriteSyncFailureBeforePublicationPreservesExistingContent proves a
-// pre-publication temp sync failure on a present target is an ordinary
-// failed write that leaves the old complete contents intact: Write returns
-// the error, removes the temp, and the destination still holds the bytes it
-// held before the call. The sibling
-// TestWriteSyncFailureBeforePublicationAborts starts from an absent path, so
-// its assertions cannot distinguish removing the temp from removing the
-// target — only a present target can see the difference.
-func TestWriteSyncFailureBeforePublicationPreservesExistingContent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rec.json")
-	if err := Write(path, []byte("original"), 0o600); err != nil {
-		t.Fatalf("seed write: %v", err)
-	}
+			created, err := tc.publish(path, []byte("replacement"), 0o600)
+			if err == nil {
+				t.Fatal("publish succeeded; want the injected temp sync failure")
+			}
+			if created {
+				t.Fatal("created = true on a failed write")
+			}
+			if tc.wantErrPart != "" && !strings.Contains(err.Error(), tc.wantErrPart) {
+				t.Fatalf("error = %v, want a %s error", err, tc.wantErrPart)
+			}
 
-	injected := errors.New("injected temp sync failure")
-	SyncFileFunc = func(*os.File) error { return injected }
-	defer func() { SyncFileFunc = nil }()
-
-	err := Write(path, []byte("replacement"), 0o600)
-	if err == nil {
-		t.Fatal("Write succeeded; want the injected temp sync failure")
-	}
-	got, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatalf("read destination: %v", readErr)
-	}
-	if string(got) != "original" {
-		t.Fatalf("destination = %q after the failed write, want original", got)
-	}
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 || entries[0].Name() != "rec.json" {
-		t.Fatalf("leftover entries after the aborted write: %v", entries)
-	}
-}
-
-// TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent
-// proves the same present-target rule for the link-based publisher:
-// CreateExclusive returns the error, leaves no temp behind (its defer removes
-// it), and the existing file keeps its original contents.
-func TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rec.json")
-
-	created, err := CreateExclusive(path, []byte("original"), 0o600)
-	if err != nil || !created {
-		t.Fatalf("seed create: (%v, %v)", created, err)
-	}
-
-	injected := errors.New("injected temp sync failure")
-	SyncFileFunc = func(*os.File) error { return injected }
-	defer func() { SyncFileFunc = nil }()
-
-	created, err = CreateExclusive(path, []byte("replacement"), 0o600)
-	if err == nil {
-		t.Fatal("CreateExclusive succeeded; want the injected temp sync failure")
-	}
-	if created {
-		t.Fatal("created = true on a failed write")
-	}
-	got, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatalf("read destination: %v", readErr)
-	}
-	if string(got) != "original" {
-		t.Fatalf("destination = %q after the failed write, want original", got)
-	}
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 || entries[0].Name() != "rec.json" {
-		t.Fatalf("leftover entries after the aborted write: %v", entries)
+			if tc.present {
+				got, readErr := os.ReadFile(path)
+				if readErr != nil {
+					t.Fatalf("read destination: %v", readErr)
+				}
+				if string(got) != "original" {
+					t.Fatalf("destination = %q after the failed write, want original", got)
+				}
+			} else if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("path exists after the aborted write: %v", statErr)
+			}
+			entries, _ := os.ReadDir(dir)
+			if tc.present {
+				if len(entries) != 1 || entries[0].Name() != "rec.json" {
+					t.Fatalf("leftover entries after the aborted write: %v", entries)
+				}
+			} else if len(entries) != 0 {
+				t.Fatalf("leftover entries after the aborted write: %v", entries)
+			}
+		})
 	}
 }
 
@@ -232,34 +204,6 @@ func TestWriteDirSyncFailureAfterPublicationReturnsSuccess(t *testing.T) {
 	}
 	if out := stderr(); !strings.Contains(out, "injected dir sync failure") {
 		t.Fatalf("stderr = %q, want the dir sync diagnostic", out)
-	}
-}
-
-// TestCreateExclusiveSyncFailureBeforePublicationAborts proves the same
-// pre-publication rule for the link-based publisher: CreateExclusive
-// returns the error, leaves no temp behind (its defer removes it), and
-// does not publish the file.
-func TestCreateExclusiveSyncFailureBeforePublicationAborts(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "rec.json")
-
-	injected := errors.New("injected temp sync failure")
-	SyncFileFunc = func(*os.File) error { return injected }
-	defer func() { SyncFileFunc = nil }()
-
-	created, err := CreateExclusive(path, []byte("data"), 0o600)
-	if err == nil {
-		t.Fatal("CreateExclusive succeeded; want the injected temp sync failure")
-	}
-	if created {
-		t.Fatal("created = true on a failed write")
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatalf("path exists after the aborted write: %v", statErr)
-	}
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 0 {
-		t.Fatalf("leftover entries after the aborted write: %v", entries)
 	}
 }
 
