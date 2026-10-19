@@ -627,6 +627,19 @@ func TestHistoryPagingAppendStableAnchors(t *testing.T) {
 	})
 }
 
+// sessionReadCalls builds the four independent reads of one Session over one
+// owner — the page, the hydration, and the two history-error probes — each
+// invoked with the caller's own context, so archived, deleted, closed, and
+// canceled callers share the same read set.
+func sessionReadCalls(ctx context.Context, r *Runtime, sessionID string) []func() error {
+	return []func() error{
+		func() error { _, err := r.getHistory(ctx, sessionID, nil); return err },
+		func() error { _, err := r.buildHydration(ctx, sessionID); return err },
+		func() error { return headerErrorThroughRuntime(ctx, r, sessionID) },
+		func() error { return historyErrorThroughRuntime(ctx, r, sessionID) },
+	}
+}
+
 // TestHistoryReadsArchivedDeletedSessions proves archived Sessions stay
 // fully readable and deleted Sessions fail every read with the typed
 // not-found.
@@ -652,31 +665,13 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 			t.Fatalf("DeleteSession: %v", err)
 		}
 
-		archivedReads := []func() error{
-			func() error { _, err := r.getHistory(context.Background(), archived, nil); return err },
-			func() error { _, err := r.buildHydration(context.Background(), archived); return err },
-			func() error {
-				return headerErrorThroughRuntime(context.Background(), r, archived)
-			},
-			func() error {
-				return historyErrorThroughRuntime(context.Background(), r, archived)
-			},
-		}
+		archivedReads := sessionReadCalls(context.Background(), r, archived)
 		for i, read := range archivedReads {
 			if err := read(); err != nil {
 				t.Fatalf("archived read %d: %v", i, err)
 			}
 		}
-		deletedReads := []func() error{
-			func() error { _, err := r.getHistory(context.Background(), deleted, nil); return err },
-			func() error { _, err := r.buildHydration(context.Background(), deleted); return err },
-			func() error {
-				return headerErrorThroughRuntime(context.Background(), r, deleted)
-			},
-			func() error {
-				return historyErrorThroughRuntime(context.Background(), r, deleted)
-			},
-		}
+		deletedReads := sessionReadCalls(context.Background(), r, deleted)
 		for i, read := range deletedReads {
 			if err := read(); !errors.Is(err, harness.ErrNotFound) {
 				t.Fatalf("deleted read %d = %v, want harness.ErrNotFound", i, err)
@@ -954,35 +949,11 @@ func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
 		defer releaseToolOnce()
 		toolStarted := make(chan struct{}, 1)
 		bg.e.server.setScript(func(_ context.Context, body string) []string {
-			return []string{
-				`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
-				`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-			}
+			return twoReadCallTurnEvents()
 		})
 		// The started call parks until the run's cancellation releases it; the
 		// unstarted call never begins and settles synthetically.
-		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			if call.ID != "call-1" {
-				return harness.PreparedTool{
-					Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
-				}
-			}
-			return harness.PreparedTool{
-				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Execute: func(execCtx context.Context) harness.ToolOutcome {
-					select {
-					case toolStarted <- struct{}{}:
-					default:
-					}
-					select {
-					case <-releaseTool:
-					case <-execCtx.Done(): // the interrupt releases the started call
-					}
-					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
-				},
-			}
-		})
+		bg.tools.setPrepare(parkedReadCallPrepare(releaseTool, toolStarted))
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		select {
 		case <-toolStarted:
@@ -1548,16 +1519,7 @@ func TestProjectionReadsClosedAndCanceledCallers(t *testing.T) {
 	if err := r.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	closed := []func() error{
-		func() error { _, err := r.getHistory(context.Background(), sessionID, nil); return err },
-		func() error { _, err := r.buildHydration(context.Background(), sessionID); return err },
-		func() error {
-			return headerErrorThroughRuntime(context.Background(), r, sessionID)
-		},
-		func() error {
-			return historyErrorThroughRuntime(context.Background(), r, sessionID)
-		},
-	}
+	closed := sessionReadCalls(context.Background(), r, sessionID)
 	for i, call := range closed {
 		if err := call(); !errors.Is(err, ErrClosed) {
 			t.Fatalf("closed caller %d = %v, want ErrClosed", i, err)
@@ -1568,16 +1530,7 @@ func TestProjectionReadsClosedAndCanceledCallers(t *testing.T) {
 	defer closeProjectionRuntime(r2)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	canceledCalls := []func() error{
-		func() error { _, err := r2.getHistory(canceled, sessionID, nil); return err },
-		func() error { _, err := r2.buildHydration(canceled, sessionID); return err },
-		func() error {
-			return headerErrorThroughRuntime(canceled, r2, sessionID)
-		},
-		func() error {
-			return historyErrorThroughRuntime(canceled, r2, sessionID)
-		},
-	}
+	canceledCalls := sessionReadCalls(canceled, r2, sessionID)
 	for i, call := range canceledCalls {
 		if err := call(); !errors.Is(err, context.Canceled) {
 			t.Fatalf("canceled caller %d = %v, want context.Canceled", i, err)

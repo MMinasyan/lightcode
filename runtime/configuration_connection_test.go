@@ -1362,77 +1362,74 @@ func TestConnectProviderOwnerCloseDuringFetchRefuses(t *testing.T) {
 	})
 }
 
-// TestDisconnectProviderUnusableRemovesManagedKey is the nearest forbidden
-// sibling of the connect usability rule: an unusable provider (the
-// windowless discovery-backed discp) still disconnects, removing its managed
-// key through the ready-publication path over untouched bytes.
-func TestDisconnectProviderUnusableRemovesManagedKey(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		if err := r.managedEnv.TrySet("CONNECTION_DISC_KEY", "managed-secret"); err != nil {
-			t.Fatalf("seed TrySet: %v", err)
-		}
-		before, _, _ := runtimeMutationBaseline(t, r)
+// TestDisconnectProviderManagedKeyTable pins the disconnect's managed-key
+// removal on both provider shapes. The unusable row is the nearest forbidden
+// sibling of the connect usability rule: the windowless discovery-backed
+// discp still disconnects, removing its managed key through the
+// ready-publication path over untouched bytes. The usable row additionally
+// pins the disconnected view — no key source, not connected — and its
+// removed .env line.
+func TestDisconnectProviderManagedKeyTable(t *testing.T) {
+	rows := []struct {
+		name       string
+		providerID string
+		envName    string
+		seed       string
+		check      func(t *testing.T, r *Runtime, mutation protocol.ProviderMutation)
+	}{
+		{
+			name: "TestDisconnectProviderUnusableRemovesManagedKey", providerID: "discp",
+			envName: "CONNECTION_DISC_KEY", seed: "managed-secret",
+		},
+		{
+			name: "TestDisconnectProviderManagedKey", providerID: "usablep",
+			envName: "CONNECTION_USABLE_KEY", seed: "managed-secret",
+			check: func(t *testing.T, r *Runtime, mutation protocol.ProviderMutation) {
+				if mutation.Result.Connected || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceNone) {
+					t.Fatalf("disconnected provider view = %+v, want the disconnected status", mutation.Result)
+				}
+				envData, err := os.ReadFile(r.managedEnv.Path())
+				if err != nil || strings.Contains(string(envData), "CONNECTION_USABLE_KEY=") {
+					t.Fatalf(".env after disconnect = (%q, %v), want the line removed", envData, err)
+				}
+			},
+		},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+				server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
+				r, _ := openConnectionRuntime(t, store, server.URL)
+				defer closeProjectionRuntime(r)
+				ctx := context.Background()
+				sub, err := r.Subscribe(8)
+				if err != nil {
+					t.Fatalf("Subscribe: %v", err)
+				}
+				defer sub.Close()
+				if err := r.managedEnv.TrySet(row.envName, row.seed); err != nil {
+					t.Fatalf("seed TrySet: %v", err)
+				}
+				before, _, _ := runtimeMutationBaseline(t, r)
 
-		mutation, err := r.disconnectProvider(ctx, "discp")
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("unusable disconnect = (%v, %+v), want generation 2", err, mutation)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if os.Getenv("CONNECTION_DISC_KEY") != "" || r.managedEnv.IsManaged("CONNECTION_DISC_KEY") {
-			t.Fatal("the managed key survived the unusable provider's disconnect")
-		}
-		after, rerr := os.ReadFile(r.config.configPath)
-		if rerr != nil || string(after) != string(before) {
-			t.Fatalf("disconnect changed the owning config (%v)", rerr)
-		}
-	})
-}
-
-func TestDisconnectProviderManagedKey(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		if err := r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"); err != nil {
-			t.Fatalf("seed TrySet: %v", err)
-		}
-		before, _, _ := runtimeMutationBaseline(t, r)
-
-		mutation, err := r.disconnectProvider(ctx, "usablep")
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("disconnectProvider = (%v, %+v), want generation 2", err, mutation)
-		}
-		if mutation.Result.Connected || mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceNone) {
-			t.Fatalf("disconnected provider view = %+v, want the disconnected status", mutation.Result)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if os.Getenv("CONNECTION_USABLE_KEY") != "" || r.managedEnv.IsManaged("CONNECTION_USABLE_KEY") {
-			t.Fatal("the managed key survived the disconnect")
-		}
-		envData, err := os.ReadFile(r.managedEnv.Path())
-		if err != nil || strings.Contains(string(envData), "CONNECTION_USABLE_KEY=") {
-			t.Fatalf(".env after disconnect = (%q, %v), want the line removed", envData, err)
-		}
-		after, err := os.ReadFile(r.config.configPath)
-		if err != nil || string(after) != string(before) {
-			t.Fatalf("disconnect changed the owning config (%v)", err)
-		}
-	})
+				mutation, err := r.disconnectProvider(ctx, row.providerID)
+				if err != nil || mutation.ConfigurationRevision.Generation != "2" {
+					t.Fatalf("disconnectProvider = (%v, %+v), want generation 2", err, mutation)
+				}
+				drainConnectionEvent(t, r.warnings, sub, "2")
+				if os.Getenv(row.envName) != "" || r.managedEnv.IsManaged(row.envName) {
+					t.Fatal("the managed key survived the disconnect")
+				}
+				after, rerr := os.ReadFile(r.config.configPath)
+				if rerr != nil || string(after) != string(before) {
+					t.Fatalf("disconnect changed the owning config (%v)", rerr)
+				}
+				if row.check != nil {
+					row.check(t, r, mutation)
+				}
+			})
+		})
+	}
 }
 
 // awaitStackMatch polls the process stacks until one stack satisfies match,
@@ -2062,169 +2059,171 @@ func TestCreateProviderExplicitEmptyEnvKeylessRefuses(t *testing.T) {
 	})
 }
 
-// TestCreateProviderExternalBindingWithKeyRefusesBeforeWrites pins the
-// supplied-key rule: an explicitly named externally defined variable refuses
-// the create before any configuration or cache side effect, leaving its
-// value intact — it is not silently substituted for the supplied key.
-func TestCreateProviderExternalBindingWithKeyRefusesBeforeWrites(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_SHELL_KEY")
-		t.Setenv("CONNECTION_SHELL_KEY", "shell-exported-value")
-		envBefore, err := os.ReadFile(r.managedEnv.Path())
-		if err != nil {
-			t.Fatalf("read .env: %v", err)
-		}
-		before, generation, warnRev := runtimeMutationBaseline(t, r)
+// TestCreateProviderKeySourceTable pins the ordinary provider-create
+// key-source unions over the connection fixture. The external-binding row
+// with a supplied key refuses the create before any configuration or cache
+// side effect, leaving the explicitly named externally defined variable
+// intact — it is not silently substituted for the supplied key. The
+// managed-orphan row updates a managed orphan name by the supplied nonempty
+// value; the managed-empty row fills a managed empty name instead of
+// tripping the external-empty refusal; the existing-managed row uses an
+// existing nonempty managed value as-is without a key write; the
+// external-binding row without a supplied key registers as-is and stays
+// external; and the missing-key row performs no credential action and no
+// resolution refusal.
+func TestCreateProviderKeySourceTable(t *testing.T) {
+	rows := []struct {
+		name    string
+		envName string
+		key     *string
+		arrange func(t *testing.T, r *Runtime)
+		refuse  error
+		check   func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte)
+	}{
+		{
+			name: "TestCreateProviderExternalBindingWithKeyRefusesBeforeWrites", envName: "CONNECTION_SHELL_KEY",
+			key: ptrTo(connectionKey), refuse: ErrConfiguration,
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_SHELL_KEY")
+				t.Setenv("CONNECTION_SHELL_KEY", "shell-exported-value")
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if os.Getenv("CONNECTION_SHELL_KEY") != "shell-exported-value" || r.managedEnv.IsManaged("CONNECTION_SHELL_KEY") {
+					t.Fatalf("external sibling state = (%q, %v), want it untouched and unmanaged", os.Getenv("CONNECTION_SHELL_KEY"), r.managedEnv.IsManaged("CONNECTION_SHELL_KEY"))
+				}
+				assertDotenvUnchanged(t, r, envBefore, "the external-sibling create")
+			},
+		},
+		{
+			name: "TestCreateProviderManagedOrphanKeyUpdatedBySuppliedValue", envName: "CONNECTION_ORPHAN_KEY",
+			key: ptrTo("sk-live-orphan-replacement"),
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_ORPHAN_KEY")
+				if err := r.managedEnv.TrySet("CONNECTION_ORPHAN_KEY", "stale-managed-value"); err != nil {
+					t.Fatalf("seed managed orphan: %v", err)
+				}
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if os.Getenv("CONNECTION_ORPHAN_KEY") != *key || !r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY") {
+					t.Fatalf("managed orphan state = (%q, %v), want the supplied replacement", os.Getenv("CONNECTION_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY"))
+				}
+				envData, rerr := os.ReadFile(r.managedEnv.Path())
+				if rerr != nil || !strings.Contains(string(envData), "CONNECTION_ORPHAN_KEY="+*key+"\n") || strings.Contains(string(envData), "stale-managed-value") {
+					t.Fatalf(".env = (%q, %v), want the replacement line only", envData, rerr)
+				}
+				raw, rerr := os.ReadFile(r.config.configPath)
+				if rerr != nil || !strings.Contains(string(raw), `"api_key_env": "CONNECTION_ORPHAN_KEY"`) || strings.Contains(string(raw), *key) {
+					t.Fatalf("raw config = (%q, %v), want the name only and never the value", raw, rerr)
+				}
+				mutBytes, merr := json.Marshal(mutation)
+				if merr != nil || strings.Contains(string(mutBytes), *key) {
+					t.Fatalf("mutation bytes carry the key value (%v)", merr)
+				}
+			},
+		},
+		{
+			name: "TestCreateProviderManagedEmptyKeyFilledBySuppliedValue", envName: "CONNECTION_EMPTY_ORPHAN_KEY",
+			key: ptrTo("sk-live-empty-orphan-replacement"),
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_EMPTY_ORPHAN_KEY")
+				if err := r.managedEnv.TrySet("CONNECTION_EMPTY_ORPHAN_KEY", ""); err != nil {
+					t.Fatalf("seed managed-empty name: %v", err)
+				}
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY") != *key || !r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY") {
+					t.Fatalf("managed-empty state = (%q, %v), want the supplied value", os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY"))
+				}
+			},
+		},
+		{
+			name: "TestCreateProviderManagedNameWithoutSuppliedKeyUsesExisting", envName: "CONNECTION_EXISTING_KEY",
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_EXISTING_KEY")
+				if err := r.managedEnv.TrySet("CONNECTION_EXISTING_KEY", "existing-managed-value"); err != nil {
+					t.Fatalf("seed managed name: %v", err)
+				}
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
+					t.Fatalf("created provider key source = %q, want managed", mutation.Result.KeySource)
+				}
+				if os.Getenv("CONNECTION_EXISTING_KEY") != "existing-managed-value" || !r.managedEnv.IsManaged("CONNECTION_EXISTING_KEY") {
+					t.Fatalf("managed value changed without a supplied key: (%q, %v)", os.Getenv("CONNECTION_EXISTING_KEY"), r.managedEnv.IsManaged("CONNECTION_EXISTING_KEY"))
+				}
+				assertDotenvUnchanged(t, r, envBefore, "the create without a supplied key")
+			},
+		},
+		{
+			name: "TestCreateProviderExternalBindingWithoutKeyRegisters", envName: "CONNECTION_SHELL_KEY",
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_SHELL_KEY")
+				t.Setenv("CONNECTION_SHELL_KEY", "shell-exported-value")
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceExternal) {
+					t.Fatalf("created provider key source = %q, want external", mutation.Result.KeySource)
+				}
+				assertDotenvUnchanged(t, r, envBefore, "the no-key create")
+				if r.managedEnv.IsManaged("CONNECTION_SHELL_KEY") {
+					t.Fatal("the no-key create managed the external variable")
+				}
+			},
+		},
+		{
+			name: "TestCreateProviderMissingKeyRegistersNoAction", envName: "CONNECTION_MISSING_KEY",
+			arrange: func(t *testing.T, r *Runtime) {
+				reserveEnvKey(t, "CONNECTION_MISSING_KEY")
+			},
+			check: func(t *testing.T, r *Runtime, e *ownerEnv, mutation protocol.ProviderMutation, key *string, envBefore []byte) {
+				if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceNone) || mutation.Result.ApiKeyEnv != "CONNECTION_MISSING_KEY" {
+					t.Fatalf("created provider = (%q, %q), want the none source with the named binding", mutation.Result.KeySource, mutation.Result.ApiKeyEnv)
+				}
+				assertDotenvUnchanged(t, r, envBefore, "the absent-binding create")
+				if _, present := metadataRawProvider(t, e.configPath, "newp")["transport"]; !present {
+					t.Fatal("the created provider missing from the raw layer")
+				}
+			},
+		},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+				server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
+				r, e := openConnectionRuntime(t, store, server.URL)
+				defer closeProjectionRuntime(r)
+				ctx := context.Background()
+				sub, err := r.Subscribe(8)
+				if err != nil {
+					t.Fatalf("Subscribe: %v", err)
+				}
+				defer sub.Close()
+				row.arrange(t, r)
+				envBefore, err := os.ReadFile(r.managedEnv.Path())
+				if err != nil {
+					t.Fatalf("read .env: %v", err)
+				}
+				before, generation, warnRev := runtimeMutationBaseline(t, r)
 
-		key := connectionKey
-		window := 4096
-		baseURL := "https://new.test/v1"
-		shellEnv := "CONNECTION_SHELL_KEY"
-		_, err = r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &shellEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
-		// The refusal oracle already pins the owning file, generation,
-		// warnings, and events; the external sibling and the .env silence are
-		// this row's own axes.
-		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
-		if os.Getenv("CONNECTION_SHELL_KEY") != "shell-exported-value" || r.managedEnv.IsManaged("CONNECTION_SHELL_KEY") {
-			t.Fatalf("external sibling state = (%q, %v), want it untouched and unmanaged", os.Getenv("CONNECTION_SHELL_KEY"), r.managedEnv.IsManaged("CONNECTION_SHELL_KEY"))
-		}
-		assertDotenvUnchanged(t, r, envBefore, "the external-sibling create")
-	})
-}
-
-// TestCreateProviderManagedOrphanKeyUpdatedBySuppliedValue is the create-side
-// ownership regression: a managed orphan name — Lightcode owns it, no
-// provider references it — must be updated by a supplied nonempty value
-// instead of being mistaken for a shell key and having the replacement
-// discarded. The exact value reaches only the .env and never a response byte.
-func TestCreateProviderManagedOrphanKeyUpdatedBySuppliedValue(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_ORPHAN_KEY")
-		if err := r.managedEnv.TrySet("CONNECTION_ORPHAN_KEY", "stale-managed-value"); err != nil {
-			t.Fatalf("seed managed orphan: %v", err)
-		}
-
-		key := "sk-live-orphan-replacement"
-		window := 4096
-		baseURL := "https://new.test/v1"
-		orphanEnv := "CONNECTION_ORPHAN_KEY"
-		mutation, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &orphanEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("managed-orphan create = (%v, %+v), want generation 2", err, mutation)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if os.Getenv("CONNECTION_ORPHAN_KEY") != key || !r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY") {
-			t.Fatalf("managed orphan state = (%q, %v), want the supplied replacement", os.Getenv("CONNECTION_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_ORPHAN_KEY"))
-		}
-		envData, rerr := os.ReadFile(r.managedEnv.Path())
-		if rerr != nil || !strings.Contains(string(envData), "CONNECTION_ORPHAN_KEY="+key+"\n") || strings.Contains(string(envData), "stale-managed-value") {
-			t.Fatalf(".env = (%q, %v), want the replacement line only", envData, rerr)
-		}
-		raw, rerr := os.ReadFile(r.config.configPath)
-		if rerr != nil || !strings.Contains(string(raw), `"api_key_env": "CONNECTION_ORPHAN_KEY"`) || strings.Contains(string(raw), key) {
-			t.Fatalf("raw config = (%q, %v), want the name only and never the value", raw, rerr)
-		}
-		mutBytes, merr := json.Marshal(mutation)
-		if merr != nil || strings.Contains(string(mutBytes), key) {
-			t.Fatalf("mutation bytes carry the key value (%v)", merr)
-		}
-	})
-}
-
-// TestCreateProviderManagedEmptyKeyFilledBySuppliedValue pins the
-// managed-empty union: Lightcode owns the name with no value, and a supplied
-// nonempty value fills it instead of tripping the external-empty refusal.
-func TestCreateProviderManagedEmptyKeyFilledBySuppliedValue(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_EMPTY_ORPHAN_KEY")
-		if err := r.managedEnv.TrySet("CONNECTION_EMPTY_ORPHAN_KEY", ""); err != nil {
-			t.Fatalf("seed managed-empty name: %v", err)
-		}
-
-		key := "sk-live-empty-orphan-replacement"
-		window := 4096
-		baseURL := "https://new.test/v1"
-		emptyEnv := "CONNECTION_EMPTY_ORPHAN_KEY"
-		if _, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &emptyEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key); err != nil {
-			t.Fatalf("managed-empty create = %v, want the supplied value to fill the managed name", err)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY") != key || !r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY") {
-			t.Fatalf("managed-empty state = (%q, %v), want the supplied value", os.Getenv("CONNECTION_EMPTY_ORPHAN_KEY"), r.managedEnv.IsManaged("CONNECTION_EMPTY_ORPHAN_KEY"))
-		}
-	})
-}
-
-// TestCreateProviderManagedNameWithoutSuppliedKeyUsesExisting pins the
-// no-supplied-value union: an existing nonempty managed value is used as-is
-// and the create publishes without a key write.
-func TestCreateProviderManagedNameWithoutSuppliedKeyUsesExisting(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_EXISTING_KEY")
-		if err := r.managedEnv.TrySet("CONNECTION_EXISTING_KEY", "existing-managed-value"); err != nil {
-			t.Fatalf("seed managed name: %v", err)
-		}
-		envBefore, err := os.ReadFile(r.managedEnv.Path())
-		if err != nil {
-			t.Fatalf("read .env: %v", err)
-		}
-
-		window := 4096
-		baseURL := "https://new.test/v1"
-		existingEnv := "CONNECTION_EXISTING_KEY"
-		mutation, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &existingEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil)
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("managed-existing create = (%v, %+v), want generation 2", err, mutation)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
-			t.Fatalf("created provider key source = %q, want managed", mutation.Result.KeySource)
-		}
-		if os.Getenv("CONNECTION_EXISTING_KEY") != "existing-managed-value" || !r.managedEnv.IsManaged("CONNECTION_EXISTING_KEY") {
-			t.Fatalf("managed value changed without a supplied key: (%q, %v)", os.Getenv("CONNECTION_EXISTING_KEY"), r.managedEnv.IsManaged("CONNECTION_EXISTING_KEY"))
-		}
-		assertDotenvUnchanged(t, r, envBefore, "the create without a supplied key")
-	})
+				window := 4096
+				baseURL := "https://new.test/v1"
+				mutation, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &row.envName},
+					map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, row.key)
+				// The refusal oracle already pins the owning file, generation,
+				// warnings, and events; the success rows share the one
+				// generation-2 publication rule.
+				if row.refuse != nil {
+					assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, row.refuse)
+				} else {
+					if err != nil || mutation.ConfigurationRevision.Generation != "2" {
+						t.Fatalf("key-source create = (%v, %+v), want generation 2", err, mutation)
+					}
+					drainConnectionEvent(t, r.warnings, sub, "2")
+				}
+				row.check(t, r, e, mutation, row.key, envBefore)
+			})
+		})
+	}
 }
 
 // TestCreateProviderGeneratedNameSkipsOccupiedNames pins the allocation
@@ -2330,88 +2329,6 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 				}
 				row.intact(t, row.base)
 			})
-		}
-	})
-}
-
-// TestCreateProviderExternalBindingWithoutKeyRegisters pins the no-supplied
-// key sibling of the allocation rule: an external shell key's variable is
-// occupied for allocation, but a create without a supplied key performs no
-// credential action at all — the binding registers as-is and stays external.
-func TestCreateProviderExternalBindingWithoutKeyRegisters(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_SHELL_KEY")
-		t.Setenv("CONNECTION_SHELL_KEY", "shell-exported-value")
-		envBefore, err := os.ReadFile(r.managedEnv.Path())
-		if err != nil {
-			t.Fatalf("read .env: %v", err)
-		}
-
-		window := 4096
-		baseURL := "https://new.test/v1"
-		shellEnv := "CONNECTION_SHELL_KEY"
-		mutation, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &shellEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil)
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("no-key external-binding create = (%v, %+v), want generation 2", err, mutation)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceExternal) {
-			t.Fatalf("created provider key source = %q, want external", mutation.Result.KeySource)
-		}
-		assertDotenvUnchanged(t, r, envBefore, "the no-key create")
-		if r.managedEnv.IsManaged("CONNECTION_SHELL_KEY") {
-			t.Fatal("the no-key create managed the external variable")
-		}
-	})
-}
-
-// TestCreateProviderMissingKeyRegistersNoAction pins the clarification's
-// headline: a create whose configured binding is absent performs no
-// credential action and no resolution refusal — the disconnected valid
-// registration is representable, and the named binding lands in the raw
-// transport and in the result.
-func TestCreateProviderMissingKeyRegistersNoAction(t *testing.T) {
-	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, e := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
-		defer sub.Close()
-		reserveEnvKey(t, "CONNECTION_MISSING_KEY")
-		envBefore, err := os.ReadFile(r.managedEnv.Path())
-		if err != nil {
-			t.Fatalf("read .env: %v", err)
-		}
-
-		window := 4096
-		baseURL := "https://new.test/v1"
-		missingEnv := "CONNECTION_MISSING_KEY"
-		mutation, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &missingEnv},
-			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil)
-		if err != nil || mutation.ConfigurationRevision.Generation != "2" {
-			t.Fatalf("absent-binding create = (%v, %+v), want generation 2", err, mutation)
-		}
-		drainConnectionEvent(t, r.warnings, sub, "2")
-		if mutation.Result.KeySource != protocol.ProviderKeySource(config.KeySourceNone) || mutation.Result.ApiKeyEnv != missingEnv {
-			t.Fatalf("created provider = (%q, %q), want the none source with the named binding", mutation.Result.KeySource, mutation.Result.ApiKeyEnv)
-		}
-		assertDotenvUnchanged(t, r, envBefore, "the absent-binding create")
-		if _, present := metadataRawProvider(t, e.configPath, "newp")["transport"]; !present {
-			t.Fatal("the created provider missing from the raw layer")
 		}
 	})
 }
