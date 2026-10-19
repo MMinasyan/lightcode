@@ -110,21 +110,20 @@ func TestCreateExclusiveRefusesOverwrite(t *testing.T) {
 // temp from removing the target: only it can see the old complete contents
 // survive the failed replacement.
 func TestPrePublicationSyncFailureRows(t *testing.T) {
-	type publisher int
-	const (
-		writePublisher publisher = iota
-		createExclusivePublisher
-	)
+	writePublisher := func(path string, data []byte, mode os.FileMode) (bool, error) {
+		err := Write(path, data, mode)
+		return err == nil, err
+	}
 	cases := []struct {
 		name        string
-		publisher   publisher
+		publish     func(string, []byte, os.FileMode) (bool, error)
 		present     bool
 		wantErrPart string
 	}{
 		{"TestWriteSyncFailureBeforePublicationAborts", writePublisher, false, "sync temp"},
 		{"TestWriteSyncFailureBeforePublicationPreservesExistingContent", writePublisher, true, ""},
-		{"TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent", createExclusivePublisher, true, ""},
-		{"TestCreateExclusiveSyncFailureBeforePublicationAborts", createExclusivePublisher, false, ""},
+		{"TestCreateExclusiveSyncFailureBeforePublicationPreservesExistingContent", CreateExclusive, true, ""},
+		{"TestCreateExclusiveSyncFailureBeforePublicationAborts", CreateExclusive, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -132,16 +131,9 @@ func TestPrePublicationSyncFailureRows(t *testing.T) {
 			path := filepath.Join(dir, "rec.json")
 
 			if tc.present {
-				switch tc.publisher {
-				case writePublisher:
-					if err := Write(path, []byte("original"), 0o600); err != nil {
-						t.Fatalf("seed write: %v", err)
-					}
-				case createExclusivePublisher:
-					created, err := CreateExclusive(path, []byte("original"), 0o600)
-					if err != nil || !created {
-						t.Fatalf("seed create: (%v, %v)", created, err)
-					}
+				created, err := tc.publish(path, []byte("original"), 0o600)
+				if err != nil || !created {
+					t.Fatalf("seed publish: (%v, %v)", created, err)
 				}
 			}
 
@@ -149,23 +141,12 @@ func TestPrePublicationSyncFailureRows(t *testing.T) {
 			SyncFileFunc = func(*os.File) error { return injected }
 			defer func() { SyncFileFunc = nil }()
 
-			payload := []byte("data")
-			if tc.present {
-				payload = []byte("replacement")
-			}
-			var err error
-			switch tc.publisher {
-			case writePublisher:
-				err = Write(path, payload, 0o600)
-			case createExclusivePublisher:
-				var created bool
-				created, err = CreateExclusive(path, payload, 0o600)
-				if created {
-					t.Fatal("created = true on a failed write")
-				}
-			}
+			created, err := tc.publish(path, []byte("replacement"), 0o600)
 			if err == nil {
 				t.Fatal("publish succeeded; want the injected temp sync failure")
+			}
+			if created {
+				t.Fatal("created = true on a failed write")
 			}
 			if tc.wantErrPart != "" && !strings.Contains(err.Error(), tc.wantErrPart) {
 				t.Fatalf("error = %v, want a %s error", err, tc.wantErrPart)
