@@ -400,7 +400,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 		Prepare: func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 			return harness.PreparedExecution{
 				Capture: harness.ExecutionCapture{ConfigurationRevision: "1", Model: prepModelRef, ContextWindow: 4096, OutputReserve: 2048, SystemPrompt: "seeded",
-					Compact: harness.CompactCapture{Model: prepModelRef, ContextWindow: 2048, OutputReserve: 1024, SystemPrompt: "summarize"}},
+					Compact: harness.CompactCapture{Model: prepModelRef, SystemPrompt: "summarize"}},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					modelFn := func(context.Context, model.Request) (model.Stream, error) {
 						select {

@@ -11,32 +11,6 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// compactionWrapperOverhead is the fixed token reserve for the compact
-// request's wrapper text around the serialized piece: role framing and the
-// Previous-summary block's fixed scaffolding.
-const compactionWrapperOverhead = 64
-
-// usageAccumulator is the orchestration's process-local piece-usage total:
-// one UsageCount summed field-wise across the pieces, all of which run on the
-// one compact model. A piece reporting no usage contributes nothing; the
-// total stays nil until a piece first reports usage.
-type usageAccumulator struct {
-	total *UsageCount
-}
-
-func (a *usageAccumulator) add(piece UsageCount) error {
-	if a.total == nil {
-		a.total = &piece
-		return nil
-	}
-	total, err := addUsageCount(*a.total, piece)
-	if err != nil {
-		return err
-	}
-	a.total = &total
-	return nil
-}
-
 // serializeCompactionMessages renders the frozen projected conversation as
 // the compaction input: one inert JSON line per message, in order. Each
 // message is copied before any field is rewritten — a shallow struct copy
@@ -72,38 +46,29 @@ func serializeCompactionMessages(messages []model.Message) ([]string, error) {
 	return lines, nil
 }
 
-// compactionPieceBudget computes one piece's serialized-input token budget:
-// the compact window minus the output reserve, the compact system prompt's
-// plain-text estimate, the fixed wrapper overhead, and — when a previous
-// summary exists — the previous summary carried as one message.
-func compactionPieceBudget(capture CompactCapture, previous string) int {
-	budget := capture.ContextWindow - capture.OutputReserve - estimateTokens(capture.SystemPrompt, nil) - compactionWrapperOverhead
-	if previous != "" {
-		budget -= estimateTokens("", []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: previous}}}})
-	}
-	return budget
-}
-
-// compactModelEffect encloses one compact piece's model request in one
-// logical model-effect intent/result pair — a sibling of modelEffect closing
-// over the compact transport and the orchestration's usage accumulator. The
-// shared active-effect intent transaction commits the same durable intent;
-// the in-memory intent's expected identity is the compact model, the assembly
+// compactModelEffect encloses the compact summary request in one logical
+// model-effect intent/result pair — a sibling of modelEffect closing over the
+// compact transport and the orchestration's reported-usage slot. The shared
+// active-effect intent transaction commits the same durable intent; the
+// in-memory intent's expected identity is the compact model, the assembly
 // source the agent's callback validates and the terminal usage model, because
-// the pieces run on the compact transport while the durable active-effect
-// state is model-agnostic. The standard attempt-retry loop runs through the
-// compact transport, and each piece's reported usage joins the accumulator
-// before its settlement. A completed output settles by the empty running
-// result — no entry, the active effect cleared, both registers replaced with
-// no usage, the reserved identity unused — and returns the ready settlement
-// whose output carries the piece summary; the orchestration validates the
-// summary text after the settlement. A piece failure and an interruption
-// settle through the effect's own terminal settlement with the accumulated
-// usage keyed by the compact model, returning the assembled output carried on
-// the failure and interruption rows — the conversation effect's own shape,
-// and the run's callback gate requires it whenever the assembly callback ran
-// — while pre-assembly failures and cancellations return no output.
-func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture, accumulated *usageAccumulator) agent.ModelEffect {
+// the summary runs on the compact transport while the durable active-effect
+// state is model-agnostic, and the intent is marked as compaction so its
+// terminal usage carries summary provenance. The standard attempt-retry loop
+// runs through the compact transport, and the assembled output's reported
+// usage — nil-preserving, a reported zero stays known zero — lands on the
+// slot before that output settles. A completed output settles by the empty
+// running result — no entry, the active effect cleared, both registers
+// replaced with no usage, the reserved identity unused — and returns the
+// ready settlement whose output carries the summary; the orchestration
+// validates the summary text after the settlement. A summary failure and an
+// interruption settle through the effect's own terminal settlement with the
+// slot's current usage keyed by the compact model, returning the assembled
+// output carried on the failure and interruption rows — the conversation
+// effect's own shape, and the run's callback gate requires it whenever the
+// assembly callback ran — while pre-assembly failures and cancellations
+// return no output.
+func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture, reported **UsageCount) agent.ModelEffect {
 	attempt := exec.CompactModel
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
@@ -115,8 +80,9 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 				if _, cerr := h.commitEffectResult(context.WithoutCancel(h.ctx), c, operationID, nil, modelResult{
 					terminal:   OperationInterruption,
 					detail:     executionInterruptedDetail,
-					usage:      accumulated.total,
+					usage:      *reported,
 					usageModel: capture.Compact.Model,
+					compaction: true,
 				}); cerr != nil {
 					return agent.ModelSettlement{}, cerr
 				}
@@ -126,13 +92,14 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 		}
 		// The durable intent transaction is the conversation model effect's
 		// own; only the in-memory intent's expected identity is the compact
-		// model's.
+		// model's, and its provenance is compaction.
 		intent.expected = capture.Compact.Model
+		intent.compaction = true
 		// Execution cancellation stops new callbacks: a context that died
 		// between the committed intent and the callback settles the Operation
 		// as terminal interruption without ever starting the callback.
 		if ctx.Err() != nil {
-			return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+			return h.interruptModelEffect(c, operationID, intent, *reported)
 		}
 		// Result and terminal transactions run without cancellation so an
 		// already-produced result or required terminal settlement publishes.
@@ -141,7 +108,7 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
 				terminal: OperationFailure,
 				detail:   cause.Error(),
-				usage:    accumulated.total,
+				usage:    *reported,
 			}); err != nil {
 				return agent.ModelSettlement{}, err
 			}
@@ -159,7 +126,7 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			}
 			output = out
 		case attemptInterrupted:
-			return h.interruptModelEffect(c, operationID, intent, accumulated.total)
+			return h.interruptModelEffect(c, operationID, intent, *reported)
 		case attemptInvalid:
 			return settle(res.err)
 		case attemptFailed:
@@ -167,38 +134,38 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
 				terminal: OperationFailure,
 				detail:   res.err.Error(),
-				usage:    accumulated.total,
+				usage:    *reported,
 			}); err != nil {
 				return agent.ModelSettlement{}, err
 			}
 			return committed, nil
 		}
-		// The piece's reported usage joins the accumulator before its
-		// settlement; a piece reporting no usage contributes nothing.
+		// The assembled output's reported usage lands on the orchestration's
+		// slot before that output settles; an output reporting no usage leaves
+		// the slot untouched.
 		if output.Usage != nil {
-			if err := accumulated.add(UsageCount{
+			usage := UsageCount{
 				InputTokens:       int64(output.Usage.InputTokens),
 				CachedInputTokens: int64(output.Usage.CachedInputTokens),
 				OutputTokens:      int64(output.Usage.OutputTokens),
-			}); err != nil {
-				return agent.ModelSettlement{}, err
 			}
+			*reported = &usage
 		}
 		if output.Status == model.OutputCompleted {
 			// The empty running result inserts no entry, clears the active
 			// effect, and replaces both registers with no usage; the reserved
-			// result identity stays unused. The piece's summary text is the
+			// result identity stays unused. The summary text is the
 			// orchestration's validation, made after this ready settlement.
 			if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{}); err != nil {
 				return agent.ModelSettlement{}, err
 			}
 			return agent.ModelSettlement{Disposition: agent.DispoReady, Output: &output}, nil
 		}
-		// A piece failure and an interruption settle through the effect's own
-		// terminal settlement, consuming the reserved identity. The assembled
-		// output rides the returned settlement — an errored output on the
-		// failure row, an interrupted one on the interruption row — while a
-		// pre-assembly failure or cancellation returns none.
+		// A summary failure and an interruption settle through the effect's
+		// own terminal settlement, consuming the reserved identity. The
+		// assembled output rides the returned settlement — an errored output
+		// on the failure row, an interrupted one on the interruption row —
+		// while a pre-assembly failure or cancellation returns none.
 		terminal := OperationFailure
 		disposition := agent.DispoFailure
 		if output.Status == model.OutputInterrupted {
@@ -208,7 +175,7 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 		if _, err := h.commitEffectResult(settleCtx, c, operationID, &intent, modelResult{
 			terminal: terminal,
 			detail:   output.Detail,
-			usage:    accumulated.total,
+			usage:    *reported,
 		}); err != nil {
 			return agent.ModelSettlement{}, err
 		}
@@ -219,25 +186,24 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 // runCompaction summarizes the frozen projected conversation through the
 // no-Session compact agent. The snapshot — the complete projected
 // conversation minus the leading system message, supplied by the caller — is
-// serialized into inert transcript lines and packed whole-message into
-// pieces that each fit the compact budget; a message that exceeds a nonempty
-// piece's remaining budget starts the next piece, and no message, reasoning
-// part, tool call, or tool result is ever split. Each piece runs one
-// agent.Run invocation: the fixed compact prompt as the system message, the
-// framed piece as the user message — the Previous summary block only when a
-// previous piece already produced a summary — the compact model effect over
-// the compact transport, and a tool boundary that rejects any hallucinated
-// dispatch. Each piece's request budget accounts for the previous summary
-// known when that piece is packed. Intermediate summaries stay process-local;
-// the final piece's output is the summary candidate returned to the caller
-// together with the accumulated piece usage — the commit is the caller's. A
-// textless completed piece fails the orchestration after its ready
-// settlement. A piece failure or interruption settles durably inside its own
-// effect; a run-level terminal or any other failure — a pre-run cancellation,
-// a cancellation observed after a settled piece, an empty snapshot, an empty
-// piece summary, an error after a settled piece — settles directly on the
-// quiet running Operation with the accumulated usage keyed by the compact
-// model. No compaction entry is written on any path.
+// serialized into inert transcript lines and joined whole into one user
+// message: the complete input is sent as one logical full-input request,
+// never split. The fixed no-Session Agent runs once: the captured compact
+// prompt as the system message, the serialized conversation as the user
+// message, the compact model effect over the compact transport, and a tool
+// boundary that rejects any hallucinated dispatch. The orchestration's
+// reported-usage slot is set by the effect from the assembled output before
+// that output settles and read after the run returns: a nil slot means the
+// summary reported no usage, and a reported zero stays known zero. The
+// summary candidate and that usage are returned to the caller — the commit is
+// the caller's. A textless completed summary fails the orchestration after
+// its ready settlement. A summary failure or interruption settles durably
+// inside its own effect; a run-level terminal or any other failure — a
+// pre-run cancellation, a cancellation observed after the settled summary
+// result, an empty snapshot, an empty summary, an error after the settled
+// result — settles directly on the quiet running Operation with the slot's
+// usage keyed by the compact model. No compaction entry is written on any
+// failure path.
 func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operationID string, exec Execution, capture ExecutionCapture, snapshot []model.Message) (string, *UsageCount, error) {
 	if len(snapshot) == 0 {
 		return "", nil, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("nothing to compact"), capture, nil)
@@ -246,79 +212,58 @@ func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operati
 	if err != nil {
 		return "", nil, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, nil)
 	}
-	accumulated := &usageAccumulator{}
-	effect := h.compactModelEffect(c, operationID, exec, capture, accumulated)
-	previous := ""
-	index := 0
-	for index < len(lines) {
-		budget := compactionPieceBudget(capture.Compact, previous)
-		var piece []string
-		used := 0
-		for index < len(lines) {
-			cost := estimateTokens(lines[index], nil)
-			if len(piece) > 0 && used+cost > budget {
-				break
-			}
-			piece = append(piece, lines[index])
-			used += cost
-			index++
-		}
-		requestText := ""
-		if previous != "" {
-			requestText = "Previous summary:\n" + previous + "\n\nContinuation:\n"
-		}
-		requestText += strings.Join(piece, "\n")
-		res, runErr := agent.Run(execCtx, agent.Invocation{
-			ExpectedModel: capture.Compact.Model,
-			Tools:         nil,
-			Context: func(context.Context) ([]model.Message, error) {
-				return []model.Message{
-					{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: capture.Compact.SystemPrompt}}},
-					{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: requestText}}},
-				}, nil
-			},
-			ModelEffect: effect,
-			ToolEffect: func(context.Context, model.ToolCall) (model.ToolResult, error) {
-				return model.ToolResult{}, &agent.ProtocolError{Boundary: "tool", Detail: "compact agent has no tools"}
-			},
-		})
-		if runErr != nil {
-			return "", accumulated.total, h.settleCompactionFailure(c, operationID, OperationFailure, runErr, capture, accumulated.total)
-		}
-		switch res.Status {
-		case agent.TerminalSuccess:
-			previous = res.LastOutput.Message.TextContent()
-			if previous == "" {
-				// A textless completed piece — including refusal-only —
-				// fails the orchestration after the piece's ready
-				// settlement: no retry, no next piece, the direct
-				// settlement carrying the retained detail and the
-				// accumulated usage.
-				return "", accumulated.total, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("compaction summary is empty"), capture, accumulated.total)
-			}
-		default:
-			// A run-level terminal — a pre-run cancellation, or a
-			// cancellation observed after a settled piece before the run's
-			// success return — leaves the Operation running and quiet with
-			// no settlement; the direct settlement covers it, and takes no
-			// compensating write when a piece effect already settled the
-			// same terminal.
-			terminal := OperationFailure
-			if res.Status == agent.TerminalInterruption {
-				terminal = OperationInterruption
-			}
-			return "", accumulated.total, h.settleCompactionFailure(c, operationID, terminal, errors.New(res.Detail), capture, accumulated.total)
-		}
+	var reported *UsageCount
+	effect := h.compactModelEffect(c, operationID, exec, capture, &reported)
+	res, runErr := agent.Run(execCtx, agent.Invocation{
+		ExpectedModel: capture.Compact.Model,
+		Tools:         nil,
+		Context: func(context.Context) ([]model.Message, error) {
+			return []model.Message{
+				{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: capture.Compact.SystemPrompt}}},
+				{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: strings.Join(lines, "\n")}}},
+			}, nil
+		},
+		ModelEffect: effect,
+		ToolEffect: func(context.Context, model.ToolCall) (model.ToolResult, error) {
+			return model.ToolResult{}, &agent.ProtocolError{Boundary: "tool", Detail: "compact agent has no tools"}
+		},
+	})
+	if runErr != nil {
+		return "", reported, h.settleCompactionFailure(c, operationID, OperationFailure, runErr, capture, reported)
 	}
-	return previous, accumulated.total, nil
+	switch res.Status {
+	case agent.TerminalSuccess:
+		summary := res.LastOutput.Message.TextContent()
+		if summary == "" {
+			// A textless completed summary — including refusal-only —
+			// fails the orchestration after its ready settlement: no
+			// retry, the direct settlement carrying the retained detail
+			// and the reported usage.
+			return "", reported, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("compaction summary is empty"), capture, reported)
+		}
+		return summary, reported, nil
+	default:
+		// A run-level terminal — a pre-run cancellation, or a cancellation
+		// observed after the settled summary result before the run's
+		// success return — leaves the Operation running and quiet with no
+		// settlement; the direct settlement covers it, and takes no
+		// compensating write when the effect already settled the same
+		// terminal.
+		terminal := OperationFailure
+		if res.Status == agent.TerminalInterruption {
+			terminal = OperationInterruption
+		}
+		return "", reported, h.settleCompactionFailure(c, operationID, terminal, errors.New(res.Detail), capture, reported)
+	}
 }
 
 // settleCompactionFailure is the direct terminal settlement of one
 // orchestration failure or run-level terminal on the quiet running Operation:
-// the given terminal state and detail commit with the accumulated usage keyed
-// by the compact model, and the cause returns to the caller. An Operation
-// already settled by a piece effect, or one whose committed intent state a
-// publication failure left for recovery, takes no compensating write.
+// the given terminal state and detail commit with the reported summary usage
+// keyed by the compact model and marked as compaction usage, and the cause
+// returns to the caller. An Operation already settled by the summary effect,
+// or one whose committed intent state a publication failure left for
+// recovery, takes no compensating write.
 func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, terminal OperationState, cause error, capture ExecutionCapture, usage *UsageCount) error {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
@@ -338,6 +283,7 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 		detail:     cause.Error(),
 		usage:      usage,
 		usageModel: capture.Compact.Model,
+		compaction: true,
 	}); err != nil {
 		return err
 	}
@@ -347,7 +293,7 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 // compactionFailureSettlement converts one compaction-trigger failure into
 // the model effect's return shape by the Operation's durable state — the
 // settled outcome's single discriminator. An Operation already settled (a
-// piece failure settled inside its own effect, or any other failure settled
+// summary failure settled inside its own effect, or any other failure settled
 // through the direct terminal settlement) keeps the failure settlement with a
 // nil error: the request whose checkpoint failed is never sent, with no
 // retry and no uncompacted fallback. A still-running or absent Operation —
@@ -443,7 +389,7 @@ func compactionBoundary(entries []graphEntry, namedCompactionID string, snapshot
 // model on the entry and both register totals in the same transaction. A
 // failed transaction leaves every previous value durable and settles the
 // quiet running Operation through the direct terminal settlement carrying
-// the commit error and the accumulated usage keyed by the compact model.
+// the commit error and the reported usage keyed by the compact model.
 func (h *Harness) commitCompaction(c *coordinator, operationID string, capture ExecutionCapture, summary string, snapshotLen int, usage *UsageCount, manual bool) error {
 	c.mu.Lock()
 	viewOp, ok := c.graph.Operation(operationID)
@@ -522,7 +468,7 @@ func (h *Harness) commitCompaction(c *coordinator, operationID string, capture E
 		}
 		newEntries = append(newEntries, adopted)
 
-		// The orchestration's accumulated total lands keyed by the compact
+		// The orchestration's reported total lands keyed by the compact
 		// model on the entry and both register totals.
 		var contribution UsageTotals
 		if usage != nil {
@@ -567,7 +513,7 @@ func (h *Harness) commitCompaction(c *coordinator, operationID string, capture E
 		// the same transaction; the settlement itself carries no usage
 		// because the compaction part already added the totals.
 		if manual {
-			settledOp, settledSess, settledEntries, err := commitTerminalSettlement(tx, sessionID, operationID, committedSess, nextOp, replacedSession.Revision, replaced.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil)
+			settledOp, settledSess, settledEntries, err := commitTerminalSettlement(tx, sessionID, operationID, committedSess, nextOp, replacedSession.Revision, replaced.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil, false)
 			if err != nil {
 				return err
 			}

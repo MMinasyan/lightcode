@@ -20,10 +20,6 @@ const publicModule = "github.com/MMinasyan/lightcode"
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 
-// tiktokenPkg is the one third-party dependency the harness permits: the
-// conversation token estimator's cl100k_base encoder.
-const tiktokenPkg = "github.com/pkoukk/tiktoken-go"
-
 // oapiRuntimePkg is the one third-party dependency the protocol permits:
 // generated HTTP parameter binding for its standard-library net/http server
 // and client.
@@ -219,8 +215,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": agent package imports "+imp+"; agent may import only the standard library and "+modelPkg)
 			}
 		case "harness":
-			if imp != modelPkg && imp != agentPkg && imp != tiktokenPkg && !std[imp] {
-				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", "+agentPkg+", and "+tiktokenPkg)
+			if imp != modelPkg && imp != agentPkg && !std[imp] {
+				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", and "+agentPkg)
 			}
 		case "runtime":
 			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && !std[imp] {
@@ -357,20 +353,12 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", publicModule + "/agent"}, std); len(problems) != 0 {
 		t.Errorf("allowed harness-agent imports flagged: %v", problems)
 	}
-	if problems := checkTrackedGoFile("harness/x.go", []string{"fmt", tiktokenPkg}, std); len(problems) != 0 {
-		t.Errorf("allowed harness tiktoken imports flagged: %v", problems)
-	}
 	if problems := checkTrackedGoFile("internal/storage/x.go", []string{"fmt", "context", publicModule + "/harness", sqliteDriverPkg}, std); len(problems) != 0 {
 		t.Errorf("allowed internal/storage imports flagged: %v", problems)
 	}
 	for _, rel := range []string{"model/x.go", "agent/x.go", "harness/x.go"} {
 		if problems := checkTrackedGoFile(rel, []string{sqliteDriverPkg}, std); len(problems) != 1 {
 			t.Errorf("%s importing the sqlite driver: %d problems, want 1: %v", rel, len(problems), problems)
-		}
-	}
-	for _, rel := range []string{"model/x.go", "agent/x.go"} {
-		if problems := checkTrackedGoFile(rel, []string{tiktokenPkg}, std); len(problems) != 1 {
-			t.Errorf("%s importing the tiktoken encoder: %d problems, want 1: %v", rel, len(problems), problems)
 		}
 	}
 	for _, imp := range []string{publicModule + "/model", publicModule + "/agent"} {
@@ -577,7 +565,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	for _, imp := range []string{
 		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
 		publicModule + "/runtime", publicModule + "/internal/agent",
-		publicModule + "/internal/storage", sqliteDriverPkg, tiktokenPkg,
+		publicModule + "/internal/storage", sqliteDriverPkg,
 	} {
 		if problems := checkTrackedGoFile("protocol/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("protocol importing %q: %d problems, want 1: %v", imp, len(problems), problems)
@@ -616,7 +604,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	for _, imp := range []string{
 		publicModule + "/model", publicModule + "/agent", publicModule + "/harness",
 		publicModule + "/runtime", publicModule + "/internal/agent", publicModule + "/internal/cli",
-		publicModule + "/internal/storage", sqliteDriverPkg, tiktokenPkg, oapiRuntimePkg,
+		publicModule + "/internal/storage", sqliteDriverPkg, oapiRuntimePkg,
 	} {
 		if problems := checkTrackedGoFile("internal/terminal/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/terminal importing %q: %d problems, want 1: %v", imp, len(problems), problems)
@@ -630,7 +618,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	}
 	for _, imp := range []string{
 		publicModule + "/model", publicModule + "/internal/cli", publicModule + "/internal/terminal",
-		publicModule + "/internal/storage", sqliteDriverPkg, oapiRuntimePkg, tiktokenPkg,
+		publicModule + "/internal/storage", sqliteDriverPkg, oapiRuntimePkg,
 	} {
 		if problems := checkTrackedGoFile("internal/hostprocess/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/hostprocess importing %q: %d problems, want 1: %v", imp, len(problems), problems)
@@ -800,7 +788,7 @@ func TestDependencyRulesProtocolGenIsolation(t *testing.T) {
 		publicModule + "/internal/clientops", publicModule + "/internal/desktopclient",
 		publicModule + "/internal/acpclient", publicModule + "/internal/cliclient",
 		publicModule + "/client", publicModule + "/protocol",
-		oapiRuntimePkg, tiktokenPkg, "github.com/getkin/kin-openapi/openapi3filter",
+		oapiRuntimePkg, "github.com/getkin/kin-openapi/openapi3filter",
 	} {
 		if problems := checkTrackedGoFile("internal/protocolgen/x.go", []string{imp}, std); len(problems) != 1 {
 			t.Errorf("internal/protocolgen importing %q: %d problems, want 1: %v", imp, len(problems), problems)

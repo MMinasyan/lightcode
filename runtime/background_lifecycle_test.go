@@ -330,7 +330,7 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
 		childID, operationID, childID, entryID, lifecycleSeedToolDefinition, now)
 	operationPayload := fmt.Sprintf(
 		`{"admission":%s,"state":{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}}`,

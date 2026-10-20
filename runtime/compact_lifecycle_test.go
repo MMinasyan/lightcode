@@ -26,9 +26,9 @@ import (
 // the paging and recovery rows seed with, and the exported-surface pin.
 
 // compactObservationConfigDocument configures the conversation model with a
-// window the sized overflow input exceeds while the post-compaction
-// projection fits, and the compact model as a distinct catalog identity with a
-// generous window, so the wire distinguishes the transports by model ID.
+// window whose trigger threshold the seed turn's reported usage overflows,
+// and the compact model as a distinct catalog identity, so the wire
+// distinguishes the transports by model ID.
 func compactObservationConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{` +
 		`"m":{"name":"M","context_window":8192,"max_output_tokens":4096},` +
@@ -43,16 +43,10 @@ const compactObservationAgentsDocument = `{
 	"compact": {"model": "prov/k"}
 }`
 
-// compactFillerRepeats sizes the overflow input. The repeated unit's pinned
-// cl100k_base cost over the bundled data is 8194 tokens for these repetitions
-// — 4096 repetitions cost only 4098 — comfortably past the 4096-token trigger
-// threshold of the configured window (8192) minus reserve (4096). The
-// post-compaction projection stays far below it.
-const compactFillerRepeats = 8192
-
 // TestCompactLifecycleNativeCompactionObservation keeps the Runtime observer
-// oracle through the native pipeline: a sized overflowing admission triggers
-// one automatic compaction whose piece request reaches the compact model's
+// oracle through the native pipeline: the first turn's reported conversation
+// usage overflows the captured window, the next admission's checkpoint runs
+// one automatic compaction whose summary request reaches the compact model's
 // transport — distinguished by its model ID, with the captured compact
 // prompt and no tools — the committed summary turns the conversation
 // projection, and the observation bus carries only well-scoped facts: the
@@ -68,13 +62,18 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		ctx := context.Background()
-		// The overflow input exceeds the window minus the reserve, while the
-		// post-compaction projection — the composed prompt plus the summary —
-		// fits.
-		overflowInput := strings.Repeat("filler ", compactFillerRepeats)
 
 		e.server.setScript(func(_ context.Context, body string) []string {
 			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
+				if lastUserText(body) == "first question" {
+					// The seed report: {5000,10} overflows the window 8192
+					// minus the reserve 4096.
+					return []string{
+						`{"choices":[{"delta":{"role":"assistant","content":"seeded answer"},"finish_reason":null}]}`,
+						`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`,
+					}
+				}
 				return nil // conversation turns: the default completed text turn
 			}
 			return []string{
@@ -94,25 +93,28 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		}
 		sessionID := session.Identity.SessionID
 
-		submitThroughRuntime(t, r, sessionID, "op-1", overflowInput)
-		op1 := awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
-		if op1.State.Status != harness.OperationSuccess {
-			t.Fatalf("overflowing operation = %+v, want the compacted success", op1.State)
+		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
+		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess) // the seed turn commits the report
+		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
+		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
+		if op2.State.Status != harness.OperationSuccess {
+			t.Fatalf("overflowing operation = %+v, want the compacted success", op2.State)
 		}
-		submitConvergedThroughRuntime(t, r, sessionID, "op-2", "second question", harness.OperationSuccess)
+		submitConvergedThroughRuntime(t, r, sessionID, "op-3", "second question", harness.OperationSuccess)
 		if err := r.Close(ctx); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
 
-		// The wire: one compact piece on the compact model, then the two
-		// conversation requests against the summary projection.
-		var compactPiece string
+		// The wire: the seed conversation request, one compact summary on
+		// the compact model, then the two conversation requests against the
+		// summary projection.
+		var compactSummary string
 		var conversation []string
 		for i := 0; i < e.server.requests(); i++ {
 			body := e.server.bodyAt(i)
 			doc := decodeWireChatBody(t, body)
 			if doc.Model == "k" {
-				compactPiece = body
+				compactSummary = body
 				continue
 			}
 			if doc.Model != "m" {
@@ -120,27 +122,31 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			}
 			conversation = append(conversation, body)
 		}
-		if compactPiece == "" {
+		if compactSummary == "" {
 			t.Fatal("the compaction never reached the compact model's transport")
 		}
-		if len(conversation) != 2 {
-			t.Fatalf("conversation requests = %d, want the compacted turn plus the later one", len(conversation))
+		if len(conversation) != 3 {
+			t.Fatalf("conversation requests = %d, want the seed turn plus the compacted turn plus the later one", len(conversation))
 		}
-		piece := decodeWireChatBody(t, compactPiece)
-		if len(piece.Tools) != 0 {
-			t.Fatalf("compact piece advertised %d tools, want none", len(piece.Tools))
+		seed := decodeWireChatBody(t, conversation[0])
+		if roles := wireRoles(seed); !slices.Equal(roles, []string{"system", "user"}) {
+			t.Fatalf("seed request roles = %v, want the prompt and the first message", roles)
 		}
-		if len(piece.Messages) == 0 || piece.Messages[0].Role != "system" {
-			t.Fatalf("compact piece = %+v, want the leading compact system prompt", piece.Messages)
+		summary := decodeWireChatBody(t, compactSummary)
+		if len(summary.Tools) != 0 {
+			t.Fatalf("compact summary request advertised %d tools, want none", len(summary.Tools))
+		}
+		if len(summary.Messages) == 0 || summary.Messages[0].Role != "system" {
+			t.Fatalf("compact summary request = %+v, want the leading compact system prompt", summary.Messages)
 		}
 		var systemText string
-		if err := json.Unmarshal(piece.Messages[0].Content, &systemText); err != nil || systemText != op1.Admission.Execution.Compact.SystemPrompt {
-			t.Fatalf("compact piece system = %q (err %v), want the captured compact prompt %q", systemText, err, op1.Admission.Execution.Compact.SystemPrompt)
+		if err := json.Unmarshal(summary.Messages[0].Content, &systemText); err != nil || systemText != op2.Admission.Execution.Compact.SystemPrompt {
+			t.Fatalf("compact summary system = %q (err %v), want the captured compact prompt %q", systemText, err, op2.Admission.Execution.Compact.SystemPrompt)
 		}
-		if op1.Admission.Execution.Compact.Model != (model.ModelRef{Provider: "prov", Model: "k"}) {
-			t.Fatalf("captured compact model = %+v, want the overlaid prov/k", op1.Admission.Execution.Compact.Model)
+		if op2.Admission.Execution.Compact.Model != (model.ModelRef{Provider: "prov", Model: "k"}) {
+			t.Fatalf("captured compact model = %+v, want the overlaid prov/k", op2.Admission.Execution.Compact.Model)
 		}
-		first := decodeWireChatBody(t, conversation[0])
+		first := decodeWireChatBody(t, conversation[1])
 		if roles := wireRoles(first); !slices.Equal(roles, []string{"system", "assistant"}) {
 			t.Fatalf("post-compaction request roles = %v, want the prompt and the summary alone", roles)
 		}
@@ -151,7 +157,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		if !strings.Contains(summaryText, "native summary one") {
 			t.Fatalf("post-compaction assistant = %q, want the committed summary", summaryText)
 		}
-		second := decodeWireChatBody(t, conversation[1])
+		second := decodeWireChatBody(t, conversation[2])
 		if roles := wireRoles(second); !slices.Equal(roles, []string{"system", "assistant", "assistant", "user"}) {
 			t.Fatalf("second request roles = %v, want the prompt, the summary, the first closing turn and the new message", roles)
 		}
@@ -175,8 +181,8 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
 				t.Fatalf("decode compaction entry: %v", err)
 			}
-			if wire.OperationID != "op-1" || wire.Summary != "native summary one" {
-				t.Fatalf("compaction entry = %+v, want op-1's committed summary", wire)
+			if wire.OperationID != "op-2" || wire.Summary != "native summary one" {
+				t.Fatalf("compaction entry = %+v, want op-2's committed summary", wire)
 			}
 		}
 		if compactions != 1 {
@@ -203,7 +209,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				}
 				sawInvalidation = true
 			case "text_delta":
-				if err := assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2"); err != nil {
+				if err := assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2", "op-3"); err != nil {
 					t.Fatalf("text progress: %v", err)
 				}
 				sawDelta = true
@@ -260,7 +266,7 @@ func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"m"},`+
 			`"context_window":4096,"output_reserve":1024,`+
 			`"system_prompt":"compact-sys","tools":[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"prov","model":"m"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"prov","model":"m"},"system_prompt":"summarize"}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, now)
 }
 
@@ -382,7 +388,7 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		if revision != durable.ConfigurationRevision {
 			t.Fatalf("hook-saw revision %q differs from the durable %q", revision, durable.ConfigurationRevision)
 		}
-		if seen.Model.Provider == "" || seen.Model.Model == "" || seen.ContextWindow <= 0 || seen.OutputReserve <= 0 || seen.SystemPrompt == "" {
+		if seen.Model.Provider == "" || seen.Model.Model == "" || seen.SystemPrompt == "" {
 			t.Fatalf("captured compact configuration incomplete: %+v", seen)
 		}
 

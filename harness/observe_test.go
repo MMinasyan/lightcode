@@ -1307,7 +1307,8 @@ func TestObserveCompactAttribution(t *testing.T) {
 	col := observeHarness(h)
 	exec := effectExecution(nil, nil)
 	exec.CompactModel = compactFn
-	effect := h.compactModelEffect(c, testOpID, exec, testCapture(), &usageAccumulator{})
+	var reported *UsageCount
+	effect := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
 	if _, err := invokeModelEffect(t, effect, nil); err != nil {
 		t.Fatalf("compact model effect: %v", err)
 	}

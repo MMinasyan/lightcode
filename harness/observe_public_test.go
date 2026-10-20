@@ -125,58 +125,27 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 }
 
 // publicChildSummary is the child fixture's projected summary turn: its
-// message text and its pinned cl100k_base cost below describe the same
-// literal.
+// message text as framed by the projection.
 const publicChildSummary = "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]"
-
-// publicFixtureTokens pins the cl100k_base cost of every literal this fixture
-// sizes with, over the bundled tokenizer data. The estimator below adds the
-// flat +4 per message, so the fixture window is the exact cost of the
-// assembled request minus one token.
-var publicFixtureTokens = map[string]int{
-	"system":                      1,
-	strings.Repeat("seed ", 80):   81,
-	"child answer":                2,
-	publicChildSummary:            17,
-	strings.Repeat("word ", 4000): 4001,
-}
 
 // TestPublicLaunchChildSessionAutomaticCompaction retains the launched-child
 // trigger oracle on both stores and extends it with the frozen-checkpoint
-// steering row: the child's actual compact request parks inside the
-// checkpoint, a user steering head submitted during the freeze stays pending
-// with no successor scoped, the compaction summary and usage commit once
-// under the preceding child Operation, and the successor then owns its caller
-// identity/input and receives the summary projection. Completion delivery,
-// terminal publication, scoped Close and run retirement are separate
-// observations.
+// steering row: the first child turn reports the conversation usage that
+// overflows the captured window, the child's actual compact request parks
+// inside the checkpoint, a user steering head submitted during the freeze
+// stays pending with no successor scoped, the compaction summary and usage
+// commit once under the preceding child Operation, and the successor then owns
+// its caller identity/input and receives the summary projection. Completion
+// delivery, terminal publication, scoped Close and run retirement are
+// separate observations.
 func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx, cancel := context.WithCancel(context.Background())
 		sink := &publicFactSink{}
-		fixtureTokens := func(text string) int {
-			tokens, ok := publicFixtureTokens[text]
-			if !ok {
-				t.Fatalf("no pinned token vector for fixture text %q", text)
-			}
-			return tokens
-		}
-		estimate := func(messages []model.Message) int {
-			total := 0
-			for _, message := range messages {
-				total += fixtureTokens(message.TextContent()) + 4
-				for _, call := range message.ToolCalls {
-					total += fixtureTokens(call.Name)
-					total += fixtureTokens(string(call.Arguments))
-				}
-			}
-			return total
-		}
 		first := strings.Repeat("seed ", 80)
 		huge := strings.Repeat("word ", 4000)
 		capture := compactManualCapture()
-		capture.ContextWindow, capture.OutputReserve = 262144, 64
-		capture.Compact.ContextWindow, capture.Compact.OutputReserve = 65536, 4096
+		capture.ContextWindow, capture.OutputReserve = 4096, 2048
 		var mu sync.Mutex
 		var prepares []harness.PreparationRequest
 		type requestObservation struct {
@@ -209,6 +178,12 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 								if admission.SessionID == root {
 									parentRequest <- admission.OperationID
 									return summaryTurnStream("parent complete", model.Usage{}), nil
+								}
+								if admission.OperationID == "child-op-1" {
+									// The report that will overflow the
+									// checkpoint: window 4096 minus reserve
+									// 2048.
+									return summaryTurnStream("child answer", model.Usage{InputTokens: 5000, CachedInputTokens: 100, OutputTokens: 50}), nil
 								}
 								return summaryTurnStream("child answer", model.Usage{}), nil
 							},
@@ -308,19 +283,9 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		if got := texts(firstRequest); len(got) != 2 || got[1] != first {
 			t.Fatalf("first child projection = %q", got)
 		}
-		assembled := append(append([]model.Message(nil), firstRequest.Messages...),
-			model.Message{Role: model.RoleAssistant, Source: publicModelRef, Content: []model.ContentPart{{Kind: model.PartText, Text: "child answer"}}},
-			model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: huge}}})
 		mu.Lock()
-		capture.ContextWindow = estimate(assembled) + capture.OutputReserve - 1
-		window, reserve, compactRef := capture.ContextWindow, capture.OutputReserve, capture.Compact.Model
+		window, compactRef := capture.ContextWindow, capture.Compact.Model
 		mu.Unlock()
-		if fits := estimate([]model.Message{
-			firstRequest.Messages[0],
-			{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: publicChildSummary}}},
-		}) + reserve; fits > window {
-			t.Fatalf("summary request %d does not fit overflowing window %d", fits, window)
-		}
 		if result, err := submit(t, h, child, "child-op-2", harness.MessageModeRegular, huge); err != nil || result.Disposition != harness.DispositionAdmitted {
 			t.Fatalf("second child submit = %+v, %v", result, err)
 		}

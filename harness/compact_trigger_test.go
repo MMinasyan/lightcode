@@ -1,13 +1,17 @@
 // Contract coverage for the conversation model effect's compaction trigger:
-// an overflowing request compacts before it is sent and proceeds against the
-// new projection, a fitting request is untouched, a failed checkpoint fails
-// the Operation with the request unsent, a storage failure that leaves the
-// Operation running propagates as the raw effect error to the storage-failure
-// latch and Wait — over a live piece intent and over the quiet direct
-// settlement — steering submitted during the orchestration stays buffered for
-// the next model boundary, a later overflow in the same Operation compacts
-// again, the committed boundary covers exactly the frozen snapshot so an entry
-// appended between the freeze and the commit still projects, and compact piece
+// the newest reported conversation usage after the current compaction boundary
+// decides the checkpoint — an overflowing report compacts before the request
+// is sent and the turn proceeds against the new projection, a report at or
+// below the threshold leaves the request untouched, a missing report never
+// compacts, a present zero obeys the same inequality, a failed checkpoint
+// fails the Operation with the request unsent, a storage failure that leaves
+// the Operation running propagates as the raw effect error to the
+// storage-failure latch and Wait — over a live summary intent and over the
+// quiet direct settlement — steering submitted during the orchestration stays
+// buffered for the next model boundary, a later overflow in the same Operation
+// compacts again, the committed boundary covers exactly the frozen snapshot so
+// an entry appended between the freeze and the commit still projects, summary
+// usage is billed without ever supplying the measurement, and compact summary
 // requests never trigger compaction.
 package harness
 
@@ -45,34 +49,14 @@ func projectedTriggerRequest(t *testing.T, h *Harness, c *coordinator) model.Req
 	return req
 }
 
-// triggerCapture returns the fixture capture with the conversation window set
-// against the request's estimate-plus-reserve threshold: one below it makes
-// the request overflow the trigger's strict inequality, exactly at it leaves
-// the request fitting.
-func triggerCapture(t *testing.T, req model.Request, overflow bool) ExecutionCapture {
-	t.Helper()
+// triggerUsageCapture returns the fixture capture whose conversation
+// threshold — ContextWindow minus OutputReserve, the value the trigger's
+// strict inequality compares reported usage against — is exactly the given
+// value. A negative threshold is a capture whose reserve exceeds its window.
+func triggerUsageCapture(threshold int64) ExecutionCapture {
 	capture := testCapture()
-	threshold := estimateTokens("", req.Messages) + capture.OutputReserve
-	if overflow {
-		capture.ContextWindow = threshold - 1
-	} else {
-		capture.ContextWindow = threshold
-	}
-	return capture
-}
-
-// overflowingTriggerCapture sizes the conversation window through the
-// triggerCapture arithmetic over the deterministic projection of one admitted
-// text input — the captured system message plus the one input message — so
-// the projected request overflows the trigger's estimate-plus-reserve
-// threshold by one.
-func overflowingTriggerCapture(input string) ExecutionCapture {
-	capture := testCapture()
-	projected := []model.Message{
-		{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: capture.SystemPrompt}}},
-		{Role: model.RoleUser, Content: admissionContent(input)},
-	}
-	capture.ContextWindow = estimateTokens("", projected) + capture.OutputReserve - 1
+	capture.ContextWindow = int(threshold) + 1024
+	capture.OutputReserve = 1024
 	return capture
 }
 
@@ -85,23 +69,50 @@ func invokeTriggerEffect(t *testing.T, me agent.ModelEffect, req model.Request) 
 	})
 }
 
-// TestModelEffectCompactTriggerFittingRequestUntouched proves the fitting row:
-// a request whose estimate plus the output reserve does not exceed the
-// conversation window is sent unchanged, the compact transport never runs, and
-// no compaction work commits.
-func TestModelEffectCompactTriggerFittingRequestUntouched(t *testing.T) {
+// seedConversationUsage runs one ordinary conversation model effect whose
+// completed output reports the given usage: the committed assistant entry is
+// the provider measurement the trigger consumes. The seed effect runs over the
+// given capture before any report the fixture tests exists.
+func seedConversationUsage(t *testing.T, h *Harness, c *coordinator, capture ExecutionCapture, usage UsageCount) {
+	t.Helper()
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		return streamOf(turnDelta("stop", "seed turn"), usageDelta(model.Usage{
+			InputTokens:       int(usage.InputTokens),
+			CachedInputTokens: int(usage.CachedInputTokens),
+			OutputTokens:      int(usage.OutputTokens),
+		})), nil
+	}
+	exec := Execution{Model: modelFn, CompactModel: forbiddenConversationModel(t), NormalizeTool: objectNormalize}
+	if set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
+		t.Fatalf("seed turn settlement = %+v, err %v, want ready", set, err)
+	}
+}
+
+// TestModelEffectCompactTriggerReportedUsageCompacts is the provider-usage
+// trigger regression: the request messages are too small for any text estimate
+// to overflow the window, and a seeded reported conversation usage above the
+// window minus the output reserve carries the trigger instead. Every summand
+// is required for the verdict: the full total 2049 strictly overflows the
+// fixture threshold 2048, while dropping any single summand lands at or below
+// it — the cached input count participates exactly like the others.
+func TestModelEffectCompactTriggerReportedUsageCompacts(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	req := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req, false)
-	var sent []model.Request
+	capture := testCapture()
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 1000, CachedInputTokens: 1000, OutputTokens: 49})
+	compactCalls := 0
+	conversationCalls := 0
 	exec := Execution{
-		Model: func(ctx context.Context, r model.Request) (model.Stream, error) {
-			sent = append(sent, r)
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			conversationCalls++
 			return completedTurnStream(), nil
 		},
-		CompactModel:  forbiddenConversationModel(t),
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			compactCalls++
+			return summaryStream("summary one", model.Usage{InputTokens: 10, OutputTokens: 5}), nil
+		},
 		NormalizeTool: objectNormalize,
 	}
+	req := projectedTriggerRequest(t, h, c)
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
 	if err != nil {
 		t.Fatalf("model effect: %v", err)
@@ -109,30 +120,182 @@ func TestModelEffectCompactTriggerFittingRequestUntouched(t *testing.T) {
 	if set.Disposition != agent.DispoReady {
 		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
 	}
-	if len(sent) != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly one", len(sent))
+	if compactCalls != 1 {
+		t.Fatalf("compact transport calls = %d, want the reported usage above the threshold to compact first", compactCalls)
 	}
-	if !reflect.DeepEqual(req.Messages, sent[0].Messages) {
-		t.Fatalf("sent messages changed through a fitting request:\nwant %+v\ngot  %+v", req.Messages, sent[0].Messages)
+	if conversationCalls != 1 {
+		t.Fatalf("conversation transport calls = %d, want exactly the post-compaction request", conversationCalls)
 	}
 	graph, err := validateFixture(t, store, sessionID)
 	if err != nil {
 		t.Fatalf("graph: %v", err)
 	}
-	if graph.Session.State.CompactionEntryID != "" {
-		t.Fatalf("compaction_entry_id %q, want it empty on a fitting request", graph.Session.State.CompactionEntryID)
+	comp := compactedEntryOf(t, graph)
+	if comp.OperationID != testOpID || comp.Summary != "summary one" {
+		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
 	}
-	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed for a fitting request")
-		}
+}
+
+// TestModelEffectCompactTriggerNoReportNeverCompacts is the missing-report
+// row: a window so small that every text estimate overflows it still never
+// compacts while no reported usage exists.
+func TestModelEffectCompactTriggerNoReportNeverCompacts(t *testing.T) {
+	h, _, c, _ := newEffectHarness(t, nil)
+	capture := testCapture()
+	capture.ContextWindow = 1
+	compactCalls := 0
+	conversationCalls := 0
+	exec := Execution{
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			conversationCalls++
+			return completedTurnStream(), nil
+		},
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			compactCalls++
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		NormalizeTool: objectNormalize,
 	}
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
 	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
+		t.Fatalf("model effect: %v", err)
 	}
-	if rec.State.Status != OperationRunning {
-		t.Fatalf("operation status %q, want running after the fitting request", rec.State.Status)
+	if set.Disposition != agent.DispoReady {
+		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
+	}
+	if compactCalls != 0 {
+		t.Fatalf("compact transport calls = %d, want no compaction without a reported usage", compactCalls)
+	}
+	if conversationCalls != 1 {
+		t.Fatalf("conversation transport calls = %d, want the fitting request sent unchanged", conversationCalls)
+	}
+}
+
+// TestModelEffectCompactTriggerFittingRequestUntouched proves the fitting
+// rows: a reported usage below the threshold and a reported usage exactly at
+// the threshold are sent unchanged — the trigger is a strict inequality — the
+// compact transport never runs, and no compaction work commits.
+func TestModelEffectCompactTriggerFittingRequestUntouched(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		usage UsageCount
+	}{
+		{"below threshold", UsageCount{InputTokens: 1000, CachedInputTokens: 1000, OutputTokens: 47}},
+		{"equal threshold", UsageCount{InputTokens: 1000, CachedInputTokens: 1000, OutputTokens: 48}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h, store, c, sessionID := newEffectHarness(t, nil)
+			capture := testCapture() // threshold 4096 - 2048 = 2048
+			seedConversationUsage(t, h, c, capture, row.usage)
+			req := projectedTriggerRequest(t, h, c)
+			var sent []model.Request
+			exec := Execution{
+				Model: func(ctx context.Context, r model.Request) (model.Stream, error) {
+					sent = append(sent, r)
+					return completedTurnStream(), nil
+				},
+				CompactModel:  forbiddenConversationModel(t),
+				NormalizeTool: objectNormalize,
+			}
+			set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+			if err != nil {
+				t.Fatalf("model effect: %v", err)
+			}
+			if set.Disposition != agent.DispoReady {
+				t.Fatalf("settlement disposition %q, want ready", set.Disposition)
+			}
+			if len(sent) != 1 {
+				t.Fatalf("conversation transport calls = %d, want exactly one", len(sent))
+			}
+			if !reflect.DeepEqual(req.Messages, sent[0].Messages) {
+				t.Fatalf("sent messages changed through a fitting request:\nwant %+v\ngot  %+v", req.Messages, sent[0].Messages)
+			}
+			graph, err := validateFixture(t, store, sessionID)
+			if err != nil {
+				t.Fatalf("graph: %v", err)
+			}
+			if graph.Session.State.CompactionEntryID != "" {
+				t.Fatalf("compaction_entry_id %q, want it empty on a fitting request", graph.Session.State.CompactionEntryID)
+			}
+			for i := range graph.Entries {
+				if graph.Entries[i].Compaction != nil {
+					t.Fatalf("compaction entry committed for a fitting request")
+				}
+			}
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			if err != nil {
+				t.Fatalf("ReadOperation: %v", err)
+			}
+			if rec.State.Status != OperationRunning {
+				t.Fatalf("operation status %q, want running after the fitting request", rec.State.Status)
+			}
+		})
+	}
+}
+
+// TestModelEffectCompactTriggerPresentZeroWithReserveOverWindowCompacts
+// proves the present-zero row: a reported all-zero usage obeys the same
+// strict inequality, and when the output reserve exceeds the context window
+// the threshold is negative, so the zero report overflows it.
+func TestModelEffectCompactTriggerPresentZeroWithReserveOverWindowCompacts(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := triggerUsageCapture(-1) // window 1023, reserve 1024: threshold -1
+	seedConversationUsage(t, h, c, capture, UsageCount{})
+	compactCalls := 0
+	conversationCalls := 0
+	exec := Execution{
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			conversationCalls++
+			return completedTurnStream(), nil
+		},
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			compactCalls++
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		NormalizeTool: objectNormalize,
+	}
+	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+	if err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+	if set.Disposition != agent.DispoReady {
+		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
+	}
+	if compactCalls != 1 || conversationCalls != 1 {
+		t.Fatalf("compact/conversation transport calls = %d/%d, want 1/1 for the overflowing zero report", compactCalls, conversationCalls)
+	}
+	if _, err := validateFixture(t, store, sessionID); err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+}
+
+// TestModelEffectCompactTriggerWideUsageSumCompacts proves big.Int exactness:
+// counts whose total exceeds the widest int64 trigger through the exact
+// comparison where int64 addition would wrap to a negative total.
+func TestModelEffectCompactTriggerWideUsageSumCompacts(t *testing.T) {
+	h, _, c, _ := newEffectHarness(t, nil)
+	capture := testCapture()
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 6_000_000_000_000_000_000, CachedInputTokens: 6_000_000_000_000_000_000})
+	compactCalls := 0
+	exec := Execution{
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			return completedTurnStream(), nil
+		},
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			compactCalls++
+			return summaryStream("summary one", model.Usage{}), nil
+		},
+		NormalizeTool: objectNormalize,
+	}
+	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+	if err != nil {
+		t.Fatalf("model effect: %v", err)
+	}
+	if set.Disposition != agent.DispoReady {
+		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
+	}
+	if compactCalls != 1 {
+		t.Fatalf("compact transport calls = %d, want the exact wide sum above the threshold to compact", compactCalls)
 	}
 }
 
@@ -172,14 +335,15 @@ func (s *triggerCompactCommitStore) Transact(ctx context.Context, fn func(Transa
 // TestModelEffectCompactTriggerOverflowCompactsFirst proves the overflow row:
 // the orchestration runs and the automatic commit lands before the request is
 // sent, the sent request carries the projection's summary message with no
-// post-boundary entries, and the piece usage is attributed to the compaction
-// entry and both register totals keyed by the compact model.
+// post-boundary entries, and the summary usage is attributed to the
+// compaction entry and both register totals keyed by the compact model.
 func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := testCapture()
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 3000, CachedInputTokens: 100, OutputTokens: 50})
 	req := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req, true)
 	compactRef := testCompactCapture().Model
-	pieceUsage := UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}
+	summaryUsage := UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}
 	var sent []model.Request
 	var conversationCalls atomic.Int64
 	compactCalls := 0
@@ -293,7 +457,7 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	if parkedEntry.BoundaryEntryID != boundary {
 		t.Fatalf("parked boundary %q != the last pre-commit entry %q", parkedEntry.BoundaryEntryID, boundary)
 	}
-	if parkedEntry.Summary != "summary one" || parkedEntry.Usage == nil || *parkedEntry.Usage != pieceUsage {
+	if parkedEntry.Summary != "summary one" || parkedEntry.Usage == nil || *parkedEntry.Usage != summaryUsage {
 		t.Fatalf("parked compaction summary/usage = %+v", parkedEntry)
 	}
 	if parked.session.State.CompactionEntryID != parkedEntry.EntryID {
@@ -305,8 +469,8 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 			parkedSessionUsage.ByModel = append(parkedSessionUsage.ByModel, mu)
 		}
 	}
-	if len(parkedSessionUsage.ByModel) != 1 || parkedSessionUsage.ByModel[0].Usage != pieceUsage {
-		t.Fatalf("parked session usage = %+v, want the piece's counts", parked.session.State.Usage)
+	if len(parkedSessionUsage.ByModel) != 1 || parkedSessionUsage.ByModel[0].Usage != summaryUsage {
+		t.Fatalf("parked session usage = %+v, want the summary's counts", parked.session.State.Usage)
 	}
 	if parked.operation.State.Status != OperationRunning || parked.operation.State.Terminal != nil {
 		t.Fatalf("parked operation status = %q, want the enclosing Operation still running", parked.operation.State.Status)
@@ -317,8 +481,8 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 			parkedOperationUsage.ByModel = append(parkedOperationUsage.ByModel, mu)
 		}
 	}
-	if len(parkedOperationUsage.ByModel) != 1 || parkedOperationUsage.ByModel[0].Usage != pieceUsage {
-		t.Fatalf("parked operation usage = %+v, want the piece's counts", parked.operation.State.Usage)
+	if len(parkedOperationUsage.ByModel) != 1 || parkedOperationUsage.ByModel[0].Usage != summaryUsage {
+		t.Fatalf("parked operation usage = %+v, want the summary's counts", parked.operation.State.Usage)
 	}
 	select {
 	case result := <-done:
@@ -338,7 +502,7 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 		t.Fatal("automatic effect did not finish after compaction transaction release")
 	}
 	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one piece", compactCalls)
+		t.Fatalf("compact transport calls = %d, want exactly one summary request", compactCalls)
 	}
 	if len(sent) != 1 {
 		t.Fatalf("conversation transport calls = %d, want exactly one after the compaction", len(sent))
@@ -364,8 +528,8 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	if comp.OperationID != testOpID || comp.Summary != "summary one" {
 		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
 	}
-	if comp.Usage == nil || *comp.Usage != pieceUsage {
-		t.Fatalf("compaction entry usage = %+v, want the piece's reported counts", comp.Usage)
+	if comp.Usage == nil || *comp.Usage != summaryUsage {
+		t.Fatalf("compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
 	}
 	if graph.Session.State.CompactionEntryID != comp.EntryID {
 		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
@@ -376,8 +540,8 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
 		}
 	}
-	if len(compactionUsage.ByModel) != 1 || compactionUsage.ByModel[0].Usage != pieceUsage {
-		t.Fatalf("session usage = %+v, want the piece's counts keyed by the compact model", graph.Session.State.Usage)
+	if len(compactionUsage.ByModel) != 1 || compactionUsage.ByModel[0].Usage != summaryUsage {
+		t.Fatalf("session usage = %+v, want the summary's counts keyed by the compact model", graph.Session.State.Usage)
 	}
 	assistants := 0
 	for i := range graph.Entries {
@@ -385,22 +549,24 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 			assistants++
 		}
 	}
-	if assistants != 1 {
-		t.Fatalf("assistant entries = %d, want the one turn committed after the compaction", assistants)
+	if assistants != 2 {
+		t.Fatalf("assistant entries = %d, want the seed turn and the one turn committed after the compaction", assistants)
 	}
 }
 
-// TestModelEffectCompactTriggerCheckpointFailureUnsent proves the failure row:
-// a piece failure inside its own effect settles the terminal failure with the
-// accumulated usage keyed by the compact model, the effect returns the failure
-// settlement with the request never sent, and the previous projection stays
-// current with its successful prior compaction unchanged. The two-piece snapshot makes the
-// accumulated total real: the first piece settles ready reporting usage, the
-// second fails before any attempt.
+// TestModelEffectCompactTriggerCheckpointFailureUnsent proves the failure
+// row: a failed summary response that reports usage settles its own effect's
+// terminal failure with that reported usage keyed by the compact model, the
+// effect returns the failure settlement with the request never sent, and the
+// previous projection stays current with its successful prior compaction
+// unchanged. The prior checkpoint ran on a seeded overflowing report, and the
+// failed checkpoint runs on the prior turn's present-zero report under a
+// capture whose reserve exceeds its window.
 func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
+	priorCapture := testCapture()
+	seedConversationUsage(t, h, c, priorCapture, UsageCount{InputTokens: 3000})
 	priorRequest := projectedTriggerRequest(t, h, c)
-	priorCapture := triggerCapture(t, priorRequest, true)
 	priorUsage := UsageCount{InputTokens: 7, OutputTokens: 3}
 	priorExec := Execution{
 		Model: func(context.Context, model.Request) (model.Stream, error) {
@@ -425,16 +591,15 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	if prior.EntryID == "" || prior.Summary != "prior summary" || prior.Usage == nil || *prior.Usage != priorUsage || operationStateOf(t, priorGraph, testOpID).Status != OperationSuccess {
 		t.Fatalf("successful nonempty prior checkpoint missing: %+v", prior)
 	}
-	const firstPieceOp = "op-2"
+	const laterOperation = "op-2"
 	const failingOperation = "op-3"
-	pieces := compactTwoPieceSnapshot(t)
-	// Two durable admitted inputs — the split-Operation shape of two delivered
-	// messages — make the later checkpoint need a continuation piece.
-	mustAdmitWithoutExecution(t, h, sessionID, firstPieceOp, pieces[0].Content)
-	if err := h.settleAgentTerminal(c, firstPieceOp, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background()); err != nil {
+	// Two durable admitted inputs — the split-Operation shape of two
+	// delivered messages.
+	mustAdmitWithoutExecution(t, h, sessionID, laterOperation, admissionContent("later input"))
+	if err := h.settleAgentTerminal(c, laterOperation, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	mustAdmitWithoutExecution(t, h, sessionID, failingOperation, pieces[1].Content)
+	mustAdmitWithoutExecution(t, h, sessionID, failingOperation, admissionContent("failing input"))
 	before, err := h.projectContext(c, failingOperation)
 	if err != nil {
 		t.Fatalf("projectContext: %v", err)
@@ -446,8 +611,8 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	for i := range preexisting {
 		preexisting[i].Payload = append(json.RawMessage(nil), preexisting[i].Payload...)
 	}
-	// Use the actual projection: the prior committed summary/answer plus two
-	// durable inputs make the later checkpoint need a continuation piece.
+	// Use the actual projection: the prior committed summary and turn plus
+	// the two later inputs make the failed checkpoint's frozen snapshot.
 	req, err := model.NewRequest(model.Request{
 		Messages: before,
 		Tools:    []model.ToolDefinition{testToolDefinition()},
@@ -455,9 +620,9 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	capture := triggerCapture(t, req, true)
+	capture := triggerUsageCapture(-1) // the prior turn's zero report overflows a negative threshold
 	compactRef := testCompactCapture().Model
-	pieceCalls := 0
+	summaryCalls := 0
 	conversationCalls := 0
 	exec := Execution{
 		Model: func(context.Context, model.Request) (model.Stream, error) {
@@ -465,16 +630,14 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 			return nil, errors.New("failed checkpoint sent its conversation request")
 		},
 		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
-			pieceCalls++
-			if pieceCalls == 1 {
-				if !strings.Contains(r.Messages[len(r.Messages)-1].TextContent(), "prior summary") {
-					return nil, errors.New("later checkpoint omitted the committed prior summary")
-				}
-				// the first piece: reports usage and settles ready
-				return summaryStream("S1", model.Usage{InputTokens: 4, OutputTokens: 2}), nil
+			summaryCalls++
+			if !strings.Contains(r.Messages[len(r.Messages)-1].TextContent(), "prior summary") {
+				return nil, errors.New("later checkpoint omitted the committed prior summary")
 			}
-			// the continuation piece: fails before any attempt
-			return nil, errors.New("provider failure")
+			// The one failed summary response: it reports usage before
+			// the read failure.
+			return failStream(errors.New("provider failure"),
+				turnDelta("", "partial"), usageDelta(model.Usage{InputTokens: 4, OutputTokens: 2})), nil
 		},
 		Retry:         (&retrySpy{limit: 0}).retry,
 		NormalizeTool: objectNormalize,
@@ -484,10 +647,10 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		t.Fatalf("model effect = %v, want the settled failure with a nil error", err)
 	}
 	if set.Disposition != agent.DispoFailure || set.Output != nil || !strings.Contains(set.Detail, "provider failure") {
-		t.Fatalf("settlement = %+v, want the outputless failure carrying the piece detail", set)
+		t.Fatalf("settlement = %+v, want the outputless failure carrying the summary failure detail", set)
 	}
-	if pieceCalls != 2 || conversationCalls != 0 {
-		t.Fatalf("later compact/conversation calls = %d/%d, want 2/0", pieceCalls, conversationCalls)
+	if summaryCalls != 1 || conversationCalls != 0 {
+		t.Fatalf("later compact/conversation calls = %d/%d, want 1/0", summaryCalls, conversationCalls)
 	}
 	graph, err := validateFixture(t, store, sessionID)
 	if err != nil {
@@ -509,13 +672,16 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
 	}
 	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 4, OutputTokens: 2}) {
-		t.Fatalf("settlement usage = %+v, want the accumulated piece usage", settlement.Usage)
+		t.Fatalf("settlement usage = %+v, want the failed summary's reported usage", settlement.Usage)
 	}
-	// The failed checkpoint's accumulated usage reaches both totals keyed by
+	if !settlement.CompactionUsage {
+		t.Fatalf("settlement compaction_usage = false, want the summary usage provenance marked")
+	}
+	// The failed checkpoint's reported usage reaches both totals keyed by
 	// the compact model: the Operation register and the Session register.
 	wantTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 4, OutputTokens: 2}}}}
 	if state := operationStateOf(t, graph, failingOperation); state.Status != OperationFailure || !usageTotalsEqual(state.Usage, wantTotals) {
-		t.Fatalf("operation usage = %+v, want the accumulated piece counts keyed by the compact model", state.Usage)
+		t.Fatalf("operation usage = %+v, want the reported summary counts keyed by the compact model", state.Usage)
 	}
 	compactSessionTotals := UsageTotals{}
 	for _, contribution := range graph.Session.State.Usage.ByModel {
@@ -525,7 +691,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 	}
 	wantSessionTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 11, OutputTokens: 5}}}}
 	if !usageTotalsEqual(compactSessionTotals, wantSessionTotals) {
-		t.Fatalf("session compact usage = %+v, want prior plus failed piece counts", compactSessionTotals)
+		t.Fatalf("session compact usage = %+v, want prior plus failed summary counts", compactSessionTotals)
 	}
 	if graph.Session.State.CompactionEntryID != prior.EntryID {
 		t.Fatalf("compaction_entry_id %q, want prior %q on failed checkpoint", graph.Session.State.CompactionEntryID, prior.EntryID)
@@ -559,15 +725,16 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 // TestModelEffectCompactTriggerSteeringStaysBuffered proves the steering row:
 // steering submitted during the orchestration never enters the frozen snapshot
 // and stays buffered — the rebuilt request carries only the compacted
-// projection, no compact piece exits at a boundary, and the completed
-// turn settles ready so the steering is delivered through ordinary successor
-// admission after the Operation's terminal.
+// projection, no compact summary request exits at a boundary, and the
+// completed turn settles ready so the steering is delivered through ordinary
+// successor admission after the Operation's terminal.
 func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, func(context.Context, model.Request) (model.Stream, error) {
 		return completedTurnStream(), nil // the successor admission's own run completes
 	})
+	capture := triggerUsageCapture(4)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
 	req := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req, true)
 	var sent []model.Request
 	exec := Execution{
 		Model: func(ctx context.Context, r model.Request) (model.Stream, error) {
@@ -593,8 +760,8 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 		t.Fatalf("model effect: %v", err)
 	}
 	// The completed turn settles ready: waiting steering never keeps the
-	// Operation running inside the model effect, and no compact piece drains
-	// or exits at a boundary for the steering.
+	// Operation running inside the model effect, and no compact summary
+	// request drains or exits at a boundary for the steering.
 	if set.Disposition != agent.DispoReady {
 		t.Fatalf("settlement disposition %q, want the ordinary ready settlement", set.Disposition)
 	}
@@ -646,13 +813,16 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 }
 
 // TestModelEffectCompactTriggerSecondOverflowSameOperation proves the
-// no-count rule: a second overflowing request later in the same Operation
+// no-count rule: a second overflowing report later in the same Operation
 // compacts again, committing a second compaction entry owned by the same
-// Operation, and the Operation continues against the newest projection.
+// Operation, and the Operation continues against the newest projection. The
+// later turn's own modest report carries the second overflow; the seed's
+// larger report stays behind the committed boundary.
 func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := triggerUsageCapture(4)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
 	req1 := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req1, true)
 	summaries := []string{"S1", "S2"}
 	compactCalls := 0
 	var sentTexts [][]string
@@ -663,7 +833,7 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 				texts = append(texts, msg.TextContent())
 			}
 			sentTexts = append(sentTexts, texts)
-			return completedTurnStream(), nil
+			return completedTurnStream(), nil // reports {3,1,2}: above threshold 4
 		},
 		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
 			compactCalls++
@@ -679,14 +849,11 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 		t.Fatalf("first request: settlement %+v err %v, want ready", set, err)
 	}
 	req2 := projectedTriggerRequest(t, h, c)
-	if estimateTokens("", req2.Messages)+capture.OutputReserve <= capture.ContextWindow {
-		t.Fatalf("fixture precondition: the second request %d tokens fits the window", estimateTokens("", req2.Messages))
-	}
 	if set, err := invokeTriggerEffect(t, me, req2); err != nil || set.Disposition != agent.DispoReady {
 		t.Fatalf("second request: settlement %+v err %v, want ready", set, err)
 	}
 	if compactCalls != 2 {
-		t.Fatalf("compact transport calls = %d, want one piece per compaction", compactCalls)
+		t.Fatalf("compact transport calls = %d, want one summary request per compaction", compactCalls)
 	}
 	if len(sentTexts) != 2 {
 		t.Fatalf("conversation transport calls = %d, want one per boundary", len(sentTexts))
@@ -722,16 +889,71 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 	}
 }
 
+// TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly proves the
+// measurement exclusion and the cutoff in one row: a committed summary's
+// usage is billed on the entry and both totals but never supplies the
+// trigger measurement, and the seed report that overflowed the first
+// checkpoint stays behind the committed boundary. The turn's modest report
+// fits the threshold, so the second checkpoint does not compact.
+func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := triggerUsageCapture(12)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
+	summaryUsage := UsageCount{InputTokens: 1000, CachedInputTokens: 1000, OutputTokens: 1000}
+	compactCalls := 0
+	conversationCalls := 0
+	exec := Execution{
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			conversationCalls++
+			return completedTurnStream(), nil // reports {3,1,2}: below threshold 12
+		},
+		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
+			compactCalls++
+			return summaryStream("summary one", model.Usage{InputTokens: 1000, CachedInputTokens: 1000, OutputTokens: 1000}), nil
+		},
+		NormalizeTool: objectNormalize,
+	}
+	me := h.modelEffect(c, testOpID, exec, capture)
+	if set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
+		t.Fatalf("overflow checkpoint: settlement %+v err %v, want ready", set, err)
+	}
+	if set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
+		t.Fatalf("fitting checkpoint: settlement %+v err %v, want ready", set, err)
+	}
+	if compactCalls != 1 {
+		t.Fatalf("compact transport calls = %d, want the billed summary usage and the bounded seed report to leave the second checkpoint fitting", compactCalls)
+	}
+	if conversationCalls != 2 {
+		t.Fatalf("conversation transport calls = %d, want one per checkpoint", conversationCalls)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	if err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+	comp := compactedEntryOf(t, graph) // exactly one compaction entry
+	if comp.Usage == nil || *comp.Usage != summaryUsage {
+		t.Fatalf("compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
+	}
+	compactionUsage := UsageTotals{}
+	for _, mu := range graph.Session.State.Usage.ByModel {
+		if mu.Model == testCompactCapture().Model {
+			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
+		}
+	}
+	if len(compactionUsage.ByModel) != 1 || compactionUsage.ByModel[0].Usage != summaryUsage {
+		t.Fatalf("session compact usage = %+v, want the summary's counts billed exactly once", graph.Session.State.Usage)
+	}
+}
+
 // TestModelEffectCompactRequestNeverTriggers proves the structural recursion
-// guard: with the conversation window small enough to fire the trigger on any
-// request and the compact window large, the compact piece requests run the
-// orchestration's single piece and commit exactly one entry — a trigger inside
-// the compact model effect would recurse into the orchestration without ever
+// guard: with an overflowing report live, the orchestration's summary request
+// runs one request and commits exactly one entry — a trigger inside the
+// compact model effect would recurse into the orchestration without ever
 // reaching a transport.
 func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	capture := testCapture()
-	capture.ContextWindow = 1 // every conversation request overflows; the compact capture stays large
+	capture := triggerUsageCapture(4)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
 	compactCalls := 0
 	conversationCalls := 0
 	exec := Execution{
@@ -754,7 +976,7 @@ func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
 	}
 	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one piece with no recursion", compactCalls)
+		t.Fatalf("compact transport calls = %d, want exactly one summary request with no recursion", compactCalls)
 	}
 	if conversationCalls != 1 {
 		t.Fatalf("conversation transport calls = %d, want exactly the post-compaction request", conversationCalls)
@@ -770,23 +992,24 @@ func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 }
 
 // TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled proves the
-// unsettled row: a storage failure at a piece's ready result commit — the
-// piece intent stays live, the failure left the Operation running for
+// unsettled row: a storage failure at the summary's ready result commit — the
+// summary intent stays live, the failure left the Operation running for
 // recovery — returns from the trigger as the raw storage error with no
 // settlement shape, and the Operation keeps its committed running/intent
-// state with no entry beyond the admitted input.
+// state with no entry beyond the seed turn.
 func TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := triggerUsageCapture(4)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
 	req := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req, true)
-	injected := fmt.Errorf("piece result commit storage failure: %w", ErrStorage)
+	injected := fmt.Errorf("summary result commit storage failure: %w", ErrStorage)
 	replaces := 0
 	store.txHook = func(step string) error {
 		if step != "replace_register" {
 			return nil
 		}
 		replaces++
-		if replaces == 2 { // #1 the piece intent, #2/#3 the ready result commit
+		if replaces == 2 { // #1 the summary intent, #2/#3 the ready result commit
 			return injected
 		}
 		return nil
@@ -816,28 +1039,32 @@ func TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled(t *testing.T
 	if err != nil {
 		t.Fatalf("graph: %v", err)
 	}
-	if len(graph.Entries) != 1 { // only the admitted input: the failed ready commit rolled back
-		t.Fatalf("entries = %d, want only the admitted input after the rollback", len(graph.Entries))
+	if len(graph.Entries) != 2 { // the admitted input and the seed turn: the failed ready commit rolled back
+		t.Fatalf("entries = %d, want the admitted input and the seed turn after the rollback", len(graph.Entries))
 	}
 }
 
 // TestCompactTriggerUnsettledStorageFailureReachesWait proves the full latch
-// row over a live piece intent: a storage failure at the piece's ready result
-// commit — the intent stays live, the Operation running — propagates as the
-// raw effect error through the run and the outer settlement, is latched as
-// the storage failure that stopped admitted work, and Wait reports it while
-// the Operation keeps its committed running/intent state for recovery.
+// row over a live summary intent: an ordinary turn first commits the reported
+// usage the later checkpoint measures, a storage failure at that checkpoint's
+// summary ready result commit — the intent stays live, the Operation running —
+// propagates as the raw effect error through the run and the outer
+// settlement, is latched as the storage failure that stopped admitted work,
+// and Wait reports it while the checkpoint Operation keeps its committed
+// running/intent state for recovery.
 func TestCompactTriggerUnsettledStorageFailureReachesWait(t *testing.T) {
 	store := emptyStore(t)
-	capture := overflowingTriggerCapture("hello")
-	injected := fmt.Errorf("piece result commit storage failure: %w", ErrStorage)
+	capture := testCapture()
+	injected := fmt.Errorf("summary result commit storage failure: %w", ErrStorage)
 	fired := make(chan struct{}, 1)
 	exec := Execution{
-		Model: forbiddenConversationModel(t),
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			return streamOf(turnDelta("stop", "seeded turn"), usageDelta(model.Usage{InputTokens: 3000})), nil
+		},
 		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
 			// The intent's replace_register has already committed when the
-			// transport runs; the next replace_register is the piece result
-			// commit's operation-register write.
+			// transport runs; the next replace_register is the summary
+			// result commit's operation-register write.
 			store.txHook = func(step string) error {
 				if step != "replace_register" {
 					return nil
@@ -861,19 +1088,23 @@ func TestCompactTriggerUnsettledStorageFailureReachesWait(t *testing.T) {
 	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	<-fired // the piece's ready result commit failed at its operation-register write
+	awaitOperationTerminal(t, store, session, "op-1", OperationSuccess) // the ordinary turn commits the report
+	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow"); err != nil {
+		t.Fatalf("second submit: %v", err)
+	}
+	<-fired // the checkpoint's summary result commit failed at its operation-register write
 	cancel()
 	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
 		t.Fatalf("Wait = %v, want the injected storage error reported over the running Operation", err)
 	}
-	rec := settledOperation(t, store, session, "op-1")
+	rec := settledOperation(t, store, session, "op-2")
 	if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
 		t.Fatalf("operation state = %+v, want the running state with its live intent for recovery", rec.State)
 	}
 }
 
 // TestCompactTriggerQuietSettlementStorageFailureReachesWait proves the quiet
-// row: the textless piece settles ready and clears the effect, and the
+// row: the textless summary settles ready and clears the effect, and the
 // direct empty-summary settlement's storage failure — the Operation quiet and
 // running — propagates as the raw effect error, takes the outer settlement's
 // no-compensating-write branch, is latched, and Wait reports it with the
@@ -881,16 +1112,18 @@ func TestCompactTriggerUnsettledStorageFailureReachesWait(t *testing.T) {
 // committed.
 func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
 	store := emptyStore(t)
-	capture := overflowingTriggerCapture("hello")
+	capture := testCapture()
 	injected := fmt.Errorf("direct settlement storage failure: %w", ErrStorage)
 	fired := make(chan struct{}, 1)
 	refusal := turnDelta("stop", "")
 	refusal.RefusalFragment = "no"
 	exec := Execution{
-		Model: forbiddenConversationModel(t),
+		Model: func(context.Context, model.Request) (model.Stream, error) {
+			return streamOf(turnDelta("stop", "seeded turn"), usageDelta(model.Usage{InputTokens: 3000})), nil
+		},
 		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
-			// The piece's ready settlement only replaces registers; the first
-			// insert_entry of the trigger invocation is the direct
+			// The summary's ready settlement only replaces registers; the
+			// first insert_entry of the checkpoint is the direct
 			// settlement's settlement entry.
 			store.txHook = func(step string) error {
 				if step != "insert_entry" {
@@ -915,12 +1148,16 @@ func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
 	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
+	awaitOperationTerminal(t, store, session, "op-1", OperationSuccess) // the ordinary turn commits the report
+	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow"); err != nil {
+		t.Fatalf("second submit: %v", err)
+	}
 	<-fired // the direct settlement failed at its settlement entry insert
 	cancel()
 	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
 		t.Fatalf("Wait = %v, want the injected storage error reported over the running quiet Operation", err)
 	}
-	rec := settledOperation(t, store, session, "op-1")
+	rec := settledOperation(t, store, session, "op-2")
 	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
 		t.Fatalf("operation state = %+v, want the running quiet state for recovery", rec.State)
 	}
@@ -928,21 +1165,41 @@ func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("graph: %v", err)
 	}
-	if len(graph.Entries) != 1 { // only the admitted input: no settlement and no compaction entry committed
-		t.Fatalf("entries = %d, want only the admitted input with no settlement entry", len(graph.Entries))
+	settlements := 0
+	for i := range graph.Entries {
+		if graph.Entries[i].Compaction != nil {
+			t.Fatalf("compaction entry committed on the failed direct settlement")
+		}
+		if graph.Entries[i].Settlement != nil {
+			settlements++
+			if graph.Entries[i].Envelope.OperationID != "op-1" {
+				t.Fatalf("settlement entry for %q, want only op-1's ordinary terminal", graph.Entries[i].Envelope.OperationID)
+			}
+		}
+	}
+	if settlements != 1 { // only op-1's ordinary terminal: no checkpoint settlement committed
+		t.Fatalf("settlement entries = %d, want only op-1's with none for the failed checkpoint", settlements)
 	}
 }
 
 // TestModelEffectCompactBoundaryExcludesPostFreezeAppends proves the frozen
 // boundary against the live interleave: a background completion delivered
-// while the trigger's piece attempt is parked appends an entry after the
+// while the trigger's summary attempt is parked appends an entry after the
 // frozen snapshot, and the committed boundary still names the freeze-time
 // last projectable entry, so the appended signal projects after the summary
 // instead of being named as covered and hidden.
 func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
+	capture := triggerUsageCapture(4)
+	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
+	seeded, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seeded) != 2 || seeded[1].Kind != EntryAssistant {
+		t.Fatalf("seed entries = %+v, want the admitted input and the seed assistant", seeded)
+	}
 	req := projectedTriggerRequest(t, h, c)
-	capture := triggerCapture(t, req, true)
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var sent []model.Request
@@ -1000,8 +1257,8 @@ func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 		t.Fatalf("graph: %v", err)
 	}
 	comp := compactedEntryOf(t, graph)
-	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
-		t.Fatalf("boundary %q, want the freeze-time last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
+	if comp.BoundaryEntryID != seeded[1].ID {
+		t.Fatalf("boundary %q, want the freeze-time last projectable entry %q", comp.BoundaryEntryID, seeded[1].ID)
 	}
 	// The rebuilt request carried the appended signal after the summary.
 	if len(sent) != 1 {
@@ -1028,93 +1285,68 @@ func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 	}
 }
 
-// TestModelEffectCompactTriggerTwoPieceCommitAccumulatesUsage proves the
-// rolling-commit chain the deleted Runtime row carried: the real two-piece
-// orchestration succeeds on both pieces, the complete rich input — the errored
-// partial with its failure signal, the ordered rich tool turn, its complete
-// tool result and the refusal turn — is consumed exactly once in order over
-// the estimator-sized complete pieces, the run returns the field-wise
-// accumulated total, the second piece carries exactly the remaining message
-// whole under the previous-summary framing, and the commit attributes that
-// same accumulated total to the Operation-owned compaction entry and both
-// registers in one transaction.
-func TestModelEffectCompactTriggerTwoPieceCommitAccumulatesUsage(t *testing.T) {
+// TestModelEffectCompactTriggerFullInputCommitAttributesUsage is the
+// full-input commit observation the deleted rolling rows carried: the real
+// orchestration succeeds on its single request over the complete rich input —
+// the errored partial with its failure signal, the ordered rich tool turn,
+// its complete tool result, the refusal turn, and the tail message — consumed
+// exactly once in order, the run returns the one response's reported usage,
+// the request carries the whole serialized snapshot under one framing, and the
+// commit attributes that same total to the Operation-owned compaction entry
+// and both registers in one transaction at the frozen boundary.
+func TestModelEffectCompactTriggerFullInputCommitAttributesUsage(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	capture := testCapture()
 	compactRef := testCompactCapture().Model
-	var pieces []model.Request
+	var requests []model.Request
 	exec := Execution{
 		Model: forbiddenConversationModel(t),
 		CompactModel: func(ctx context.Context, r model.Request) (model.Stream, error) {
-			pieces = append(pieces, r)
-			if len(pieces) == 1 {
-				return summaryStream("piece one", model.Usage{InputTokens: 4, OutputTokens: 2}), nil
-			}
-			return summaryStream("piece two", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
+			requests = append(requests, r)
+			return summaryStream("full summary", model.Usage{InputTokens: 5, OutputTokens: 3}), nil
 		},
 		NormalizeTool: objectNormalize,
 	}
 	// The complete-input snapshot: the rich conversation prefix followed by
-	// the estimator-sized two-message tail, so the first piece carries the
-	// whole rich history plus the first complete message and the second
-	// piece carries only the remaining message.
+	// one further message.
 	rich := completeCompactionInputMessages(t)
-	tail := compactTwoPieceSnapshot(t)
+	tail := []model.Message{{Role: model.RoleUser, Content: admissionContent("the tail message")}}
 	snapshot := append(append([]model.Message(nil), rich...), tail...)
-	// Fixture preconditions against the real estimator: the prefix plus the
-	// first tail message fit one fresh piece, and the second tail message
-	// exceeds that piece's remaining budget while fitting a whole piece.
-	budget := compactionPieceBudget(capture.Compact, "")
-	prefixCost := 0
-	for _, line := range mustSerializeCompaction(t, rich) {
-		prefixCost += estimateTokens(line, nil)
-	}
-	costFirst := estimateTokens(mustSerializeCompaction(t, tail[:1])[0], nil)
-	costSecond := estimateTokens(mustSerializeCompaction(t, tail[1:])[0], nil)
-	if prefixCost+costFirst > budget {
-		t.Fatalf("fixture precondition: the rich prefix plus the first message costs %d over the %d-token piece budget", prefixCost+costFirst, budget)
-	}
-	if costSecond <= budget-prefixCost-costFirst {
-		t.Fatalf("fixture precondition: the second message would fit the first piece's remaining budget")
-	}
 
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
 	if err != nil {
 		t.Fatalf("runCompaction: %v", err)
 	}
-	if summary != "piece two" {
-		t.Fatalf("summary = %q, want the final piece output", summary)
+	if summary != "full summary" {
+		t.Fatalf("summary = %q, want the request output", summary)
 	}
 	if usage == nil || *usage != (UsageCount{InputTokens: 5, OutputTokens: 3}) {
-		t.Fatalf("run usage = %+v, want the field-wise piece sum {5,3}", usage)
+		t.Fatalf("run usage = %+v, want the one request's reported counts", usage)
 	}
-	if len(pieces) != 2 {
-		t.Fatalf("compact transport calls = %d, want exactly two pieces", len(pieces))
+	if len(requests) != 1 {
+		t.Fatalf("compact transport calls = %d, want one full-input request", len(requests))
 	}
-	// Consumed exactly once in order: the two pieces' user texts carry the
-	// snapshot's serialized lines whole and in snapshot order.
+	// Consumed exactly once in order: the request's user text carries every
+	// serialized snapshot line whole in snapshot order.
 	wantLines := mustSerializeCompaction(t, snapshot)
-	firstText := pieces[0].Messages[1].TextContent()
-	if firstText != strings.Join(wantLines[:len(wantLines)-1], "\n") {
-		t.Fatalf("first piece user text = %q, want the whole rich history plus the first message in order", firstText)
+	userText := requests[0].Messages[1].TextContent()
+	if userText != strings.Join(wantLines, "\n") {
+		t.Fatalf("request user text = %q, want every snapshot line whole in order", userText)
 	}
-	// The second piece carries exactly the remaining message whole under the
-	// continuation framing — the one-message-per-piece isolation.
-	framing := "Previous summary:\npiece one\n\nContinuation:\n"
-	if got := pieces[1].Messages[1].TextContent(); got != framing+wantLines[len(wantLines)-1] {
-		t.Fatalf("second piece user text %q, want the whole remaining message under the continuation framing", got)
+	if strings.Contains(userText, "Previous summary:") || strings.Contains(userText, "Continuation:") {
+		t.Fatalf("the request carries continuation framing: %q", userText)
 	}
-	// The first piece's rich lines on the wire: the errored partial, the
-	// wrapped failure signal, the ordered content parts, the raw tool-call
-	// arguments, the complete tool result and the refusal turn.
-	for i, line := range strings.Split(firstText, "\n")[:len(rich)] {
+	// The rich lines on the wire: the errored partial, the wrapped failure
+	// signal, the ordered content parts, the raw tool-call arguments, the
+	// complete tool result and the refusal turn.
+	for i, line := range strings.Split(userText, "\n")[:len(rich)] {
 		var got compactPieceWireLine
 		if err := json.Unmarshal([]byte(line), &got); err != nil {
-			t.Fatalf("first piece line %d unmarshal: %v", i, err)
+			t.Fatalf("request line %d unmarshal: %v", i, err)
 		}
 		if i == 3 { // the call's raw arguments ride the quoted representation
 			if len(got.ToolCalls) != 1 || got.ToolCalls[0].ID != "call-rich" || got.ToolCalls[0].Name != "noop" {
-				t.Fatalf("first piece line 3 tool calls = %+v, want exactly the one noop call", got.ToolCalls)
+				t.Fatalf("request line 3 tool calls = %+v, want exactly the one noop call", got.ToolCalls)
 			}
 			args, uerr := strconv.Unquote(got.ToolCalls[0].Arguments)
 			if uerr != nil || args != `{"x":1}` {
@@ -1123,11 +1355,11 @@ func TestModelEffectCompactTriggerTwoPieceCommitAccumulatesUsage(t *testing.T) {
 			got.ToolCalls[0].Arguments = ""
 		}
 		if !reflect.DeepEqual(got, wantRichPieceLines[i]) {
-			t.Fatalf("first piece line %d = %+v, want %+v", i, got, wantRichPieceLines[i])
+			t.Fatalf("request line %d = %+v, want %+v", i, got, wantRichPieceLines[i])
 		}
 	}
-	// The rolling commit attributes the same accumulated total to the
-	// Operation-owned compaction entry and both registers in one transaction.
+	// The commit attributes the same reported total to the Operation-owned
+	// compaction entry and both registers in one transaction.
 	if err := h.commitCompaction(c, testOpID, capture, summary, 1, usage, false); err != nil {
 		t.Fatalf("commitCompaction: %v", err)
 	}
@@ -1136,21 +1368,24 @@ func TestModelEffectCompactTriggerTwoPieceCommitAccumulatesUsage(t *testing.T) {
 		t.Fatalf("graph: %v", err)
 	}
 	comp := compactedEntryOf(t, graph)
-	if comp.OperationID != testOpID || comp.Summary != "piece two" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned final piece summary", comp)
+	if comp.OperationID != testOpID || comp.Summary != "full summary" {
+		t.Fatalf("compaction entry = %+v, want the Operation-owned summary", comp)
+	}
+	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
+		t.Fatalf("boundary %q, want the last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
 	}
 	if comp.Usage == nil || *comp.Usage != (UsageCount{InputTokens: 5, OutputTokens: 3}) {
-		t.Fatalf("compaction entry usage = %+v, want the accumulated piece sum {5,3}", comp.Usage)
+		t.Fatalf("compaction entry usage = %+v, want the reported counts {5,3}", comp.Usage)
 	}
 	if graph.Session.State.CompactionEntryID != comp.EntryID {
 		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
 	}
 	want := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 5, OutputTokens: 3}}}}
 	if state := operationStateOf(t, graph, testOpID); !usageTotalsEqual(state.Usage, want) {
-		t.Fatalf("operation usage = %+v, want the accumulated piece counts keyed by the compact model", state.Usage)
+		t.Fatalf("operation usage = %+v, want the reported counts keyed by the compact model", state.Usage)
 	}
 	if !usageTotalsEqual(graph.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want the accumulated piece counts keyed by the compact model", graph.Session.State.Usage)
+		t.Fatalf("session usage = %+v, want the reported counts keyed by the compact model", graph.Session.State.Usage)
 	}
 }
 
@@ -1194,7 +1429,7 @@ var wantRichPieceLines = []compactPieceWireLine{
 	{Role: "assistant", Refusal: "cannot do that"},
 }
 
-// completeCompactionInputMessages builds the deleted complete-input row's rich
+// completeCompactionInputMessages builds the complete-input row's rich
 // conversation prefix through the accepting message constructor: the errored
 // partial with its production-wrapped failure signal, the ordered rich tool
 // turn, its complete tool result and the refusal turn.

@@ -125,6 +125,29 @@ func entryKindsByOperation(t *testing.T, store harness.Storage, sessionID, opera
 	return kinds
 }
 
+// settlementPayloadOf returns the one settlement entry payload of the given
+// Operation.
+func settlementPayloadOf(t *testing.T, store harness.Storage, sessionID, operationID string) string {
+	t.Helper()
+	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	var found string
+	for _, entry := range entries {
+		if entry.OperationID == operationID && entry.Kind == harness.EntryOperationSettlement {
+			if found != "" {
+				t.Fatalf("operation %q carries more than one settlement entry", operationID)
+			}
+			found = string(entry.Payload)
+		}
+	}
+	if found == "" {
+		t.Fatalf("operation %q carries no settlement entry", operationID)
+	}
+	return found
+}
+
 // idleHistory runs one completed conversation turn so the Session carries
 // compactable history and is idle again.
 func idleHistory(t *testing.T, f *compactManualFixture, session string) {
@@ -224,7 +247,7 @@ func (s *compactCommitGateStore) Transact(ctx context.Context, fn func(harness.T
 }
 
 // parkedUsageCount reports whether one raw register usage section carries
-// exactly the piece counts keyed by the compact model.
+// exactly the summary counts keyed by the compact model.
 func parkedUsageCount(t *testing.T, raw json.RawMessage, wantRef model.ModelRef) bool {
 	t.Helper()
 	// The register's usage section encodes its model identity in the wire
@@ -294,7 +317,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("decode parked compaction entry: %v", err)
 		}
 		if parkedWire.Summary != "S1" || parkedWire.Usage == nil || *parkedWire.Usage != (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}) {
-			t.Fatalf("parked compaction entry = %+v, want the committed summary and piece usage", parkedWire)
+			t.Fatalf("parked compaction entry = %+v, want the committed summary and summary usage", parkedWire)
 		}
 		parkedSessionReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
 		if err != nil {
@@ -313,7 +336,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("parked compaction_entry_id = %q, want the committed entry %q", parkedSession.State.CompactionEntryID, parkedCompaction.ID)
 		}
 		if !parkedUsageCount(t, parkedSession.State.Usage, compactModelRef) {
-			t.Fatalf("parked session usage = %s, want the piece counts keyed by the compact model", parkedSessionReg.Payload)
+			t.Fatalf("parked session usage = %s, want the summary counts keyed by the compact model", parkedSessionReg.Payload)
 		}
 		parkedOpReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "c-1"})
 		if err != nil {
@@ -337,7 +360,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("parked operation state = %s, want the register already terminal at the frozen instant", parkedOpReg.Payload)
 		}
 		if !parkedUsageCount(t, parkedOperation.State.Usage, compactModelRef) {
-			t.Fatalf("parked operation usage = %s, want the piece counts keyed by the compact model", parkedOpReg.Payload)
+			t.Fatalf("parked operation usage = %s, want the summary counts keyed by the compact model", parkedOpReg.Payload)
 		}
 		close(gated.release)
 		rec := awaitTerminal(t, f.h, session, "c-1")
@@ -345,7 +368,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			t.Fatalf("compact operation state = %+v, want the success terminal", rec.State)
 		}
 		if got := len(compact.seen()); got != 1 {
-			t.Fatalf("compact transport calls = %d, want exactly one piece", got)
+			t.Fatalf("compact transport calls = %d, want exactly one summary request", got)
 		}
 		if got := len(conversation.seen()); got != conversationCalls {
 			t.Fatalf("conversation transport calls = %d, want unchanged during compaction", got)
@@ -356,10 +379,13 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		if len(kinds) != 2 || kinds[0] != harness.EntryCompaction || kinds[1] != harness.EntryOperationSettlement {
 			t.Fatalf("compact Operation entries = %v, want exactly one compaction entry and its settlement", kinds)
 		}
+		if payload := settlementPayloadOf(t, store, session, "c-1"); strings.Contains(payload, "compaction_usage") {
+			t.Fatalf("manual success settlement payload %s, want the marker omitted", payload)
+		}
 		if ids := compactionEntryIDs(t, store, session); len(ids) != 1 {
 			t.Fatalf("compaction entries = %v, want exactly one", ids)
 		}
-		// The piece usage landed keyed by the compact model.
+		// The summary usage landed keyed by the compact model.
 		view, err := f.h.ReadSessionView(context.Background(), session)
 		if err != nil {
 			t.Fatalf("ReadSessionView: %v", err)
@@ -371,7 +397,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("session usage = %+v, want the piece counts keyed by the compact model", view.TotalUsage)
+			t.Fatalf("session usage = %+v, want the summary counts keyed by the compact model", view.TotalUsage)
 		}
 		// The compact preparation carried the compact request kind while the
 		// conversation turn's preparation carried the message kind.
@@ -580,6 +606,9 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 		if len(kinds) != 1 || kinds[0] != harness.EntryOperationSettlement {
 			t.Fatalf("compact Operation entries = %v, want only the settlement", kinds)
 		}
+		if payload := settlementPayloadOf(t, store, session, "c-1"); !strings.Contains(payload, `"compaction_usage":true`) {
+			t.Fatalf("failed compact settlement payload %s, want the inert summary marker durable", payload)
+		}
 		if ids := compactionEntryIDs(t, store, session); len(ids) != 0 {
 			t.Fatalf("compaction entries = %v, want none", ids)
 		}
@@ -609,6 +638,58 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 		}
 		if texts := texts(reqs[0]); len(texts) != 2 || texts[1] != "hello" {
 			t.Fatalf("first conversation request = %q, want the system and the user message alone", texts)
+		}
+	})
+}
+
+// TestPublicManualCompactFailedSummaryMarkerSurvivesReload proves the usage
+// provenance across a cold reload on both stores: a manual compaction whose
+// summary fails after reporting usage leaves that usage durably on the marked
+// settlement entry, and the conversation measurement reads the assistant
+// turn's usage unchanged through the warm view and through a freshly built
+// Harness over the same store — whose Session graph cold-loads from storage
+// via validateSessionGraph — because the marked settlement never supplies the
+// measurement. A reload that lost the marker would surface the settlement's
+// {5,7} in place of the assistant's {3,1,2} and flip this assertion.
+func TestPublicManualCompactFailedSummaryMarkerSurvivesReload(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(publicAttempt{stream: publicPartialTurnStream()})
+		f := newCompactManualFixture(t, store, conversation, compact)
+		defer f.close()
+		session := createSession(t, f.h)
+		idleHistory(t, f, session)
+
+		compactWhenIdle(t, f.h, session, "c-1")
+		rec := awaitTerminal(t, f.h, session, "c-1")
+		if rec.State.Status != harness.OperationFailure || !strings.Contains(rec.State.Terminal.Detail, "provider failure") {
+			t.Fatalf("compact operation = %+v, want the failed summary terminal", rec.State)
+		}
+		payload := settlementPayloadOf(t, store, session, "c-1")
+		if !strings.Contains(payload, `"compaction_usage":true`) || !strings.Contains(payload, `"input_tokens":5`) {
+			t.Fatalf("failed compact settlement payload %s, want the marked {5,7} summary usage durable", payload)
+		}
+
+		want := harness.UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}
+		// The cold reload first: a fresh Harness over the same store
+		// cold-loads the Session graph from storage; the same value the warm
+		// live graph returns must survive the durable round-trip.
+		cold := newCompactManualFixture(t, store, newScriptModel(publicTurn()), newScriptModel(publicTurn()))
+		defer cold.close()
+		view, err := cold.h.ReadSessionView(context.Background(), session)
+		if err != nil {
+			t.Fatalf("cold ReadSessionView: %v", err)
+		}
+		got := view.History.LatestContextUsage()
+		if got == nil || *got != want {
+			t.Fatalf("reloaded measurement = %+v, want the assistant turn's %+v: the cold load lost the settlement marker", got, want)
+		}
+		warm, err := f.h.ReadSessionView(context.Background(), session)
+		if err != nil {
+			t.Fatalf("warm ReadSessionView: %v", err)
+		}
+		if measured := warm.History.LatestContextUsage(); measured == nil || *measured != *got {
+			t.Fatalf("warm measurement = %+v, want the reloaded view's %+v", measured, got)
 		}
 	})
 }
@@ -685,7 +766,7 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 }
 
 // TestPublicManualCompactInterruptKeepsPriorProjection proves the interrupt
-// row: a live interrupt of a manual compact Operation parked at its piece
+// row: a live interrupt of a manual compact Operation parked at its summary request
 // settles the interruption with no new compaction entry, the previous
 // projection stays current, and the Session's current Operation clears.
 func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
@@ -708,9 +789,9 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 		}
 		priorID := prior[0]
 
-		// The second compact's piece parks until its own effect context
+		// The second compact's summary request parks until its own effect context
 		// ends: the interrupt releases it and settles the interruption.
-		pieceStarted := make(chan struct{}, 1)
+		summaryStarted := make(chan struct{}, 1)
 		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
 			if req.RequestKind == harness.RequestKindCompact && call >= 2 {
 				return harness.PreparedExecution{
@@ -720,10 +801,10 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 							Model: conversation.effect,
 							CompactModel: func(ctx context.Context, _ model.Request) (model.Stream, error) {
 								select {
-								case pieceStarted <- struct{}{}:
+								case summaryStarted <- struct{}{}:
 								default:
 								}
-								<-ctx.Done() // the interrupt ends the parked piece
+								<-ctx.Done() // the interrupt ends the parked summary request
 								return nil, ctx.Err()
 							},
 							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
@@ -738,9 +819,9 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 		}
 		compactWhenIdle(t, f.h, session, "c-2")
 		select {
-		case <-pieceStarted:
+		case <-summaryStarted:
 		case <-time.After(10 * time.Second):
-			t.Fatalf("the second compact piece never started")
+			t.Fatalf("the second compact summary request never started")
 		}
 		if err := f.h.Interrupt(ctx, session); err != nil {
 			t.Fatalf("Interrupt: %v", err)

@@ -47,10 +47,8 @@ func publicCapture() harness.ExecutionCapture {
 			Parameters:  json.RawMessage(`{"type":"object"}`),
 		}},
 		Compact: harness.CompactCapture{
-			Model:         publicModelRef,
-			ContextWindow: 4096,
-			OutputReserve: 2048,
-			SystemPrompt:  "summarize",
+			Model:        publicModelRef,
+			SystemPrompt: "summarize",
 		},
 	}
 }
@@ -3325,7 +3323,7 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
 }
 
@@ -6397,7 +6395,7 @@ func rawCompactAdmission(sessionID, operationID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
 		sessionID, operationID, rawToolDefinition, now)
 }
 

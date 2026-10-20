@@ -427,10 +427,8 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 					OutputReserve:         2048,
 					SystemPrompt:          "seeded",
 					Compact: harness.CompactCapture{
-						Model:         model.ModelRef{Provider: "prov", Model: "m"},
-						ContextWindow: 2048,
-						OutputReserve: 1024,
-						SystemPrompt:  "summarize",
+						Model:        model.ModelRef{Provider: "prov", Model: "m"},
+						SystemPrompt: "summarize",
 					},
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {

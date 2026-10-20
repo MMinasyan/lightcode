@@ -391,10 +391,8 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 		SystemPrompt:          "composed tools",
 		Tools:                 definitions,
 		Compact: harness.CompactCapture{
-			Model:         model.ModelRef{Provider: "prov", Model: "m"},
-			ContextWindow: 2048,
-			OutputReserve: 1024,
-			SystemPrompt:  "summarize",
+			Model:        model.ModelRef{Provider: "prov", Model: "m"},
+			SystemPrompt: "summarize",
 		},
 	}
 }

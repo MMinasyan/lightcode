@@ -570,6 +570,9 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 		if entry.Settlement.Usage == nil || *entry.Settlement.Usage != (UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}) {
 			t.Fatalf("settlement usage = %+v, want the reported no-output counts", entry.Settlement.Usage)
 		}
+		if entry.Settlement.CompactionUsage {
+			t.Fatalf("settlement compaction_usage = true, want the conversation usage unmarked")
+		}
 	}
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}}}}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -585,6 +588,9 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	}
 	if !usageTotalsEqual(view.TotalUsage, want) {
 		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
+	}
+	if measured := view.History.LatestContextUsage(); measured == nil || *measured != (UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}) {
+		t.Fatalf("latest context measurement = %+v, want the conversation no-output usage eligible", measured)
 	}
 }
 
@@ -2985,7 +2991,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil)
+			committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil, false)
 			if err != nil {
 				return err
 			}

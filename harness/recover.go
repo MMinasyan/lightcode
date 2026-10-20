@@ -88,7 +88,7 @@ func recoverRunningOperation(ctx context.Context, store Storage, sessionID, oper
 		if currentOp.State.Status != OperationRunning { // a second run finds no running Operation and writes nothing
 			return nil
 		}
-		_, _, _, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, OperationInterruption, recoveryInterruptedDetail, nil, model.ModelRef{}, nil)
+		_, _, _, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, OperationInterruption, recoveryInterruptedDetail, nil, model.ModelRef{}, nil, false)
 		return err
 	})
 }

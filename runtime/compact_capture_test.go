@@ -136,10 +136,8 @@ func compactBaseCapture() harness.ExecutionCapture {
 		ContextWindow:         4096,
 		OutputReserve:         131072,
 		Compact: harness.CompactCapture{
-			Model:         model.ModelRef{Provider: "prov", Model: "m2"},
-			ContextWindow: 2048,
-			OutputReserve: 1000,
-			SystemPrompt:  "summarize",
+			Model:        model.ModelRef{Provider: "prov", Model: "m2"},
+			SystemPrompt: "summarize",
 		},
 	}
 }
@@ -151,90 +149,76 @@ func testToolDefinitionRuntime() model.ToolDefinition {
 // TestConcretePrepareCompactCapture pins every capture field the compaction
 // configuration must carry from one revision: the conversation window, the
 // output reserve with the 131072 fallback, the compact selection with the
-// conversation-model default, the compact window fallback, and the compact
-// prompt equal to the resolved compact type's Prompt.
+// conversation-model default, and the compact prompt equal to the resolved
+// compact type's Prompt.
 func TestConcretePrepareCompactCapture(t *testing.T) {
 	conversationRef := model.ModelRef{Provider: "prov", Model: "m"}
 	m2Ref := model.ModelRef{Provider: "prov", Model: "m2"}
 
 	cases := []struct {
-		name            string
-		agentsDoc       string
-		agent           string
-		wantModel       model.ModelRef
-		wantWindow      int
-		wantReserve     int
-		wantCompactRef  model.ModelRef
-		wantCompWindow  int
-		wantCompReserve int
+		name           string
+		agentsDoc      string
+		agent          string
+		wantModel      model.ModelRef
+		wantWindow     int
+		wantReserve    int
+		wantCompactRef model.ModelRef
 	}{
 		{
-			name:            "conversation model with the reserve fallback",
-			agentsDoc:       prepAgentsDocument,
-			agent:           "solo",
-			wantModel:       conversationRef,
-			wantWindow:      4096,
-			wantReserve:     131072,
-			wantCompactRef:  conversationRef,
-			wantCompWindow:  4096,
-			wantCompReserve: 131072,
+			name:           "conversation model with the reserve fallback",
+			agentsDoc:      prepAgentsDocument,
+			agent:          "solo",
+			wantModel:      conversationRef,
+			wantWindow:     4096,
+			wantReserve:    131072,
+			wantCompactRef: conversationRef,
 		},
 		{
-			name:            "compact model override via the roster",
-			agentsDoc:       agentsWithCompact(`{"model": "prov/m2"}`),
-			agent:           "solo",
-			wantModel:       conversationRef,
-			wantWindow:      4096,
-			wantReserve:     131072,
-			wantCompactRef:  m2Ref,
-			wantCompWindow:  2048,
-			wantCompReserve: 1000,
+			name:           "compact model override via the roster",
+			agentsDoc:      agentsWithCompact(`{"model": "prov/m2"}`),
+			agent:          "solo",
+			wantModel:      conversationRef,
+			wantWindow:     4096,
+			wantReserve:    131072,
+			wantCompactRef: m2Ref,
 		},
 		{
-			name:            "compact model that does not resolve falls back",
-			agentsDoc:       agentsWithCompact(`{"model": "prov/absent"}`),
-			agent:           "solo",
-			wantModel:       conversationRef,
-			wantWindow:      4096,
-			wantReserve:     131072,
-			wantCompactRef:  conversationRef,
-			wantCompWindow:  4096,
-			wantCompReserve: 131072,
+			name:           "compact model that does not resolve falls back",
+			agentsDoc:      agentsWithCompact(`{"model": "prov/absent"}`),
+			agent:          "solo",
+			wantModel:      conversationRef,
+			wantWindow:     4096,
+			wantReserve:    131072,
+			wantCompactRef: conversationRef,
 		},
 		{
-			name:            "compact key that does not resolve falls back",
-			agentsDoc:       agentsWithCompact(`{"model": "p2/m3"}`),
-			agent:           "solo",
-			wantModel:       conversationRef,
-			wantWindow:      4096,
-			wantReserve:     131072,
-			wantCompactRef:  conversationRef,
-			wantCompWindow:  4096,
-			wantCompReserve: 131072,
+			name:           "compact key that does not resolve falls back",
+			agentsDoc:      agentsWithCompact(`{"model": "p2/m3"}`),
+			agent:          "solo",
+			wantModel:      conversationRef,
+			wantWindow:     4096,
+			wantReserve:    131072,
+			wantCompactRef: conversationRef,
 		},
 		{
 			// catalog.Lookup rejects the zero-window model, so the
 			// conversation-model default applies.
-			name:            "compact entry with no positive window falls back",
-			agentsDoc:       agentsWithCompact(`{"model": "prov/mzero"}`),
-			agent:           "solo",
-			wantModel:       conversationRef,
-			wantWindow:      4096,
-			wantReserve:     131072,
-			wantCompactRef:  conversationRef,
-			wantCompWindow:  4096,
-			wantCompReserve: 131072,
+			name:           "compact entry with no positive window falls back",
+			agentsDoc:      agentsWithCompact(`{"model": "prov/mzero"}`),
+			agent:          "solo",
+			wantModel:      conversationRef,
+			wantWindow:     4096,
+			wantReserve:    131072,
+			wantCompactRef: conversationRef,
 		},
 		{
-			name:            "conversation reserve from the entry's max output tokens",
-			agentsDoc:       strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
-			agent:           "reservable",
-			wantModel:       m2Ref,
-			wantWindow:      2048,
-			wantReserve:     1000,
-			wantCompactRef:  m2Ref,
-			wantCompWindow:  2048,
-			wantCompReserve: 1000,
+			name:           "conversation reserve from the entry's max output tokens",
+			agentsDoc:      strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
+			agent:          "reservable",
+			wantModel:      m2Ref,
+			wantWindow:     2048,
+			wantReserve:    1000,
+			wantCompactRef: m2Ref,
 		},
 	}
 	for _, tc := range cases {
@@ -259,12 +243,6 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			}
 			if capture.Compact.Model != tc.wantCompactRef {
 				t.Fatalf("capture Compact.Model = %s, want %s", capture.Compact.Model.String(), tc.wantCompactRef.String())
-			}
-			if capture.Compact.ContextWindow != tc.wantCompWindow {
-				t.Fatalf("capture Compact.ContextWindow = %d, want %d", capture.Compact.ContextWindow, tc.wantCompWindow)
-			}
-			if capture.Compact.OutputReserve != tc.wantCompReserve {
-				t.Fatalf("capture Compact.OutputReserve = %d, want %d", capture.Compact.OutputReserve, tc.wantCompReserve)
 			}
 			if capture.Compact.SystemPrompt != retainedSummarizerPrompt {
 				t.Fatalf("capture Compact.SystemPrompt = %q, want the compact type's retained prompt", capture.Compact.SystemPrompt)
@@ -401,8 +379,6 @@ func TestValidateHookedCaptureProtectsCompaction(t *testing.T) {
 		{"context window", func(c *harness.ExecutionCapture) { c.ContextWindow++ }},
 		{"output reserve", func(c *harness.ExecutionCapture) { c.OutputReserve++ }},
 		{"compact model", func(c *harness.ExecutionCapture) { c.Compact.Model = model.ModelRef{Provider: "other", Model: "m"} }},
-		{"compact context window", func(c *harness.ExecutionCapture) { c.Compact.ContextWindow++ }},
-		{"compact output reserve", func(c *harness.ExecutionCapture) { c.Compact.OutputReserve++ }},
 		{"compact system prompt", func(c *harness.ExecutionCapture) { c.Compact.SystemPrompt = "changed" }},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {

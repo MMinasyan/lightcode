@@ -619,9 +619,24 @@ func TestHistoryViewAccessorsPure(t *testing.T) {
 		}
 	}
 	settlementAt := func(id string, seq int64, usage *UsageCount) graphEntry {
+		identity := testCompactCapture().Model
 		return graphEntry{
 			Envelope:   Entry{ID: id, Sequence: seq, Kind: EntryOperationSettlement, CommittedAt: testTime},
-			Settlement: &operationSettlementEntry{EntryID: id, Status: OperationSuccess, Usage: usage},
+			Settlement: &operationSettlementEntry{EntryID: id, Status: OperationSuccess, Usage: usage, Model: &identity},
+		}
+	}
+	settlementMarked := func(id string, seq int64, usage *UsageCount) graphEntry {
+		identity := testModelRef()
+		return graphEntry{
+			Envelope:   Entry{ID: id, Sequence: seq, Kind: EntryOperationSettlement, CommittedAt: testTime},
+			Settlement: &operationSettlementEntry{EntryID: id, Status: OperationFailure, Detail: "summary failure", Usage: usage, Model: &identity, CompactionUsage: true},
+		}
+	}
+	settlementFailureAt := func(id string, seq int64, usage *UsageCount) graphEntry {
+		identity := testModelRef()
+		return graphEntry{
+			Envelope:   Entry{ID: id, Sequence: seq, Kind: EntryOperationSettlement, CommittedAt: testTime},
+			Settlement: &operationSettlementEntry{EntryID: id, Status: OperationFailure, Detail: "summary failure", Usage: usage, Model: &identity},
 		}
 	}
 	compactionAt := func(id string, seq int64) graphEntry {
@@ -678,6 +693,36 @@ func TestHistoryViewAccessorsPure(t *testing.T) {
 			"compaction usage stays totals-only",
 			"c1",
 			[]graphEntry{compactionAt("c1", 1)},
+			nil,
+		},
+		{
+			"equal-identity pair: marked newest skipped, older unmarked measured",
+			"",
+			[]graphEntry{settlementFailureAt("s1", 1, count(500)), settlementMarked("s2", 2, count(300))},
+			count(500),
+		},
+		{
+			"marked settlement skipped, scan continues",
+			"",
+			[]graphEntry{assistantAt("a1", 1, count(100)), settlementMarked("s1", 2, count(300))},
+			count(100),
+		},
+		{
+			"marked settlement without usage is inert",
+			"",
+			[]graphEntry{assistantAt("a1", 1, count(100)), settlementMarked("s1", 2, nil)},
+			count(100),
+		},
+		{
+			"unmarked settlement eligible beside compact identity",
+			"",
+			[]graphEntry{settlementAt("s1", 1, count(300))},
+			count(300),
+		},
+		{
+			"marked settlement latest leaves none",
+			"",
+			[]graphEntry{settlementMarked("s1", 1, count(300)), settlementMarked("s2", 2, count(400))},
 			nil,
 		},
 	}

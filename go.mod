@@ -7,7 +7,6 @@ require (
 	github.com/gofrs/flock v0.13.0
 	github.com/mattn/go-sqlite3 v1.14.50
 	github.com/oapi-codegen/runtime v1.7.0
-	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/wailsapp/wails/v2 v2.12.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
@@ -18,7 +17,6 @@ require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
-	github.com/dlclark/regexp2 v1.11.4 // indirect
 	github.com/dprotaso/go-yit v0.0.0-20220510233725-9ba8df137936 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v0.23.1 // indirect

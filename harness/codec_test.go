@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,10 +37,8 @@ func testToolDefinition() model.ToolDefinition {
 
 func testCompactCapture() CompactCapture {
 	return CompactCapture{
-		Model:         model.ModelRef{Provider: "cprov", Model: "compact-x"},
-		ContextWindow: 2048,
-		OutputReserve: 1024,
-		SystemPrompt:  "summarize",
+		Model:        model.ModelRef{Provider: "cprov", Model: "compact-x"},
+		SystemPrompt: "summarize",
 	}
 }
 
@@ -801,7 +800,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -1808,12 +1807,13 @@ func TestExecutionCapturePermissionMembers(t *testing.T) {
 
 // TestExecutionCaptureCompactionMembers pins the durable compaction
 // configuration members: context_window, output_reserve and compact are
-// required members encoded always, the nested compact object carries exactly
-// the model, context_window, output_reserve and system_prompt keys with the
-// model in the durable two-field form, everything round-trips unchanged, and
-// a capture missing a member, carrying a non-positive window or reserve, an
-// incomplete compact model identity, or an empty compact prompt is invalid on
-// both the encode and decode paths.
+// required conversation members encoded always, the nested compact object
+// carries exactly the model and system_prompt keys with the model in the
+// durable two-field form, everything round-trips unchanged, a capture missing
+// a member, carrying a non-positive conversation window or reserve, an
+// incomplete compact model identity, an empty compact prompt, or a compact
+// object carrying a retired budget member is invalid on both the encode and
+// decode paths.
 func TestExecutionCaptureCompactionMembers(t *testing.T) {
 	encode := func(t *testing.T, v ExecutionCapture) map[string]json.RawMessage {
 		t.Helper()
@@ -1839,19 +1839,13 @@ func TestExecutionCaptureCompactionMembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodePayloadObject(compact): %v", err)
 	}
-	if err := rejectUnknownMembers(compactObj, "model", "context_window", "output_reserve", "system_prompt"); err != nil {
+	if err := rejectUnknownMembers(compactObj, "model", "system_prompt"); err != nil {
 		t.Fatalf("encoded compact object carries unexpected members: %v", err)
 	}
-	for _, key := range []string{"model", "context_window", "output_reserve", "system_prompt"} {
+	for _, key := range []string{"model", "system_prompt"} {
 		if _, present := compactObj[key]; !present {
 			t.Fatalf("encoded compact object misses the %q member", key)
 		}
-	}
-	if got := string(compactObj["context_window"]); got != "2048" {
-		t.Fatalf("encoded compact context_window member = %s, want 2048", got)
-	}
-	if got := string(compactObj["output_reserve"]); got != "1024" {
-		t.Fatalf("encoded compact output_reserve member = %s, want 1024", got)
 	}
 	compactModelObj, err := decodePayloadObject(compactObj["model"])
 	if err != nil {
@@ -1886,10 +1880,6 @@ func TestExecutionCaptureCompactionMembers(t *testing.T) {
 		{"negative output reserve", func(v *ExecutionCapture) { v.OutputReserve = -1 }},
 		{"empty compact model", func(v *ExecutionCapture) { v.Compact.Model = model.ModelRef{} }},
 		{"incomplete compact model", func(v *ExecutionCapture) { v.Compact.Model = model.ModelRef{Provider: "cprov"} }},
-		{"zero compact window", func(v *ExecutionCapture) { v.Compact.ContextWindow = 0 }},
-		{"negative compact window", func(v *ExecutionCapture) { v.Compact.ContextWindow = -2 }},
-		{"zero compact reserve", func(v *ExecutionCapture) { v.Compact.OutputReserve = 0 }},
-		{"negative compact reserve", func(v *ExecutionCapture) { v.Compact.OutputReserve = -3 }},
 		{"empty compact prompt", func(v *ExecutionCapture) { v.Compact.SystemPrompt = "" }},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
@@ -1934,7 +1924,8 @@ func TestExecutionCaptureCompactionMembers(t *testing.T) {
 		{"unknown compact member", func(m map[string]json.RawMessage) { m["extra"] = json.RawMessage(`1`) }},
 		{"missing compact prompt", func(m map[string]json.RawMessage) { delete(m, "system_prompt") }},
 		{"null compact prompt", func(m map[string]json.RawMessage) { m["system_prompt"] = json.RawMessage("null") }},
-		{"missing compact window", func(m map[string]json.RawMessage) { delete(m, "context_window") }},
+		{"retired compact context window", func(m map[string]json.RawMessage) { m["context_window"] = json.RawMessage(`2048`) }},
+		{"retired compact output reserve", func(m map[string]json.RawMessage) { m["output_reserve"] = json.RawMessage(`1024`) }},
 	}
 	for _, mutation := range compactMutations {
 		t.Run("wire "+mutation.name, func(t *testing.T) {
@@ -1951,6 +1942,105 @@ func TestExecutionCaptureCompactionMembers(t *testing.T) {
 			m["compact"] = raw
 			if got, err := decodeExecutionCapture(m); err == nil {
 				t.Fatalf("capture with %s decoded to %+v, want rejection", mutation.name, got)
+			}
+		})
+	}
+}
+
+// TestOperationSettlementCompactionUsageMarker pins the usage provenance
+// marker's wire shape: false encodes by omission, true encodes and round-trips
+// unchanged, an omitted member decodes as false, a marker beside no usage is
+// inert and valid, and null and non-boolean marker values are rejected through
+// the member reader.
+func TestOperationSettlementCompactionUsageMarker(t *testing.T) {
+	roundTrip := func(t *testing.T, v operationSettlementEntry) operationSettlementEntry {
+		t.Helper()
+		raw, err := encodeOperationSettlementEntry(v)
+		if err != nil {
+			t.Fatalf("encodeOperationSettlementEntry: %v", err)
+		}
+		decoded, err := decodeOperationSettlementEntry(Entry{
+			SessionID:   v.SessionID,
+			ID:          v.EntryID,
+			OperationID: v.OperationID,
+			Kind:        EntryOperationSettlement,
+			Payload:     raw,
+		})
+		if err != nil {
+			t.Fatalf("decodeOperationSettlementEntry: %v", err)
+		}
+		return decoded
+	}
+
+	unmarked := validSettlementEntry()
+	raw, err := encodeOperationSettlementEntry(unmarked)
+	if err != nil {
+		t.Fatalf("encode unmarked: %v", err)
+	}
+	if strings.Contains(string(raw), "compaction_usage") {
+		t.Fatalf("false marker encoded as a member: %s", raw)
+	}
+	if got := roundTrip(t, unmarked); got.CompactionUsage {
+		t.Fatalf("round-tripped omitted marker = true, want the omitted/false equivalence")
+	}
+
+	ref := testModelRef()
+	usage := &UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}
+	marked := validSettlementEntry()
+	marked.Status = OperationFailure
+	marked.Detail = "summary failure"
+	marked.Model = &ref
+	marked.Usage = usage
+	marked.CompactionUsage = true
+	raw, err = encodeOperationSettlementEntry(marked)
+	if err != nil {
+		t.Fatalf("encode marked: %v", err)
+	}
+	if !strings.Contains(string(raw), `"compaction_usage":true`) {
+		t.Fatalf("marked settlement payload %s, want the true member", raw)
+	}
+	if got := roundTrip(t, marked); !reflect.DeepEqual(got, marked) {
+		t.Fatalf("round-tripped settlement = %+v, want %+v", got, marked)
+	}
+
+	inert := validSettlementEntry()
+	inert.Status = OperationInterruption
+	inert.Detail = "interrupted"
+	inert.CompactionUsage = true
+	if got := roundTrip(t, inert); !got.CompactionUsage || got.Model != nil || got.Usage != nil {
+		t.Fatalf("round-tripped marker-without-usage = %+v, want the inert true marker with no usage", got)
+	}
+
+	for _, row := range []struct {
+		name  string
+		value string
+	}{
+		{"null marker", "null"},
+		{"number marker", "1"},
+		{"string marker", `"true"`},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			unmarkedRaw, err := encodeOperationSettlementEntry(unmarked)
+			if err != nil {
+				t.Fatalf("encodeOperationSettlementEntry: %v", err)
+			}
+			members, err := decodePayloadObject(unmarkedRaw)
+			if err != nil {
+				t.Fatalf("decodePayloadObject: %v", err)
+			}
+			members["compaction_usage"] = json.RawMessage(row.value)
+			raw, err := json.Marshal(members)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if _, err := decodeOperationSettlementEntry(Entry{
+				SessionID:   unmarked.SessionID,
+				ID:          unmarked.EntryID,
+				OperationID: unmarked.OperationID,
+				Kind:        EntryOperationSettlement,
+				Payload:     raw,
+			}); err == nil {
+				t.Fatalf("settlement with %s decoded, want rejection", row.name)
 			}
 		})
 	}
