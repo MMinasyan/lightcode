@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,25 +24,20 @@ func TestGeneratedContractsFresh(t *testing.T) {
 	// go test runs the test binary with the package directory as its working
 	// directory, so the module root is exactly "..".
 	committed, err := os.ReadFile(filepath.Join("..", "protocol", "protocol.gen.go"))
-	if err != nil {
-		t.Fatalf("reading committed generated contracts: %v", err)
-	}
+	testassert.NoError(t, err)
 	generated := filepath.Join(t.TempDir(), "protocol.gen.go")
 	cmd := exec.Command("go", "tool", "oapi-codegen",
 		"--config", "protocol/oapi-codegen.yaml",
 		"-o", generated,
 		"protocol/openapi.yaml")
 	cmd.Dir = ".."
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("regenerating protocol contracts: %v\n%s", err, out)
+	{
+		out, err := cmd.CombinedOutput()
+		testassert.Require(t, err == nil, "regenerating protocol contracts: %v\n%s", err, out)
 	}
 	regenerated, err := os.ReadFile(generated)
-	if err != nil {
-		t.Fatalf("reading regenerated contracts: %v", err)
-	}
-	if !bytes.Equal(committed, regenerated) {
-		t.Fatalf("committed protocol/protocol.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committed), len(regenerated))
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, bytes.Equal(committed, regenerated), "committed protocol/protocol.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committed), len(regenerated))
 }
 
 // TestGeneratedNativeBindingsFresh regenerates the native operation bindings
@@ -64,22 +60,17 @@ func TestGeneratedNativeBindingsFresh(t *testing.T) {
 			"-out", source,
 			"-native-contract-out", contract)
 		cmd.Dir = ".."
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("regenerating native bindings: %v\n%s", err, out)
+		{
+			out, err := cmd.CombinedOutput()
+			testassert.Require(t, err == nil, "regenerating native bindings: %v\n%s", err, out)
 		}
 		return readArtifact(t, source), readArtifact(t, contract)
 	}
 	source, contract := generate(t)
 	againSource, againContract := generate(t)
-	if !bytes.Equal(source, againSource) || !bytes.Equal(contract, againContract) {
-		t.Fatal("the native bindings generator is not deterministic")
-	}
-	if !bytes.Equal(committedSource, source) {
-		t.Fatalf("committed internal/clientops/operations.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedSource), len(source))
-	}
-	if !bytes.Equal(committedContract, contract) {
-		t.Fatalf("committed frontend/src/generated/native-invocations.json is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedContract), len(contract))
-	}
+	testassert.Require(t, bytes.Equal(source, againSource) && bytes.Equal(contract, againContract), "the native bindings generator is not deterministic")
+	testassert.Require(t, bytes.Equal(committedSource, source), "committed internal/clientops/operations.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedSource), len(source))
+	testassert.Require(t, bytes.Equal(committedContract, contract), "committed frontend/src/generated/native-invocations.json is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedContract), len(contract))
 }
 
 // committedArtifact reads one committed artifact relative to the module root.
@@ -92,9 +83,7 @@ func committedArtifact(t *testing.T, rel string) []byte {
 func readArtifact(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "reading %s: %v", path, err)
 	return data
 }
 
@@ -108,9 +97,7 @@ func readArtifact(t *testing.T, path string) []byte {
 // fixture.
 func TestGeneratedFileSetGate(t *testing.T) {
 	script, err := filepath.Abs(filepath.Join("..", "scripts", "check-generated-files.sh"))
-	if err != nil {
-		t.Fatalf("resolving the freshness script: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	// The two real invocations: make check-protocol names the four protocol
 	// artifacts (directories included) and make check-wails-bindings names the
@@ -141,35 +128,27 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		dir := t.TempDir()
 		for _, output := range outputs {
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				t.Fatalf("creating fixture directory: %v", err)
-			}
-			if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
-				t.Fatalf("writing fixture artifact: %v", err)
-			}
+			testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			testassert.NoError(t, os.WriteFile(path, []byte("generated"), 0o644))
 		}
 		// Ignored output the gates must never flag: the ignored Wails runtime
 		// tree and an ignored sibling inside the checked bindings directory.
-		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("frontend/client-bindings/wailsjs/runtime/\n*.ignored\n"), 0o644); err != nil {
-			t.Fatalf("writing fixture ignore file: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("frontend/client-bindings/wailsjs/runtime/\n*.ignored\n"), 0o644))
 		for _, file := range []string{
 			"frontend/client-bindings/wailsjs/runtime/runtime.js",
 			"frontend/client-bindings/wailsjs/go/desktopclient/Host.js.ignored",
 		} {
 			path := filepath.Join(dir, filepath.FromSlash(file))
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				t.Fatalf("creating ignored fixture directory: %v", err)
-			}
-			if err := os.WriteFile(path, []byte("ignored"), 0o644); err != nil {
-				t.Fatalf("writing ignored fixture file: %v", err)
-			}
+			testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			testassert.NoError(t, os.WriteFile(path, []byte("ignored"), 0o644))
 		}
-		if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
-			t.Fatalf("fixture git init: %v\n%s", err, out)
+		{
+			out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput()
+			testassert.Require(t, err == nil, "fixture git init: %v\n%s", err, out)
 		}
-		if out, err := exec.Command("git", "-C", dir, "add", ".").CombinedOutput(); err != nil {
-			t.Fatalf("fixture git add: %v\n%s", err, out)
+		{
+			out, err := exec.Command("git", "-C", dir, "add", ".").CombinedOutput()
+			testassert.Require(t, err == nil, "fixture git add: %v\n%s", err, out)
 		}
 		return dir
 	}
@@ -186,17 +165,14 @@ func TestGeneratedFileSetGate(t *testing.T) {
 
 	t.Run("matching staged bytes pass", func(t *testing.T) {
 		dir := fixture(t)
-		if err := run(t, dir, protocolPaths...); err != nil {
-			t.Fatalf("gate rejected matching staged protocol artifacts: %v", err)
-		}
-		if err := run(t, dir, wailsPaths...); err != nil {
-			t.Fatalf("gate rejected matching staged Wails bindings: %v", err)
-		}
+		testassert.NoError(t, run(t, dir, protocolPaths...))
+		testassert.NoError(t, run(t, dir, wailsPaths...))
 	})
 
 	t.Run("no path arguments fail", func(t *testing.T) {
-		if err := run(t, fixture(t)); err == nil {
-			t.Fatal("gate accepted an invocation without path arguments")
+		{
+			err := run(t, fixture(t))
+			testassert.Require(t, err != nil, "gate accepted an invocation without path arguments")
 		}
 	})
 
@@ -204,11 +180,10 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.WriteFile(path, []byte("hand-edited"), 0o644); err != nil {
-				t.Fatalf("modifying fixture artifact: %v", err)
-			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a modified tracked artifact: %s", output.path)
+			testassert.NoError(t, os.WriteFile(path, []byte("hand-edited"), 0o644))
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a modified tracked artifact: %s", output.path)
 			}
 		}
 	})
@@ -217,11 +192,10 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.Remove(path); err != nil {
-				t.Fatalf("deleting fixture artifact: %v", err)
-			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a deleted tracked artifact: %s", output.path)
+			testassert.NoError(t, os.Remove(path))
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a deleted tracked artifact: %s", output.path)
 			}
 		}
 	})
@@ -230,11 +204,13 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			// The staged artifact becomes untracked output again.
-			if out, err := exec.Command("git", "-C", dir, "rm", "--cached", "-q", "--", output.path).CombinedOutput(); err != nil {
-				t.Fatalf("unstaging fixture artifact %s: %v\n%s", output.path, err, out)
+			{
+				out, err := exec.Command("git", "-C", dir, "rm", "--cached", "-q", "--", output.path).CombinedOutput()
+				testassert.Require(t, err == nil, "unstaging fixture artifact %s: %v\n%s", output.path, err, out)
 			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a newly untracked artifact: %s", output.path)
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a newly untracked artifact: %s", output.path)
 			}
 		}
 		for _, output := range []struct {
@@ -246,39 +222,31 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		} {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
-				t.Fatalf("emitting untracked fixture artifact %s: %v", output.path, err)
+			{
+				err := os.WriteFile(path, []byte("generated"), 0o644)
+				testassert.Require(t, err == nil, "emitting untracked fixture artifact %s: %v", output.path, err)
 			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a newly emitted untracked artifact: %s", output.path)
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a newly emitted untracked artifact: %s", output.path)
 			}
 		}
 	})
 
 	t.Run("output outside the supplied paths passes", func(t *testing.T) {
 		dir := fixture(t)
-		if err := os.WriteFile(filepath.Join(dir, "protocol", "protocol.gen.go"), []byte("hand-edited"), 0o644); err != nil {
-			t.Fatalf("modifying fixture artifact: %v", err)
-		}
-		if err := run(t, dir, wailsPaths...); err != nil {
-			t.Fatalf("gate flagged output outside its path arguments: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "protocol", "protocol.gen.go"), []byte("hand-edited"), 0o644))
+		testassert.NoError(t, run(t, dir, wailsPaths...))
 	})
 
 	t.Run("unrelated untracked file passes", func(t *testing.T) {
 		dir := fixture(t)
-		if err := os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("junk"), 0o644); err != nil {
-			t.Fatalf("writing unrelated fixture file: %v", err)
-		}
-		if err := run(t, dir, protocolPaths...); err != nil {
-			t.Fatalf("gate rejected an unrelated untracked file: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("junk"), 0o644))
+		testassert.NoError(t, run(t, dir, protocolPaths...))
 	})
 
 	t.Run("ignored output passes", func(t *testing.T) {
-		if err := run(t, fixture(t), wailsPaths...); err != nil {
-			t.Fatalf("gate flagged ignored output: %v", err)
-		}
+		testassert.NoError(t, run(t, fixture(t), wailsPaths...))
 	})
 }
 
@@ -312,12 +280,11 @@ type workflowFile struct {
 func parseWorkflow(t *testing.T, path string) workflowFile {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading workflow %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "reading workflow %s: %v", path, err)
 	var workflow workflowFile
-	if err := yaml.Unmarshal(data, &workflow); err != nil {
-		t.Fatalf("decoding workflow %s: %v", path, err)
+	{
+		err := yaml.Unmarshal(data, &workflow)
+		testassert.Require(t, err == nil, "decoding workflow %s: %v", path, err)
 	}
 	return workflow
 }
@@ -328,9 +295,7 @@ func parsedSteps(t *testing.T, path, job string) []workflowStep {
 	t.Helper()
 	workflow := parseWorkflow(t, path)
 	parsed, ok := workflow.Jobs[job]
-	if !ok {
-		t.Fatalf("workflow %s has no %s job", path, job)
-	}
+	testassert.Require(t, ok, "workflow %s has no %s job", path, job)
 	return parsed.Steps
 }
 
@@ -440,17 +405,17 @@ func TestDeliveryGateWorkflowWiring(t *testing.T) {
 	releasePath := filepath.Join("..", ".github", "workflows", "release.yml")
 
 	testSteps := parsedSteps(t, testPath, "test")
-	if err := checkDeliveryGates(testSteps); err != nil {
-		t.Errorf("test workflow: %v", err)
+	{
+		err := checkDeliveryGates(testSteps)
+		testassert.Check(t, err == nil, "test workflow: %v", err)
 	}
 	releaseSteps := parsedSteps(t, releasePath, "build")
-	if err := checkDeliveryGates(releaseSteps); err != nil {
-		t.Errorf("release workflow: %v", err)
+	{
+		err := checkDeliveryGates(releaseSteps)
+		testassert.Check(t, err == nil, "release workflow: %v", err)
 	}
 	for _, publication := range []string{"Package release assets", "Upload release assets"} {
-		if findNamedStep(releaseSteps, publication) < 0 {
-			t.Errorf("release workflow is missing the %s step", publication)
-		}
+		testassert.Check(t, findNamedStep(releaseSteps, publication) >= 0, "release workflow is missing the %s step", publication)
 	}
 
 	// protocolBeforeWails moves the exact protocol gate step to just before the
@@ -532,14 +497,10 @@ func TestDeliveryGateWorkflowWiring(t *testing.T) {
 			steps := mutation.mutate(parsedSteps(t, mutation.path, mutation.job))
 			err := checkDeliveryGates(steps)
 			if mutation.accept {
-				if err != nil {
-					t.Fatalf("accepted workflow mutation reported %v", err)
-				}
+				testassert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Fatal("mutated workflow was accepted")
-			}
+			testassert.Require(t, err != nil, "mutated workflow was accepted")
 		})
 	}
 }

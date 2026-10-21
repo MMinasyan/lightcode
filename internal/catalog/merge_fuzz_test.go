@@ -3,6 +3,8 @@ package catalog
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func FuzzDeepMergeCatalog(f *testing.F) {
@@ -57,13 +59,9 @@ func FuzzDeepMergeCatalog(f *testing.F) {
 	}
 	for _, pair := range seedPairs {
 		bundled, err := json.Marshal(pair[0])
-		if err != nil {
-			f.Fatalf("marshal bundled seed: %v", err)
-		}
+		testassert.Require(f, err == nil, "marshal bundled seed: %v", err)
 		user, err := json.Marshal(pair[1])
-		if err != nil {
-			f.Fatalf("marshal user seed: %v", err)
-		}
+		testassert.Require(f, err == nil, "marshal user seed: %v", err)
 		f.Add(bundled, user)
 	}
 	for _, invalid := range []struct {
@@ -88,11 +86,10 @@ func FuzzDeepMergeCatalog(f *testing.F) {
 		}
 
 		merged := DeepMergeCatalog(bundled, user)
-		if merged == nil {
-			t.Fatal("DeepMergeCatalog returned nil")
-		}
-		if _, err := json.Marshal(merged); err != nil {
-			t.Fatalf("merged catalog is not valid JSON: %v", err)
+		testassert.Require(t, merged != nil, "DeepMergeCatalog returned nil")
+		{
+			_, err := json.Marshal(merged)
+			testassert.NoError(t, err)
 		}
 	})
 }

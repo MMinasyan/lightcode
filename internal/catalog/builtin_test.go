@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
@@ -26,40 +28,35 @@ func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
 		seen[providerID] = true
 
 		var raw map[string]any
-		if err := json.Unmarshal(data, &raw); err != nil {
-			t.Fatalf("%s: unmarshal: %v", path, err)
+		{
+			err := json.Unmarshal(data, &raw)
+			testassert.Require(t, err == nil, "%s: unmarshal: %v", path, err)
 		}
-		if errs := ValidateRaw(providerID, raw, true); len(errs) != 0 {
-			t.Fatalf("%s: ValidateRaw(strict=true) errors = %#v", path, errs)
+		{
+			errs := ValidateRaw(providerID, raw, true)
+			testassert.Require(t, len(errs) == 0, "%s: ValidateRaw(strict=true) errors = %#v", path, errs)
 		}
 
 		result := Build(BuildInputs{Bundled: map[string]json.RawMessage{providerID: data}})
-		if len(result.Warnings) != 0 {
-			t.Fatalf("%s: Build warnings = %#v, want none", path, result.Warnings)
-		}
+		testassert.Require(t, len(result.Warnings) == 0, "%s: Build warnings = %#v, want none", path, result.Warnings)
 		provider := result.Catalog.Providers[providerID]
-		if provider == nil {
-			t.Fatalf("%s: provider %q missing after Build", path, providerID)
-		}
-		if errs := ValidateEffective(provider); len(errs) != 0 {
-			t.Fatalf("%s: ValidateEffective errors = %#v", path, errs)
+		testassert.Require(t, provider != nil, "%s: provider %q missing after Build", path, providerID)
+		{
+			errs := ValidateEffective(provider)
+			testassert.Require(t, len(errs) == 0, "%s: ValidateEffective errors = %#v", path, errs)
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("walk bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	for _, providerID := range []string{"openai", "openrouter"} {
-		if !seen[providerID] {
-			t.Fatalf("bundled provider %q was not found", providerID)
-		}
+		testassert.Require(t, seen[providerID], "bundled provider %q was not found", providerID)
 	}
 }
 
 func TestBrokenBundledCatalogFixtureFailsStrictValidation(t *testing.T) {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(`{
+	testassert.NoError(t, json.Unmarshal([]byte(`{
 		"id": "broken",
 		"name": "Broken",
 		"transport": {"base_url": "https://example.com/v1", "api_key_env": "BROKEN_API_KEY"},
@@ -70,14 +67,10 @@ func TestBrokenBundledCatalogFixtureFailsStrictValidation(t *testing.T) {
 				"extra_body": {"model": "not allowed"}
 			}
 		}
-	}`), &raw); err != nil {
-		t.Fatalf("broken fixture unmarshal: %v", err)
-	}
+	}`), &raw))
 
 	errs := ValidateRaw("broken", raw, true)
-	if len(errs) == 0 {
-		t.Fatalf("ValidateRaw accepted deliberately broken fixture")
-	}
+	testassert.Require(t, len(errs) != 0, "ValidateRaw accepted deliberately broken fixture")
 	for _, err := range errs {
 		if err.Field == "models.bad.extra_body.model" && err.Reason == "reserved request body key" {
 			return

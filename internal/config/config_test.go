@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The retained first-run skeleton the Runtime configuration service creates
@@ -35,25 +37,17 @@ func TestParseAcceptsCatalogProviderEnvelopeAndIgnoresRemovedMembers(t *testing.
     "model": { "provider": "local", "model": "chat" }
   }
 }`))
-	if err != nil {
-		t.Fatalf("Parse returned error for the provider envelope: %v", err)
-	}
-	if _, ok := cfg.Providers["local"]; !ok {
-		t.Fatalf("providers map did not retain local entry: %#v", cfg.Providers)
+	testassert.NoError(t, err)
+	{
+		_, ok := cfg.Providers["local"]
+		testassert.Require(t, ok, "providers map did not retain local entry: %#v", cfg.Providers)
 	}
 }
 
 func TestParseAcceptsEmptySkeleton(t *testing.T) {
 	cfg, err := Parse([]byte(firstRunConfigSkeleton))
-	if err != nil {
-		t.Fatalf("Parse(empty skeleton) returned error: %v", err)
-	}
-	if cfg.Providers == nil || len(cfg.Providers) != 0 {
-		t.Fatalf("Providers = %v, want empty map", cfg.Providers)
-	}
-	if !cfg.Sessions.AutoArchive || cfg.Sessions.ArchiveAfterDays != 7 {
-		t.Fatalf("Sessions defaults not applied: %+v", cfg.Sessions)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, cfg.Providers != nil && len(cfg.Providers) == 0 && cfg.Sessions.AutoArchive && cfg.Sessions.ArchiveAfterDays == 7, "Providers = %v, want empty map; Sessions defaults not applied: %+v", cfg.Providers, cfg.Sessions)
 }
 
 func TestParsePreservesExactProviderExtraBodyNumbers(t *testing.T) {
@@ -71,13 +65,12 @@ func TestParsePreservesExactProviderExtraBodyNumbers(t *testing.T) {
 }
 
 `))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	providers := cfg.Providers["local"].(map[string]any)
 	extraBody := providers["extra_body"].(map[string]any)
-	if got, ok := extraBody["large"].(json.Number); !ok || got.String() != "90071992547409931234567890" {
-		t.Fatalf("provider extra_body number = %#v (%T), want exact json.Number", extraBody["large"], extraBody["large"])
+	{
+		got, ok := extraBody["large"].(json.Number)
+		testassert.Require(t, ok && got.String() == "90071992547409931234567890", "provider extra_body number = %#v (%T), want exact json.Number", extraBody["large"], extraBody["large"])
 	}
 }
 
@@ -90,8 +83,9 @@ func TestParseRejectsTrailingWholeDocumentData(t *testing.T) {
 		{name: "junk", data: `{"providers": {}} junk`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Parse([]byte(tc.data)); err == nil {
-				t.Fatal("Parse accepted trailing whole-document data")
+			{
+				_, err := Parse([]byte(tc.data))
+				testassert.Require(t, err != nil, "Parse accepted trailing whole-document data")
 			}
 		})
 	}
@@ -99,9 +93,7 @@ func TestParseRejectsTrailingWholeDocumentData(t *testing.T) {
 
 func TestParseRejectsMalformedWholeDocument(t *testing.T) {
 	_, err := Parse([]byte(`{not json`))
-	if err == nil {
-		t.Fatal("Parse returned nil error, want the decode rejection")
-	}
+	testassert.Require(t, err != nil, "Parse returned nil error, want the decode rejection")
 	if !strings.Contains(err.Error(), "invalid character") {
 		t.Fatalf("error = %q, want substring %q", err.Error(), "invalid character")
 	}
@@ -127,12 +119,8 @@ func TestParseSessionsSharedPolicy(t *testing.T) {
 				data = []byte(row.data)
 			}
 			got, err := ParseSessions(data)
-			if err != nil {
-				t.Fatalf("ParseSessions(%s): %v", row.data, err)
-			}
-			if got != row.want {
-				t.Fatalf("ParseSessions(%s) = %+v, want %+v", row.data, got, row.want)
-			}
+			testassert.Require(t, err == nil, "ParseSessions(%s): %v", row.data, err)
+			testassert.Require(t, got == row.want, "ParseSessions(%s) = %+v, want %+v", row.data, got, row.want)
 		})
 	}
 
@@ -140,8 +128,9 @@ func TestParseSessionsSharedPolicy(t *testing.T) {
 		`{"auto_archive":`, `{"archive_after_days":106752}`, `{"delete_after_archive_days":9223372036854775807}`,
 		`[]`, `"7"`, `5`,
 	} {
-		if got, err := ParseSessions([]byte(bad)); err == nil {
-			t.Fatalf("ParseSessions(%s) = %+v, want rejection", bad, got)
+		{
+			got, err := ParseSessions([]byte(bad))
+			testassert.Require(t, err != nil, "ParseSessions(%s) = %+v, want rejection", bad, got)
 		}
 	}
 }
@@ -155,20 +144,12 @@ func TestParseSessionsSharesTheLegacyParseImplementation(t *testing.T) {
 		`{"providers":{},"sessions":{"archive_after_days":-3}}`,
 	} {
 		cfg, err := Parse([]byte(doc))
-		if err != nil {
-			t.Fatalf("Parse(%s): %v", doc, err)
-		}
+		testassert.Require(t, err == nil, "Parse(%s): %v", doc, err)
 		var members map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(doc), &members); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, json.Unmarshal([]byte(doc), &members))
 		want, err := ParseSessions(members["sessions"])
-		if err != nil {
-			t.Fatalf("ParseSessions for %s: %v", doc, err)
-		}
-		if cfg.Sessions != want {
-			t.Fatalf("Parse(%s) sessions = %+v, ParseSessions = %+v", doc, cfg.Sessions, want)
-		}
+		testassert.Require(t, err == nil, "ParseSessions for %s: %v", doc, err)
+		testassert.Require(t, cfg.Sessions == want, "Parse(%s) sessions = %+v, ParseSessions = %+v", doc, cfg.Sessions, want)
 	}
 	// The whole-document entry shares the ParseSessions contract: its
 	// validation errors are propagated instead of inventing defaults for a
@@ -176,17 +157,9 @@ func TestParseSessionsSharesTheLegacyParseImplementation(t *testing.T) {
 	doc := []byte(`{"providers":{},"sessions":{"archive_after_days":106752}}`)
 	_, docErr := Parse(doc)
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(doc, &members); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, json.Unmarshal(doc, &members))
 	_, sharedErr := ParseSessions(members["sessions"])
-	if sharedErr == nil {
-		t.Fatal("ParseSessions accepted the overflowed policy")
-	}
-	if docErr == nil {
-		t.Fatalf("Parse of overflowed days = nil error, want the ParseSessions rejection %q", sharedErr)
-	}
-	if docErr.Error() != sharedErr.Error() {
-		t.Fatalf("Parse error = %q, want the propagated ParseSessions error %q", docErr, sharedErr)
-	}
+	testassert.Require(t, sharedErr != nil, "ParseSessions accepted the overflowed policy")
+	testassert.Require(t, docErr != nil, "Parse of overflowed days = nil error, want the ParseSessions rejection %q", sharedErr)
+	testassert.Require(t, docErr.Error() == sharedErr.Error(), "Parse error = %q, want the propagated ParseSessions error %q", docErr, sharedErr)
 }

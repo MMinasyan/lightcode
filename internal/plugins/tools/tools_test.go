@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -59,9 +60,7 @@ func callToolContext(workspace string, constraints runtime.ToolConstraints) runt
 func makeCall(t *testing.T, name, args string) model.ToolCall {
 	t.Helper()
 	call, err := model.NewToolCall(model.ToolCall{ID: "call-1", Name: name, Arguments: json.RawMessage(args)})
-	if err != nil {
-		t.Fatalf("NewToolCall: %v", err)
-	}
+	testassert.NoError(t, err)
 	return call
 }
 
@@ -98,8 +97,9 @@ func TestValidateConfigSettings(t *testing.T) {
 		`{"max_background_processes":5}`,
 		`{"max_background_processes":"many","unknown_member":{"deep":[1,2]}}`,
 	} {
-		if err := validate(raw); err != nil {
-			t.Errorf("ValidateConfig(%s) = %v, want accepted", raw, err)
+		{
+			err := validate(raw)
+			testassert.Check(t, err == nil, "ValidateConfig(%s) = %v, want accepted", raw, err)
 		}
 	}
 	for _, raw := range []string{
@@ -114,8 +114,9 @@ func TestValidateConfigSettings(t *testing.T) {
 		// Wrong section shapes.
 		`[]`, `"tools"`, `5`,
 	} {
-		if err := validate(raw); err == nil {
-			t.Errorf("ValidateConfig(%s) = nil, want rejected", raw)
+		{
+			err := validate(raw)
+			testassert.Check(t, err != nil, "ValidateConfig(%s) = nil, want rejected", raw)
 		}
 	}
 }
@@ -146,22 +147,12 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	for _, tc := range cases {
 		for name, want := range tc.available {
 			got, err := describe[name](runtime.Invocation{}, tc.constraints, harness.SessionIdentity{})
-			if err != nil {
-				t.Fatalf("%s: describe %s: %v", tc.name, name, err)
-			}
-			if got.Available != want {
-				t.Errorf("%s: describe %s Available = %v, want %v", tc.name, name, got.Available, want)
-			}
+			testassert.Require(t, err == nil, "%s: describe %s: %v", tc.name, name, err)
+			testassert.Check(t, got.Available == want, "%s: describe %s Available = %v, want %v", tc.name, name, got.Available, want)
 			wantHidden := name == "apply_patch"
-			if got.DefaultHidden != wantHidden {
-				t.Errorf("%s: describe %s DefaultHidden = %v, want %v", tc.name, name, got.DefaultHidden, wantHidden)
-			}
-			if got.Definition.Name != name {
-				t.Errorf("%s: describe %s declares name %q", tc.name, name, got.Definition.Name)
-			}
-			if got.Definition.Description == "" || !json.Valid(got.Definition.Parameters) {
-				t.Errorf("%s: describe %s produced an unusable definition", tc.name, name)
-			}
+			testassert.Check(t, got.DefaultHidden == wantHidden, "%s: describe %s DefaultHidden = %v, want %v", tc.name, name, got.DefaultHidden, wantHidden)
+			testassert.Check(t, got.Definition.Name == name, "%s: describe %s declares name %q", tc.name, name, got.Definition.Name)
+			testassert.Check(t, got.Definition.Description != "" && json.Valid(got.Definition.Parameters), "%s: describe %s produced an unusable definition", tc.name, name)
 		}
 	}
 }
@@ -170,19 +161,17 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 func assertJSONEqual(t *testing.T, got json.RawMessage, want any) {
 	t.Helper()
 	wantRaw, err := json.Marshal(want)
-	if err != nil {
-		t.Fatalf("marshal retained schema: %v", err)
-	}
+	testassert.NoError(t, err)
 	var gotValue, wantValue any
-	if err := json.Unmarshal(got, &gotValue); err != nil {
-		t.Fatalf("decode described schema %s: %v", got, err)
+	{
+		err := json.Unmarshal(got, &gotValue)
+		testassert.Require(t, err == nil, "decode described schema %s: %v", got, err)
 	}
-	if err := json.Unmarshal(wantRaw, &wantValue); err != nil {
-		t.Fatalf("decode retained schema %s: %v", wantRaw, err)
+	{
+		err := json.Unmarshal(wantRaw, &wantValue)
+		testassert.Require(t, err == nil, "decode retained schema %s: %v", wantRaw, err)
 	}
-	if !reflect.DeepEqual(gotValue, wantValue) {
-		t.Errorf("described schema = %s, want the retained schema %s", got, wantRaw)
-	}
+	testassert.Check(t, reflect.DeepEqual(gotValue, wantValue), "described schema = %s, want the retained schema %s", got, wantRaw)
 }
 
 // wantRunCommandDescription is the independent golden fixture for the
@@ -248,41 +237,25 @@ const wantProcessParameters = `{
 // constants.
 func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
 	ordinary, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("describe ordinary: %v", err)
-	}
-	if ordinary.Definition.Description != wantRunCommandDescription {
-		t.Errorf("ordinary description = %q, want the retained description %q", ordinary.Definition.Description, wantRunCommandDescription)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, ordinary.Definition.Description == wantRunCommandDescription, "ordinary description = %q, want the retained description %q", ordinary.Definition.Description, wantRunCommandDescription)
 	assertJSONEqual(t, ordinary.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
 
 	readonly, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{Readonly: true}, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("describe readonly: %v", err)
-	}
-	if readonly.Definition.Description != tool.ReadOnlyRunCommandDescription {
-		t.Errorf("readonly description = %q, want the retained readonly description", readonly.Definition.Description)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, readonly.Definition.Description == tool.ReadOnlyRunCommandDescription, "readonly description = %q, want the retained readonly description", readonly.Definition.Description)
 	assertJSONEqual(t, readonly.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
-	if !ordinary.Available || !readonly.Available {
-		t.Errorf("availability ordinary/readonly = %v/%v, want both available", ordinary.Available, readonly.Available)
-	}
+	testassert.Check(t, ordinary.Available && readonly.Available, "availability ordinary/readonly = %v/%v, want both available", ordinary.Available, readonly.Available)
 }
 
 // TestProcessDescriptionAndSchemaMatchRetained pins the process tool's
 // model-visible surface to the independent test-local fixtures.
 func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
 	got, err := processTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("describe process: %v", err)
-	}
-	if got.Definition.Description != wantProcessDescription {
-		t.Errorf("process description = %q, want the retained description %q", got.Definition.Description, wantProcessDescription)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, got.Definition.Description == wantProcessDescription, "process description = %q, want the retained description %q", got.Definition.Description, wantProcessDescription)
 	assertJSONEqual(t, got.Definition.Parameters, json.RawMessage(wantProcessParameters))
-	if got.Definition.Name != "process" || !got.Available || got.DefaultHidden {
-		t.Errorf("process definition = %+v, want name process, available, not hidden", got)
-	}
+	testassert.Check(t, got.Definition.Name == "process" && got.Available && !got.DefaultHidden, "process definition = %+v, want name process, available, not hidden", got)
 }
 
 func TestNormalizeArguments(t *testing.T) {
@@ -291,33 +264,26 @@ func TestNormalizeArguments(t *testing.T) {
 
 	t.Run("read_file applies defaults and strips private fields", func(t *testing.T) {
 		raw, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a.txt","_lightcode_receipt":"x"}`)
-		if err != nil {
-			t.Fatalf("Normalize: %v", err)
-		}
+		testassert.NoError(t, err)
 		var args map[string]any
-		if err := json.Unmarshal(raw, &args); err != nil {
-			t.Fatalf("normalized bytes: %v", err)
-		}
-		if args["path"] != "a.txt" || args["offset"] != float64(1) || args["limit"] != float64(500) {
-			t.Fatalf("normalized = %s, want the path with default offset/limit", raw)
-		}
-		if _, ok := args["_lightcode_receipt"]; ok {
-			t.Fatal("normalized arguments retained a private field")
+		testassert.NoError(t, json.Unmarshal(raw, &args))
+		testassert.Require(t, args["path"] == "a.txt" && args["offset"] == float64(1) && args["limit"] == float64(500), "normalized = %s, want the path with default offset/limit", raw)
+		{
+			_, ok := args["_lightcode_receipt"]
+			testassert.Require(t, !ok, "normalized arguments retained a private field")
 		}
 	})
 	t.Run("read_file keeps exact integral spellings and rejects fractions and overflow", func(t *testing.T) {
 		raw, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a","offset":1e0,"limit":2.0}`)
-		if err != nil {
-			t.Fatalf("Normalize: %v", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, strings.Contains(string(raw), `"offset":1`) && strings.Contains(string(raw), `"limit":2`), "normalized = %s, want exact integral values", raw)
+		{
+			_, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a","limit":2.5}`)
+			testassert.Check(t, err != nil, "fractional limit normalized, want rejection")
 		}
-		if !strings.Contains(string(raw), `"offset":1`) || !strings.Contains(string(raw), `"limit":2`) {
-			t.Fatalf("normalized = %s, want exact integral values", raw)
-		}
-		if _, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a","limit":2.5}`); err == nil {
-			t.Error("fractional limit normalized, want rejection")
-		}
-		if _, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a","offset":99999999999999999999}`); err == nil {
-			t.Error("overflowing offset normalized, want rejection")
+		{
+			_, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a","offset":99999999999999999999}`)
+			testassert.Check(t, err != nil, "overflowing offset normalized, want rejection")
 		}
 	})
 	t.Run("strict schema errors", func(t *testing.T) {
@@ -334,8 +300,9 @@ func TestNormalizeArguments(t *testing.T) {
 			if strings.HasSuffix(toolName, "2") {
 				toolName = strings.TrimSuffix(toolName, "2")
 			}
-			if _, err := normalize(t, byID[toolName], tc, toolName, args); err == nil {
-				t.Errorf("%s normalized %s, want rejection", toolName, args)
+			{
+				_, err := normalize(t, byID[toolName], tc, toolName, args)
+				testassert.Check(t, err != nil, "%s normalized %s, want rejection", toolName, args)
 			}
 		}
 	})
@@ -346,30 +313,27 @@ func TestNormalizeArguments(t *testing.T) {
 			`{"action":"read","id":5}`,
 			`{"action":"list","id":true}`,
 		} {
-			if _, err := normalize(t, byID["process"], tc, "process", args); err == nil {
-				t.Errorf("process normalized %s, want rejection", args)
+			{
+				_, err := normalize(t, byID["process"], tc, "process", args)
+				testassert.Check(t, err != nil, "process normalized %s, want rejection", args)
 			}
 		}
 		raw, err := normalize(t, byID["process"], tc, "process", `{"action":"read","id":"deadbeef","_lightcode_receipt":"x","note":"kept"}`)
-		if err != nil {
-			t.Fatalf("Normalize: %v", err)
-		}
+		testassert.NoError(t, err)
 		var normalized map[string]any
-		if err := json.Unmarshal(raw, &normalized); err != nil {
-			t.Fatalf("normalized bytes: %v", err)
-		}
-		if normalized["action"] != "read" || normalized["id"] != "deadbeef" || normalized["note"] != "kept" {
-			t.Fatalf("normalized = %s, want the members preserved", raw)
-		}
-		if _, ok := normalized["_lightcode_receipt"]; ok {
-			t.Fatal("normalized arguments retained a private field")
+		testassert.NoError(t, json.Unmarshal(raw, &normalized))
+		testassert.Require(t, normalized["action"] == "read" && normalized["id"] == "deadbeef" && normalized["note"] == "kept", "normalized = %s, want the members preserved", raw)
+		{
+			_, ok := normalized["_lightcode_receipt"]
+			testassert.Require(t, !ok, "normalized arguments retained a private field")
 		}
 	})
 	t.Run("malformed, null and trailing argument bytes are validation errors", func(t *testing.T) {
 		for _, args := range []string{``, `not json`, `null`, `[1]`, `{"path":"a"} trailing`, `"str"`} {
 			for _, name := range []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "process", "sleep"} {
-				if _, err := normalize(t, byID[name], tc, name, args); err == nil {
-					t.Errorf("%s normalized %q, want rejection", name, args)
+				{
+					_, err := normalize(t, byID[name], tc, name, args)
+					testassert.Check(t, err != nil, "%s normalized %q, want rejection", name, args)
 				}
 			}
 		}
@@ -381,9 +345,7 @@ func TestNormalizeArguments(t *testing.T) {
 func bindingChangePatchInput(t *testing.T, path string) string {
 	t.Helper()
 	raw, err := json.Marshal(map[string]string{"input": "*** Begin Patch\n*** Add File: " + path + "\n+new\n*** End Patch"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	return string(raw)
 }
 
@@ -423,24 +385,18 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 				flipTo = realB
 				link = filepath.Join(t.TempDir(), "w")
 				workspace = link
-				if err := os.Symlink(realA, link); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Symlink(realA, link))
 			} else {
 				workspace = t.TempDir()
 				wdA, wdB := t.TempDir(), t.TempDir()
 				flipTo = wdB
 				preFlipWriteDir = wdA
 				link = filepath.Join(workspace, "wd")
-				if err := os.Symlink(wdA, link); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Symlink(wdA, link))
 				constraints = runtime.ToolConstraints{WriteDir: "wd"}
 			}
 			if cell.content != "" {
-				if err := os.WriteFile(filepath.Join(flipTo, "target.txt"), []byte(cell.content), 0o644); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.WriteFile(filepath.Join(flipTo, "target.txt"), []byte(cell.content), 0o644))
 			}
 			// The seam repoints the symlink on its return: after the plugin's
 			// canonical resolutions, before the shared preparation binds.
@@ -450,27 +406,19 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 				if err != nil {
 					return w, b, err
 				}
-				if err := os.Remove(link); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(flipTo, link); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Remove(link))
+				testassert.NoError(t, os.Symlink(flipTo, link))
 				return w, b, err
 			}
 			defer func() { canonicalPathsFn = orig }()
 			plan := prepare(t, byID[cell.toolID], callToolContext(workspace, constraints), cell.toolID, cell.args)
 			outcome := plan.Execute(context.Background())
-			if outcome.Result.Status != model.ResultError || !strings.Contains(outcome.Result.Content, "changed") {
-				t.Fatalf("result = %+v, want the changed-binding failure without substitution", outcome.Result)
-			}
+			testassert.Require(t, outcome.Result.Status == model.ResultError && strings.Contains(outcome.Result.Content, "changed"), "result = %+v, want the changed-binding failure without substitution", outcome.Result)
 			// The patch path threads the write-dir witness directly, so a
 			// dropped witness would fail with the empty-witness form
 			// ("changed from  to ..."); the real changed-binding error names
 			// the pre-flip canonical write-dir as the bound value.
-			if cell.boundWriteDir && !strings.Contains(outcome.Result.Content, preFlipWriteDir) {
-				t.Fatalf("result = %+v, want the changed-binding error naming the bound write-dir %q", outcome.Result, preFlipWriteDir)
-			}
+			testassert.Require(t, !cell.boundWriteDir || strings.Contains(outcome.Result.Content, preFlipWriteDir), "result = %+v, want the changed-binding error naming the bound write-dir %q", outcome.Result, preFlipWriteDir)
 		})
 	}
 }

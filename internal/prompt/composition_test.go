@@ -8,34 +8,27 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/adaptation"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestAssembleFullSpecIsStatelessAndDeterministic(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600))
 	spec := Spec{Size: SizeFull}
 	// A baseline (nil adapt) render and an explicit full spec are the same prompt,
 	// and repeated renders are byte-identical: the service holds no state that
 	// would drift between calls.
 	base := assembleFull(projectRoot, home, nil).Prompt
 	explicit := assembleSpec(projectRoot, home, spec).Prompt
-	if base != explicit {
-		t.Fatalf("full empty-body spec differs from baseline\n--- baseline ---\n%s\n--- spec ---\n%s", base, explicit)
-	}
-	if again := assembleSpec(projectRoot, home, spec).Prompt; again != explicit {
-		t.Fatalf("repeated render differs\n--- first ---\n%s\n--- again ---\n%s", explicit, again)
-	}
+	testassert.Equal(t, base, explicit)
+	testassert.Equal(t, assembleSpec(projectRoot, home, spec).Prompt, explicit)
 }
 
 func TestAssembleConcurrent(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600))
 	svc := NewService(home)
 	adapt := &adaptation.Adaptation{Blocks: []string{"CONCURRENT_BLOCK"}}
 	var wg sync.WaitGroup
@@ -62,27 +55,21 @@ func TestAssembleConcurrent(t *testing.T) {
 func TestAssembleFullWithAdaptationRendersAdaptationContent(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600))
 	adapt := &adaptation.Adaptation{
 		Blocks:    []string{"FULL_BLOCK_MARKER"},
 		Additions: map[string]string{"tone": "FULL_TONE_ADDITION"},
 	}
 	prompt := assembleFull(projectRoot, home, adapt).Prompt
 	for _, want := range []string{"FULL_BLOCK_MARKER", "FULL_TONE_ADDITION", "PROJECT_RULES_MARKER", "## Environment"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("adapted full prompt missing %q\n%s", want, prompt)
-		}
+		testassert.Require(t, strings.Contains(prompt, want), "adapted full prompt missing %q\n%s", want, prompt)
 	}
 }
 
 func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("## Tone\n\nPROJECT_TONE_RULES_MARKER"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("## Tone\n\nPROJECT_TONE_RULES_MARKER"), 0o600))
 	adapt := &adaptation.Adaptation{
 		Blocks:    []string{"SIMPLE_BLOCK_MARKER"},
 		Additions: map[string]string{"safety": "SIMPLE_SAFETY_ADDITION", "tone": "SIMPLE_TONE_ADDITION"},
@@ -105,9 +92,7 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 		"Do the focused job.",
 		"PROJECT_TONE_RULES_MARKER",
 	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("simple prompt missing %q\n%s", want, prompt)
-		}
+		testassert.Require(t, strings.Contains(prompt, want), "simple prompt missing %q\n%s", want, prompt)
 	}
 	for _, forbidden := range []string{
 		strings.TrimSpace(rulesFileGuideSection),
@@ -116,9 +101,7 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 		strings.TrimSpace(languageSection),
 		"SIMPLE_TONE_ADDITION",
 	} {
-		if strings.Contains(prompt, forbidden) {
-			t.Fatalf("simple prompt contains omitted content %q\n%s", forbidden, prompt)
-		}
+		testassert.Require(t, !strings.Contains(prompt, forbidden), "simple prompt contains omitted content %q\n%s", forbidden, prompt)
 	}
 
 	assertOrder(t, prompt,
@@ -134,9 +117,7 @@ func TestAssembleForSpecSimpleIncludesOnlySimpleSectionsAndBodySlot(t *testing.T
 func TestAssembleForSpecNoneProducesBodyOnly(t *testing.T) {
 	home := t.TempDir()
 	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(projectRoot, "AGENTS.md"), []byte("PROJECT_RULES_MARKER"), 0o600))
 	body := "## Your Role and Instructions\n\nOnly compact this transcript."
 	prompt := assembleSpec(projectRoot, home, Spec{
 		Size:  SizeNone,
@@ -144,9 +125,7 @@ func TestAssembleForSpecNoneProducesBodyOnly(t *testing.T) {
 		Adapt: &adaptation.Adaptation{Blocks: []string{"IGNORED_BLOCK"}},
 	}).Prompt
 
-	if !strings.Contains(prompt, body) {
-		t.Fatalf("none prompt missing body %q\n%s", body, prompt)
-	}
+	testassert.Require(t, strings.Contains(prompt, body), "none prompt missing body %q\n%s", body, prompt)
 	for _, forbidden := range []string{
 		strings.TrimSpace(identitySection),
 		strings.TrimSpace(coreRulesSection),
@@ -160,12 +139,11 @@ func TestAssembleForSpecNoneProducesBodyOnly(t *testing.T) {
 		"PROJECT_RULES_MARKER",
 		"IGNORED_BLOCK",
 	} {
-		if strings.Contains(prompt, forbidden) {
-			t.Fatalf("none prompt contains omitted content %q\n%s", forbidden, prompt)
-		}
+		testassert.Require(t, !strings.Contains(prompt, forbidden), "none prompt contains omitted content %q\n%s", forbidden, prompt)
 	}
-	if count := strings.Count(prompt, agentPromptHeading); count != 1 {
-		t.Fatalf("agent prompt heading count = %d, want 1\n%s", count, prompt)
+	{
+		count := strings.Count(prompt, agentPromptHeading)
+		testassert.Require(t, count == 1, "agent prompt heading count = %d, want 1\n%s", count, prompt)
 	}
 }
 
@@ -174,12 +152,8 @@ func assertOrder(t *testing.T, text string, markers ...string) {
 	prev := -1
 	for _, marker := range markers {
 		idx := strings.Index(text, marker)
-		if idx < 0 {
-			t.Fatalf("missing order marker %q\n%s", marker, text)
-		}
-		if idx < prev {
-			t.Fatalf("marker %q at %d appeared before previous marker at %d\n%s", marker, idx, prev, text)
-		}
+		testassert.Require(t, idx >= 0, "missing order marker %q\n%s", marker, text)
+		testassert.Require(t, idx >= prev, "marker %q at %d appeared before previous marker at %d\n%s", marker, idx, prev, text)
 		prev = idx
 	}
 }

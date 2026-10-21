@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The fixture schema is a minimal valid protocol: one JSON operation, one
@@ -47,9 +49,7 @@ paths:
 func writeFixture(t *testing.T, text string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "openapi.yaml")
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
-		t.Fatalf("writing fixture schema: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(path, []byte(text), 0o644))
 	return path
 }
 
@@ -58,9 +58,7 @@ func writeFixture(t *testing.T, text string) string {
 func generateFixture(t *testing.T, text string) (string, string) {
 	t.Helper()
 	source, contract, err := generateFiles(writeFixture(t, text))
-	if err != nil {
-		t.Fatalf("generating from the fixture schema: %v", err)
-	}
+	testassert.NoError(t, err)
 	return string(source), string(contract)
 }
 
@@ -94,31 +92,15 @@ func TestSupportedAdditionGenerates(t *testing.T) {
 `
 	schema := fixtureHead + healthPath + eventsPath + addition
 	source, contract := generateFixture(t, schema)
-	if !strings.Contains(source, `"Extra",`) {
-		t.Errorf("generated bindings do not advertise the added operation:\n%s", source)
-	}
-	if !strings.Contains(source, `case "Extra":`) {
-		t.Errorf("generated bindings have no dispatch arm for the added operation")
-	}
-	if !strings.Contains(source, "c.ExtraWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))") {
-		t.Errorf("generated arm does not call the added operation's generated method")
-	}
-	if !strings.Contains(source, "return response, 201, callErr") {
-		t.Errorf("generated arm does not carry the added operation's declared success status")
-	}
-	if !strings.Contains(contract, `"Extra": {`) {
-		t.Errorf("invocation contract has no entry for the added operation:\n%s", contract)
-	}
-	if !strings.Contains(contract, `"body": "required"`) || !strings.Contains(contract, `"session_id": "required"`) {
-		t.Errorf("invocation contract does not carry the added operation's declared modes")
-	}
-	if strings.Contains(contract, "GetEvents") {
-		t.Errorf("invocation contract carries the event stream:\n%s", contract)
-	}
+	testassert.Check(t, strings.Contains(source, `"Extra",`), "generated bindings do not advertise the added operation:\n%s", source)
+	testassert.Check(t, strings.Contains(source, `case "Extra":`), "generated bindings have no dispatch arm for the added operation")
+	testassert.Check(t, strings.Contains(source, "c.ExtraWithBody(ctx, protocol.SessionID(env.session), contentTypeJSON, bytes.NewReader(env.body))"), "generated arm does not call the added operation's generated method")
+	testassert.Check(t, strings.Contains(source, "return response, 201, callErr"), "generated arm does not carry the added operation's declared success status")
+	testassert.Check(t, strings.Contains(contract, `"Extra": {`), "invocation contract has no entry for the added operation:\n%s", contract)
+	testassert.Check(t, strings.Contains(contract, `"body": "required"`) && strings.Contains(contract, `"session_id": "required"`), "invocation contract does not carry the added operation's declared modes")
+	testassert.Check(t, !strings.Contains(contract, "GetEvents"), "invocation contract carries the event stream:\n%s", contract)
 	againSource, againContract := generateFixture(t, schema)
-	if source != againSource || contract != againContract {
-		t.Error("two runs over the same schema produced different artifacts")
-	}
+	testassert.Check(t, source == againSource && contract == againContract, "two runs over the same schema produced different artifacts")
 }
 
 // TestOptionalQueryMembersGenerate proves the optional query envelope modes
@@ -226,14 +208,10 @@ func TestOptionalQueryMembersGenerate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			source, contract := generateFixture(t, fixtureHead+healthPath+eventsPath+tc.path)
 			for _, want := range tc.source {
-				if !strings.Contains(source, want) {
-					t.Errorf("generated bindings are missing %q:\n%s", want, source)
-				}
+				testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
 			}
 			for _, want := range tc.contract {
-				if !strings.Contains(contract, want) {
-					t.Errorf("invocation contract is missing %q:\n%s", want, contract)
-				}
+				testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
 			}
 		})
 	}
@@ -318,13 +296,9 @@ func TestSupportedShapesGenerate(t *testing.T) {
 		`"Removed204",`,
 		`"ResetField",`,
 	} {
-		if !strings.Contains(source, want) {
-			t.Errorf("generated bindings are missing %q:\n%s", want, source)
-		}
+		testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
 	}
-	if strings.Contains(source, "http.Status") {
-		t.Errorf("generated bindings carry a named status constant instead of the schema's number:\n%s", source)
-	}
+	testassert.Check(t, !strings.Contains(source, "http.Status"), "generated bindings carry a named status constant instead of the schema's number:\n%s", source)
 	for _, want := range []string{
 		`"ResetField": {`,
 		`"field": "required"`,
@@ -336,9 +310,7 @@ func TestSupportedShapesGenerate(t *testing.T) {
         "type": "string"
       }`,
 	} {
-		if !strings.Contains(contract, want) {
-			t.Errorf("invocation contract is missing %q:\n%s", want, contract)
-		}
+		testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
 	}
 }
 
@@ -913,16 +885,12 @@ components:
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			schemaPath := filepath.Join(dir, "openapi.yaml")
-			if err := os.WriteFile(schemaPath, []byte(tc.schema), 0o644); err != nil {
-				t.Fatalf("writing the fixture schema: %v", err)
-			}
+			testassert.NoError(t, os.WriteFile(schemaPath, []byte(tc.schema), 0o644))
 			outPath := filepath.Join(dir, "operations.gen.go")
 			contractPath := filepath.Join(dir, "native-invocations.json")
 			const sentinel = "untouched\n"
 			for _, path := range []string{outPath, contractPath} {
-				if err := os.WriteFile(path, []byte(sentinel), 0o644); err != nil {
-					t.Fatalf("writing the sentinel artifact: %v", err)
-				}
+				testassert.NoError(t, os.WriteFile(path, []byte(sentinel), 0o644))
 			}
 			if err := run(schemaPath, outPath, contractPath); err == nil {
 				t.Fatal("the generator accepted an unsupported schema shape")
@@ -931,9 +899,7 @@ components:
 			}
 			for _, path := range []string{outPath, contractPath} {
 				content, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatalf("reading %s: %v", path, err)
-				}
+				testassert.Require(t, err == nil, "reading %s: %v", path, err)
 				if !bytes.Equal(content, []byte(sentinel)) {
 					t.Fatalf("unsupported input rewrote %s: %q", filepath.Base(path), content)
 				}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestDefaultOptions pins the shared default resolution: the home data
@@ -19,56 +20,30 @@ func TestDefaultOptions(t *testing.T) {
 	t.Setenv("LIGHTCODE_CONFIG", "")
 
 	options, err := clienthost.DefaultOptions()
-	if err != nil {
-		t.Fatalf("DefaultOptions: %v", err)
-	}
+	testassert.NoError(t, err)
 	wantDataDir := filepath.Join(home, ".lightcode")
-	if options.DataDir != wantDataDir || !filepath.IsAbs(options.DataDir) {
-		t.Fatalf("DataDir = %q, want absolute %q", options.DataDir, wantDataDir)
-	}
-	if options.ConfigPath != filepath.Join(wantDataDir, "config.json") {
-		t.Fatalf("ConfigPath = %q, want the data directory's config.json", options.ConfigPath)
-	}
+	testassert.Require(t, options.DataDir == wantDataDir && filepath.IsAbs(options.DataDir) && options.ConfigPath == filepath.Join(wantDataDir, "config.json"), "DataDir = %q, want absolute %q; ConfigPath = %q, want the data directory's config.json", options.DataDir, wantDataDir, options.ConfigPath)
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
-	if options.Executable != executable {
-		t.Fatalf("Executable = %q, want the running executable %q", options.Executable, executable)
-	}
-	if len(options.PrefixArgs) != 0 {
-		t.Fatalf("PrefixArgs = %q, want none", options.PrefixArgs)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, options.Executable == executable && len(options.PrefixArgs) == 0, "got %v, want %v; PrefixArgs = %q, want none", options.Executable, executable, options.PrefixArgs)
 
 	configured := filepath.Join(home, "elsewhere", "custom.json")
 	t.Setenv("LIGHTCODE_CONFIG", configured)
 	options, err = clienthost.DefaultOptions()
-	if err != nil {
-		t.Fatalf("DefaultOptions with LIGHTCODE_CONFIG: %v", err)
-	}
-	if options.ConfigPath != configured {
-		t.Fatalf("ConfigPath = %q, want the configured %q", options.ConfigPath, configured)
-	}
-	if options.DataDir != wantDataDir {
-		t.Fatalf("LIGHTCODE_CONFIG relocated DataDir to %q", options.DataDir)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, options.ConfigPath == configured && options.DataDir == wantDataDir, "got %v, want %v; got %v, want %v", options.ConfigPath, configured, options.DataDir, wantDataDir)
 
 	relative := filepath.Join("relative", "config.json")
 	t.Setenv("LIGHTCODE_CONFIG", relative)
 	options, err = clienthost.DefaultOptions()
-	if err != nil {
-		t.Fatalf("DefaultOptions with a relative LIGHTCODE_CONFIG: %v", err)
-	}
+	testassert.NoError(t, err)
 	wantConfigured, err := filepath.Abs(relative)
-	if err != nil {
-		t.Fatalf("filepath.Abs: %v", err)
-	}
-	if options.ConfigPath != wantConfigured {
-		t.Fatalf("relative ConfigPath = %q, want normalized %q", options.ConfigPath, wantConfigured)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, options.ConfigPath, wantConfigured)
 
 	t.Setenv("HOME", "")
-	if _, err := clienthost.DefaultOptions(); err == nil {
-		t.Fatal("DefaultOptions without HOME reported success")
+	{
+		_, err := clienthost.DefaultOptions()
+		testassert.Require(t, err != nil, "DefaultOptions without HOME reported success")
 	}
 }

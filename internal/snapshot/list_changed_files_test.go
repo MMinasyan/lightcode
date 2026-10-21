@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The ListChangedFiles contract tests: the durable identity shape on the
@@ -22,9 +24,7 @@ func seedListGroup(t *testing.T, dataDir, sessionID, groupID string, turns map[i
 	for turn, files := range turns {
 		for i, meta := range files {
 			entry := filepath.Join(dataDir, "code", sessionID, groupID, "snapshots", strconv.Itoa(turn), "entry"+strconv.Itoa(i))
-			if err := os.MkdirAll(entry, 0o755); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, os.MkdirAll(entry, 0o755))
 			writeMeta(t, filepath.Join(entry, "meta.json"), meta)
 		}
 	}
@@ -33,25 +33,20 @@ func seedListGroup(t *testing.T, dataDir, sessionID, groupID string, turns map[i
 func writeMeta(t *testing.T, path string, meta SnapshotMeta) {
 	t.Helper()
 	data := "{\"original_path\":\"" + meta.OriginalPath + "\",\"canonical_path\":\"" + meta.CanonicalPath + "\",\"existed\":true}"
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(path, []byte(data), 0o600))
 }
 
 func TestListChangedFilesAbsentSessionIsEmptySuccess(t *testing.T) {
 	paths, err := ListChangedFiles(t.TempDir(), listTestSession)
-	if err != nil {
-		t.Fatalf("ListChangedFiles absent session: %v", err)
-	}
-	if len(paths) != 0 {
-		t.Fatalf("paths = %q, want empty", paths)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(paths) == 0, "paths = %q, want empty", paths)
 }
 
 func TestListChangedFilesSessionIDShape(t *testing.T) {
 	for _, bad := range []string{"", "short", "0123456789abcdef0123456789abcde", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcdeg"} {
-		if _, err := ListChangedFiles(t.TempDir(), bad); err == nil {
-			t.Errorf("ListChangedFiles(%q) = nil error, want the identity-shape rejection", bad)
+		{
+			_, err := ListChangedFiles(t.TempDir(), bad)
+			testassert.Check(t, err != nil, "ListChangedFiles(%q) = nil error, want the identity-shape rejection", bad)
 		}
 	}
 }
@@ -60,99 +55,61 @@ func TestListChangedFilesEnumerationError(t *testing.T) {
 	dataDir := t.TempDir()
 	// The session path is a file: reading it as a directory is an error other
 	// than not-exist.
-	if err := os.MkdirAll(filepath.Join(dataDir, "code"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "code", listTestSession), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(dataDir, "code"), 0o755))
+	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "code", listTestSession), []byte("x"), 0o600))
 	paths, err := ListChangedFiles(dataDir, listTestSession)
-	if err == nil {
-		t.Fatal("ListChangedFiles on a file session path = nil error, want the enumeration failure")
-	}
-	if paths != nil {
-		t.Fatalf("paths = %q, want nil", paths)
-	}
+	testassert.Require(t, err != nil, "ListChangedFiles on a file session path = nil error, want the enumeration failure")
+	testassert.Require(t, paths == nil, "paths = %q, want nil", paths)
 }
 
 func TestListChangedFilesSkipsInvalidNamesSymlinksAndNonDirectories(t *testing.T) {
 	dataDir := t.TempDir()
 	sessionDir := filepath.Join(dataDir, "code", listTestSession)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(sessionDir, 0o755))
 	// The command-output spill directory: a non-hex sibling of the groups.
-	if err := os.MkdirAll(filepath.Join(sessionDir, "output"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(sessionDir, "output"), 0o755))
 	// A valid group whose content would leak if the name check were missing.
-	if err := os.MkdirAll(filepath.Join(sessionDir, "output", "snapshots", "1", "e"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(sessionDir, "output", "snapshots", "1", "e"), 0o755))
 	writeMeta(t, filepath.Join(sessionDir, "output", "snapshots", "1", "e", "meta.json"), SnapshotMeta{OriginalPath: "/o", CanonicalPath: "/leaked"})
 
 	// A symlinked group directory with real content behind it.
 	real := filepath.Join(t.TempDir(), "realgroup")
-	if err := os.MkdirAll(filepath.Join(real, "snapshots", "1", "e"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(real, "snapshots", "1", "e"), 0o755))
 	writeMeta(t, filepath.Join(real, "snapshots", "1", "e", "meta.json"), SnapshotMeta{OriginalPath: "/s", CanonicalPath: "/symlinked"})
-	if err := os.Symlink(real, filepath.Join(sessionDir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(real, filepath.Join(sessionDir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")))
 
 	// A non-directory child with a valid group-ID name.
-	if err := os.WriteFile(filepath.Join(sessionDir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(sessionDir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), []byte("x"), 0o600))
 
 	// A short-named group: content present, name invalid.
-	if err := os.MkdirAll(filepath.Join(sessionDir, "short", "snapshots", "1", "e"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(sessionDir, "short", "snapshots", "1", "e"), 0o755))
 	writeMeta(t, filepath.Join(sessionDir, "short", "snapshots", "1", "e", "meta.json"), SnapshotMeta{OriginalPath: "/h", CanonicalPath: "/shortgroup"})
 
 	paths, err := ListChangedFiles(dataDir, listTestSession)
-	if err != nil {
-		t.Fatalf("ListChangedFiles: %v", err)
-	}
-	if len(paths) != 0 {
-		t.Fatalf("paths = %q, want every invalid-name, symlink and non-directory child skipped", paths)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(paths) == 0, "paths = %q, want every invalid-name, symlink and non-directory child skipped", paths)
 }
 
 func TestListChangedFilesSkipsMalformedMetadataAndEmptyCanonical(t *testing.T) {
 	dataDir := t.TempDir()
 	sessionDir := filepath.Join(dataDir, "code", listTestSession)
 	group := filepath.Join(sessionDir, "cccccccccccccccccccccccccccccccc", "snapshots", "1", "a")
-	if err := os.MkdirAll(group, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(group, 0o755))
 	// Malformed metadata is skipped silently by ListTurns.
-	if err := os.WriteFile(filepath.Join(group, "meta.json"), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(group, "meta.json"), []byte("{not json"), 0o600))
 	// An empty-CanonicalPath entry is skipped: no legacy-path fallback.
 	empty := filepath.Join(sessionDir, "cccccccccccccccccccccccccccccccc", "snapshots", "1", "b")
-	if err := os.MkdirAll(empty, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(empty, 0o755))
 	writeMeta(t, filepath.Join(empty, "meta.json"), SnapshotMeta{OriginalPath: "/legacy-only"})
 
 	// The one valid entry.
 	valid := filepath.Join(sessionDir, "cccccccccccccccccccccccccccccccc", "snapshots", "2", "c")
-	if err := os.MkdirAll(valid, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(valid, 0o755))
 	writeMeta(t, filepath.Join(valid, "meta.json"), SnapshotMeta{OriginalPath: "/orig", CanonicalPath: "/kept.go"})
 
 	paths, err := ListChangedFiles(dataDir, listTestSession)
-	if err != nil {
-		t.Fatalf("ListChangedFiles: %v", err)
-	}
-	if len(paths) != 1 || paths[0] != "/kept.go" {
-		t.Fatalf("paths = %q, want [/kept.go] only", paths)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(paths) == 1 && paths[0] == "/kept.go", "paths = %q, want [/kept.go] only", paths)
 }
 
 func TestListChangedFilesDeduplicatesAndSortsAcrossGroups(t *testing.T) {
@@ -169,13 +126,9 @@ func TestListChangedFilesDeduplicatesAndSortsAcrossGroups(t *testing.T) {
 	seedListGroup(t, dataDir, listTestSession, "dddddddddddddddddddddddddddddddd", groups())
 	seedListGroup(t, dataDir, listTestSession, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", groups())
 	paths, err := ListChangedFiles(dataDir, listTestSession)
-	if err != nil {
-		t.Fatalf("ListChangedFiles: %v", err)
-	}
+	testassert.NoError(t, err)
 	want := []string{"/a.go", "/m.go", "/z.go"}
-	if !slices.Equal(paths, want) {
-		t.Fatalf("paths = %q, want %q", paths, want)
-	}
+	testassert.Require(t, slices.Equal(paths, want), "paths = %q, want %q", paths, want)
 }
 
 func TestListChangedFilesTurnErrorDiscardsResult(t *testing.T) {
@@ -191,25 +144,17 @@ func TestListChangedFilesTurnErrorDiscardsResult(t *testing.T) {
 	// entries, and the complete result — including the earlier group's
 	// path — must be discarded.
 	turnDir := filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1", "e")
-	if err := os.MkdirAll(turnDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(turnDir, 0o755))
 	writeMeta(t, filepath.Join(turnDir, "meta.json"), SnapshotMeta{OriginalPath: "/x", CanonicalPath: "/x.go"})
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not block reads as root")
 	}
-	if err := os.Chmod(filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1"), 0o000); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Chmod(filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1"), 0o000))
 	t.Cleanup(func() {
 		_ = os.Chmod(filepath.Join(sessionDir, "ffffffffffffffffffffffffffffffff", "snapshots", "1"), 0o755)
 	})
 
 	paths, err := ListChangedFiles(dataDir, listTestSession)
-	if err == nil {
-		t.Fatal("ListChangedFiles = nil error, want the turn-read failure")
-	}
-	if paths != nil {
-		t.Fatalf("paths = %q, want the complete result discarded", paths)
-	}
+	testassert.Require(t, err != nil, "ListChangedFiles = nil error, want the turn-read failure")
+	testassert.Require(t, paths == nil, "paths = %q, want the complete result discarded", paths)
 }

@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -139,9 +140,7 @@ func TestActualWriterPromptErasureCanonicalReplacementAndPartialOutput(t *testin
 	c.command("/runtime NotAnOperation {}")
 	frameContaining(t, screen, "unknown operation")
 	result := screen.text()
-	if strings.Count(result, "unsubmitted") != 1 || strings.Count(result, "input 1") != 1 || !strings.Contains(result, "unknown operation") {
-		t.Fatalf("prompt corrupted transcript/command output:\n%s", result)
-	}
+	testassert.Require(t, strings.Count(result, "unsubmitted") == 1 && strings.Count(result, "input 1") == 1 && strings.Contains(result, "unknown operation"), "prompt corrupted transcript/command output:\n%s", result)
 	// A pending assistant becomes terminal under the SAME item identity. The
 	// accepted reader assignment, not permanent ID suppression, refreshes the range.
 	pending := assistant("same-item", "pending content", true)
@@ -166,9 +165,7 @@ func TestActualWriterPromptErasureCanonicalReplacementAndPartialOutput(t *testin
 	c.report(s, terminal.RenderWarningMsg(string(raw)), true)
 	frameContaining(t, screen, "partial restore")
 	result = screen.text()
-	if strings.Count(result, "unsubmitted") != 1 || !strings.Contains(result, "terminal content") || !strings.Contains(result, "actual tool result") || !strings.Contains(strings.ReplaceAll(result, "\n", ""), "one.go") || !strings.Contains(strings.ReplaceAll(result, "\n", ""), "two.go") {
-		t.Fatalf("resulting screen lost content:\n%s", result)
-	}
+	testassert.Require(t, strings.Count(result, "unsubmitted") == 1 && strings.Contains(result, "terminal content") && strings.Contains(result, "actual tool result") && strings.Contains(strings.ReplaceAll(result, "\n", ""), "one.go") && strings.Contains(strings.ReplaceAll(result, "\n", ""), "two.go"), "resulting screen lost content:\n%s", result)
 	c.requestExit(nil)
 }
 
@@ -185,46 +182,30 @@ func TestFrameFollowsAcceptedReaderAssignments(t *testing.T) {
 		return c.frameLocked(content)
 	}
 	const refreshed = "Authoritative refreshed range"
-	if !strings.Contains(frame(""), refreshed) {
-		t.Fatal("initial accepted range not rendered")
-	}
+	testassert.Require(t, strings.Contains(frame(""), refreshed), "initial accepted range not rendered")
 	press(c, terminal.KeyMsg{Rune: 'x'})
-	if strings.Contains(frame(""), refreshed) {
-		t.Fatal("key-only redraw reprinted history")
-	}
+	testassert.Require(t, !strings.Contains(frame(""), refreshed), "key-only redraw reprinted history")
 	c.acceptEvent(eventDelivery{c.conn, scopedProgress(rootA, "active", "provisional only", false)})
-	if strings.Contains(frame(""), refreshed) {
-		t.Fatal("provisional-only redraw reprinted history")
-	}
+	testassert.Require(t, !strings.Contains(frame(""), refreshed), "provisional-only redraw reprinted history")
 	done = c.refreshReader(r)
 	receive(t, transport.requests).respond(h)
 	barrier(t, done)
-	if !strings.Contains(frame(""), refreshed) {
-		t.Fatal("equal-body accepted assignment did not refresh the range")
-	}
+	testassert.Require(t, strings.Contains(frame(""), refreshed), "equal-body accepted assignment did not refresh the range")
 	c.mu.Lock()
 	r.pendingOlder = true
 	c.kickReaderLocked(r)
 	done = r.chain.done
 	c.mu.Unlock()
 	older := receive(t, transport.requests)
-	if older.req.URL.Query().Get("cursor") != "oldest" {
-		t.Fatal("render invalidation changed the oldest cursor")
-	}
+	testassert.Require(t, older.req.URL.Query().Get("cursor") == "oldest", "render invalidation changed the oldest cursor")
 	older.respond(protocol.HistoryPage{SessionRevision: revision("1"), Items: inputs(1, 1)})
 	barrier(t, done)
 	rendered := frame("")
-	if !strings.Contains(rendered, refreshed) || !strings.Contains(rendered, "input 1") || !strings.Contains(rendered, "input 2") {
-		t.Fatal("accepted older range not rendered")
-	}
+	testassert.Require(t, strings.Contains(rendered, refreshed) && strings.Contains(rendered, "input 1") && strings.Contains(rendered, "input 2"), "accepted older range not rendered")
 	c.mu.Lock()
-	if r.assignmentVersion != 3 || r.floor.DurableRevision != "1" || r.cursor != nil {
-		t.Fatal("local assignments changed protocol revision or oldest-edge state")
-	}
+	testassert.Require(t, r.assignmentVersion == 3 && r.floor.DurableRevision == "1" && r.cursor == nil, "local assignments changed protocol revision or oldest-edge state")
 	c.mu.Unlock()
-	if !strings.Contains(frame("\x1b[2J\x1b[3J\x1b[H"), refreshed) {
-		t.Fatal("clear did not redraw the accepted range")
-	}
+	testassert.Require(t, strings.Contains(frame("\x1b[2J\x1b[3J\x1b[H"), refreshed), "clear did not redraw the accepted range")
 }
 
 func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
@@ -246,15 +227,11 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	c.mu.Unlock()
 	frameContaining(t, screen, "new metadata")
 	result := screen.text()
-	if !strings.Contains(result, "raw.go") || strings.Contains(result, "normalized.go") || !strings.Contains(result, "old metadata") {
-		t.Fatalf("tool display used wrong arguments/metadata: %s", result)
-	}
+	testassert.Require(t, strings.Contains(result, "raw.go") && !strings.Contains(result, "normalized.go") && strings.Contains(result, "old metadata"), "tool display used wrong arguments/metadata: %s", result)
 	c.command("/copy")
 	osc := frameContaining(t, screen, "\x1b]52;")
 	encoded := base64.StdEncoding.EncodeToString([]byte("canonical first\ncanonical second"))
-	if !strings.Contains(osc, "\x1b]52;c;"+encoded+"\a") {
-		t.Fatalf("not canonical OSC52: %q", osc)
-	}
+	testassert.Require(t, strings.Contains(osc, "\x1b]52;c;"+encoded+"\a"), "not canonical OSC52: %q", osc)
 	c.requestExit(nil)
 }
 
@@ -287,21 +264,15 @@ func TestActualWriterProvisionalBoundedNoncanonicalAndReset(t *testing.T) {
 	frameContaining(t, screen, "first-position")
 	c.events <- eventDelivery{c.conn, scopedProgress(rootA, "active", "repeated-position", true)}
 	frameContaining(t, screen, "[Refusal]")
-	if strings.Count(screen.text(), "input 1") != 1 {
-		t.Fatal("provisional reprinted canonical history")
-	}
+	testassert.Require(t, strings.Count(screen.text(), "input 1") == 1, "provisional reprinted canonical history")
 	c.mu.Lock()
-	if len(r.items) != 1 {
-		t.Fatal("progress created canonical items")
-	}
+	testassert.Require(t, len(r.items) == 1, "progress created canonical items")
 	c.mu.Unlock()
 	// Direct concrete event acceptance keeps the screen fixture small while
 	// exercising the same bounded area used by the writer above.
 	c.acceptEvent(eventDelivery{c.conn, scopedProgress(rootA, "active", strings.Repeat("é", 40000), false)})
 	c.mu.Lock()
-	if len(c.provisional) > 65536 || !utf8.ValidString(c.provisional) || !c.provisionalTruncated {
-		t.Fatal("provisional bound is not UTF8 safe")
-	}
+	testassert.Require(t, len(c.provisional) <= 65536 && utf8.ValidString(c.provisional) && c.provisionalTruncated, "provisional bound is not UTF8 safe")
 	c.mu.Unlock()
 	done = c.refreshReader(r)
 	h.SessionRevision = revision("2")
@@ -309,9 +280,7 @@ func TestActualWriterProvisionalBoundedNoncanonicalAndReset(t *testing.T) {
 	receive(t, transport.requests).respond(h)
 	barrier(t, done)
 	c.mu.Lock()
-	if c.provisional != "" || c.provisionalTruncated {
-		t.Fatal("accepted hydration did not clear provisional")
-	}
+	testassert.Require(t, c.provisional == "" && !c.provisionalTruncated, "accepted hydration did not clear provisional")
 	c.mu.Unlock()
 	c.requestExit(nil)
 }
@@ -341,29 +310,21 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 	c.command("/context")
 	c.command("/warnings")
 	text := outputs(c)
-	if !strings.Contains(text, "9007199254740993") || !strings.Contains(text, "18446744073709551615") || !strings.Contains(text, "own") || strings.Contains(text, "sibling") {
-		t.Fatal("usage/warnings lost exact subset")
-	}
+	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, "18446744073709551615") && strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "usage/warnings lost exact subset")
 	c.mu.Lock()
 	c.root = nil
 	c.mu.Unlock()
 	c.command("/warnings")
 	text = outputs(c)
-	if !strings.Contains(text, "global") || strings.Contains(text, "own") || strings.Contains(text, "sibling") {
-		t.Fatal("global-only indicator included owned groups")
-	}
+	testassert.Require(t, strings.Contains(text, "global") && !strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "global-only indicator included owned groups")
 	c.command("/runtime UnknownOperation {}")
 	settleTasks(t, c)
 	text = outputs(c)
-	if !strings.Contains(text, "unknown operation") || strings.Contains(text, "Outcome unknown") {
-		t.Fatalf("unknown /runtime classification: %s", text)
-	}
+	testassert.Require(t, strings.Contains(text, "unknown operation") && !strings.Contains(text, "Outcome unknown"), "unknown /runtime classification: %s", text)
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	for _, route := range transport.calls {
-		if strings.Contains(route, "UnknownOperation") {
-			t.Fatal("unknown runtime performed HTTP")
-		}
+		testassert.Require(t, !strings.Contains(route, "UnknownOperation"), "unknown runtime performed HTTP")
 	}
 }
 
@@ -398,20 +359,14 @@ func TestActualClipboardRefusalAndNoLoadedAssistant(t *testing.T) {
 			c.command("/copy")
 			if test.want == "" {
 				frame := frameContaining(t, screen, "No loaded authoritative assistant")
-				if strings.Contains(frame, "\x1b]52;") {
-					t.Fatal("an absent or empty history wrote the clipboard")
-				}
+				testassert.Require(t, !strings.Contains(frame, "\x1b]52;"), "an absent or empty history wrote the clipboard")
 			} else {
 				frame := frameContaining(t, screen, "\x1b]52;")
-				if !strings.Contains(frame, test.want) {
-					t.Fatalf("copy did not skip the empty assistant: %q", frame)
-				}
+				testassert.Require(t, strings.Contains(frame, test.want), "copy did not skip the empty assistant: %q", frame)
 			}
 			transport.mu.Lock()
 			for _, route := range transport.calls {
-				if strings.Contains(route, "/history") {
-					t.Fatal("copy guessed skipped history")
-				}
+				testassert.Require(t, !strings.Contains(route, "/history"), "copy guessed skipped history")
 			}
 			transport.mu.Unlock()
 			c.requestExit(nil)
@@ -435,9 +390,7 @@ func TestProgressTupleUnmatchedOperationRepairsWithoutReplay(t *testing.T) {
 	}
 	c.acceptEvent(eventDelivery{c.conn, tool(rootA, "first")})
 	c.mu.Lock()
-	if !strings.Contains(c.provisional, "same-call") || len(r.items) != 1 {
-		t.Fatal("matched tool hint not temporary activity")
-	}
+	testassert.Require(t, strings.Contains(c.provisional, "same-call") && len(r.items) == 1, "matched tool hint not temporary activity")
 	c.mu.Unlock()
 	done = c.refreshReader(r)
 	h.SessionRevision = revision("2")
@@ -448,27 +401,19 @@ func TestProgressTupleUnmatchedOperationRepairsWithoutReplay(t *testing.T) {
 	repair := receive(t, transport.requests)
 	c.mu.Lock()
 	done = r.chain.done
-	if c.provisional != "" {
-		t.Fatal("old Operation call ID reused in new activity")
-	}
+	testassert.Require(t, c.provisional == "", "old Operation call ID reused in new activity")
 	c.mu.Unlock()
 	repair.respond(h)
 	barrier(t, done)
 	c.mu.Lock()
-	if c.provisional != "" || len(r.items) != 1 {
-		t.Fatal("unmatched hint replayed into canonical/provisional items")
-	}
+	testassert.Require(t, c.provisional == "" && len(r.items) == 1, "unmatched hint replayed into canonical/provisional items")
 	c.mu.Unlock()
 	c.acceptEvent(eventDelivery{c.conn, tool(rootB, "second")})
 	c.mu.Lock()
-	if r.chain != nil || c.provisional != "" {
-		t.Fatal("foreign Session tool hint dirtied selected Session")
-	}
+	testassert.Require(t, r.chain == nil && c.provisional == "", "foreign Session tool hint dirtied selected Session")
 	c.mu.Unlock()
 	c.acceptEvent(eventDelivery{c.conn, tool(rootA, "second")})
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !strings.Contains(c.provisional, "same-call") {
-		t.Fatal("same call ID under current Operation was suppressed")
-	}
+	testassert.Require(t, strings.Contains(c.provisional, "same-call"), "same call ID under current Operation was suppressed")
 }

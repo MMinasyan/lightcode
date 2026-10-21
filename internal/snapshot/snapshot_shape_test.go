@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"golang.org/x/sys/unix"
 )
 
@@ -22,9 +23,7 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 			name: "directory",
 			target: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "target-dir")
-				if err := os.Mkdir(path, 0o755); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Mkdir(path, 0o755))
 				return path
 			},
 		},
@@ -62,24 +61,14 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 				_, _, err := store.SnapshotResolvedEntry(turn, target, target)
 				return err
 			})
-			if err == nil {
-				t.Fatalf("SnapshotResolved(%s) succeeded, want non-regular target refusal", tc.name)
-			}
+			testassert.Require(t, err != nil, "SnapshotResolved(%s) succeeded, want non-regular target refusal", tc.name)
 			msg := strings.ToLower(err.Error())
-			if strings.Contains(msg, "did not fail closed before blocking") {
-				t.Fatalf("SnapshotResolved(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
-			}
-			if !strings.Contains(msg, "non-regular") {
-				t.Fatalf("SnapshotResolved(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
-			}
+			testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "SnapshotResolved(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
+			testassert.Require(t, strings.Contains(msg, "non-regular"), "SnapshotResolved(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
 
 			entries, readErr := os.ReadDir(filepath.Join(store.snapshotsDir, "1"))
-			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-				t.Fatal(readErr)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("snapshot entries = %d, want none for refused %s", len(entries), tc.name)
-			}
+			testassert.Require(t, readErr == nil || errors.Is(readErr, os.ErrNotExist), "%v", readErr)
+			testassert.Require(t, len(entries) == 0, "snapshot entries = %d, want none for refused %s", len(entries), tc.name)
 			if info, statErr := os.Lstat(target); statErr != nil {
 				t.Fatalf("lstat %s = %v, want target preserved", target, statErr)
 			} else if info.Mode().IsRegular() {
@@ -94,16 +83,16 @@ func TestSnapshotResolvedStillAllowsMissingAndRegularTargets(t *testing.T) {
 	const turn = 1
 
 	missing := filepath.Join(t.TempDir(), "new-file.txt")
-	if _, _, err := store.SnapshotResolvedEntry(turn, missing, missing); err != nil {
-		t.Fatalf("SnapshotResolvedEntry missing target error = %v", err)
+	{
+		_, _, err := store.SnapshotResolvedEntry(turn, missing, missing)
+		testassert.NoError(t, err)
 	}
 
 	regular := filepath.Join(t.TempDir(), "regular.txt")
-	if err := os.WriteFile(regular, []byte("before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.SnapshotResolvedEntry(turn, regular, regular); err != nil {
-		t.Fatalf("SnapshotResolvedEntry regular target error = %v", err)
+	testassert.NoError(t, os.WriteFile(regular, []byte("before"), 0o644))
+	{
+		_, _, err := store.SnapshotResolvedEntry(turn, regular, regular)
+		testassert.NoError(t, err)
 	}
 }
 

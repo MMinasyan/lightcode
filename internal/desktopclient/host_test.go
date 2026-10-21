@@ -22,6 +22,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/version"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -98,9 +99,7 @@ func missingExecutable(t *testing.T) string {
 func newHost(t *testing.T, server *httptest.Server) *Host {
 	t.Helper()
 	dataDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(recordContent(server.URL)), 0o600); err != nil {
-		t.Fatalf("write discovery record: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(recordContent(server.URL)), 0o600))
 	host := New(clienthost.Options{DataDir: dataDir, Executable: missingExecutable(t)}, "/ws/name")
 	host.startup(context.Background())
 	t.Cleanup(func() { host.shutdown(context.Background()) })
@@ -145,9 +144,7 @@ func awaitPulling(t *testing.T, host *Host) {
 		if pulling {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the event pull never took the outstanding-pull gate")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "the event pull never took the outstanding-pull gate")
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -164,9 +161,7 @@ func awaitTerminal(t *testing.T, host *Host) {
 		if ready {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the stream never reported its terminal error")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "the stream never reported its terminal error")
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -179,44 +174,25 @@ func TestDesktopHostOpenGenerationSupersession(t *testing.T) {
 	host := newHost(t, server)
 
 	first, err := host.Open()
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	if first.InstanceID != testInstance {
-		t.Fatalf("first instance = %q, want %q", first.InstanceID, testInstance)
-	}
-	if first.Workspace != "/ws/name" {
-		t.Fatalf("first workspace = %q, want the host workspace", first.Workspace)
-	}
-	if first.Generation != "1" {
-		t.Fatalf("first generation = %q, want the first monotonic stamp", first.Generation)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, first.InstanceID == testInstance && first.Workspace == "/ws/name" && first.Generation == "1", "got %v, want %v; got %v, want %v; got %v, want %v", first.InstanceID, testInstance, first.Workspace, "/ws/name", first.Generation, "1")
 
 	second, err := host.Open()
-	if err != nil {
-		t.Fatalf("second Open: %v", err)
-	}
-	if second.Generation != "2" {
-		t.Fatalf("second generation = %q, want the next monotonic stamp", second.Generation)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, second.Generation, "2")
 
-	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil {
-		t.Fatal("a superseded generation accepted a call")
+	{
+		_, err := host.Call(first.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil, "a superseded generation accepted a call")
 	}
-	if _, err := host.NextEvent(first.Generation); err == nil {
-		t.Fatal("a superseded generation accepted an event pull")
+	{
+		_, err := host.NextEvent(first.Generation)
+		testassert.Require(t, err != nil, "a superseded generation accepted an event pull")
 	}
 
 	response, err := host.Call(second.Generation, "GetHealth", "")
-	if err != nil {
-		t.Fatalf("current generation Call: %v", err)
-	}
-	if response.Status != http.StatusOK {
-		t.Fatalf("health status = %d, want 200", response.Status)
-	}
-	if !strings.Contains(response.Body, testInstance) {
-		t.Fatalf("health body = %q, want the authenticated instance", response.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, response.Status == http.StatusOK && strings.Contains(response.Body, testInstance), "got %v, want %v; health body = %q, want the authenticated instance", response.Status, http.StatusOK, response.Body)
 }
 
 // TestDesktopHostOpenCancelsInFlightCall proves a newer Open cancels a
@@ -233,20 +209,20 @@ func TestDesktopHostOpenCancelsInFlightCall(t *testing.T) {
 	})
 	host := newHost(t, server)
 	info, err := host.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	done := make(chan error, 1)
 	go func() {
 		_, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"parked"}`)
 		done <- err
 	}()
 	<-arrived
-	if _, err := host.Open(); err != nil {
-		t.Fatalf("superseding Open: %v", err)
+	{
+		_, err := host.Open()
+		testassert.NoError(t, err)
 	}
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("superseded call = %v, want context.Canceled", err)
+	{
+		err := <-done
+		testassert.Require(t, errors.Is(err, context.Canceled), "superseded call = %v, want context.Canceled", err)
 	}
 	select {
 	case <-observed:
@@ -281,44 +257,27 @@ func TestDesktopHostCallClassification(t *testing.T) {
 	})
 	host := newHost(t, server)
 	info, err := host.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	success, err := host.Call(info.Generation, "GetHealth", "")
-	if err != nil {
-		t.Fatalf("success Call: %v", err)
-	}
-	if success.Status != http.StatusOK || success.Invalid || !strings.Contains(success.Body, testInstance) {
-		t.Fatalf("success response = %+v, want the authenticated health body", success)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, success.Status == http.StatusOK && !success.Invalid && strings.Contains(success.Body, testInstance), "success response = %+v, want the authenticated health body", success)
 
 	rejected, err := host.Call(info.Generation, "RevertSessionCode", `{"session_id":"abc","body":{"operation_id":"op-1"}}`)
-	if err != nil {
-		t.Fatalf("rejection Call: %v", err)
-	}
-	if rejected.Status != http.StatusConflict || rejected.Invalid || rejected.Body != partial {
-		t.Fatalf("rejection response = %+v, want the validated partial body without rejection", rejected)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rejected.Status == http.StatusConflict && !rejected.Invalid && rejected.Body == partial, "rejection response = %+v, want the validated partial body without rejection", rejected)
 
 	empty, err := host.Call(info.Generation, "InterruptSession", `{"session_id":"abc"}`)
-	if err != nil {
-		t.Fatalf("204 Call: %v", err)
-	}
-	if empty.Status != http.StatusNoContent || empty.Invalid || empty.Body != "" {
-		t.Fatalf("204 response = %+v, want a valid empty success", empty)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, empty.Status == http.StatusNoContent && !empty.Invalid && empty.Body == "", "204 response = %+v, want a valid empty success", empty)
 
 	invalid, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"malformed"}`)
-	if err != nil {
-		t.Fatalf("invalid Call: %v", err)
-	}
-	if invalid.Status != http.StatusOK || !invalid.Invalid || invalid.Body != "not json" {
-		t.Fatalf("invalid response = %+v, want the received status/body with the Invalid bit", invalid)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, invalid.Status == http.StatusOK && invalid.Invalid && invalid.Body == "not json", "invalid response = %+v, want the received status/body with the Invalid bit", invalid)
 
-	if _, err := host.Call(info.Generation, "Nope", ""); err == nil {
-		t.Fatal("an unknown operation did not reject the binding")
+	{
+		_, err := host.Call(info.Generation, "Nope", "")
+		testassert.Require(t, err != nil, "an unknown operation did not reject the binding")
 	}
 }
 
@@ -336,8 +295,9 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
-		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "closed") {
-			t.Fatalf("NextEvent = %v, want a closure loss", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "closed"), "NextEvent = %v, want a closure loss", err)
 		}
 	})
 
@@ -352,8 +312,9 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 			close(firstDone)
 		}()
 		awaitPulling(t, host)
-		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "already outstanding") {
-			t.Fatalf("second pull = %v, want the one outstanding pull", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "already outstanding"), "second pull = %v, want the one outstanding pull", err)
 		}
 		cancel()
 		<-firstDone
@@ -366,8 +327,9 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
-		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "closed without a terminal error") {
-			t.Fatalf("NextEvent = %v, want the closure loss", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "closed without a terminal error"), "NextEvent = %v, want the closure loss", err)
 		}
 	})
 
@@ -379,8 +341,9 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
-		if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("NextEvent = %v, want the producer's queued terminal error", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "NextEvent = %v, want the producer's queued terminal error", err)
 		}
 	})
 
@@ -388,32 +351,28 @@ func TestDesktopHostNextEventPullOwnership(t *testing.T) {
 		events := make(chan protocol.Event, 1)
 		errs := make(chan error, 1)
 		var scope protocol.Scope
-		if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
-			t.Fatalf("build scope: %v", err)
-		}
+		testassert.NoError(t, scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}))
 		var event protocol.Event
-		if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
-			t.Fatalf("build event: %v", err)
-		}
+		testassert.NoError(t, event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}))
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
 		errs <- client.ErrResyncRequired
-		if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("pull = %v, want the observed terminal error", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "pull = %v, want the observed terminal error", err)
 		}
 		// The loss retires the generation before any later pull can observe
 		// its remaining buffered progress.
 		events <- event
-		if _, err := host.NextEvent("1"); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-			t.Fatalf("later pull = %v, want the stale-generation rejection", err)
+		{
+			_, err := host.NextEvent("1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "later pull = %v, want the stale-generation rejection", err)
 		}
 		host.mu.Lock()
 		canceled, retired := ctx.Err() != nil, host.generation == ""
 		host.mu.Unlock()
-		if !canceled || !retired {
-			t.Fatal("an observed loss must cancel and retire only its matching generation")
-		}
+		testassert.Require(t, canceled && retired, "an observed loss must cancel and retire only its matching generation")
 	})
 }
 
@@ -426,29 +385,22 @@ func TestDesktopHostProgressPrecedesUnobservedTerminal(t *testing.T) {
 	events := make(chan protocol.Event, 1)
 	errs := make(chan error, 1)
 	var scope protocol.Scope
-	if err := scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}); err != nil {
-		t.Fatalf("build scope: %v", err)
-	}
+	testassert.NoError(t, scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}))
 	var event protocol.Event
-	if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
-		t.Fatalf("build event: %v", err)
-	}
+	testassert.NoError(t, event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}))
 	want, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("marshal event: %v", err)
-	}
+	testassert.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	host := &Host{generation: "1", events: events, errs: errs, connCtx: ctx, connCancel: cancel}
 
 	events <- event
 	raw, err := host.NextEvent("1")
-	if err != nil || raw != string(want) {
-		t.Fatalf("progress pull = (%q, %v), want the exact %q ahead of the unobserved terminal", raw, err, want)
-	}
+	testassert.Require(t, err == nil && raw == string(want), "progress pull = (%q, %v), want the exact %q ahead of the unobserved terminal", raw, err, want)
 	errs <- client.ErrResyncRequired
-	if _, err := host.NextEvent("1"); !errors.Is(err, client.ErrResyncRequired) {
-		t.Fatalf("later pull = %v, want the now-observed terminal error", err)
+	{
+		_, err := host.NextEvent("1")
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "later pull = %v, want the now-observed terminal error", err)
 	}
 }
 
@@ -490,45 +442,35 @@ func TestDesktopHostOverflowTerminalRetiresGeneration(t *testing.T) {
 	})
 	host := newHost(t, server)
 	info, err := host.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	close(start)
 	awaitTerminal(t, host)
 
 	var observed error
 	for pulls := 0; ; pulls++ {
-		if pulls > total {
-			t.Fatal("the terminal failure was never observed")
-		}
+		testassert.Require(t, pulls <= total, "the terminal failure was never observed")
 		raw, err := host.NextEvent(info.Generation)
 		if err != nil {
 			observed = err
 			break
 		}
 		var delivered map[string]any
-		if json.Unmarshal([]byte(raw), &delivered) != nil || delivered["kind"] != "session_changed" {
-			t.Fatalf("pull delivered %q, want only the valid queued progress", raw)
-		}
+		testassert.Require(t, json.Unmarshal([]byte(raw), &delivered) == nil && delivered["kind"] == "session_changed", "pull delivered %q, want only the valid queued progress", raw)
 	}
-	if !errors.Is(observed, client.ErrResyncRequired) {
-		t.Fatalf("observed terminal = %v, want the overflow resync error", observed)
-	}
+	testassert.Require(t, errors.Is(observed, client.ErrResyncRequired), "observed terminal = %v, want the overflow resync error", observed)
 	host.mu.Lock()
 	generationErr := host.connCtx.Err()
 	retired := host.generation == ""
 	host.mu.Unlock()
-	if generationErr == nil {
-		t.Fatal("the terminal failure did not cancel its connection generation")
+	testassert.Require(t, generationErr != nil, "the terminal failure did not cancel its connection generation")
+	testassert.Require(t, retired, "the terminal failure did not retire its connection generation")
+	{
+		_, err := host.NextEvent(info.Generation)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "later pull = %v, want the stale-generation rejection", err)
 	}
-	if !retired {
-		t.Fatal("the terminal failure did not retire its connection generation")
-	}
-	if _, err := host.NextEvent(info.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("later pull = %v, want the stale-generation rejection", err)
-	}
-	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatal("a later request acted healthy on the lost generation")
+	{
+		_, err := host.Call(info.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "a later request acted healthy on the lost generation")
 	}
 }
 
@@ -540,14 +482,17 @@ func TestDesktopHostOpenRejectsEstablishmentFailure(t *testing.T) {
 		http.Error(w, "no stream", http.StatusInternalServerError)
 	})
 	host := newHost(t, server)
-	if _, err := host.Open(); err == nil {
-		t.Fatal("Open succeeded over a failed event stream")
+	{
+		_, err := host.Open()
+		testassert.Require(t, err != nil, "Open succeeded over a failed event stream")
 	}
-	if _, err := host.Call("1", "GetHealth", ""); err == nil {
-		t.Fatal("no generation was installed, yet a call succeeded")
+	{
+		_, err := host.Call("1", "GetHealth", "")
+		testassert.Require(t, err != nil, "no generation was installed, yet a call succeeded")
 	}
-	if _, err := host.NextEvent("1"); err == nil {
-		t.Fatal("no generation was installed, yet a pull succeeded")
+	{
+		_, err := host.NextEvent("1")
+		testassert.Require(t, err != nil, "no generation was installed, yet a pull succeeded")
 	}
 }
 
@@ -565,9 +510,7 @@ func TestDesktopHostCloseCancelsWaits(t *testing.T) {
 	})
 	host := newHost(t, server)
 	info, err := host.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	requestDone := make(chan error, 1)
 	go func() {
 		_, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"parked"}`)
@@ -582,11 +525,13 @@ func TestDesktopHostCloseCancelsWaits(t *testing.T) {
 	awaitPulling(t, host)
 
 	host.shutdown(context.Background())
-	if err := <-requestDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("closed request = %v, want context.Canceled", err)
+	{
+		err := <-requestDone
+		testassert.Require(t, errors.Is(err, context.Canceled), "closed request = %v, want context.Canceled", err)
 	}
-	if err := <-pullDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("closed pull = %v, want context.Canceled", err)
+	{
+		err := <-pullDone
+		testassert.Require(t, errors.Is(err, context.Canceled), "closed pull = %v, want context.Canceled", err)
 	}
 	select {
 	case <-observed:
@@ -605,9 +550,7 @@ func TestDesktopHostNativeInvocation(t *testing.T) {
 		defer host.shutdown(context.Background())
 		host.pickDirFn = func(context.Context) (string, error) { return "/chosen", nil }
 		got, err := host.PickDirectory()
-		if err != nil || got != "/chosen" {
-			t.Fatalf("PickDirectory = (%q, %v)", got, err)
-		}
+		testassert.Require(t, err == nil && got == "/chosen", "PickDirectory = (%q, %v)", got, err)
 	})
 
 	t.Run("directory cancel is an empty result", func(t *testing.T) {
@@ -616,9 +559,7 @@ func TestDesktopHostNativeInvocation(t *testing.T) {
 		defer host.shutdown(context.Background())
 		host.pickDirFn = func(context.Context) (string, error) { return "", nil }
 		got, err := host.PickDirectory()
-		if err != nil || got != "" {
-			t.Fatalf("PickDirectory = (%q, %v), want the cancel result", got, err)
-		}
+		testassert.Require(t, err == nil && got == "", "PickDirectory = (%q, %v), want the cancel result", got, err)
 	})
 
 	t.Run("title matches the one shared algorithm", func(t *testing.T) {
@@ -627,22 +568,23 @@ func TestDesktopHostNativeInvocation(t *testing.T) {
 			host.startup(context.Background())
 			var applied []string
 			host.titleFn = func(_ context.Context, title string) { applied = append(applied, title) }
-			if err := host.SetTitle(workspace); err != nil {
-				t.Fatalf("SetTitle(%q): %v", workspace, err)
+			{
+				err := host.SetTitle(workspace)
+				testassert.Require(t, err == nil, "SetTitle(%q): %v", workspace, err)
 			}
-			if err := host.SetTitle(workspace); err != nil {
-				t.Fatalf("second SetTitle(%q): %v", workspace, err)
+			{
+				err := host.SetTitle(workspace)
+				testassert.Require(t, err == nil, "second SetTitle(%q): %v", workspace, err)
 			}
 			// The initial window title and every subsequent SetTitle apply
 			// the one shared algorithm: the plain basename join, no
 			// special case.
 			want := "Lightcode — " + filepath.Base(workspace)
-			if got := windowTitle(workspace); got != want {
-				t.Fatalf("initial title for %q = %q, want %q", workspace, got, want)
+			{
+				got := windowTitle(workspace)
+				testassert.Require(t, got == want, "initial title for %q = %q, want %q", workspace, got, want)
 			}
-			if applied[0] != want || applied[1] != want {
-				t.Fatalf("SetTitle(%q) applied %q, want the initial title %q", workspace, applied, want)
-			}
+			testassert.Require(t, applied[0] == want && applied[1] == want, "SetTitle(%q) applied %q, want the initial title %q", workspace, applied, want)
 		}
 	})
 
@@ -713,21 +655,20 @@ func TestDesktopHostParkedCallsUnblockOnStartup(t *testing.T) {
 		startupCtx := context.WithValue(context.Background(), startupProbeKey{}, "startup")
 		host.startup(startupCtx)
 
-		if got := <-directory; got.err != nil || got.value != "/chosen" {
-			t.Fatalf("PickDirectory after startup = %+v", got)
+		{
+			got := <-directory
+			testassert.Require(t, got.err == nil && got.value == "/chosen", "PickDirectory after startup = %+v", got)
 		}
-		if got := <-title; got.err != nil {
-			t.Fatalf("SetTitle after startup = %+v", got)
+		{
+			got := <-title
+			testassert.Require(t, got.err == nil, "SetTitle after startup = %+v", got)
 		}
-		if got := <-opened; got.err == nil || !strings.Contains(got.err.Error(), "connect runtime:") {
-			t.Fatalf("Open after startup = %v, want the actual clienthost.Connect outcome", got.err)
+		{
+			got := <-opened
+			testassert.Require(t, got.err != nil && strings.Contains(got.err.Error(), "connect runtime:"), "Open after startup = %v, want the actual clienthost.Connect outcome", got.err)
 		}
-		if nativeCtx != startupCtx {
-			t.Fatal("the native dialog did not receive the exact startup context")
-		}
-		if titledCtx != startupCtx {
-			t.Fatal("the native title call did not receive the exact startup context")
-		}
+		testassert.Require(t, nativeCtx == startupCtx, "the native dialog did not receive the exact startup context")
+		testassert.Require(t, titledCtx == startupCtx, "the native title call did not receive the exact startup context")
 		host.shutdown(context.Background())
 	})
 }
@@ -765,18 +706,19 @@ func TestDesktopHostShutdownBeforeStartupWakesWaiters(t *testing.T) {
 		synctest.Wait() // parked before startup, as above
 		host.shutdown(context.Background())
 
-		if got := <-directory; got.err == nil {
-			t.Fatalf("PickDirectory after shutdown-before-startup = %+v, want an error", got)
+		{
+			got := <-directory
+			testassert.Require(t, got.err != nil, "PickDirectory after shutdown-before-startup = %+v, want an error", got)
 		}
-		if got := <-title; got.err == nil {
-			t.Fatalf("SetTitle after shutdown-before-startup = %+v, want an error", got)
+		{
+			got := <-title
+			testassert.Require(t, got.err != nil, "SetTitle after shutdown-before-startup = %+v, want an error", got)
 		}
-		if got := <-opened; got.err == nil || !strings.Contains(got.err.Error(), "closed") {
-			t.Fatalf("Open after shutdown-before-startup = %v, want the closed-host error", got.err)
+		{
+			got := <-opened
+			testassert.Require(t, got.err != nil && strings.Contains(got.err.Error(), "closed"), "Open after shutdown-before-startup = %v, want the closed-host error", got.err)
 		}
-		if invoked {
-			t.Fatal("shutdown-before-startup invoked a native presentation function")
-		}
+		testassert.Require(t, !invoked, "shutdown-before-startup invoked a native presentation function")
 	})
 }
 
@@ -790,18 +732,19 @@ func TestDesktopHostPostCloseNativeCallsError(t *testing.T) {
 	host.titleFn = func(context.Context, string) { invoked = true }
 	host.shutdown(context.Background())
 
-	if got, err := host.PickDirectory(); err == nil {
-		t.Fatalf("PickDirectory after close = (%q, %v), want the closed-host error", got, err)
+	{
+		got, err := host.PickDirectory()
+		testassert.Require(t, err != nil, "PickDirectory after close = (%q, %v), want the closed-host error", got, err)
 	}
-	if err := host.SetTitle("/ws/name"); err == nil {
-		t.Fatal("SetTitle after close succeeded")
+	{
+		err := host.SetTitle("/ws/name")
+		testassert.Require(t, err != nil, "SetTitle after close succeeded")
 	}
-	if _, err := host.Open(); err == nil {
-		t.Fatal("Open after close succeeded")
+	{
+		_, err := host.Open()
+		testassert.Require(t, err != nil, "Open after close succeeded")
 	}
-	if invoked {
-		t.Fatal("post-close native calls reached the injected presentation functions")
-	}
+	testassert.Require(t, !invoked, "post-close native calls reached the injected presentation functions")
 }
 
 // gatedFixture scripts one authenticated health endpoint whose second and
@@ -908,12 +851,8 @@ func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
 	server := newFixture(t, fixture.health, fixture.events)
 	host := newHost(t, server)
 	first, err := host.Open()
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	if first.Generation != "1" {
-		t.Fatalf("first generation = %q, want 1", first.Generation)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, first.Generation, "1")
 	close(fixture.terminate)
 	awaitTerminal(t, host)
 
@@ -928,22 +867,20 @@ func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
 	}()
 	recvBounded(t, fixture.held) // the newer attempt waits at its authenticated health gate
 
-	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("old-stamp request during a pending open = %v, want rejection before I/O", err)
+	{
+		_, err := host.Call(first.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "old-stamp request during a pending open = %v, want rejection before I/O", err)
 	}
-	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("old-stamp pull during a pending open = %v, want rejection before I/O", err)
+	{
+		_, err := host.NextEvent(first.Generation)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "old-stamp pull during a pending open = %v, want rejection before I/O", err)
 	}
 
 	close(fixture.release)
 	result := recvBounded(t, opened)
-	if result.err != nil || result.info.Generation != "2" {
-		t.Fatalf("pending Open = (%+v, %v), want the installed second generation", result.info, result.err)
-	}
+	testassert.Require(t, result.err == nil && result.info.Generation == "2", "pending Open = (%+v, %v), want the installed second generation", result.info, result.err)
 	response, err := host.Call(result.info.Generation, "GetHealth", "")
-	if err != nil || response.Status != http.StatusOK {
-		t.Fatalf("new-generation request = (%+v, %v), want the usable install", response, err)
-	}
+	testassert.Require(t, err == nil && response.Status == http.StatusOK, "new-generation request = (%+v, %v), want the usable install", response, err)
 }
 
 // TestDesktopHostFailedOpenDoesNotResurrectOldStamp proves a failed newer
@@ -968,18 +905,19 @@ func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
 	server := newFixture(t, failingHealth, parkedStream())
 	host := newHost(t, server)
 	first, err := host.Open()
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	if _, err := host.Open(); err == nil {
-		t.Fatal("second Open succeeded over a failing discovery owner")
+	testassert.NoError(t, err)
+	{
+		_, err := host.Open()
+		testassert.Require(t, err != nil, "second Open succeeded over a failing discovery owner")
 	}
 
-	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("old-stamp request after a failed open = %v, want the retired stamp to stay rejected", err)
+	{
+		_, err := host.Call(first.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "old-stamp request after a failed open = %v, want the retired stamp to stay rejected", err)
 	}
-	if _, err := host.NextEvent(first.Generation); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("old-stamp pull after a failed open = %v, want the retired stamp to stay rejected", err)
+	{
+		_, err := host.NextEvent(first.Generation)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "old-stamp pull after a failed open = %v, want the retired stamp to stay rejected", err)
 	}
 }
 
@@ -994,9 +932,7 @@ func TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen(t *testing.T) {
 	server := newFixture(t, fixture.health, fixture.events)
 	host := newHost(t, server)
 	first, err := host.Open()
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	host.mu.Lock()
 	barrier := &errBarrierContext{Context: host.connCtx, entered: make(chan struct{}), release: make(chan struct{})}
@@ -1023,22 +959,20 @@ func TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen(t *testing.T) {
 	recvBounded(t, fixture.held) // the newer attempt is pending at its health gate
 
 	close(barrier.release) // the cleanup proceeds through its read-to-lock window
-	if err := recvBounded(t, pulled); !errors.Is(err, client.ErrResyncRequired) {
-		t.Fatalf("old pull = %v, want the terminal resync error", err)
+	{
+		err := recvBounded(t, pulled)
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "old pull = %v, want the terminal resync error", err)
 	}
 
 	close(fixture.release)
 	result := recvBounded(t, opened)
-	if result.err != nil || result.info.Generation != "2" {
-		t.Fatalf("pending Open after the late cleanup = (%+v, %v), want the cleanup to leave the pending attempt intact", result.info, result.err)
-	}
-	if _, err := host.Call(first.Generation, "GetHealth", ""); err == nil || !strings.Contains(err.Error(), "stale connection generation") {
-		t.Fatalf("old stamp after the new install = %v, want the stale rejection", err)
+	testassert.Require(t, result.err == nil && result.info.Generation == "2", "pending Open after the late cleanup = (%+v, %v), want the cleanup to leave the pending attempt intact", result.info, result.err)
+	{
+		_, err := host.Call(first.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "stale connection generation"), "old stamp after the new install = %v, want the stale rejection", err)
 	}
 	response, err := host.Call(result.info.Generation, "GetHealth", "")
-	if err != nil || response.Status != http.StatusOK {
-		t.Fatalf("installed generation request = (%+v, %v), want the usable connection", response, err)
-	}
+	testassert.Require(t, err == nil && response.Status == http.StatusOK, "installed generation request = (%+v, %v), want the usable connection", response, err)
 }
 
 // The mounted smoke fixture: the real production Runtime over isolated HOME,
@@ -1050,11 +984,10 @@ const smokeAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"si
 // writeServiceFile writes one owner configuration file.
 func writeServiceFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create config directory: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
 }
 
@@ -1064,9 +997,7 @@ func writeServiceFile(t *testing.T, path, content string) {
 func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -1106,60 +1037,37 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 		ConfigPath: configPath,
 		Plugins:    builtin.Plugins(),
 	})
-	if err != nil {
-		t.Fatalf("runtime.Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() {
-		if err := owner.Close(context.Background()); err != nil {
-			t.Errorf("runtime.Close: %v", err)
+		{
+			err := owner.Close(context.Background())
+			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
 	server, err := owner.OpenProtocol(context.Background())
-	if err != nil {
-		t.Fatalf("OpenProtocol: %v", err)
-	}
-	if err := server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")))
 
 	host := New(clienthost.Options{DataDir: dataDir, Executable: missingExecutable(t)}, "/ws/smoke")
 	host.startup(context.Background())
 	defer host.shutdown(context.Background())
 
 	info, err := host.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if info.InstanceID == "" || info.Generation != "1" || info.Workspace != "/ws/smoke" {
-		t.Fatalf("connection info = %+v", info)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, info.InstanceID != "" && info.Generation == "1" && info.Workspace == "/ws/smoke", "connection info = %+v", info)
 
 	response, err := host.Call(info.Generation, "GetHealth", "")
-	if err != nil {
-		t.Fatalf("health Call: %v", err)
-	}
-	if response.Status != http.StatusOK {
-		t.Fatalf("health response status = %d", response.Status)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
-	if err := json.Unmarshal([]byte(response.Body), &health); err != nil {
-		t.Fatalf("decode health body: %v", err)
-	}
-	if health.InstanceId != info.InstanceID || health.ProtocolVersion != protocol.N2 {
-		t.Fatalf("health = %+v, want the connected owner", health)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N2, "health = %+v, want the connected owner", health)
 
 	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_type":"integrated"}}`)
-	if err != nil {
-		t.Fatalf("create Call: %v", err)
-	}
-	if create.Status != http.StatusCreated {
-		t.Fatalf("create status = %d: %s", create.Status, create.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, create.Status == http.StatusCreated, "create status = %d: %s", create.Status, create.Body)
 	var created protocol.Session
-	if err := json.Unmarshal([]byte(create.Body), &created); err != nil {
-		t.Fatalf("decode created session: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(create.Body), &created))
 
 	// The established subscription is the delivery barrier: the committed
 	// creation hint reaches the native pull.
@@ -1176,34 +1084,22 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 		}()
 		select {
 		case result := <-pulled:
-			if result.err != nil {
-				t.Fatalf("NextEvent: %v", result.err)
-			}
+			testassert.Require(t, result.err == nil, "NextEvent: %v", result.err)
 			var event protocol.Event
-			if err := json.Unmarshal([]byte(result.raw), &event); err != nil {
-				t.Fatalf("decode pulled event: %v", err)
-			}
+			testassert.NoError(t, json.Unmarshal([]byte(result.raw), &event))
 			kind, err := event.Discriminator()
-			if err != nil {
-				t.Fatalf("event discriminator: %v", err)
-			}
+			testassert.NoError(t, err)
 			if kind != "session_changed" {
 				continue
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("session_changed body: %v", err)
-			}
+			testassert.NoError(t, err)
 			scope, err := body.Scope.AsSessionScope()
-			if err != nil {
-				t.Fatalf("session_changed scope: %v", err)
-			}
+			testassert.NoError(t, err)
 			if scope.SessionId != created.SessionId {
 				continue
 			}
-			if body.SessionRevision.InstanceId != info.InstanceID {
-				t.Fatalf("hint instance = %q, want %q", body.SessionRevision.InstanceId, info.InstanceID)
-			}
+			testassert.Equal(t, body.SessionRevision.InstanceId, info.InstanceID)
 			return
 		case <-deadline:
 			t.Fatal("no session_changed event for the created session arrived")
@@ -1219,40 +1115,26 @@ func TestDesktopHostAppOptions(t *testing.T) {
 	host := New(clienthost.Options{}, filepath.Join("some", "WorkspaceDir"))
 	assets := os.DirFS(t.TempDir())
 	opts := appOptions(host, assets)
-	if opts.Width != 900 || opts.Height != 700 {
-		t.Fatalf("window size = %dx%d, want 900x700", opts.Width, opts.Height)
+	testassert.Require(t, opts.Width == 900 && opts.Height == 700, "window size = %dx%d, want 900x700", opts.Width, opts.Height)
+	{
+		want := "Lightcode — WorkspaceDir"
+		testassert.Equal(t, opts.Title, want)
 	}
-	if want := "Lightcode — WorkspaceDir"; opts.Title != want {
-		t.Fatalf("title = %q, want %q", opts.Title, want)
-	}
-	if opts.AssetServer == nil || opts.AssetServer.Assets != assets {
-		t.Fatalf("AssetServer.Assets = %v, want the given filesystem", opts.AssetServer)
-	}
-	if opts.OnStartup == nil || opts.OnShutdown == nil {
-		t.Fatal("the private lifecycle hooks must be wired into the options")
-	}
+	testassert.Require(t, opts.AssetServer != nil && opts.AssetServer.Assets == assets, "AssetServer.Assets = %v, want the given filesystem", opts.AssetServer)
+	testassert.Require(t, opts.OnStartup != nil && opts.OnShutdown != nil, "the private lifecycle hooks must be wired into the options")
 	// The wired hooks act on the supplied host: startup stores the caller's
 	// context and closes readiness (observed without waiting on the host's
 	// lifecycle), and shutdown marks that same host closed.
 	testCtx, cancelTestCtx := context.WithCancel(context.Background())
 	defer cancelTestCtx()
 	opts.OnStartup(testCtx)
-	if host.hostCtx != testCtx {
-		t.Fatalf("OnStartup stored context %v, want the supplied context", host.hostCtx)
-	}
+	testassert.Equal(t, host.hostCtx, testCtx)
 	select {
 	case <-host.ready:
 	default:
 		t.Fatal("OnStartup did not close the host readiness channel")
 	}
 	opts.OnShutdown(testCtx)
-	if !host.closed {
-		t.Fatal("OnShutdown did not close the host")
-	}
-	if len(opts.Bind) != 1 || opts.Bind[0] != interface{}(host) {
-		t.Fatalf("Bind = %v, want exactly the host", opts.Bind)
-	}
-	if opts.Linux == nil || opts.Linux.WebviewGpuPolicy != linux.WebviewGpuPolicyAlways {
-		t.Fatalf("Linux GPU policy = %v, want WebviewGpuPolicyAlways", opts.Linux)
-	}
+	testassert.Require(t, host.closed, "OnShutdown did not close the host")
+	testassert.Require(t, len(opts.Bind) == 1 && opts.Bind[0] == interface{}(host) && opts.Linux != nil && opts.Linux.WebviewGpuPolicy == linux.WebviewGpuPolicyAlways, "Bind = %v, want exactly the host; Linux GPU policy = %v, want WebviewGpuPolicyAlways", opts.Bind, opts.Linux)
 }

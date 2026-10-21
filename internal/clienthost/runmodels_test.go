@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientops"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -32,9 +33,7 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		mu.Lock()
 		defer mu.Unlock()
 		requests = append(requests, r.Method+" "+r.URL.RequestURI())
-		if r.Header.Get("Authorization") != "Bearer "+credential {
-			t.Error("request lacks discovery authentication")
-		}
+		testassert.Check(t, r.Header.Get("Authorization") == "Bearer "+credential, "request lacks discovery authentication")
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/health":
@@ -53,27 +52,19 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		mu.Lock()
 		defer mu.Unlock()
 		want := []string{"GET /v1/health", "GET /v1/configuration"}
-		if !reflect.DeepEqual(requests, want) {
-			t.Errorf("requests = %v, want exactly %v", requests, want)
-		}
+		testassert.Check(t, reflect.DeepEqual(requests, want), "requests = %v, want exactly %v", requests, want)
 	})
 	dir := t.TempDir()
 	record, err := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": credential})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), record, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), record, 0o600))
 	return clienthost.Options{DataDir: dir, Executable: filepath.Join(dir, "must-not-launch")}
 }
 
 func modelsConfiguration(t *testing.T, view protocol.ConfigurationView) clienthost.Options {
 	t.Helper()
 	body, err := json.Marshal(view)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	return modelsEndpoint(t, http.StatusOK, body)
 }
 
@@ -133,9 +124,7 @@ func TestRunModelsRetainedOutput(t *testing.T) {
 			err := clienthost.RunModels(context.Background(), opts, tc.provider, tc.all, tc.asJSON, &out, &diagnostics)
 			if tc.usage != "" {
 				var usage *clienthost.UsageError
-				if !errors.As(err, &usage) || usage.ExitCode() != 2 || usage.Error() != tc.usage {
-					t.Fatalf("error = %v, want usage %q", err, tc.usage)
-				}
+				testassert.Require(t, errors.As(err, &usage) && usage.ExitCode() == 2 && usage.Error() == tc.usage, "error = %v, want usage %q", err, tc.usage)
 			} else if err != nil {
 				t.Fatal(err)
 			}
@@ -169,9 +158,7 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, diagnostics bytes.Buffer
-			if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", tc.all, tc.asJSON, &out, &diagnostics); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", tc.all, tc.asJSON, &out, &diagnostics))
 			if out.String() != tc.want || diagnostics.Len() != 0 {
 				t.Fatalf("stdout=%q diagnostics=%q, want %q", out.String(), diagnostics.String(), tc.want)
 			}
@@ -179,18 +166,14 @@ func TestRunModelsConfigurationFields(t *testing.T) {
 	}
 	view.Providers[0].Models[0].Incomplete = true
 	var allOut bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "hidden", true, false, &allOut, io.Discard); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "hidden", true, false, &allOut, io.Discard))
 	if allOut.String() != "hidden/org/m\t9007199254740993\t0\tdefault,hidden,incomplete\n" {
 		t.Fatalf("combined markers = %q", allOut.String())
 	}
 	for _, agents := range [][]protocol.Agent{nil, {{Name: "primary"}}, {{Name: "secondary", Model: "fallback/z/slash"}}} {
 		view.Agents = agents
 		var out bytes.Buffer
-		if err := clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", false, false, &out, io.Discard); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, clienthost.RunModels(context.Background(), modelsConfiguration(t, view), "", false, false, &out, io.Discard))
 		if out.String() != "fallback/z/slash\t100\t0\t-\n" {
 			t.Fatalf("unset primary output = %q", out.String())
 		}
@@ -207,16 +190,12 @@ func TestRunModelsOpaqueOverflowFieldsRenders(t *testing.T) {
 	raw := `{"configuration_revision":{"instance_id":"` + strings.Repeat("a", 32) + `","generation":"1"},"settings":{},"agents":[{"name":"primary","model":"prov/m"}],"providers":[{"id":"prov","connected":true,"extra_body":{"n":9007199254740993,"big":1e400},"models":[{"id":"m","name":"M","context_window":4096,"source":"user","extra_body":{"n":9007199254740993,"big":1e400}}]}]}`
 	opts := modelsEndpoint(t, http.StatusOK, []byte(raw))
 	var out, diagnostics bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), opts, "", false, false, &out, &diagnostics); err != nil {
-		t.Fatalf("RunModels: %v", err)
-	}
+	testassert.NoError(t, clienthost.RunModels(context.Background(), opts, "", false, false, &out, &diagnostics))
 	if out.String() != "prov/m\t4096\t0\tdefault\n" {
 		t.Fatalf("stdout=%q diagnostics=%q, want the retained row despite opaque overflow fields", out.String(), diagnostics.String())
 	}
 	var jsonOut bytes.Buffer
-	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(raw)), "", false, true, &jsonOut, io.Discard); err != nil {
-		t.Fatalf("RunModels --json: %v", err)
-	}
+	testassert.NoError(t, clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(raw)), "", false, true, &jsonOut, io.Discard))
 	if jsonOut.String() != `[{"ref":"prov/m","provider":"prov","providerName":"prov","model":"m","displayName":"M","contextWindow":4096,"maxOutputTokens":0,"hidden":false,"providerHidden":false,"incomplete":false,"default":true,"source":"user"}]`+"\n" {
 		t.Fatalf("json stdout=%q", jsonOut.String())
 	}
@@ -235,8 +214,9 @@ func TestRunModelsFailures(t *testing.T) {
 	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusOK, []byte(`{"providers":`)), "", false, false, &malformedOut, io.Discard); err == nil || malformedOut.Len() != 0 {
 		t.Fatalf("malformed success: error=%v output=%q", err, malformedOut.String())
 	}
-	if err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNoContent, nil), "", false, false, io.Discard, io.Discard); err == nil {
-		t.Fatal("missing configuration body reported success")
+	{
+		err := clienthost.RunModels(context.Background(), modelsEndpoint(t, http.StatusNoContent, nil), "", false, false, io.Discard, io.Discard)
+		testassert.Require(t, err != nil, "missing configuration body reported success")
 	}
 	var out bytes.Buffer
 	err := clienthost.RunModels(context.Background(), clienthost.Options{DataDir: t.TempDir(), Executable: "/does-not-exist"}, "", false, false, &out, io.Discard)

@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestRunWithTimeoutContextCancellation(t *testing.T) {
@@ -23,9 +25,7 @@ func TestRunWithTimeoutContextCancellation(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("runWithTimeout after cancellation = %v, want context.Canceled", err)
-		}
+		testassert.Require(t, errors.Is(err, context.Canceled), "runWithTimeout after cancellation = %v, want context.Canceled", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("runWithTimeout never returned after the lifetime was canceled")
 	}
@@ -37,10 +37,6 @@ func TestRunWithTimeoutPreservesDeadline(t *testing.T) {
 	start := time.Now()
 	err := runWithTimeout(context.Background(), exec.Command("sleep", "30"), 100*time.Millisecond)
 	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("runWithTimeout past the deadline = %v, want context.DeadlineExceeded", err)
-	}
-	if elapsed >= 5*time.Second {
-		t.Fatalf("runWithTimeout took %s, want a prompt deadline kill", elapsed)
-	}
+	testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "runWithTimeout past the deadline = %v, want context.DeadlineExceeded", err)
+	testassert.Require(t, elapsed < 5*time.Second, "runWithTimeout took %s, want a prompt deadline kill", elapsed)
 }

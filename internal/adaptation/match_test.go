@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
@@ -25,12 +27,8 @@ func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
 			got := matchIn(tbl, tc.id)
-			if got == nil {
-				t.Fatalf("matchIn(%q) = nil, want %q", tc.id, tc.want)
-			}
-			if got.Additions["tone"] != tc.want {
-				t.Fatalf("matchIn(%q).Additions[tone] = %q, want %q", tc.id, got.Additions["tone"], tc.want)
-			}
+			testassert.Require(t, got != nil, "matchIn(%q) = nil, want %q", tc.id, tc.want)
+			testassert.Require(t, got.Additions["tone"] == tc.want, "matchIn(%q).Additions[tone] = %q, want %q", tc.id, got.Additions["tone"], tc.want)
 		})
 	}
 }
@@ -38,8 +36,9 @@ func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 func TestMatchInAbstention(t *testing.T) {
 	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt-addition"}}}}
 	for _, id := range []string{"claude-opus-4-8", "qwen3.7-plus", "", "gp"} {
-		if got := matchIn(tbl, id); got != nil {
-			t.Fatalf("matchIn(%q) = %+v, want nil", id, got)
+		{
+			got := matchIn(tbl, id)
+			testassert.Require(t, got == nil, "matchIn(%q) = %+v, want nil", id, got)
 		}
 	}
 }
@@ -49,9 +48,7 @@ func TestMatchInCaseInsensitive(t *testing.T) {
 	// Both the pattern (upper) and the input (mixed) are folded before matching.
 	for _, id := range []string{"gpt-oss-20b", "GPT-OSS-20B", "Gpt-Oss-20b"} {
 		got := matchIn(tbl, id)
-		if got == nil || got.Additions["tone"] != "gpt-oss-addition" {
-			t.Fatalf("matchIn(%q) = %+v, want the gpt-oss row", id, got)
-		}
+		testassert.Require(t, got != nil && got.Additions["tone"] == "gpt-oss-addition", "matchIn(%q) = %+v, want the gpt-oss row", id, got)
 	}
 }
 
@@ -60,20 +57,20 @@ func TestMatchInSlashContainingBareID(t *testing.T) {
 	// first '/'), so the wildcard must cross '/'.
 	tbl := []entry{{pattern: "deepseek*", adapt: Adaptation{Additions: map[string]string{"tone": "deepseek-addition"}}}}
 	got := matchIn(tbl, "deepseek/deepseek-chat")
-	if got == nil || got.Additions["tone"] != "deepseek-addition" {
-		t.Fatalf("matchIn(deepseek/deepseek-chat) = %+v, want the deepseek row", got)
-	}
+	testassert.Require(t, got != nil && got.Additions["tone"] == "deepseek-addition", "matchIn(deepseek/deepseek-chat) = %+v, want the deepseek row", got)
 }
 
 func TestMatchInIsAnchoredNotSubstring(t *testing.T) {
 	// The resolver is always fed the bare model id; a provider-prefixed string
 	// must not match a pattern that the bare id matches (documents "feed ref.Model").
 	tbl := []entry{{pattern: "gpt-5*", adapt: Adaptation{Additions: map[string]string{"tone": "gpt5-addition"}}}}
-	if got := matchIn(tbl, "gpt-5.4"); got == nil || got.Additions["tone"] != "gpt5-addition" {
-		t.Fatalf("matchIn(gpt-5.4) = %+v, want the gpt-5 row", got)
+	{
+		got := matchIn(tbl, "gpt-5.4")
+		testassert.Require(t, got != nil && got.Additions["tone"] == "gpt5-addition", "matchIn(gpt-5.4) = %+v, want the gpt-5 row", got)
 	}
-	if got := matchIn(tbl, "openai/gpt-5.4"); got != nil {
-		t.Fatalf("matchIn(openai/gpt-5.4) = %+v, want nil (anchored, not substring)", got)
+	{
+		got := matchIn(tbl, "openai/gpt-5.4")
+		testassert.Require(t, got == nil, "matchIn(openai/gpt-5.4) = %+v, want nil (anchored, not substring)", got)
 	}
 }
 
@@ -86,12 +83,8 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 		ToolDescriptionReplacements: map[string]string{"<EDIT FILE OR WRITE FILE>": "apply_patch"},
 	}}}
 	got := matchIn(tbl, "gpt-5.4")
-	if got == nil {
-		t.Fatal("matchIn returned nil")
-	}
-	if got == &tbl[0].adapt {
-		t.Fatal("matchIn returned a pointer aliasing the table entry")
-	}
+	testassert.Require(t, got != nil, "matchIn returned nil")
+	testassert.Require(t, got != &tbl[0].adapt, "matchIn returned a pointer aliasing the table entry")
 	// Mutating every field of the result must not touch the table entry.
 	got.ExcludeTools[0] = "mutated"
 	got.IncludeTools[0] = "mutated"
@@ -100,21 +93,11 @@ func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	got.Additions["tone"] = "mutated"
 	got.Additions["safety"] = "mutated"
 	got.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] = "mutated"
-	if tbl[0].adapt.ExcludeTools[0] != "edit_file" {
-		t.Fatalf("ExcludeTools leaked into the table: %q", tbl[0].adapt.ExcludeTools[0])
-	}
-	if tbl[0].adapt.IncludeTools[0] != "apply_patch" {
-		t.Fatalf("IncludeTools leaked into the table: %q", tbl[0].adapt.IncludeTools[0])
-	}
-	if len(tbl[0].adapt.Blocks) != 1 || tbl[0].adapt.Blocks[0] != "coach" {
-		t.Fatalf("Blocks leaked into the table: %v", tbl[0].adapt.Blocks)
-	}
-	if len(tbl[0].adapt.Additions) != 1 || tbl[0].adapt.Additions["tone"] != "tone-add" {
-		t.Fatalf("Additions leaked into the table: %v", tbl[0].adapt.Additions)
-	}
-	if len(tbl[0].adapt.ToolDescriptionReplacements) != 1 || tbl[0].adapt.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] != "apply_patch" {
-		t.Fatalf("ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
-	}
+	testassert.Equal(t, tbl[0].adapt.ExcludeTools[0], "edit_file")
+	testassert.Equal(t, tbl[0].adapt.IncludeTools[0], "apply_patch")
+	testassert.Require(t, len(tbl[0].adapt.Blocks) == 1 && tbl[0].adapt.Blocks[0] == "coach", "Blocks leaked into the table: %v", tbl[0].adapt.Blocks)
+	testassert.Require(t, len(tbl[0].adapt.Additions) == 1 && tbl[0].adapt.Additions["tone"] == "tone-add", "Additions leaked into the table: %v", tbl[0].adapt.Additions)
+	testassert.Require(t, len(tbl[0].adapt.ToolDescriptionReplacements) == 1 && tbl[0].adapt.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] == "apply_patch", "ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
 }
 
 func TestSectionAdditionResolution(t *testing.T) {
@@ -132,9 +115,7 @@ func TestSectionAdditionResolution(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := SectionAddition(tc.adapt, tc.section)
-			if got != tc.want {
-				t.Fatalf("SectionAddition(%v, %q) = %q, want %q", tc.adapt, tc.section, got, tc.want)
-			}
+			testassert.Require(t, got == tc.want, "SectionAddition(%v, %q) = %q, want %q", tc.adapt, tc.section, got, tc.want)
 		})
 	}
 }
@@ -144,8 +125,9 @@ func TestShippedToolDescriptionDefaults(t *testing.T) {
 		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
 	}
 	for key, value := range want {
-		if got := defaultToolDescriptionReplacements[key]; got != value {
-			t.Fatalf("defaultToolDescriptionReplacements[%q] = %q, want %q", key, got, value)
+		{
+			got := defaultToolDescriptionReplacements[key]
+			testassert.Require(t, got == value, "defaultToolDescriptionReplacements[%q] = %q, want %q", key, got, value)
 		}
 	}
 }
@@ -165,9 +147,7 @@ func TestRenderToolDescriptionReplacements(t *testing.T) {
 	}, "\n")
 
 	baseline := RenderToolDescription(description, nil)
-	if strings.Contains(baseline, "<") || !strings.Contains(baseline, "use edit_file or write_file") || !strings.Contains(baseline, "- removed by adaptation") {
-		t.Fatalf("baseline RenderToolDescription = %q", baseline)
-	}
+	testassert.Require(t, !strings.Contains(baseline, "<") && strings.Contains(baseline, "use edit_file or write_file") && strings.Contains(baseline, "- removed by adaptation"), "baseline RenderToolDescription = %q", baseline)
 
 	adapted := RenderToolDescription(description, &Adaptation{
 		ToolDescriptionReplacements: map[string]string{
@@ -175,11 +155,10 @@ func TestRenderToolDescriptionReplacements(t *testing.T) {
 			"<REMOVE LINE>":             "",
 		},
 	})
-	if strings.Contains(adapted, "<") || strings.Contains(adapted, "removed by adaptation") {
-		t.Fatalf("adapted RenderToolDescription = %q", adapted)
-	}
-	if want := "use apply_patch\ndone"; adapted != want {
-		t.Fatalf("adapted RenderToolDescription = %q, want %q", adapted, want)
+	testassert.Require(t, !strings.Contains(adapted, "<") && !strings.Contains(adapted, "removed by adaptation"), "adapted RenderToolDescription = %q", adapted)
+	{
+		want := "use apply_patch\ndone"
+		testassert.Equal(t, adapted, want)
 	}
 }
 
@@ -191,26 +170,19 @@ func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
 	fx := loadFixture(t)
 	codex := fixtureRow(fx, "gpt-codex")
 	want := "Use more tool calls when they can improve the response, provide useful context, or help plan or complete the task.\n\nIf you encounter a new or unexpected challenge before the active task is complete, try to resolve it yourself first. If a tool call fails or returns incomplete or unhelpful output, try another tool or a different approach."
-	if codex.Additions["task_execution"] != want {
-		t.Fatalf("fixture gpt-codex additions text differs from canonical Decision-1 text")
-	}
+	testassert.Equal(t, codex.Additions["task_execution"], want)
 	for _, id := range []string{
 		"gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "openai/gpt-5.4-mini", "openai/gpt-5.5-pro",
 	} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
-			if got == nil {
-				t.Fatalf("Match(%q) = nil, want gpt-codex", id)
+			testassert.Require(t, got != nil, "Match(%q) = nil, want gpt-codex", id)
+			testassert.Require(t, reflect.DeepEqual(got.Additions, codex.Additions), "Match(%q).Additions = %v, want the %s row additions", id, got.Additions, codex.Name)
+			{
+				add := SectionAddition(got, "task_execution")
+				testassert.Require(t, add == want, "SectionAddition(Match(%q), task_execution) differs from canonical text", id)
 			}
-			if !reflect.DeepEqual(got.Additions, codex.Additions) {
-				t.Fatalf("Match(%q).Additions = %v, want the %s row additions", id, got.Additions, codex.Name)
-			}
-			if add := SectionAddition(got, "task_execution"); add != want {
-				t.Fatalf("SectionAddition(Match(%q), task_execution) differs from canonical text", id)
-			}
-			if !slices.Contains(got.IncludeTools, "apply_patch") {
-				t.Errorf("Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
-			}
+			testassert.Check(t, slices.Contains(got.IncludeTools, "apply_patch"), "Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
 		})
 	}
 }
@@ -223,17 +195,12 @@ func TestShippedTableMatchesBundledGPTApplyPatchBroad(t *testing.T) {
 	} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
-			if got == nil {
-				t.Fatalf("Match(%q) = nil, want gpt-apply-patch", id)
-			}
-			if !reflect.DeepEqual(got.IncludeTools, ap.IncludeTools) {
-				t.Fatalf("Match(%q).IncludeTools = %v, want the %s row include_tools", id, got.IncludeTools, ap.Name)
-			}
-			if !slices.Contains(got.IncludeTools, "apply_patch") {
-				t.Errorf("Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
-			}
-			if v, ok := got.Additions["task_execution"]; ok && v != "" {
-				t.Errorf("Match(%q).Additions[task_execution] = %q, want absent (broader gpt-5 has no prompt addition)", id, v)
+			testassert.Require(t, got != nil, "Match(%q) = nil, want gpt-apply-patch", id)
+			testassert.Require(t, reflect.DeepEqual(got.IncludeTools, ap.IncludeTools), "Match(%q).IncludeTools = %v, want the %s row include_tools", id, got.IncludeTools, ap.Name)
+			testassert.Check(t, slices.Contains(got.IncludeTools, "apply_patch"), "Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
+			{
+				v, ok := got.Additions["task_execution"]
+				testassert.Check(t, !ok || v == "", "Match(%q).Additions[task_execution] = %q, want absent (broader gpt-5 has no prompt addition)", id, v)
 			}
 		})
 	}
@@ -245,15 +212,12 @@ func TestShippedTableMatchesBundledGrok(t *testing.T) {
 	for _, id := range []string{"grok-build-0.1", "x-ai/grok-build-0.1"} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
-			if got == nil {
-				t.Fatalf("Match(%q) = nil, want adaptation", id)
+			testassert.Require(t, got != nil, "Match(%q) = nil, want adaptation", id)
+			{
+				add := SectionAddition(got, "task_execution")
+				testassert.Require(t, add != "" && add == ge.Additions["task_execution"], "Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
 			}
-			if add := SectionAddition(got, "task_execution"); add == "" || add != ge.Additions["task_execution"] {
-				t.Fatalf("Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
-			}
-			if slices.Contains(got.IncludeTools, "apply_patch") {
-				t.Errorf("grok should not include apply_patch (not V4A): %v", got.IncludeTools)
-			}
+			testassert.Check(t, !slices.Contains(got.IncludeTools, "apply_patch"), "grok should not include apply_patch (not V4A): %v", got.IncludeTools)
 		})
 	}
 }
@@ -267,11 +231,10 @@ func TestShippedTableMatchesBundledGoogle(t *testing.T) {
 	} {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
-			if got == nil {
-				t.Fatalf("Match(%q) = nil, want google-task-execution", id)
-			}
-			if add := SectionAddition(got, "task_execution"); add == "" || add != ge.Additions["task_execution"] {
-				t.Fatalf("Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
+			testassert.Require(t, got != nil, "Match(%q) = nil, want google-task-execution", id)
+			{
+				add := SectionAddition(got, "task_execution")
+				testassert.Require(t, add != "" && add == ge.Additions["task_execution"], "Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
 			}
 		})
 	}
@@ -292,8 +255,9 @@ func TestShippedTableLeavesOtherModelsBaseline(t *testing.T) {
 		"",
 	} {
 		t.Run(id, func(t *testing.T) {
-			if got := Match(id); got != nil {
-				t.Fatalf("Match(%q) = %+v, want nil", id, got)
+			{
+				got := Match(id)
+				testassert.Require(t, got == nil, "Match(%q) = %+v, want nil", id, got)
 			}
 		})
 	}
@@ -322,8 +286,9 @@ func TestGlobMatch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.glob+"~"+tc.s, func(t *testing.T) {
-			if got := globMatch(tc.glob, tc.s); got != tc.want {
-				t.Fatalf("globMatch(%q, %q) = %v, want %v", tc.glob, tc.s, got, tc.want)
+			{
+				got := globMatch(tc.glob, tc.s)
+				testassert.Require(t, got == tc.want, "globMatch(%q, %q) = %v, want %v", tc.glob, tc.s, got, tc.want)
 			}
 		})
 	}

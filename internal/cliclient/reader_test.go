@@ -19,6 +19,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientview"
 	"github.com/MMinasyan/lightcode/internal/terminal"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -111,13 +112,9 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 	dir := t.TempDir()
 	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
 	path := filepath.Join(dir, "runtime.json")
-	if err := os.WriteFile(path, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(path, raw, 0600))
 	conn, err := client.Connect(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	return clienthost.Options{DataDir: dir}, conn
 }
 func health(w http.ResponseWriter) {
@@ -128,16 +125,12 @@ func health(w http.ResponseWriter) {
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {
 	t.Helper()
 	_, conn := discovery(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/health" {
-			t.Errorf("unexpected discovery %s", r.URL.Path)
-		}
+		testassert.Check(t, r.URL.Path == "/v1/health", "unexpected discovery %s", r.URL.Path)
 		health(w)
 	}))
 	transport := &scriptedTransport{requests: make(chan request, 32)}
 	generated, ok := conn.ClientWithResponses.ClientInterface.(*protocol.Client)
-	if !ok {
-		t.Fatal("connection does not own the concrete generated client")
-	}
+	testassert.Require(t, ok, "connection does not own the concrete generated client")
 	generated.Client = &http.Client{Transport: transport}
 	c := New(Options{Workspace: "/workspace"})
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -216,9 +209,7 @@ func ids(t *testing.T, items []protocol.ConversationItem) []string {
 	var ids []string
 	for _, item := range items {
 		id, err := clientview.ItemID(item)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		ids = append(ids, id)
 	}
 	return ids
@@ -257,9 +248,7 @@ func TestReaderAnchoredHistory(t *testing.T) {
 					t.Fatalf("cursor %q, want %q", req.req.URL.Query().Get("cursor"), want)
 				}
 				c.mu.Lock()
-				if !reflect.DeepEqual(ids(t, r.items), ids(t, cached)) {
-					t.Error("disconnected range published before walk completed")
-				}
+				testassert.Check(t, reflect.DeepEqual(ids(t, r.items), ids(t, cached)), "disconnected range published before walk completed")
 				c.mu.Unlock()
 				req.respond(page)
 			}
@@ -275,14 +264,10 @@ func TestReaderAnchoredHistory(t *testing.T) {
 			if !reflect.DeepEqual(ids(t, r.items), want) {
 				t.Fatalf("range %v", ids(t, r.items))
 			}
-			if r.cursor == nil || *r.cursor != "oldest-original" {
-				t.Fatalf("oldest edge changed: %v", r.cursor)
-			}
+			testassert.Require(t, r.cursor != nil && *r.cursor == "oldest-original", "oldest edge changed: %v", r.cursor)
 			if test.unresolved {
 				a, _ := r.items[9].AsAssistantItem()
-				if contentText(a.Content) != "settled" {
-					t.Fatal("unresolved value not replaced")
-				}
+				testassert.Require(t, contentText(a.Content) == "settled", "unresolved value not replaced")
 			}
 		})
 	}
@@ -299,15 +284,11 @@ func TestReaderFloorOlderDisjointAndHints(t *testing.T) {
 	done = r.chain.done
 	c.mu.Unlock()
 	older := receive(t, transport.requests)
-	if older.req.URL.Query().Get("cursor") != "real-oldest" {
-		t.Fatal("older cursor changed")
-	}
+	testassert.Require(t, older.req.URL.Query().Get("cursor") == "real-oldest", "older cursor changed")
 	c.mu.Lock()
 	r.dirty = true
 	c.kickReaderLocked(r)
-	if done != r.chain.done {
-		t.Fatal("parallel reader")
-	}
+	testassert.Require(t, done == r.chain.done, "parallel reader")
 	c.mu.Unlock()
 	older.respond(protocol.HistoryPage{Items: inputs(1, 50), OlderCursor: pointer("edge"), SessionRevision: revision("6")})
 	receive(t, transport.requests).respond(hydration(rootA, "5", inputs(51, 100), nil))
@@ -319,9 +300,7 @@ func TestReaderFloorOlderDisjointAndHints(t *testing.T) {
 	barrier(t, done)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(r.items) != 100 || r.floor.DurableRevision != "6" || *r.cursor != "edge" || r.hydration.Usage.Context.UsedTokens != "9007199254740993" || r.hydration.Pending.Queued[0].OperationId != "queued-id" {
-		t.Fatalf("reader %#v", r)
-	}
+	testassert.Require(t, len(r.items) == 100 && r.floor.DurableRevision == "6" && *r.cursor == "edge" && r.hydration.Usage.Context.UsedTokens == "9007199254740993" && r.hydration.Pending.Queued[0].OperationId == "queued-id", "reader %#v", r)
 }
 
 func TestReaderNavigationSupersedesSuccessAndError(t *testing.T) {
@@ -346,13 +325,12 @@ func TestReaderNavigationSupersedesSuccessAndError(t *testing.T) {
 			}
 			barrier(t, oldDone)
 			c.mu.Lock()
-			if c.root != selected || c.rootID != rootB || old.hydration != nil {
-				t.Fatal("superseded reader published")
-			}
+			testassert.Require(t, c.root == selected && c.rootID == rootB && old.hydration == nil, "superseded reader published")
 			c.mu.Unlock()
 			for len(c.outputs) > 0 {
-				if d := <-c.outputs; strings.Contains(d.text, "late error") {
-					t.Fatal("superseded error printed")
+				{
+					d := <-c.outputs
+					testassert.Require(t, !strings.Contains(d.text, "late error"), "superseded error printed")
 				}
 			}
 		})
@@ -428,7 +406,5 @@ func TestRootResetDisposesInspectorAndSameRootIntent(t *testing.T) {
 	barrier(t, childDone)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.selection <= generation || c.root == oldRoot || c.child != nil || c.childID != "" || c.root.hydration.SessionRevision.DurableRevision != "2" {
-		t.Fatal("root reset failed to dispose both readers")
-	}
+	testassert.Require(t, c.selection > generation && c.root != oldRoot && c.child == nil && c.childID == "" && c.root.hydration.SessionRevision.DurableRevision == "2", "root reset failed to dispose both readers")
 }

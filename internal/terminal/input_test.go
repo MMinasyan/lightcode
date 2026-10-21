@@ -1,28 +1,37 @@
 package terminal
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 func TestInputHistoryNavigationRestoresDraft(t *testing.T) {
 	h := NewInputHistory()
 	h.Reset([]string{"first", "second"})
 
-	if got, ok := h.Prev("draft"); !ok || got != "second" {
-		t.Fatalf("Prev() = %q, %v; want second, true", got, ok)
+	{
+		got, ok := h.Prev("draft")
+		testassert.Require(t, ok && got == "second", "Prev() = %q, %v; want second, true", got, ok)
 	}
-	if got, ok := h.Prev("ignored"); !ok || got != "first" {
-		t.Fatalf("Prev() = %q, %v; want first, true", got, ok)
+	{
+		got, ok := h.Prev("ignored")
+		testassert.Require(t, ok && got == "first", "Prev() = %q, %v; want first, true", got, ok)
 	}
-	if _, ok := h.Prev("ignored"); ok {
-		t.Fatalf("Prev() at oldest entry returned ok")
+	{
+		_, ok := h.Prev("ignored")
+		testassert.Require(t, !ok, "Prev() at oldest entry returned ok")
 	}
-	if got, ok := h.Next(); !ok || got != "second" {
-		t.Fatalf("Next() = %q, %v; want second, true", got, ok)
+	{
+		got, ok := h.Next()
+		testassert.Require(t, ok && got == "second", "Next() = %q, %v; want second, true", got, ok)
 	}
-	if got, ok := h.Next(); !ok || got != "draft" {
-		t.Fatalf("Next() = %q, %v; want draft, true", got, ok)
+	{
+		got, ok := h.Next()
+		testassert.Require(t, ok && got == "draft", "Next() = %q, %v; want draft, true", got, ok)
 	}
-	if _, ok := h.Next(); ok {
-		t.Fatalf("Next() at draft returned ok")
+	{
+		_, ok := h.Next()
+		testassert.Require(t, !ok, "Next() at draft returned ok")
 	}
 }
 
@@ -32,14 +41,17 @@ func TestInputHistoryAddSkipsConsecutiveDuplicates(t *testing.T) {
 	h.Add("same")
 	h.Add("next")
 
-	if got, ok := h.Prev(""); !ok || got != "next" {
-		t.Fatalf("Prev() = %q, %v; want next, true", got, ok)
+	{
+		got, ok := h.Prev("")
+		testassert.Require(t, ok && got == "next", "Prev() = %q, %v; want next, true", got, ok)
 	}
-	if got, ok := h.Prev(""); !ok || got != "same" {
-		t.Fatalf("Prev() = %q, %v; want same, true", got, ok)
+	{
+		got, ok := h.Prev("")
+		testassert.Require(t, ok && got == "same", "Prev() = %q, %v; want same, true", got, ok)
 	}
-	if _, ok := h.Prev(""); ok {
-		t.Fatalf("duplicate entry was stored")
+	{
+		_, ok := h.Prev("")
+		testassert.Require(t, !ok, "duplicate entry was stored")
 	}
 }
 
@@ -53,12 +65,14 @@ func TestCompleteSlashCommandCompletesAgainstSuppliedList(t *testing.T) {
 		{"/nope", "/nope"}, // no match is returned unchanged
 	}
 	for _, tc := range cases {
-		if got := CompleteSlashCommand(tc.text, commands); got != tc.want {
-			t.Errorf("CompleteSlashCommand(%q) = %q, want %q", tc.text, got, tc.want)
+		{
+			got := CompleteSlashCommand(tc.text, commands)
+			testassert.Check(t, got == tc.want, "CompleteSlashCommand(%q) = %q, want %q", tc.text, got, tc.want)
 		}
 	}
 	// Multiple matches extend to their longest common prefix.
-	if got, want := CompleteSlashCommand("/al", []string{"/alpha", "/alpine"}), "/alp"; got != want {
-		t.Errorf("CompleteSlashCommand(/al) = %q, want %q", got, want)
+	{
+		got, want := CompleteSlashCommand("/al", []string{"/alpha", "/alpine"}), "/alp"
+		testassert.Check(t, got == want, "CompleteSlashCommand(/al) = %q, want %q", got, want)
 	}
 }

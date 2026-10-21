@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestMemoryConformance runs the shared storage conformance suite against the
@@ -59,12 +60,11 @@ func TestMemoryReadCancellationUnderWriterLock(t *testing.T) {
 	<-readCtx.Done() // the deadline expires while the reads still wait for the writer
 	close(release)
 
-	if err := <-first; err != nil {
-		t.Fatalf("writer transaction: %v", err)
-	}
+	testassert.NoError(t, <-first)
 	for range reads {
-		if err := <-readDone; !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("blocked read error = %v, want context.DeadlineExceeded", err)
+		{
+			err := <-readDone
+			testassert.Check(t, errors.Is(err, context.DeadlineExceeded), "blocked read error = %v, want context.DeadlineExceeded", err)
 		}
 	}
 }

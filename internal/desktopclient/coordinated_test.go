@@ -26,6 +26,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/cliclient"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 	"golang.org/x/sys/unix"
@@ -146,9 +147,7 @@ func (p *pipeTerminal) Write(data []byte) (int, error) {
 func startPipeTerminal(t *testing.T, opts clienthost.Options, workspace string) *pipeTerminal {
 	t.Helper()
 	inR, inW, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	p := &pipeTerminal{in: inW, done: make(chan error, 1), written: make(chan struct{}, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	cli := cliclient.New(cliclient.Options{Startup: opts, Workspace: workspace})
@@ -165,8 +164,9 @@ func startPipeTerminal(t *testing.T, opts clienthost.Options, workspace string) 
 
 func (p *pipeTerminal) send(t *testing.T, text string) {
 	t.Helper()
-	if _, err := io.WriteString(p.in, text+"\r"); err != nil {
-		t.Fatal(err)
+	{
+		_, err := io.WriteString(p.in, text+"\r")
+		testassert.NoError(t, err)
 	}
 }
 
@@ -255,28 +255,24 @@ func (p *pipeACP) call(t *testing.T, method string, params any, target any) {
 	t.Helper()
 	p.next++
 	line, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": p.next, "method": method, "params": params})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.in.Write(append(line, '\n')); err != nil {
-		t.Fatal(err)
+	testassert.NoError(t, err)
+	{
+		_, err := p.in.Write(append(line, '\n'))
+		testassert.NoError(t, err)
 	}
 	for {
 		frame := recvBounded(t, p.frames)
-		if frame == nil {
-			t.Fatal("ACP output closed")
-		}
+		testassert.Require(t, frame != nil, "ACP output closed")
 		p.seen = append(p.seen, frame)
 		if string(frame["id"]) != fmt.Sprint(p.next) {
 			continue
 		}
-		if raw := frame["error"]; len(raw) != 0 {
-			t.Fatalf("ACP %s: %s", method, raw)
+		{
+			raw := frame["error"]
+			testassert.Require(t, len(raw) == 0, "ACP %s: %s", method, raw)
 		}
 		if target != nil {
-			if err := json.Unmarshal(frame["result"], target); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, json.Unmarshal(frame["result"], target))
 		}
 		return
 	}
@@ -293,15 +289,9 @@ func desktopHydrate(t *testing.T, host *Host, info ConnectionInfo, id string) pr
 	t.Helper()
 	var h protocol.Hydration
 	response, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"`+id+`"}`)
-	if err != nil || response.Status != http.StatusOK {
-		t.Fatalf("desktop hydration: %+v, %v", response, err)
-	}
-	if err := json.Unmarshal([]byte(response.Body), &h); err != nil {
-		t.Fatal(err)
-	}
-	if h.Session.SessionId != id || h.SessionRevision.InstanceId != info.InstanceID {
-		t.Fatalf("foreign hydration: %+v", h.SessionRevision)
-	}
+	testassert.Require(t, err == nil && response.Status == http.StatusOK, "desktop hydration: %+v, %v", response, err)
+	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &h))
+	testassert.Require(t, h.Session.SessionId == id && h.SessionRevision.InstanceId == info.InstanceID, "foreign hydration: %+v", h.SessionRevision)
 	return h
 }
 
@@ -345,9 +335,7 @@ func openNativeFIFO(t *testing.T, path string) *os.File {
 			t.Cleanup(func() { _ = f.Close() })
 			return f
 		}
-		if !errors.Is(err, unix.ENXIO) || time.Now().After(deadline) {
-			t.Fatalf("native shell did not reach FIFO read: %v", err)
-		}
+		testassert.Require(t, errors.Is(err, unix.ENXIO) && !time.Now().After(deadline), "native shell did not reach FIFO read: %v", err)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -360,9 +348,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	waves := make([]*nativeWave, 2)
 	for n := range waves {
 		waves[n] = &nativeWave{fifo: filepath.Join(workspace, fmt.Sprintf("job-%d.fifo", n)), rootArrived: make(chan struct{}), childArrived: make(chan struct{}), release: make(chan struct{})}
-		if err := unix.Mkfifo(waves[n].fifo, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, unix.Mkfifo(waves[n].fifo, 0o600))
 		defer waves[n].unblock()
 	}
 	model := &nativeModel{waves: waves}
@@ -381,23 +367,18 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	openOwner := func() string {
 		var err error
 		owner, err = runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		server, err := owner.OpenProtocol(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")))
 		return server.Endpoint()
 	}
 	oldEndpoint := openOwner()
 	defer func() {
 		if owner != nil {
-			if err := owner.Close(context.Background()); err != nil {
-				t.Error(err)
+			{
+				err := owner.Close(context.Background())
+				testassert.Check(t, err == nil, "%v", err)
 			}
 		}
 	}()
@@ -405,26 +386,18 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	// runs no tests is a non-owning, immediately exiting contender. It opens no
 	// state; common startup keeps probing the real publication across the gap.
 	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	opts := clienthost.Options{DataDir: dataDir, ConfigPath: configPath, Executable: executable, PrefixArgs: []string{"-test.run=^$", "--"}}
 	host := New(opts, workspace)
 	host.startup(context.Background())
 	defer host.shutdown(context.Background())
 	info, err := host.Open()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	oldInstance := info.InstanceID
 	created, err := host.Call(info.Generation, "CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_type":"primary"}}`, workspace))
-	if err != nil || created.Status != http.StatusCreated {
-		t.Fatalf("create root: %+v, %v", created, err)
-	}
+	testassert.Require(t, err == nil && created.Status == http.StatusCreated, "create root: %+v, %v", created, err)
 	var root protocol.Session
-	if err := json.Unmarshal([]byte(created.Body), &root); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(created.Body), &root))
 	// Drain the actual native event pull, retaining deliveries and terminal loss.
 	events := make(chan string, 256)
 	lost := make(chan error, 1)
@@ -443,9 +416,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 		Runtime protocol.Health `json:"runtime"`
 	}
 	acp.call(t, "initialize", map[string]any{}, &initialized)
-	if initialized.Runtime.InstanceId != oldInstance {
-		t.Fatal("ACP attached another owner")
-	}
+	testassert.Require(t, initialized.Runtime.InstanceId == oldInstance, "ACP attached another owner")
 	terminal := startPipeTerminal(t, opts, workspace)
 	terminal.await(t, 0, func(text string) bool {
 		return strings.Contains(text, "Authoritative refreshed range — "+root.SessionId) && strings.Contains(text, "Future: primary / prov/root")
@@ -462,9 +433,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 			return h.ActiveOperation != nil && len(h.Background) == 2 && len(h.Pending.Queued) == 1
 		})
 		queuedID, rootOperation = h.Pending.Queued[0].OperationId, h.ActiveOperation.OperationId
-		if len(queuedID) != 32 || queuedID == rootOperation {
-			t.Fatalf("caller identity: %q, %q", queuedID, rootOperation)
-		}
+		testassert.Require(t, len(queuedID) == 32 && queuedID != rootOperation, "caller identity: %q, %q", queuedID, rootOperation)
 		childID = ""
 		jobID := ""
 		for _, member := range h.Background {
@@ -475,50 +444,32 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 				jobID = member.Id
 			}
 		}
-		if childID == "" || jobID == "" {
-			t.Fatalf("native members: %+v", h.Background)
-		}
+		testassert.Require(t, childID != "" && jobID != "", "native members: %+v", h.Background)
 		child := desktopHydrate(t, host, info, childID)
-		if child.ActiveOperation == nil || child.Session.ParentSessionId == nil || *child.Session.ParentSessionId != root.SessionId {
-			t.Fatal("native child not active or not owned by root")
-		}
-		if !reflect.DeepEqual(h, acp.hydrate(t, root.SessionId)) || !reflect.DeepEqual(child, acp.hydrate(t, childID)) {
-			t.Fatal("desktop/ACP gated native facts differ")
-		}
+		testassert.Require(t, child.ActiveOperation != nil && child.Session.ParentSessionId != nil && *child.Session.ParentSessionId == root.SessionId, "native child not active or not owned by root")
+		testassert.Require(t, reflect.DeepEqual(h, acp.hydrate(t, root.SessionId)) && reflect.DeepEqual(child, acp.hydrate(t, childID)), "desktop/ACP gated native facts differ")
 		return fifo, h, child
 	}
 	fifo, heldRoot, heldChild := startWave(0, terminal)
 	_ = terminal.in.Close()
-	if err := recvBounded(t, terminal.done); err != nil {
-		t.Fatalf("terminal EOF: %v", err)
-	}
-	if !reflect.DeepEqual(heldRoot, rootRead()) || !reflect.DeepEqual(heldChild, desktopHydrate(t, host, info, childID)) {
-		t.Fatal("terminal departure changed native work or pending caller")
-	}
-	if !reflect.DeepEqual(heldRoot, acp.hydrate(t, root.SessionId)) || !reflect.DeepEqual(heldChild, acp.hydrate(t, childID)) {
-		t.Fatal("remaining ACP not healthy after terminal departure")
-	}
+	testassert.NoError(t, recvBounded(t, terminal.done))
+	testassert.Require(t, reflect.DeepEqual(heldRoot, rootRead()) && reflect.DeepEqual(heldChild, desktopHydrate(t, host, info, childID)), "terminal departure changed native work or pending caller")
+	testassert.Require(t, reflect.DeepEqual(heldRoot, acp.hydrate(t, root.SessionId)) && reflect.DeepEqual(heldChild, acp.hydrate(t, childID)), "remaining ACP not healthy after terminal departure")
 	model.mu.Lock()
 	canceled := model.canceled
 	model.mu.Unlock()
-	if canceled != 0 {
-		t.Fatal("departure canceled a native model")
-	}
+	testassert.Require(t, canceled == 0, "departure canceled a native model")
 	fresh := startPipeTerminal(t, opts, workspace)
 	fresh.await(t, 0, func(text string) bool {
 		return strings.Contains(text, "Authoritative refreshed range — "+root.SessionId)
 	})
-	if !reflect.DeepEqual(heldRoot, fresh.hydrate(t, root.SessionId)) || !reflect.DeepEqual(heldChild, fresh.hydrate(t, childID)) {
-		t.Fatal("same-owner fresh terminal root/child reads differ")
-	}
+	testassert.Require(t, reflect.DeepEqual(heldRoot, fresh.hydrate(t, root.SessionId)) && reflect.DeepEqual(heldChild, fresh.hydrate(t, childID)), "same-owner fresh terminal root/child reads differ")
 	// Actual streams delivered native Session hints to both observing hosts.
 	seenDesktop := make(map[string]bool)
 	for len(seenDesktop) != 2 {
 		raw := recvBounded(t, events)
 		var event protocol.Event
-		if err := json.Unmarshal([]byte(raw), &event); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, json.Unmarshal([]byte(raw), &event))
 		changed, err := event.AsSessionChangedEvent()
 		if err != nil {
 			continue
@@ -537,9 +488,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	for _, frame := range acp.seen {
 		if string(frame["method"]) == `"runtime/event"` {
 			var event protocol.Event
-			if err := json.Unmarshal(frame["params"], &event); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, json.Unmarshal(frame["params"], &event))
 			changed, err := event.AsSessionChangedEvent()
 			if err != nil {
 				continue
@@ -550,12 +499,11 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 			}
 		}
 	}
-	if len(seenACP) != 2 {
-		t.Fatal("ACP did not forward native root and child events")
-	}
+	testassert.Require(t, len(seenACP) == 2, "ACP did not forward native root and child events")
 	waves[0].unblock()
-	if _, err := io.WriteString(fifo, "complete\n"); err != nil {
-		t.Fatal(err)
+	{
+		_, err := io.WriteString(fifo, "complete\n")
+		testassert.NoError(t, err)
 	}
 	_ = fifo.Close()
 	// Terminal settlement is not an execution-retirement barrier. Read current
@@ -580,9 +528,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 			admitted = true
 		}
 	}
-	if !admitted {
-		t.Fatal("queued caller did not become its successful Operation")
-	}
+	testassert.Require(t, admitted, "queued caller did not become its successful Operation")
 	jobCompleted := false
 	for _, item := range converged.Conversation.Items {
 		input, err := item.AsInputItem()
@@ -596,31 +542,25 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 			}
 		}
 	}
-	if !jobCompleted {
-		t.Fatal("native Job did not publish its successful process completion")
-	}
+	testassert.Require(t, jobCompleted, "native Job did not publish its successful process completion")
 	// A second native batch establishes active root/child/Job and an unadmitted
 	// caller when the test owner explicitly closes. No client controls it.
 	_, lossRoot, lossChild := startWave(1, fresh)
 	lossQueued, lossChildID := queuedID, childID
 	repairOffset := fresh.mark()
-	if err := owner.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, owner.Close(context.Background()))
 	owner = nil
-	if err := recvBounded(t, lost); err == nil {
-		t.Fatal("desktop did not report old-owner loss")
+	{
+		err := recvBounded(t, lost)
+		testassert.Require(t, err != nil, "desktop did not report old-owner loss")
 	}
 	newEndpoint := openOwner()
 	newInfo, err := host.Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newInfo.InstanceID == oldInstance || newInfo.Generation == info.Generation {
-		t.Fatal("new owner reused desktop identity/generation")
-	}
-	if _, err := host.Call(info.Generation, "GetHealth", ""); err == nil {
-		t.Fatal("old generation survived owner replacement")
+	testassert.NoError(t, err)
+	testassert.Require(t, newInfo.InstanceID != oldInstance && newInfo.Generation != info.Generation, "new owner reused desktop identity/generation")
+	{
+		_, err := host.Call(info.Generation, "GetHealth", "")
+		testassert.Require(t, err != nil, "old generation survived owner replacement")
 	}
 	info = newInfo
 	// Wait for the actual repair announcement; its snapshot is generated from
@@ -630,9 +570,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	repairedNotice := false
 	for !repairedSnapshot || !repairedConnected || !repairedNotice {
 		frame := recvBounded(t, acp.frames)
-		if frame == nil {
-			t.Fatal("ACP ended during repair")
-		}
+		testassert.Require(t, frame != nil, "ACP ended during repair")
 		switch string(frame["method"]) {
 		case `"runtime/connected"`:
 			var health protocol.Health
@@ -655,43 +593,29 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	newRoot, newChild := rootRead(), desktopHydrate(t, host, info, lossChildID)
 	for _, pair := range []struct{ before, after protocol.Hydration }{{lossRoot, newRoot}, {lossChild, newChild}} {
 		h := pair.after
-		if h.ActiveOperation != nil || len(h.Background) != 0 || len(h.Pending.Queued)+len(h.Pending.Steering) != 0 {
-			t.Fatal("new owner resumed active work or recovered a pending buffer")
-		}
+		testassert.Require(t, h.ActiveOperation == nil && len(h.Background) == 0 && len(h.Pending.Queued)+len(h.Pending.Steering) == 0, "new owner resumed active work or recovered a pending buffer")
 		found := false
 		for _, op := range h.Operations {
-			if op.OperationId == lossQueued {
-				t.Fatal("new owner admitted lost pending caller")
-			}
+			testassert.Require(t, op.OperationId != lossQueued, "new owner admitted lost pending caller")
 			if op.OperationId == pair.before.ActiveOperation.OperationId {
 				found = op.Status == protocol.OperationStatusInterruption
 			}
 		}
-		if !found {
-			t.Fatal("closed owner's active Operation did not settle interrupted")
-		}
+		testassert.Require(t, found, "closed owner's active Operation did not settle interrupted")
 	}
 	for _, id := range []string{root.SessionId, lossChildID} {
 		h := desktopHydrate(t, host, info, id)
-		if !reflect.DeepEqual(h, acp.hydrate(t, id)) || !reflect.DeepEqual(h, fresh.hydrate(t, id)) {
-			t.Fatal("new-owner instance-qualified root/child reads differ")
-		}
+		testassert.Require(t, reflect.DeepEqual(h, acp.hydrate(t, id)) && reflect.DeepEqual(h, fresh.hydrate(t, id)), "new-owner instance-qualified root/child reads differ")
 	}
 	model.mu.Lock()
 	calls := model.calls
 	model.mu.Unlock()
 	t.Logf("old owner %s instance %s; new owner %s instance %s; root %s child %s; discarded queued caller %s; native model requests %d", oldEndpoint, oldInstance, newEndpoint, info.InstanceID, root.SessionId, lossChildID, lossQueued, calls)
 	_ = fresh.in.Close()
-	if err := recvBounded(t, fresh.done); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, recvBounded(t, fresh.done))
 	_ = acp.in.Close()
-	if err := recvBounded(t, acp.done); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, recvBounded(t, acp.done))
 	host.shutdown(context.Background())
-	if err := owner.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, owner.Close(context.Background()))
 	owner = nil
 }

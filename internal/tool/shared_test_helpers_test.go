@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // testCodeGroupStore adapts one real snapshot.CodeStore to the shared
@@ -33,9 +34,7 @@ func (s testCodeGroupStore) Snapshot(turn int, absPath string) error {
 func newCodeGroupStore(t *testing.T, groupDir string, turn int) testCodeGroupStore {
 	t.Helper()
 	store, err := snapshot.OpenCodeStore(groupDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	return testCodeGroupStore{CodeStore: store, turn: turn}
 }
 
@@ -140,11 +139,10 @@ func (s *recordingSnapshotStore) CurrentTurn() int {
 func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(data); got != want {
-		t.Fatalf("content of %s = %q, want %q", path, got, want)
+	testassert.NoError(t, err)
+	{
+		got := string(data)
+		testassert.Require(t, got == want, "content of %s = %q, want %q", path, got, want)
 	}
 }
 

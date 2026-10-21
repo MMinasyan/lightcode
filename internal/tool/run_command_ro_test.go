@@ -3,6 +3,8 @@ package tool
 import (
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
@@ -34,8 +36,9 @@ func TestReadOnlyRunCommandAllowsWhitelistedCommands(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := ReadOnlyCommand(tt.command); err != nil {
-				t.Fatalf("ReadOnlyCommand(%q) error = %v, want accepted", tt.command, err)
+			{
+				_, err := ReadOnlyCommand(tt.command)
+				testassert.Require(t, err == nil, "ReadOnlyCommand(%q) error = %v, want accepted", tt.command, err)
 			}
 		})
 	}
@@ -110,8 +113,9 @@ func TestReadOnlyRunCommandRejectsUnsafeCommands(t *testing.T) {
 
 	for _, command := range tests {
 		t.Run(command, func(t *testing.T) {
-			if _, err := ReadOnlyCommand(command); err == nil {
-				t.Fatalf("ReadOnlyCommand(%q) accepted, want read-only rejection", command)
+			{
+				_, err := ReadOnlyCommand(command)
+				testassert.Require(t, err != nil, "ReadOnlyCommand(%q) accepted, want read-only rejection", command)
 			}
 		})
 	}
@@ -167,8 +171,9 @@ func TestIsReadOnlyCommandClassifiesChainsBeforePrefixAllow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.command, func(t *testing.T) {
-			if got := isReadOnlyCommand(tt.command); got != tt.want {
-				t.Fatalf("isReadOnlyCommand(%q) = %v, want %v", tt.command, got, tt.want)
+			{
+				got := isReadOnlyCommand(tt.command)
+				testassert.Require(t, got == tt.want, "isReadOnlyCommand(%q) = %v, want %v", tt.command, got, tt.want)
 			}
 		})
 	}
@@ -182,14 +187,10 @@ func TestReadOnlyRunCommandRejectsAmbiguousGitConfigFlags(t *testing.T) {
 		"git show --config-env core.pager=HOME HEAD",
 	} {
 		t.Run(command, func(t *testing.T) {
-			if isReadOnlyCommand(command) {
-				t.Fatalf("isReadOnlyCommand(%q) = true, want false", command)
-			}
+			testassert.Require(t, !isReadOnlyCommand(command), "isReadOnlyCommand(%q) = true, want false", command)
 		})
 	}
-	if !isReadOnlyCommand("git diff -- -c") {
-		t.Fatal("isReadOnlyCommand(\"git diff -- -c\") = false, want true for literal path after --")
-	}
+	testassert.Require(t, isReadOnlyCommand("git diff -- -c"), "isReadOnlyCommand(\"git diff -- -c\") = false, want true for literal path after --")
 }
 
 func TestPR11Closure_GitSubcommandLocalDashCDeliberatelyBlocked(t *testing.T) {
@@ -199,14 +200,10 @@ func TestPR11Closure_GitSubcommandLocalDashCDeliberatelyBlocked(t *testing.T) {
 		"git show -c HEAD",
 	} {
 		t.Run(command, func(t *testing.T) {
-			if isReadOnlyCommand(command) {
-				t.Fatalf("isReadOnlyCommand(%q) = true, want false (subcommand-local -c is deliberately blocked)", command)
-			}
+			testassert.Require(t, !isReadOnlyCommand(command), "isReadOnlyCommand(%q) = true, want false (subcommand-local -c is deliberately blocked)", command)
 		})
 	}
-	if !isReadOnlyCommand("git diff -- -c") {
-		t.Fatal("isReadOnlyCommand(\"git diff -- -c\") = false, want true (literal -- escape must still work)")
-	}
+	testassert.Require(t, isReadOnlyCommand("git diff -- -c"), "isReadOnlyCommand(\"git diff -- -c\") = false, want true (literal -- escape must still work)")
 }
 
 func TestPR11Closure_ReadOnlyRejectsHeredocAndHereString(t *testing.T) {
@@ -216,9 +213,7 @@ func TestPR11Closure_ReadOnlyRejectsHeredocAndHereString(t *testing.T) {
 		`grep pattern <<<"$var"`,
 	} {
 		t.Run(command, func(t *testing.T) {
-			if isReadOnlyCommand(command) {
-				t.Fatalf("isReadOnlyCommand(%q) = true, want false (heredoc/here-string redirection must be rejected)", command)
-			}
+			testassert.Require(t, !isReadOnlyCommand(command), "isReadOnlyCommand(%q) = true, want false (heredoc/here-string redirection must be rejected)", command)
 		})
 	}
 }
@@ -229,17 +224,12 @@ func TestPR11Closure_ReadOnlyRejectsHeredocAndHereString(t *testing.T) {
 // is one the allowlist rejects.
 func TestReadOnlyRunCommandDescriptionMatchesEnforcement(t *testing.T) {
 	for _, command := range []string{"git branch --list", "git tag -l 'v*'"} {
-		if _, err := ReadOnlyCommand(command); err != nil {
-			t.Errorf("ReadOnlyCommand(%q) error = %v, want the advertised listing mode accepted", command, err)
+		{
+			_, err := ReadOnlyCommand(command)
+			testassert.Check(t, err == nil, "ReadOnlyCommand(%q) error = %v, want the advertised listing mode accepted", command, err)
 		}
 	}
-	if !strings.Contains(ReadOnlyRunCommandDescription, "branch/tag listing") {
-		t.Error("read-only description does not advertise the branch/tag listing modes the allowlist accepts")
-	}
-	if strings.Contains(ReadOnlyRunCommandDescription, "cd ") {
-		t.Error("read-only description suggests a cd command the allowlist rejects")
-	}
-	if isReadOnlyCommand("cd /tmp && pwd") {
-		t.Error("isReadOnlyCommand accepted a cd chain, so the description's removed suggestion was not unsupported")
-	}
+	testassert.Check(t, strings.Contains(ReadOnlyRunCommandDescription, "branch/tag listing"), "read-only description does not advertise the branch/tag listing modes the allowlist accepts")
+	testassert.Check(t, !strings.Contains(ReadOnlyRunCommandDescription, "cd "), "read-only description suggests a cd command the allowlist rejects")
+	testassert.Check(t, !isReadOnlyCommand("cd /tmp && pwd"), "isReadOnlyCommand accepted a cd chain, so the description's removed suggestion was not unsupported")
 }

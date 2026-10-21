@@ -9,6 +9,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestStopJobReaperBarrierAndHarnessStopDelivery proves the ordered
@@ -42,25 +43,19 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 		},
 		Jobs: j,
 	})
-	if err != nil {
-		t.Fatalf("harness.New: %v", err)
-	}
+	testassert.NoError(t, err)
 	session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{
 		Workspace: t.TempDir(), AgentType: "coder",
 	})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	sid := session.Identity.SessionID
 
 	jobID, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	callbackEntered := make(chan struct{})
 	callbackGate := make(chan struct{})
 	deliveryErr := make(chan error, 1)
-	if err := h.StartJob(context.Background(), sid, jobID, func(_ context.Context, completionID string) error {
+	testassert.NoError(t, h.StartJob(context.Background(), sid, jobID, func(_ context.Context, completionID string) error {
 		return j.Start(StartRequest{
 			JobID: jobID, SessionID: sid, Workspace: t.TempDir(),
 			Command: "sleep 30", Env: os.Environ(),
@@ -70,9 +65,7 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 				deliveryErr <- h.DeliverBackgroundCompletion(context.Background(), sid, completionID, "job completed")
 			},
 		})
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
-	}
+	}))
 
 	// The parent stops being receivable: the gated delivery commits the
 	// durable signal entry on the closed path, like managed shutdown.
@@ -132,13 +125,9 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 	close(callbackGate)
 	select {
 	case err := <-stopDone:
-		if err != nil {
-			t.Fatalf("Stop: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(15 * time.Second):
 		t.Fatal("Stop did not converge after the delivery finished the member")
 	}
-	if err := <-deliveryErr; err != nil {
-		t.Fatalf("DeliverBackgroundCompletion: %v", err)
-	}
+	testassert.NoError(t, <-deliveryErr)
 }

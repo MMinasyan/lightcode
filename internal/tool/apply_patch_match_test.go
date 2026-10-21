@@ -3,6 +3,8 @@ package tool
 import (
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestLocateScenarios(t *testing.T) {
@@ -182,20 +184,14 @@ func TestLocateScenarios(t *testing.T) {
 			for _, p := range tc.probes {
 				start, err := locate(tc.lines, tc.h, "p", p.cursor)
 				if p.wantErr {
-					if err == nil {
-						t.Fatalf("locate(cursor=%d) err = nil, want non-nil", p.cursor)
-					}
+					testassert.Require(t, err != nil, "locate(cursor=%d) err = nil, want non-nil", p.cursor)
 					if p.errPrefix != "" && !strings.HasPrefix(err.Error(), p.errPrefix) {
 						t.Fatalf("locate(cursor=%d) err = %q, want prefix %q", p.cursor, err.Error(), p.errPrefix)
 					}
 					continue
 				}
-				if err != nil {
-					t.Fatalf("locate(cursor=%d) err = %v", p.cursor, err)
-				}
-				if start != p.start {
-					t.Fatalf("locate(cursor=%d) start = %d, want %d", p.cursor, start, p.start)
-				}
+				testassert.Require(t, err == nil, "locate(cursor=%d) err = %v", p.cursor, err)
+				testassert.Require(t, start == p.start, "locate(cursor=%d) start = %d, want %d", p.cursor, start, p.start)
 			}
 		})
 	}
@@ -212,19 +208,11 @@ func TestLocateEOFTrailingEmptyRetry(t *testing.T) {
 		{Kind: lineContext, Text: ""},
 	}}
 	start, err := locate(lines, h, "p", 0)
-	if err != nil {
-		t.Fatalf("locate err = %v (EOF empty retry should have dropped the trailing empty)", err)
-	}
-	if start != 0 {
-		t.Fatalf("start = %d, want 0", start)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, start, 0)
 	match, err := locateHunk(lines, h, "p", 0)
-	if err != nil {
-		t.Fatalf("locateHunk err = %v", err)
-	}
-	if match.start != 0 || match.realMatchedLen != 2 || !match.syntheticTrailingEmpty {
-		t.Fatalf("locateHunk = %+v, want start 0 len 2 synthetic trailing empty", match)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, match.start == 0 && match.realMatchedLen == 2 && match.syntheticTrailingEmpty, "locateHunk = %+v, want start 0 len 2 synthetic trailing empty", match)
 }
 
 func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
@@ -237,17 +225,9 @@ func TestLocateNoEOFTrailingEmptyWhenFileHasIt(t *testing.T) {
 		{Kind: lineContext, Text: ""},
 	}}
 	start, err := locate(lines, h, "p", 0)
-	if err != nil {
-		t.Fatalf("locate err = %v", err)
-	}
-	if start != 0 {
-		t.Fatalf("start = %d, want 0", start)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, start, 0)
 	match, err := locateHunk(lines, h, "p", 0)
-	if err != nil {
-		t.Fatalf("locateHunk err = %v", err)
-	}
-	if match.start != 0 || match.realMatchedLen != 3 || match.syntheticTrailingEmpty {
-		t.Fatalf("locateHunk = %+v, want start 0 len 3 no synthetic line", match)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, match.start == 0 && match.realMatchedLen == 3 && !match.syntheticTrailingEmpty, "locateHunk = %+v, want start 0 len 3 no synthetic line", match)
 }

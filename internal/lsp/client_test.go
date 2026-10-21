@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestWorkspaceSymbolAllFailedInstancesIsError: when every mapped instance is
@@ -25,9 +26,7 @@ func TestWorkspaceSymbolAllFailedInstancesIsError(t *testing.T) {
 	m.mu.Unlock()
 
 	content, err := NewClient(m).WorkspaceSymbol(context.Background(), "x")
-	if err == nil || content != "" || err.Error() != "No language servers available for the symbol query." {
-		t.Fatalf("WorkspaceSymbol with only failed servers = (%q, %v), want the fixed unavailability error", content, err)
-	}
+	testassert.Require(t, err != nil && content == "" && err.Error() == "No language servers available for the symbol query.", "WorkspaceSymbol with only failed servers = (%q, %v), want the fixed unavailability error", content, err)
 }
 
 // TestClientNoInstancesMessages: with no mapped instance at all, the symbol
@@ -38,17 +37,11 @@ func TestWorkspaceSymbolAllFailedInstancesIsError(t *testing.T) {
 func TestClientNoInstancesMessages(t *testing.T) {
 	client := NewClient(NewManager(t.TempDir(), t.TempDir()))
 	got, err := client.WorkspaceSymbol(context.Background(), "x")
-	if err == nil || got != "" || err.Error() != "No language servers available." {
-		t.Fatalf("WorkspaceSymbol no instances = %q, %v", got, err)
-	}
+	testassert.Require(t, err != nil && got == "" && err.Error() == "No language servers available.", "WorkspaceSymbol no instances = %q, %v", got, err)
 	got, err = client.GetDiagnosticsCanonical(context.Background(), []string{"main.go"})
-	if err == nil || got != "" || err.Error() != "main.go: no language server for this file (could not check)" {
-		t.Fatalf("GetDiagnosticsCanonical unsupported path = %q, %v", got, err)
-	}
+	testassert.Require(t, err != nil && got == "" && err.Error() == "main.go: no language server for this file (could not check)", "GetDiagnosticsCanonical unsupported path = %q, %v", got, err)
 	got, err = client.GetDiagnosticsCanonical(context.Background(), nil)
-	if err == nil || got != "" || err.Error() != "No language servers available for the modified files." {
-		t.Fatalf("GetDiagnosticsCanonical empty input = %q, %v", got, err)
-	}
+	testassert.Require(t, err != nil && got == "" && err.Error() == "No language servers available for the modified files.", "GetDiagnosticsCanonical empty input = %q, %v", got, err)
 }
 
 // TestGetDiagnosticsCanonicalDeadServerIsNotCleanResult pins the sample-time
@@ -69,9 +62,7 @@ func TestGetDiagnosticsCanonicalDeadServerIsNotCleanResult(t *testing.T) {
 	// every later launch crashes before readiness, so the instance can never
 	// serve the sample.
 	inst := newFakeServerInstance(t, log, "", 0, 0, "after-open", "")
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	m := NewManager(t.TempDir(), t.TempDir())
 	def := server.ForExtension(".go")
 	m.mu.Lock()
@@ -91,31 +82,18 @@ func TestGetDiagnosticsCanonicalDeadServerIsNotCleanResult(t *testing.T) {
 	m.mu.Unlock()
 
 	healthy := filepath.Join(t.TempDir(), "healthy.go")
-	if err := os.WriteFile(healthy, []byte("package healthy\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(healthy, []byte("package healthy\n"), 0o600))
 	missingPy := filepath.Join(t.TempDir(), "missing.py")
 
 	content, err := NewClient(m).GetDiagnosticsCanonical(context.Background(), []string{healthy, missingPy})
-	if err == nil || content != "" {
-		t.Fatalf("GetDiagnosticsCanonical with a live but unsynchronized server = (%q, %v), want the could-not-check error, never a successful sample", content, err)
-	}
-	if !strings.Contains(err.Error(), "(could not check)") || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("GetDiagnosticsCanonical error = %q, want the unavailable could-not-check lines", err)
-	}
-	if !strings.Contains(err.Error(), "missing.py") || !strings.Contains(err.Error(), "healthy.go") {
-		t.Fatalf("GetDiagnosticsCanonical error = %q, want both the refused pyright leaf and the dead server's synced path", err)
-	}
+	testassert.Require(t, err != nil && content == "", "GetDiagnosticsCanonical with a live but unsynchronized server = (%q, %v), want the could-not-check error, never a successful sample", content, err)
+	testassert.Require(t, strings.Contains(err.Error(), "(could not check)") && strings.Contains(err.Error(), "unavailable") && strings.Contains(err.Error(), "missing.py") && strings.Contains(err.Error(), "healthy.go"), "GetDiagnosticsCanonical error = %q, want the unavailable could-not-check lines; GetDiagnosticsCanonical error = %q, want both the refused pyright leaf and the dead server's synced path", err, err)
 
 	// The crash loop really ran to exhaustion over the served sync: the
 	// document reached the first launch, and every later launch died before
 	// readiness.
 	data, err := os.ReadFile(reqLog)
-	if err != nil || !strings.Contains(string(data), "textDocument/didOpen") {
-		t.Fatalf("the document sync never reached the server (log %q, err %v)", data, err)
-	}
+	testassert.Require(t, err == nil && strings.Contains(string(data), "textDocument/didOpen"), "the document sync never reached the server (log %q, err %v)", data, err)
 	waitForState(t, inst, stateFailed)
-	if n := countLaunches(log); n != maxRestarts+1 {
-		t.Fatalf("server processes launched = %d, want %d (the serving launch plus the exhausted restarts)", n, maxRestarts+1)
-	}
+	testassert.Equal(t, countLaunches(log), maxRestarts+1)
 }

@@ -3,6 +3,8 @@ package catalog
 import (
 	"errors"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestCatalogLookupReturnsUnknownErrors(t *testing.T) {
@@ -18,11 +20,13 @@ func TestCatalogLookupReturnsUnknownErrors(t *testing.T) {
 		},
 	}}
 
-	if _, _, err := cat.Lookup(ModelRef{Provider: "missing", Model: "gpt"}); !errors.Is(err, ErrUnknownProvider) {
-		t.Fatalf("missing provider err = %v, want ErrUnknownProvider", err)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "missing", Model: "gpt"})
+		testassert.Require(t, errors.Is(err, ErrUnknownProvider), "missing provider err = %v, want ErrUnknownProvider", err)
 	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "openai", Model: "missing"}); !errors.Is(err, ErrUnknownModel) {
-		t.Fatalf("missing model err = %v, want ErrUnknownModel", err)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "openai", Model: "missing"})
+		testassert.Require(t, errors.Is(err, ErrUnknownModel), "missing model err = %v, want ErrUnknownModel", err)
 	}
 }
 
@@ -65,22 +69,10 @@ func TestMergeDiscoveredProviderUpdatesExistingCost(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
-	}
+	testassert.NoError(t, err)
 	model := cat.Providers["openai"].Models["gpt-5.4-mini"]
-	if model.Cost == nil {
-		t.Fatalf("model.Cost = nil")
-	}
-	if model.Cost.Input == nil || *model.Cost.Input != 15 {
-		t.Fatalf("model.Cost.Input = %v, want 15", model.Cost.Input)
-	}
-	if model.Cost.Output == nil || *model.Cost.Output != 30 {
-		t.Fatalf("model.Cost.Output = %v, want 30", model.Cost.Output)
-	}
-	if model.Cost.CacheRead == nil || *model.Cost.CacheRead != 5 {
-		t.Fatalf("model.Cost.CacheRead = %v, want 5", model.Cost.CacheRead)
-	}
+	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
+	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 15 && model.Cost.Output != nil && *model.Cost.Output == 30 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 5, "model.Cost.Input = %v, want 15; model.Cost.Output = %v, want 30; model.Cost.CacheRead = %v, want 5", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead)
 }
 
 func TestMergeDiscoveredProviderPreservesCostFieldsDiscoveryDoesNotProvide(t *testing.T) {
@@ -119,25 +111,10 @@ func TestMergeDiscoveredProviderPreservesCostFieldsDiscoveryDoesNotProvide(t *te
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
-	}
+	testassert.NoError(t, err)
 	model := cat.Providers["openai"].Models["gpt-5.4-mini"]
-	if model.Cost == nil {
-		t.Fatalf("model.Cost = nil")
-	}
-	if model.Cost.Input == nil || *model.Cost.Input != 12 {
-		t.Fatalf("model.Cost.Input = %v, want 12 (updated by discovery)", model.Cost.Input)
-	}
-	if model.Cost.Output == nil || *model.Cost.Output != 25 {
-		t.Fatalf("model.Cost.Output = %v, want 25 (updated by discovery)", model.Cost.Output)
-	}
-	if model.Cost.CacheRead == nil || *model.Cost.CacheRead != 3 {
-		t.Fatalf("model.Cost.CacheRead = %v, want 3 (preserved from existing)", model.Cost.CacheRead)
-	}
-	if model.Cost.CacheWrite == nil || *model.Cost.CacheWrite != 7 {
-		t.Fatalf("model.Cost.CacheWrite = %v, want 7 (preserved from existing)", model.Cost.CacheWrite)
-	}
+	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
+	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 12 && model.Cost.Output != nil && *model.Cost.Output == 25 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 3 && model.Cost.CacheWrite != nil && *model.Cost.CacheWrite == 7, "model.Cost.Input = %v, want 12 (updated by discovery); model.Cost.Output = %v, want 25 (updated by discovery); model.Cost.CacheRead = %v, want 3 (preserved from existing); model.Cost.CacheWrite = %v, want 7 (preserved from existing)", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite)
 }
 
 func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing.T) {
@@ -189,37 +166,13 @@ func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing
 	}, map[string]map[string]bool{
 		"gpt-5.4-mini": {"input": true},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProviderWithCostProtection error: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	protected := cat.Providers["openai"].Models["gpt-5.4-mini"].Cost
-	if protected.Input == nil || *protected.Input != 99 {
-		t.Fatalf("protected input = %v, want 99", protected.Input)
-	}
-	if protected.Output == nil || *protected.Output != 2 {
-		t.Fatalf("unprotected output = %v, want 2", protected.Output)
-	}
-	if protected.CacheRead == nil || *protected.CacheRead != 4 {
-		t.Fatalf("unprotected cache_read = %v, want 4", protected.CacheRead)
-	}
-	if protected.CacheWrite == nil || *protected.CacheWrite != 5 {
-		t.Fatalf("unprotected cache_write = %v, want 5", protected.CacheWrite)
-	}
+	testassert.Require(t, protected.Input != nil && *protected.Input == 99 && protected.Output != nil && *protected.Output == 2 && protected.CacheRead != nil && *protected.CacheRead == 4 && protected.CacheWrite != nil && *protected.CacheWrite == 5, "protected input = %v, want 99; unprotected output = %v, want 2; unprotected cache_read = %v, want 4; unprotected cache_write = %v, want 5", protected.Input, protected.Output, protected.CacheRead, protected.CacheWrite)
 
 	omitted := cat.Providers["openai"].Models["omitted-costs"].Cost
-	if omitted.Input == nil || *omitted.Input != 15 {
-		t.Fatalf("omitted input = %v, want updated 15", omitted.Input)
-	}
-	if omitted.Output == nil || *omitted.Output != 11 {
-		t.Fatalf("omitted output = %v, want preserved 11", omitted.Output)
-	}
-	if omitted.CacheRead == nil || *omitted.CacheRead != 12 {
-		t.Fatalf("omitted cache_read = %v, want preserved 12", omitted.CacheRead)
-	}
-	if omitted.CacheWrite == nil || *omitted.CacheWrite != 13 {
-		t.Fatalf("omitted cache_write = %v, want preserved 13", omitted.CacheWrite)
-	}
+	testassert.Require(t, omitted.Input != nil && *omitted.Input == 15 && omitted.Output != nil && *omitted.Output == 11 && omitted.CacheRead != nil && *omitted.CacheRead == 12 && omitted.CacheWrite != nil && *omitted.CacheWrite == 13, "omitted input = %v, want updated 15; omitted output = %v, want preserved 11; omitted cache_read = %v, want preserved 12; omitted cache_write = %v, want preserved 13", omitted.Input, omitted.Output, omitted.CacheRead, omitted.CacheWrite)
 }
 
 func TestMergeDiscoveredProviderAddsCostWhenPreviouslyNil(t *testing.T) {
@@ -253,19 +206,10 @@ func TestMergeDiscoveredProviderAddsCostWhenPreviouslyNil(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
-	}
+	testassert.NoError(t, err)
 	model := cat.Providers["local"].Models["qwen3"]
-	if model.Cost == nil {
-		t.Fatalf("model.Cost = nil, want cost from discovery")
-	}
-	if model.Cost.Input == nil || *model.Cost.Input != 5 {
-		t.Fatalf("model.Cost.Input = %v, want 5", model.Cost.Input)
-	}
-	if model.Cost.Output == nil || *model.Cost.Output != 10 {
-		t.Fatalf("model.Cost.Output = %v, want 10", model.Cost.Output)
-	}
+	testassert.Require(t, model.Cost != nil, "model.Cost = nil, want cost from discovery")
+	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 5 && model.Cost.Output != nil && *model.Cost.Output == 10, "model.Cost.Input = %v, want 5; model.Cost.Output = %v, want 10", model.Cost.Input, model.Cost.Output)
 }
 
 func TestMergeDiscoveredProviderLeavesMaxOutputUnsetWhenDiscoveryOmits(t *testing.T) {
@@ -290,19 +234,10 @@ func TestMergeDiscoveredProviderLeavesMaxOutputUnsetWhenDiscoveryOmits(t *testin
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
-	}
+	testassert.NoError(t, err)
 	m := cat.Providers["openrouter"].Models["free-model"]
-	if m == nil {
-		t.Fatal("model not found in catalog")
-	}
-	if m.ContextWindow != 200000 {
-		t.Fatalf("ContextWindow = %d, want 200000", m.ContextWindow)
-	}
-	if m.MaxOutputTokens != 0 {
-		t.Fatalf("MaxOutputTokens = %d, want 0 (no fallback to context_window)", m.MaxOutputTokens)
-	}
+	testassert.Require(t, m != nil, "model not found in catalog")
+	testassert.Require(t, m.ContextWindow == 200000 && m.MaxOutputTokens == 0, "got %v, want %v; got %v, want %v", m.ContextWindow, 200000, m.MaxOutputTokens, 0)
 }
 
 func TestMergeDiscoveredProviderFiltersRejectedDiscoveredOnlyModels(t *testing.T) {
@@ -331,14 +266,14 @@ func TestMergeDiscoveredProviderFiltersRejectedDiscoveredOnlyModels(t *testing.T
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, ok := cat.Providers["openrouter"].Models["image-only"]
+		testassert.Require(t, !ok, "rejected discovered model was added: %#v", cat.Providers["openrouter"].Models["image-only"])
 	}
-	if _, ok := cat.Providers["openrouter"].Models["image-only"]; ok {
-		t.Fatalf("rejected discovered model was added: %#v", cat.Providers["openrouter"].Models["image-only"])
-	}
-	if _, ok := cat.Providers["openrouter"].Models["unknown"]; !ok {
-		t.Fatalf("unknown discovered model without metadata was not added")
+	{
+		_, ok := cat.Providers["openrouter"].Models["unknown"]
+		testassert.Require(t, ok, "unknown discovered model without metadata was not added")
 	}
 }
 
@@ -359,11 +294,10 @@ func TestMergeDiscoveredProviderConfigOnlyDoesNotAddModels(t *testing.T) {
 			"qwen3": {Name: "Qwen 3", ContextWindow: 32768, MaxOutputTokens: 8192, Cost: &Cost{Input: ptrFloat64(1)}},
 		},
 	})
-	if err != nil {
-		t.Fatalf("MergeDiscoveredProvider error: %v", err)
-	}
-	if _, ok := cat.Providers["local"].Models["qwen3"]; ok {
-		t.Fatalf("config-only provider gained discovered model: %#v", cat.Providers["local"].Models["qwen3"])
+	testassert.NoError(t, err)
+	{
+		_, ok := cat.Providers["local"].Models["qwen3"]
+		testassert.Require(t, !ok, "config-only provider gained discovered model: %#v", cat.Providers["local"].Models["qwen3"])
 	}
 }
 
@@ -386,17 +320,11 @@ func TestCatalogVisibleModelsFiltersHiddenAndSorts(t *testing.T) {
 
 	visible := cat.VisibleModels()
 	want := []string{"local/qwen", "openai/z"}
-	if len(visible) != len(want) {
-		t.Fatalf("VisibleModels = %#v, want %v", visible, want)
-	}
+	testassert.Require(t, len(visible) == len(want), "VisibleModels = %#v, want %v", visible, want)
 	for i := range want {
-		if visible[i].String() != want[i] {
-			t.Fatalf("VisibleModels = %#v, want %v", visible, want)
-		}
+		testassert.Require(t, visible[i].String() == want[i], "VisibleModels = %#v, want %v", visible, want)
 	}
 
 	all := cat.AllModels()
-	if len(all) != 4 {
-		t.Fatalf("AllModels length = %d, want 4", len(all))
-	}
+	testassert.Equal(t, len(all), 4)
 }

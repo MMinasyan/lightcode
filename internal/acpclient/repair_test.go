@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The in-package frame fixtures drive the real Runner helpers and queues:
@@ -268,9 +269,7 @@ func (f *frameFixture) writeRecord(t *testing.T, dataDir string) {
 	t.Helper()
 	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"2","credential":%q}`,
 		f.server.URL, f.instance, frameCredential)
-	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600); err != nil {
-		t.Fatalf("write discovery record: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 }
 
 // newFrameRunner builds one Runner over this fixture's discovery record.
@@ -421,14 +420,10 @@ func TestNotificationFramesFollowTheCurrentConnection(t *testing.T) {
 			writer := startParkedWriter(t, r, ctx)
 
 			first, err := r.establish(ctx)
-			if err != nil {
-				t.Fatalf("establish: %v", err)
-			}
+			testassert.NoError(t, err)
 			r.retire(first)
 			r.pumps.Wait()
-			if r.currentConnection() != nil {
-				t.Fatal("the retired connection generation repaired itself")
-			}
+			testassert.Require(t, r.currentConnection() == nil, "the retired connection generation repaired itself")
 			markerFixture := f
 			markerOpen := 2
 			if tc.newInstance {
@@ -438,12 +433,8 @@ func TestNotificationFramesFollowTheCurrentConnection(t *testing.T) {
 				markerOpen = 1
 			}
 			second, err := r.establish(ctx)
-			if err != nil {
-				t.Fatalf("replacement establish: %v", err)
-			}
-			if second == first {
-				t.Fatal("the replacement connection is the retired one")
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, second != first, "the replacement connection is the retired one")
 			markerFixture.marker(markerOpen) <- eventDocument(markerFixture.instance, "7")
 			writer.release()
 			writer.awaitContains(t, `"durable_revision":"7"`)
@@ -481,16 +472,13 @@ func TestRepairSnapshotFramesFollowTheCurrentSelection(t *testing.T) {
 		r, f, writer, ctx, cancel := setup(t)
 		defer cancel()
 		first, err := r.establish(ctx)
-		if err != nil {
-			t.Fatalf("establish: %v", err)
-		}
+		testassert.NoError(t, err)
 		r.selection = selection{id: "s1", generation: 1}
 		r.repair(first)
-		if r.currentConnection() == nil {
-			t.Fatal("repair left no connection")
-		}
-		if _, rpcErr := r.workspaceSelect(json.RawMessage(`{"workspace":"/other"}`)); rpcErr != nil {
-			t.Fatalf("workspace/select: %v", rpcErr)
+		testassert.Require(t, r.currentConnection() != nil, "repair left no connection")
+		{
+			_, rpcErr := r.workspaceSelect(json.RawMessage(`{"workspace":"/other"}`))
+			testassert.Require(t, rpcErr == nil, "workspace/select: %v", rpcErr)
 		}
 		f.marker(2) <- eventDocument(f.instance, "7")
 		writer.release()
@@ -504,9 +492,7 @@ func TestRepairSnapshotFramesFollowTheCurrentSelection(t *testing.T) {
 		r, f, writer, ctx, cancel := setup(t)
 		defer cancel()
 		first, err := r.establish(ctx)
-		if err != nil {
-			t.Fatalf("establish: %v", err)
-		}
+		testassert.NoError(t, err)
 		r.selection = selection{id: "s1", generation: 1}
 		r.repair(first)
 		f.marker(2) <- eventDocument(f.instance, "7")
@@ -524,15 +510,11 @@ func TestRepairSnapshotFramesFollowTheCurrentSelection(t *testing.T) {
 		r, f, writer, ctx, cancel := setup(t)
 		defer cancel()
 		first, err := r.establish(ctx)
-		if err != nil {
-			t.Fatalf("establish: %v", err)
-		}
+		testassert.NoError(t, err)
 		r.selection = selection{id: "s1", generation: 1}
 		r.repair(first)
 		second := r.currentConnection()
-		if second == nil {
-			t.Fatal("the first repair left no connection")
-		}
+		testassert.Require(t, second != nil, "the first repair left no connection")
 		r.selection = selection{id: "s2", generation: 2}
 		r.repair(second)
 		f.marker(3) <- eventDocument(f.instance, "7")
@@ -587,9 +569,7 @@ func TestRetiredConnectionCancelsItsInFlightCall(t *testing.T) {
 			defer cancel()
 			r.ctx = ctx
 			conn, err := r.establish(ctx)
-			if err != nil {
-				t.Fatalf("establish: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			handled := make(chan struct{})
 			go func() {
@@ -611,34 +591,18 @@ func TestRetiredConnectionCancelsItsInFlightCall(t *testing.T) {
 			var frame response
 			select {
 			case data := <-r.responses:
-				if err := json.Unmarshal(data, &frame); err != nil {
-					t.Fatalf("response frame: %v", err)
-				}
+				testassert.NoError(t, json.Unmarshal(data, &frame))
 			case <-time.After(15 * time.Second):
 				t.Fatal("the canceled call produced no response")
 			}
-			if string(frame.ID) != tc.id {
-				t.Fatalf("response ID = %s, want the original request ID %s", frame.ID, tc.id)
-			}
-			if frame.Error == nil {
-				t.Fatalf("frame = %+v, want the canceled call's transport error", frame)
-			}
-			if frame.Error.Code != codeTransport {
-				t.Fatalf("error code = %d, want %d", frame.Error.Code, codeTransport)
-			}
-			if !strings.Contains(frame.Error.Message, "context canceled") {
-				t.Fatalf("error message = %q, want the real transport cancellation", frame.Error.Message)
-			}
-			if len(frame.Result) != 0 {
-				t.Fatalf("frame carries a result beside the error: %s", frame.Result)
-			}
-			if got := r.selectionSnapshot(); got.id != "" {
-				t.Fatalf("selection = %+v, want no adoption from a cancelled call", got)
+			testassert.Require(t, string(frame.ID) == tc.id && frame.Error != nil, "response ID = %s, want the original request ID %s; frame = %+v, want the canceled call's transport error", frame.ID, tc.id, frame)
+			testassert.Require(t, frame.Error.Code == codeTransport && strings.Contains(frame.Error.Message, "context canceled") && len(frame.Result) == 0, "got %v, want %v; error message = %q, want the real transport cancellation; frame carries a result beside the error: %s", frame.Error.Code, codeTransport, frame.Error.Message, frame.Result)
+			{
+				got := r.selectionSnapshot()
+				testassert.Require(t, got.id == "", "selection = %+v, want no adoption from a cancelled call", got)
 			}
 			for _, path := range f.paths() {
-				if strings.Contains(path, "stop") || strings.Contains(path, "interrupt") || strings.Contains(path, "shutdown") {
-					t.Fatalf("cancellation issued owner control %s", path)
-				}
+				testassert.Require(t, !strings.Contains(path, "stop") && !strings.Contains(path, "interrupt") && !strings.Contains(path, "shutdown"), "cancellation issued owner control %s", path)
 			}
 		})
 	}
@@ -658,9 +622,7 @@ func TestCompletedResponseSurvivesRetirement(t *testing.T) {
 	r.out = writer
 	go r.writeLoop(ctx)
 	conn, err := r.establish(ctx)
-	if err != nil {
-		t.Fatalf("establish: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	handled := make(chan struct{})
 	go func() {
@@ -678,24 +640,19 @@ func TestCompletedResponseSurvivesRetirement(t *testing.T) {
 		t.Fatal("the completed addressed call never returned")
 	}
 	stamp := r.selectionSnapshot()
-	if stamp.id != "s1" {
-		t.Fatalf("selection = %+v, want the completed request's adoption", stamp)
-	}
+	testassert.Require(t, stamp.id == "s1", "selection = %+v, want the completed request's adoption", stamp)
 
 	// Retirement after the completed response: the local adoption rejects the
 	// retired connection and adopts the current one.
 	r.retire(conn)
 	replacement, err := r.establish(ctx)
-	if err != nil {
-		t.Fatalf("replacement establish: %v", err)
-	}
+	testassert.NoError(t, err)
 	r.adoptSelection(conn, stamp, "s2", "/ws/s2")
-	if got := r.selectionSnapshot(); got != stamp {
-		t.Fatalf("selection = %+v, want the retired connection's adoption rejected", got)
-	}
+	testassert.Equal(t, r.selectionSnapshot(), stamp)
 	r.adoptSelection(replacement, stamp, "s2", "/ws/s2")
-	if got := r.selectionSnapshot(); got.id != "s2" {
-		t.Fatalf("selection = %+v, want the current connection's adoption", got)
+	{
+		got := r.selectionSnapshot()
+		testassert.Require(t, got.id == "s2", "selection = %+v, want the current connection's adoption", got)
 	}
 }
 
@@ -708,18 +665,16 @@ func TestSelectionAdoptionFollowsTheCurrentSelection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r.ctx = ctx
-	if _, err := r.establish(ctx); err != nil {
-		t.Fatalf("establish: %v", err)
+	{
+		_, err := r.establish(ctx)
+		testassert.NoError(t, err)
 	}
 	result, rpcErr := r.sessionSelect(ctx, json.RawMessage(`{"session_id":"s1"}`))
-	if rpcErr != nil {
-		t.Fatalf("session/select = %+v", rpcErr)
-	}
-	if !strings.Contains(string(result), `"workspace":"/ws/s1"`) {
-		t.Fatalf("session/select result = %s", result)
-	}
-	if got := r.selectionSnapshot(); got.id != "s1" {
-		t.Fatalf("selection = %+v, want the adopted explicit session", got)
+	testassert.Require(t, rpcErr == nil, "session/select = %+v", rpcErr)
+	testassert.Require(t, strings.Contains(string(result), `"workspace":"/ws/s1"`), "session/select result = %s", result)
+	{
+		got := r.selectionSnapshot()
+		testassert.Require(t, got.id == "s1", "selection = %+v, want the adopted explicit session", got)
 	}
 }
 
@@ -740,30 +695,22 @@ func TestEstablishInstallsOnlyAHealthyStream(t *testing.T) {
 			defer cancel()
 			r.ctx = ctx
 
-			if _, rpcErr := r.initialize(ctx, nil); rpcErr == nil || rpcErr.Code != codeTransport {
-				t.Fatalf("initialize = %+v, want the unavailable transport error", rpcErr)
+			{
+				_, rpcErr := r.initialize(ctx, nil)
+				testassert.Require(t, rpcErr != nil && rpcErr.Code == codeTransport, "initialize = %+v, want the unavailable transport error", rpcErr)
 			}
 			attempts := f.countPath("/v1/events")
-			if attempts == 0 {
-				t.Fatal("the failed establish never attempted the event stream")
-			}
+			testassert.Require(t, attempts != 0, "the failed establish never attempted the event stream")
 			r.pumps.Wait()
-			if r.currentConnection() != nil {
-				t.Fatal("a known failed stream was installed as healthy")
+			testassert.Require(t, r.currentConnection() == nil, "a known failed stream was installed as healthy")
+			testassert.Require(t, !r.initialized, "a failed stream marked the bridge initialized")
+			{
+				frame := drainEventFrames(r)
+				testassert.Require(t, len(frame) == 0, "a failed stream published %v", frame)
 			}
-			if r.initialized {
-				t.Fatal("a failed stream marked the bridge initialized")
-			}
-			if frame := drainEventFrames(r); len(frame) != 0 {
-				t.Fatalf("a failed stream published %v", frame)
-			}
-			if got := f.countPath("/v1/events"); got != attempts {
-				t.Fatalf("event stream attempts grew from %d to %d without a loss", attempts, got)
-			}
+			testassert.Equal(t, f.countPath("/v1/events"), attempts)
 			for _, path := range f.paths() {
-				if strings.HasPrefix(path, "/v1/sessions") || strings.HasPrefix(path, "/v1/configuration") {
-					t.Fatalf("a failed stream performed %s", path)
-				}
+				testassert.Require(t, !strings.HasPrefix(path, "/v1/sessions") && !strings.HasPrefix(path, "/v1/configuration"), "a failed stream performed %s", path)
 			}
 		})
 	}
@@ -778,19 +725,20 @@ func TestEstablishOpensTheStreamBeforeTheDescriptiveRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r.ctx = ctx
-	if _, err := r.establish(ctx); err != nil {
-		t.Fatalf("establish: %v", err)
+	{
+		_, err := r.establish(ctx)
+		testassert.NoError(t, err)
 	}
 	want := []string{"/v1/health", "/v1/events", "/v1/health"}
-	if got := f.paths(); !slices.Equal(got, want) {
-		t.Fatalf("establish requests = %v, want the stream established before the descriptive read %v", got, want)
+	{
+		got := f.paths()
+		testassert.Require(t, slices.Equal(got, want), "establish requests = %v, want the stream established before the descriptive read %v", got, want)
 	}
-	if _, rpcErr := r.initialize(ctx, nil); rpcErr != nil {
-		t.Fatalf("initialize: %+v", rpcErr)
+	{
+		_, rpcErr := r.initialize(ctx, nil)
+		testassert.Require(t, rpcErr == nil, "initialize: %+v", rpcErr)
 	}
-	if got := f.countPath("/v1/events"); got != 1 {
-		t.Fatalf("repeated initialize opened %d event streams, want one", got)
-	}
+	testassert.Equal(t, f.countPath("/v1/events"), 1)
 }
 
 // TestFailedRepairLeavesNoConnection proves a lost established stream whose
@@ -806,8 +754,9 @@ func TestFailedRepairLeavesNoConnection(t *testing.T) {
 	defer cancel()
 	r.ctx = ctx
 	endFirst := f.end(1)
-	if _, rpcErr := r.initialize(ctx, nil); rpcErr != nil {
-		t.Fatalf("initialize: %+v", rpcErr)
+	{
+		_, rpcErr := r.initialize(ctx, nil)
+		testassert.Require(t, rpcErr == nil, "initialize: %+v", rpcErr)
 	}
 	f.awaitEventsOpen(t)
 	drainEventFrames(r) // the initial connection's announcement
@@ -817,54 +766,30 @@ func TestFailedRepairLeavesNoConnection(t *testing.T) {
 	close(endFirst)
 	f.awaitEventsOpen(t) // the failed reconnect's stream request
 	// Stop any further startup attempt so quiescence is deterministic.
-	if err := os.Remove(filepath.Join(dataDir, "runtime.json")); err != nil {
-		t.Fatalf("remove discovery record: %v", err)
-	}
+	testassert.NoError(t, os.Remove(filepath.Join(dataDir, "runtime.json")))
 	r.pumps.Wait()
-	if r.currentConnection() != nil {
-		t.Fatal("a failed repair left a connection installed")
-	}
-	if !r.initialized {
-		t.Fatal("the established-once flag was lost with the connection")
-	}
-	if _, rpcErr := r.requireConnection(); rpcErr == nil {
-		t.Fatal("a lost connection was reported available")
+	testassert.Require(t, r.currentConnection() == nil, "a failed repair left a connection installed")
+	testassert.Require(t, r.initialized, "the established-once flag was lost with the connection")
+	{
+		_, rpcErr := r.requireConnection()
+		testassert.Require(t, rpcErr != nil, "a lost connection was reported available")
 	}
 	for _, frame := range drainEventFrames(r) {
-		if strings.Contains(frame, `"runtime/connected"`) ||
-			strings.Contains(frame, `"runtime/resync_required"`) ||
-			strings.Contains(frame, `"session/snapshot"`) {
-			t.Fatalf("a failed repair published %s", frame)
-		}
+		testassert.Require(t, !strings.Contains(frame, `"runtime/connected"`) && !strings.Contains(frame, `"runtime/resync_required"`) && !strings.Contains(frame, `"session/snapshot"`), "a failed repair published %s", frame)
 	}
-	if got := f.countPath("/v1/events"); got != 2 {
-		t.Fatalf("event stream attempts = %d, want one loss and one failed reconnect", got)
-	}
+	testassert.Equal(t, f.countPath("/v1/events"), 2)
 
 	f.setEventsFailure("")
 	f.writeRecord(t, dataDir)
-	if _, rpcErr := r.initialize(ctx, nil); rpcErr != nil {
-		t.Fatalf("explicit initialize after recovery: %+v", rpcErr)
+	{
+		_, rpcErr := r.initialize(ctx, nil)
+		testassert.Require(t, rpcErr == nil, "explicit initialize after recovery: %+v", rpcErr)
 	}
-	if r.currentConnection() == nil {
-		t.Fatal("explicit initialize left no connection")
-	}
-	if got := f.countPath("/v1/events"); got != 3 {
-		t.Fatalf("event streams = %d, want the recovery stream", got)
-	}
+	testassert.Require(t, r.currentConnection() != nil, "explicit initialize left no connection")
+	testassert.Equal(t, f.countPath("/v1/events"), 3)
 	frames := drainEventFrames(r)
-	if !containsFrame(frames, `"runtime/connected"`) {
-		t.Fatalf("the recovered connection was not announced: %v", frames)
-	}
-	if !containsFrame(frames, `"runtime/resync_required"`) {
-		t.Fatalf("the recovery did not record the repair: %v", frames)
-	}
-	if !containsFrame(frames, `"workspace":"/ws/s1"`) {
-		t.Fatalf("the recovery re-snapshotted no retained selection: %v", frames)
-	}
-	if got := f.countPath("/v1/sessions/s1/hydration"); got != 1 {
-		t.Fatalf("snapshot hydration reads = %d, want one", got)
-	}
+	testassert.Require(t, containsFrame(frames, `"runtime/connected"`) && containsFrame(frames, `"runtime/resync_required"`) && containsFrame(frames, `"workspace":"/ws/s1"`), "the recovered connection was not announced: %v; the recovery did not record the repair: %v; the recovery re-snapshotted no retained selection: %v", frames, frames, frames)
+	testassert.Equal(t, f.countPath("/v1/sessions/s1/hydration"), 1)
 }
 
 // TestResponseAdmissionWaitsCancellably proves the actual response admission
@@ -878,9 +803,7 @@ func TestResponseAdmissionWaitsCancellably(t *testing.T) {
 	for i := 0; i < responseQueueSize; i++ {
 		r.send(response{JSONRPC: jsonRPCVersion, ID: json.RawMessage(fmt.Sprintf("%d", i)), Result: json.RawMessage("null")})
 	}
-	if got := len(r.responses); got != responseQueueSize {
-		t.Fatalf("queue length = %d, want the full %d", got, responseQueueSize)
-	}
+	testassert.Equal(t, len(r.responses), responseQueueSize)
 	started := make(chan struct{})
 	admitted := make(chan struct{})
 	go func() {
@@ -895,9 +818,7 @@ func TestResponseAdmissionWaitsCancellably(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("a full response queue admission did not return on caller cancellation")
 	}
-	if got := len(r.responses); got != responseQueueSize {
-		t.Fatalf("queue length = %d, want the queue unchanged after a cancelled admission", got)
-	}
+	testassert.Equal(t, len(r.responses), responseQueueSize)
 }
 
 // drainEventFrames empties the queued notification frames.

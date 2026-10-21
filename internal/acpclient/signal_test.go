@@ -16,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/acpclient"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestACPSignalHelper is the subprocess entry: one bridge parked on open
@@ -53,17 +54,11 @@ func TestACPSignalCancelsRun(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestACPSignalHelper", "-test.v")
 	cmd.Env = append(os.Environ(), "ACP_SIGNAL_HELPER=1", "ACP_SIGNAL_DATADIR="+dataDir)
 	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer stdin.Close()
 	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, cmd.Start())
 	joined := false
 	defer func() {
 		if !joined {
@@ -87,17 +82,13 @@ func TestACPSignalCancelsRun(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the helper never reported readiness")
 	}
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("signal helper: %v", err)
-	}
+	testassert.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	select {
 	case err := <-waited:
 		joined = true
-		if err != nil {
-			t.Fatalf("helper exit: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("the helper did not join within the bounded wait")
 	}

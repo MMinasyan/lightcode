@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestCaptureBelowCapExactOutputNoSpill(t *testing.T) {
@@ -17,9 +19,7 @@ func TestCaptureBelowCapExactOutputNoSpill(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte("hello\n"))
 	_, _ = c.Stderr().Write([]byte("warn\n"))
 
-	if got := c.Format(); got != "hello\nwarn\n" {
-		t.Fatalf("Format() = %q, want combined output", got)
-	}
+	testassert.Equal(t, c.Format(), "hello\nwarn\n")
 	assertNoFiles(t, filepath.Join(home, ".lightcode"))
 }
 
@@ -31,20 +31,11 @@ func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte(full))
 
 	result := c.Format()
-	if !strings.Contains(result, "line 01") || !strings.Contains(result, "line 25") {
-		t.Fatalf("Format() = %q, want first and last lines", result)
-	}
-	if strings.Contains(result, "line 11") {
-		t.Fatalf("Format() = %q, want middle lines omitted", result)
-	}
+	testassert.Require(t, strings.Contains(result, "line 01") && strings.Contains(result, "line 25") && !strings.Contains(result, "line 11"), "Format() = %q, want first and last lines; Format() = %q, want middle lines omitted", result, result)
 	spillPath := extractSpillPath(t, result)
-	if !strings.HasPrefix(spillPath, filepath.Join(home, ".lightcode", "cmd_output_")) {
-		t.Fatalf("spill path = %q, want cmd_output_ under home", spillPath)
-	}
+	testassert.Require(t, strings.HasPrefix(spillPath, filepath.Join(home, ".lightcode", "cmd_output_")), "spill path = %q, want cmd_output_ under home", spillPath)
 	data, err := os.ReadFile(spillPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q): %v", spillPath, err)
-	}
+	testassert.Require(t, err == nil, "ReadFile(%q): %v", spillPath, err)
 	if string(data) != full {
 		t.Fatalf("spill content = %q, want full output", string(data))
 	}
@@ -58,13 +49,9 @@ func TestCaptureFewLongLinesAboveCapTruncatesAndSpills(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte(full))
 
 	result := c.Format()
-	if !strings.Contains(result, "abcde... [truncated 7 chars]") {
-		t.Fatalf("Format() = %q, want per-line truncation", result)
-	}
+	testassert.Require(t, strings.Contains(result, "abcde... [truncated 7 chars]"), "Format() = %q, want per-line truncation", result)
 	data, err := os.ReadFile(extractSpillPath(t, result))
-	if err != nil {
-		t.Fatalf("read spill: %v", err)
-	}
+	testassert.NoError(t, err)
 	if string(data) != full {
 		t.Fatalf("spill = %q, want %q", string(data), full)
 	}
@@ -80,15 +67,11 @@ func TestCaptureSharedBudgetAcrossStdoutAndStderr(t *testing.T) {
 	c.mu.Lock()
 	retained := c.stdout.buf.Len() + c.stderr.buf.Len()
 	c.mu.Unlock()
-	if retained != 6 {
-		t.Fatalf("retained bytes = %d, want shared cap 6", retained)
-	}
+	testassert.Equal(t, retained, 6)
 	result := c.Format()
 	spillPath := extractSpillPath(t, result)
 	data, err := os.ReadFile(spillPath)
-	if err != nil {
-		t.Fatalf("read spill: %v", err)
-	}
+	testassert.NoError(t, err)
 	if string(data) != "abcdefgh" {
 		t.Fatalf("spill = %q, want stdout then stderr", string(data))
 	}
@@ -101,13 +84,9 @@ func TestCaptureCrossingWriteUsesSingleBudget(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte("abcdef"))
 	_, _ = c.Stderr().Write([]byte("ghij"))
 
-	if got := c.Len(); got != 10 {
-		t.Fatalf("Len() = %d, want total accepted bytes", got)
-	}
+	testassert.Equal(t, c.Len(), 10)
 	data, err := os.ReadFile(extractSpillPath(t, c.Format()))
-	if err != nil {
-		t.Fatalf("read spill: %v", err)
-	}
+	testassert.NoError(t, err)
 	if string(data) != "abcdefghij" {
 		t.Fatalf("spill = %q, want full output", string(data))
 	}
@@ -120,9 +99,7 @@ func TestCaptureDisabledCapReturnsFullOutputNoSpill(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte("abcdefg\n"))
 	_, _ = c.Stderr().Write([]byte("1234567\n"))
 
-	if got := c.Format(); got != "abcdefg\n1234567\n" {
-		t.Fatalf("Format() = %q, want full output with disabled cap", got)
-	}
+	testassert.Equal(t, c.Format(), "abcdefg\n1234567\n")
 	assertNoFiles(t, filepath.Join(home, ".lightcode"))
 }
 
@@ -134,12 +111,8 @@ func TestCaptureRepeatedFormatReusesSpillPath(t *testing.T) {
 
 	first := c.Format()
 	second := c.Format()
-	if first != second {
-		t.Fatalf("second Format() changed result\nfirst=%q\nsecond=%q", first, second)
-	}
-	if extractSpillPath(t, first) != extractSpillPath(t, second) {
-		t.Fatalf("Format() did not reuse spill path")
-	}
+	testassert.Equal(t, first, second)
+	testassert.Require(t, extractSpillPath(t, first) == extractSpillPath(t, second), "Format() did not reuse spill path")
 }
 
 func TestCaptureFinalSpillFailureReturnsExplicitMarker(t *testing.T) {
@@ -147,36 +120,22 @@ func TestCaptureFinalSpillFailureReturnsExplicitMarker(t *testing.T) {
 	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghi"))
-	if err := os.Chmod(filepath.Join(home, ".lightcode"), 0o500); err != nil {
-		t.Fatalf("chmod spill dir: %v", err)
-	}
+	testassert.NoError(t, os.Chmod(filepath.Join(home, ".lightcode"), 0o500))
 	defer func() { _ = os.Chmod(filepath.Join(home, ".lightcode"), 0o700) }()
 
 	result := c.Format()
-	if !strings.Contains(result, "could not be saved:") {
-		t.Fatalf("Format() = %q, want could-not-save marker", result)
-	}
-	if strings.Contains(result, "saved to:") {
-		t.Fatalf("Format() = %q, should not claim saved path", result)
-	}
+	testassert.Require(t, strings.Contains(result, "could not be saved:") && !strings.Contains(result, "saved to:"), "Format() = %q, want could-not-save marker; Format() = %q, should not claim saved path", result, result)
 }
 
 func TestCapturePrivateSpillFailureStaysBounded(t *testing.T) {
 	homeFile := filepath.Join(t.TempDir(), "home-file")
-	if err := os.WriteFile(homeFile, []byte("not a dir"), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(homeFile, []byte("not a dir"), 0o600))
 	c := NewCapture(Options{Directory: filepath.Join(homeFile, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 4})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghijklmnopqrstuvwxyz"))
 
 	result := c.Format()
-	if !strings.Contains(result, "could not be saved:") {
-		t.Fatalf("Format() = %q, want could-not-save marker", result)
-	}
-	if strings.Contains(result, "mnopqrstuvwxyz") {
-		t.Fatalf("Format() = %q, retained discarded tail after private spill failure", result)
-	}
+	testassert.Require(t, strings.Contains(result, "could not be saved:") && !strings.Contains(result, "mnopqrstuvwxyz"), "Format() = %q, want could-not-save marker; Format() = %q, retained discarded tail after private spill failure", result, result)
 }
 
 func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
@@ -186,12 +145,7 @@ func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
 	_, _ = c.Stdout().Write([]byte(strings.Repeat("x", 10000)))
 
 	result := c.Format()
-	if !strings.Contains(result, "xxxxx... [truncated 10000 chars]") {
-		t.Fatalf("Format() = %q, want long-line truncation", result)
-	}
-	if len(result) > 300 {
-		t.Fatalf("Format() length = %d, want bounded preview", len(result))
-	}
+	testassert.Require(t, strings.Contains(result, "xxxxx... [truncated 10000 chars]") && len(result) <= 300, "Format() = %q, want long-line truncation; Format() length = %d, want bounded preview", result, len(result))
 }
 
 func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
@@ -212,9 +166,7 @@ func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if c.Len() == 0 {
-		t.Fatal("Len() = 0, want captured concurrent output")
-	}
+	testassert.Require(t, c.Len() != 0, "Len() = 0, want captured concurrent output")
 }
 
 func TestCaptureConcurrentFormatAndClose(t *testing.T) {
@@ -252,8 +204,9 @@ func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T)
 		path := c.visiblePath
 		c.mu.Unlock()
 		c.Close()
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("visible spill after Close = %v, want removed", err)
+		{
+			_, err := os.Stat(path)
+			testassert.Require(t, os.IsNotExist(err), "visible spill after Close = %v, want removed", err)
 		}
 	})
 
@@ -263,8 +216,9 @@ func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T)
 		_, _ = c.Stdout().Write([]byte("abcdefghi"))
 		path := extractSpillPath(t, c.Format())
 		c.Close()
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("visible spill after Close = %v, want kept", err)
+		{
+			_, err := os.Stat(path)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -281,9 +235,7 @@ func extractSpillPath(t *testing.T, result string) string {
 	t.Helper()
 	marker := "saved to: "
 	idx := strings.LastIndex(result, marker)
-	if idx < 0 {
-		t.Fatalf("result = %q, missing spill marker", result)
-	}
+	testassert.Require(t, idx >= 0, "result = %q, missing spill marker", result)
 	path := result[idx+len(marker):]
 	if end := strings.IndexAny(path, "]\n"); end >= 0 {
 		path = path[:end]
@@ -297,10 +249,6 @@ func assertNoFiles(t *testing.T, dir string) {
 	if os.IsNotExist(err) {
 		return
 	}
-	if err != nil {
-		t.Fatalf("ReadDir(%q): %v", dir, err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("dir %q has files %v, want empty", dir, entries)
-	}
+	testassert.Require(t, err == nil, "ReadDir(%q): %v", dir, err)
+	testassert.Require(t, len(entries) == 0, "dir %q has files %v, want empty", dir, entries)
 }

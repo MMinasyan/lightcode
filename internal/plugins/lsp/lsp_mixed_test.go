@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -33,26 +34,17 @@ func TestMixedDetectionReturnsAvailableServerContent(t *testing.T) {
 	_, symbol := pluginUnderTest(t, dataDir)
 
 	workspace := markerWorkspace(t)
-	if err := os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte("[project]\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte("[project]\n"), 0o600))
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("mixed detection query = %+v, want the available server's success", outcome.Result)
-	}
-	if !strings.Contains(outcome.Result.Content, "Foo") {
-		t.Fatalf("mixed detection content = %q, want the available server's symbol", outcome.Result.Content)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "Foo"), "mixed detection query = %+v, want the available server's success; mixed detection content = %q, want the available server's symbol", outcome.Result, outcome.Result.Content)
 	waitForLog(t, requests, "workspace/symbol", 1)
 	// The unavailable server went through its crash loop: the pyright binary
 	// launched maxRestarts+1 times (the template writes "started" exactly
 	// once per launch) and ended failed; no symbol query ever reached it.
 	waitForLog(t, pyrightLog, "started", maxRestartLaunches)
-	if n := logCount(t, pyrightLog, "workspace/symbol"); n != 0 {
-		t.Fatalf("the unavailable server received %d symbol queries, want 0 (omitted)", n)
-	}
+	testassert.Equal(t, logCount(t, pyrightLog, "workspace/symbol"), 0)
 }
 
 // maxRestartLaunches is the launch count that exhausts the crash budget: the
@@ -69,43 +61,29 @@ func TestRestartedPluginInstanceReincludesSessionFiles(t *testing.T) {
 	dataDir := t.TempDir()
 	workspace := markerWorkspace(t)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
-	if err := os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600))
 	uriA := fileURI(workspace, "a.go")
 
 	// The first instance's query.
 	plugin := Plugin()
 	first, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	firstDiag := first.Values["diagnostics"].(runtime.Tool)
 	prepared := firstDiag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c1", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("first instance query = %+v, want success", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "first instance query = %+v, want success", outcome.Result)
 	waitForQuery(t, requests, uriA, 1)
-	if err := first.Close(); err != nil {
-		t.Fatalf("first Close: %v", err)
-	}
+	testassert.NoError(t, first.Close())
 
 	// The restarted instance: fresh detection over the same data root and
 	// home, and the same Session's changed files are included again.
 	second, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("second Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { _ = second.Close() })
 	secondDiag := second.Values["diagnostics"].(runtime.Tool)
 	prepared = secondDiag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c2", "diagnostics", `{}`))
 	outcome = prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("restarted query = %+v, want success", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "restarted query = %+v, want success", outcome.Result)
 	waitForQuery(t, requests, uriA, 2)
-	if n := spy.count(); n != 2 {
-		t.Fatalf("workspace managers constructed = %d, want one per instance", n)
-	}
+	testassert.Equal(t, spy.count(), 2)
 }

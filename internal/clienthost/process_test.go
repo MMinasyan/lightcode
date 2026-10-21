@@ -34,6 +34,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -352,9 +353,7 @@ func newSandbox(t *testing.T) *sandbox {
 	dataDir := t.TempDir()
 	dir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
-	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
-		t.Fatalf("prepare isolated config: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(configPath, []byte("{}"), 0o600))
 	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	s := &sandbox{
@@ -383,8 +382,9 @@ type launched struct {
 func (s *sandbox) launched(name string) *launched {
 	s.t.Helper()
 	dir := filepath.Join(s.dir, name)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		s.t.Fatalf("prepare launched attempt directory: %v", err)
+	{
+		err := os.MkdirAll(dir, 0o700)
+		testassert.Require(s.t, err == nil, "prepare launched attempt directory: %v", err)
 	}
 	return &launched{
 		sandbox: s, dir: dir,
@@ -438,8 +438,9 @@ type directChild struct {
 func (s *sandbox) startDirect(t *testing.T, role string) *directChild {
 	t.Helper()
 	dir := filepath.Join(s.dir, role)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("prepare %s helper directory: %v", role, err)
+	{
+		err := os.MkdirAll(dir, 0o700)
+		testassert.Require(t, err == nil, "prepare %s helper directory: %v", role, err)
 	}
 	c := &directChild{
 		t: t, role: role,
@@ -465,8 +466,9 @@ func (s *sandbox) startDirect(t *testing.T, role string) *directChild {
 	log := &lockedBuffer{}
 	cmd.Stdout = log
 	cmd.Stderr = log
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start %s helper: %v", role, err)
+	{
+		err := cmd.Start()
+		testassert.Require(t, err == nil, "start %s helper: %v", role, err)
 	}
 	c.cmd = cmd
 	c.log = log
@@ -482,9 +484,7 @@ func (s *sandbox) startDirect(t *testing.T, role string) *directChild {
 // stopAndJoin performs the managed stop-marker shutdown and joins the exit.
 func (c *directChild) stopAndJoin(t *testing.T) {
 	t.Helper()
-	if err := os.WriteFile(c.stop, []byte("stop"), 0o600); err != nil {
-		t.Fatalf("write stop marker: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(c.stop, []byte("stop"), 0o600))
 	select {
 	case <-c.done:
 	case <-time.After(15 * time.Second):
@@ -533,9 +533,7 @@ func (s *sandbox) reapLaunched() {
 		for aliveProcess(process) && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
 		}
-		if aliveProcess(process) {
-			s.t.Errorf("launched child %d survived cleanup", pid)
-		}
+		testassert.Check(s.t, !aliveProcess(process), "launched child %d survived cleanup", pid)
 	}
 }
 
@@ -602,9 +600,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 	for _, results := range []<-chan outcome{firstResults, secondResults} {
 		select {
 		case result := <-results:
-			if result.err != nil {
-				t.Fatalf("concurrent Connect: %v", result.err)
-			}
+			testassert.Require(t, result.err == nil, "concurrent Connect: %v", result.err)
 			clients = append(clients, result.client)
 		case <-time.After(70 * time.Second):
 			t.Fatal("concurrent Connect did not return")
@@ -619,9 +615,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 		t.Fatalf("client instance %q, record %q", clients[0].InstanceID(), record.InstanceID)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
-		t.Fatalf("authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
-	}
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N2, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
 
 	winners := 0
 	for _, l := range []*launched{first, second} {
@@ -636,16 +630,13 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 			winners++
 		}
 	}
-	if winners != 1 {
-		t.Fatalf("factory-opening contender attempts = %d, want exactly one", winners)
-	}
+	testassert.Equal(t, winners, 1)
 
-	if err := os.WriteFile(s.stop, []byte("stop"), 0o600); err != nil {
-		t.Fatalf("write stop marker: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(s.stop, []byte("stop"), 0o600))
 	awaitMarker(t, s.closed)
-	if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
-		t.Fatalf("the record survived managed shutdown: %v", err)
+	{
+		_, err := os.Stat(recordPath)
+		testassert.Require(t, os.IsNotExist(err), "the record survived managed shutdown: %v", err)
 	}
 }
 
@@ -658,36 +649,28 @@ func TestClientHostIncompatibleIncumbent(t *testing.T) {
 	incumbent := s.startDirect(t, roleIncompatible)
 	shapedEndpoint := strings.TrimSpace(awaitMarker(t, incumbent.ready, incumbent))
 	originalEndpoint := strings.TrimSpace(awaitMarker(t, incumbent.endpoint, incumbent))
-	if shapedEndpoint == originalEndpoint {
-		t.Fatal("the shaped health server did not replace the record endpoint")
-	}
+	testassert.Require(t, shapedEndpoint != originalEndpoint, "the shaped health server did not replace the record endpoint")
 	recordPath := filepath.Join(s.dataDir, "runtime.json")
 	record := readRecord(t, recordPath)
-	if record.Endpoint != shapedEndpoint {
-		t.Fatalf("record endpoint = %q, want the shaped %q", record.Endpoint, shapedEndpoint)
-	}
+	testassert.Equal(t, record.Endpoint, shapedEndpoint)
 	before := readFile(t, recordPath)
 
 	contender := s.launched("contender")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, err := clienthost.Connect(ctx, contender.options(filepath.Join(s.dir, "no-such-executable"), roleOwner, false))
-	if !errors.Is(err, client.ErrIncompatibleProtocol) {
-		t.Fatalf("Connect over an incompatible incumbent = %v, want ErrIncompatibleProtocol", err)
+	testassert.Require(t, errors.Is(err, client.ErrIncompatibleProtocol), "Connect over an incompatible incumbent = %v, want ErrIncompatibleProtocol", err)
+	testassert.NoError(t, ctx.Err())
+	{
+		attempts := readAttemptFiles(t, contender.dir)
+		testassert.Equal(t, len(attempts), 0)
 	}
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("Connect did not return immediately: %v", err)
-	}
-	if attempts := readAttemptFiles(t, contender.dir); len(attempts) != 0 {
-		t.Fatalf("an incompatible incumbent started %d contender attempts", len(attempts))
-	}
-	if after := readFile(t, recordPath); !bytes.Equal(after, before) {
-		t.Fatal("the incompatible record changed across the probe")
+	{
+		after := readFile(t, recordPath)
+		testassert.Require(t, bytes.Equal(after, before), "the incompatible record changed across the probe")
 	}
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
-		t.Fatalf("the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
-	}
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N2, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	incumbent.stopAndJoin(t)
 }
 
@@ -707,9 +690,7 @@ func TestClientHostReadinessExitAndWinner(t *testing.T) {
 
 	// The contender loses the held lock and exits before any owner publishes.
 	awaitLost(t, contender)
-	if err := os.WriteFile(incumbent.gate, []byte("publish"), 0o600); err != nil {
-		t.Fatalf("open the incumbent's publish gate: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(incumbent.gate, []byte("publish"), 0o600))
 	awaitMarker(t, incumbent.ready, incumbent)
 
 	var res outcome
@@ -718,16 +699,15 @@ func TestClientHostReadinessExitAndWinner(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		t.Fatal("Connect did not return after the contender's pre-ready exit")
 	}
-	if res.err != nil {
-		t.Fatalf("Connect after the contender's pre-ready exit = %v, want the winner", res.err)
-	}
+	testassert.Require(t, res.err == nil, "Connect after the contender's pre-ready exit = %v, want the winner", res.err)
 	record := readRecord(t, filepath.Join(s.dataDir, "runtime.json"))
 	if res.client.InstanceID() != record.InstanceID {
 		t.Fatalf("Connect returned instance %q, winner %q", res.client.InstanceID(), record.InstanceID)
 	}
 	for _, path := range readAttemptFiles(t, contender.dir) {
-		if plugins := readFactoryMarker(t, contender.dir, attemptPID(t, path)); plugins != nil {
-			t.Fatalf("the losing contender opened factories %q", plugins)
+		{
+			plugins := readFactoryMarker(t, contender.dir, attemptPID(t, path))
+			testassert.Require(t, plugins == nil, "the losing contender opened factories %q", plugins)
 		}
 	}
 	incumbent.stopAndJoin(t)
@@ -752,36 +732,23 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("canceled Connect did not return")
 	}
-	if !errors.Is(res.err, context.Canceled) {
-		t.Fatalf("canceled Connect = %v, want context.Canceled", res.err)
-	}
-	if res.client != nil {
-		t.Fatal("canceled Connect returned a client")
-	}
+	testassert.Require(t, errors.Is(res.err, context.Canceled), "canceled Connect = %v, want context.Canceled", res.err)
+	testassert.Require(t, res.client == nil, "canceled Connect returned a client")
 
-	if err := os.WriteFile(contender.gate, []byte("go"), 0o600); err != nil {
-		t.Fatalf("release the surviving contender: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(contender.gate, []byte("go"), 0o600))
 	endpoint := strings.TrimSpace(awaitMarker(t, contender.ready))
 	record := readRecord(t, filepath.Join(s.dataDir, "runtime.json"))
-	if record.Endpoint != endpoint {
-		t.Fatalf("record endpoint = %q, want the surviving owner %q", record.Endpoint, endpoint)
-	}
+	testassert.Equal(t, record.Endpoint, endpoint)
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
-		t.Fatalf("the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
-	}
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N2, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	pid := attemptPID(t, attempts[0])
-	if !aliveProcessByPID(pid) {
-		t.Fatalf("the canceled Connect killed owner process %d", pid)
-	}
-	if plugins := readFactoryMarker(t, contender.dir, pid); plugins == nil {
-		t.Fatal("the surviving owner opened no factories")
+	testassert.Require(t, aliveProcessByPID(pid), "the canceled Connect killed owner process %d", pid)
+	{
+		plugins := readFactoryMarker(t, contender.dir, pid)
+		testassert.Require(t, plugins != nil, "the surviving owner opened no factories")
 	}
 
-	if err := os.WriteFile(s.stop, []byte("stop"), 0o600); err != nil {
-		t.Fatalf("write stop marker: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(s.stop, []byte("stop"), 0o600))
 	awaitMarker(t, s.closed)
 	awaitReaped(t, pid)
 }
@@ -803,24 +770,20 @@ func TestClientHostHealthTimeoutPreservesHolder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	_, err := clienthost.Connect(ctx, contender.options(os.Args[0], roleOwner, false))
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Connect against a parked health holder = %v, want the caller deadline", err)
-	}
+	testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "Connect against a parked health holder = %v, want the caller deadline", err)
 
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	if health.InstanceId != record.InstanceID || health.ProtocolVersion != protocol.N2 {
-		t.Fatalf("the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
-	}
-	if after := readFile(t, recordPath); !bytes.Equal(after, before) {
-		t.Fatal("the parked record changed across the failed probes")
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N2, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	{
+		after := readFile(t, recordPath)
+		testassert.Require(t, bytes.Equal(after, before), "the parked record changed across the failed probes")
 	}
 	contenders := readAttemptFiles(t, contender.dir)
-	if len(contenders) == 0 {
-		t.Fatal("the parked holder was never probed by a started contender")
-	}
+	testassert.Require(t, len(contenders) != 0, "the parked holder was never probed by a started contender")
 	for _, path := range contenders {
-		if plugins := readFactoryMarker(t, contender.dir, attemptPID(t, path)); plugins != nil {
-			t.Fatalf("a parked-health contender opened factories %q", plugins)
+		{
+			plugins := readFactoryMarker(t, contender.dir, attemptPID(t, path))
+			testassert.Require(t, plugins == nil, "a parked-health contender opened factories %q", plugins)
 		}
 	}
 	incumbent.stopAndJoin(t)
@@ -844,22 +807,23 @@ func TestClientHostPreReadyFailureRestartsDiscovery(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Connect did not return after cancellation")
 	}
-	if !errors.Is(res.err, context.Canceled) {
-		t.Fatalf("canceled Connect = %v, want context.Canceled", res.err)
-	}
+	testassert.Require(t, errors.Is(res.err, context.Canceled), "canceled Connect = %v, want context.Canceled", res.err)
 	for _, path := range attempts {
 		if tail := attemptTail(t, path); !slices.Equal(tail, s.wantTail()) {
 			t.Fatalf("failed contender argument tail = %q, want %q", tail, s.wantTail())
 		}
-		if plugins := readFactoryMarker(t, failures.dir, attemptPID(t, path)); plugins != nil {
-			t.Fatalf("a failing contender opened factories %q", plugins)
+		{
+			plugins := readFactoryMarker(t, failures.dir, attemptPID(t, path))
+			testassert.Require(t, plugins == nil, "a failing contender opened factories %q", plugins)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(s.dataDir, "runtime.json")); !os.IsNotExist(err) {
-		t.Fatalf("a failing contender published discovery: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(s.dataDir, "runtime.json"))
+		testassert.Require(t, os.IsNotExist(err), "a failing contender published discovery: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(s.dataDir, "lightcode.db")); !os.IsNotExist(err) {
-		t.Fatalf("a failing contender opened storage: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(s.dataDir, "lightcode.db"))
+		testassert.Require(t, os.IsNotExist(err), "a failing contender opened storage: %v", err)
 	}
 }
 
@@ -874,17 +838,11 @@ func TestClientHostLaunchError(t *testing.T) {
 		ConfigPath: s.configPath,
 		Executable: missing,
 	})
-	if err == nil {
-		t.Fatal("Connect with a missing runtime executable reported success")
-	}
-	if errors.Is(err, client.ErrNoRuntime) || errors.Is(err, client.ErrIncompatibleProtocol) {
-		t.Fatalf("launch failure classified as a probe outcome: %v", err)
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("launch error = %v, want the missing executable reported", err)
-	}
-	if _, err := os.Stat(filepath.Join(s.dataDir, "runtime.json")); !os.IsNotExist(err) {
-		t.Fatalf("launch failure left discovery state: %v", err)
+	testassert.Require(t, err != nil, "Connect with a missing runtime executable reported success")
+	testassert.Require(t, !errors.Is(err, client.ErrNoRuntime) && !errors.Is(err, client.ErrIncompatibleProtocol) && errors.Is(err, os.ErrNotExist), "launch failure classified as a probe outcome: %v; launch error = %v, want the missing executable reported", err, err)
+	{
+		_, err := os.Stat(filepath.Join(s.dataDir, "runtime.json"))
+		testassert.Require(t, os.IsNotExist(err), "launch failure left discovery state: %v", err)
 	}
 }
 
@@ -903,9 +861,7 @@ type recordView struct {
 func readRecord(t *testing.T, path string) recordView {
 	t.Helper()
 	var record recordView
-	if err := json.Unmarshal(readFile(t, path), &record); err != nil {
-		t.Fatalf("decode discovery record: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(readFile(t, path), &record))
 	return record
 }
 
@@ -913,9 +869,7 @@ func readRecord(t *testing.T, path string) recordView {
 func readFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "read %s: %v", path, err)
 	return data
 }
 
@@ -923,25 +877,18 @@ func readFile(t *testing.T, path string) []byte {
 func authenticatedHealth(t *testing.T, endpoint, credential string) protocol.Health {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, endpoint+"/v1/health", nil)
-	if err != nil {
-		t.Fatalf("build health request: %v", err)
-	}
+	testassert.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+credential)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		t.Fatalf("authenticated health: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read health body: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("authenticated health = %d body=%q", resp.StatusCode, body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.StatusCode == http.StatusOK, "authenticated health = %d body=%q", resp.StatusCode, body)
 	var health protocol.Health
-	if err := json.Unmarshal(body, &health); err != nil {
-		t.Fatalf("decode health body %q: %v", body, err)
+	{
+		err := json.Unmarshal(body, &health)
+		testassert.Require(t, err == nil, "decode health body %q: %v", body, err)
 	}
 	return health
 }
@@ -955,9 +902,7 @@ func awaitMarker(t *testing.T, path string, children ...*directChild) string {
 		if err == nil {
 			return string(data)
 		}
-		if !os.IsNotExist(err) {
-			t.Fatalf("read marker %s: %v", path, err)
-		}
+		testassert.Require(t, os.IsNotExist(err), "read marker %s: %v", path, err)
 		time.Sleep(10 * time.Millisecond)
 	}
 	for _, child := range children {
@@ -1020,8 +965,9 @@ func readAttemptFiles(t *testing.T, dir string) []string {
 func attemptTail(t *testing.T, path string) []string {
 	t.Helper()
 	var tail []string
-	if err := json.Unmarshal(readFile(t, path), &tail); err != nil {
-		t.Fatalf("decode attempt marker %s: %v", path, err)
+	{
+		err := json.Unmarshal(readFile(t, path), &tail)
+		testassert.Require(t, err == nil, "decode attempt marker %s: %v", path, err)
 	}
 	return tail
 }
@@ -1030,9 +976,7 @@ func attemptTail(t *testing.T, path string) []string {
 func attemptPID(t *testing.T, path string) int {
 	t.Helper()
 	pid, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(path), "attempt-"))
-	if err != nil {
-		t.Fatalf("attempt marker %s carries no PID: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "attempt marker %s carries no PID: %v", path, err)
 	return pid
 }
 
@@ -1045,9 +989,7 @@ func readFactoryMarker(t *testing.T, dir string, pid int) []string {
 	if os.IsNotExist(err) {
 		return nil
 	}
-	if err != nil {
-		t.Fatalf("read factory marker %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "read factory marker %s: %v", path, err)
 	var plugins []string
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		if line != "" {
@@ -1079,9 +1021,7 @@ func awaitReaped(t *testing.T, pid int) {
 	for aliveProcessByPID(pid) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if aliveProcessByPID(pid) {
-		t.Fatalf("helper %d was never reaped", pid)
-	}
+	testassert.Require(t, !aliveProcessByPID(pid), "helper %d was never reaped", pid)
 }
 
 // lockedBuffer collects one helper child's diagnostics safely.
@@ -1109,9 +1049,7 @@ func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	catalogDir := filepath.Join("..", "..", "internal", "catalog", "builtin")
 	entries, err := os.ReadDir(catalogDir)
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue

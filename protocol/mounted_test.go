@@ -12,6 +12,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -32,11 +33,13 @@ const mountedDiscoveryEnv = "LIGHTCODE_PROTOCOL_DISCOVERY"
 
 func writeMountedFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create directory for %s: %v", path, err)
+	{
+		err := os.MkdirAll(filepath.Dir(path), 0o700)
+		testassert.Require(t, err == nil, "create directory for %s: %v", path, err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
 }
 
@@ -46,9 +49,7 @@ func writeMountedFile(t *testing.T, path, content string) {
 func isolateMountedBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -96,9 +97,7 @@ func mountedReporterPlugin() runtime.Plugin {
 // transport tests.
 func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	frontendDir, err := filepath.Abs(filepath.Join("..", "frontend"))
-	if err != nil {
-		t.Fatalf("resolve frontend directory: %v", err)
-	}
+	testassert.NoError(t, err)
 	vitest := filepath.Join(frontendDir, "node_modules", ".bin", "vitest")
 	if _, err := os.Stat(vitest); err != nil {
 		t.Skipf("frontend toolchain is not installed: %v", err)
@@ -119,35 +118,27 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 		ConfigPath: configPath,
 		Plugins:    append(builtin.Plugins(), mountedReporterPlugin()),
 	})
-	if err != nil {
-		t.Fatalf("runtime.Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer func() {
-		if err := owner.Close(context.Background()); err != nil {
-			t.Errorf("runtime.Close: %v", err)
+		{
+			err := owner.Close(context.Background())
+			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	}()
 
 	server, err := owner.OpenProtocol(context.Background())
-	if err != nil {
-		t.Fatalf("OpenProtocol: %v", err)
-	}
+	testassert.NoError(t, err)
 	record := filepath.Join(t.TempDir(), "discovery.json")
-	if err := server.PublishDiscovery(record); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, server.PublishDiscovery(record))
 	recordBytes, err := os.ReadFile(record)
-	if err != nil {
-		t.Fatalf("read discovery record: %v", err)
-	}
+	testassert.NoError(t, err)
 	var discovery struct {
 		Credential string `json:"credential"`
 	}
-	if err := json.Unmarshal(recordBytes, &discovery); err != nil {
-		t.Fatalf("decode discovery record: %v", err)
-	}
-	if info, err := os.Stat(record); err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("discovery record mode = %v (%v), want 0600", info, err)
+	testassert.NoError(t, json.Unmarshal(recordBytes, &discovery))
+	{
+		info, err := os.Stat(record)
+		testassert.Require(t, err == nil && info.Mode().Perm() == 0o600, "discovery record mode = %v (%v), want 0600", info, err)
 	}
 
 	// The generated TypeScript client: one Node process reads the discovery
@@ -166,13 +157,7 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	// The credential guard runs before any diagnostic prints the output, so a
 	// failing process that echoes the credential is reported as a leak and
 	// never echoed itself.
-	if strings.Contains(string(output), discovery.Credential) {
-		t.Fatal("the mounted generated TypeScript client output contains the credential")
-	}
-	if err != nil {
-		t.Fatalf("mounted generated TypeScript client: %v\n%s", err, output)
-	}
-	if !strings.Contains(string(output), "1 passed") {
-		t.Fatalf("mounted TypeScript row did not pass:\n%s", output)
-	}
+	testassert.Require(t, !strings.Contains(string(output), discovery.Credential), "the mounted generated TypeScript client output contains the credential")
+	testassert.Require(t, err == nil, "mounted generated TypeScript client: %v\n%s", err, output)
+	testassert.Require(t, strings.Contains(string(output), "1 passed"), "mounted TypeScript row did not pass:\n%s", output)
 }

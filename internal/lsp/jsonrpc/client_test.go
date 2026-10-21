@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 type writeCloserBuffer struct {
@@ -51,9 +53,7 @@ func TestClientCallSuccessAndServerError(t *testing.T) {
 	waitForWrittenRequest(t, stdin, "workspace/symbol")
 	writeJSONRPCMessage(t, stdoutW, message{JSONRPC: "2.0", ID: intPtr(0), Result: json.RawMessage(`{"ok":true}`)})
 	got := <-resultCh
-	if got.err != nil || string(got.data) != `{"ok":true}` {
-		t.Fatalf("Call success = %s, %v", got.data, got.err)
-	}
+	testassert.Require(t, got.err == nil && string(got.data) == `{"ok":true}`, "Call success = %s, %v", got.data, got.err)
 
 	go func() {
 		data, err := client.Call(context.Background(), "bad", nil)
@@ -65,9 +65,7 @@ func TestClientCallSuccessAndServerError(t *testing.T) {
 	waitForWrittenRequest(t, stdin, `"bad"`)
 	writeJSONRPCMessage(t, stdoutW, message{JSONRPC: "2.0", ID: intPtr(1), Error: &ResponseError{Code: -32000, Message: "boom"}})
 	got = <-resultCh
-	if got.err == nil || !strings.Contains(got.err.Error(), "boom") {
-		t.Fatalf("Call server error = %s, %v; want boom error", got.data, got.err)
-	}
+	testassert.Require(t, got.err != nil && strings.Contains(got.err.Error(), "boom"), "Call server error = %s, %v; want boom error", got.data, got.err)
 }
 
 func TestClientNotifyAndOnNotify(t *testing.T) {
@@ -78,18 +76,14 @@ func TestClientNotifyAndOnNotify(t *testing.T) {
 	client.Start()
 	defer client.Close()
 
-	if err := client.Notify("initialized", map[string]any{"ok": true}); err != nil {
-		t.Fatalf("Notify: %v", err)
-	}
+	testassert.NoError(t, client.Notify("initialized", map[string]any{"ok": true}))
 	if !strings.Contains(stdin.String(), "initialized") {
 		t.Fatalf("stdin after Notify = %q", stdin.String())
 	}
 	writeJSONRPCMessage(t, stdoutW, message{JSONRPC: "2.0", Method: "window/logMessage", Params: json.RawMessage(`{"message":"hi"}`)})
 	select {
 	case got := <-notifyCh:
-		if !strings.Contains(got, "window/logMessage") || !strings.Contains(got, "hi") {
-			t.Fatalf("notification = %q", got)
-		}
+		testassert.Require(t, strings.Contains(got, "window/logMessage") && strings.Contains(got, "hi"), "notification = %q", got)
 	case <-time.After(time.Second):
 		t.Fatal("OnNotify not called")
 	}
@@ -103,15 +97,15 @@ func TestClientCallContextCanceledAndClose(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := client.Call(ctx, "slow", nil); err == nil {
-		t.Fatal("Call with canceled context error = nil, want error")
+	{
+		_, err := client.Call(ctx, "slow", nil)
+		testassert.Require(t, err != nil, "Call with canceled context error = nil, want error")
 	}
 	client.Close()
-	if !client.IsClosed() {
-		t.Fatal("IsClosed = false after Close")
-	}
-	if err := client.Notify("x", nil); err == nil {
-		t.Fatal("Notify after Close error = nil, want error")
+	testassert.Require(t, client.IsClosed(), "IsClosed = false after Close")
+	{
+		err := client.Notify("x", nil)
+		testassert.Require(t, err != nil, "Notify after Close error = nil, want error")
 	}
 }
 
@@ -130,12 +124,8 @@ func waitForWrittenRequest(t *testing.T, buf *writeCloserBuffer, contains string
 func writeJSONRPCMessage(t *testing.T, w io.Writer, msg message) {
 	t.Helper()
 	body, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteMessage(w, body); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, WriteMessage(w, body))
 }
 
 func intPtr(v int) *int { return &v }

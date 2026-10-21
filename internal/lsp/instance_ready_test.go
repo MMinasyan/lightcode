@@ -24,6 +24,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // fakeServerScript is a minimal LSP server over stdio that records every
@@ -124,13 +125,9 @@ func newFakeServerInstanceWithLifetime(t *testing.T, log, failMarker string, ini
 	t.Helper()
 	home := t.TempDir()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(cacheDir, 0o755))
 	script := filepath.Join(cacheDir, "fake-lsp")
-	if err := os.WriteFile(script, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(script, []byte(fakeServerScript), 0o755))
 	inst := newInstance(&server.Definition{
 		Name:    "fake",
 		Command: "fake-lsp",
@@ -155,18 +152,12 @@ func newPIDRecordingFakeServer(t *testing.T, initDelay string) (home, pidfile, l
 	t.Helper()
 	home = t.TempDir()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", "fake")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(cacheDir, 0o755))
 	real := filepath.Join(cacheDir, "fake-lsp.py")
-	if err := os.WriteFile(real, []byte(fakeServerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(real, []byte(fakeServerScript), 0o755))
 	wrapper := filepath.Join(cacheDir, "fake-lsp")
 	wrapperScript := "#!/bin/sh\necho $$ > \"${FAKE_PIDFILE:?}\"\nexec python3 \"$(dirname \"$0\")/fake-lsp.py\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(wrapper, []byte(wrapperScript), 0o755))
 	pidfile = filepath.Join(t.TempDir(), "lsp.pid")
 	t.Setenv("FAKE_PIDFILE", pidfile)
 	log = filepath.Join(t.TempDir(), "launches.log")
@@ -214,15 +205,9 @@ func TestWaitReadyConcurrentCallsStartOneProcess(t *testing.T) {
 	second := make(chan error, 1)
 	go func() { second <- inst.waitReady(context.Background()) }()
 
-	if err := <-second; err != nil {
-		t.Fatalf("second caller: %v", err)
-	}
-	if err := <-first; err != nil {
-		t.Fatalf("first caller: %v", err)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1", n)
-	}
+	testassert.NoError(t, <-second)
+	testassert.NoError(t, <-first)
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 func TestWaitReadyFailedStartAllowsRetry(t *testing.T) {
@@ -230,9 +215,7 @@ func TestWaitReadyFailedStartAllowsRetry(t *testing.T) {
 	log := filepath.Join(dir, "launches.log")
 	failMarker := filepath.Join(dir, "fail")
 	inst := newFakeServerInstance(t, log, failMarker, 0, 0, "", "")
-	if err := os.WriteFile(failMarker, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(failMarker, nil, 0o644))
 
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
@@ -246,9 +229,7 @@ func TestWaitReadyFailedStartAllowsRetry(t *testing.T) {
 	wg.Wait()
 
 	for i, err := range errs {
-		if err == nil {
-			t.Errorf("caller %d: error = nil after failed start, want a failure reported", i)
-		}
+		testassert.Check(t, err != nil, "caller %d: error = nil after failed start, want a failure reported", i)
 	}
 
 	// A failed start attempt ends in the idle state, not the failed one: the
@@ -256,21 +237,13 @@ func TestWaitReadyFailedStartAllowsRetry(t *testing.T) {
 	inst.mu.Lock()
 	state := inst.state
 	inst.mu.Unlock()
-	if state != stateIdle {
-		t.Fatalf("instance state after failed start = %d, want %d (idle)", state, stateIdle)
-	}
+	testassert.Equal(t, state, stateIdle)
 
 	// A failed start attempt must leave the instance usable: once the cause
 	// is removed a fresh wait claims a new launch and reaches ready.
-	if err := os.Remove(failMarker); err != nil {
-		t.Fatal(err)
-	}
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady after failed start: %v", err)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched after retry = %d, want 1", n)
-	}
+	testassert.NoError(t, os.Remove(failMarker))
+	testassert.NoError(t, inst.waitReady(context.Background()))
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 func TestWaitReadyCancelDoesNotAbortStart(t *testing.T) {
@@ -291,15 +264,9 @@ func TestWaitReadyCancelDoesNotAbortStart(t *testing.T) {
 	second := make(chan error, 1)
 	go func() { second <- inst.waitReady(context.Background()) }()
 
-	if err := <-second; err != nil {
-		t.Fatalf("second caller: %v, want ready despite the first caller cancelling", err)
-	}
-	if err := <-first; err != context.Canceled {
-		t.Fatalf("first caller: error = %v, want context.Canceled", err)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1", n)
-	}
+	testassert.NoError(t, <-second)
+	testassert.Equal(t, <-first, context.Canceled)
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 func TestWaitReadyTimeoutReportsStateNotSuccess(t *testing.T) {
@@ -313,12 +280,8 @@ func TestWaitReadyTimeoutReportsStateNotSuccess(t *testing.T) {
 	inst := newFakeServerInstance(t, log, "", 0, -1, "", "")
 
 	err := inst.waitReady(context.Background())
-	if err == nil {
-		t.Fatal("waitReady error = nil, want a timeout reporting the state")
-	}
-	if !strings.Contains(err.Error(), "starting") {
-		t.Fatalf("waitReady error = %q, want it to name the state", err)
-	}
+	testassert.Require(t, err != nil, "waitReady error = nil, want a timeout reporting the state")
+	testassert.Require(t, strings.Contains(err.Error(), "starting"), "waitReady error = %q, want it to name the state", err)
 }
 
 func TestWaitReadyRecoversAfterCrashBeforeReady(t *testing.T) {
@@ -333,17 +296,14 @@ func TestWaitReadyRecoversAfterCrashBeforeReady(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "first", "")
 
-	if err := inst.waitReady(context.Background()); err == nil {
-		t.Fatal("waitReady error = nil for the crashed launch, want a failure")
+	{
+		err := inst.waitReady(context.Background())
+		testassert.Require(t, err != nil, "waitReady error = nil for the crashed launch, want a failure")
 	}
 
 	// The restart must recover the instance: a fresh wait reaches ready.
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady after the restart: %v", err)
-	}
-	if n := countLaunches(log); n != 2 {
-		t.Fatalf("server processes launched = %d, want 2 (crashed attempt plus restart)", n)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
+	testassert.Equal(t, countLaunches(log), 2)
 }
 
 func waitForState(t *testing.T, inst *instance, want int) {
@@ -356,9 +316,7 @@ func waitForState(t *testing.T, inst *instance, want int) {
 		if state == want {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("instance state = %d, want %d", state, want)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "instance state = %d, want %d", state, want)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -371,30 +329,29 @@ func TestFailedInstanceStaysFailed(t *testing.T) {
 
 	// The first wait rides the initial launch and is released with its
 	// failure once the attempt dies.
-	if err := inst.waitReady(context.Background()); err == nil {
-		t.Fatal("waitReady error = nil for the crashed launch, want a failure")
+	{
+		err := inst.waitReady(context.Background())
+		testassert.Require(t, err != nil, "waitReady error = nil for the crashed launch, want a failure")
 	}
 	waitForState(t, inst, stateFailed)
 
 	// A later wait on the failed instance must not launch another process.
-	if err := inst.waitReady(context.Background()); err == nil {
-		t.Fatal("waitReady on the failed instance: error = nil, want unavailable")
+	{
+		err := inst.waitReady(context.Background())
+		testassert.Require(t, err != nil, "waitReady on the failed instance: error = nil, want unavailable")
 	}
-	if _, err := inst.start(context.Background()); err != nil {
-		t.Fatalf("start on the failed instance: %v, want a refused no-op", err)
+	{
+		_, err := inst.start(context.Background())
+		testassert.NoError(t, err)
 	}
-	if n := countLaunches(log); n != maxRestarts+1 {
-		t.Fatalf("server processes launched = %d, want %d (the crash loop)", n, maxRestarts+1)
-	}
+	testassert.Equal(t, countLaunches(log), maxRestarts+1)
 }
 
 func TestSupersededWatcherIsInert(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 
 	// Reproduce the window in which a shutdown followed by a wait replaces
 	// the attempt: kill the running process while holding the lock, so the
@@ -429,33 +386,24 @@ func TestSupersededWatcherIsInert(t *testing.T) {
 	state := inst.state
 	restarts := inst.restarts
 	inst.mu.Unlock()
-	if state != stateStarting {
-		t.Fatalf("state = %d, want %d (starting): the superseded watcher touched state", state, stateStarting)
-	}
-	if restarts != 0 {
-		t.Fatalf("restarts = %d, want 0: the superseded watcher counted a crash", restarts)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1: the superseded watcher restarted", n)
-	}
+	testassert.Equal(t, state, stateStarting)
+	testassert.Equal(t, restarts, 0)
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 func TestStartRefusedWhileReady(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 
 	// A launch is already running: starting again must be refused rather than
 	// launch a second process over the live one.
-	if _, err := inst.start(context.Background()); err != nil {
-		t.Fatalf("start on a ready instance: %v, want a refused no-op", err)
+	{
+		_, err := inst.start(context.Background())
+		testassert.NoError(t, err)
 	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1", n)
-	}
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 // TestStartAfterPermanentCloseSelfReaps proves the close-loser path: a start
@@ -508,26 +456,24 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if pid == 0 {
-		t.Fatal("language server process never launched")
-	}
+	testassert.Require(t, pid != 0, "language server process never launched")
 
 	inst.closeAdmission()
 	close(release)
 
-	if err := <-started; err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("start after permanent close = %v, want the unavailable error", err)
+	{
+		err := <-started
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "unavailable"), "start after permanent close = %v, want the unavailable error", err)
 	}
 	// The close loser's process is gone and reaped by the start goroutine
 	// itself: kill(pid, 0) returns ESRCH only once reaped.
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("close-loser process %d still alive after start returned (kill err = %v)", pid, err)
+	{
+		err := syscall.Kill(pid, 0)
+		testassert.Require(t, errors.Is(err, syscall.ESRCH), "close-loser process %d still alive after start returned (kill err = %v)", pid, err)
 	}
 	// Exactly one wait happened, and it was this start goroutine's: procDone
 	// and the watcher were never installed, so no other waiter exists.
-	if n := waits.Load(); n != 1 {
-		t.Fatalf("process waits before watcher installation = %d, want exactly 1 (the close loser's own reap)", n)
-	}
+	testassert.Equal(t, waits.Load(), 1)
 	inst.mu.Lock()
 	state := inst.state
 	procDone := inst.procDone
@@ -536,17 +482,14 @@ func TestStartAfterPermanentCloseSelfReaps(t *testing.T) {
 	if state != stateFailed {
 		t.Fatalf("state = %d (%s), want %d (failed)", state, stateName(state), stateFailed)
 	}
-	if procDone != nil || cmd != nil {
-		t.Fatalf("close loser installed handles: procDone = %v, cmd = %v", procDone, cmd)
-	}
+	testassert.Require(t, procDone == nil && cmd == nil, "close loser installed handles: procDone = %v, cmd = %v", procDone, cmd)
 	// Permanent close cannot restart: a later ordinary start is a refused
 	// no-op and launches no process.
-	if _, err := inst.start(context.Background()); err != nil {
-		t.Fatalf("start on the failed instance: %v, want a refused no-op", err)
+	{
+		_, err := inst.start(context.Background())
+		testassert.NoError(t, err)
 	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1", n)
-	}
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 // TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite proves
@@ -559,27 +502,20 @@ func TestOpenFileCanonicalAfterPermanentCloseRefusesWithoutProtocolWrite(t *test
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	inst.closeAdmission()
 
 	target := filepath.Join(t.TempDir(), "existing.txt")
-	if err := os.WriteFile(target, []byte("content"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := inst.openFileCanonical(context.Background(), target); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("openFileCanonical after permanent close = %v, want the unavailable error", err)
+	testassert.NoError(t, os.WriteFile(target, []byte("content"), 0o600))
+	{
+		err := inst.openFileCanonical(context.Background(), target)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "unavailable"), "openFileCanonical after permanent close = %v, want the unavailable error", err)
 	}
 	// No protocol write: the server saw the startup initialize/initialized
 	// requests but never a didOpen.
 	data, err := os.ReadFile(reqLog)
-	if err != nil {
-		t.Fatalf("read requests log: %v", err)
-	}
-	if strings.Contains(string(data), "textDocument/didOpen") {
-		t.Fatal("openFileCanonical after permanent close sent didOpen to the server")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(string(data), "textDocument/didOpen"), "openFileCanonical after permanent close sent didOpen to the server")
 }
 
 // TestIdleRetirementRestartsWithFreshBudget is the positive idle-retirement
@@ -591,9 +527,7 @@ func TestIdleRetirementRestartsWithFreshBudget(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "launches.log")
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	// The idle-retirement path: retire the ready instance without permanent
 	// close.
 	inst.shutdown()
@@ -605,9 +539,7 @@ func TestIdleRetirementRestartsWithFreshBudget(t *testing.T) {
 	}
 
 	// A later ordinary request restarts the retired instance.
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady after idle retirement: %v, want a restart", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	inst.mu.Lock()
 	state = inst.state
 	restarts := inst.restarts
@@ -615,12 +547,8 @@ func TestIdleRetirementRestartsWithFreshBudget(t *testing.T) {
 	if state != stateReady {
 		t.Fatalf("state after restart = %d (%s), want %d (ready)", state, stateName(state), stateReady)
 	}
-	if restarts != 0 {
-		t.Fatalf("restarts after idle retirement = %d, want a fresh budget", restarts)
-	}
-	if n := countLaunches(log); n != 2 {
-		t.Fatalf("server processes launched = %d, want 2 (initial plus idle-retirement restart)", n)
-	}
+	testassert.Equal(t, restarts, 0)
+	testassert.Equal(t, countLaunches(log), 2)
 }
 
 // TestPermanentCloseWatcherReapsWithoutRestart is the permanent-close watcher
@@ -640,22 +568,16 @@ func TestPermanentCloseWatcherReapsWithoutRestart(t *testing.T) {
 	waitCommand = func(cmd *exec.Cmd) error { waits.Add(1); return oldWait(cmd) }
 	t.Cleanup(func() { waitCommand = oldWait })
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	inst.closeAdmission()
 	inst.mu.Lock()
 	procDone := inst.procDone
 	cmd := inst.cmd
 	inst.mu.Unlock()
-	if procDone == nil || cmd == nil {
-		t.Fatal("ready instance has no procDone or cmd")
-	}
+	testassert.Require(t, procDone != nil && cmd != nil, "ready instance has no procDone or cmd")
 
 	// The process exits after permanent close: the watcher reaps it.
-	if err := cmd.Process.Kill(); err != nil {
-		t.Fatalf("kill the ready server: %v", err)
-	}
+	testassert.NoError(t, cmd.Process.Kill())
 	select {
 	case <-procDone:
 	case <-time.After(10 * time.Second):
@@ -664,9 +586,7 @@ func TestPermanentCloseWatcherReapsWithoutRestart(t *testing.T) {
 	// Exactly one wait happened after the procDone/watcher handoff: the
 	// watcher's own. No teardown path, restart, or second waiter touched the
 	// process.
-	if n := waits.Load(); n != 1 {
-		t.Fatalf("process waits after the watcher handoff = %d, want exactly 1 (the watcher's reap)", n)
-	}
+	testassert.Equal(t, waits.Load(), 1)
 
 	inst.mu.Lock()
 	state := inst.state
@@ -675,19 +595,14 @@ func TestPermanentCloseWatcherReapsWithoutRestart(t *testing.T) {
 	if state != stateFailed {
 		t.Fatalf("state = %d (%s), want %d (failed)", state, stateName(state), stateFailed)
 	}
-	if restarts != 0 {
-		t.Fatalf("restarts = %d, want 0: the watcher relaunched after permanent close", restarts)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1 (no relaunch after permanent close)", n)
-	}
+	testassert.Equal(t, restarts, 0)
+	testassert.Equal(t, countLaunches(log), 1)
 	// A later ordinary request refuses: permanent close cannot restart.
-	if err := inst.waitReady(context.Background()); err == nil {
-		t.Fatal("waitReady after permanent close: error = nil, want unavailable")
+	{
+		err := inst.waitReady(context.Background())
+		testassert.Require(t, err != nil, "waitReady after permanent close: error = nil, want unavailable")
 	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched after refused wait = %d, want 1", n)
-	}
+	testassert.Equal(t, countLaunches(log), 1)
 }
 
 func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
@@ -700,9 +615,7 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 	// stays open long enough for a newer attempt to become current.
 	inst := newFakeServerInstance(t, log, "", 0, 0, "", "1")
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 
 	done := make(chan struct{})
 	go func() { inst.shutdown(); close(done) }()
@@ -718,9 +631,7 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 		if state == stateShutdown {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("shutdown never captured the attempt")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "shutdown never captured the attempt")
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -740,15 +651,9 @@ func TestSupersededShutdownLeavesNewAttemptIntact(t *testing.T) {
 	cmd := inst.cmd
 	procDone := inst.procDone
 	inst.mu.Unlock()
-	if state != stateStarting {
-		t.Fatalf("state = %d, want %d (starting): shutdown ended the newer attempt", state, stateStarting)
-	}
-	if rpc == nil || cmd == nil {
-		t.Fatal("shutdown cleared the newer attempt's rpc or cmd")
-	}
-	if procDone != fresh {
-		t.Fatal("shutdown replaced the newer attempt's procDone")
-	}
+	testassert.Equal(t, state, stateStarting)
+	testassert.Require(t, rpc != nil && cmd != nil, "shutdown cleared the newer attempt's rpc or cmd")
+	testassert.Require(t, procDone == fresh, "shutdown replaced the newer attempt's procDone")
 }
 
 // TestSupersededShutdownKeepsReplacementDiagnostics is the stale-attempt
@@ -773,9 +678,7 @@ func TestSupersededShutdownKeepsReplacementDiagnostics(t *testing.T) {
 	waitCommand = func(cmd *exec.Cmd) error { waits.Add(1); return oldWait(cmd) }
 	t.Cleanup(func() { waitCommand = oldWait })
 
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 	inst.mu.Lock()
 	pid := inst.cmd.Process.Pid
 	inst.mu.Unlock()
@@ -795,9 +698,7 @@ func TestSupersededShutdownKeepsReplacementDiagnostics(t *testing.T) {
 		if state == stateShutdown {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("shutdown never captured the attempt")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "shutdown never captured the attempt")
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -826,18 +727,15 @@ func TestSupersededShutdownKeepsReplacementDiagnostics(t *testing.T) {
 	<-done
 
 	diags := inst.fileDiagnostics(uri)
-	if len(diags) != 1 || diags[0].Message != "replacement error" {
-		t.Fatalf("diagnostics after the superseded shutdown = %+v, want the replacement attempt's cached error", diags)
-	}
+	testassert.Require(t, len(diags) == 1 && diags[0].Message == "replacement error", "diagnostics after the superseded shutdown = %+v, want the replacement attempt's cached error", diags)
 	// The captured attempt's process was killed and reaped inside the
 	// teardown: kill(pid, 0) returns ESRCH only once reaped, and the single
 	// wait is the watcher's own reap.
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("captured attempt process %d still alive after the superseded shutdown (kill err = %v)", pid, err)
+	{
+		err := syscall.Kill(pid, 0)
+		testassert.Require(t, errors.Is(err, syscall.ESRCH), "captured attempt process %d still alive after the superseded shutdown (kill err = %v)", pid, err)
 	}
-	if n := waits.Load(); n != 1 {
-		t.Fatalf("process waits = %d, want exactly 1 (the captured attempt's watcher reap)", n)
-	}
+	testassert.Equal(t, waits.Load(), 1)
 }
 
 // TestStartWithCancelledContextLaunchesNothing proves the pre-spawn guard: a
@@ -858,22 +756,15 @@ func TestStartWithCancelledContextLaunchesNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := inst.start(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("start with a cancelled context: error = %v, want context.Canceled", err)
+	{
+		_, err := inst.start(ctx)
+		testassert.Require(t, errors.Is(err, context.Canceled), "start with a cancelled context: error = %v, want context.Canceled", err)
 	}
-	if n := starts.Load(); n != 0 {
-		t.Fatalf("successful cmd.Start invocations = %d, want 0", n)
-	}
-	if n := countLaunches(log); n != 0 {
-		t.Fatalf("server processes launched = %d, want 0", n)
-	}
+	testassert.Equal(t, starts.Load(), 0)
+	testassert.Equal(t, countLaunches(log), 0)
 
 	// The refused attempt ended the launch it claimed, so the instance is
 	// claimable again: a live start still works.
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady after the refused attempt: %v", err)
-	}
-	if n := countLaunches(log); n != 1 {
-		t.Fatalf("server processes launched = %d, want 1 after the live start", n)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
+	testassert.Equal(t, countLaunches(log), 1)
 }

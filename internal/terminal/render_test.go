@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestRenderEditPreviewColorsOnlyGutter(t *testing.T) {
@@ -15,18 +16,7 @@ func TestRenderEditPreviewColorsOnlyGutter(t *testing.T) {
 	}}}}
 	rendered := RenderEditPreview(preview, "  ", 80, true)
 
-	if !strings.Contains(rendered, "  "+colorRed+"12 -"+colorReset+colorDim+"removed()"+colorReset) {
-		t.Fatalf("removed gutter was not red or spacing is wrong: %q", rendered)
-	}
-	if !strings.Contains(rendered, "  "+colorGreen+"12 +"+colorReset+colorDim+"added()"+colorReset) {
-		t.Fatalf("added gutter was not green or spacing is wrong: %q", rendered)
-	}
-	if !strings.Contains(rendered, "  "+colorDim+"13  "+colorReset+colorDim+"kept()"+colorReset) {
-		t.Fatalf("context gutter was not dim or spacing is wrong: %q", rendered)
-	}
-	if strings.Contains(rendered, colorRed+"removed()") || strings.Contains(rendered, colorGreen+"added()") {
-		t.Fatalf("code content should not be colored: %q", rendered)
-	}
+	testassert.Require(t, strings.Contains(rendered, "  "+colorRed+"12 -"+colorReset+colorDim+"removed()"+colorReset) && strings.Contains(rendered, "  "+colorGreen+"12 +"+colorReset+colorDim+"added()"+colorReset) && strings.Contains(rendered, "  "+colorDim+"13  "+colorReset+colorDim+"kept()"+colorReset) && !strings.Contains(rendered, colorRed+"removed()") && !strings.Contains(rendered, colorGreen+"added()"), "removed gutter was not red or spacing is wrong: %q; added gutter was not green or spacing is wrong: %q; context gutter was not dim or spacing is wrong: %q; code content should not be colored: %q", rendered, rendered, rendered, rendered)
 }
 
 func TestRenderEditPreviewCollapsesUnlessExpanded(t *testing.T) {
@@ -45,23 +35,14 @@ func TestRenderEditPreviewCollapsesUnlessExpanded(t *testing.T) {
 	}}}}
 
 	collapsed := RenderEditPreview(preview, "", 80, false)
-	if strings.Contains(collapsed, "eleven") {
-		t.Fatalf("collapsed preview should hide eleventh row: %q", collapsed)
-	}
-	if !strings.Contains(collapsed, "(1 more line)") {
-		t.Fatalf("collapsed preview missing more-lines marker: %q", collapsed)
-	}
-	if got, want := strings.Count(collapsed, nl), collapsedEditPreviewLines+1; got != want {
-		t.Fatalf("collapsed preview lines = %d, want %d: %q", got, want, collapsed)
+	testassert.Require(t, !strings.Contains(collapsed, "eleven") && strings.Contains(collapsed, "(1 more line)"), "collapsed preview should hide eleventh row: %q; collapsed preview missing more-lines marker: %q", collapsed, collapsed)
+	{
+		got, want := strings.Count(collapsed, nl), collapsedEditPreviewLines+1
+		testassert.Require(t, got == want, "collapsed preview lines = %d, want %d: %q", got, want, collapsed)
 	}
 
 	expanded := RenderEditPreview(preview, "", 80, true)
-	if !strings.Contains(expanded, "eleven") {
-		t.Fatalf("expanded preview missing eleventh row: %q", expanded)
-	}
-	if strings.Contains(expanded, "more lines") {
-		t.Fatalf("expanded preview should not show more-lines marker: %q", expanded)
-	}
+	testassert.Require(t, strings.Contains(expanded, "eleven") && !strings.Contains(expanded, "more lines"), "expanded preview missing eleventh row: %q; expanded preview should not show more-lines marker: %q", expanded, expanded)
 }
 
 func TestRenderEditPreviewCollapsedSkipsHunkGaps(t *testing.T) {
@@ -84,37 +65,24 @@ func TestRenderEditPreviewCollapsedSkipsHunkGaps(t *testing.T) {
 	}}
 
 	collapsed := RenderEditPreview(preview, "", 80, false)
-	if got, want := strings.Count(collapsed, nl), collapsedEditPreviewLines+1; got != want {
-		t.Fatalf("collapsed preview terminal lines = %d, want %d: %q", got, want, collapsed)
+	{
+		got, want := strings.Count(collapsed, nl), collapsedEditPreviewLines+1
+		testassert.Require(t, got == want, "collapsed preview terminal lines = %d, want %d: %q", got, want, collapsed)
 	}
-	if strings.Contains(collapsed, nl+nl) {
-		t.Fatalf("collapsed preview should not include hunk gap: %q", collapsed)
-	}
-	if strings.Contains(collapsed, "eleven") {
-		t.Fatalf("collapsed preview should hide eleventh row: %q", collapsed)
-	}
+	testassert.Require(t, !strings.Contains(collapsed, nl+nl) && !strings.Contains(collapsed, "eleven"), "collapsed preview should not include hunk gap: %q; collapsed preview should hide eleventh row: %q", collapsed, collapsed)
 }
 
 func TestRenderOutputPreviewShowsMoreLinesMarker(t *testing.T) {
 	rendered := renderOutputPreview("1\n2\n3\n4\n5\n6\n7", "  ", 80, colorDim, false)
-	if strings.Contains(rendered, "6") || strings.Contains(rendered, "7") {
-		t.Fatalf("collapsed output should hide extra lines: %q", rendered)
-	}
-	if !strings.Contains(rendered, "(2 more lines)") {
-		t.Fatalf("collapsed output missing more-lines marker: %q", rendered)
-	}
+	testassert.Require(t, !strings.Contains(rendered, "6") && !strings.Contains(rendered, "7") && strings.Contains(rendered, "(2 more lines)"), "collapsed output should hide extra lines: %q; collapsed output missing more-lines marker: %q", rendered, rendered)
 
 	expanded := renderOutputPreview("1\n2\n3\n4\n5\n6\n7", "  ", 80, colorDim, true)
-	if !strings.Contains(expanded, "6") || strings.Contains(expanded, "more lines") {
-		t.Fatalf("expanded output should show all lines without marker: %q", expanded)
-	}
+	testassert.Require(t, strings.Contains(expanded, "6") && !strings.Contains(expanded, "more lines"), "expanded output should show all lines without marker: %q", expanded)
 }
 
 func TestRenderToolCallShowsWriteLineCount(t *testing.T) {
 	rendered := RenderToolCall("write_file", `{"path":"x.go","content":"one\ntwo\n"}`, nil)
-	if !strings.Contains(rendered, colorGreen+"+2"+colorCyan) {
-		t.Fatalf("write_file header missing green inserted-line count: %q", rendered)
-	}
+	testassert.Require(t, strings.Contains(rendered, colorGreen+"+2"+colorCyan), "write_file header missing green inserted-line count: %q", rendered)
 }
 
 func TestRenderToolCallShowsEditChangeCounts(t *testing.T) {
@@ -125,28 +93,12 @@ func TestRenderToolCallShowsEditChangeCounts(t *testing.T) {
 	}}}}}
 
 	rendered := RenderToolCall("edit_file", `{"path":"x.go"}`, metadata)
-	if !strings.Contains(rendered, colorGreen+"+2"+colorCyan) {
-		t.Fatalf("edit_file header missing green inserted-line count: %q", rendered)
-	}
-	if !strings.Contains(rendered, colorRed+"-1"+colorCyan) {
-		t.Fatalf("edit_file header missing red deleted-line count: %q", rendered)
-	}
+	testassert.Require(t, strings.Contains(rendered, colorGreen+"+2"+colorCyan) && strings.Contains(rendered, colorRed+"-1"+colorCyan), "edit_file header missing green inserted-line count: %q; edit_file header missing red deleted-line count: %q", rendered, rendered)
 }
 
 func TestRenderToolCallPreservesMultilineCommandHeader(t *testing.T) {
 	rendered := RenderToolCall("run_command", `{"command":"cd /tmp && git commit -m \"Title\n\n    - one\n    - two with a deliberately long line that should not be shortened by the header renderer\""}`, nil)
-	if !strings.Contains(rendered, "Title"+nl+"     (3 more lines)") {
-		t.Fatalf("tool header should collapse multiline command with continuation marker: %q", rendered)
-	}
-	if strings.Contains(rendered, `Title - one - two`) {
-		t.Fatalf("tool header should not collapse multiline command into one line: %q", rendered)
-	}
-	if strings.Contains(rendered, "- one") || strings.Contains(rendered, "- two") {
-		t.Fatalf("tool header should hide continuation command lines: %q", rendered)
-	}
-	if strings.Contains(rendered, "...") {
-		t.Fatalf("tool header should not truncate command lines: %q", rendered)
-	}
+	testassert.Require(t, strings.Contains(rendered, "Title"+nl+"     (3 more lines)") && !strings.Contains(rendered, `Title - one - two`) && !strings.Contains(rendered, "- one") && !strings.Contains(rendered, "- two") && !strings.Contains(rendered, "..."), "tool header should collapse multiline command with continuation marker: %q; tool header should not collapse multiline command into one line: %q; tool header should hide continuation command lines: %q; tool header should not truncate command lines: %q", rendered, rendered, rendered, rendered)
 }
 
 func TestExtractJSONString(t *testing.T) {
@@ -166,9 +118,7 @@ func TestExtractJSONString(t *testing.T) {
 	}
 	for _, tc := range cases {
 		got := extractJSONString(tc.json, tc.key)
-		if got != tc.want {
-			t.Errorf("extractJSONString(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
-		}
+		testassert.Check(t, got == tc.want, "extractJSONString(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
 	}
 }
 
@@ -187,20 +137,14 @@ func TestExtractJSONNumber(t *testing.T) {
 	}
 	for _, tc := range cases {
 		got := extractJSONNumber(tc.json, tc.key)
-		if got != tc.want {
-			t.Errorf("extractJSONNumber(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
-		}
+		testassert.Check(t, got == tc.want, "extractJSONNumber(%q, %q) = %q, want %q", tc.json, tc.key, got, tc.want)
 	}
 }
 
 func TestFormatToolArgsSleepQuotedNumberFallback(t *testing.T) {
 	got := FormatToolArgs("sleep", `{"seconds":"5"}`)
-	if got != `{"seconds":"5"}` {
-		t.Errorf("FormatToolArgs sleep with quoted number = %q, want raw args fallback", got)
-	}
+	testassert.Check(t, got == `{"seconds":"5"}`, "FormatToolArgs sleep with quoted number = %q, want raw args fallback", got)
 
 	got = FormatToolArgs("sleep", `{"seconds":5}`)
-	if got != "5s" {
-		t.Errorf("FormatToolArgs sleep with real number = %q, want %q", got, "5s")
-	}
+	testassert.Check(t, got == "5s", "FormatToolArgs sleep with real number = %q, want %q", got, "5s")
 }

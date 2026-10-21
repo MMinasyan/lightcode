@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // stageGroupCapture drives one real CodeStore capture in the given group
@@ -16,14 +18,14 @@ func stageGroupCapture(t *testing.T, groupDir, target string, turn int, content 
 	t.Helper()
 	code := mustOpenCodeStore(t, groupDir)
 	entryID, _, err := code.SnapshotResolvedEntry(turn, target, target)
-	if err != nil {
-		t.Fatalf("SnapshotResolvedEntry(%s): %v", target, err)
+	testassert.Require(t, err == nil, "SnapshotResolvedEntry(%s): %v", target, err)
+	{
+		err := os.WriteFile(target, content, 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", target, err)
 	}
-	if err := os.WriteFile(target, content, 0o600); err != nil {
-		t.Fatalf("write %s: %v", target, err)
-	}
-	if err := code.RecordSnapshotContent(turn, entryID, content); err != nil {
-		t.Fatalf("RecordSnapshotContent(%s): %v", target, err)
+	{
+		err := code.RecordSnapshotContent(turn, entryID, content)
+		testassert.Require(t, err == nil, "RecordSnapshotContent(%s): %v", target, err)
 	}
 	code.RetainSnapshotEntry(turn, entryID)
 }
@@ -38,12 +40,8 @@ func stageTwoGroups(t *testing.T) (newest, oldest, file string) {
 	newest = filepath.Join(root, "entry-new")
 	oldest = filepath.Join(root, "entry-old")
 	file = filepath.Join(root, "tree", "app.txt")
-	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(file, []byte("v0"), 0o600); err != nil {
-		t.Fatalf("write v0: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(file), 0o700))
+	testassert.NoError(t, os.WriteFile(file, []byte("v0"), 0o600))
 	stageGroupCapture(t, oldest, file, 1, []byte("v1"))
 	stageGroupCapture(t, newest, file, 1, []byte("v2"))
 	return newest, oldest, file
@@ -58,24 +56,13 @@ func TestRevertCodeGroupsSharesSkipLedgerAcrossGroups(t *testing.T) {
 
 	// The external edit matches the older group's last-write identity, so only
 	// the shared ledger can keep the older group from restoring.
-	if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
-		t.Fatalf("write external v1: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
 
 	result, err := RevertCodeGroups([]string{newest, oldest}, 0)
-	if err != nil {
-		t.Fatalf("RevertCodeGroups: %v", err)
-	}
-	if len(result.Restored) != 0 {
-		t.Fatalf("restored = %v, want no restore after the newer skip", result.Restored)
-	}
-	if len(result.Skipped) != 1 || result.Skipped[0].Path != file {
-		t.Fatalf("skipped = %+v, want exactly one reported skip for %s", result.Skipped, file)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 1 && result.Skipped[0].Path == file, "restored = %v, want no restore after the newer skip; skipped = %+v, want exactly one reported skip for %s", result.Restored, result.Skipped, file)
 	data, err := os.ReadFile(file)
-	if err != nil || string(data) != "v1" {
-		t.Fatalf("file = (%q, %v), want the external v1 untouched", data, err)
-	}
+	testassert.Require(t, err == nil && string(data) == "v1", "file = (%q, %v), want the external v1 untouched", data, err)
 }
 
 // TestRevertCodeGroupsRestoresAcrossGroupsInOrder proves the shared ledger
@@ -85,21 +72,17 @@ func TestRevertCodeGroupsRestoresAcrossGroupsInOrder(t *testing.T) {
 	newest, oldest, file := stageTwoGroups(t)
 
 	result, err := RevertCodeGroups([]string{newest, oldest}, 0)
-	if err != nil {
-		t.Fatalf("RevertCodeGroups: %v", err)
-	}
-	if len(result.Restored) != 2 || result.Restored[0] != file || result.Restored[1] != file {
-		t.Fatalf("restored = %v, want the newest then the older preimage", result.Restored)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(result.Restored) == 2 && result.Restored[0] == file && result.Restored[1] == file, "restored = %v, want the newest then the older preimage", result.Restored)
 	data, err := os.ReadFile(file)
-	if err != nil || string(data) != "v0" {
-		t.Fatalf("file = (%q, %v), want the oldest preimage v0", data, err)
+	testassert.Require(t, err == nil && string(data) == "v0", "file = (%q, %v), want the oldest preimage v0", data, err)
+	{
+		_, err := os.Stat(filepath.Join(newest, "snapshots", "1"))
+		testassert.Require(t, errors.Is(err, os.ErrNotExist), "newest turn dir = %v, want it removed after the restore", err)
 	}
-	if _, err := os.Stat(filepath.Join(newest, "snapshots", "1")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("newest turn dir = %v, want it removed after the restore", err)
-	}
-	if _, err := os.Stat(filepath.Join(oldest, "snapshots", "1")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("older turn dir = %v, want it removed after the restore", err)
+	{
+		_, err := os.Stat(filepath.Join(oldest, "snapshots", "1"))
+		testassert.Require(t, errors.Is(err, os.ErrNotExist), "older turn dir = %v, want it removed after the restore", err)
 	}
 }
 
@@ -111,29 +94,21 @@ func TestRevertCodeGroupsPartialFailurePreservesPriorEffects(t *testing.T) {
 	newest, oldest, file := stageTwoGroups(t)
 
 	badEntry := filepath.Join(oldest, "snapshots", "1", hashString(file))
-	if err := os.MkdirAll(badEntry, 0o700); err != nil {
-		t.Fatalf("mkdir bad entry: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(badEntry, "meta.json"), []byte("{"), 0o600); err != nil {
-		t.Fatalf("write bad meta: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(badEntry, 0o700))
+	testassert.NoError(t, os.WriteFile(filepath.Join(badEntry, "meta.json"), []byte("{"), 0o600))
 
 	result, err := RevertCodeGroups([]string{newest, oldest}, 0)
-	if err == nil {
-		t.Fatalf("RevertCodeGroups = %+v, want the older group's traversal error", result)
-	}
-	if len(result.Restored) != 1 || result.Restored[0] != file {
-		t.Fatalf("restored = %v, want the newest group's honest restore", result.Restored)
-	}
+	testassert.Require(t, err != nil, "RevertCodeGroups = %+v, want the older group's traversal error", result)
+	testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == file, "restored = %v, want the newest group's honest restore", result.Restored)
 	data, err := os.ReadFile(file)
-	if err != nil || string(data) != "v1" {
-		t.Fatalf("file = (%q, %v), want the newest group's preimage v1", data, err)
+	testassert.Require(t, err == nil && string(data) == "v1", "file = (%q, %v), want the newest group's preimage v1", data, err)
+	{
+		_, err := os.Stat(filepath.Join(newest, "snapshots", "1"))
+		testassert.Require(t, errors.Is(err, os.ErrNotExist), "newest turn dir = %v, want it removed after its restore", err)
 	}
-	if _, err := os.Stat(filepath.Join(newest, "snapshots", "1")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("newest turn dir = %v, want it removed after its restore", err)
-	}
-	if _, err := os.Stat(filepath.Join(oldest, "snapshots", "1")); err != nil {
-		t.Fatalf("older turn dir = %v, want it kept after the failure", err)
+	{
+		_, err := os.Stat(filepath.Join(oldest, "snapshots", "1"))
+		testassert.NoError(t, err)
 	}
 }
 
@@ -146,20 +121,16 @@ func TestRevertCodeGroupsAfterTurnAppliesPerDirectory(t *testing.T) {
 	stageGroupCapture(t, newest, file, 2, []byte("v3"))
 
 	result, err := RevertCodeGroups([]string{newest, oldest}, 1)
-	if err != nil {
-		t.Fatalf("RevertCodeGroups: %v", err)
-	}
-	if len(result.Restored) != 1 || result.Restored[0] != file {
-		t.Fatalf("restored = %v, want only the newest group's turn-2 preimage", result.Restored)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == file, "restored = %v, want only the newest group's turn-2 preimage", result.Restored)
 	data, err := os.ReadFile(file)
-	if err != nil || string(data) != "v2" {
-		t.Fatalf("file = (%q, %v), want the turn-2 preimage v2", data, err)
+	testassert.Require(t, err == nil && string(data) == "v2", "file = (%q, %v), want the turn-2 preimage v2", data, err)
+	{
+		_, err := os.Stat(filepath.Join(newest, "snapshots", "1"))
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Stat(filepath.Join(newest, "snapshots", "1")); err != nil {
-		t.Fatalf("newest turn-1 dir = %v, want it kept at the after-turn floor", err)
-	}
-	if _, err := os.Stat(filepath.Join(oldest, "snapshots", "1")); err != nil {
-		t.Fatalf("older turn-1 dir = %v, want it kept at the after-turn floor", err)
+	{
+		_, err := os.Stat(filepath.Join(oldest, "snapshots", "1"))
+		testassert.NoError(t, err)
 	}
 }

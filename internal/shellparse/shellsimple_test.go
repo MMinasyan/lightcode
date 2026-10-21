@@ -1,6 +1,9 @@
 package shellparse
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 // TestParseSimpleGrammar pins the restricted simple-command grammar: every
 // conclusive row decomposes into per-segment source-faithful Text targets,
@@ -139,12 +142,8 @@ func TestParseSimpleGrammar(t *testing.T) {
 			continue
 		}
 		for i := range segments {
-			if segments[i].Text != tc.text[i] {
-				t.Errorf("%s: ParseSimple(%q)[%d].Text = %q, want %q", tc.name, tc.command, i, segments[i].Text, tc.text[i])
-			}
-			if segments[i].UnsafeExpansion || segments[i].HasRedirection {
-				t.Errorf("%s: ParseSimple(%q)[%d] carries grammar markers outside the simple-command shape", tc.name, tc.command, i)
-			}
+			testassert.Check(t, segments[i].Text == tc.text[i], "%s: ParseSimple(%q)[%d].Text = %q, want %q", tc.name, tc.command, i, segments[i].Text, tc.text[i])
+			testassert.Check(t, !segments[i].UnsafeExpansion && !segments[i].HasRedirection, "%s: ParseSimple(%q)[%d] carries grammar markers outside the simple-command shape", tc.name, tc.command, i)
 		}
 	}
 }

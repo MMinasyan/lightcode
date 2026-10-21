@@ -16,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestStorageComposition constructs memory and a temporary-file SQLite store
@@ -37,9 +38,7 @@ func TestStorageComposition(t *testing.T) {
 			name: "sqlite",
 			open: func(t *testing.T) harness.Storage {
 				store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "storage.db"))
-				if err != nil {
-					t.Fatalf("OpenSQLite: %v", err)
-				}
+				testassert.NoError(t, err)
 				return store
 			},
 			close: func(t *testing.T, store harness.Storage) {
@@ -48,8 +47,9 @@ func TestStorageComposition(t *testing.T) {
 					t.Fatalf("sqlite backend built %T, want *storage.SQLite", store)
 					return
 				}
-				if err := sqlite.Close(); err != nil {
-					t.Errorf("Close: %v", err)
+				{
+					err := sqlite.Close()
+					testassert.Check(t, err == nil, "Close: %v", err)
 				}
 			},
 		},
@@ -77,33 +77,19 @@ func TestStorageComposition(t *testing.T) {
 				})
 				return err
 			})
-			if err != nil {
-				t.Fatalf("Transact: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			entries, err := store.ReadEntries(ctx, "s1", 0)
-			if err != nil {
-				t.Fatalf("ReadEntries: %v", err)
-			}
-			if len(entries) != 1 || entries[0].ID != "e1" || entries[0].Sequence != 1 || entries[0].Kind != harness.EntryInput || string(entries[0].Payload) != `{"text":"hello"}` {
-				t.Fatalf("round-trip entries = %+v, want one input entry e1 at sequence 1 with its original payload", entries)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(entries) == 1 && entries[0].ID == "e1" && entries[0].Sequence == 1 && entries[0].Kind == harness.EntryInput && string(entries[0].Payload) == `{"text":"hello"}`, "round-trip entries = %+v, want one input entry e1 at sequence 1 with its original payload", entries)
 
 			register, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: "s1", Kind: harness.RegisterSession})
-			if err != nil {
-				t.Fatalf("ReadRegister: %v", err)
-			}
-			if register.Revision != 1 || string(register.Payload) != `{"state":"active"}` {
-				t.Fatalf("round-trip register = %+v, want revision 1 with its original payload", register)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, register.Revision == 1 && string(register.Payload) == `{"state":"active"}`, "round-trip register = %+v, want revision 1 with its original payload", register)
 
 			ids, err := store.ListSessionIDs(ctx)
-			if err != nil {
-				t.Fatalf("ListSessionIDs: %v", err)
-			}
-			if len(ids) != 1 || ids[0] != "s1" {
-				t.Fatalf("ListSessionIDs = %v, want [s1]", ids)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(ids) == 1 && ids[0] == "s1", "ListSessionIDs = %v, want [s1]", ids)
 		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestFirstRunCreationPreservesExistingFiles verifies the retained first-run
@@ -18,19 +19,14 @@ func TestFirstRunCreationPreservesExistingFiles(t *testing.T) {
 		t.Setenv("HOME", home)
 		t.Cleanup(func() { os.Unsetenv("LIGHTCODE_TEST_USERKEY") })
 		path := filepath.Join(home, ".lightcode", ".env")
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 		custom := "# user managed file\nLIGHTCODE_TEST_USERKEY=1\n"
-		if err := os.WriteFile(path, []byte(custom), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := config.LoadDotEnv(); err != nil {
-			t.Fatalf("LoadDotEnv: %v", err)
+		testassert.NoError(t, os.WriteFile(path, []byte(custom), 0o600))
+		{
+			_, err := config.LoadDotEnv()
+			testassert.NoError(t, err)
 		}
 		after, _ := os.ReadFile(path)
-		if string(after) != custom {
-			t.Fatalf("existing .env was overwritten: %q", after)
-		}
+		testassert.Require(t, string(after) == custom, "existing .env was overwritten: %q", after)
 	})
 }
