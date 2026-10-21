@@ -55,7 +55,7 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 	f := &fixture{handlers: map[string]http.HandlerFunc{}, eventsOpen: make(chan struct{}, 16)}
 	f.handlers["/v1/health"] = func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
+		fmt.Fprint(w, healthBody())
 	}
 	f.handlers["/v1/events"] = f.idleEvents
 	// Startup composition defaults: an empty open-root list and one created

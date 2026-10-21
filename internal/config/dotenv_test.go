@@ -97,83 +97,156 @@ func TestLoadDotEnvShellKeyNotManaged(t *testing.T) {
 	testassert.Require(t, !m.IsManaged(key), "shell-exported key %s must not be in managed set", key)
 }
 
-func TestManagedEnvSetWritesKeyAndUpdatesProcessEnv(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	// Seed with an unrelated line + comment to verify preservation.
-	seed := "# keep me\nUNRELATED=keep\n"
-	testassert.NoError(t, os.WriteFile(path, []byte(seed), 0o600))
-
-	key := envKeyForTest(t, "SET_WRITE")
-	m := NewManagedEnvForTest(path)
-
-	testassert.NoError(t, m.Set(key, "hello"))
-
-	// Process env updated.
-	{
-		got := os.Getenv(key)
-		testassert.Require(t, got == "hello", "env %s = %q, want %q", key, got, "hello")
+// TestManagedEnvOrdinaryRows drives the ordinary Set/Remove outcomes. Each
+// row carries its seed, external environment and initial managed membership,
+// its Set/Remove action, and independently authored post-state predicates for
+// the process environment, the managed set and the real file.
+func TestManagedEnvOrdinaryRows(t *testing.T) {
+	rows := []struct {
+		name          string
+		suffix        string
+		seed          string
+		externalValue string
+		externalSet   bool
+		managed       bool
+		remove        bool
+		value         string
+		wantErr       error
+		wantEnv       string
+		wantEnvSet    bool
+		wantManaged   bool
+		keyValue      string
+		noKeyValue    string
+		keyAbsent     bool
+		wantFile      []string
+		wantMode      os.FileMode
+	}{
+		{
+			name:        "SetWritesKeyAndUpdatesProcessEnv",
+			suffix:      "SET_WRITE",
+			seed:        "# keep me\nUNRELATED=keep\n",
+			value:       "hello",
+			wantEnv:     "hello",
+			wantEnvSet:  true,
+			wantManaged: true,
+			keyValue:    "hello",
+			wantFile:    []string{"# keep me", "UNRELATED=keep"},
+			wantMode:    0o600,
+		},
+		{
+			name:        "SetReplacesExistingKey",
+			suffix:      "SET_REPLACE",
+			seed:        "$KEY=old\nOTHER=x\n",
+			managed:     true,
+			value:       "new",
+			wantEnv:     "new",
+			wantEnvSet:  true,
+			wantManaged: true,
+			keyValue:    "new",
+			noKeyValue:  "old",
+			wantFile:    []string{"OTHER=x"},
+		},
+		{
+			name:          "SetRefusesExternalKey",
+			suffix:        "EXT_REFUSE",
+			seed:          "",
+			externalValue: "external",
+			externalSet:   true,
+			value:         "overwrite",
+			wantErr:       ErrExternalKey,
+			wantEnv:       "external",
+			wantEnvSet:    true,
+			wantManaged:   false,
+			keyAbsent:     true,
+		},
+		{
+			name:          "RemoveDeletesLineAndUnsets",
+			suffix:        "RM_LINE",
+			seed:          "# header\n$KEY=val\nKEEP=me\n",
+			externalValue: "val",
+			externalSet:   true,
+			managed:       true,
+			remove:        true,
+			wantEnvSet:    false,
+			wantManaged:   false,
+			keyAbsent:     true,
+			wantFile:      []string{"# header", "KEEP=me"},
+		},
+		{
+			name:          "RemoveNoopForUnmanagedKey",
+			suffix:        "RM_NOOP",
+			seed:          "KEEP=me\n",
+			externalValue: "external",
+			externalSet:   true,
+			managed:       false,
+			remove:        true,
+			wantEnv:       "external",
+			wantEnvSet:    true,
+			wantManaged:   false,
+			keyAbsent:     true,
+			wantFile:      []string{"KEEP=me"},
+		},
 	}
-	// Managed set updated.
-	testassert.Require(t, m.IsManaged(key), "key %s should be managed after Set", key)
-	// File contents.
-	data, err := os.ReadFile(path)
-	testassert.NoError(t, err)
-	body := string(data)
-	testassert.Require(t, strings.Contains(body, key+"=hello") && strings.Contains(body, "# keep me") && strings.Contains(body, "UNRELATED=keep"), "file missing key line: %q; comment not preserved: %q; unrelated line not preserved: %q", body, body, body)
-	// File mode.
-	info, err := os.Stat(path)
-	testassert.NoError(t, err)
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("file mode = %o, want 0600", info.Mode().Perm())
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			key := envKeyForTest(t, row.suffix)
+			path := filepath.Join(t.TempDir(), ".env")
+			seed := strings.ReplaceAll(row.seed, "$KEY", key) // $KEY is the row's env key
+			testassert.NoError(t, os.WriteFile(path, []byte(seed), 0o600))
+			if row.externalSet {
+				t.Setenv(key, row.externalValue)
+			}
+			m := NewManagedEnvForTest(path)
+			if row.managed {
+				m.managed[key] = struct{}{}
+			}
+
+			var err error
+			if row.remove {
+				err = m.Remove(key)
+			} else {
+				err = m.Set(key, row.value)
+			}
+			if row.wantErr != nil {
+				testassert.Require(t, errors.Is(err, row.wantErr), "%s err = %v, want %v", row.name, err, row.wantErr)
+			} else {
+				testassert.NoError(t, err)
+			}
+			if row.wantEnvSet {
+				{
+					got := os.Getenv(key)
+					testassert.Require(t, got == row.wantEnv, "env %s = %q, want %q", key, got, row.wantEnv)
+				}
+			} else {
+				{
+					_, ok := os.LookupEnv(key)
+					testassert.Require(t, !ok, "env %s still set after %s", key, row.name)
+				}
+			}
+			testassert.Require(t, m.IsManaged(key) == row.wantManaged, "managed %s = %v after %s, want %v", key, m.IsManaged(key), row.name, row.wantManaged)
+
+			data, err := os.ReadFile(path)
+			testassert.NoError(t, err)
+			body := string(data)
+			if row.keyValue != "" {
+				testassert.Require(t, strings.Contains(body, key+"="+row.keyValue), "file missing %s=%s: %q", key, row.keyValue, body)
+			}
+			if row.noKeyValue != "" {
+				testassert.Require(t, !strings.Contains(body, key+"="+row.noKeyValue), "old value %s=%s still in file: %q", key, row.noKeyValue, body)
+			}
+			if row.keyAbsent {
+				testassert.Require(t, !strings.Contains(body, key), "file still contains %s: %q", key, body)
+			}
+			for _, want := range row.wantFile {
+				testassert.Require(t, strings.Contains(body, want), "file missing %q: %q", want, body)
+			}
+			if row.wantMode != 0 {
+				info, err := os.Stat(path)
+				testassert.NoError(t, err)
+				testassert.Require(t, info.Mode().Perm() == row.wantMode, "file mode = %o, want %o", info.Mode().Perm(), row.wantMode)
+			}
+		})
 	}
-}
-
-func TestManagedEnvSetReplacesExistingKey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	key := envKeyForTest(t, "SET_REPLACE")
-	seed := key + "=old\nOTHER=x\n"
-	testassert.NoError(t, os.WriteFile(path, []byte(seed), 0o600))
-
-	m := NewManagedEnvForTest(path)
-	m.managed[key] = struct{}{} // simulate that it was loaded from .env
-
-	testassert.NoError(t, m.Set(key, "new"))
-
-	data, err := os.ReadFile(path)
-	testassert.NoError(t, err)
-	body := string(data)
-	testassert.Require(t, !strings.Contains(body, key+"=old") && strings.Contains(body, key+"=new") && strings.Contains(body, "OTHER=x"), "old value still present: %q; new value missing: %q; unrelated line lost: %q", body, body, body)
-	{
-		got := os.Getenv(key)
-		testassert.Require(t, got == "new", "env %s = %q, want %q", key, got, "new")
-	}
-}
-
-func TestManagedEnvSetRefusesExternalKey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	testassert.NoError(t, os.WriteFile(path, []byte(""), 0o600))
-
-	key := envKeyForTest(t, "EXT_REFUSE")
-	t.Setenv(key, "external")
-
-	m := NewManagedEnvForTest(path)
-	err := m.Set(key, "overwrite")
-	testassert.Require(t, errors.Is(err, ErrExternalKey), "Set err = %v, want ErrExternalKey", err)
-	// Env unchanged.
-	{
-		got := os.Getenv(key)
-		testassert.Require(t, got == "external", "env %s = %q, want %q", key, got, "external")
-	}
-	// File unchanged.
-	data, _ := os.ReadFile(path)
-	if strings.Contains(string(data), key) {
-		t.Fatalf("file should not contain key after refused Set: %q", string(data))
-	}
-	// Not in managed set.
-	testassert.Require(t, !m.IsManaged(key), "refused key must not be in managed set")
 }
 
 func TestManagedEnvRejectsNULValueWithoutFileEffect(t *testing.T) {
@@ -203,48 +276,6 @@ func TestManagedEnvRejectsNULValueWithoutFileEffect(t *testing.T) {
 			}
 			testassert.Require(t, !m.IsManaged(key), "a NUL value marked the key managed")
 		})
-	}
-}
-
-func TestManagedEnvRemoveDeletesLineAndUnsets(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	key := envKeyForTest(t, "RM_LINE")
-	seed := "# header\n" + key + "=val\nKEEP=me\n"
-	testassert.NoError(t, os.WriteFile(path, []byte(seed), 0o600))
-	t.Setenv(key, "val") // ensure cleanup
-
-	m := NewManagedEnvForTest(path)
-	m.managed[key] = struct{}{}
-
-	testassert.NoError(t, m.Remove(key))
-
-	{
-		_, ok := os.LookupEnv(key)
-		testassert.Require(t, !ok, "env %s still set after Remove", key)
-	}
-	testassert.Require(t, !m.IsManaged(key), "key %s still managed after Remove", key)
-	data, err := os.ReadFile(path)
-	testassert.NoError(t, err)
-	body := string(data)
-	testassert.Require(t, !strings.Contains(body, key+"=") && strings.Contains(body, "# header") && strings.Contains(body, "KEEP=me"), "key line still in file: %q; comment lost: %q; unrelated line lost: %q", body, body, body)
-}
-
-func TestManagedEnvRemoveNoopForUnmanagedKey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	testassert.NoError(t, os.WriteFile(path, []byte("KEEP=me\n"), 0o600))
-
-	key := envKeyForTest(t, "RM_NOOP")
-	t.Setenv(key, "external")
-
-	m := NewManagedEnvForTest(path)
-	// Key is external, not managed.
-	testassert.NoError(t, m.Remove(key))
-	// Env still set.
-	{
-		got := os.Getenv(key)
-		testassert.Require(t, got == "external", "env %s = %q, want %q (should be untouched)", key, got, "external")
 	}
 }
 

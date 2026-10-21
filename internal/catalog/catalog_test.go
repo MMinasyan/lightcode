@@ -30,56 +30,25 @@ func TestCatalogLookupReturnsUnknownErrors(t *testing.T) {
 	}
 }
 
-func TestMergeDiscoveredProviderUpdatesExistingCost(t *testing.T) {
-	// Model already has cost with input=10, output=20.
-	// Discovery provides input=15, output=30, cache_read=5.
-	// Discovery should update all cost subfields.
-	in15 := 15.0
-	out30 := 30.0
-	cacheRead := 5.0
-	cat := &Catalog{Providers: map[string]*Provider{
-		"openai": {
-			ID:            "openai",
-			Name:          "OpenAI",
-			Transport:     Transport{BaseURL: "https://api.openai.com/v1"},
-			SystemRole:    RoleSystem,
-			UsageInStream: true,
-			ExtraBody:     map[string]any{},
-			Models: map[string]*Model{
-				"gpt-5.4-mini": {
-					ID:              "gpt-5.4-mini",
-					Name:            "GPT-5.4 mini",
-					ContextWindow:   400000,
-					MaxOutputTokens: 128000,
-					InputModalities: []Modality{ModalityText},
-					SystemRole:      RoleSystem,
-					UsageInStream:   true,
-					ExtraBody:       map[string]any{},
-					Cost:            &Cost{Input: ptrFloat64(10), Output: ptrFloat64(20)},
-				},
-			},
-		},
-	}}
-	err := cat.MergeDiscoveredProvider("openai", DiscoveredProvider{
-		Models: map[string]DiscoveredModel{
-			"gpt-5.4-mini": {
-				Name:          "GPT-5.4 mini",
-				ContextWindow: 400000,
-				Cost:          &Cost{Input: &in15, Output: &out30, CacheRead: &cacheRead},
-			},
-		},
-	})
-	testassert.NoError(t, err)
-	model := cat.Providers["openai"].Models["gpt-5.4-mini"]
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 15 && model.Cost.Output != nil && *model.Cost.Output == 30 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 5, "model.Cost.Input = %v, want 15; model.Cost.Output = %v, want 30; model.Cost.CacheRead = %v, want 5", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead)
+// mergeCostModel is the nominal typed merge model stem with the row's
+// existing cost; nil is the absent-cost state.
+func mergeCostModel(cost *Cost) *Model {
+	return &Model{
+		ID:              "gpt-5.4-mini",
+		Name:            "GPT-5.4 mini",
+		ContextWindow:   400000,
+		MaxOutputTokens: 128000,
+		InputModalities: []Modality{ModalityText},
+		SystemRole:      RoleSystem,
+		UsageInStream:   true,
+		ExtraBody:       map[string]any{},
+		Cost:            cost,
+	}
 }
 
-func TestMergeDiscoveredProviderPreservesCostFieldsDiscoveryDoesNotProvide(t *testing.T) {
-	// Model has input/output/cache_read/cache_write.
-	// Discovery only provides input/output.
-	// Should update input/output but keep cache_read and cache_write.
-	cat := &Catalog{Providers: map[string]*Provider{
+// mergeCostProvider wraps one model in the nominal typed merge provider.
+func mergeCostProvider(model *Model) *Catalog {
+	return &Catalog{Providers: map[string]*Provider{
 		"openai": {
 			ID:            "openai",
 			Name:          "OpenAI",
@@ -87,34 +56,54 @@ func TestMergeDiscoveredProviderPreservesCostFieldsDiscoveryDoesNotProvide(t *te
 			SystemRole:    RoleSystem,
 			UsageInStream: true,
 			ExtraBody:     map[string]any{},
-			Models: map[string]*Model{
-				"gpt-5.4-mini": {
-					ID:              "gpt-5.4-mini",
-					Name:            "GPT-5.4 mini",
-					ContextWindow:   400000,
-					MaxOutputTokens: 128000,
-					InputModalities: []Modality{ModalityText},
-					SystemRole:      RoleSystem,
-					UsageInStream:   true,
-					ExtraBody:       map[string]any{},
-					Cost:            &Cost{Input: ptrFloat64(10), Output: ptrFloat64(20), CacheRead: ptrFloat64(3), CacheWrite: ptrFloat64(7)},
-				},
-			},
+			Models:        map[string]*Model{model.ID: model},
 		},
 	}}
-	err := cat.MergeDiscoveredProvider("openai", DiscoveredProvider{
-		Models: map[string]DiscoveredModel{
-			"gpt-5.4-mini": {
-				Name:          "GPT-5.4 mini",
-				ContextWindow: 400000,
-				Cost:          &Cost{Input: ptrFloat64(12), Output: ptrFloat64(25)},
-			},
+}
+
+func TestMergeDiscoveredProviderCostFields(t *testing.T) {
+	rows := []struct {
+		name                          string
+		existing                      *Cost
+		discovered                    *Cost
+		wantInput, wantOutput         *float64
+		wantCacheRead, wantCacheWrite *float64
+	}{
+		{
+			name:          "updates existing cost",
+			existing:      &Cost{Input: ptrFloat64(10), Output: ptrFloat64(20)},
+			discovered:    &Cost{Input: ptrFloat64(15), Output: ptrFloat64(30), CacheRead: ptrFloat64(5)},
+			wantInput:     ptrFloat64(15),
+			wantOutput:    ptrFloat64(30),
+			wantCacheRead: ptrFloat64(5),
 		},
-	})
-	testassert.NoError(t, err)
-	model := cat.Providers["openai"].Models["gpt-5.4-mini"]
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 12 && model.Cost.Output != nil && *model.Cost.Output == 25 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 3 && model.Cost.CacheWrite != nil && *model.Cost.CacheWrite == 7, "model.Cost.Input = %v, want 12 (updated by discovery); model.Cost.Output = %v, want 25 (updated by discovery); model.Cost.CacheRead = %v, want 3 (preserved from existing); model.Cost.CacheWrite = %v, want 7 (preserved from existing)", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite)
+		{
+			name:           "preserves fields discovery omits",
+			existing:       &Cost{Input: ptrFloat64(10), Output: ptrFloat64(20), CacheRead: ptrFloat64(3), CacheWrite: ptrFloat64(7)},
+			discovered:     &Cost{Input: ptrFloat64(12), Output: ptrFloat64(25)},
+			wantInput:      ptrFloat64(12),
+			wantOutput:     ptrFloat64(25),
+			wantCacheRead:  ptrFloat64(3),
+			wantCacheWrite: ptrFloat64(7),
+		},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			cat := mergeCostProvider(mergeCostModel(row.existing))
+			err := cat.MergeDiscoveredProvider("openai", DiscoveredProvider{
+				Models: map[string]DiscoveredModel{
+					"gpt-5.4-mini": {
+						Name:          "GPT-5.4 mini",
+						ContextWindow: 400000,
+						Cost:          row.discovered,
+					},
+				},
+			})
+			testassert.NoError(t, err)
+			model := cat.Providers["openai"].Models["gpt-5.4-mini"]
+			assertCostFields(t, model.Cost, row.wantInput, row.wantOutput, row.wantCacheRead, row.wantCacheWrite)
+		})
+	}
 }
 
 func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing.T) {
@@ -146,6 +135,15 @@ func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing
 					ExtraBody:       map[string]any{},
 					Cost:            &Cost{Input: ptrFloat64(10), Output: ptrFloat64(11), CacheRead: ptrFloat64(12), CacheWrite: ptrFloat64(13)},
 				},
+				"zero-cost": {
+					ID:              "zero-cost",
+					Name:            "Zero Cost",
+					InputModalities: []Modality{ModalityText},
+					SystemRole:      RoleSystem,
+					UsageInStream:   true,
+					ExtraBody:       map[string]any{},
+					Cost:            &Cost{Input: ptrFloat64(0), Output: ptrFloat64(20)},
+				},
 			},
 		},
 	}}
@@ -162,17 +160,24 @@ func TestMergeDiscoveredProviderWithCostProtectionPreservesUserFields(t *testing
 			"omitted-costs": {
 				Cost: &Cost{Input: ptrFloat64(15)},
 			},
+			"zero-cost": {
+				Cost: &Cost{Input: ptrFloat64(15), Output: ptrFloat64(30)},
+			},
 		},
 	}, map[string]map[string]bool{
 		"gpt-5.4-mini": {"input": true},
+		"zero-cost":    {"input": true},
 	})
 	testassert.NoError(t, err)
 
 	protected := cat.Providers["openai"].Models["gpt-5.4-mini"].Cost
-	testassert.Require(t, protected.Input != nil && *protected.Input == 99 && protected.Output != nil && *protected.Output == 2 && protected.CacheRead != nil && *protected.CacheRead == 4 && protected.CacheWrite != nil && *protected.CacheWrite == 5, "protected input = %v, want 99; unprotected output = %v, want 2; unprotected cache_read = %v, want 4; unprotected cache_write = %v, want 5", protected.Input, protected.Output, protected.CacheRead, protected.CacheWrite)
+	assertCostFields(t, protected, ptrFloat64(99), ptrFloat64(2), ptrFloat64(4), ptrFloat64(5))
 
 	omitted := cat.Providers["openai"].Models["omitted-costs"].Cost
-	testassert.Require(t, omitted.Input != nil && *omitted.Input == 15 && omitted.Output != nil && *omitted.Output == 11 && omitted.CacheRead != nil && *omitted.CacheRead == 12 && omitted.CacheWrite != nil && *omitted.CacheWrite == 13, "omitted input = %v, want updated 15; omitted output = %v, want preserved 11; omitted cache_read = %v, want preserved 12; omitted cache_write = %v, want preserved 13", omitted.Input, omitted.Output, omitted.CacheRead, omitted.CacheWrite)
+	assertCostFields(t, omitted, ptrFloat64(15), ptrFloat64(11), ptrFloat64(12), ptrFloat64(13))
+
+	zero := cat.Providers["openai"].Models["zero-cost"].Cost
+	assertCostFields(t, zero, ptrFloat64(0), ptrFloat64(30), nil, nil)
 }
 
 func TestMergeDiscoveredProviderAddsCostWhenPreviouslyNil(t *testing.T) {
@@ -208,8 +213,7 @@ func TestMergeDiscoveredProviderAddsCostWhenPreviouslyNil(t *testing.T) {
 	})
 	testassert.NoError(t, err)
 	model := cat.Providers["local"].Models["qwen3"]
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil, want cost from discovery")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 5 && model.Cost.Output != nil && *model.Cost.Output == 10, "model.Cost.Input = %v, want 5; model.Cost.Output = %v, want 10", model.Cost.Input, model.Cost.Output)
+	assertCostFields(t, model.Cost, ptrFloat64(5), ptrFloat64(10), nil, nil)
 }
 
 func TestMergeDiscoveredProviderLeavesMaxOutputUnsetWhenDiscoveryOmits(t *testing.T) {

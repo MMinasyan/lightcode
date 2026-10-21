@@ -191,6 +191,18 @@ func pluginUnderTest(t *testing.T, dataDir string) (runtime.Tool, runtime.Tool) 
 	return openPlugin(t, Plugin(), dataDir)
 }
 
+// newPluginWorkspace installs the manager spy over fakeHome, opens the plugin
+// over dataDir, and builds a marked workspace. Each case keeps its own data
+// root, seeds, request log and query expectations.
+func newPluginWorkspace(t *testing.T, fakeHome, dataDir string) (spy *managerSpy, diag, symbol runtime.Tool, workspace string) {
+	t.Helper()
+	spy = &managerSpy{}
+	spy.install(t, fakeHome)
+	diag, symbol = pluginUnderTest(t, dataDir)
+	workspace = markerWorkspace(t)
+	return spy, diag, symbol, workspace
+}
+
 func openPlugin(t *testing.T, plugin runtime.Plugin, dataDir string) (runtime.Tool, runtime.Tool) {
 	t.Helper()
 	inst, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
@@ -300,11 +312,8 @@ func TestPluginCacheStaysHomeBased(t *testing.T) {
 	// ever reached.
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c1", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
@@ -334,11 +343,8 @@ func TestPluginCacheStaysHomeBased(t *testing.T) {
 func TestConcurrentFirstUsesJoinOneDetect(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
@@ -389,11 +395,8 @@ func TestDetectionOnceIncludingEmptyMap(t *testing.T) {
 // a second caller succeeds against the started server.
 func TestCanceledWaiterDoesNotCancelDetection(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0.4)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, _, symbol, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	first, cancelFirst := context.WithCancel(context.Background())
 	prepared := symbol.Prepare(first, runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c1", "workspace_symbol", `{"query":"x"}`))
@@ -534,11 +537,8 @@ func TestDeniedAndPreparedCallsStartNothing(t *testing.T) {
 // checked-group set.
 func TestDiagnosticsNoCursorAcrossCalls(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	seedGroup(t, dataDir, pluginSessionID, groupTwo, filepath.Join(workspace, "b.go"))
 	for _, name := range []string{"a.go", "b.go"} {
@@ -559,11 +559,8 @@ func TestDiagnosticsNoCursorAcrossCalls(t *testing.T) {
 // read.
 func TestDiagnosticsExcludesOtherSessions(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	seedGroup(t, dataDir, otherSessionID, groupTwo, filepath.Join(workspace, "b.go"))
 	for _, name := range []string{"a.go", "b.go"} {
@@ -581,11 +578,8 @@ func TestDiagnosticsExcludesOtherSessions(t *testing.T) {
 // dropped un-read.
 func TestDiagnosticsDropsOutsideRootPaths(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	outside := filepath.Join(t.TempDir(), "outside.go")
 	seedGroup(t, dataDir, pluginSessionID, groupTwo, outside)
@@ -606,11 +600,8 @@ func TestDiagnosticsDropsOutsideRootPaths(t *testing.T) {
 // to the real root and the tool succeeds against it.
 func TestSymlinkedWorkspaceBindsToRealRoot(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	realRoot := markerWorkspace(t)
+	spy, diag, _, realRoot := newPluginWorkspace(t, fakeHome, dataDir)
 	testassert.NoError(t, os.WriteFile(filepath.Join(realRoot, "a.go"), []byte("package w\n"), 0o600))
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(realRoot, "a.go"))
 	link := filepath.Join(t.TempDir(), "link")
@@ -632,11 +623,8 @@ func TestSymlinkedWorkspaceBindsToRealRoot(t *testing.T) {
 func TestPostAuthorizationBindingChangeFailsWithoutStart(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	realRoot := markerWorkspace(t)
+	spy, diag, _, realRoot := newPluginWorkspace(t, fakeHome, dataDir)
 	link := filepath.Join(t.TempDir(), "link")
 	testassert.NoError(t, os.Symlink(realRoot, link))
 
@@ -658,11 +646,8 @@ func TestPostAuthorizationBindingChangeFailsWithoutStart(t *testing.T) {
 // content.
 func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	// One healthy file (its sync proves the opens completed) and one
 	// replaced-symlink leaf (its canonical read fails, so partial
@@ -702,15 +687,12 @@ func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 // a successful text line that reads as a clean query.
 func TestDiagnosticsListingFailureIsError(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
 	// The valid Session identity's session path is a regular file: the
 	// enumeration fails for real.
 	testassert.NoError(t, os.MkdirAll(filepath.Join(dataDir, "code"), 0o755))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "code", pluginSessionID), []byte("x"), 0o600))
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
@@ -721,11 +703,8 @@ func TestDiagnosticsListingFailureIsError(t *testing.T) {
 // content.
 func TestDiagnosticsNoFiles(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
@@ -743,11 +722,8 @@ func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
 	}
 
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	_, symbolTool := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, _, symbolTool, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := symbolTool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":""}`))
 	testassert.Require(t, prepared.Immediate != nil && prepared.Immediate.Result.Status == model.ResultError, "empty-query preparation = %+v, want the immediate validation error", prepared)
@@ -762,11 +738,8 @@ func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
 func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 	home := t.TempDir()
 	plantServer(t, home, "gopls", "gopls", 0, "", "1", "")
-	spy := &managerSpy{}
-	spy.install(t, home)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, _, symbol, workspace := newPluginWorkspace(t, home, dataDir)
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
@@ -779,11 +752,8 @@ func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 func TestWorkspaceSymbolEmptyReplyIsSuccessful(t *testing.T) {
 	home := t.TempDir()
 	plantServer(t, home, "gopls", "gopls", 0, "", "", "1")
-	spy := &managerSpy{}
-	spy.install(t, home)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, _, symbol, workspace := newPluginWorkspace(t, home, dataDir)
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
@@ -894,11 +864,8 @@ func TestContentCap(t *testing.T) {
 // by the truncation marker — bounded content through the all-failed error path.
 func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	const count = 1000
 	for i := 0; i < count; i++ {

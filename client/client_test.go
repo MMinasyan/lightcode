@@ -356,10 +356,9 @@ func TestConnectHealthClassification(t *testing.T) {
 		mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
 		})
-		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, r *http.Request) {
 			redirected = true
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":%q}`, testInstance, testVersion)
+			jsonHealth(testInstance, testVersion)(w, r)
 		})
 		server := httptest.NewServer(mux)
 		t.Cleanup(server.Close)

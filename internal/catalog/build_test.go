@@ -633,29 +633,32 @@ func TestBuildSkipsRetiredProviderControlsWithWarning(t *testing.T) {
 	}
 }
 
-func TestBuildDiscoveryUpdatesBundledCostFields(t *testing.T) {
-	// Bundled model has cost with input=10, output=20.
-	// Discovery cache has updated cost with input=15, output=30.
-	// Discovery should update the cost fields.
-	in15 := 15.0
-	out30 := 30.0
-	result := Build(BuildInputs{
-		Bundled: map[string]json.RawMessage{
-			"openai": rawProviderJSON(`{
-				"id": "openai",
-				"name": "OpenAI",
-				"transport": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
-				"discovery": true,
-				"models": {
-					"gpt-5.4-mini": {
-						"name": "GPT-5.4 mini",
-						"context_window": 400000,
-						"max_output_tokens": 128000,
-						"cost": {"input": 10, "output": 20}
-					}
-				}
-			}`),
-		},
+// buildCostProviderDocument is the raw bundled provider for the
+// discovery-cost rows: one OpenAI provider whose single model carries the
+// row's cost object.
+func buildCostProviderDocument(cost string) json.RawMessage {
+	return rawProviderJSON(fmt.Sprintf(`{
+		"id": "openai",
+		"name": "OpenAI",
+		"transport": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
+		"discovery": true,
+		"models": {
+			"gpt-5.4-mini": {
+				"name": "GPT-5.4 mini",
+				"context_window": 400000,
+				"max_output_tokens": 128000,
+				"cost": %s
+			}
+		}
+	}`, cost))
+}
+
+// buildCostInputs is one raw Build input over the nominal provider: the
+// bundled cost, an optional user override for the same model's cost, and the
+// matching discovery record.
+func buildCostInputs(bundledCost string, userCost map[string]any, discovered *Cost) BuildInputs {
+	inputs := BuildInputs{
+		Bundled: map[string]json.RawMessage{"openai": buildCostProviderDocument(bundledCost)},
 		Records: map[string]DiscoveryRecord{
 			"openai": {
 				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
@@ -663,153 +666,115 @@ func TestBuildDiscoveryUpdatesBundledCostFields(t *testing.T) {
 					"gpt-5.4-mini": {
 						Name:          "GPT-5.4 mini",
 						ContextWindow: 400000,
-						Cost:          &Cost{Input: &in15, Output: &out30},
+						Cost:          discovered,
 					},
 				},
 			},
 		},
-	})
-	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v", result.Warnings)
-	_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"})
-	testassert.NoError(t, err)
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil, want cost from discovery")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 15 && model.Cost.Output != nil && *model.Cost.Output == 30, "model.Cost.Input = %v, want 15 from discovery; model.Cost.Output = %v, want 30 from discovery", model.Cost.Input, model.Cost.Output)
-}
-
-func TestBuildDiscoveryMergesCostSubfieldsOverBundled(t *testing.T) {
-	// Bundled has input/output. Discovery has input/output/cache_read.
-	// Discovery should merge: update input/output, add cache_read.
-	in5 := 5.0
-	out12 := 12.0
-	cacheRead := 1.5
-	result := Build(BuildInputs{
-		Bundled: map[string]json.RawMessage{
-			"openai": rawProviderJSON(`{
-				"id": "openai",
-				"name": "OpenAI",
-				"transport": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
-				"discovery": true,
-				"models": {
-					"gpt-5.4-mini": {
-						"name": "GPT-5.4 mini",
-						"context_window": 400000,
-						"max_output_tokens": 128000,
-						"cost": {"input": 10, "output": 20}
-					}
-				}
-			}`),
-		},
-		Records: map[string]DiscoveryRecord{
-			"openai": {
-				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
-				Models: map[string]DiscoveredModel{
-					"gpt-5.4-mini": {
-						Name:          "GPT-5.4 mini",
-						ContextWindow: 400000,
-						Cost:          &Cost{Input: &in5, Output: &out12, CacheRead: &cacheRead},
-					},
-				},
-			},
-		},
-	})
-	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v", result.Warnings)
-	_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"})
-	testassert.NoError(t, err)
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 5 && model.Cost.Output != nil && *model.Cost.Output == 12 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 1.5, "model.Cost.Input = %v, want 5 (updated by discovery); model.Cost.Output = %v, want 12 (updated by discovery); model.Cost.CacheRead = %v, want 1.5 (added by discovery)", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead)
-}
-
-func TestBuildDiscoveryDoesNotOverrideUserCostFields(t *testing.T) {
-	// User cost is an explicit override. Discovery may update bundled prices, but
-	// must not overwrite fields the user set.
-	result := Build(BuildInputs{
-		Bundled: map[string]json.RawMessage{
-			"openai": rawProviderJSON(`{
-				"id": "openai",
-				"name": "OpenAI",
-				"transport": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
-				"discovery": true,
-				"models": {
-					"gpt-5.4-mini": {
-						"name": "GPT-5.4 mini",
-						"context_window": 400000,
-						"max_output_tokens": 128000,
-						"cost": {"input": 10, "output": 20, "cache_read": 2}
-					}
-				}
-			}`),
-		},
-		UserRaw: map[string]any{
+	}
+	if userCost != nil {
+		inputs.UserRaw = map[string]any{
 			"openai": map[string]any{
 				"models": map[string]any{
-					"gpt-5.4-mini": map[string]any{
-						"cost": map[string]any{"input": 99.0},
-					},
+					"gpt-5.4-mini": map[string]any{"cost": userCost},
 				},
 			},
-		},
-		Records: map[string]DiscoveryRecord{
-			"openai": {
-				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
-				Models: map[string]DiscoveredModel{
-					"gpt-5.4-mini": {
-						Name:          "GPT-5.4 mini",
-						ContextWindow: 400000,
-						Cost:          &Cost{Input: ptrFloat64(8), Output: ptrFloat64(12), CacheRead: ptrFloat64(1)},
-					},
-				},
-			},
-		},
-	})
-	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v", result.Warnings)
-	_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"})
-	testassert.NoError(t, err)
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 99 && model.Cost.Output != nil && *model.Cost.Output == 12 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == 1, "model.Cost.Input = %v, want 99 from user override; model.Cost.Output = %v, want 12 from discovery; model.Cost.CacheRead = %v, want 1 from discovery", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead)
+		}
+	}
+	return inputs
 }
 
-func TestBuildDiscoveryPreservesExistingCostFieldsItDoesNotProvide(t *testing.T) {
-	// Bundled has input/output/cache_read. Discovery only has input.
-	// Discovery should update input, but keep output and cache_read from bundled.
-	cacheRead := 3.0
-	result := Build(BuildInputs{
-		Bundled: map[string]json.RawMessage{
-			"openai": rawProviderJSON(`{
-				"id": "openai",
-				"name": "OpenAI",
-				"transport": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
-				"discovery": true,
-				"models": {
-					"gpt-5.4-mini": {
-						"name": "GPT-5.4 mini",
-						"context_window": 400000,
-						"max_output_tokens": 128000,
-						"cost": {"input": 10, "output": 20, "cache_read": 3}
-					}
-				}
-			}`),
+func TestBuildDiscoveryMergesCostFields(t *testing.T) {
+	rows := []struct {
+		name                          string
+		bundledCost                   string
+		userCost                      map[string]any
+		discovered                    *Cost
+		wantInput, wantOutput         *float64
+		wantCacheRead, wantCacheWrite *float64
+	}{
+		{
+			name:        "updates bundled input and output",
+			bundledCost: `{"input": 10, "output": 20}`,
+			discovered:  &Cost{Input: ptrFloat64(15), Output: ptrFloat64(30)},
+			wantInput:   ptrFloat64(15),
+			wantOutput:  ptrFloat64(30),
 		},
-		Records: map[string]DiscoveryRecord{
-			"openai": {
-				TransportFingerprint: transportFingerprint(Transport{BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"}),
-				Models: map[string]DiscoveredModel{
-					"gpt-5.4-mini": {
-						Name:          "GPT-5.4 mini",
-						ContextWindow: 400000,
-						Cost:          &Cost{Input: ptrFloat64(8)},
-					},
-				},
-			},
+		{
+			name:          "adds discovered cache_read",
+			bundledCost:   `{"input": 10, "output": 20}`,
+			discovered:    &Cost{Input: ptrFloat64(5), Output: ptrFloat64(12), CacheRead: ptrFloat64(1.5)},
+			wantInput:     ptrFloat64(5),
+			wantOutput:    ptrFloat64(12),
+			wantCacheRead: ptrFloat64(1.5),
 		},
-	})
-	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v", result.Warnings)
-	_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"})
-	testassert.NoError(t, err)
-	testassert.Require(t, model.Cost != nil, "model.Cost = nil")
-	testassert.Require(t, model.Cost.Input != nil && *model.Cost.Input == 8 && model.Cost.Output != nil && *model.Cost.Output == 20 && model.Cost.CacheRead != nil && *model.Cost.CacheRead == cacheRead, "model.Cost.Input = %v, want 8 (updated by discovery); model.Cost.Output = %v, want 20 (preserved from bundled); model.Cost.CacheRead = %v, want 3 (preserved from bundled)", model.Cost.Input, model.Cost.Output, model.Cost.CacheRead)
+		{
+			name:          "user field wins over discovery",
+			bundledCost:   `{"input": 10, "output": 20, "cache_read": 2}`,
+			userCost:      map[string]any{"input": 99.0},
+			discovered:    &Cost{Input: ptrFloat64(8), Output: ptrFloat64(12), CacheRead: ptrFloat64(1)},
+			wantInput:     ptrFloat64(99),
+			wantOutput:    ptrFloat64(12),
+			wantCacheRead: ptrFloat64(1),
+		},
+		{
+			name:          "preserves bundled fields discovery omits",
+			bundledCost:   `{"input": 10, "output": 20, "cache_read": 3}`,
+			discovered:    &Cost{Input: ptrFloat64(8)},
+			wantInput:     ptrFloat64(8),
+			wantOutput:    ptrFloat64(20),
+			wantCacheRead: ptrFloat64(3),
+		},
+		{
+			name:        "user-owned zero input is preserved",
+			bundledCost: `{"input": 10, "output": 20}`,
+			userCost:    map[string]any{"input": 0.0},
+			discovered:  &Cost{Input: ptrFloat64(8), Output: ptrFloat64(12)},
+			wantInput:   ptrFloat64(0),
+			wantOutput:  ptrFloat64(12),
+		},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			result := Build(buildCostInputs(row.bundledCost, row.userCost, row.discovered))
+			testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v", result.Warnings)
+			_, model, err := result.Catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"})
+			testassert.NoError(t, err)
+			assertCostFields(t, model.Cost, row.wantInput, row.wantOutput, row.wantCacheRead, row.wantCacheWrite)
+		})
+	}
 }
 
 func ptrFloat64(v float64) *float64 { return &v }
+
+// assertCostFields checks each cost subfield's independent presence and value.
+// A nil want is an absent field, not a zero.
+func assertCostFields(t *testing.T, cost *Cost, input, output, cacheRead, cacheWrite *float64) {
+	t.Helper()
+	testassert.Require(t, cost != nil, "model.Cost = nil")
+	for _, field := range []struct {
+		name      string
+		got, want *float64
+	}{
+		{"input", cost.Input, input},
+		{"output", cost.Output, output},
+		{"cache_read", cost.CacheRead, cacheRead},
+		{"cache_write", cost.CacheWrite, cacheWrite},
+	} {
+		if field.want == nil {
+			testassert.Require(t, field.got == nil, "%s = %s, want absent", field.name, costFieldValue(field.got))
+			continue
+		}
+		testassert.Require(t, field.got != nil && *field.got == *field.want, "%s = %s, want %g", field.name, costFieldValue(field.got), *field.want)
+	}
+}
+
+func costFieldValue(v *float64) string {
+	if v == nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%g", *v)
+}
 
 func BenchmarkBuildCatalog(b *testing.B) {
 	bundled, err := readBundledProviders(bundledFS)

@@ -110,23 +110,29 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
-	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
 	path := filepath.Join(dir, "runtime.json")
-	testassert.NoError(t, os.WriteFile(path, raw, 0600))
+	testassert.NoError(t, os.WriteFile(path, discoveryRecord(server.URL, instance), 0600))
 	conn, err := client.Connect(context.Background(), path)
 	testassert.NoError(t, err)
 	return clienthost.Options{DataDir: dir}, conn
 }
-func health(w http.ResponseWriter) {
+
+// discoveryRecord builds one private discovery document for the given owner.
+func discoveryRecord(endpoint, owner string) []byte {
+	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
+	return raw
+}
+
+func health(w http.ResponseWriter, owner string) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: instance, ProtocolVersion: protocol.N2})
+	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N2})
 }
 
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {
 	t.Helper()
 	_, conn := discovery(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		testassert.Check(t, r.URL.Path == "/v1/health", "unexpected discovery %s", r.URL.Path)
-		health(w)
+		health(w, instance)
 	}))
 	transport := &scriptedTransport{requests: make(chan request, 32)}
 	generated, ok := conn.ClientWithResponses.ClientInterface.(*protocol.Client)

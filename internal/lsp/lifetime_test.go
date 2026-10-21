@@ -154,6 +154,22 @@ func TestWorkspaceSymbolReturnsCanceledNotSwallowed(t *testing.T) {
 	testassert.Equal(t, content, "")
 }
 
+// readyGoInstance registers one all-zero ready fake .go instance under a new
+// Manager. Per-test files, request-log setup, instance-lock gates and queries
+// stay outside.
+func readyGoInstance(t *testing.T) (*instance, *Manager) {
+	t.Helper()
+	log := filepath.Join(t.TempDir(), "launches.log")
+	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
+	testassert.NoError(t, inst.waitReady(context.Background()))
+	m := NewManager(t.TempDir(), t.TempDir())
+	def := server.ForExtension(".go")
+	m.mu.Lock()
+	m.instances[def.Name] = inst
+	m.mu.Unlock()
+	return inst, m
+}
+
 // TestGetDiagnosticsCanonicalCancellationReturnsPartial pins the cancellation
 // observation at the sample window: a canceled caller gets the could-not-check
 // content accumulated so far with the cancellation error. The instance mutex
@@ -165,14 +181,7 @@ func TestWorkspaceSymbolReturnsCanceledNotSwallowed(t *testing.T) {
 // returned partial proves the query reached the window instead of the
 // nothing-synchronized gate.
 func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	testassert.NoError(t, inst.waitReady(context.Background()))
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
+	inst, m := readyGoInstance(t)
 
 	dir := t.TempDir()
 	healthy := filepath.Join(dir, "healthy.go")
@@ -208,14 +217,7 @@ func TestGetDiagnosticsCanonicalCancellationReturnsPartial(t *testing.T) {
 func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	testassert.NoError(t, inst.waitReady(context.Background()))
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
+	_, m := readyGoInstance(t)
 
 	dir := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.go")
@@ -239,14 +241,7 @@ func TestGetDiagnosticsCanonicalRefusesReplacedSymlink(t *testing.T) {
 // cannot block the openat — the no-follow open settles immediately, none
 // synchronizes, and the retained could-not-check line is the all-failed error.
 func TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	testassert.NoError(t, inst.waitReady(context.Background()))
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
+	_, m := readyGoInstance(t)
 
 	fifo := filepath.Join(t.TempDir(), "fifo.go")
 	if err := unix.Mkfifo(fifo, 0o600); err != nil {
@@ -278,14 +273,7 @@ func TestGetDiagnosticsCanonicalWriterlessFIFOIsCouldNotCheck(t *testing.T) {
 // synchronizable regular sibling still produces the explicit failed-path lines
 // and the sampled result.
 func TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	testassert.NoError(t, inst.waitReady(context.Background()))
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
+	_, m := readyGoInstance(t)
 
 	dir := t.TempDir()
 	healthy := filepath.Join(dir, "healthy.go")
@@ -306,14 +294,7 @@ func TestGetDiagnosticsCanonicalRefusedDocumentsAreCouldNotCheck(t *testing.T) {
 func TestGetDiagnosticsCanonicalRefusesHardlinkedLeaf(t *testing.T) {
 	reqLog := filepath.Join(t.TempDir(), "requests.log")
 	t.Setenv("FAKE_LSP_REQUESTS_LOG", reqLog)
-	log := filepath.Join(t.TempDir(), "launches.log")
-	inst := newFakeServerInstance(t, log, "", 0, 0, "", "")
-	testassert.NoError(t, inst.waitReady(context.Background()))
-	m := NewManager(t.TempDir(), t.TempDir())
-	def := server.ForExtension(".go")
-	m.mu.Lock()
-	m.instances[def.Name] = inst
-	m.mu.Unlock()
+	_, m := readyGoInstance(t)
 
 	dir := t.TempDir()
 	original := filepath.Join(dir, "original.go")

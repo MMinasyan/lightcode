@@ -781,8 +781,7 @@ func (f *gatedFixture) health(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
+	jsonHealth()(w, r)
 }
 
 func (f *gatedFixture) events(w http.ResponseWriter, r *http.Request) {
@@ -889,7 +888,7 @@ func TestDesktopHostPendingOpenRejectsOldStamps(t *testing.T) {
 func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
 	var mu sync.Mutex
 	var healthCalls int
-	failingHealth := func(w http.ResponseWriter, _ *http.Request) {
+	failingHealth := func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		healthCalls++
 		second := healthCalls > 1
@@ -899,8 +898,7 @@ func TestDesktopHostFailedOpenDoesNotResurrectOldStamp(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
+		jsonHealth()(w, r)
 	}
 	server := newFixture(t, failingHealth, parkedStream())
 	host := newHost(t, server)

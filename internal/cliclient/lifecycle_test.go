@@ -48,7 +48,7 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/health":
-			health(w)
+			health(w, instance)
 		case r.URL.Path == "/v1/events":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
@@ -93,8 +93,7 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 	}))
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
-	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
-	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600))
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), discoveryRecord(server.URL, instance), 0600))
 	live.opts = clienthost.Options{DataDir: dir}
 	return live
 }

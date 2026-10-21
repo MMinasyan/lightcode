@@ -179,8 +179,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			requests := make(chan request, 16)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/health" {
-					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N2})
+					health(w, owner)
 					return
 				}
 				if r.URL.Path == "/v1/events" {
@@ -202,8 +201,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			}))
 			defer server.Close()
 			dir := t.TempDir()
-			raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": owner, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
-			testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600))
+			testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), discoveryRecord(server.URL, owner), 0600))
 			c.mu.Lock()
 			c.opts.Startup = clienthost.Options{DataDir: dir}
 			c.mu.Unlock()

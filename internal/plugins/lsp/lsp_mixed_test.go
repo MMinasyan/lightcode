@@ -28,12 +28,8 @@ import (
 func TestMixedDetectionReturnsAvailableServerContent(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
 	pyrightLog := plantServer(t, fakeHome, "pyright", "pyright-langserver", 0, "1", "", "")
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-
-	workspace := markerWorkspace(t)
+	_, _, symbol, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte("[project]\n"), 0o600))
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))

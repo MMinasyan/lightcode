@@ -355,17 +355,33 @@ func (e fsFakeEntry) IsDir() bool                { return e.mode.IsDir() }
 func (e fsFakeEntry) Type() os.FileMode          { return e.mode.Type() }
 func (e fsFakeEntry) Info() (os.FileInfo, error) { return nil, os.ErrNotExist }
 
-func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
+// workspaceRepointFixture builds the two real trees and the Workspace root
+// symlink the repointed-root cases share. The caller keeps each operation's
+// own normalization, preparation and execution.
+func workspaceRepointFixture(t *testing.T, realAContent string) (realA, realB, root string) {
+	t.Helper()
 	base := t.TempDir()
-	realA := filepath.Join(base, "realA")
-	realB := filepath.Join(base, "realB")
+	realA = filepath.Join(base, "realA")
+	realB = filepath.Join(base, "realB")
 	for _, dir := range []string{realA, realB} {
 		testassert.NoError(t, os.Mkdir(dir, 0o755))
 	}
-	testassert.NoError(t, os.WriteFile(filepath.Join(realA, "f.txt"), []byte("A-content"), 0o644))
-	testassert.NoError(t, os.WriteFile(filepath.Join(realB, "f.txt"), []byte("B-content"), 0o644))
-	root := filepath.Join(base, "w")
+	testassert.NoError(t, os.WriteFile(filepath.Join(realA, "f.txt"), []byte(realAContent), 0o644))
+	root = filepath.Join(base, "w")
 	testassert.NoError(t, os.Symlink(realA, root))
+	return realA, realB, root
+}
+
+// repointWorkspaceRoot points the Workspace root symlink at another tree.
+func repointWorkspaceRoot(t *testing.T, root, target string) {
+	t.Helper()
+	testassert.NoError(t, os.Remove(root))
+	testassert.NoError(t, os.Symlink(target, root))
+}
+
+func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
+	realA, realB, root := workspaceRepointFixture(t, "A-content")
+	testassert.NoError(t, os.WriteFile(filepath.Join(realB, "f.txt"), []byte("B-content"), 0o644))
 
 	// The target is addressed directly under the real directory, so its
 	// canonical path is independent of the root symlink; only the bound
@@ -386,8 +402,7 @@ func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	testassert.NoError(t, err)
 	prepared, err = PrepareReadCall(root, "", config.ToolsConfig{ReadMaxLines: 500}, args)
 	testassert.NoError(t, err)
-	testassert.NoError(t, os.Remove(root))
-	testassert.NoError(t, os.Symlink(realB, root))
+	repointWorkspaceRoot(t, root, realB)
 	{
 		_, err := prepared.Execute(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "workspace root changed"), "Execute error = %v, want workspace root change refusal", err)
@@ -397,23 +412,14 @@ func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 }
 
 func TestPrepareWriteRevalidatesRepointedWorkspaceRoot(t *testing.T) {
-	base := t.TempDir()
-	realA := filepath.Join(base, "realA")
-	realB := filepath.Join(base, "realB")
-	for _, dir := range []string{realA, realB} {
-		testassert.NoError(t, os.Mkdir(dir, 0o755))
-	}
-	testassert.NoError(t, os.WriteFile(filepath.Join(realA, "f.txt"), []byte("x"), 0o644))
-	root := filepath.Join(base, "w")
-	testassert.NoError(t, os.Symlink(realA, root))
+	realA, realB, root := workspaceRepointFixture(t, "x")
 	store := &applyPatchStore{turn: 1}
 
 	args, err := NormalizeWriteArgs(map[string]any{"path": filepath.Join(realA, "f.txt"), "content": "y"})
 	testassert.NoError(t, err)
 	prepared, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, store, args)
 	testassert.NoError(t, err)
-	testassert.NoError(t, os.Remove(root))
-	testassert.NoError(t, os.Symlink(realB, root))
+	repointWorkspaceRoot(t, root, realB)
 	{
 		_, err := prepared.Execute(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "workspace root changed"), "Execute error = %v, want workspace root change refusal", err)
@@ -427,15 +433,7 @@ func TestPrepareWriteRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 }
 
 func TestPreparePatchRevalidatesRepointedWorkspaceRoot(t *testing.T) {
-	base := t.TempDir()
-	realA := filepath.Join(base, "realA")
-	realB := filepath.Join(base, "realB")
-	for _, dir := range []string{realA, realB} {
-		testassert.NoError(t, os.Mkdir(dir, 0o755))
-	}
-	testassert.NoError(t, os.WriteFile(filepath.Join(realA, "f.txt"), []byte("hi"), 0o644))
-	root := filepath.Join(base, "w")
-	testassert.NoError(t, os.Symlink(realA, root))
+	realA, realB, root := workspaceRepointFixture(t, "hi")
 	store := &applyPatchStore{turn: 1}
 	input := applyPatchInput(t, "*** Update File: "+filepath.Join(realA, "f.txt")+"\n@@\n-hi\n+bye")
 
@@ -445,8 +443,7 @@ func TestPreparePatchRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	testassert.NoError(t, err)
 	prepared, err := PreparePatchCall(root, rootCanonical, "", CapabilityOptions{}, store, args)
 	testassert.NoError(t, err)
-	testassert.NoError(t, os.Remove(root))
-	testassert.NoError(t, os.Symlink(realB, root))
+	repointWorkspaceRoot(t, root, realB)
 	{
 		_, err := prepared.Execute(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "workspace root changed"), "Execute error = %v, want workspace root change refusal", err)
