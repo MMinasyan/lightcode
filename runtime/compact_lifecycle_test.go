@@ -67,19 +67,13 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				if lastUserText(body) == "first question" {
 					// The seed report: {5000,10} overflows the window 8192
 					// minus the reserve 4096.
-					return []string{
-						`{"choices":[{"delta":{"role":"assistant","content":"seeded answer"},"finish_reason":null}]}`,
-						`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`,
-					}
+					return append(textTurnEvents("seeded answer"),
+						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
 				}
 				return nil // conversation turns: the default completed text turn
 			}
-			return []string{
-				`{"choices":[{"delta":{"role":"assistant","content":"native summary one"},"finish_reason":null}]}`,
-				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`,
-			}
+			return append(textTurnEvents("native summary one"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
 		})
 
 		sub, err := r.Subscribe(256)
@@ -217,17 +211,47 @@ func assertProgressScopedToOperations(t *testing.T, event Event, sessionID strin
 	return fmt.Errorf("progress carries operation %q outside %v", body.OperationId, operationIDs)
 }
 
-// compactRawMessageAdmission builds one message-kind admission payload.
-func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
+// rawAdmissionValues carries the authored execution values of one raw
+// message-kind admission seed.
+type rawAdmissionValues struct {
+	agentType     string
+	model         usageWireRef
+	outputReserve int
+	systemPrompt  string
+	tools         string
+	compactModel  usageWireRef
+	compactPrompt string
+}
+
+// rawMessageAdmission builds one message-kind admission payload from the
+// caller's authored execution values.
+func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionValues) string {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return fmt.Sprintf(
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"solo",`+
-			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"m"},`+
-			`"context_window":4096,"output_reserve":1024,`+
-			`"system_prompt":"compact-sys","tools":[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"prov","model":"m"},"system_prompt":"summarize"}},"admitted_at":%q}`,
-		sessionID, operationID, sessionID, entryID, now)
+			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":%q,`+
+			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
+			`"context_window":4096,"output_reserve":%d,`+
+			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
+			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q}},"admitted_at":%q}`,
+		sessionID, operationID, sessionID, entryID, v.agentType,
+		v.model.Provider, v.model.Model, v.outputReserve,
+		v.systemPrompt, v.tools,
+		v.compactModel.Provider, v.compactModel.Model, v.compactPrompt, now)
+}
+
+// compactRawMessageAdmission builds the compact and paging fixtures'
+// message-kind admission payload.
+func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
+	return rawMessageAdmission(sessionID, operationID, entryID, rawAdmissionValues{
+		agentType:     "solo",
+		model:         usageWireRef{Provider: "prov", Model: "m"},
+		outputReserve: 1024,
+		systemPrompt:  "compact-sys",
+		tools:         `[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}]`,
+		compactModel:  usageWireRef{Provider: "prov", Model: "m"},
+		compactPrompt: "summarize",
+	})
 }
 
 func compactRawOperationRegister(admission, state string) string {
@@ -240,16 +264,16 @@ func compactRawRunningModelState(now, reserved string) string {
 		now, reserved)
 }
 
-func compactRawSuccessState(now, settlementEntry, sessionID string) string {
+func compactRawSuccessState(now, settlementEntry, sessionID, usage string) string {
 	return fmt.Sprintf(
-		`{"status":"success","started_at":%q,"settled_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]},"terminal":{"settlement_entry":{"session_id":%q,"entry_id":%q}}}`,
-		now, now, sessionID, settlementEntry)
+		`{"status":"success","started_at":%q,"settled_at":%q,"pending_tool_calls":[],"usage":%s,"terminal":{"settlement_entry":{"session_id":%q,"entry_id":%q}}}`,
+		now, now, usage, sessionID, settlementEntry)
 }
 
-func compactRawInputEntry(sessionID, entryID, operationID, text string) string {
+func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"user","content":[{"kind":"text","text":%q}]}`,
-		sessionID, entryID, operationID, text)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":%q,"content":[{"kind":"text","text":%q}]}`,
+		sessionID, entryID, operationID, origin, text)
 }
 
 func compactRawAssistantEntry(sessionID, entryID, operationID, text string) string {
@@ -259,10 +283,10 @@ func compactRawAssistantEntry(sessionID, entryID, operationID, text string) stri
 		sessionID, entryID, operationID, text)
 }
 
-func compactRawSettlementEntry(sessionID, entryID, operationID string) string {
+func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`,
-		sessionID, entryID, operationID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"%s}`,
+		sessionID, entryID, operationID, extra)
 }
 
 func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundaryID string) string {
@@ -281,11 +305,11 @@ func compactRawSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inputID, assistantID, settlementID := newLifecycleID(t), newLifecycleID(t), newLifecycleID(t)
-	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, inputText))
+	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, "user", inputText))
 	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, assistantText))
-	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID))
+	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID, ""))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
-		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID)))
+		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID, `{"by_model":[]}`)))
 	return assistantID
 }
 
@@ -323,15 +347,7 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		submitThroughRuntime(t, r, sessionID, "op-1", "please write")
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
-		var durable harness.ExecutionCapture
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			rec, err := h.ReadOperation(ctx, sessionID, "op-1")
-			if err != nil {
-				return err
-			}
-			durable = rec.Admission.Execution
-			return nil
-		}))
+		durable := readOperation(t, r, sessionID, "op-1").Admission.Execution
 		seenMu.Lock()
 		seen := seenCompact
 		revision := seenRevision
@@ -356,18 +372,7 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		// capture, whose admission rejects and whose item is dropped — the
 		// never-admitted check below pins every path, so only an accepted
 		// admission fails the row.
-		var rejected harness.SubmitResult
-		err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			var serr error
-			rejected, serr = h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   sessionID,
-				OperationID: "op-2",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "please write"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return serr
-		})
+		rejected, err := submitRawThroughRuntime(ctx, r, sessionID, "op-2", "please write", harness.MessageModeRegular)
 		testassert.Require(t, err != nil || rejected.Disposition != harness.DispositionAdmitted, "a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
 		{
 			_, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"})
@@ -392,31 +397,13 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		freedSession, err := r.createSession(ctx, e.workspace("compact-freed"), "freedworker")
 		testassert.NoError(t, err)
 		freedID := freedSession.Identity.SessionID
-		var freed harness.SubmitResult
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			var serr error
-			freed, serr = h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   freedID,
-				OperationID: "op-3",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "please write"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return serr
-		}))
-		testassert.Equal(t, freed.Disposition, harness.DispositionAdmitted)
+		submitThroughRuntime(t, r, freedID, "op-3", "please write")
 		awaitOperation(t, r, freedID, "op-3", harness.OperationSuccess)
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			rec, err := h.ReadOperation(ctx, freedID, "op-3")
-			if err != nil {
-				return err
-			}
-			testassert.Require(t, strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed"), "capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
-			for _, tool := range rec.Admission.Execution.Tools {
-				testassert.Require(t, tool.Description == "freed description", "tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
-			}
-			return nil
-		}))
+		rec := readOperation(t, r, freedID, "op-3")
+		testassert.Require(t, strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed"), "capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
+		for _, tool := range rec.Admission.Execution.Tools {
+			testassert.Require(t, tool.Description == "freed description", "tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
+		}
 	})
 }
 

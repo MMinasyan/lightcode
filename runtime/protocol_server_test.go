@@ -50,6 +50,16 @@ func openProtocolServer(t *testing.T, r *Runtime) *ProtocolServer {
 	return ps
 }
 
+// openProtocolOwner opens one default-document owner over the given store for
+// the protocol rows.
+func openProtocolOwner(t *testing.T, store harness.Storage) (*Runtime, *ownerEnv) {
+	t.Helper()
+	e := newOwnerEnv(t)
+	r, err := e.open(context.Background(), e.storagePlugin(store))
+	testassert.NoError(t, err)
+	return r, e
+}
+
 // protocolClient builds the generated Go client with the server's bearer
 // credential on every request.
 func protocolClient(t *testing.T, ps *ProtocolServer) *protocol.ClientWithResponses {
@@ -1157,9 +1167,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 // key value.
 func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 	reserveEnvKey(t, "LIGHTCODE_GENERATED_API_KEY")
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)
@@ -1386,9 +1394,7 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 	// start from the same external state and any original shell value is
 	// restored after the test.
 	reserveEnvKey(t, "IDENTITY_QUERY_KEY")
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)

@@ -274,9 +274,7 @@ func TestProtocolServerEventQualification(t *testing.T) {
 func TestProtocolServerShutdownTopology(t *testing.T) {
 	store := storage.NewMemory()
 	blocked := newTargetedBlockStore(store)
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(blocked))
-	testassert.NoError(t, err)
+	r, e := openProtocolOwner(t, blocked)
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)
@@ -429,9 +427,7 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 // claim after a failed pre-write attempt, the required existing parent, and
 // the post-shutdown refusal.
 func TestProtocolServerDiscoveryPublication(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -491,9 +487,7 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 // claim: a pre-write failure — the parent directory must already exist —
 // leaves the server free to publish at the next valid path.
 func TestProtocolServerDiscoveryClaimRelease(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -523,9 +517,7 @@ func TestProtocolServerDiscoveryClaimRelease(t *testing.T) {
 // second attachment while one exists fails invalid and the first server keeps
 // serving.
 func TestProtocolServerAttachmentRaces(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	first := openProtocolServer(t, r)
 
@@ -545,9 +537,7 @@ func TestProtocolServerAttachmentRaces(t *testing.T) {
 // written record is withdrawn before the ownership lock releases, and a
 // publication attempted after closure is the refused sibling.
 func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, e := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -675,9 +665,7 @@ func TestProtocolServerStreamDisconnectPreservesLiveJob(t *testing.T) {
 	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 0)
 
 	// The existing stop path completes the job through the fixture seam.
-	testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		return h.Stop(ctx, session)
-	}))
+	testassert.NoError(t, r.stopSession(ctx, session))
 	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 1)
 	settled, err := client.GetSessionHydrationWithResponse(ctx, session)
 	testassert.Require(t, err == nil && settled.JSON200 != nil, "hydration after stop: %v", err)
@@ -714,9 +702,7 @@ func firstNonLoopbackAddress(t *testing.T) string {
 // endpoint answers only on the loopback interface: dialing the bound port
 // through a non-loopback local address fails.
 func TestProtocolServerListenerIsLoopbackOnly(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(ps.Endpoint(), "http://"))
@@ -793,9 +779,7 @@ func processListenPorts(t *testing.T) map[int]bool {
 // attachment returns the closed refusal with no attachment while the
 // process-table-captured listener port stops answering.
 func TestProtocolServerPostBindCloseRace(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 
 	before := processListenPorts(t)
@@ -905,9 +889,7 @@ func TestProtocolServerPostBindCloseRace(t *testing.T) {
 // verification completes, Close cancels the owner work context, and the
 // admitted publisher errors without remembering a path or writing a record.
 func TestProtocolServerPublicationReadinessVsClose(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -989,9 +971,7 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 	}
 
 	t.Run("parked first write leaves one remembered path", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		testassert.NoError(t, err)
+		r, _ := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		dir := t.TempDir()
@@ -1027,9 +1007,7 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 	})
 
 	t.Run("injected first-write failure lets the waiter succeed", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		testassert.NoError(t, err)
+		r, _ := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		dir := t.TempDir()
@@ -1076,9 +1054,7 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 // releases and the directory contents survive.
 func TestProtocolServerDiscoveryWithdrawalStates(t *testing.T) {
 	t.Run("already removed", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		testassert.NoError(t, err)
+		r, e := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		record := filepath.Join(t.TempDir(), "discovery.json")
@@ -1093,9 +1069,7 @@ func TestProtocolServerDiscoveryWithdrawalStates(t *testing.T) {
 	})
 
 	t.Run("replaced by a nonempty directory", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		testassert.NoError(t, err)
+		r, e := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		record := filepath.Join(t.TempDir(), "discovery.json")
@@ -1104,7 +1078,7 @@ func TestProtocolServerDiscoveryWithdrawalStates(t *testing.T) {
 		testassert.NoError(t, os.Mkdir(record, 0o700))
 		inner := filepath.Join(record, "inner.txt")
 		testassert.NoError(t, os.WriteFile(inner, []byte("kept"), 0o600))
-		err = r.Close(context.Background())
+		err := r.Close(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "withdraw discovery record"), "Close with a replaced record = %v, want the removal failure", err)
 		{
 			data, err := os.ReadFile(inner)

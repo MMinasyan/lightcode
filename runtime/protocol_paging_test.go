@@ -403,7 +403,7 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 	now := time.Now().UTC()
 	inputID, assistantID, settlementID := newLifecycleID(t), newLifecycleID(t), newLifecycleID(t)
 	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput,
-		compactRawInputEntry(sessionID, inputID, operationID, "question "+operationID))
+		compactRawInputEntry(sessionID, inputID, operationID, "user", "question "+operationID))
 	assistant, err := json.Marshal(struct {
 		SessionID   string                   `json:"session_id"`
 		EntryID     string                   `json:"entry_id"`
@@ -421,47 +421,28 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		Usage:     assistantUsage,
 	})
 	testassert.NoError(t, err)
-	settlementWire := struct {
-		SessionID   string              `json:"session_id"`
-		EntryID     string              `json:"entry_id"`
-		OperationID string              `json:"operation_id"`
-		Status      string              `json:"status"`
-		Model       *usageWireRef       `json:"model,omitempty"`
-		Usage       *harness.UsageCount `json:"usage,omitempty"`
-	}{
-		SessionID: sessionID, EntryID: settlementID, OperationID: operationID, Status: "success",
-	}
+	settlementExtra := ""
 	if settlementUsage != nil {
-		settlementWire.Model = &usageWireRef{Provider: "prov", Model: "m"}
-		settlementWire.Usage = settlementUsage
+		model, err := json.Marshal(usageWireRef{Provider: "prov", Model: "m"})
+		testassert.NoError(t, err)
+		usage, err := json.Marshal(settlementUsage)
+		testassert.NoError(t, err)
+		settlementExtra = `,"model":` + string(model) + `,"usage":` + string(usage)
 	}
-	settlementData, err := json.Marshal(settlementWire)
-	testassert.NoError(t, err)
 	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, string(assistant))
-	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, string(settlementData))
+	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
+		compactRawSettlementEntry(sessionID, settlementID, operationID, settlementExtra))
 
 	stateUsage := emptyUsageWireTotals()
 	if assistantUsage != nil || settlementUsage != nil {
 		stateUsage = usageWireTotalsFor(derefUsage(assistantUsage), derefUsage(settlementUsage))
 	}
-	state, err := json.Marshal(struct {
-		Status           harness.OperationState    `json:"status"`
-		StartedAt        time.Time                 `json:"started_at"`
-		SettledAt        time.Time                 `json:"settled_at"`
-		PendingToolCalls []harness.PendingToolCall `json:"pending_tool_calls"`
-		Usage            usageWireTotals           `json:"usage"`
-		Terminal         harness.OperationTerminal `json:"terminal"`
-	}{
-		Status:           harness.OperationSuccess,
-		StartedAt:        now,
-		SettledAt:        now,
-		PendingToolCalls: []harness.PendingToolCall{},
-		Usage:            stateUsage,
-		Terminal:         harness.OperationTerminal{SettlementEntry: harness.EntryRef{SessionID: sessionID, EntryID: settlementID}},
-	})
+	usageJSON, err := json.Marshal(stateUsage)
 	testassert.NoError(t, err)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
-		fmt.Sprintf(`{"admission":%s,"state":%s}`, compactRawMessageAdmission(sessionID, operationID, inputID), state))
+		compactRawOperationRegister(
+			compactRawMessageAdmission(sessionID, operationID, inputID),
+			compactRawSuccessState(now.Format(time.RFC3339Nano), settlementID, sessionID, string(usageJSON))))
 	return assistantID
 }
 
@@ -821,9 +802,7 @@ func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the first call never started")
 		}
-		testassert.NoError(t, bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, session)
-		}))
+		testassert.NoError(t, bg.r.interruptSession(ctx, session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 		awaitIdleSession(t, bg.r, session)
 
@@ -874,19 +853,9 @@ func TestHydrationPendingFIFOsAndActiveOperation(t *testing.T) {
 		awaitModelArrival(t, e)
 		// A regular submit while running rides the steering buffer; queued
 		// submissions fill the queued FIFO in order.
-		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: session, OperationID: "op-s1", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "steer me"}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionSteering {
-				return fmt.Errorf("steering submit = %s, want steering", res.Disposition)
-			}
-			return nil
-		}))
+		steering, err := submitRawThroughRuntime(context.Background(), r, session, "op-s1", "steer me", harness.MessageModeRegular)
+		testassert.Require(t, err == nil, "Submit(op-s1): %v", err)
+		testassert.Require(t, steering.Disposition == harness.DispositionSteering, "steering submit = %s, want steering", steering.Disposition)
 		submitQueuedThroughRuntime(t, r, session, "op-q1", "queued one")
 		submitQueuedThroughRuntime(t, r, session, "op-q2", "queued two")
 
@@ -978,7 +947,7 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
 		awaitIdleSession(t, bg.r, child)
 		stopper.addDelivery(child, completionID, "job report")
-		testassert.NoError(t, bg.stop(child))
+		testassert.NoError(t, bg.r.stopSession(context.Background(), child))
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			rootHydration, err = bg.r.buildHydration(context.Background(), root)
@@ -1065,7 +1034,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		busyInput := newLifecycleID(t)
 		usageSeedSession(t, store, busy, "b-op-1", "", "solo", emptyUsageWireTotals())
 		lifecycleInsertEntry(t, store, busy, busyInput, "b-op-1", harness.EntryInput,
-			compactRawInputEntry(busy, busyInput, "b-op-1", "running"))
+			compactRawInputEntry(busy, busyInput, "b-op-1", "user", "running"))
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: busy, Kind: harness.RegisterOperation, OperationID: "b-op-1"},
 			compactRawOperationRegister(compactRawMessageAdmission(busy, "b-op-1", busyInput), compactRawRunningModelState(time.Now().UTC().Format(time.RFC3339Nano), newLifecycleID(t))))
 

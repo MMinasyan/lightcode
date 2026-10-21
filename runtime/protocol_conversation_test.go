@@ -559,25 +559,12 @@ func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.
 // so the one-rule check repeats here; awaitOperation owns the convergence.
 func submitConvergedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string, want harness.OperationState) {
 	t.Helper()
-	var disposition harness.SubmitDisposition
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, submitErr := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
-		})
-		if submitErr == nil {
-			disposition = res.Disposition
-		}
-		return submitErr
-	})
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
 	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
-	switch disposition {
+	switch res.Disposition {
 	case harness.DispositionAdmitted, harness.DispositionSteering, harness.DispositionQueued:
 	default:
-		t.Fatalf("Submit(%q) = %+v, want an admitted or buffered disposition", operationID, disposition)
+		t.Fatalf("Submit(%q) = %+v, want an admitted or buffered disposition", operationID, res.Disposition)
 	}
 	awaitOperation(t, r, sessionID, operationID, want)
 }
@@ -594,14 +581,7 @@ func itemIDs(t *testing.T, items []protocol.ConversationItem) []string {
 // itemIdentity reads one item's kind and identity member.
 func itemIdentity(t *testing.T, item protocol.ConversationItem) string {
 	t.Helper()
-	data, err := json.Marshal(item)
-	testassert.NoError(t, err)
-	var probe struct {
-		Kind   string `json:"kind"`
-		ItemID string `json:"item_id"`
-	}
-	testassert.NoError(t, json.Unmarshal(data, &probe))
-	return probe.Kind + ":" + probe.ItemID
+	return itemKind(t, item) + ":" + wireItemID(t, item)
 }
 
 // itemKind reports one projected item's discriminator kind.
@@ -718,9 +698,7 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the first call never started")
 		}
-		testassert.NoError(t, bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, session)
-		}))
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -842,9 +820,7 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 				t.Fatal("the partial fragment never became published progress")
 			}
 		}
-		testassert.NoError(t, bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, session)
-		}))
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -995,7 +971,7 @@ func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 
 		completionID := bg.startJob(child, "cc000003")
 		stopper.addDelivery(child, completionID, "job report")
-		testassert.NoError(t, bg.stop(child))
+		testassert.NoError(t, bg.r.stopSession(context.Background(), child))
 
 		// The child's conversation: its own turn plus the typed completion
 		// signal naming the job member.
@@ -1193,9 +1169,7 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the model effect never arrived")
 		}
-		testassert.NoError(t, bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, interrupted)
-		}))
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), interrupted))
 		awaitOperation(t, bg.r, interrupted, "op-int", harness.OperationInterruption)
 
 		items = projectSessionItems(t, bg.r, interrupted)

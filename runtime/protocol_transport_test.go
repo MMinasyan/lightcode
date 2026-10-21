@@ -756,9 +756,7 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 // the mapped non-2xx status — never a replacement empty error, while a
 // pre-traversal refusal answers the plain typed error.
 func TestProtocolServerRevertPartialFailure(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	testassert.NoError(t, err)
+	r, e := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)

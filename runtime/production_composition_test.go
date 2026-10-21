@@ -14,7 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +21,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -580,15 +578,6 @@ func (s *chainServer) bodyAt(i int) string {
 	return s.bodies[i]
 }
 
-// chainToolCallTurn writes one completed assistant turn publishing one tool
-// call with an explicit call identity.
-func chainToolCallTurn(w http.ResponseWriter, id, name, args string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"`+id+`","type":"function","function":{"name":"`+name+`","arguments":`+strconv.Quote(args)+`}}]},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-	)
-}
-
 // chainCodeGroupDirs lists one session's code-group directory names under the
 // owner data root.
 func chainCodeGroupDirs(t *testing.T, dataDir, sessionID string) []string {
@@ -694,17 +683,17 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		allowedPatch, err := json.Marshal(map[string]any{"input": "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: renamed.txt\n@@\n-alpha\n+ALPHA\n*** End Patch"})
 		testassert.NoError(t, err)
 		writeTurn := func(id string) func(http.ResponseWriter) {
-			return func(w http.ResponseWriter) { chainToolCallTurn(w, id, "prod_write", modelWriteArgs) }
+			return func(w http.ResponseWriter) { writeToolCallTurn(w, id, "prod_write", modelWriteArgs) }
 		}
 		release2 := make(chan struct{})
 		release3 := make(chan struct{})
 		parked := make(chan struct{}) // the canceled operation parks until the owner cancels
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-1", "prod_write", modelWriteArgs) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "prod_write", modelWriteArgs) }},
 			chainTurn{hold: release2, respond: writeTurn("call-2")},
 			chainTurn{hold: release3, respond: writeTurn("call-3")},
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-4", "apply_patch", string(deniedPatch)) }},
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-5", "apply_patch", string(allowedPatch)) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-4", "apply_patch", string(deniedPatch)) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-5", "apply_patch", string(allowedPatch)) }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 			chainTurn{hold: parked, respond: func(w http.ResponseWriter) { writeTextTurn(w, "unreachable") }},
@@ -773,19 +762,9 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// 3. The steering submit buffers over the active operation: no
 		// committed input and no new code-group directory while it sits
 		// buffered.
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionID, OperationID: "op-1-steer", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: steeringText}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionSteering {
-				return fmt.Errorf("steering submit = %+v, want buffered steering", res.Disposition)
-			}
-			return nil
-		}))
+		steering, err := submitRawThroughRuntime(ctx, r, sessionID, "op-1-steer", steeringText, harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Require(t, steering.Disposition == harness.DispositionSteering, "steering submit = %+v, want buffered steering", steering.Disposition)
 		{
 			got := chainCodeGroupDirs(t, dataDir, sessionID)
 			testassert.Require(t, slices.Equal(got, []string{admitted}), "code groups while the steering input is buffered = %v, want only the admitted operation's group %q", got, admitted)
@@ -977,7 +956,7 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "ro-note.txt"), []byte("untracked\n"), 0o600))
 
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-1", "run_command", `{"command":"git status"}`) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "run_command", `{"command":"git status"}`) }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		writeServiceFile(t, e.configPath, chainCommandConfigDocument(server.URL))
@@ -985,9 +964,7 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 			`{"rogit": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"], "readonly": true, "capabilities": ["arg.noop"]}}`)
 
 		hook := &noopArgumentHook{}
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
-			coreStoragePlugin(e.store), chainCommandPlugin(), argumentHookPlugin("arg.noop", hook),
-		}})
+		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), chainCommandPlugin(), argumentHookPlugin("arg.noop", hook))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
@@ -1034,9 +1011,7 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
 
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
-			coreStoragePlugin(e.store), inertToolsPlugin(), bundledAdaptationPlugin(),
-		}})
+		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), inertToolsPlugin(), bundledAdaptationPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
@@ -1091,14 +1066,14 @@ func TestProductionOpenInitialSweepCleansArtifacts(t *testing.T) {
 		// The initial pass deleted the aged session and removed its artifact
 		// tree before the owner was published.
 		{
-			_, err := readSweptSession(t, r, deletable)
+			err := headerErrorThroughRuntime(context.Background(), r, deletable)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "aged session after the initial sweep = err %v, want it deleted", err)
 		}
 		mustNotExist(t, deletableCode, "the deleted session's artifact tree")
 
 		// The stale-but-not-yet-deletable session survives with its tree.
-		rec, err := readSweptSession(t, r, young)
-		testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "young session after the initial sweep = %+v err %v, want it archived and intact", rec, err)
+		rec := headerThroughRuntime(t, r, young)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "young session after the initial sweep = %+v, want it archived and intact", rec)
 		mustExist(t, youngCode, "the surviving session's artifact tree")
 	})
 }

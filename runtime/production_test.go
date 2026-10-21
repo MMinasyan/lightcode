@@ -336,12 +336,19 @@ func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkin
 	return e.openWithPlugins(ctx, hook, park)
 }
 
+// openPlugins opens the fixture's exact plugin list over its data and config
+// roots.
+func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
+	e.t.Helper()
+	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins})
+}
+
 // openWithPlugins composes the suite's base plugin set plus extras — the
 // adaptation row adds its custom ModelAdaptation export this way.
 func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, park *parkingHook, extra ...Plugin) (*Runtime, error) {
 	e.t.Helper()
 	plugins := []Plugin{coreStoragePlugin(e.store), productionToolsPlugin(), hookPlugin(hook), parkPlugin(park)}
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: append(plugins, extra...)})
+	return e.openPlugins(ctx, append(plugins, extra...)...)
 }
 
 func (e *productionEnv) hookedHook() *recordHook {
@@ -459,7 +466,7 @@ func (s *productionModelServer) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeToolCallTurn(w, toolName, toolArgs)
+		writeToolCallTurn(w, "call-1", toolName, toolArgs)
 	}
 }
 
@@ -654,29 +661,14 @@ func TestProductionKeyResolution(t *testing.T) {
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("key-ws"), "worker")
 		testassert.NoError(t, err)
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
-		readOperationErr := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ReadOperation(ctx, session.Identity.SessionID, opID)
-				return err
-			})
-		}
 
 		// A required credential that resolves empty rejects admission with
 		// the retained provider/env-name diagnostic; no Operation exists.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
-		err = submit("op-missing")
+		err = submitExpectFailure(r, session.Identity.SessionID, "op-missing", "please write")
 		testassert.Require(t, errors.Is(err, config.ErrMissingEnvVar) && errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") && strings.Contains(err.Error(), `for provider "prov"`), "missing credential submit = %v, want the retained diagnostic wrapping both identities; missing credential diagnostic = %v, want the env name and provider identity", err, err)
 		{
-			err := readOperationErr("op-missing")
+			err := readOperationError(ctx, r, session.Identity.SessionID, "op-missing")
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected admission left %v, want no Operation", err)
 		}
 
@@ -686,7 +678,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// key, and the turn completes.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 		e.server.armGate()
-		testassert.NoError(t, submit("op-1"))
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
 		e.server.awaitRequests(1)
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
 		e.server.releaseGate()
@@ -722,15 +714,6 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		testassert.Require(t, r.managedEnv != nil && r.managedEnv.IsManaged("PRODUCTION_TEST_KEY"), "the fixture credential is not managed")
 		session, err := r.createSession(ctx, e.workspace("race-ws"), "worker")
 		testassert.NoError(t, err)
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
 
 		probe := installOwningSyncProbe(t, r.managedEnv.Path())
 		defer probe.restore()
@@ -752,7 +735,7 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		// The admission must establish its wait at configuration capture
 		// while the writer holds the publication/capture ownership.
 		submitDone := make(chan error, 1)
-		go func() { submitDone <- submit("op-race") }()
+		go func() { submitDone <- submitExpectFailure(r, session.Identity.SessionID, "op-race", "please write") }()
 		awaitConfigurationCaptureWait(t)
 		release()
 		connect := <-connectDone
@@ -809,15 +792,6 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 
 		session, err := r.createSession(ctx, e.workspace("ready-ws"), "worker")
 		testassert.NoError(t, err)
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
 
 		armed.Store(true)
 		reloadDone := make(chan error, 1)
@@ -831,7 +805,10 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 			t.Fatal("the reload never reached the parked validator")
 		}
 		submitDone := make(chan error, 1)
-		go func() { submitDone <- submit("op-ready") }()
+		go func() {
+			_, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-ready", "please write", harness.MessageModeRegular)
+			submitDone <- err
+		}()
 		select {
 		case err := <-submitDone:
 			testassert.NoError(t, err)
@@ -865,19 +842,10 @@ func TestProductionModelSelectionRejection(t *testing.T) {
 		} {
 			session, err := r.createSession(ctx, e.workspace("reject-"+row.agent), row.agent)
 			testassert.Require(t, err == nil, "createSession(%s): %v", row.agent, err)
-			err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: row.opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
+			err = submitExpectFailure(r, session.Identity.SessionID, row.opID, "hello")
 			testassert.Require(t, errors.Is(err, row.wantClass) && strings.Contains(err.Error(), row.wantText), "%s submit = %v, want %v with %q", row.agent, err, row.wantClass, row.wantText)
 			{
-				err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-					_, err := h.ReadOperation(ctx, session.Identity.SessionID, row.opID)
-					return err
-				})
+				err := readOperationError(ctx, r, session.Identity.SessionID, row.opID)
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "%s rejection left %v, want no Operation", row.agent, err)
 			}
 		}
@@ -945,19 +913,7 @@ func TestProductionQueuedAndFork(t *testing.T) {
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "parked")
 		e.server.awaitRequests(1)
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: session.Identity.SessionID, OperationID: "op-2", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeQueued,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionQueued {
-				return fmt.Errorf("submit = %v, want queued", res.Disposition)
-			}
-			return nil
-		}))
+		submitQueuedThroughRuntime(t, r, session.Identity.SessionID, "op-2", "please write")
 		e.server.releaseGate()
 		awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 		awaitOperation(t, r, session.Identity.SessionID, "op-2", harness.OperationSuccess)
@@ -1004,22 +960,13 @@ func TestProductionHookCapture(t *testing.T) {
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("hook-ws"), "worker")
 		testassert.NoError(t, err)
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
 		// The hook's narrowed description survives into the committed
 		// capture.
 		hook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
 			c.Tools[0].Description = "narrowed by the hook"
 			return c
 		})
-		testassert.NoError(t, submit("op-narrow"))
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-narrow", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-narrow", harness.OperationSuccess)
 		testassert.Equal(t, rec.Admission.Execution.Tools[0].Description, "narrowed by the hook")
 
@@ -1047,19 +994,10 @@ func TestProductionHookCapture(t *testing.T) {
 			hook.set(nil, row.mutate)
 			rowSession, err := r.createSession(ctx, e.workspace("hook-"+row.name+"-ws"), "worker")
 			testassert.Require(t, err == nil, "createSession(%s): %v", row.name, err)
-			err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: rowSession.Identity.SessionID, OperationID: "op-" + row.name, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
+			err = submitExpectFailure(r, rowSession.Identity.SessionID, "op-"+row.name, "hello")
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s submit = %v, want the ErrInvalid rejection", row.name, err)
 			{
-				err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-					_, err := h.ReadOperation(ctx, rowSession.Identity.SessionID, "op-"+row.name)
-					return err
-				})
+				err := readOperationError(ctx, r, rowSession.Identity.SessionID, "op-"+row.name)
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "%s rejection left %v, want no Operation", row.name, err)
 			}
 		}
@@ -1102,13 +1040,7 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		park.arm(release, used)
 		done := make(chan error, 1)
 		go func() {
-			done <- r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: "op-parked", Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
+			done <- submitExpectFailure(r, session.Identity.SessionID, "op-parked", "hello")
 		}()
 		select {
 		case <-used:
@@ -1141,17 +1073,9 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		e.server.armGate() // the run parks at its first model request
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-run", "hello")
 		e.server.awaitRequests(1)
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: session.Identity.SessionID, OperationID: "op-steer", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "steer"}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			testassert.Check(t, res.Disposition == harness.DispositionSteering, "steering submit disposition = %q, want steering", res.Disposition)
-			return nil
-		}))
+		steering, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-steer", "steer", harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Check(t, steering.Disposition == harness.DispositionSteering, "steering submit disposition = %q, want steering", steering.Disposition)
 		testassert.NoError(t, r.Close(ctx))
 		e.server.releaseGate()
 		{
@@ -1403,22 +1327,16 @@ func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
 
 		admitted := make(chan error, 1)
 		go func() {
-			admitted <- r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				res, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID:   sessionID,
-					OperationID: "op-write",
-					Origin:      harness.InputOriginUser,
-					Content:     []model.ContentPart{{Kind: model.PartText, Text: "write it"}},
-					Mode:        harness.MessageModeRegular,
-				})
-				if err != nil {
-					return err
-				}
-				if res.Disposition != harness.DispositionAdmitted {
-					return fmt.Errorf("disposition %q, want admitted", res.Disposition)
-				}
-				return nil
-			})
+			res, err := submitRawThroughRuntime(ctx, r, sessionID, "op-write", "write it", harness.MessageModeRegular)
+			if err != nil {
+				admitted <- err
+				return
+			}
+			if res.Disposition != harness.DispositionAdmitted {
+				admitted <- fmt.Errorf("disposition %q, want admitted", res.Disposition)
+				return
+			}
+			admitted <- nil
 		}()
 		select {
 		case err := <-admitted:

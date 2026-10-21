@@ -365,11 +365,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	for i, name := range []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"} {
 		e.argHooks[i] = &recordArgumentHook{replace: json.RawMessage(`{"repaired":"` + name + `"}`)}
 	}
-	r, err := Open(context.Background(), Options{
-		DataDir:    e.dataDir,
-		ConfigPath: e.configPath,
-		Plugins:    append(e.plugins(), e.storagePlugin(store)),
-	})
+	r, err := e.open(context.Background(), append(e.plugins(), e.storagePlugin(store))...)
 	testassert.NoError(t, err)
 	e.r = r
 	t.Cleanup(func() { _ = e.converge() })
@@ -470,19 +466,7 @@ func (e *prepEnv) session(agentType string) string {
 // submit runs one public Submit through the Runtime's actual Harness,
 // returning the reported result even on error exactly as the Harness does.
 func (e *prepEnv) submit(ctx context.Context, sessionID, operationID, text string, mode harness.MessageMode) (harness.SubmitResult, error) {
-	var res harness.SubmitResult
-	err := e.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		res, err = h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        mode,
-		})
-		return err
-	})
-	return res, err
+	return submitRawThroughRuntime(ctx, e.r, sessionID, operationID, text, mode)
 }
 
 // readOperation, snapshotSession and fork run their public Harness

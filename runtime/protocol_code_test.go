@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +21,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -59,16 +57,7 @@ func captureCodeMutation(t *testing.T, groupRoot, displayPath, target string, co
 // buffered submission drains under the same caller ID.
 func submitCodeOperation(t *testing.T, r *Runtime, sessionID, operationID, text string) harness.OperationRecord {
 	t.Helper()
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		_, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
-		})
-		return err
-	})
+	_, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
 	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
 	rec := awaitOperation(t, r, sessionID, operationID, harness.OperationSuccess)
 	awaitIdleSession(t, r, sessionID)
@@ -162,10 +151,7 @@ func openCodeRuntime(t *testing.T, store harness.Storage) *codeRuntime {
 	// text turns and manual compaction.
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
-	ticks := make(chan time.Time)
-	opts := e.options(e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, newLifecycleStopper()))
-	opts.sweepTicks = ticks
-	r, err := open(context.Background(), opts)
+	r, _, err := e.openSwept(context.Background(), e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, newLifecycleStopper()))
 	testassert.NoError(t, err)
 	return &codeRuntime{t: t, store: store, r: r, e: e}
 }
@@ -184,17 +170,7 @@ func (f *codeRuntime) session(name string) string {
 // is the rendezvous, not the terminal state.
 func (f *codeRuntime) submit(sessionID, operationID, text string) {
 	f.t.Helper()
-	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		_, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
-		})
-		return err
-	})
-	if err != nil {
+	if _, err := submitRawThroughRuntime(context.Background(), f.r, sessionID, operationID, text, harness.MessageModeRegular); err != nil {
 		f.t.Fatalf("Submit(%s): %v", operationID, err)
 	}
 }
@@ -227,24 +203,11 @@ func (f *codeRuntime) compactIdle(sessionID, operationID string) harness.Operati
 // disposition.
 func (f *codeRuntime) submitMode(sessionID, operationID, text string, mode harness.MessageMode) harness.SubmitDisposition {
 	f.t.Helper()
-	var disposition harness.SubmitDisposition
-	err := f.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        mode,
-		})
-		if err == nil {
-			disposition = res.Disposition
-		}
-		return err
-	})
+	res, err := submitRawThroughRuntime(context.Background(), f.r, sessionID, operationID, text, mode)
 	if err != nil {
 		f.t.Fatalf("Submit(%s): %v", operationID, err)
 	}
-	return disposition
+	return res.Disposition
 }
 
 // TestCodeSnapshotsSteeringDerivesOwnGroup proves a delivered steering input
@@ -1630,38 +1593,10 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 		defer releaseGate()
 		e.server.setHold(gate)
 
-		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   session,
-				OperationID: "op-run",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "run first"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionAdmitted {
-				return fmt.Errorf("disposition %q, want admitted", res.Disposition)
-			}
-			return nil
-		}))
-		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   session,
-				OperationID: "op-queued",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "queued behind"}},
-				Mode:        harness.MessageModeQueued,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionQueued {
-				return fmt.Errorf("disposition %q, want queued", res.Disposition)
-			}
-			return nil
-		}))
+		run, err := submitRawThroughRuntime(context.Background(), r, session, "op-run", "run first", harness.MessageModeRegular)
+		testassert.Require(t, err == nil, "Submit(op-run): %v", err)
+		testassert.Require(t, run.Disposition == harness.DispositionAdmitted, "disposition %q, want admitted", run.Disposition)
+		submitQueuedThroughRuntime(t, r, session, "op-queued", "queued behind")
 
 		awaitOpenerRegistered(t, r, session)
 		select { // neither execution's model request began inside the interval
@@ -1785,16 +1720,8 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 
-		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   session,
-				OperationID: "op-fail",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "fail"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return err
-		}))
+		_, err = submitRawThroughRuntime(context.Background(), r, session, "op-fail", "fail", harness.MessageModeRegular)
+		testassert.NoError(t, err)
 		{
 			rec := awaitOperation(t, r, session, "op-fail", harness.OperationFailure)
 			testassert.Require(t, rec.State.Status == harness.OperationFailure, "failed opening settled as %+v, want failure", rec.State)
@@ -1903,16 +1830,8 @@ func TestRestoreIntervalCancellationAndShutdownOutcomes(t *testing.T) {
 		defer park.flush()
 		drainCommandModelArrivals(e)
 
-		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   session,
-				OperationID: "op-parked",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "parked"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return err
-		}))
+		_, err := submitRawThroughRuntime(context.Background(), r, session, "op-parked", "parked", harness.MessageModeRegular)
+		testassert.NoError(t, err)
 		awaitOpenerRegistered(t, r, session)
 
 		// The managed shutdown begins while the opener is parked: its

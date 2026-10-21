@@ -46,7 +46,7 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 			return c
 		}}
 		ws := &workspaceOpens{}
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: assembledPlugins(e, store, hook, ws)})
+		r, err := e.open(ctx, assembledPlugins(e, store, hook, ws)...)
 		testassert.NoError(t, err)
 		ps := openProtocolServer(t, r)
 		client := protocolClient(t, ps)

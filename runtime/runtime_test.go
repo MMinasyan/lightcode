@@ -115,6 +115,18 @@ func (e *ownerEnv) open(ctx context.Context, plugins ...Plugin) (*Runtime, error
 	return open(ctx, e.options(plugins...))
 }
 
+// openSwept opens one Runtime with a test-driven sweep clock: the returned
+// channel is the only tick source, so the automatic lifecycle sweep never runs
+// until a test sends.
+func (e *ownerEnv) openSwept(ctx context.Context, plugins ...Plugin) (*Runtime, chan time.Time, error) {
+	e.t.Helper()
+	ticks := make(chan time.Time)
+	opts := e.options(plugins...)
+	opts.sweepTicks = ticks
+	r, err := open(ctx, opts)
+	return r, ticks, err
+}
+
 // corePlugin is one Runtime-scoped plugin whose single export is declared
 // exactly as harness.Storage: the private Core binding. Its Close records the
 // disposal event only; the test retains the store itself.
@@ -335,25 +347,30 @@ func eventsNamed(events []string, name string) int {
 	return n
 }
 
-func submitThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string) {
-	t.Helper()
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
+// submitRawThroughRuntime runs one user submission in the given mode through
+// the Runtime's admission gate and returns the reported result and error
+// unchanged, exactly as the Harness reports them.
+func submitRawThroughRuntime(ctx context.Context, r *Runtime, sessionID, operationID, text string, mode harness.MessageMode) (harness.SubmitResult, error) {
+	var res harness.SubmitResult
+	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		res, err = h.Submit(ctx, harness.SubmitRequest{
 			SessionID:   sessionID,
 			OperationID: operationID,
 			Origin:      harness.InputOriginUser,
 			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
+			Mode:        mode,
 		})
-		if err != nil {
-			return err
-		}
-		if res.Disposition != harness.DispositionAdmitted {
-			return fmt.Errorf("submit %q = %+v, want admitted", operationID, res.Disposition)
-		}
-		return nil
+		return err
 	})
+	return res, err
+}
+
+func submitThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string) {
+	t.Helper()
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
 	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
+	testassert.Require(t, res.Disposition == harness.DispositionAdmitted, "submit %q = %+v, want admitted", operationID, res.Disposition)
 }
 
 func readOperation(t *testing.T, r *Runtime, sessionID, operationID string) harness.OperationRecord {
@@ -366,6 +383,15 @@ func readOperation(t *testing.T, r *Runtime, sessionID, operationID string) harn
 	})
 	testassert.Require(t, err == nil, "ReadOperation(%q): %v", operationID, err)
 	return rec
+}
+
+// readOperationError reads one Operation through the Runtime's admission gate
+// and returns its typed error unchanged.
+func readOperationError(ctx context.Context, r *Runtime, sessionID, operationID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		_, err := h.ReadOperation(ctx, sessionID, operationID)
+		return err
+	})
 }
 
 // committedAdmission renders one committed Operation's admission as the

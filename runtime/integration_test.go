@@ -193,17 +193,13 @@ func writeSSE(w http.ResponseWriter, events ...string) {
 }
 
 func writeTextTurn(w http.ResponseWriter, text string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","content":"`+text+`"},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-	)
+	writeSSE(w, textTurnEvents(text)...)
 }
 
-func writeToolCallTurn(w http.ResponseWriter, name, args string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"`+name+`","arguments":`+strconv.Quote(args)+`}}]},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-	)
+// writeToolCallTurn writes one completed assistant turn publishing one tool
+// call under the given call identity.
+func writeToolCallTurn(w http.ResponseWriter, id, name, args string) {
+	writeSSE(w, toolCallTurnEvents(id, name, args)...)
 }
 
 func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *workspaceOpens) []Plugin {
@@ -331,7 +327,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// The combined scenario runs through the public production
 		// construction: concrete preparation, custom plugin slice.
 		openAssembled := func() (*Runtime, error) {
-			return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins})
+			return e.open(ctx, plugins...)
 		}
 
 		// Raw storage is never exported into execution: the Core export ID is
@@ -341,16 +337,8 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		testassert.NoError(t, err)
 		leakySession, err := leaky.createSession(ctx, e.dataDir, "leaky")
 		testassert.NoError(t, err)
-		{
-			err := leaky.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: leakySession.Identity.SessionID, OperationID: "op-leaky", Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit through a definition selecting the Core storage export = %v, want harness.ErrInvalid (raw storage must not be exported into execution)", err)
-		}
+		_, err = submitRawThroughRuntime(ctx, leaky, leakySession.Identity.SessionID, "op-leaky", "x", harness.MessageModeRegular)
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit through a definition selecting the Core storage export = %v, want harness.ErrInvalid (raw storage must not be exported into execution)", err)
 		testassert.NoError(t, leaky.Close(ctx))
 
 		r, err := openAssembled()
@@ -432,19 +420,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		sat.Close()
 
 		// The queued next revision is buffered while the Operation is blocked.
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionA.Identity.SessionID, OperationID: "op-a2", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "queued"}}, Mode: harness.MessageModeQueued,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionQueued {
-				return fmt.Errorf("queued submit = %+v, want queued", res.Disposition)
-			}
-			return nil
-		}))
+		submitQueuedThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a2", "queued")
 
 		// Reload publishes the next revision over the blocked Operation.
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T2", "L2"))
@@ -494,19 +470,9 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// A submit racing the predecessor's post-terminal drain is buffered
 		// and delivered by that drain, so either disposition starts this
 		// execution.
-		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionA.Identity.SessionID, OperationID: "op-a3", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "parked"}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionAdmitted && res.Disposition != harness.DispositionSteering {
-				return fmt.Errorf("submit op-a3 = %+v, want admitted or buffered steering", res.Disposition)
-			}
-			return nil
-		}))
+		parked, err := submitRawThroughRuntime(ctx, r, sessionA.Identity.SessionID, "op-a3", "parked", harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Require(t, parked.Disposition == harness.DispositionAdmitted || parked.Disposition == harness.DispositionSteering, "submit op-a3 = %+v, want admitted or buffered steering", parked.Disposition)
 		server.awaitRequests(before + 1)
 		closeDone := make(chan error, 1)
 		go func() { closeDone <- r.Close(ctx) }()

@@ -136,23 +136,9 @@ func historyFactsOf(view harness.HistoryReadView) []harness.HistoryFact {
 // submitQueuedThroughRuntime submits one buffered queued message.
 func submitQueuedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string) {
 	t.Helper()
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeQueued,
-		})
-		if err != nil {
-			return err
-		}
-		if res.Disposition != harness.DispositionQueued {
-			return errors.New("submit " + operationID + " = " + string(res.Disposition) + ", want queued")
-		}
-		return nil
-	})
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeQueued)
 	testassert.Require(t, err == nil, "queued Submit(%q): %v", operationID, err)
+	testassert.Require(t, res.Disposition == harness.DispositionQueued, "queued submit %q = %+v, want queued", operationID, res.Disposition)
 }
 
 // forkThroughRuntime forks one source Session at the input entry of the named
@@ -349,10 +335,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		e.server.setHold(gate)
 		submitThroughRuntime(t, r, interruptedSession, "op-2", "again")
 		awaitModelArrival(t, e)
-		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, interruptedSession)
-		})
-		testassert.NoError(t, err)
+		testassert.NoError(t, r.interruptSession(context.Background(), interruptedSession))
 		interrupted := projectOperation(awaitOperation(t, r, interruptedSession, "op-2", harness.OperationInterruption))
 		testassert.Require(t, interrupted.Status == protocol.OperationStatusInterruption && interrupted.SettledAt != nil && interrupted.Detail != nil && *interrupted.Detail != "", "interrupted projection = %+v, want interruption with a required detail", interrupted)
 	})

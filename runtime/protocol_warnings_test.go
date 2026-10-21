@@ -138,7 +138,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		failedSession, err := r.createSession(ctx, e.workspace("prompt-ws-3"), "worker")
 		testassert.NoError(t, err)
 		{
-			err := submitExpectFailure(r, failedSession.Identity.SessionID, "op-failed")
+			err := submitExpectFailure(r, failedSession.Identity.SessionID, "op-failed", "hello")
 			testassert.Require(t, err != nil, "the missing-credential submit succeeded, want the failed preparation")
 		}
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
@@ -151,7 +151,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		hookSession, err := r.createSession(ctx, e.workspace("prompt-ws-4"), "worker")
 		testassert.NoError(t, err)
 		{
-			err := submitExpectFailure(r, hookSession.Identity.SessionID, "op-hooked")
+			err := submitExpectFailure(r, hookSession.Identity.SessionID, "op-hooked", "hello")
 			testassert.Require(t, err != nil, "the rejected-hook submit succeeded, want the failed preparation")
 		}
 		hook.set(nil, nil)
@@ -201,14 +201,9 @@ func awaitSessionNotBusy(t *testing.T, r *Runtime, sessionID string) {
 
 // submitExpectFailure submits one regular message expecting the admission to
 // fail; the raw error is returned for the caller to ignore or inspect.
-func submitExpectFailure(r *Runtime, sessionID, operationID string) error {
-	return r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		_, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID: sessionID, OperationID: operationID, Origin: harness.InputOriginUser,
-			Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-		})
-		return err
-	})
+func submitExpectFailure(r *Runtime, sessionID, operationID, text string) error {
+	_, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
+	return err
 }
 
 func warnRevision(rev string) (uint64, error) {
@@ -404,7 +399,7 @@ func (e *countingFailingEndpoint) serve(w http.ResponseWriter, r *http.Request) 
 	body, _ := io.ReadAll(r.Body)
 	e.count++
 	if e.count == 1 && lastMessageRole(string(body)) != "tool" {
-		writeToolCallTurn(w, "prod_write", productionWriteArgs)
+		writeToolCallTurn(w, "call-1", "prod_write", productionWriteArgs)
 		return
 	}
 	http.Error(w, `{"error":{"message":"denied"}}`, http.StatusUnauthorized)
@@ -755,7 +750,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		wrapped.armFailAfterRelease(admissionFailure)
 		admitDone := make(chan error, 1)
 		go func() {
-			admitDone <- submitExpectFailure(r, victim.Identity.SessionID, "op-orphan-admit")
+			admitDone <- submitExpectFailure(r, victim.Identity.SessionID, "op-orphan-admit", "hello")
 		}()
 		select {
 		case <-wrapped.arrived:

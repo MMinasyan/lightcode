@@ -6,7 +6,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -130,14 +129,6 @@ func CreateSessionForTest(ctx context.Context, r *Runtime, workspace, agentType 
 // SubmitForTest bridges one private regular user-message submission for the
 // external composition tests. It is absent from production builds.
 func SubmitForTest(ctx context.Context, r *Runtime, sessionID, operationID, text string) error {
-	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		_, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
-		})
-		return err
-	})
+	_, err := submitRawThroughRuntime(ctx, r, sessionID, operationID, text, harness.MessageModeRegular)
+	return err
 }

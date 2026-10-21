@@ -318,17 +318,6 @@ func (c *deadlineContext) Err() error {
 
 func (c *deadlineContext) expire() { close(c.done) }
 
-func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.SessionHeader, error) {
-	t.Helper()
-	var rec harness.SessionHeader
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		rec, err = h.ReadSessionHeader(ctx, sessionID)
-		return err
-	})
-	return rec, err
-}
-
 func readSweepRegister(t *testing.T, store harness.Storage, sessionID string) harness.Register {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
@@ -410,8 +399,7 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
-		rec, err := readSweptSession(t, r, seeded)
-		testassert.NoError(t, err)
+		rec := headerThroughRuntime(t, r, seeded)
 		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived && rec.ArchivedAt != nil, "seeded Session after startup = %+v, want the initial pass to have archived it", rec)
 		testassert.Equal(t, e.server.requests(), 0)
 		testassert.Equal(t, len(hook.calls()), 0)
@@ -440,12 +428,9 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		wrapped := newSweepStore(store)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped), hookPlugin(hook),
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped), hookPlugin(hook),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
 		testassert.NoError(t, err)
 		testassert.Equal(t, wrapped.listCount(), 1)
 		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
@@ -466,8 +451,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		sendTick(t, ticks, archiveBoundary) // exact archive boundary: no transition
 		sendTick(t, ticks, archivedAt)      // one nanosecond past: archive, stamped with the tick time
 		waitWritten(t, wrapped)             // the archive committed; the boundary pass converged at the previous rendezvous
-		archived, err := readSweptSession(t, r, id)
-		testassert.NoError(t, err)
+		archived := headerThroughRuntime(t, r, id)
 		testassert.Require(t, archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == created.Revision+1 && archived.ArchivedAt != nil && archived.ArchivedAt.Equal(archivedAt), "Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d; sweep stamped %v, want the archive tick's explicit time %v", archived, archived.Revision.DurableRevision, created.Revision+1, archived.ArchivedAt, archivedAt)
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour))                 // exact delete boundary
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour+time.Nanosecond)) // one nanosecond past: delete
@@ -509,10 +493,7 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				e := newOwnerEnv(t)
 				writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 				wrapped := newSweepStore(store)
-				ticks := make(chan time.Time)
-				opts := e.options(e.storagePlugin(wrapped))
-				opts.sweepTicks = ticks
-				r, err := open(context.Background(), opts)
+				r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 				testassert.NoError(t, err)
 				created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 				testassert.NoError(t, err)
@@ -522,10 +503,8 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				sendTick(t, ticks, tick) // this pass lists, fails, and reports
 				sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
 				waitWritten(t, wrapped)  // the later tick committed the archive
-				{
-					rec, err := readSweptSession(t, r, created.Identity.SessionID)
-					testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
-				}
+				rec := headerThroughRuntime(t, r, created.Identity.SessionID)
+				testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "Session after the later tick = %+v, want the failed pass to leave no lasting damage", rec)
 				testassert.NoError(t, r.Close(context.Background()))
 				out := stderr()
 				{
@@ -550,10 +529,7 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			e := newOwnerEnv(t)
 			writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 			wrapped := newSweepStore(store)
-			ticks := make(chan time.Time)
-			opts := e.options(e.storagePlugin(wrapped))
-			opts.sweepTicks = ticks
-			r, err := open(context.Background(), opts)
+			r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 			testassert.NoError(t, err)
@@ -605,11 +581,8 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			e := newOwnerEnv(t)
 			writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 			wrapped := newSweepStore(store)
-			ticks := make(chan time.Time)
-			opts := e.options(e.storagePlugin(wrapped))
-			opts.sweepTicks = ticks
 			ctx := newDeadlineContext()
-			r, err := open(ctx, opts)
+			r, ticks, err := e.openSwept(ctx, e.storagePlugin(wrapped))
 			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 			testassert.NoError(t, err)
@@ -656,10 +629,7 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 		testassert.NoError(t, err)
 		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 		testassert.NoError(t, err)
@@ -725,10 +695,7 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		testassert.NoError(t, err)
 		busy, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "busy"), "solo")
 		testassert.NoError(t, err)
@@ -748,10 +715,8 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		sendTick(t, ticks, tick) // returns once the first pass fully converged
 		after := readSweepRegister(t, wrapped, busy.Identity.SessionID)
 		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "the sweep changed the running Session's register (%d -> %d), want it left unchanged", before.Revision, after.Revision)
-		{
-			rec, err := readSweptSession(t, r, idle.Identity.SessionID)
-			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "idle sibling after the sweep = %+v err %v, want it archived", rec, err)
-		}
+		rec := headerThroughRuntime(t, r, idle.Identity.SessionID)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "idle sibling after the sweep = %+v, want it archived", rec)
 		testassert.Equal(t, e.server.requests(), 1)
 		close(gate)
 		{
@@ -773,10 +738,7 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 		testassert.NoError(t, err)
 		corrupted, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "bad"), "solo")
 		testassert.NoError(t, err)
@@ -794,25 +756,14 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		const malformed = "corrupt-id"                        // non-empty, not the durable 32-hex shape
 		const preCorrupt = "fedcba9876543210fedcba9876543210" // valid hex, corrupt register
 		for _, row := range []string{malformed, preCorrupt} {
-			{
-				err := wrapped.Transact(context.Background(), func(tx harness.Transaction) error {
-					_, err := tx.InsertRegister(harness.RegisterDraft{
-						Key:     harness.RegisterKey{SessionID: row, Kind: harness.RegisterSession},
-						Payload: json.RawMessage(`{}`),
-					})
-					return err
-				})
-				testassert.Require(t, err == nil, "plant row %q: %v", row, err)
-			}
+			lifecycleInsertRegister(t, wrapped, harness.RegisterKey{SessionID: row, Kind: harness.RegisterSession}, `{}`)
 		}
 		stderr := captureSweepStderr(t)
 		tick := valid.State.LastActivity.Add(100 * time.Hour)
 		sendTick(t, ticks, tick)
 		sendTick(t, ticks, tick)
-		{
-			rec, err := readSweptSession(t, r, valid.Identity.SessionID)
-			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "valid sibling after the sweep = %+v err %v, want it archived", rec, err)
-		}
+		rec := headerThroughRuntime(t, r, valid.Identity.SessionID)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "valid sibling after the sweep = %+v, want it archived", rec)
 		// Shutdown still converges — Close returns, joining the latched
 		// corruption of the planted corrupt Session as reporting, not as a
 		// failure to converge.
@@ -1011,10 +962,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
 		{
-			err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ReadSessionHeader(ctx, archivedID)
-				return err
-			})
+			err := headerErrorThroughRuntime(ctx, r, archivedID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after delete = err %v, want ErrNotFound", err)
 		}
 
@@ -1290,10 +1238,7 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		plantSessionCode(t, e.dataDir, second)
 
 		blocked := newTargetedBlockStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(blocked))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(blocked))
 		testassert.NoError(t, err)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
@@ -1351,10 +1296,7 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		first, second, third := ids[0], ids[1], ids[2]
 
 		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -1463,10 +1405,7 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		thirdCode := plantSessionCode(t, e.dataDir, third)
 
 		wrapped := newSweepStore(store)
-		ticks := make(chan time.Time)
-		opts := e.options(e.storagePlugin(wrapped))
-		opts.sweepTicks = ticks
-		r, err := open(context.Background(), opts)
+		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -1543,10 +1482,8 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 			testassert.Require(t, sessionWarningPresent(warnings, keeperID), "the unrelated Session's warning group was removed")
 		}
 		wrapped.disarmReadFailure(third) // the transient read failure is retryable, never latched
-		{
-			rec, err := readSweptSession(t, r, third)
-			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "the unreadable candidate after the pass = %+v err %v, want it left readable and archived", rec, err)
-		}
+		rec := headerThroughRuntime(t, r, third)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "the unreadable candidate after the pass = %+v, want it left readable and archived", rec)
 
 		// The pass error's one retained diagnostic may land just after the
 		// hint; poll it under a bounded budget.

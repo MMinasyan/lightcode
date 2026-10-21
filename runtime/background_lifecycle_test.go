@@ -322,22 +322,20 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 			`"state":{"lifecycle":"open","current_agent_type":"worker","current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
 		childID, now, parentID, operationID, now)
 	entryID := newLifecycleID(t)
-	inputPayload := fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"plugin","content":[{"kind":"text","text":"child work"}]}`,
-		childID, entryID, operationID)
-	admission := fmt.Sprintf(
-		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"worker",`+
-			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
-			`"context_window":4096,"output_reserve":2048,`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
-		childID, operationID, childID, entryID, lifecycleSeedToolDefinition, now)
-	operationPayload := fmt.Sprintf(
-		`{"admission":%s,"state":{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
-		admission, now)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterSession}, sessionPayload)
-	lifecycleInsertEntry(t, store, childID, entryID, operationID, harness.EntryInput, inputPayload)
+	lifecycleInsertEntry(t, store, childID, entryID, operationID, harness.EntryInput,
+		compactRawInputEntry(childID, entryID, operationID, "plugin", "child work"))
+	admission := rawMessageAdmission(childID, operationID, entryID, rawAdmissionValues{
+		agentType:     "worker",
+		model:         usageWireRef{Provider: "prov", Model: "gpt-x"},
+		outputReserve: 2048,
+		systemPrompt:  "system",
+		tools:         "[" + lifecycleSeedToolDefinition + "]",
+		compactModel:  usageWireRef{Provider: "cprov", Model: "compact-x"},
+		compactPrompt: "summarize",
+	})
+	operationPayload := compactRawOperationRegister(admission,
+		fmt.Sprintf(`{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}`, now))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterOperation, OperationID: operationID}, operationPayload)
 }
 
@@ -475,35 +473,13 @@ func (b *bgRuntime) startJob(sessionID, jobID string) string {
 	return completionID
 }
 
-// stop stops one Session through the Runtime's admitted-call gate.
-func (b *bgRuntime) stop(sessionID string) error {
-	b.t.Helper()
-	return b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		return h.Stop(ctx, sessionID)
-	})
-}
-
 // submitMode submits one message in the given mode and returns its
 // disposition.
 func (b *bgRuntime) submitMode(sessionID, operationID, text string, mode harness.MessageMode) harness.SubmitDisposition {
 	b.t.Helper()
-	var disposition harness.SubmitDisposition
-	err := b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        mode,
-		})
-		if err != nil {
-			return err
-		}
-		disposition = res.Disposition
-		return nil
-	})
+	res, err := submitRawThroughRuntime(context.Background(), b.r, sessionID, operationID, text, mode)
 	if err != nil {
 		b.t.Fatalf("Submit(%s): %v", operationID, err)
 	}
-	return disposition
+	return res.Disposition
 }

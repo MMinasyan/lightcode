@@ -2487,7 +2487,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-1", "env_echo", `{}`) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "env_echo", `{}`) }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		t.Setenv("CONNECT_CHAIN_EXTERNAL", "sibling-value")
@@ -2497,9 +2497,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", false, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
 
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
-			coreStoragePlugin(e.store), connectEnvEchoPlugin(),
-		}})
+		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), connectEnvEchoPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
