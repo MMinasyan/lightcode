@@ -28,6 +28,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -291,9 +292,7 @@ func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harne
 		}
 		return prepared, nil
 	}, Jobs: stopper})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 	f.h = h
 	return f
 }
@@ -309,9 +308,7 @@ func (f *publicFixture) close() { f.cancel() }
 func createSession(t *testing.T, h *harness.Harness) string {
 	t.Helper()
 	session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	return session.Identity.SessionID
 }
 
@@ -342,15 +339,11 @@ func awaitTerminal(t *testing.T, h *harness.Harness, session, operation string) 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		rec, err := h.ReadOperation(context.Background(), session, operation)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
+		testassert.NoError(t, err)
 		if rec.State.Terminal != nil {
 			return rec
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("operation %s never settled within the wait bound", operation)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "operation %s never settled within the wait bound", operation)
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -363,9 +356,7 @@ func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 	})
 	t.Run("sqlite", func(t *testing.T) {
 		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
-		if err != nil {
-			t.Fatalf("OpenSQLite: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)
 	})
@@ -390,65 +381,48 @@ func TestPublicTurnLifecycle(t *testing.T) {
 		session := createSession(t, f.h)
 
 		res, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
-		if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
-			t.Fatalf("first submit = %+v err %v, want admitted", res, err)
-		}
+		testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted && res.Operation != nil, "first submit = %+v err %v, want admitted", res, err)
 		rec := res.Operation
-		if rec.State.Status != harness.OperationRunning || rec.Admission.AgentType != "coder" ||
-			rec.Admission.Execution.ConfigurationRevision != "rev-1" || rec.Admission.Execution.Model != publicModelRef {
-			t.Fatalf("admitted record = %+v", rec)
-		}
+		testassert.Require(t, rec.State.Status == harness.OperationRunning && rec.Admission.AgentType == "coder" && rec.Admission.Execution.ConfigurationRevision == "rev-1" && rec.Admission.Execution.Model == publicModelRef, "admitted record = %+v", rec)
 		<-script.arrived // parked at the first model boundary: the Session is active
-		if got := texts(script.seen()[0]); got[0] != "system" || got[1] != "hello" || len(got) != 2 {
-			t.Fatalf("first projection = %v, want the captured system prompt and the admitted input", got)
+		{
+			got := texts(script.seen()[0])
+			testassert.Require(t, got[0] == "system" && got[1] == "hello" && len(got) == 2, "first projection = %v, want the captured system prompt and the admitted input", got)
 		}
-		if queued, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil ||
-			queued.Disposition != harness.DispositionQueued || queued.Operation != nil {
-			t.Fatalf("active queued submit = %+v err %v, want queued", queued, err)
+		{
+			queued, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+			testassert.Require(t, err == nil && queued.Disposition == harness.DispositionQueued && queued.Operation == nil, "active queued submit = %+v err %v, want queued", queued, err)
 		}
 
 		script.releaseGate()
 		<-f.prepare // the drain admitted the queued item: op-1's terminal committed
 		<-script.arrived
-		if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "queued-1" {
-			t.Fatalf("second projection = %v, want the first turn's committed history before the queued input", got)
+		{
+			got := texts(script.seen()[1])
+			testassert.Require(t, got[0] == "system" && got[1] == "hello" && got[2] == "done" && got[3] == "queued-1", "second projection = %v, want the first turn's committed history before the queued input", got)
 		}
 		awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		first, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || first.State.Status != harness.OperationSuccess || first.State.Terminal == nil {
-			t.Fatalf("first operation = %+v err %v, want terminal success", first, err)
-		}
+		testassert.Require(t, err == nil && first.State.Status == harness.OperationSuccess && first.State.Terminal != nil, "first operation = %+v err %v, want terminal success", first, err)
 		want := harness.UsageTotals{ByModel: []harness.ModelUsage{{
 			Model: publicModelRef,
 			Usage: harness.UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2},
 		}}}
-		if len(first.State.Usage.ByModel) != 1 || first.State.Usage.ByModel[0] != want.ByModel[0] {
-			t.Fatalf("operation usage = %+v, want the reported counts", first.State.Usage)
-		}
+		testassert.Require(t, len(first.State.Usage.ByModel) == 1 && first.State.Usage.ByModel[0] == want.ByModel[0], "operation usage = %+v, want the reported counts", first.State.Usage)
 		sessionHeader, err := f.h.ReadSessionHeader(context.Background(), session)
-		if err != nil || sessionHeader.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v", sessionHeader, err)
-		}
+		testassert.Require(t, err == nil && sessionHeader.CurrentOperationID == "", "session after convergence = %+v err %v", sessionHeader, err)
 		sessionView, err := f.h.ReadSessionView(context.Background(), session)
-		if err != nil {
-			t.Fatalf("ReadSessionView: %v", err)
-		}
-		if len(sessionView.TotalUsage.ByModel) != 1 || sessionView.TotalUsage.ByModel[0] != want.ByModel[0] {
-			t.Fatalf("session usage = %+v, want the same totals", sessionView.TotalUsage)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(sessionView.TotalUsage.ByModel) == 1 && sessionView.TotalUsage.ByModel[0] == want.ByModel[0], "session usage = %+v, want the same totals", sessionView.TotalUsage)
 		second, err := f.h.ReadOperation(context.Background(), session, "op-2")
-		if err != nil || second.State.Status != harness.OperationFailure ||
-			second.State.Terminal == nil || second.State.Terminal.Detail != "second turn failed" {
-			t.Fatalf("drained operation = %+v err %v, want terminal failure with its detail", second, err)
-		}
+		testassert.Require(t, err == nil && second.State.Status == harness.OperationFailure && second.State.Terminal != nil && second.State.Terminal.Detail == "second turn failed", "drained operation = %+v err %v, want terminal failure with its detail", second, err)
 		calls := f.preparationCalls()
-		if len(calls) != 2 || calls[0].Session.AgentType != "coder" || calls[1].Session.AgentType != "coder" {
-			t.Fatalf("preparation calls = %+v, want one per admission with the Session type", calls)
-		}
+		testassert.Require(t, len(calls) == 2 && calls[0].Session.AgentType == "coder" && calls[1].Session.AgentType == "coder", "preparation calls = %+v, want one per admission with the Session type", calls)
 	})
 }
 
@@ -466,43 +440,40 @@ func TestPublicSteeringContinuation(t *testing.T) {
 		defer f.close()
 		session := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // parked at the first model boundary
-		if steered, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "steer"); err != nil ||
-			steered.Disposition != harness.DispositionSteering || steered.Operation != nil {
-			t.Fatalf("steering submit = %+v err %v, want steering", steered, err)
+		{
+			steered, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "steer")
+			testassert.Require(t, err == nil && steered.Disposition == harness.DispositionSteering && steered.Operation == nil, "steering submit = %+v err %v, want steering", steered, err)
 		}
-		if queued, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "queued-1"); err != nil ||
-			queued.Disposition != harness.DispositionQueued {
-			t.Fatalf("queued submit = %+v err %v, want queued", queued, err)
+		{
+			queued, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "queued-1")
+			testassert.Require(t, err == nil && queued.Disposition == harness.DispositionQueued, "queued submit = %+v err %v, want queued", queued, err)
 		}
 		script.releaseGate()
 		<-f.prepare      // the drain admitted the steering item: op-1's quiet terminal committed
 		<-script.arrived // the steering item's own Operation makes the next request
-		if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "steer" {
-			t.Fatalf("successor projection = %v, want the steering as its own Operation's first request", got)
+		{
+			got := texts(script.seen()[1])
+			testassert.Require(t, got[0] == "system" && got[1] == "hello" && got[2] == "done" && got[3] == "steer", "successor projection = %v, want the steering as its own Operation's first request", got)
 		}
 		awaitTerminal(t, f.h, session, "op-2")
 		<-f.prepare // the queued item drains after the successor's terminal
 		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
-			t.Fatalf("settled predecessor = %+v err %v, want quiet success with empty detail", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.Detail == "", "settled predecessor = %+v err %v, want quiet success with empty detail", rec, err)
 		successor, err := f.h.ReadOperation(context.Background(), session, "op-2")
-		if err != nil || successor.State.Status != harness.OperationSuccess {
-			t.Fatalf("steering operation = %+v err %v, want the successor's success", successor, err)
-		}
+		testassert.Require(t, err == nil && successor.State.Status == harness.OperationSuccess, "steering operation = %+v err %v, want the successor's success", successor, err)
 		for _, fact := range readHistoryFacts(t, f.h, session) {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "steer" {
-				if fact.OperationID != "op-2" {
-					t.Fatalf("steering input owned by %q, want its own Operation op-2", fact.OperationID)
-				}
+				testassert.Equal(t, fact.OperationID, "op-2")
 			}
 		}
 	})
@@ -522,31 +493,27 @@ func TestPublicIdempotency(t *testing.T) {
 		session := createSession(t, f.h)
 
 		first, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "first")
-		if err != nil || first.Disposition != harness.DispositionAdmitted || first.Operation == nil {
-			t.Fatalf("first submit = %+v err %v, want admitted", first, err)
-		}
+		testassert.Require(t, err == nil && first.Disposition == harness.DispositionAdmitted && first.Operation != nil, "first submit = %+v err %v, want admitted", first, err)
 		<-script.arrived // the Operation stays active
 
 		retry, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "changed")
-		if err != nil || retry.Disposition != harness.DispositionExisting || retry.Operation == nil ||
-			retry.Operation.Admission.AdmittedEntry != first.Operation.Admission.AdmittedEntry {
-			t.Fatalf("active retry = %+v err %v, want the first record", retry, err)
-		}
+		testassert.Require(t, err == nil && retry.Disposition == harness.DispositionExisting && retry.Operation != nil && retry.Operation.Admission.AdmittedEntry == first.Operation.Admission.AdmittedEntry, "active retry = %+v err %v, want the first record", retry, err)
 		queuedRetry, err := submit(t, f.h, session, "op-1", harness.MessageModeQueued, "changed-again")
-		if err != nil || queuedRetry.Disposition != harness.DispositionExisting || queuedRetry.Operation == nil {
-			t.Fatalf("queued retry = %+v err %v, want existing before routing", queuedRetry, err)
-		}
+		testassert.Require(t, err == nil && queuedRetry.Disposition == harness.DispositionExisting && queuedRetry.Operation != nil, "queued retry = %+v err %v, want existing before routing", queuedRetry, err)
 		other := createSession(t, f.h)
-		if _, err := submit(t, f.h, other, "op-1", harness.MessageModeRegular, "reused"); err == nil {
-			t.Fatalf("cross-session reuse succeeded, want an error")
+		{
+			_, err := submit(t, f.h, other, "op-1", harness.MessageModeRegular, "reused")
+			testassert.Require(t, err != nil, "cross-session reuse succeeded, want an error")
 		}
 
 		script.releaseGate()
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
-		if _, err := f.h.ReadOperation(context.Background(), other, "op-1"); err == nil {
-			t.Fatalf("cross-session reuse published an operation, want nothing")
+		{
+			_, err := f.h.ReadOperation(context.Background(), other, "op-1")
+			testassert.Require(t, err != nil, "cross-session reuse published an operation, want nothing")
 		}
 
 		t.Run("reuse after delete", func(t *testing.T) {
@@ -567,41 +534,41 @@ func TestPublicIdempotency(t *testing.T) {
 			}
 			source := createSession(t, f.h)
 
-			if _, err := submit(t, f.h, source, "reuse-1", harness.MessageModeRegular, "first"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, source, "reuse-1", harness.MessageModeRegular, "first")
+				testassert.NoError(t, err)
 			}
 			<-f.prepare      // the first admission prepared
 			<-script.arrived // parked at the model boundary: reuse-1 is running
-			if _, err := submit(t, f.h, source, "reuse-x", harness.MessageModeQueued, "queued"); err != nil {
-				t.Fatalf("queued submit: %v", err)
+			{
+				_, err := submit(t, f.h, source, "reuse-x", harness.MessageModeQueued, "queued")
+				testassert.NoError(t, err)
 			}
 			script.releaseGate()
 			<-f.prepare // barrier: the drain reached the queued item's preparation — reuse-1's terminal committed
 
 			// the failed preparation is final for the item and the drain retires, leaving
 			// the source Session idle; ArchiveSession's waitIdle joins that retirement
-			if _, err := f.h.ArchiveSession(context.Background(), source); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f.h.ArchiveSession(context.Background(), source)
+				testassert.NoError(t, err)
 			}
-			if err := f.h.DeleteSession(context.Background(), source); err != nil {
-				t.Fatalf("delete: %v", err)
+			{
+				err := f.h.DeleteSession(context.Background(), source)
+				testassert.NoError(t, err)
 			}
 
 			other := createSession(t, f.h)
 			res, err := submit(t, f.h, other, "reuse-1", harness.MessageModeRegular, "reused")
-			if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
-				t.Fatalf("reuse after delete = %+v err %v, want admitted in another session", res, err)
-			}
+			testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted && res.Operation != nil, "reuse after delete = %+v err %v, want admitted in another session", res, err)
 			<-script.arrived                        // the reused ID's Operation reached its model boundary
 			awaitTerminal(t, f.h, other, "reuse-1") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			rec, err := f.h.ReadOperation(context.Background(), other, "reuse-1")
-			if err != nil || rec.State.Status != harness.OperationFailure ||
-				rec.State.Terminal == nil || rec.State.Terminal.Detail != "reused turn settled" {
-				t.Fatalf("reused operation = %+v err %v, want the model-originated terminal in the other session", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "reused turn settled", "reused operation = %+v err %v, want the model-originated terminal in the other session", rec, err)
 		})
 	})
 }
@@ -696,40 +663,36 @@ func TestPublicSubmitRoutesAfterReservationWinner(t *testing.T) {
 		close(releasePrep) // the winner publishes and installs its execution; its model stays gated
 
 		out := <-winner
-		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted || out.res.Operation == nil {
-			t.Fatalf("winning submit = %+v err %v, want admitted", out.res, out.err)
-		}
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionAdmitted && out.res.Operation != nil, "winning submit = %+v err %v, want admitted", out.res, out.err)
 		<-script.arrived // the winner is parked at its model boundary: the Session stays active
 
 		out = <-steerer
-		if out.err != nil || out.res.Disposition != harness.DispositionSteering || out.res.Operation != nil {
-			t.Fatalf("waiting regular submit = %+v err %v, want steering after the winner's admission", out.res, out.err)
-		}
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionSteering && out.res.Operation == nil, "waiting regular submit = %+v err %v, want steering after the winner's admission", out.res, out.err)
 		out = <-queuer
-		if out.err != nil || out.res.Disposition != harness.DispositionQueued || out.res.Operation != nil {
-			t.Fatalf("waiting queued submit = %+v err %v, want queued after the winner's admission", out.res, out.err)
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionQueued && out.res.Operation == nil, "waiting queued submit = %+v err %v, want queued after the winner's admission", out.res, out.err)
+		{
+			calls := f.preparationCalls()
+			testassert.Equal(t, len(calls), 1)
 		}
-		if calls := f.preparationCalls(); len(calls) != 1 {
-			t.Fatalf("preparation calls = %d, want only the winner's", len(calls))
+		{
+			_, err := f.h.ReadOperation(context.Background(), session, "op-2")
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "buffered steering operation read = err %v, want ErrNotFound while buffered", err)
 		}
-		if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("buffered steering operation read = err %v, want ErrNotFound while buffered", err)
-		}
-		if _, err := f.h.ReadOperation(context.Background(), session, "op-3"); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("buffered queued operation read = err %v, want ErrNotFound while buffered", err)
+		{
+			_, err := f.h.ReadOperation(context.Background(), session, "op-3")
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "buffered queued operation read = err %v, want ErrNotFound while buffered", err)
 		}
 		rec, err := f.h.ReadSessionHeader(context.Background(), session)
-		if err != nil || rec.CurrentOperationID != "op-1" {
-			t.Fatalf("session while both items wait buffered = %+v err %v, want the winner as the one active Operation", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.CurrentOperationID == "op-1", "session while both items wait buffered = %+v err %v, want the winner as the one active Operation", rec, err)
 
 		script.releaseGate() // every buffered item is delivered or discarded per the landed lifetime semantics
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
-		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
-			rec.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v, want no operation left running", rec, err)
+		{
+			rec, err := f.h.ReadSessionHeader(context.Background(), session)
+			testassert.Require(t, err == nil && rec.CurrentOperationID == "", "session after convergence = %+v err %v, want no operation left running", rec, err)
 		}
 	})
 }
@@ -759,40 +722,39 @@ func TestPublicSubmitSameIDResolvesExistingUnderReservation(t *testing.T) {
 		close(releasePrep)
 
 		winOut := <-winner
-		if winOut.err != nil || winOut.res.Disposition != harness.DispositionAdmitted || winOut.res.Operation == nil {
-			t.Fatalf("winning submit = %+v err %v, want admitted", winOut.res, winOut.err)
-		}
+		testassert.Require(t, winOut.err == nil && winOut.res.Disposition == harness.DispositionAdmitted && winOut.res.Operation != nil, "winning submit = %+v err %v, want admitted", winOut.res, winOut.err)
 		<-script.arrived // the winner is parked at its model boundary
 		out := <-retry
-		if out.err != nil || out.res.Disposition != harness.DispositionExisting || out.res.Operation == nil ||
-			out.res.Operation.Admission.AdmittedEntry != winOut.res.Operation.Admission.AdmittedEntry {
-			t.Fatalf("same-ID retry = %+v err %v, want the first Operation as existing", out.res, out.err)
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionExisting && out.res.Operation != nil && out.res.Operation.Admission.AdmittedEntry == winOut.res.Operation.Admission.AdmittedEntry, "same-ID retry = %+v err %v, want the first Operation as existing", out.res, out.err)
+		{
+			calls := f.preparationCalls()
+			testassert.Equal(t, len(calls), 1)
 		}
-		if calls := f.preparationCalls(); len(calls) != 1 {
-			t.Fatalf("preparation calls = %d, want no repeated preparation for the same ID", len(calls))
+		{
+			got := texts(script.seen()[0])
+			testassert.Require(t, got[len(got)-1] == "first", "admitted projection = %v, want the originally admitted content, not the retry's", got)
 		}
-		if got := texts(script.seen()[0]); got[len(got)-1] != "first" {
-			t.Fatalf("admitted projection = %v, want the originally admitted content, not the retry's", got)
+		{
+			rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationRunning, "same-ID operation = %+v err %v, want the one running Operation", rec, err)
 		}
-		if rec, err := f.h.ReadOperation(context.Background(), session, "op-1"); err != nil ||
-			rec.State.Status != harness.OperationRunning {
-			t.Fatalf("same-ID operation = %+v err %v, want the one running Operation", rec, err)
-		}
-		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
-			rec.CurrentOperationID != "op-1" {
-			t.Fatalf("session = %+v err %v, want the same ID still current", rec, err)
+		{
+			rec, err := f.h.ReadSessionHeader(context.Background(), session)
+			testassert.Require(t, err == nil && rec.CurrentOperationID == "op-1", "session = %+v err %v, want the same ID still current", rec, err)
 		}
 
 		script.releaseGate() // the winner settles; no buffered duplicate exists to drain
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
-		if calls := f.preparationCalls(); len(calls) != 1 {
-			t.Fatalf("preparation calls after convergence = %d, want the same ID never independently executed", len(calls))
+		{
+			calls := f.preparationCalls()
+			testassert.Equal(t, len(calls), 1)
 		}
-		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
-			rec.CurrentOperationID != "" {
-			t.Fatalf("session after convergence = %+v err %v, want no buffered duplicate delivered", rec, err)
+		{
+			rec, err := f.h.ReadSessionHeader(context.Background(), session)
+			testassert.Require(t, err == nil && rec.CurrentOperationID == "", "session after convergence = %+v err %v, want no buffered duplicate delivered", rec, err)
 		}
 	})
 }
@@ -822,33 +784,33 @@ func TestPublicSubmitCanceledWaiterPublishesNothing(t *testing.T) {
 		cancelWait()
 
 		out := <-canceled
-		if !errors.Is(out.err, context.Canceled) || out.res.Operation != nil {
-			t.Fatalf("canceled waiter = %+v err %v, want a context error and no result", out.res, out.err)
+		testassert.Require(t, errors.Is(out.err, context.Canceled) && out.res.Operation == nil, "canceled waiter = %+v err %v, want a context error and no result", out.res, out.err)
+		{
+			calls := f.preparationCalls()
+			testassert.Equal(t, len(calls), 1)
 		}
-		if calls := f.preparationCalls(); len(calls) != 1 {
-			t.Fatalf("preparation calls = %d, want no preparation for the canceled caller", len(calls))
+		{
+			_, err := f.h.ReadOperation(context.Background(), session, "op-2")
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canceled operation read = err %v, want ErrNotFound: nothing published", err)
 		}
-		if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("canceled operation read = err %v, want ErrNotFound: nothing published", err)
-		}
-		if rec, err := f.h.ReadSessionHeader(context.Background(), session); err != nil ||
-			rec.CurrentOperationID != "" {
-			t.Fatalf("session after the canceled waiter = %+v err %v, want nothing published", rec, err)
+		{
+			rec, err := f.h.ReadSessionHeader(context.Background(), session)
+			testassert.Require(t, err == nil && rec.CurrentOperationID == "", "session after the canceled waiter = %+v err %v, want nothing published", rec, err)
 		}
 
 		close(releasePrep) // the winner's publication wins after the waiter's cancellation
 		out = <-winner
-		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("winner after a canceled waiter = %+v err %v, want admitted", out.res, out.err)
-		}
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionAdmitted, "winner after a canceled waiter = %+v err %v, want admitted", out.res, out.err)
 		<-script.arrived
 
 		script.releaseGate()
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
-		if calls := f.preparationCalls(); len(calls) != 1 {
-			t.Fatalf("preparation calls after convergence = %d, want the canceled item never delivered", len(calls))
+		{
+			calls := f.preparationCalls()
+			testassert.Equal(t, len(calls), 1)
 		}
 	})
 }
@@ -868,32 +830,29 @@ func TestPublicAgentTypeChange(t *testing.T) {
 		defer f.close()
 		session := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived
-		if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+			testassert.NoError(t, err)
 		}
 		changed, err := f.h.ChangeAgentType(context.Background(), session, "reviewer")
-		if err != nil || changed.State.CurrentAgentType != "reviewer" {
-			t.Fatalf("ChangeAgentType = %+v err %v, want success during the blocked effect", changed, err)
-		}
+		testassert.Require(t, err == nil && changed.State.CurrentAgentType == "reviewer", "ChangeAgentType = %+v err %v, want success during the blocked effect", changed, err)
 		script.releaseGate()
 
 		<-f.prepare // the drained admission prepared again
 		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 		calls := f.preparationCalls()
-		if len(calls) != 2 || calls[0].Session.AgentType != "coder" || calls[1].Session.AgentType != "reviewer" {
-			t.Fatalf("preparation agent types = %+v, want the capture-time value then the changed one", calls)
-		}
+		testassert.Require(t, len(calls) == 2 && calls[0].Session.AgentType == "coder" && calls[1].Session.AgentType == "reviewer", "preparation agent types = %+v, want the capture-time value then the changed one", calls)
 		first, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || first.Admission.AgentType != "coder" || first.State.Status != harness.OperationSuccess {
-			t.Fatalf("first operation = %+v err %v, want the immutable capture and success", first, err)
-		}
+		testassert.Require(t, err == nil && first.Admission.AgentType == "coder" && first.State.Status == harness.OperationSuccess, "first operation = %+v err %v, want the immutable capture and success", first, err)
 	})
 }
 
@@ -908,41 +867,43 @@ func TestPublicHarnessLifetime(t *testing.T) {
 		f := newPublicFixture(t, store, script, nil)
 		session := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // parked inside the model effect
-		if _, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "steer"); err != nil {
-			t.Fatalf("steering submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "steer")
+			testassert.NoError(t, err)
 		}
-		if _, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "queued-1"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "queued-1")
+			testassert.NoError(t, err)
 		}
 
 		waited := make(chan error, 1)
 		go func() { waited <- f.h.Wait(context.Background()) }() // Wait begins before cancellation
 		f.cancel()                                               // Harness loss closes admission and ends the run
 		script.releaseGate()
-		if err := <-waited; err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := <-waited
+			testassert.NoError(t, err)
 		}
 
-		if _, err := submit(t, f.h, session, "op-4", harness.MessageModeRegular, "late"); err == nil {
-			t.Fatalf("submit after cancellation succeeded, want admission closed")
+		{
+			_, err := submit(t, f.h, session, "op-4", harness.MessageModeRegular, "late")
+			testassert.Require(t, err != nil, "submit after cancellation succeeded, want admission closed")
 		}
 		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationInterruption {
-			t.Fatalf("converged operation = %+v err %v, want interruption", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption, "converged operation = %+v err %v, want interruption", rec, err)
 		for _, id := range []string{"op-2", "op-3"} {
-			if _, err := f.h.ReadOperation(context.Background(), session, id); err == nil {
-				t.Fatalf("buffered item %q became an operation, want the buffers discarded", id)
+			{
+				_, err := f.h.ReadOperation(context.Background(), session, id)
+				testassert.Require(t, err != nil, "buffered item %q became an operation, want the buffers discarded", id)
 			}
 		}
 		calls := f.preparationCalls()
-		if len(calls) != 1 {
-			t.Fatalf("preparation calls = %d, want no buffered delivery attempts after Harness loss", len(calls))
-		}
+		testassert.Equal(t, len(calls), 1)
 	})
 }
 
@@ -958,9 +919,7 @@ func TestPublicWaitOwnContextCancelsOnlyTheWait(t *testing.T) {
 		go func() { done <- f.h.Wait(waitCtx) }()
 		select {
 		case err := <-done:
-			if err == nil {
-				t.Fatalf("Wait over a canceled wait context returned nil, want its error")
-			}
+			testassert.Require(t, err != nil, "Wait over a canceled wait context returned nil, want its error")
 		case <-time.After(5 * time.Second):
 			t.Fatalf("Wait ignored its own context cancellation")
 		}
@@ -1015,12 +974,14 @@ func submitRequest(sessionID, operationID, text string) harness.SubmitRequest {
 // the Session carries no entries and no Operation register.
 func assertNothingAdmitted(t *testing.T, store harness.Storage, sessionID, operationID string) {
 	t.Helper()
-	if entries := recoverEntries(t, store, sessionID); len(entries) != 0 {
-		t.Fatalf("aborted admission published %d entries, want none", len(entries))
+	{
+		entries := recoverEntries(t, store, sessionID)
+		testassert.Equal(t, len(entries), 0)
 	}
 	key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID}
-	if _, err := store.ReadRegister(context.Background(), key); !errors.Is(err, harness.ErrNotFound) {
-		t.Fatalf("operation register after the aborted admission = err %v, want absence", err)
+	{
+		_, err := store.ReadRegister(context.Background(), key)
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "operation register after the aborted admission = err %v, want absence", err)
 	}
 }
 
@@ -1032,12 +993,14 @@ func seedIdleSource(t *testing.T, store harness.Storage, operationID string) str
 	script := newScriptModel(publicTurn())
 	f := newPublicFixture(t, store, script, nil)
 	source := createSession(t, f.h)
-	if _, err := submit(t, f.h, source, operationID, harness.MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("seed submit: %v", err)
+	{
+		_, err := submit(t, f.h, source, operationID, harness.MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-script.arrived
-	if err := converge(t, f); err != nil {
-		t.Fatalf("seed Wait: %v", err)
+	{
+		err := converge(t, f)
+		testassert.NoError(t, err)
 	}
 	return source
 }
@@ -1063,16 +1026,13 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			probe.atEntry = f.cancel // the Harness context dies as the publication transaction begins
 
 			res, err := f.h.Submit(ctx, submitRequest(session, "op-a", "hello"))
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("submit whose publication lost the Harness context = %+v err %v, want a context error", res, err)
-			}
-			if res.Operation != nil {
-				t.Fatalf("submit result = %+v, want no admitted operation", res)
-			}
+			testassert.Require(t, errors.Is(err, context.Canceled), "submit whose publication lost the Harness context = %+v err %v, want a context error", res, err)
+			testassert.Require(t, res.Operation == nil, "submit result = %+v, want no admitted operation", res)
 			assertNothingAdmitted(t, store, session, "op-a")
 			assertSessionIDs(t, store, session)
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1086,15 +1046,12 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			probe.atEntry = cancelCaller
 
 			res, err := f.h.Submit(caller, submitRequest(session, "op-b", "hello"))
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("submit whose publication lost the caller context = %+v err %v, want a context error", res, err)
-			}
-			if res.Operation != nil {
-				t.Fatalf("submit result = %+v, want no admitted operation", res)
-			}
+			testassert.Require(t, errors.Is(err, context.Canceled), "submit whose publication lost the caller context = %+v err %v, want a context error", res, err)
+			testassert.Require(t, res.Operation == nil, "submit result = %+v, want no admitted operation", res)
 			assertNothingAdmitted(t, store, session, "op-b")
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1102,9 +1059,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			source := seedIdleSource(t, store, "seed-op-1")
 			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-1").ID
 			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			probe := &publicationCancelStore{Storage: store}
 			f := newPublicFixture(t, probe, newScriptModel(), nil)
@@ -1117,23 +1072,16 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 				OperationID:     "fork-1",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("fork whose publication lost the Harness context = %+v err %v, want a context error", res, err)
-			}
+			testassert.Require(t, errors.Is(err, context.Canceled), "fork whose publication lost the Harness context = %+v err %v, want a context error", res, err)
 			after, err := store.ListSessionIDs(ctx)
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
-			if len(after) != len(before) {
-				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(after) == len(before), "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			for i := range after {
-				if after[i] != before[i] {
-					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-				}
+				testassert.Require(t, after[i] == before[i], "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			}
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1141,9 +1089,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			source := seedIdleSource(t, store, "seed-op-3")
 			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-3").ID
 			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			probe := &publicationCancelStore{Storage: store}
 			f := newPublicFixture(t, probe, newScriptModel(), nil)
@@ -1158,23 +1104,16 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 				OperationID:     "fork-2",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("fork whose publication lost the caller context = %+v err %v, want a context error", res, err)
-			}
+			testassert.Require(t, errors.Is(err, context.Canceled), "fork whose publication lost the caller context = %+v err %v, want a context error", res, err)
 			after, err := store.ListSessionIDs(ctx)
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
-			if len(after) != len(before) {
-				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(after) == len(before), "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			for i := range after {
-				if after[i] != before[i] {
-					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-				}
+				testassert.Require(t, after[i] == before[i], "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			}
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1188,15 +1127,12 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			probe.atEntry = func() { <-caller.Done() } // publication gated until the caller deadline expires
 
 			res, err := f.h.Submit(caller, submitRequest(session, "op-d", "hello"))
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("submit whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
-			}
-			if res.Operation != nil {
-				t.Fatalf("submit result = %+v, want no admitted operation", res)
-			}
+			testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "submit whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
+			testassert.Require(t, res.Operation == nil, "submit result = %+v, want no admitted operation", res)
 			assertNothingAdmitted(t, store, session, "op-d")
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1204,9 +1140,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			source := seedIdleSource(t, store, "seed-op-4")
 			boundary := forkEntryOf(t, store, source, harness.EntryInput, "seed-op-4").ID
 			before, err := store.ListSessionIDs(ctx) // subtests share the store: no destination means an unchanged listing
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			probe := &publicationCancelStore{Storage: store}
 			f := newPublicFixture(t, probe, newScriptModel(), nil)
@@ -1221,23 +1155,16 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 				OperationID:     "fork-3",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("fork whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
-			}
+			testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "fork whose publication lost the caller deadline = %+v err %v, want DeadlineExceeded", res, err)
 			after, err := store.ListSessionIDs(ctx)
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
-			if len(after) != len(before) {
-				t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(after) == len(before), "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			for i := range after {
-				if after[i] != before[i] {
-					t.Fatalf("session listing after the aborted fork = %v, want it unchanged at %v", after, before)
-				}
+				testassert.Require(t, after[i] == before[i], "session listing after the aborted fork = %v, want it unchanged at %v", after, before)
 			}
-			if calls := f.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want exactly one with no retry", len(calls))
+			{
+				calls := f.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
 		})
 
@@ -1252,21 +1179,16 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			probe.afterCommit = cancelCaller
 
 			res, err := f.h.Submit(caller, submitRequest(session, "op-c", "hello"))
-			if err != nil || res.Disposition != harness.DispositionAdmitted || res.Operation == nil {
-				t.Fatalf("submit over a caller context canceled after the commit = %+v err %v, want the committed admission", res, err)
-			}
-			if caller.Err() == nil {
-				t.Fatalf("the caller context was not canceled after the commit")
-			}
+			testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted && res.Operation != nil, "submit over a caller context canceled after the commit = %+v err %v, want the committed admission", res, err)
+			testassert.Require(t, caller.Err() != nil, "the caller context was not canceled after the commit")
 			<-script.arrived                       // the admitted execution reached its model boundary; its terminal commits in the effect's own transaction
 			awaitTerminal(t, f.h, session, "op-c") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			rec, err := f.h.ReadOperation(ctx, session, "op-c")
-			if err != nil || rec.State.Status != harness.OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "committed turn" {
-				t.Fatalf("committed operation = %+v err %v, want the model-originated terminal", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "committed turn", "committed operation = %+v err %v, want the model-originated terminal", rec, err)
 		})
 
 		t.Run("post-commit caller cancellation returns the committed fork", func(t *testing.T) {
@@ -1287,23 +1209,18 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 				OperationID:     "fork-2",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if err != nil {
-				t.Fatalf("fork over a caller context canceled after the commit = err %v, want the committed result", err)
-			}
+			testassert.NoError(t, err)
 			dest := res.Session.Identity.SessionID
-			if dest == source || res.Session.Identity.SourceSessionID != source ||
-				res.Operation.Admission.OperationID != "fork-2" || res.Operation.State.Status != harness.OperationRunning {
-				t.Fatalf("fork result = %+v, want the committed destination and its running fork operation", res)
-			}
-			if caller.Err() == nil {
-				t.Fatalf("the caller context was not canceled after the commit")
-			}
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			testassert.Require(t, dest != source && res.Session.Identity.SourceSessionID == source && res.Operation.Admission.OperationID == "fork-2" && res.Operation.State.Status == harness.OperationRunning, "fork result = %+v, want the committed destination and its running fork operation", res)
+			testassert.Require(t, caller.Err() != nil, "the caller context was not canceled after the commit")
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			assertForkSourceUnchanged(t, store, source, snapshotSession(t, store, source)) // the source is untouched
-			if entries := recoverEntries(t, store, dest); len(entries) == 0 {
-				t.Fatalf("committed destination %q has no entries", dest)
+			{
+				entries := recoverEntries(t, store, dest)
+				testassert.Require(t, len(entries) != 0, "committed destination %q has no entries", dest)
 			}
 		})
 	})
@@ -1377,41 +1294,31 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 					}, nil
 				}
 				session := createSession(t, f.h)
-				if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("submit: %v", err)
+				{
+					_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 				select {
 				case <-settled:
 				case <-time.After(10 * time.Second):
 					t.Fatalf("the execution cleanup never ran after the settlement")
 				}
-				if err := converge(t, f); err != nil {
-					t.Fatalf("Wait: %v", err)
+				{
+					err := converge(t, f)
+					testassert.NoError(t, err)
 				}
 				if opens.Load() != 1 {
 					t.Fatalf("opener calls = %d, want the mutation assertion to run through a real open", opens.Load())
 				}
 				seen := script.seen()
-				if len(seen) != 1 {
-					t.Fatalf("%d model requests, want one", len(seen))
-				}
+				testassert.Equal(t, len(seen), 1)
 				got := seen[0].Tools
-				if len(got) != 1 || got[0].Name != "echo" || got[0].Description != "echoes" || string(got[0].Parameters) != string(admittedParams) {
-					t.Fatalf("advertised tools = %+v, want the admitted definitions, not the opener's local mutations", got)
-				}
+				testassert.Require(t, len(got) == 1 && got[0].Name == "echo" && got[0].Description == "echoes" && string(got[0].Parameters) == string(admittedParams), "advertised tools = %+v, want the admitted definitions, not the opener's local mutations", got)
 				rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-				if err != nil {
-					t.Fatalf("ReadOperation: %v", err)
-				}
-				if rec.State.Status != harness.OperationSuccess {
-					t.Fatalf("operation status = %s, want success over the admitted capture", rec.State.Status)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 				durable := rec.Admission.Execution
-				if len(durable.Tools) != 1 || durable.Tools[0].Name != "echo" || durable.Tools[0].Description != "echoes" ||
-					string(durable.Tools[0].Parameters) != string(admittedParams) ||
-					!reflect.DeepEqual(durable.Capabilities, []string{"cap.one", "cap.two"}) {
-					t.Fatalf("durable capture = %+v, want the admitted values", durable)
-				}
+				testassert.Require(t, len(durable.Tools) == 1 && durable.Tools[0].Name == "echo" && durable.Tools[0].Description == "echoes" && string(durable.Tools[0].Parameters) == string(admittedParams) && reflect.DeepEqual(durable.Capabilities, []string{"cap.one", "cap.two"}), "durable capture = %+v, want the admitted values", durable)
 			})
 		})
 	}
@@ -1441,33 +1348,35 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 			}
 			session := createSession(t, f.h)
 
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-f.prepare      // the first admission prepared
 			<-script.arrived // parked: the Session is active
-			if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "q1"); err != nil {
-				t.Fatalf("queued submit 1: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "q1")
+				testassert.NoError(t, err)
 			}
-			if _, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "q2"); err != nil {
-				t.Fatalf("queued submit 2: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "q2")
+				testassert.NoError(t, err)
 			}
 			script.releaseGate()
 
 			<-f.prepare // the failed item was dropped and the next one admitted
 			<-script.arrived
 			awaitTerminal(t, f.h, session, "op-3") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
-			if _, err := f.h.ReadOperation(context.Background(), session, "op-2"); err == nil {
-				t.Fatalf("failed item's operation exists, want nothing retained")
+			{
+				_, err := f.h.ReadOperation(context.Background(), session, "op-2")
+				testassert.Require(t, err != nil, "failed item's operation exists, want nothing retained")
 			}
 			rec, err := f.h.ReadOperation(context.Background(), session, "op-3")
-			if err != nil || rec.State.Status != harness.OperationFailure ||
-				rec.State.Terminal == nil || rec.State.Terminal.Detail != "next item settled" {
-				t.Fatalf("next buffered message = %+v err %v, want admitted and settled", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "next item settled", "next buffered message = %+v err %v, want admitted and settled", rec, err)
 		})
 	})
 
@@ -1484,16 +1393,19 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 			defer f.close()
 			session := createSession(t, f.h)
 
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-f.prepare      // the first admission prepared
 			<-script.arrived // parked: the Session is active
-			if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "q1"); err != nil {
-				t.Fatalf("queued submit 1: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "q1")
+				testassert.NoError(t, err)
 			}
-			if _, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "q2"); err != nil {
-				t.Fatalf("queued submit 2: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-3", harness.MessageModeQueued, "q2")
+				testassert.NoError(t, err)
 			}
 			script.releaseGate()
 
@@ -1502,19 +1414,14 @@ func TestPublicBufferedItemFailure(t *testing.T) {
 			<-f.prepare // q1's failed terminal let the drain admit the next item
 			<-script.arrived
 			awaitTerminal(t, f.h, session, "op-3") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			failed, err := f.h.ReadOperation(context.Background(), session, "op-2")
-			if err != nil || failed.State.Status != harness.OperationFailure ||
-				failed.State.Terminal == nil || failed.State.Terminal.Detail != "queued turn failed" {
-				t.Fatalf("failed delivered operation = %+v err %v, want terminal failure", failed, err)
-			}
+			testassert.Require(t, err == nil && failed.State.Status == harness.OperationFailure && failed.State.Terminal != nil && failed.State.Terminal.Detail == "queued turn failed", "failed delivered operation = %+v err %v, want terminal failure", failed, err)
 			rec, err := f.h.ReadOperation(context.Background(), session, "op-3")
-			if err != nil || rec.State.Status != harness.OperationFailure ||
-				rec.State.Terminal == nil || rec.State.Terminal.Detail != "next item settled" {
-				t.Fatalf("next buffered message = %+v err %v, want admitted and settled", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "next item settled", "next buffered message = %+v err %v, want admitted and settled", rec, err)
 		})
 	})
 }
@@ -1541,8 +1448,9 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // submit at the model-result boundary, before the settlement returns
 					first = false
-					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "at-boundary"); err != nil {
-						t.Errorf("boundary submit: %v", err)
+					{
+						_, err := submit(t, f.h, session, "op-2", harness.MessageModeRegular, "at-boundary")
+						testassert.Check(t, err == nil, "boundary submit: %v", err)
 					}
 				}
 				return inner(ctx, req)
@@ -1551,32 +1459,28 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			defer f.close()
 			session = createSession(t, f.h)
 
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-script.arrived
 			<-script.arrived // the boundary input's own Operation makes the next request
-			if got := texts(script.seen()[1]); got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "at-boundary" {
-				t.Fatalf("successor projection = %v, want the boundary steering as its own Operation's first request", got)
+			{
+				got := texts(script.seen()[1])
+				testassert.Require(t, got[0] == "system" && got[1] == "hello" && got[2] == "done" && got[3] == "at-boundary", "successor projection = %v, want the boundary steering as its own Operation's first request", got)
 			}
 			awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-			if err != nil || rec.State.Status != harness.OperationSuccess || rec.State.Terminal == nil {
-				t.Fatalf("operation = %+v err %v, want the natural-success boundary's quiet success", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess && rec.State.Terminal != nil, "operation = %+v err %v, want the natural-success boundary's quiet success", rec, err)
 			successor, err := f.h.ReadOperation(context.Background(), session, "op-2")
-			if err != nil || successor.State.Status != harness.OperationFailure ||
-				successor.State.Terminal == nil || successor.State.Terminal.Detail != "successor settled" {
-				t.Fatalf("successor operation = %+v err %v, want the boundary input's own Operation at its terminal", successor, err)
-			}
+			testassert.Require(t, err == nil && successor.State.Status == harness.OperationFailure && successor.State.Terminal != nil && successor.State.Terminal.Detail == "successor settled", "successor operation = %+v err %v, want the boundary input's own Operation at its terminal", successor, err)
 			for _, fact := range readHistoryFacts(t, f.h, session) {
 				if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 && fact.Input.Content[0].Text == "at-boundary" {
-					if fact.OperationID != "op-2" {
-						t.Fatalf("boundary input owned by %q, want its own Operation op-2", fact.OperationID)
-					}
+					testassert.Equal(t, fact.OperationID, "op-2")
 				}
 			}
 		})
@@ -1597,8 +1501,9 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			boundary := func(ctx context.Context, req model.Request) (model.Stream, error) {
 				if first { // defer one queued message at the final model-result boundary
 					first = false
-					if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "at-boundary"); err != nil {
-						t.Errorf("boundary submit: %v", err)
+					{
+						_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "at-boundary")
+						testassert.Check(t, err == nil, "boundary submit: %v", err)
 					}
 				}
 				return inner(ctx, req)
@@ -1607,25 +1512,22 @@ func TestPublicFinalBoundarySerialization(t *testing.T) {
 			defer f.close()
 			session = createSession(t, f.h)
 
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-script.arrived
 			<-f.prepare // the drain admitted the boundary item after the terminal commit
 			<-script.arrived
 			awaitTerminal(t, f.h, session, "op-2") // the settlement commits before the convergence cancellation
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			firstRec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-			if err != nil || firstRec.State.Status != harness.OperationFailure ||
-				firstRec.State.Terminal == nil || firstRec.State.Terminal.Detail != "first settled" {
-				t.Fatalf("first operation = %+v err %v, want its terminal before the drain", firstRec, err)
-			}
+			testassert.Require(t, err == nil && firstRec.State.Status == harness.OperationFailure && firstRec.State.Terminal != nil && firstRec.State.Terminal.Detail == "first settled", "first operation = %+v err %v, want its terminal before the drain", firstRec, err)
 			rec, err := f.h.ReadOperation(context.Background(), session, "op-2")
-			if err != nil || rec.State.Status != harness.OperationFailure {
-				t.Fatalf("drained operation = %+v err %v, want the boundary queued input admitted after the terminal", rec, err)
-			}
+			testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure, "drained operation = %+v err %v, want the boundary queued input admitted after the terminal", rec, err)
 		})
 	})
 }
@@ -1657,33 +1559,30 @@ func TestPublicSessionsExecuteConcurrently(t *testing.T) {
 		sessionA := createSession(t, f.h)
 		sessionB := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, sessionA, "op-a", harness.MessageModeRegular, "first"); err != nil {
-			t.Fatalf("first session submit: %v", err)
+		{
+			_, err := submit(t, f.h, sessionA, "op-a", harness.MessageModeRegular, "first")
+			testassert.NoError(t, err)
 		}
 		<-f.prepare      // the first admission prepared
 		<-parked.arrived // the first Session is parked at its model boundary
 
-		if _, err := submit(t, f.h, sessionB, "op-b", harness.MessageModeRegular, "second"); err != nil {
-			t.Fatalf("second session submit: %v", err)
+		{
+			_, err := submit(t, f.h, sessionB, "op-b", harness.MessageModeRegular, "second")
+			testassert.NoError(t, err)
 		}
 		<-f.prepare                             // the second Session was admitted while the first is parked
 		<-finished.arrived                      // and reached its model boundary before the first one resumed
 		parked.releaseGate()                    // the first Session settles through its own model-originated terminal
 		awaitTerminal(t, f.h, sessionA, "op-a") // both failing attempts' settlements commit
 		awaitTerminal(t, f.h, sessionB, "op-b") // before the convergence cancellation can race either
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 		doneRec, err := f.h.ReadOperation(context.Background(), sessionB, "op-b")
-		if err != nil || doneRec.State.Status != harness.OperationFailure ||
-			doneRec.State.Terminal == nil || doneRec.State.Terminal.Detail != "second session settled" {
-			t.Fatalf("second session = %+v err %v, want it settled while the first was parked", doneRec, err)
-		}
+		testassert.Require(t, err == nil && doneRec.State.Status == harness.OperationFailure && doneRec.State.Terminal != nil && doneRec.State.Terminal.Detail == "second session settled", "second session = %+v err %v, want it settled while the first was parked", doneRec, err)
 		rec, err := f.h.ReadOperation(context.Background(), sessionA, "op-a")
-		if err != nil || rec.State.Status != harness.OperationFailure ||
-			rec.State.Terminal == nil || rec.State.Terminal.Detail != "first session settled" {
-			t.Fatalf("first session = %+v err %v, want its model-originated terminal after its release", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "first session settled", "first session = %+v err %v, want its model-originated terminal after its release", rec, err)
 	})
 }
 
@@ -1744,10 +1643,7 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 									t.Errorf("decode operation register during execution: %v", err)
 									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 								}
-								if wire.State.ActiveEffect == nil || wire.State.ActiveEffect.Kind != "tool" ||
-									wire.State.ActiveEffect.ToolCallID != "call-1" || wire.State.ActiveEffect.ResultEntryID == "" {
-									t.Errorf("tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
-								}
+								testassert.Check(t, wire.State.ActiveEffect != nil && wire.State.ActiveEffect.Kind == "tool" && wire.State.ActiveEffect.ToolCallID == "call-1" && wire.State.ActiveEffect.ResultEntryID != "", "tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
 								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
 							}}
 						}
@@ -1761,39 +1657,36 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		script.gate = make(chan struct{}) // the first turn parks at its model boundary until released below
 		session = createSession(t, f.h)
 		res, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
-		if err != nil || res.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("first submit = %+v err %v, want the auto-started admission", res, err)
-		}
+		testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted, "first submit = %+v err %v, want the auto-started admission", res, err)
 		<-f.prepare      // the initial admission prepared: the later prepare barrier is the drain's alone
 		<-script.arrived // the first model boundary — parked at the gate
-		if got := texts(script.seen()[0]); got[0] != "system" || got[1] != "hello" || len(got) != 2 {
-			t.Fatalf("first projection = %v, want the system prompt and the admitted input", got)
+		{
+			got := texts(script.seen()[0])
+			testassert.Require(t, got[0] == "system" && got[1] == "hello" && len(got) == 2, "first projection = %v, want the system prompt and the admitted input", got)
 		}
-		if queued, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil || queued.Disposition != harness.DispositionQueued {
-			t.Fatalf("queued submit = %+v err %v, want queued", queued, err)
+		{
+			queued, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+			testassert.Require(t, err == nil && queued.Disposition == harness.DispositionQueued, "queued submit = %+v err %v, want queued", queued, err)
 		}
 		script.releaseGate()
 
 		<-script.arrived // the second request: both committed results project before it
-		if got := texts(script.seen()[1]); len(got) != 5 || got[0] != "system" || got[1] != "hello" || got[2] != "done" ||
-			got[3] != "ran call-1" || got[4] != "immediate call-2" {
-			t.Fatalf("subsequent projection = %v, want both tool results in dispatch order", got)
+		{
+			got := texts(script.seen()[1])
+			testassert.Require(t, len(got) == 5 && got[0] == "system" && got[1] == "hello" && got[2] == "done" && got[3] == "ran call-1" && got[4] == "immediate call-2", "subsequent projection = %v, want both tool results in dispatch order", got)
 		}
 		<-f.prepare // the drain admitted the queued item: op-1's terminal success committed
 		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationSuccess || len(rec.State.PendingToolCalls) != 0 {
-			t.Fatalf("tool turn = %+v err %v, want terminal success with every call settled", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess && len(rec.State.PendingToolCalls) == 0, "tool turn = %+v err %v, want terminal success with every call settled", rec, err)
 		toolMu.Lock()
 		defer toolMu.Unlock()
-		if len(toolOrder) != 2 || toolOrder[0] != "call-1" || toolOrder[1] != "call-2" {
-			t.Fatalf("dispatch order = %v, want the completed calls in published order", toolOrder)
-		}
+		testassert.Require(t, len(toolOrder) == 2 && toolOrder[0] == "call-1" && toolOrder[1] == "call-2", "dispatch order = %v, want the completed calls in published order", toolOrder)
 	})
 }
 
@@ -1819,9 +1712,7 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 		// durable payload, expanding it far past the bound.
 		const durableBound = 1 << 20
 		expanded := json.RawMessage(`"` + strings.Repeat("<", durableBound-2) + `"`)
-		if len(expanded) != durableBound {
-			t.Fatalf("fixture raw size = %d, want exactly the durable bound", len(expanded))
-		}
+		testassert.Equal(t, len(expanded), durableBound)
 		script := newScriptModel(
 			publicTurn("call-1", "call-2", "call-3"),
 			publicTurn(),
@@ -1860,16 +1751,19 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			}, nil
 		}
 		session := createSession(t, f.h)
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the turn that published the calls
 		<-script.arrived // the completion turn: all three results projected before it
-		if got := texts(script.seen()[1]); len(got) != 6 || got[3] != "ran call-1" || got[4] != "no preview" || got[5] != "expanded metadata" {
-			t.Fatalf("projection = %v, want the committed contents only", got)
+		{
+			got := texts(script.seen()[1])
+			testassert.Require(t, len(got) == 6 && got[3] == "ran call-1" && got[4] == "no preview" && got[5] == "expanded metadata", "projection = %v, want the committed contents only", got)
 		}
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		readResults := func() map[string]map[string]json.RawMessage {
@@ -1879,44 +1773,41 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 					continue
 				}
 				var wire map[string]json.RawMessage
-				if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-					t.Fatalf("decode tool result payload: %v", err)
+				{
+					err := json.Unmarshal(entry.Payload, &wire)
+					testassert.NoError(t, err)
 				}
 				var callID string
-				if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
-					t.Fatalf("decode tool call id: %v", err)
+				{
+					err := json.Unmarshal(wire["tool_call_id"], &callID)
+					testassert.NoError(t, err)
 				}
 				results[callID] = wire
 			}
 			return results
 		}
 		results := readResults()
-		if string(results["call-1"]["metadata"]) != encoded {
-			t.Fatalf("call-1 metadata = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		testassert.Require(t, string(results["call-1"]["metadata"]) == encoded, "call-1 metadata = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		{
+			_, present := results["call-2"]["metadata"]
+			testassert.Require(t, !present, "call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
 		}
-		if _, present := results["call-2"]["metadata"]; present {
-			t.Fatalf("call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
+		testassert.Require(t, string(results["call-2"]["content"]) == `"no preview"`, "call-2 payload = %s, want the settled result alongside the dropped metadata", results["call-2"]["content"])
+		{
+			_, present := results["call-3"]["metadata"]
+			testassert.Require(t, !present, "call-3 carries durable-oversized metadata, want it dropped while the result committed")
 		}
-		if string(results["call-2"]["content"]) != `"no preview"` {
-			t.Fatalf("call-2 payload = %s, want the settled result alongside the dropped metadata", results["call-2"]["content"])
-		}
-		if _, present := results["call-3"]["metadata"]; present {
-			t.Fatalf("call-3 carries durable-oversized metadata, want it dropped while the result committed")
-		}
-		if string(results["call-3"]["content"]) != `"expanded metadata"` {
-			t.Fatalf("call-3 payload = %s, want the settled result committed past the metadata drop", results["call-3"]["content"])
-		}
+		testassert.Require(t, string(results["call-3"]["content"]) == `"expanded metadata"`, "call-3 payload = %s, want the settled result committed past the metadata drop", results["call-3"]["content"])
 
 		// a restarted Harness revalidates every committed payload: the durable
 		// states prove no transaction failed and the Session stayed sound,
 		// and the committed encoded member survives recovery unchanged.
-		if err := harness.Recover(context.Background(), store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		{
+			err := harness.Recover(context.Background(), store)
+			testassert.NoError(t, err)
 		}
 		results = readResults()
-		if string(results["call-1"]["metadata"]) != encoded {
-			t.Fatalf("call-1 metadata after Recover = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
-		}
+		testassert.Require(t, string(results["call-1"]["metadata"]) == encoded, "call-1 metadata after Recover = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
 	})
 }
 
@@ -1971,33 +1862,27 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			}, nil
 		}
 		session := createSession(t, f.h)
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the turn publishing both calls
 		<-script.arrived // the continuation after the settled calls
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
-		if executions != 1 {
-			t.Fatalf("concrete effects started = %d, want only the declared call", executions)
-		}
-		if string(consumed) != `{"x":1}` {
-			t.Fatalf("executor saw arguments %s, want the committed normalized bytes", consumed)
-		}
+		testassert.Equal(t, executions, 1)
+		testassert.Require(t, string(consumed) == `{"x":1}`, "executor saw arguments %s, want the committed normalized bytes", consumed)
 		rec, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if !rec.Admission.Execution.Readonly || rec.Admission.Execution.WriteDir != "/w/sub" {
-			t.Fatalf("committed capture = %v %q, want the durable permission capability members",
-				rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.Admission.Execution.Readonly && rec.Admission.Execution.WriteDir == "/w/sub", "committed capture = %v %q, want the durable permission capability members", rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
 		var normalized, denial, settled int
 		for _, entry := range recoverEntries(t, store, session) {
 			var wire map[string]json.RawMessage
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode %s payload: %v", entry.ID, err)
+			{
+				err := json.Unmarshal(entry.Payload, &wire)
+				testassert.Require(t, err == nil, "decode %s payload: %v", entry.ID, err)
 			}
 			switch entry.Kind {
 			case harness.EntryAssistant:
@@ -2005,47 +1890,44 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 					ID                  string          `json:"id"`
 					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
 				}
-				if err := json.Unmarshal(wire["tool_calls"], &calls); err != nil {
-					t.Fatalf("decode assistant tool calls: %v", err)
+				{
+					err := json.Unmarshal(wire["tool_calls"], &calls)
+					testassert.NoError(t, err)
 				}
 				for _, call := range calls {
-					if string(call.NormalizedArguments) != `{"x":1}` {
-						t.Fatalf("%s normalized_arguments = %s, want the producer's committed object", call.ID, call.NormalizedArguments)
-					}
+					testassert.Require(t, string(call.NormalizedArguments) == `{"x":1}`, "%s normalized_arguments = %s, want the producer's committed object", call.ID, call.NormalizedArguments)
 					normalized++
 				}
 			case harness.EntryToolResult:
 				settled++
 				var callID, status string
-				if err := json.Unmarshal(wire["tool_call_id"], &callID); err != nil {
-					t.Fatalf("decode tool call id: %v", err)
+				{
+					err := json.Unmarshal(wire["tool_call_id"], &callID)
+					testassert.NoError(t, err)
 				}
-				if err := json.Unmarshal(wire["status"], &status); err != nil {
-					t.Fatalf("decode status: %v", err)
+				{
+					err := json.Unmarshal(wire["status"], &status)
+					testassert.NoError(t, err)
 				}
 				if callID == "call-2" {
 					denial++
-					if status != "denied" || string(wire["content"]) != `"Permission denied."` {
-						t.Fatalf("call-2 result = %s, want the fixed public denial", entry.Payload)
-					}
-					if _, present := wire["metadata"]; present {
-						t.Fatalf("denied call-2 carries a metadata member")
+					testassert.Require(t, status == "denied" && string(wire["content"]) == `"Permission denied."`, "call-2 result = %s, want the fixed public denial", entry.Payload)
+					{
+						_, present := wire["metadata"]
+						testassert.Require(t, !present, "denied call-2 carries a metadata member")
 					}
 				} else if status != "success" {
 					t.Fatalf("call-1 result = %s, want the allowed execution", entry.Payload)
 				}
 			}
 		}
-		if normalized != 2 || denial != 1 || settled != 2 {
-			t.Fatalf("committed shape = %d normalized calls, %d denials, %d results, want 2/1/2", normalized, denial, settled)
-		}
-		if err := harness.Recover(context.Background(), store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		testassert.Require(t, normalized == 2 && denial == 1 && settled == 2, "committed shape = %d normalized calls, %d denials, %d results, want 2/1/2", normalized, denial, settled)
+		{
+			err := harness.Recover(context.Background(), store)
+			testassert.NoError(t, err)
 		}
 		after, err := f.h.ReadOperation(context.Background(), session, "op-1")
-		if err != nil || after.Admission.Execution.WriteDir != "/w/sub" || !after.Admission.Execution.Readonly {
-			t.Fatalf("capture after recovery = %+v err %v, want the same durable constraints", after.Admission.Execution, err)
-		}
+		testassert.Require(t, err == nil && after.Admission.Execution.WriteDir == "/w/sub" && after.Admission.Execution.Readonly, "capture after recovery = %+v err %v, want the same durable constraints", after.Admission.Execution, err)
 	})
 }
 
@@ -2053,9 +1935,7 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 func sessionRegister(t *testing.T, store harness.Storage, sessionID string) harness.Register {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
-	if err != nil {
-		t.Fatalf("read session register: %v", err)
-	}
+	testassert.NoError(t, err)
 	return reg
 }
 
@@ -2074,56 +1954,35 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			defer f.close()
 			session := createSession(t, f.h)
 			first, err := f.h.ReadSessionHeader(ctx, session)
-			if err != nil || first.Lifecycle != harness.LifecycleOpen || first.Revision.DurableRevision != 1 {
-				t.Fatalf("created session = %+v err %v, want open at revision 1", first, err)
-			}
+			testassert.Require(t, err == nil && first.Lifecycle == harness.LifecycleOpen && first.Revision.DurableRevision == 1, "created session = %+v err %v, want open at revision 1", first, err)
 			originalActivity := first.LastActivity
 
 			reopened, err := f.h.ReopenSession(ctx, session)
-			if err != nil || reopened.State.Lifecycle != harness.LifecycleOpen || reopened.State.ArchivedAt != nil ||
-				reopened.Revision != first.Revision.DurableRevision || !reopened.State.LastActivity.Equal(originalActivity) {
-				t.Fatalf("reopen of open = %+v err %v, want the no-write success", reopened, err)
-			}
+			testassert.Require(t, err == nil && reopened.State.Lifecycle == harness.LifecycleOpen && reopened.State.ArchivedAt == nil && reopened.Revision == first.Revision.DurableRevision && reopened.State.LastActivity.Equal(originalActivity), "reopen of open = %+v err %v, want the no-write success", reopened, err)
 
 			archived, err := f.h.ArchiveSession(ctx, session)
-			if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.Revision != first.Revision.DurableRevision+1 {
-				t.Fatalf("archive of open = %+v err %v, want archived at the next revision", archived, err)
+			testassert.Require(t, err == nil && archived.State.Lifecycle == harness.LifecycleArchived && archived.Revision == first.Revision.DurableRevision+1, "archive of open = %+v err %v, want archived at the next revision", archived, err)
+			{
+				reg := sessionRegister(t, store, session)
+				testassert.Equal(t, reg.Revision, archived.Revision)
 			}
-			if reg := sessionRegister(t, store, session); reg.Revision != archived.Revision {
-				t.Fatalf("durable register revision %d disagrees with the returned record's %d", reg.Revision, archived.Revision)
-			}
-			if archived.State.ArchivedAt == nil || archived.State.ArchivedAt.IsZero() ||
-				archived.State.ArchivedAt.Location() != time.UTC {
-				t.Fatalf("archived_at = %v, want one sampled UTC time", archived.State.ArchivedAt)
-			}
-			if !archived.State.LastActivity.Equal(originalActivity) {
-				t.Fatalf("archive moved last activity to %v, want it unchanged at %v", archived.State.LastActivity, originalActivity)
-			}
+			testassert.Require(t, archived.State.ArchivedAt != nil && !archived.State.ArchivedAt.IsZero() && archived.State.ArchivedAt.Location() == time.UTC, "archived_at = %v, want one sampled UTC time", archived.State.ArchivedAt)
+			testassert.Require(t, archived.State.LastActivity.Equal(originalActivity), "archive moved last activity to %v, want it unchanged at %v", archived.State.LastActivity, originalActivity)
 
 			again, err := f.h.ArchiveSession(ctx, session)
-			if err != nil || again.Revision != archived.Revision || !again.State.ArchivedAt.Equal(*archived.State.ArchivedAt) {
-				t.Fatalf("archive of archived = %+v err %v, want the no-write success", again, err)
-			}
+			testassert.Require(t, err == nil && again.Revision == archived.Revision && again.State.ArchivedAt.Equal(*archived.State.ArchivedAt), "archive of archived = %+v err %v, want the no-write success", again, err)
 
 			back, err := f.h.ReopenSession(ctx, session)
-			if err != nil || back.State.Lifecycle != harness.LifecycleOpen || back.State.ArchivedAt != nil ||
-				back.Revision != archived.Revision+1 {
-				t.Fatalf("reopen of archived = %+v err %v, want open with the archived time cleared", back, err)
+			testassert.Require(t, err == nil && back.State.Lifecycle == harness.LifecycleOpen && back.State.ArchivedAt == nil && back.Revision == archived.Revision+1, "reopen of archived = %+v err %v, want open with the archived time cleared", back, err)
+			{
+				reg := sessionRegister(t, store, session)
+				testassert.Equal(t, reg.Revision, back.Revision)
 			}
-			if reg := sessionRegister(t, store, session); reg.Revision != back.Revision {
-				t.Fatalf("durable register revision %d disagrees with the returned record's %d", reg.Revision, back.Revision)
-			}
-			if !back.State.LastActivity.After(originalActivity) {
-				t.Fatalf("reopen left last activity at %v, want it advanced past %v", back.State.LastActivity, originalActivity)
-			}
-			if back.Identity != first.Identity || back.State.CurrentAgentType != "coder" {
-				t.Fatalf("reopen changed identity or Agent type: %+v", back)
-			}
+			testassert.Require(t, back.State.LastActivity.After(originalActivity), "reopen left last activity at %v, want it advanced past %v", back.State.LastActivity, originalActivity)
+			testassert.Require(t, back.Identity == first.Identity && back.State.CurrentAgentType == "coder", "reopen changed identity or Agent type: %+v", back)
 
 			againOpen, err := f.h.ReopenSession(ctx, session)
-			if err != nil || againOpen.Revision != back.Revision || !againOpen.State.LastActivity.Equal(back.State.LastActivity) {
-				t.Fatalf("second reopen = %+v err %v, want the no-write success", againOpen, err)
-			}
+			testassert.Require(t, err == nil && againOpen.Revision == back.Revision && againOpen.State.LastActivity.Equal(back.State.LastActivity), "second reopen = %+v err %v, want the no-write success", againOpen, err)
 		})
 
 		t.Run("archive rejects a running session without losing its buffers", func(t *testing.T) {
@@ -2132,34 +1991,34 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			f := newPublicFixture(t, store, script, nil)
 			defer f.close()
 			session := createSession(t, f.h)
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-f.prepare      // the first admission prepared
 			<-script.arrived // parked at the model boundary: the Session is running
-			if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
-				t.Fatalf("queued submit: %v", err)
+			{
+				_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+				testassert.NoError(t, err)
 			}
 			before := sessionRegister(t, store, session)
 
-			if _, err := f.h.ArchiveSession(ctx, session); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("archive of a running session = err %v, want ErrInvalid", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive of a running session = err %v, want ErrInvalid", err)
 			}
 			after := sessionRegister(t, store, session)
-			if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-				t.Fatalf("rejected archive changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-			}
+			testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "rejected archive changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
 			script.releaseGate()
 			<-f.prepare      // the rejected archive kept the buffered item: the drain admitted it
 			<-script.arrived // the admitted item reached its model boundary: its admission committed
-			if err := converge(t, f); err != nil {
-				t.Fatalf("Wait: %v", err)
+			{
+				err := converge(t, f)
+				testassert.NoError(t, err)
 			}
 			drained, err := f.h.ReadOperation(ctx, session, "op-2")
-			if err != nil || drained.State.Terminal == nil {
-				t.Fatalf("buffered item after rejected archive = %+v err %v, want it delivered and settled", drained, err)
-			}
+			testassert.Require(t, err == nil && drained.State.Terminal != nil, "buffered item after rejected archive = %+v err %v, want it delivered and settled", drained, err)
 		})
 
 		t.Run("delete requires archived and invalidates the coordinator", func(t *testing.T) {
@@ -2168,56 +2027,61 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			session := createSession(t, f.h)
 			before := sessionRegister(t, store, session)
 
-			if err := f.h.DeleteSession(ctx, session); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("delete of an open session = err %v, want ErrInvalid", err)
+			{
+				err := f.h.DeleteSession(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete of an open session = err %v, want ErrInvalid", err)
 			}
 			after := sessionRegister(t, store, session)
-			if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-				t.Fatalf("rejected delete changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-			}
+			testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "rejected delete changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
-			if _, err := f.h.ArchiveSession(ctx, session); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, session)
+				testassert.NoError(t, err)
 			}
-			if err := f.h.DeleteSession(ctx, session); err != nil {
-				t.Fatalf("delete of archived: %v", err)
+			{
+				err := f.h.DeleteSession(ctx, session)
+				testassert.NoError(t, err)
 			}
 
 			key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-			if _, err := store.ReadRegister(ctx, key); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("deleted session register = err %v, want ErrNotFound", err)
+			{
+				_, err := store.ReadRegister(ctx, key)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted session register = err %v, want ErrNotFound", err)
 			}
 			ids, err := store.ListSessionIDs(ctx)
-			if err != nil {
-				t.Fatalf("list sessions: %v", err)
-			}
+			testassert.NoError(t, err)
 			for _, id := range ids { // deletion is absence: no tombstone, no listing
-				if id == session {
-					t.Fatalf("deleted session still listed")
-				}
+				testassert.Require(t, id != session, "deleted session still listed")
 			}
 
 			// holders of the materialized coordinator and later materialization both get ErrNotFound
-			if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("read after delete = err %v, want ErrNotFound, not a stale record", err)
+			{
+				_, err := f.h.ReadSessionHeader(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after delete = err %v, want ErrNotFound, not a stale record", err)
 			}
-			if _, err := f.h.ReadOperation(ctx, session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("operation read after delete = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ReadOperation(ctx, session, "op-1")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "operation read after delete = err %v, want ErrNotFound", err)
 			}
-			if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "late"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("submit after delete = err %v, want ErrNotFound", err)
+			{
+				_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "late")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "submit after delete = err %v, want ErrNotFound", err)
 			}
-			if _, err := f.h.ChangeAgentType(ctx, session, "reviewer"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("agent-type change after delete = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ChangeAgentType(ctx, session, "reviewer")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "agent-type change after delete = err %v, want ErrNotFound", err)
 			}
-			if _, err := f.h.ReopenSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("reopen after delete = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ReopenSession(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "reopen after delete = err %v, want ErrNotFound", err)
 			}
-			if _, err := f.h.ArchiveSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("archive after delete = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "archive after delete = err %v, want ErrNotFound", err)
 			}
-			if err := f.h.DeleteSession(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("second delete = err %v, want ErrNotFound", err)
+			{
+				err := f.h.DeleteSession(ctx, session)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "second delete = err %v, want ErrNotFound", err)
 			}
 		})
 
@@ -2225,24 +2089,30 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			f := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f.close()
 			unknown := "0123456789abcdef0123456789abcdef" // valid hex identity, absent Session
-			if _, err := f.h.ReopenSession(ctx, unknown); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("reopen of unknown = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ReopenSession(ctx, unknown)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "reopen of unknown = err %v, want ErrNotFound", err)
 			}
-			if _, err := f.h.ArchiveSession(ctx, unknown); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("archive of unknown = err %v, want ErrNotFound", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, unknown)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "archive of unknown = err %v, want ErrNotFound", err)
 			}
-			if err := f.h.DeleteSession(ctx, unknown); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("delete of unknown = err %v, want ErrNotFound", err)
+			{
+				err := f.h.DeleteSession(ctx, unknown)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "delete of unknown = err %v, want ErrNotFound", err)
 			}
 			malformed := "not-a-session-id"
-			if _, err := f.h.ReopenSession(ctx, malformed); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("reopen of malformed = err %v, want ErrInvalid", err)
+			{
+				_, err := f.h.ReopenSession(ctx, malformed)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "reopen of malformed = err %v, want ErrInvalid", err)
 			}
-			if _, err := f.h.ArchiveSession(ctx, malformed); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("archive of malformed = err %v, want ErrInvalid", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, malformed)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive of malformed = err %v, want ErrInvalid", err)
 			}
-			if err := f.h.DeleteSession(ctx, malformed); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("delete of malformed = err %v, want ErrInvalid", err)
+			{
+				err := f.h.DeleteSession(ctx, malformed)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete of malformed = err %v, want ErrInvalid", err)
 			}
 		})
 	})
@@ -2260,42 +2130,33 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		first, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil {
-			t.Fatalf("read created session: %v", err)
-		}
+		testassert.NoError(t, err)
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 
 		boundary := first.LastActivity.Add(policy.ArchiveAfter)
 		before := sessionRegister(t, store, session)
-		if _, err := f.h.SweepSession(ctx, session, policy, boundary); err != nil {
-			t.Fatalf("sweep at the boundary: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, boundary)
+			testassert.NoError(t, err)
 		}
 		still, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.Revision != first.Revision {
-			t.Fatalf("boundary sweep = %+v err %v, want the open Session unchanged", still, err)
-		}
+		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.Revision == first.Revision, "boundary sweep = %+v err %v, want the open Session unchanged", still, err)
 		after := sessionRegister(t, store, session)
-		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-			t.Fatalf("no-op boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-		}
+		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "no-op boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
 		past := boundary.Add(time.Nanosecond)
-		if _, err := f.h.SweepSession(ctx, session, policy, past); err != nil {
-			t.Fatalf("sweep past the boundary: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, past)
+			testassert.NoError(t, err)
 		}
 		archived, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != first.Revision.DurableRevision+1 {
-			t.Fatalf("past-boundary sweep = %+v err %v, want archived at the next revision", archived, err)
+		testassert.Require(t, err == nil && archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == first.Revision.DurableRevision+1, "past-boundary sweep = %+v err %v, want archived at the next revision", archived, err)
+		{
+			reg := sessionRegister(t, store, session)
+			testassert.Equal(t, reg.Revision, archived.Revision.DurableRevision)
 		}
-		if reg := sessionRegister(t, store, session); reg.Revision != archived.Revision.DurableRevision {
-			t.Fatalf("durable register revision %d disagrees with the swept record's %d", reg.Revision, archived.Revision.DurableRevision)
-		}
-		if archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(past) {
-			t.Fatalf("sweep archive stamped %v, want the explicit sweep time %v", archived.ArchivedAt, past)
-		}
-		if !archived.LastActivity.Equal(first.LastActivity) {
-			t.Fatalf("sweep archive moved last activity to %v, want it unchanged", archived.LastActivity)
-		}
+		testassert.Require(t, archived.ArchivedAt != nil && archived.ArchivedAt.Equal(past), "sweep archive stamped %v, want the explicit sweep time %v", archived.ArchivedAt, past)
+		testassert.Require(t, archived.LastActivity.Equal(first.LastActivity), "sweep archive moved last activity to %v, want it unchanged", archived.LastActivity)
 	})
 }
 
@@ -2311,42 +2172,39 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		archived, err := f.h.ArchiveSession(ctx, session)
-		if err != nil || archived.State.ArchivedAt == nil {
-			t.Fatalf("archive = %+v err %v", archived, err)
-		}
+		testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "archive = %+v err %v", archived, err)
 		policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
 
 		boundary := archived.State.ArchivedAt.Add(policy.DeleteAfterArchive)
 		before := sessionRegister(t, store, session)
-		if _, err := f.h.SweepSession(ctx, session, policy, boundary); err != nil {
-			t.Fatalf("sweep at the delete boundary: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, boundary)
+			testassert.NoError(t, err)
 		}
-		if _, err := f.h.ReadSessionHeader(ctx, session); err != nil {
-			t.Fatalf("delete-boundary sweep removed the session: %v", err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, session)
+			testassert.NoError(t, err)
 		}
 		after := sessionRegister(t, store, session)
-		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-			t.Fatalf("no-op delete-boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-		}
+		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "no-op delete-boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
-		if _, err := f.h.SweepSession(ctx, session, policy, boundary.Add(time.Nanosecond)); err != nil {
-			t.Fatalf("sweep past the delete boundary: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, boundary.Add(time.Nanosecond))
+			testassert.NoError(t, err)
 		}
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-		if _, err := store.ReadRegister(ctx, key); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("sweep-deleted session register = err %v, want ErrNotFound", err)
+		{
+			_, err := store.ReadRegister(ctx, key)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "sweep-deleted session register = err %v, want ErrNotFound", err)
 		}
 		ids, err := store.ListSessionIDs(ctx)
-		if err != nil {
-			t.Fatalf("list sessions: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, id := range ids {
-			if id == session {
-				t.Fatalf("sweep-deleted session still listed")
-			}
+			testassert.Require(t, id != session, "sweep-deleted session still listed")
 		}
-		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("read after sweep delete = err %v, want ErrNotFound, not a stale record", err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, session)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after sweep delete = err %v, want ErrNotFound, not a stale record", err)
 		}
 	})
 }
@@ -2364,31 +2222,26 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			defer f.close()
 			open := createSession(t, f.h)
 			archivedID := createSession(t, f.h)
-			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, archivedID)
+				testassert.NoError(t, err)
 			}
 			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil {
-				t.Fatalf("read open: %v", err)
-			}
+			testassert.NoError(t, err)
 			beforeArchived, err := f.h.ReadSessionHeader(ctx, archivedID)
-			if err != nil {
-				t.Fatalf("read archived: %v", err)
+			testassert.NoError(t, err)
+			{
+				_, err := f.h.SweepSession(ctx, open, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
+				testassert.NoError(t, err)
 			}
-			if _, err := f.h.SweepSession(ctx, open, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity)); err != nil {
-				t.Fatalf("sweep with disabled thresholds: %v", err)
-			}
-			if _, err := f.h.SweepSession(ctx, archivedID, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity)); err != nil {
-				t.Fatalf("sweep with disabled thresholds: %v", err)
+			{
+				_, err := f.h.SweepSession(ctx, archivedID, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
+				testassert.NoError(t, err)
 			}
 			afterOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil || afterOpen.Revision != beforeOpen.Revision || afterOpen.Lifecycle != harness.LifecycleOpen {
-				t.Fatalf("disabled sweep touched the open session: %+v err %v", afterOpen, err)
-			}
+			testassert.Require(t, err == nil && afterOpen.Revision == beforeOpen.Revision && afterOpen.Lifecycle == harness.LifecycleOpen, "disabled sweep touched the open session: %+v err %v", afterOpen, err)
 			afterArchived, err := f.h.ReadSessionHeader(ctx, archivedID)
-			if err != nil || afterArchived.Revision != beforeArchived.Revision || afterArchived.Lifecycle != harness.LifecycleArchived {
-				t.Fatalf("disabled sweep touched the archived session: %+v err %v", afterArchived, err)
-			}
+			testassert.Require(t, err == nil && afterArchived.Revision == beforeArchived.Revision && afterArchived.Lifecycle == harness.LifecycleArchived, "disabled sweep touched the archived session: %+v err %v", afterArchived, err)
 		})
 
 		t.Run("delete disabled archives but does not delete", func(t *testing.T) {
@@ -2396,29 +2249,30 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			defer f.close()
 			open := createSession(t, f.h)
 			archivedID := createSession(t, f.h)
-			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, archivedID)
+				testassert.NoError(t, err)
 			}
 			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil {
-				t.Fatalf("read open: %v", err)
-			}
+			testassert.NoError(t, err)
 			policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour}
-			if _, err := f.h.SweepSession(ctx, open, policy, farPast(beforeOpen.LastActivity)); err != nil {
-				t.Fatalf("sweep: %v", err)
+			{
+				_, err := f.h.SweepSession(ctx, open, policy, farPast(beforeOpen.LastActivity))
+				testassert.NoError(t, err)
 			}
-			if _, err := f.h.SweepSession(ctx, archivedID, policy, farPast(beforeOpen.LastActivity)); err != nil {
-				t.Fatalf("sweep: %v", err)
+			{
+				_, err := f.h.SweepSession(ctx, archivedID, policy, farPast(beforeOpen.LastActivity))
+				testassert.NoError(t, err)
 			}
 			sweptOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil || sweptOpen.Lifecycle != harness.LifecycleArchived {
-				t.Fatalf("enabled archive transition = %+v err %v, want archived", sweptOpen, err)
+			testassert.Require(t, err == nil && sweptOpen.Lifecycle == harness.LifecycleArchived, "enabled archive transition = %+v err %v, want archived", sweptOpen, err)
+			{
+				_, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: archivedID, Kind: harness.RegisterSession})
+				testassert.NoError(t, err)
 			}
-			if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: archivedID, Kind: harness.RegisterSession}); err != nil {
-				t.Fatalf("disabled delete removed the archived session: %v", err)
-			}
-			if _, err := f.h.ReadSessionHeader(ctx, archivedID); err != nil {
-				t.Fatalf("archived sibling after sweep = err %v, want it still present", err)
+			{
+				_, err := f.h.ReadSessionHeader(ctx, archivedID)
+				testassert.NoError(t, err)
 			}
 		})
 
@@ -2427,28 +2281,28 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			defer f.close()
 			open := createSession(t, f.h)
 			archivedID := createSession(t, f.h)
-			if _, err := f.h.ArchiveSession(ctx, archivedID); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f.h.ArchiveSession(ctx, archivedID)
+				testassert.NoError(t, err)
 			}
 			beforeOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil {
-				t.Fatalf("read open: %v", err)
-			}
+			testassert.NoError(t, err)
 			policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
 			now := beforeOpen.LastActivity.Add(100 * time.Hour)
-			if _, err := f.h.SweepSession(ctx, open, policy, now); err != nil {
-				t.Fatalf("sweep: %v", err)
+			{
+				_, err := f.h.SweepSession(ctx, open, policy, now)
+				testassert.NoError(t, err)
 			}
-			if _, err := f.h.SweepSession(ctx, archivedID, policy, now); err != nil {
-				t.Fatalf("sweep: %v", err)
+			{
+				_, err := f.h.SweepSession(ctx, archivedID, policy, now)
+				testassert.NoError(t, err)
 			}
 			stillOpen, err := f.h.ReadSessionHeader(ctx, open)
-			if err != nil || stillOpen.Lifecycle != harness.LifecycleOpen {
-				t.Fatalf("disabled archive transition = %+v err %v, want the session still open", stillOpen, err)
-			}
+			testassert.Require(t, err == nil && stillOpen.Lifecycle == harness.LifecycleOpen, "disabled archive transition = %+v err %v, want the session still open", stillOpen, err)
 			key := harness.RegisterKey{SessionID: archivedID, Kind: harness.RegisterSession}
-			if _, err := store.ReadRegister(ctx, key); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("enabled delete transition left the archived session: err %v", err)
+			{
+				_, err := store.ReadRegister(ctx, key)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "enabled delete transition left the archived session: err %v", err)
 			}
 		})
 	})
@@ -2467,47 +2321,41 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		first, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil {
-			t.Fatalf("read created session: %v", err)
-		}
+		testassert.NoError(t, err)
 
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-f.prepare      // the first admission prepared
 		<-script.arrived // parked at the model boundary: the Session is running
-		if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+			testassert.NoError(t, err)
 		}
 		active, err := f.h.ReadSessionHeader(ctx, session) // the admission's own write is the sweep's baseline
-		if err != nil {
-			t.Fatalf("read active session: %v", err)
-		}
+		testassert.NoError(t, err)
 		before := sessionRegister(t, store, session)
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if _, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour)); err != nil {
-			t.Fatalf("sweep of a running session: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
+			testassert.NoError(t, err)
 		}
 		still, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.Revision != active.Revision {
-			t.Fatalf("sweep touched the running session: %+v err %v, want it unchanged", still, err)
-		}
+		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.Revision == active.Revision, "sweep touched the running session: %+v err %v, want it unchanged", still, err)
 		after := sessionRegister(t, store, session)
-		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-			t.Fatalf("sweep of a running session changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-		}
+		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "sweep of a running session changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
 		script.releaseGate()
 		<-f.prepare      // the buffered item was not lost by the sweep: the drain admitted it
 		<-script.arrived // the admitted item reached its model boundary: its admission committed
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 		drained, err := f.h.ReadOperation(ctx, session, "op-2")
-		if err != nil || drained.State.Terminal == nil {
-			t.Fatalf("buffered item after sweep = %+v err %v, want it delivered and settled", drained, err)
-		}
+		testassert.Require(t, err == nil && drained.State.Terminal != nil, "buffered item after sweep = %+v err %v, want it delivered and settled", drained, err)
 	})
 }
 
@@ -2529,54 +2377,50 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 		// valid JSON whose state section violates the closed lifecycle enum
 		reg := sessionRegister(t, store, corrupt)
 		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(reg.Payload, &obj); err != nil {
-			t.Fatalf("unmarshal session payload: %v", err)
+		{
+			err := json.Unmarshal(reg.Payload, &obj)
+			testassert.NoError(t, err)
 		}
 		var state map[string]json.RawMessage
-		if err := json.Unmarshal(obj["state"], &state); err != nil {
-			t.Fatalf("unmarshal state section: %v", err)
+		{
+			err := json.Unmarshal(obj["state"], &state)
+			testassert.NoError(t, err)
 		}
 		state["lifecycle"] = json.RawMessage(`"bogus"`)
 		newState, err := json.Marshal(state)
-		if err != nil {
-			t.Fatalf("marshal state section: %v", err)
-		}
+		testassert.NoError(t, err)
 		obj["state"] = newState
 		bad, err := json.Marshal(obj)
-		if err != nil {
-			t.Fatalf("marshal session payload: %v", err)
-		}
+		testassert.NoError(t, err)
 		key := harness.RegisterKey{SessionID: corrupt, Kind: harness.RegisterSession}
-		if err := store.Transact(ctx, func(tx harness.Transaction) error {
-			_, err := tx.ReplaceRegister(key, reg.Revision, bad)
-			return err
-		}); err != nil {
-			t.Fatalf("corrupt the register: %v", err)
+		{
+			err := store.Transact(ctx, func(tx harness.Transaction) error {
+				_, err := tx.ReplaceRegister(key, reg.Revision, bad)
+				return err
+			})
+			testassert.NoError(t, err)
 		}
 
 		validBefore, err := f.h.ReadSessionHeader(ctx, valid)
-		if err != nil {
-			t.Fatalf("read valid sibling: %v", err)
-		}
+		testassert.NoError(t, err)
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		when := validBefore.LastActivity.Add(100 * time.Hour)
-		if _, err := f.h.SweepSession(ctx, corrupt, policy, when); !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("sweep of the corrupt session = %v, want the corruption error and the row left in place", err)
+		{
+			_, err := f.h.SweepSession(ctx, corrupt, policy, when)
+			testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "sweep of the corrupt session = %v, want the corruption error and the row left in place", err)
 		}
-		if _, err := f.h.SweepSession(ctx, valid, policy, when); err != nil {
-			t.Fatalf("sweep of the valid sibling = %v, want it archived", err)
+		{
+			_, err := f.h.SweepSession(ctx, valid, policy, when)
+			testassert.NoError(t, err)
 		}
 
 		untouched := sessionRegister(t, store, corrupt) // the corruption write itself took revision reg.Revision+1
-		if !bytes.Equal(untouched.Payload, bad) || untouched.Revision != reg.Revision+1 {
-			t.Fatalf("sweep changed the corrupt register (revision %d -> %d)", reg.Revision+1, untouched.Revision)
-		}
+		testassert.Require(t, bytes.Equal(untouched.Payload, bad) && untouched.Revision == reg.Revision+1, "sweep changed the corrupt register (revision %d -> %d)", reg.Revision+1, untouched.Revision)
 		swept, err := f.h.ReadSessionHeader(ctx, valid)
-		if err != nil || swept.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("valid sibling after sweep = %+v err %v, want it archived", swept, err)
-		}
-		if _, err := f.h.ReadSessionHeader(ctx, corrupt); !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("corrupt session after sweep = err %v, want the corruption error", err)
+		testassert.Require(t, err == nil && swept.Lifecycle == harness.LifecycleArchived, "valid sibling after sweep = %+v err %v, want it archived", swept, err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, corrupt)
+			testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt session after sweep = err %v, want the corruption error", err)
 		}
 	})
 }
@@ -2635,8 +2479,9 @@ func (s *gatedEntryStore) ReadEntries(ctx context.Context, sessionID string, aft
 func seedArchivedSession(t *testing.T, store harness.Storage) string {
 	t.Helper()
 	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		t.Fatalf("random session id: %v", err)
+	{
+		_, err := rand.Read(buf[:])
+		testassert.NoError(t, err)
 	}
 	id := hex.EncodeToString(buf[:])
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -2651,9 +2496,7 @@ func seedArchivedSession(t *testing.T, store harness.Storage) string {
 		})
 		return err
 	})
-	if err != nil {
-		t.Fatalf("seed archived session: %v", err)
-	}
+	testassert.NoError(t, err)
 	return id
 }
 
@@ -2670,23 +2513,18 @@ func TestPublicSweepZeroTime(t *testing.T) {
 		defer f.close()
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if deleted, err := f.h.SweepSession(ctx, session, policy, time.Time{}); !errors.Is(err, harness.ErrInvalid) || deleted {
-			t.Fatalf("sweep with a zero time = (%v, %v), want ErrInvalid and no transition", deleted, err)
+		{
+			deleted, err := f.h.SweepSession(ctx, session, policy, time.Time{})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid) && !deleted, "sweep with a zero time = (%v, %v), want ErrInvalid and no transition", deleted, err)
 		}
-		if counting.reads != 0 {
-			t.Fatalf("zero-time sweep performed %d materialization reads, want none before the rejection", counting.reads)
-		}
+		testassert.Equal(t, counting.reads, 0)
 
 		// An ordinary valid read reaches the same counter through the cold
 		// fixture, so the zero count above cannot pass vacuously, and shows
 		// the seeded Session untouched by the rejection.
 		header, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || header.Identity.SessionID != session || header.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("read after the rejected zero-time sweep = %+v err %v, want the seeded archived Session present and unchanged", header, err)
-		}
-		if counting.reads == 0 {
-			t.Fatalf("the cold fixture never reached the read counter: the zero-read assertion cannot pass vacuously")
-		}
+		testassert.Require(t, err == nil && header.Identity.SessionID == session && header.Lifecycle == harness.LifecycleArchived, "read after the rejected zero-time sweep = %+v err %v, want the seeded archived Session present and unchanged", header, err)
+		testassert.Require(t, counting.reads != 0, "the cold fixture never reached the read counter: the zero-read assertion cannot pass vacuously")
 	})
 }
 
@@ -2706,9 +2544,7 @@ func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h) // the only Session: the sweep reaches the reserved candidate
 		first, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil {
-			t.Fatalf("read created session: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		prepStarted := make(chan struct{}, 1)
 		releasePrep := make(chan struct{})
@@ -2749,35 +2585,29 @@ func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 		}()
 		select {
 		case err := <-sweepDone:
-			if err != nil {
-				t.Fatalf("sweep over a blocked preparation = %v, want the no-transition skip", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("the sweep waited for the blocked preparation: busy candidates skip without waiting")
 		}
 		// The skip happened before the preparation released: nothing
 		// transitioned while the reservation was still held.
 		still, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.CurrentOperationID != "" {
-			t.Fatalf("sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
-		}
+		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.CurrentOperationID == "", "sweep transitioned the Session under a blocked preparation: %+v err %v", still, err)
 
 		close(releasePrep) // the preparation completes: the admission commits and the Session becomes running
 		out := <-submitDone
-		if out.err != nil || out.res.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("first submit = %+v err %v, want admitted", out.res, out.err)
-		}
+		testassert.Require(t, out.err == nil && out.res.Disposition == harness.DispositionAdmitted, "first submit = %+v err %v, want admitted", out.res, out.err)
 		settled, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || settled.Lifecycle != harness.LifecycleOpen || settled.CurrentOperationID != "op-1" {
-			t.Fatalf("post-commit header = %+v err %v, want the running Session unchanged", settled, err)
-		}
-		if _, err := f.h.ReadOperation(ctx, session, "op-1"); err != nil {
-			t.Fatalf("blocked-preparation admission = err %v, want it admitted after the sweep skipped", err)
+		testassert.Require(t, err == nil && settled.Lifecycle == harness.LifecycleOpen && settled.CurrentOperationID == "op-1", "post-commit header = %+v err %v, want the running Session unchanged", settled, err)
+		{
+			_, err := f.h.ReadOperation(ctx, session, "op-1")
+			testassert.NoError(t, err)
 		}
 
 		script.releaseGate()
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -2810,23 +2640,22 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		}
 
 		close(gated.release) // validation now completes on the captured pre-deletion value
-		if err := <-readDone; err != nil && !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("load across a deletion = err %v, want the pre-deletion capture or ErrNotFound", err)
+		{
+			err := <-readDone
+			testassert.Require(t, err == nil || errors.Is(err, harness.ErrNotFound), "load across a deletion = err %v, want the pre-deletion capture or ErrNotFound", err)
 		}
-		if err := <-deleteDone; err != nil {
-			t.Fatalf("delete after the load released the cell = %v, want nil", err)
+		{
+			err := <-deleteDone
+			testassert.NoError(t, err)
 		}
-		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("later materialization installed a stale coordinator: err %v, want ErrNotFound", err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, session)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "later materialization installed a stale coordinator: err %v, want ErrNotFound", err)
 		}
 		listed, err := f.h.ListSessions(ctx)
-		if err != nil {
-			t.Fatalf("ListSessions: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, row := range listed {
-			if row.Identity.SessionID == session {
-				t.Fatalf("the deleted Session stayed listed: %+v", row)
-			}
+			testassert.Require(t, row.Identity.SessionID != session, "the deleted Session stayed listed: %+v", row)
 		}
 	})
 }
@@ -2899,22 +2728,10 @@ func (t *rollbackProbeTransaction) InsertRegister(draft harness.RegisterDraft) (
 func assertRollback(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.Register, want harness.SessionHeader) {
 	t.Helper()
 	after := sessionRegister(t, store, session)
-	if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-		t.Fatalf("failed transition changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
-	}
+	testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "failed transition changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 	got, err := h.ReadSessionHeader(context.Background(), session)
-	if err != nil {
-		t.Fatalf("read after failed transition: %v", err)
-	}
-	if got.Revision != want.Revision || got.Lifecycle != want.Lifecycle ||
-		!got.LastActivity.Equal(want.LastActivity) ||
-		got.CurrentAgentType != want.CurrentAgentType {
-		t.Fatalf("cached view after failed transition = %+v, want the pre-attempt record", got)
-	}
-	if (got.ArchivedAt == nil) != (want.ArchivedAt == nil) ||
-		(got.ArchivedAt != nil && !got.ArchivedAt.Equal(*want.ArchivedAt)) {
-		t.Fatalf("cached view archived_at after failed transition = %v, want %v", got.ArchivedAt, want.ArchivedAt)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, got.Revision == want.Revision && got.Lifecycle == want.Lifecycle && got.LastActivity.Equal(want.LastActivity) && got.CurrentAgentType == want.CurrentAgentType && ((got.ArchivedAt == nil) == (want.ArchivedAt == nil) && (got.ArchivedAt == nil || got.ArchivedAt.Equal(*want.ArchivedAt))), "cached view after failed transition = %+v, want the pre-attempt record; cached view archived_at after failed transition = %v, want %v", got, got.ArchivedAt, want.ArchivedAt)
 }
 
 // TestPublicLifecycleRollbackOnTransactionFailure proves the lifecycle row's
@@ -2934,9 +2751,7 @@ func TestPublicLifecycleRollbackOnTransactionFailure(t *testing.T) {
 		{name: "memory", open: func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{name: "sqlite", open: func(t *testing.T) harness.Storage {
 			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
-			if err != nil {
-				t.Fatalf("OpenSQLite: %v", err)
-			}
+			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store
 		}},
@@ -2967,26 +2782,23 @@ func rollbackReopenCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	if _, err := f.h.ArchiveSession(ctx, session); err != nil {
-		t.Fatalf("seed archive: %v", err)
+	{
+		_, err := f.h.ArchiveSession(ctx, session)
+		testassert.NoError(t, err)
 	}
 	archived, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil {
-		t.Fatalf("read seed archive: %v", err)
-	}
+	testassert.NoError(t, err)
 	before := sessionRegister(t, store, session)
 
 	probe.failReplace = true
-	if _, err := f.h.ReopenSession(ctx, session); !errors.Is(err, errInjectedRollback) {
-		t.Fatalf("reopen with injected post-mutation failure = err %v, want the injected rollback", err)
+	{
+		_, err := f.h.ReopenSession(ctx, session)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "reopen with injected post-mutation failure = err %v, want the injected rollback", err)
 	}
 	assertRollback(t, store, f.h, session, before, archived)
 
 	reopened, err := f.h.ReopenSession(ctx, session)
-	if err != nil || reopened.State.Lifecycle != harness.LifecycleOpen || reopened.State.ArchivedAt != nil ||
-		reopened.Revision != before.Revision+1 {
-		t.Fatalf("reopen after rollback = %+v err %v, want open at the next revision", reopened, err)
-	}
+	testassert.Require(t, err == nil && reopened.State.Lifecycle == harness.LifecycleOpen && reopened.State.ArchivedAt == nil && reopened.Revision == before.Revision+1, "reopen after rollback = %+v err %v, want open at the next revision", reopened, err)
 }
 
 // rollbackArchiveCase proves Archive's post-mutation rollback on one isolated store.
@@ -2997,22 +2809,18 @@ func rollbackArchiveCase(t *testing.T, store harness.Storage) {
 	ctx := context.Background()
 	session := createSession(t, f.h)
 	first, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil {
-		t.Fatalf("read created session: %v", err)
-	}
+	testassert.NoError(t, err)
 	before := sessionRegister(t, store, session)
 
 	probe.failReplace = true
-	if _, err := f.h.ArchiveSession(ctx, session); !errors.Is(err, errInjectedRollback) {
-		t.Fatalf("archive with injected post-mutation failure = err %v, want the injected rollback", err)
+	{
+		_, err := f.h.ArchiveSession(ctx, session)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "archive with injected post-mutation failure = err %v, want the injected rollback", err)
 	}
 	assertRollback(t, store, f.h, session, before, first)
 
 	archived, err := f.h.ArchiveSession(ctx, session)
-	if err != nil || archived.State.Lifecycle != harness.LifecycleArchived || archived.State.ArchivedAt == nil ||
-		archived.Revision != before.Revision+1 {
-		t.Fatalf("archive after rollback = %+v err %v, want archived at the next revision", archived, err)
-	}
+	testassert.Require(t, err == nil && archived.State.Lifecycle == harness.LifecycleArchived && archived.State.ArchivedAt != nil && archived.Revision == before.Revision+1, "archive after rollback = %+v err %v, want archived at the next revision", archived, err)
 }
 
 // rollbackDeleteCase proves Delete's post-mutation rollback on one isolated store.
@@ -3022,40 +2830,38 @@ func rollbackDeleteCase(t *testing.T, store harness.Storage) {
 	defer f.close()
 	ctx := context.Background()
 	session := createSession(t, f.h)
-	if _, err := f.h.ArchiveSession(ctx, session); err != nil {
-		t.Fatalf("seed archive: %v", err)
+	{
+		_, err := f.h.ArchiveSession(ctx, session)
+		testassert.NoError(t, err)
 	}
 	archived, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil {
-		t.Fatalf("read seed archive: %v", err)
-	}
+	testassert.NoError(t, err)
 	before := sessionRegister(t, store, session)
 
 	probe.failDelete = true
-	if err := f.h.DeleteSession(ctx, session); !errors.Is(err, errInjectedRollback) {
-		t.Fatalf("delete with injected post-mutation failure = err %v, want the injected rollback", err)
+	{
+		err := f.h.DeleteSession(ctx, session)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "delete with injected post-mutation failure = err %v, want the injected rollback", err)
 	}
 	assertRollback(t, store, f.h, session, before, archived)
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil {
-		t.Fatalf("list sessions: %v", err)
-	}
+	testassert.NoError(t, err)
 	found := false
 	for _, id := range ids { // the rolled-back deletion is absence-free: the Session is still listed
 		if id == session {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatalf("rolled-back delete removed the session from the listing")
-	}
+	testassert.Require(t, found, "rolled-back delete removed the session from the listing")
 
-	if err := f.h.DeleteSession(ctx, session); err != nil {
-		t.Fatalf("delete after rollback: %v", err)
+	{
+		err := f.h.DeleteSession(ctx, session)
+		testassert.NoError(t, err)
 	}
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-	if _, err := store.ReadRegister(ctx, key); !errors.Is(err, harness.ErrNotFound) {
-		t.Fatalf("register after delete = err %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, key)
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after delete = err %v, want ErrNotFound", err)
 	}
 }
 
@@ -3068,27 +2874,24 @@ func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
 	ctx := context.Background()
 	session := createSession(t, f.h)
 	first, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil {
-		t.Fatalf("read created session: %v", err)
-	}
+	testassert.NoError(t, err)
 	before := sessionRegister(t, store, session)
 
 	policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 	now := first.LastActivity.Add(100 * time.Hour)
 	probe.failReplace = true
-	if _, err := f.h.SweepSession(ctx, session, policy, now); !errors.Is(err, errInjectedRollback) {
-		t.Fatalf("sweep with injected post-mutation failure = err %v, want the transition to return it", err)
+	{
+		_, err := f.h.SweepSession(ctx, session, policy, now)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "sweep with injected post-mutation failure = err %v, want the transition to return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, first)
 
-	if _, err := f.h.SweepSession(ctx, session, policy, now); err != nil {
-		t.Fatalf("sweep after rollback: %v", err)
+	{
+		_, err := f.h.SweepSession(ctx, session, policy, now)
+		testassert.NoError(t, err)
 	}
 	archived, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil || archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != before.Revision+1 ||
-		archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(now) {
-		t.Fatalf("sweep after rollback = %+v err %v, want archived at the sweep time", archived, err)
-	}
+	testassert.Require(t, err == nil && archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == before.Revision+1 && archived.ArchivedAt != nil && archived.ArchivedAt.Equal(now), "sweep after rollback = %+v err %v, want archived at the sweep time", archived, err)
 }
 
 // rollbackSweepDeleteCase proves the sweep delete transition's post-mutation
@@ -3100,29 +2903,28 @@ func rollbackSweepDeleteCase(t *testing.T, store harness.Storage) {
 	ctx := context.Background()
 	session := createSession(t, f.h)
 	archived, err := f.h.ArchiveSession(ctx, session)
-	if err != nil || archived.State.ArchivedAt == nil {
-		t.Fatalf("seed archive = %+v err %v", archived, err)
-	}
+	testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "seed archive = %+v err %v", archived, err)
 	before := sessionRegister(t, store, session)
 
 	policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 	now := archived.State.ArchivedAt.Add(100 * time.Hour)
 	archivedHeader, err := f.h.ReadSessionHeader(ctx, session)
-	if err != nil {
-		t.Fatalf("read seed archive: %v", err)
-	}
+	testassert.NoError(t, err)
 	probe.failDelete = true
-	if _, err := f.h.SweepSession(ctx, session, policy, now); !errors.Is(err, errInjectedRollback) {
-		t.Fatalf("sweep with injected post-mutation failure = err %v, want the transition to return it", err)
+	{
+		_, err := f.h.SweepSession(ctx, session, policy, now)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "sweep with injected post-mutation failure = err %v, want the transition to return it", err)
 	}
 	assertRollback(t, store, f.h, session, before, archivedHeader)
 
-	if _, err := f.h.SweepSession(ctx, session, policy, now); err != nil {
-		t.Fatalf("sweep after rollback: %v", err)
+	{
+		_, err := f.h.SweepSession(ctx, session, policy, now)
+		testassert.NoError(t, err)
 	}
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-	if _, err := store.ReadRegister(ctx, key); !errors.Is(err, harness.ErrNotFound) {
-		t.Fatalf("register after swept delete = err %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, key)
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after swept delete = err %v, want ErrNotFound", err)
 	}
 }
 
@@ -3144,43 +2946,45 @@ func TestPublicWaitConvergesWithCorruptingTransition(t *testing.T) {
 		// the transition discovers it in-transaction under c.mu
 		reg := sessionRegister(t, store, session)
 		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(reg.Payload, &obj); err != nil {
-			t.Fatalf("unmarshal session payload: %v", err)
+		{
+			err := json.Unmarshal(reg.Payload, &obj)
+			testassert.NoError(t, err)
 		}
 		var state map[string]json.RawMessage
-		if err := json.Unmarshal(obj["state"], &state); err != nil {
-			t.Fatalf("unmarshal state section: %v", err)
+		{
+			err := json.Unmarshal(obj["state"], &state)
+			testassert.NoError(t, err)
 		}
 		state["lifecycle"] = json.RawMessage(`"bogus"`)
 		newState, err := json.Marshal(state)
-		if err != nil {
-			t.Fatalf("marshal state section: %v", err)
-		}
+		testassert.NoError(t, err)
 		obj["state"] = newState
 		bad, err := json.Marshal(obj)
-		if err != nil {
-			t.Fatalf("marshal session payload: %v", err)
-		}
+		testassert.NoError(t, err)
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-		if err := store.Transact(ctx, func(tx harness.Transaction) error {
-			_, err := tx.ReplaceRegister(key, reg.Revision, bad)
-			return err
-		}); err != nil {
-			t.Fatalf("corrupt the register: %v", err)
+		{
+			err := store.Transact(ctx, func(tx harness.Transaction) error {
+				_, err := tx.ReplaceRegister(key, reg.Revision, bad)
+				return err
+			})
+			testassert.NoError(t, err)
 		}
 
 		f.cancel() // Harness loss before both calls
 		waited := make(chan error, 1)
 		go func() { waited <- f.h.Wait(ctx) }() // Wait begins while the transition is in flight
 
-		if _, err := f.h.ArchiveSession(ctx, session); !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("archive over a corrupted register = err %v, want the corruption error", err)
+		{
+			_, err := f.h.ArchiveSession(ctx, session)
+			testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "archive over a corrupted register = err %v, want the corruption error", err)
 		}
-		if err := <-waited; err != nil {
-			t.Fatalf("Wait converging with the corrupting transition = %v, want nil", err)
+		{
+			err := <-waited
+			testassert.NoError(t, err)
 		}
-		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("corrupt session after convergence = err %v, want the sticky corruption error", err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, session)
+			testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt session after convergence = err %v, want the sticky corruption error", err)
 		}
 	})
 }
@@ -3219,8 +3023,9 @@ func recoverOpStateAt(t *testing.T, store harness.Storage, sessionID, operationI
 	var wire struct {
 		State recoverOpState `json:"state"`
 	}
-	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-		t.Fatalf("decode operation register %q: %v", operationID, err)
+	{
+		err := json.Unmarshal(reg.Payload, &wire)
+		testassert.Require(t, err == nil, "decode operation register %q: %v", operationID, err)
 	}
 	return wire.State
 }
@@ -3230,9 +3035,7 @@ func recoverOpStateAt(t *testing.T, store harness.Storage, sessionID, operationI
 func operationRegister(t *testing.T, store harness.Storage, sessionID, operationID string) harness.Register {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID})
-	if err != nil {
-		t.Fatalf("read operation register %q: %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "read operation register %q: %v", operationID, err)
 	return reg
 }
 
@@ -3245,8 +3048,9 @@ func recoverSessionCurrent(t *testing.T, store harness.Storage, sessionID string
 			CurrentOperationID string `json:"current_operation_id"`
 		} `json:"state"`
 	}
-	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-		t.Fatalf("decode session register: %v", err)
+	{
+		err := json.Unmarshal(reg.Payload, &wire)
+		testassert.NoError(t, err)
 	}
 	return wire.State.CurrentOperationID
 }
@@ -3255,9 +3059,7 @@ func recoverSessionCurrent(t *testing.T, store harness.Storage, sessionID string
 func recoverEntries(t *testing.T, store harness.Storage, sessionID string) []harness.Entry {
 	t.Helper()
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("read entries of session %q: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "read entries of session %q: %v", sessionID, err)
 	return entries
 }
 
@@ -3265,8 +3067,9 @@ func recoverEntries(t *testing.T, store harness.Storage, sessionID string) []har
 func newRawSessionID(t *testing.T) string {
 	t.Helper()
 	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		t.Fatalf("random id: %v", err)
+	{
+		_, err := rand.Read(buf[:])
+		testassert.NoError(t, err)
 	}
 	return hex.EncodeToString(buf[:])
 }
@@ -3276,11 +3079,12 @@ func newRawSessionID(t *testing.T) string {
 // and entries.
 func insertRawRegister(t *testing.T, store harness.Storage, key harness.RegisterKey, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert register %v: %v", key, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert register %v: %v", key, err)
 	}
 }
 
@@ -3288,11 +3092,12 @@ func insertRawRegister(t *testing.T, store harness.Storage, key harness.Register
 // contract. The addressed Session must already exist.
 func insertRawEntry(t *testing.T, store harness.Storage, sessionID, id, operationID string, kind harness.EntryKind, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert entry %s: %v", id, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert entry %s: %v", id, err)
 	}
 }
 
@@ -3361,12 +3166,7 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2
 // the pending reservations in order.
 func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect, operationID string, calls []string) (sessionID, modelReserved string, pendingResultIDs []string) {
 	t.Helper()
-	if activeEffect == "model" && len(calls) > 0 {
-		t.Fatalf("a model effect admits no pending calls")
-	}
-	if (activeEffect == "tool" || activeEffect == "hook") && len(calls) == 0 {
-		t.Fatalf("a %s effect requires a first pending call", activeEffect)
-	}
+	testassert.Require(t, (activeEffect != "model" || len(calls) <= 0) && (activeEffect != "tool" && activeEffect != "hook" || len(calls) != 0), "a model effect admits no pending calls; a %s effect requires a first pending call", activeEffect)
 	sessionID = newRawSessionID(t)
 	entryID, assistantID := newRawSessionID(t), newRawSessionID(t)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -3427,13 +3227,9 @@ type sessionSnapshot struct {
 func snapshotSession(t *testing.T, store harness.Storage, sessionID string) sessionSnapshot {
 	t.Helper()
 	registers, err := store.ReadRegisters(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("read registers of %q: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "read registers of %q: %v", sessionID, err)
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("read entries of %q: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "read entries of %q: %v", sessionID, err)
 	return sessionSnapshot{registers: registers, entries: entries}
 }
 
@@ -3443,21 +3239,14 @@ func snapshotSession(t *testing.T, store harness.Storage, sessionID string) sess
 func assertSessionUnchanged(t *testing.T, store harness.Storage, sessionID string, before sessionSnapshot) {
 	t.Helper()
 	after := snapshotSession(t, store, sessionID)
-	if len(after.registers) != len(before.registers) || len(after.entries) != len(before.entries) {
-		t.Fatalf("recovery changed the record count of corrupt session %q (registers %d -> %d, entries %d -> %d)",
-			sessionID, len(before.registers), len(after.registers), len(before.entries), len(after.entries))
-	}
+	testassert.Require(t, len(after.registers) == len(before.registers) && len(after.entries) == len(before.entries), "recovery changed the record count of corrupt session %q (registers %d -> %d, entries %d -> %d)", sessionID, len(before.registers), len(after.registers), len(before.entries), len(after.entries))
 	for i := range before.registers {
 		b, a := before.registers[i], after.registers[i]
-		if b.Key != a.Key || b.Revision != a.Revision || !bytes.Equal(b.Payload, a.Payload) {
-			t.Fatalf("recovery changed register %v of corrupt session %q (revision %d -> %d)", b.Key, sessionID, b.Revision, a.Revision)
-		}
+		testassert.Require(t, b.Key == a.Key && b.Revision == a.Revision && bytes.Equal(b.Payload, a.Payload), "recovery changed register %v of corrupt session %q (revision %d -> %d)", b.Key, sessionID, b.Revision, a.Revision)
 	}
 	for i := range before.entries {
 		b, a := before.entries[i], after.entries[i]
-		if b.ID != a.ID || b.Kind != a.Kind || b.Sequence != a.Sequence || !bytes.Equal(b.Payload, a.Payload) {
-			t.Fatalf("recovery changed entry %s of corrupt session %q", b.ID, sessionID)
-		}
+		testassert.Require(t, b.ID == a.ID && b.Kind == a.Kind && b.Sequence == a.Sequence && bytes.Equal(b.Payload, a.Payload), "recovery changed entry %s of corrupt session %q", b.ID, sessionID)
 	}
 }
 
@@ -3468,9 +3257,7 @@ func harnessOver(t *testing.T, store harness.Storage) *harness.Harness {
 	h, err := harness.New(context.Background(), harness.Dependencies{Storage: store, Prepare: func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 		return harness.PreparedExecution{}, errors.New("the recovery suite never prepares")
 	}})
-	if err != nil {
-		t.Fatalf("New after recover: %v", err)
-	}
+	testassert.NoError(t, err)
 	return h
 }
 
@@ -3484,17 +3271,11 @@ func harnessOver(t *testing.T, store harness.Storage) *harness.Harness {
 func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, operationID string, preEntries []harness.Entry, wantSettlementID string, wantInterruptedResultIDs []string) {
 	t.Helper()
 	state := recoverOpStateAt(t, store, sessionID, operationID)
-	if state.Status != "interruption" || state.ActiveEffect != nil || len(state.PendingToolCalls) != 0 || state.Terminal == nil {
-		t.Fatalf("recovered operation = %+v, want terminal interruption with no active or pending effects", state)
-	}
-	if state.Terminal.Detail != recoveredInterruptionDetail {
-		t.Fatalf("recovered detail = %q, want the exact recovery detail %q", state.Terminal.Detail, recoveredInterruptionDetail)
-	}
+	testassert.Require(t, state.Status == "interruption" && state.ActiveEffect == nil && len(state.PendingToolCalls) == 0 && state.Terminal != nil, "recovered operation = %+v, want terminal interruption with no active or pending effects", state)
+	testassert.Equal(t, state.Terminal.Detail, recoveredInterruptionDetail)
 	settlementID := state.Terminal.SettlementEntry.EntryID
 	if wantSettlementID != "" {
-		if settlementID != wantSettlementID {
-			t.Fatalf("settlement entry = %s, want the reserved identity %s", settlementID, wantSettlementID)
-		}
+		testassert.Equal(t, settlementID, wantSettlementID)
 	} else {
 		seen := map[string]bool{}
 		for _, e := range preEntries {
@@ -3503,12 +3284,11 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		for _, id := range wantInterruptedResultIDs {
 			seen[id] = true
 		}
-		if len(settlementID) != 32 || seen[settlementID] {
-			t.Fatalf("settlement entry = %q, want a fresh identity unused by the pre-recovery state", settlementID)
-		}
+		testassert.Require(t, len(settlementID) == 32 && !seen[settlementID], "settlement entry = %q, want a fresh identity unused by the pre-recovery state", settlementID)
 	}
-	if current := recoverSessionCurrent(t, store, sessionID); current != "" {
-		t.Fatalf("session current operation = %q, want it cleared after recovery", current)
+	{
+		current := recoverSessionCurrent(t, store, sessionID)
+		testassert.Equal(t, current, "")
 	}
 	wantTail := make([]harness.EntryKind, 0, len(wantInterruptedResultIDs)+2)
 	for range wantInterruptedResultIDs {
@@ -3516,45 +3296,35 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 	}
 	wantTail = append(wantTail, harness.EntrySignal, harness.EntryOperationSettlement)
 	entries := recoverEntries(t, store, sessionID)
-	if len(entries) != len(preEntries)+len(wantTail) {
-		t.Fatalf("recovered entries = %d, want the pre-recovery %d plus the %d recovery commits", len(entries), len(preEntries), len(wantTail))
-	}
+	testassert.Require(t, len(entries) == len(preEntries)+len(wantTail), "recovered entries = %d, want the pre-recovery %d plus the %d recovery commits", len(entries), len(preEntries), len(wantTail))
 	for i, want := range preEntries {
-		if entries[i].ID != want.ID || entries[i].Kind != want.Kind || !bytes.Equal(entries[i].Payload, want.Payload) {
-			t.Fatalf("pre-recovery entry %d = %s/%s, want %s/%s unchanged", i, entries[i].ID, entries[i].Kind, want.ID, want.Kind)
-		}
+		testassert.Require(t, entries[i].ID == want.ID && entries[i].Kind == want.Kind && bytes.Equal(entries[i].Payload, want.Payload), "pre-recovery entry %d = %s/%s, want %s/%s unchanged", i, entries[i].ID, entries[i].Kind, want.ID, want.Kind)
 	}
 	for i, kind := range wantTail {
 		entry := entries[len(preEntries)+i]
-		if entry.Kind != kind {
-			t.Fatalf("recovery commit %d is a %s entry, want %s", i, entry.Kind, kind)
-		}
+		testassert.Require(t, entry.Kind == kind, "recovery commit %d is a %s entry, want %s", i, entry.Kind, kind)
 		switch kind {
 		case harness.EntryToolResult:
-			if entry.ID != wantInterruptedResultIDs[i] {
-				t.Fatalf("interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
-			}
+			testassert.Require(t, entry.ID == wantInterruptedResultIDs[i], "interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
 			var wire struct {
 				Status  model.ToolResultStatus `json:"status"`
 				Content string                 `json:"content"`
 			}
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil || wire.Status != model.ResultInterrupted || wire.Content != "Tool call interrupted." {
-				t.Fatalf("interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
+			{
+				err := json.Unmarshal(entry.Payload, &wire)
+				testassert.Require(t, err == nil && wire.Status == model.ResultInterrupted && wire.Content == "Tool call interrupted.", "interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
 			}
 		case harness.EntryOperationSettlement:
-			if entry.ID != settlementID {
-				t.Fatalf("settlement entry %s disagrees with the operation's terminal reference %s", entry.ID, settlementID)
-			}
+			testassert.Equal(t, entry.ID, settlementID)
 			var wire struct {
 				Status string `json:"status"`
 				Detail string `json:"detail"`
 			}
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode settlement entry: %v", err)
+			{
+				err := json.Unmarshal(entry.Payload, &wire)
+				testassert.NoError(t, err)
 			}
-			if wire.Status != "interruption" || wire.Detail != recoveredInterruptionDetail {
-				t.Fatalf("settlement payload = %+v, want the terminal interruption with the recovery detail", wire)
-			}
+			testassert.Require(t, wire.Status == "interruption" && wire.Detail == recoveredInterruptionDetail, "settlement payload = %+v, want the terminal interruption with the recovery detail", wire)
 		}
 	}
 }
@@ -3567,19 +3337,17 @@ func assertRecoverIdempotent(t *testing.T, store harness.Storage, sessionID, ope
 	opBefore := operationRegister(t, store, sessionID, operationID)
 	sessBefore := sessionRegister(t, store, sessionID)
 	entriesBefore := recoverEntries(t, store, sessionID)
-	if err := harness.Recover(context.Background(), store); err != nil {
-		t.Fatalf("second recover: %v", err)
+	{
+		err := harness.Recover(context.Background(), store)
+		testassert.NoError(t, err)
 	}
 	opAfter := operationRegister(t, store, sessionID, operationID)
 	sessAfter := sessionRegister(t, store, sessionID)
-	if opAfter.Revision != opBefore.Revision || !bytes.Equal(opAfter.Payload, opBefore.Payload) {
-		t.Fatalf("second recover changed the operation register (revision %d -> %d)", opBefore.Revision, opAfter.Revision)
-	}
-	if sessAfter.Revision != sessBefore.Revision || !bytes.Equal(sessAfter.Payload, sessBefore.Payload) {
-		t.Fatalf("second recover changed the session register (revision %d -> %d)", sessBefore.Revision, sessAfter.Revision)
-	}
-	if got := len(recoverEntries(t, store, sessionID)); got != len(entriesBefore) {
-		t.Fatalf("second recover committed %d entries, want none", got-len(entriesBefore))
+	testassert.Require(t, opAfter.Revision == opBefore.Revision && bytes.Equal(opAfter.Payload, opBefore.Payload), "second recover changed the operation register (revision %d -> %d)", opBefore.Revision, opAfter.Revision)
+	testassert.Require(t, sessAfter.Revision == sessBefore.Revision && bytes.Equal(sessAfter.Payload, sessBefore.Payload), "second recover changed the session register (revision %d -> %d)", sessBefore.Revision, sessAfter.Revision)
+	{
+		got := len(recoverEntries(t, store, sessionID))
+		testassert.Require(t, got == len(entriesBefore), "second recover committed %d entries, want none", got-len(entriesBefore))
 	}
 }
 
@@ -3615,42 +3383,30 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 				sessionID, modelReserved, pendingResultIDs := seedRunningOperationShape(t, store, shape.activeEffect, "op-1", calls)
 
 				state := recoverOpStateAt(t, store, sessionID, "op-1")
-				if state.Status != "running" || len(state.PendingToolCalls) != shape.calls {
-					t.Fatalf("seeded operation = %+v, want running with %d pending call(s)", state, shape.calls)
-				}
+				testassert.Require(t, state.Status == "running" && len(state.PendingToolCalls) == shape.calls, "seeded operation = %+v, want running with %d pending call(s)", state, shape.calls)
 				switch shape.activeEffect {
 				case "model":
-					if state.ActiveEffect == nil || state.ActiveEffect.Kind != "model" || state.ActiveEffect.ResultEntryID != modelReserved {
-						t.Fatalf("seeded operation = %+v, want the committed model effect intent", state)
-					}
+					testassert.Require(t, state.ActiveEffect != nil && state.ActiveEffect.Kind == "model" && state.ActiveEffect.ResultEntryID == modelReserved, "seeded operation = %+v, want the committed model effect intent", state)
 				case "tool":
-					if state.ActiveEffect == nil || state.ActiveEffect.Kind != "tool" || state.ActiveEffect.ToolCallID != calls[0] ||
-						state.ActiveEffect.ResultEntryID != pendingResultIDs[0] {
-						t.Fatalf("seeded operation = %+v, want the committed tool effect intent on %s", state, calls[0])
-					}
+					testassert.Require(t, state.ActiveEffect != nil && state.ActiveEffect.Kind == "tool" && state.ActiveEffect.ToolCallID == calls[0] && state.ActiveEffect.ResultEntryID == pendingResultIDs[0], "seeded operation = %+v, want the committed tool effect intent on %s", state, calls[0])
 				default:
-					if state.ActiveEffect != nil {
-						t.Fatalf("seeded operation = %+v, want no active effect", state)
-					}
+					testassert.Require(t, state.ActiveEffect == nil, "seeded operation = %+v, want no active effect", state)
 				}
 
 				pre := recoverEntries(t, store, sessionID)
-				if err := harness.Recover(ctx, store); err != nil { // before any live Harness over the store
-					t.Fatalf("recover: %v", err)
+				// before any live Harness over the store
+				{
+					err := harness.Recover(ctx, store)
+					testassert.NoError(t, err)
 				}
 				assertRecoveredOperation(t, store, sessionID, "op-1", pre, modelReserved, pendingResultIDs)
 				assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 				h := harnessOver(t, store) // one Harness after recovery: materialization verification only
 				sess, err := h.ReadSessionHeader(ctx, sessionID)
-				if err != nil || sess.CurrentOperationID != "" {
-					t.Fatalf("repaired session = %+v err %v, want open with the current Operation cleared", sess, err)
-				}
+				testassert.Require(t, err == nil && sess.CurrentOperationID == "", "repaired session = %+v err %v, want open with the current Operation cleared", sess, err)
 				rec, err := h.ReadOperation(ctx, sessionID, "op-1")
-				if err != nil || rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
-					rec.State.Terminal.Detail != recoveredInterruptionDetail {
-					t.Fatalf("repaired operation = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
-				}
+				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired operation = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
 			})
 		})
 	}
@@ -3842,9 +3598,7 @@ func seedCorruptSiblingHookResult(t *testing.T, store harness.Storage) string {
 	t.Helper()
 	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("read seeded entries: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.Kind == harness.EntryAssistant {
 			hookID := newRawSessionID(t)
@@ -3864,9 +3618,7 @@ func seedCorruptSiblingFailedHook(t *testing.T, store harness.Storage) string {
 	t.Helper()
 	sessionID, _, _ := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("read seeded entries: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.Kind == harness.EntryAssistant {
 			hookID := newRawSessionID(t)
@@ -3969,14 +3721,13 @@ func snapAppendOperation(snap *sessionSnapshot, sessionID, operationID, payload 
 func editPayloadObject(t *testing.T, raw json.RawMessage, edit func(map[string]json.RawMessage)) json.RawMessage {
 	t.Helper()
 	obj := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		t.Fatalf("payload is not a JSON object: %v", err)
+	{
+		err := json.Unmarshal(raw, &obj)
+		testassert.NoError(t, err)
 	}
 	edit(obj)
 	out, err := json.Marshal(obj)
-	if err != nil {
-		t.Fatalf("marshal edited payload: %v", err)
-	}
+	testassert.NoError(t, err)
 	return out
 }
 
@@ -4001,14 +3752,13 @@ func editOperationAdmission(t *testing.T, raw json.RawMessage, edit func(map[str
 func editJSONArray(t *testing.T, raw json.RawMessage, edit func([]map[string]json.RawMessage)) json.RawMessage {
 	t.Helper()
 	items := []map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &items); err != nil {
-		t.Fatalf("payload is not a JSON array of objects: %v", err)
+	{
+		err := json.Unmarshal(raw, &items)
+		testassert.NoError(t, err)
 	}
 	edit(items)
 	out, err := json.Marshal(items)
-	if err != nil {
-		t.Fatalf("marshal edited array: %v", err)
-	}
+	testassert.NoError(t, err)
 	return out
 }
 
@@ -4022,8 +3772,9 @@ func snapReservedResultID(t *testing.T, snap *sessionSnapshot) string {
 			ResultEntryID string `json:"result_entry_id"`
 		} `json:"tool_calls"`
 	}
-	if err := json.Unmarshal(assistant.Payload, &wire); err != nil || len(wire.ToolCalls) != 1 {
-		t.Fatalf("assistant payload has no single published call: %v", err)
+	{
+		err := json.Unmarshal(assistant.Payload, &wire)
+		testassert.Require(t, err == nil && len(wire.ToolCalls) == 1, "assistant payload has no single published call: %v", err)
 	}
 	return wire.ToolCalls[0].ResultEntryID
 }
@@ -4472,8 +4223,9 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 						ResultEntryID string `json:"result_entry_id"`
 					} `json:"tool_calls"`
 				}
-				if err := json.Unmarshal(assistant.Payload, &wire); err != nil || len(wire.ToolCalls) != 2 {
-					t.Fatalf("seeded assistant has no two published calls: %v", err)
+				{
+					err := json.Unmarshal(assistant.Payload, &wire)
+					testassert.Require(t, err == nil && len(wire.ToolCalls) == 2, "seeded assistant has no two published calls: %v", err)
 				}
 				snapAppendEntry(snap, sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", harness.EntryToolResult,
 					rawToolResultPayload(sessionID, wire.ToolCalls[0].ResultEntryID, "op-1", assistant.ID, "call-1"))
@@ -4947,8 +4699,9 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				// The unmutated graph materializes on a separate fresh store.
 				baseline := storage.NewMemory()
 				baselineID := row.seed(t, baseline)
-				if _, err := harnessOver(t, baseline).ReadSessionHeader(ctx, baselineID); err != nil {
-					t.Fatalf("unmutated graph does not materialize: %v", err)
+				{
+					_, err := harnessOver(t, baseline).ReadSessionHeader(ctx, baselineID)
+					testassert.NoError(t, err)
 				}
 
 				targetID := row.seed(t, store)
@@ -4959,21 +4712,20 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				pre := recoverEntries(t, store, siblingID)
 
 				wrapped := &corruptSiblingStore{Storage: store, session: targetID, registers: snap.registers, entries: snap.entries}
-				if err := harness.Recover(ctx, wrapped); err != nil {
-					t.Fatalf("recover with %q corruption = %v, want the corruption left in place and the pass completed", row.name, err)
+				{
+					err := harness.Recover(ctx, wrapped)
+					testassert.Require(t, err == nil, "recover with %q corruption = %v, want the corruption left in place and the pass completed", row.name, err)
 				}
 				assertSessionUnchanged(t, store, targetID, before)
 				assertRecoveredOperation(t, store, siblingID, "op-sib", pre, "", nil)
 
 				h := harnessOver(t, wrapped) // constructed only after recovery: materialization verification
-				if _, err := h.ReadSessionHeader(ctx, targetID); !errors.Is(err, harness.ErrCorrupt) {
-					t.Fatalf("corrupt session after recovery = err %v, want the corruption error", err)
+				{
+					_, err := h.ReadSessionHeader(ctx, targetID)
+					testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt session after recovery = err %v, want the corruption error", err)
 				}
 				rec, err := h.ReadOperation(ctx, siblingID, "op-sib")
-				if err != nil || rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
-					rec.State.Terminal.Detail != recoveredInterruptionDetail {
-					t.Fatalf("repaired sibling after recovery = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
-				}
+				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired sibling after recovery = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
 			})
 		})
 	}
@@ -5001,21 +4753,14 @@ func forkEntryOf(t *testing.T, store harness.Storage, sessionID string, kind har
 func assertForkSourceUnchanged(t *testing.T, store harness.Storage, sessionID string, before sessionSnapshot) {
 	t.Helper()
 	after := snapshotSession(t, store, sessionID)
-	if len(after.registers) != len(before.registers) || len(after.entries) != len(before.entries) {
-		t.Fatalf("fork changed the record count of source %q (registers %d -> %d, entries %d -> %d)",
-			sessionID, len(before.registers), len(after.registers), len(before.entries), len(after.entries))
-	}
+	testassert.Require(t, len(after.registers) == len(before.registers) && len(after.entries) == len(before.entries), "fork changed the record count of source %q (registers %d -> %d, entries %d -> %d)", sessionID, len(before.registers), len(after.registers), len(before.entries), len(after.entries))
 	for i := range before.registers {
 		b, a := before.registers[i], after.registers[i]
-		if b.Key != a.Key || b.Revision != a.Revision || !bytes.Equal(b.Payload, a.Payload) {
-			t.Fatalf("fork changed register %v of source %q (revision %d -> %d)", b.Key, sessionID, b.Revision, a.Revision)
-		}
+		testassert.Require(t, b.Key == a.Key && b.Revision == a.Revision && bytes.Equal(b.Payload, a.Payload), "fork changed register %v of source %q (revision %d -> %d)", b.Key, sessionID, b.Revision, a.Revision)
 	}
 	for i := range before.entries {
 		b, a := before.entries[i], after.entries[i]
-		if b.ID != a.ID || b.Kind != a.Kind || b.Sequence != a.Sequence || b.OperationID != a.OperationID || !bytes.Equal(b.Payload, a.Payload) {
-			t.Fatalf("fork changed entry %s of source %q", b.ID, sessionID)
-		}
+		testassert.Require(t, b.ID == a.ID && b.Kind == a.Kind && b.Sequence == a.Sequence && b.OperationID == a.OperationID && bytes.Equal(b.Payload, a.Payload), "fork changed entry %s of source %q", b.ID, sessionID)
 	}
 }
 
@@ -5024,24 +4769,16 @@ func assertForkSourceUnchanged(t *testing.T, store harness.Storage, sessionID st
 func assertSessionIDs(t *testing.T, store harness.Storage, want ...string) {
 	t.Helper()
 	ids, err := store.ListSessionIDs(context.Background())
-	if err != nil {
-		t.Fatalf("list sessions: %v", err)
-	}
+	testassert.NoError(t, err)
 	got := append([]string(nil), ids...)
-	if len(got) != len(want) {
-		t.Fatalf("session listing = %v, want %v", got, want)
-	}
+	testassert.Require(t, len(got) == len(want), "session listing = %v, want %v", got, want)
 	wantSet := make(map[string]bool, len(want))
 	for _, id := range want {
-		if wantSet[id] {
-			t.Fatalf("session listing expectation repeats %q", id)
-		}
+		testassert.Require(t, !wantSet[id], "session listing expectation repeats %q", id)
 		wantSet[id] = true
 	}
 	for _, id := range got {
-		if !wantSet[id] {
-			t.Fatalf("session listing = %v, want %v", got, want)
-		}
+		testassert.Require(t, wantSet[id], "session listing = %v, want %v", got, want)
 	}
 }
 
@@ -5148,35 +4885,39 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 		source := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the published call
 		<-script.arrived // the continued partial turn
 		<-script.arrived // the terminal turn
-		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   source,
-			OperationID: "op-2",
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: "second"}},
-			Mode:        harness.MessageModeQueued,
-		}); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := f.h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   source,
+				OperationID: "op-2",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "second"}},
+				Mode:        harness.MessageModeQueued,
+			})
+			testassert.NoError(t, err)
 		}
 		<-f.prepare // the drain admitted op-2: op-1's terminal committed
 		<-script.arrived
-		if _, err := f.h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   source,
-			OperationID: "op-3",
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: "third"}},
-			Mode:        harness.MessageModeQueued,
-		}); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := f.h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   source,
+				OperationID: "op-3",
+				Origin:      harness.InputOriginUser,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "third"}},
+				Mode:        harness.MessageModeQueued,
+			})
+			testassert.NoError(t, err)
 		}
 		<-f.prepare // the drain admitted op-3: op-2's terminal committed
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
@@ -5194,44 +4935,25 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			OperationID:     "fork-1",
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		})
-		if err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		dest := res.Session.Identity.SessionID
-		if dest == source || res.Session.Identity.SessionID == "" {
-			t.Fatalf("fork session identity = %+v, want one fresh identity", res.Session.Identity)
-		}
-		if res.Session.Identity.Workspace != "/tmp/works" || res.Session.Identity.SourceSessionID != source ||
-			res.Session.Identity.SourceBoundaryEntryID != boundary {
-			t.Fatalf("fork identity = %+v, want the inherited workspace and source/boundary lineage", res.Session.Identity)
-		}
-		if res.Session.State.Lifecycle != harness.LifecycleOpen || res.Session.State.CurrentAgentType != "coder" ||
-			len(res.Session.State.Usage.ByModel) != 0 || res.Session.State.CurrentOperationID != "fork-1" {
-			t.Fatalf("fork session state = %+v, want open, the source type, zero usage, and the running fork", res.Session.State)
-		}
-		if res.Operation.State.Status != harness.OperationRunning || res.Operation.Admission.OperationID != "fork-1" ||
-			res.Operation.Admission.RequestKind != harness.RequestKindMessage || res.Operation.Admission.AgentType != "coder" ||
-			res.Operation.Admission.AdmittedEntry.SessionID != dest ||
-			res.Operation.Admission.Execution.ConfigurationRevision != "rev-1" {
-			t.Fatalf("fork operation = %+v, want a running message admission with the fresh capture", res.Operation)
-		}
+		testassert.Require(t, dest != source && res.Session.Identity.SessionID != "", "fork session identity = %+v, want one fresh identity", res.Session.Identity)
+		testassert.Require(t, res.Session.Identity.Workspace == "/tmp/works" && res.Session.Identity.SourceSessionID == source && res.Session.Identity.SourceBoundaryEntryID == boundary && (res.Session.State.Lifecycle == harness.LifecycleOpen && res.Session.State.CurrentAgentType == "coder" && len(res.Session.State.Usage.ByModel) == 0 && res.Session.State.CurrentOperationID == "fork-1") && (res.Operation.State.Status == harness.OperationRunning && res.Operation.Admission.OperationID == "fork-1" && res.Operation.Admission.RequestKind == harness.RequestKindMessage && res.Operation.Admission.AgentType == "coder" && res.Operation.Admission.AdmittedEntry.SessionID == dest && res.Operation.Admission.Execution.ConfigurationRevision == "rev-1"), "fork identity = %+v, want the inherited workspace and source/boundary lineage; fork session state = %+v, want open, the source type, zero usage, and the running fork; fork operation = %+v, want a running message admission with the fresh capture", res.Session.Identity, res.Session.State, res.Operation)
 
 		<-forkScript.arrived // the destination execution reached its model boundary
-		if got := texts(forkScript.seen()[0]); len(got) != 7 ||
-			got[0] != "system" || got[1] != "hello" || got[2] != "done" || got[3] != "ran call-1" || got[4] != "partial" ||
-			got[5] != "<system-signal>The previous model response failed after partial output. Continue from the retained response.</system-signal>" || got[6] != "fork input" {
-			t.Fatalf("fork projection = %v, want the copied prefix before the fork input", got)
+		{
+			got := texts(forkScript.seen()[0])
+			testassert.Require(t, len(got) == 7 && got[0] == "system" && got[1] == "hello" && got[2] == "done" && got[3] == "ran call-1" && got[4] == "partial" && got[5] == "<system-signal>The previous model response failed after partial output. Continue from the retained response.</system-signal>" && got[6] == "fork input", "fork projection = %v, want the copied prefix before the fork input", got)
 		}
 		forkScript.releaseGate()
 		awaitTerminal(t, f2.h, dest, "fork-1") // the fork turn's settlement commits before the convergence cancellation
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 
 		calls := f2.preparationCalls()
-		if len(calls) != 1 || calls[0].Session.Identity.Workspace != "/tmp/works" || calls[0].Session.AgentType != "coder" {
-			t.Fatalf("fork preparation calls = %+v, want one call with the source workspace and Agent type", calls)
-		}
+		testassert.Require(t, len(calls) == 1 && calls[0].Session.Identity.Workspace == "/tmp/works" && calls[0].Session.AgentType == "coder", "fork preparation calls = %+v, want one call with the source workspace and Agent type", calls)
 
 		// the source is byte-identical after the fork
 		assertForkSourceUnchanged(t, store, source, before)
@@ -5240,41 +4962,27 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		// user-origin admission input and the fork's model-originated terminal
 		entries := recoverEntries(t, store, dest)
 		wantKinds := []harness.EntryKind{harness.EntryInput, harness.EntryAssistant, harness.EntryToolResult, harness.EntryAssistant, harness.EntrySignal, harness.EntryInput, harness.EntryOperationSettlement}
-		if len(entries) != len(wantKinds) {
-			t.Fatalf("destination entries = %d, want the %d copied prefix entries, the fork admission, and the fork's settled turn", len(entries), 5)
-		}
+		testassert.Require(t, len(entries) == len(wantKinds), "destination entries = %d, want the %d copied prefix entries, the fork admission, and the fork's settled turn", len(entries), 5)
 		sourceIDs := map[string]bool{}
 		for _, entry := range before.entries {
 			sourceIDs[entry.ID] = true
 		}
 		for i, entry := range entries {
-			if entry.Kind != wantKinds[i] {
-				t.Fatalf("destination entry %d is a %s entry, want %s", i, entry.Kind, wantKinds[i])
-			}
-			if entry.SessionID != dest {
-				t.Fatalf("destination entry %d addresses session %q", i, entry.SessionID)
-			}
+			testassert.Require(t, entry.Kind == wantKinds[i] && entry.SessionID == dest, "destination entry %d is a %s entry, want %s; destination entry %d addresses session %q", i, entry.Kind, wantKinds[i], i, entry.SessionID)
 			if i < 5 { // copied prefix entries are operationless and freshly identified
-				if entry.OperationID != "" {
-					t.Fatalf("copied entry %s carries operation %q, want no source ownership", entry.ID, entry.OperationID)
-				}
-				if sourceIDs[entry.ID] {
-					t.Fatalf("copied entry %s reuses a source identity", entry.ID)
-				}
+				testassert.Require(t, entry.OperationID == "", "copied entry %s carries operation %q, want no source ownership", entry.ID, entry.OperationID)
+				testassert.Require(t, !sourceIDs[entry.ID], "copied entry %s reuses a source identity", entry.ID)
 			}
 		}
-		if entries[5].OperationID != "fork-1" {
-			t.Fatalf("fork admission entry = %+v, want it owned by fork-1", entries[5])
-		}
+		testassert.Require(t, entries[5].OperationID == "fork-1", "fork admission entry = %+v, want it owned by fork-1", entries[5])
 		var copiedInput struct {
 			Origin string `json:"origin"`
 		}
-		if err := json.Unmarshal(entries[0].Payload, &copiedInput); err != nil {
-			t.Fatalf("decode copied input: %v", err)
+		{
+			err := json.Unmarshal(entries[0].Payload, &copiedInput)
+			testassert.NoError(t, err)
 		}
-		if copiedInput.Origin != "user" {
-			t.Fatalf("copied input origin = %q, want the source origin preserved", copiedInput.Origin)
-		}
+		testassert.Equal(t, copiedInput.Origin, "user")
 		var copiedAssistant struct {
 			ToolCalls []struct {
 				ID                  string          `json:"id"`
@@ -5283,19 +4991,13 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			} `json:"tool_calls"`
 			Usage *struct{} `json:"usage"`
 		}
-		if err := json.Unmarshal(entries[1].Payload, &copiedAssistant); err != nil {
-			t.Fatalf("decode copied assistant: %v", err)
+		{
+			err := json.Unmarshal(entries[1].Payload, &copiedAssistant)
+			testassert.NoError(t, err)
 		}
-		if copiedAssistant.Usage != nil {
-			t.Fatalf("copied assistant carries source usage")
-		}
-		if len(copiedAssistant.ToolCalls) != 1 || copiedAssistant.ToolCalls[0].ID != "call-1" ||
-			copiedAssistant.ToolCalls[0].ResultEntryID != entries[2].ID {
-			t.Fatalf("copied call reservation = %+v, want it rewritten to the copied result entry %s", copiedAssistant.ToolCalls, entries[2].ID)
-		}
-		if string(copiedAssistant.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
-			t.Fatalf("copied assistant normalized arguments = %s, want the source's committed normalization preserved verbatim", copiedAssistant.ToolCalls[0].NormalizedArguments)
-		}
+		testassert.Require(t, copiedAssistant.Usage == nil, "copied assistant carries source usage")
+		testassert.Require(t, len(copiedAssistant.ToolCalls) == 1 && copiedAssistant.ToolCalls[0].ID == "call-1" && copiedAssistant.ToolCalls[0].ResultEntryID == entries[2].ID, "copied call reservation = %+v, want it rewritten to the copied result entry %s", copiedAssistant.ToolCalls, entries[2].ID)
+		testassert.Require(t, string(copiedAssistant.ToolCalls[0].NormalizedArguments) == `{"x":1}`, "copied assistant normalized arguments = %s, want the source's committed normalization preserved verbatim", copiedAssistant.ToolCalls[0].NormalizedArguments)
 		var copiedResult struct {
 			AssistantEntry struct {
 				SessionID string `json:"session_id"`
@@ -5304,52 +5006,38 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			ToolCallID string          `json:"tool_call_id"`
 			Metadata   json.RawMessage `json:"metadata"`
 		}
-		if err := json.Unmarshal(entries[2].Payload, &copiedResult); err != nil {
-			t.Fatalf("decode copied tool result: %v", err)
+		{
+			err := json.Unmarshal(entries[2].Payload, &copiedResult)
+			testassert.NoError(t, err)
 		}
-		if copiedResult.AssistantEntry.SessionID != dest || copiedResult.AssistantEntry.EntryID != entries[1].ID ||
-			copiedResult.ToolCallID != "call-1" {
-			t.Fatalf("copied result reference = %+v, want it rewritten inside the copied prefix", copiedResult.AssistantEntry)
-		}
-		if string(copiedResult.Metadata) != `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}` {
-			t.Fatalf("copied result metadata = %s, want the source's encoded metadata preserved verbatim", copiedResult.Metadata)
-		}
+		testassert.Require(t, copiedResult.AssistantEntry.SessionID == dest && copiedResult.AssistantEntry.EntryID == entries[1].ID && copiedResult.ToolCallID == "call-1" && string(copiedResult.Metadata) == `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`, "copied result reference = %+v, want it rewritten inside the copied prefix; copied result metadata = %s, want the source's encoded metadata preserved verbatim", copiedResult.AssistantEntry, copiedResult.Metadata)
 		var copiedSignal struct {
 			RelatedOperation struct {
 				SessionID   string `json:"session_id"`
 				OperationID string `json:"operation_id"`
 			} `json:"related_operation"`
 		}
-		if err := json.Unmarshal(entries[4].Payload, &copiedSignal); err != nil {
-			t.Fatalf("decode copied signal: %v", err)
+		{
+			err := json.Unmarshal(entries[4].Payload, &copiedSignal)
+			testassert.NoError(t, err)
 		}
-		if copiedSignal.RelatedOperation.SessionID != source || copiedSignal.RelatedOperation.OperationID != "op-1" {
-			t.Fatalf("copied signal related operation = %+v, want the source Operation kept as informational history", copiedSignal.RelatedOperation)
-		}
+		testassert.Require(t, copiedSignal.RelatedOperation.SessionID == source && copiedSignal.RelatedOperation.OperationID == "op-1", "copied signal related operation = %+v, want the source Operation kept as informational history", copiedSignal.RelatedOperation)
 		var admission struct {
 			Origin string `json:"origin"`
 		}
-		if err := json.Unmarshal(entries[5].Payload, &admission); err != nil {
-			t.Fatalf("decode fork admission input: %v", err)
+		{
+			err := json.Unmarshal(entries[5].Payload, &admission)
+			testassert.NoError(t, err)
 		}
-		if admission.Origin != "user" {
-			t.Fatalf("fork admission origin = %q, want the fixed user origin", admission.Origin)
-		}
+		testassert.Equal(t, admission.Origin, "user")
 
 		// the fork's own turn settled through its model-originated terminal
 		destHeader, err := f2.h.ReadSessionHeader(ctx, dest)
-		if err != nil || destHeader.CurrentOperationID != "" {
-			t.Fatalf("fork session after convergence = %+v err %v, want it settled", destHeader, err)
-		}
+		testassert.Require(t, err == nil && destHeader.CurrentOperationID == "", "fork session after convergence = %+v err %v, want it settled", destHeader, err)
 		destView, err := f2.h.ReadSessionView(ctx, dest)
-		if err != nil || len(destView.TotalUsage.ByModel) != 0 {
-			t.Fatalf("fork session usage = %+v err %v, want zero usage", destView.TotalUsage, err)
-		}
+		testassert.Require(t, err == nil && len(destView.TotalUsage.ByModel) == 0, "fork session usage = %+v err %v, want zero usage", destView.TotalUsage, err)
 		rec, err := f2.h.ReadOperation(ctx, dest, "fork-1")
-		if err != nil || rec.State.Status != harness.OperationFailure ||
-			rec.State.Terminal == nil || rec.State.Terminal.Detail != "fork turn settled" {
-			t.Fatalf("fork operation after convergence = %+v err %v, want its model-originated terminal", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "fork turn settled", "fork operation after convergence = %+v err %v, want its model-originated terminal", rec, err)
 	})
 }
 
@@ -5363,8 +5051,9 @@ func TestPublicForkArchivedSource(t *testing.T) {
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f2.close()
-		if _, err := f2.h.ArchiveSession(ctx, source); err != nil {
-			t.Fatalf("archive: %v", err)
+		{
+			_, err := f2.h.ArchiveSession(ctx, source)
+			testassert.NoError(t, err)
 		}
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
 		res, err := f2.h.Fork(ctx, harness.ForkRequest{
@@ -5373,18 +5062,13 @@ func TestPublicForkArchivedSource(t *testing.T) {
 			OperationID:     "fork-1",
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		})
-		if err != nil {
-			t.Fatalf("Fork of an archived source: %v", err)
-		}
-		if res.Session.State.Lifecycle != harness.LifecycleOpen {
-			t.Fatalf("fork lifecycle = %s, want open", res.Session.State.Lifecycle)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, res.Session.State.Lifecycle, harness.LifecycleOpen)
 		src, err := f2.h.ReadSessionHeader(ctx, source)
-		if err != nil || src.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("source after fork = %+v err %v, want it archived without reopening", src, err)
-		}
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("Wait: %v", err)
+		testassert.Require(t, err == nil && src.Lifecycle == harness.LifecycleArchived, "source after fork = %+v err %v, want it archived without reopening", src, err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -5402,48 +5086,56 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 		defer f.close()
 		source := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // parked: the source is running
-		if _, err := f.h.Fork(ctx, harness.ForkRequest{
-			SourceSessionID: source,
-			BoundaryEntryID: newRawSessionID(t),
-			OperationID:     "fork-1",
-			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-		}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("fork of a running source = err %v, want ErrInvalid", err)
+		{
+			_, err := f.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: newRawSessionID(t),
+				OperationID:     "fork-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork of a running source = err %v, want ErrInvalid", err)
 		}
-		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: "short", BoundaryEntryID: newRawSessionID(t), OperationID: "fork-1"}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("fork with a malformed source identity = err %v, want ErrInvalid", err)
+		{
+			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: "short", BoundaryEntryID: newRawSessionID(t), OperationID: "fork-1"})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork with a malformed source identity = err %v, want ErrInvalid", err)
 		}
-		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: "short", OperationID: "fork-1"}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("fork with a malformed boundary identity = err %v, want ErrInvalid", err)
+		{
+			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: "short", OperationID: "fork-1"})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork with a malformed boundary identity = err %v, want ErrInvalid", err)
 		}
-		if _, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: newRawSessionID(t), OperationID: ""}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("fork without an operation identity = err %v, want ErrInvalid", err)
+		{
+			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: newRawSessionID(t), OperationID: ""})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork without an operation identity = err %v, want ErrInvalid", err)
 		}
 		script.releaseGate()
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		// an idle source with one runtime-origin input: non-user boundaries are invalid
 		runtimeScript := newScriptModel()
 		f2 := newPublicFixture(t, store, runtimeScript, nil)
 		defer f2.close()
-		if _, err := f2.h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   source,
-			OperationID: "op-2",
-			Origin:      harness.InputOriginRuntime,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: "runtime input"}},
-			Mode:        harness.MessageModeRegular,
-		}); err != nil {
-			t.Fatalf("runtime submit: %v", err)
+		{
+			_, err := f2.h.Submit(ctx, harness.SubmitRequest{
+				SessionID:   source,
+				OperationID: "op-2",
+				Origin:      harness.InputOriginRuntime,
+				Content:     []model.ContentPart{{Kind: model.PartText, Text: "runtime input"}},
+				Mode:        harness.MessageModeRegular,
+			})
+			testassert.NoError(t, err)
 		}
 		<-runtimeScript.arrived
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 
 		f3 := newPublicFixture(t, store, newScriptModel(), nil)
@@ -5458,13 +5150,14 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 			{"non-input boundary", assistantBoundary},
 			{"runtime-origin boundary", runtimeBoundary},
 		} {
-			if _, err := f3.h.Fork(ctx, harness.ForkRequest{
-				SourceSessionID: source,
-				BoundaryEntryID: tt.boundary,
-				OperationID:     "fork-1",
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-			}); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("fork with %s = err %v, want ErrInvalid", tt.name, err)
+			{
+				_, err := f3.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: source,
+					BoundaryEntryID: tt.boundary,
+					OperationID:     "fork-1",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+				})
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork with %s = err %v, want ErrInvalid", tt.name, err)
 			}
 		}
 		assertSessionIDs(t, store, source) // nothing was published by any rejection
@@ -5495,12 +5188,11 @@ func TestPublicForkExistingLookup(t *testing.T) {
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f2.close()
 		first, err := f2.h.Fork(ctx, forkReq)
-		if err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		dest := first.Session.Identity.SessionID
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 
 		// one further live idle source for the later subtests
@@ -5508,12 +5200,14 @@ func TestPublicForkExistingLookup(t *testing.T) {
 		f3 := newPublicFixture(t, store, otherScript, nil)
 		defer f3.close()
 		other := createSession(t, f3.h)
-		if _, err := submit(t, f3.h, other, "fork-b", harness.MessageModeRegular, "reused"); err != nil {
-			t.Fatalf("cross-session submit: %v", err)
+		{
+			_, err := submit(t, f3.h, other, "fork-b", harness.MessageModeRegular, "reused")
+			testassert.NoError(t, err)
 		}
 		<-otherScript.arrived
-		if err := converge(t, f3); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f3)
+			testassert.NoError(t, err)
 		}
 		otherBoundary := forkEntryOf(t, store, other, harness.EntryInput, "fork-b").ID
 
@@ -5523,15 +5217,11 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			retry := forkReq
 			retry.Content = []model.ContentPart{{Kind: model.PartText, Text: "changed"}}
 			res, err := f4.h.Fork(ctx, retry)
-			if err != nil {
-				t.Fatalf("retry Fork: %v", err)
-			}
-			if res.Session.Identity.SessionID != dest ||
-				res.Operation.Admission.AdmittedEntry != first.Operation.Admission.AdmittedEntry {
-				t.Fatalf("retry = %+v, want the first destination", res)
-			}
-			if calls := f4.preparationCalls(); len(calls) != 0 {
-				t.Fatalf("retry prepared %d times, want the lookup to resolve before preparation", len(calls))
+			testassert.NoError(t, err)
+			testassert.Require(t, res.Session.Identity.SessionID == dest && res.Operation.Admission.AdmittedEntry == first.Operation.Admission.AdmittedEntry, "retry = %+v, want the first destination", res)
+			{
+				calls := f4.preparationCalls()
+				testassert.Equal(t, len(calls), 0)
 			}
 			assertSessionIDs(t, store, dest, other, source)
 		})
@@ -5539,31 +5229,30 @@ func TestPublicForkExistingLookup(t *testing.T) {
 		t.Run("lookup precedes source validation", func(t *testing.T) {
 			f5 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f5.close()
-			if _, err := f5.h.ArchiveSession(ctx, source); err != nil {
-				t.Fatalf("archive: %v", err)
+			{
+				_, err := f5.h.ArchiveSession(ctx, source)
+				testassert.NoError(t, err)
 			}
-			if err := f5.h.DeleteSession(ctx, source); err != nil {
-				t.Fatalf("delete: %v", err)
+			{
+				err := f5.h.DeleteSession(ctx, source)
+				testassert.NoError(t, err)
 			}
 			res, err := f5.h.Fork(ctx, forkReq)
-			if err != nil {
-				t.Fatalf("retry after source deletion: %v", err)
-			}
-			if res.Session.Identity.SessionID != dest {
-				t.Fatalf("retry after source deletion = %+v, want the first destination", res)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, res.Session.Identity.SessionID == dest, "retry after source deletion = %+v, want the first destination", res)
 		})
 
 		t.Run("other reuse of the ID is invalid", func(t *testing.T) {
 			f6 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f6.close()
-			if _, err := f6.h.Fork(ctx, harness.ForkRequest{
-				SourceSessionID: other,
-				BoundaryEntryID: otherBoundary,
-				OperationID:     "fork-b",
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-			}); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("fork reusing a root Session's operation ID = err %v, want ErrInvalid", err)
+			{
+				_, err := f6.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: other,
+					BoundaryEntryID: otherBoundary,
+					OperationID:     "fork-b",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+				})
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork reusing a root Session's operation ID = err %v, want ErrInvalid", err)
 			}
 		})
 
@@ -5576,60 +5265,62 @@ func TestPublicForkExistingLookup(t *testing.T) {
 				OperationID:     "fork-c",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if err != nil {
-				t.Fatalf("Fork: %v", err)
-			}
-			if err := converge(t, f7); err != nil {
-				t.Fatalf("Wait: %v", err)
+			testassert.NoError(t, err)
+			{
+				err := converge(t, f7)
+				testassert.NoError(t, err)
 			}
 			// corrupt the destination register directly through storage
 			reg := sessionRegister(t, store, res.Session.Identity.SessionID)
 			var obj map[string]json.RawMessage
-			if err := json.Unmarshal(reg.Payload, &obj); err != nil {
-				t.Fatalf("unmarshal session payload: %v", err)
+			{
+				err := json.Unmarshal(reg.Payload, &obj)
+				testassert.NoError(t, err)
 			}
 			var state map[string]json.RawMessage
-			if err := json.Unmarshal(obj["state"], &state); err != nil {
-				t.Fatalf("unmarshal state section: %v", err)
+			{
+				err := json.Unmarshal(obj["state"], &state)
+				testassert.NoError(t, err)
 			}
 			state["lifecycle"] = json.RawMessage(`"bogus"`)
 			newState, err := json.Marshal(state)
-			if err != nil {
-				t.Fatalf("marshal state section: %v", err)
-			}
+			testassert.NoError(t, err)
 			obj["state"] = newState
 			bad, err := json.Marshal(obj)
-			if err != nil {
-				t.Fatalf("marshal session payload: %v", err)
-			}
+			testassert.NoError(t, err)
 			key := harness.RegisterKey{SessionID: res.Session.Identity.SessionID, Kind: harness.RegisterSession}
 			f8 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f8.close()
 			// the affected destination is already materialized in the retry
 			// Harness before the corruption is reported
-			if _, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID); err != nil {
-				t.Fatalf("read the destination before corruption: %v", err)
+			{
+				_, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID)
+				testassert.NoError(t, err)
 			}
-			if err := store.Transact(ctx, func(tx harness.Transaction) error {
-				_, err := tx.ReplaceRegister(key, reg.Revision, bad)
-				return err
-			}); err != nil {
-				t.Fatalf("corrupt the register: %v", err)
+			{
+				err := store.Transact(ctx, func(tx harness.Transaction) error {
+					_, err := tx.ReplaceRegister(key, reg.Revision, bad)
+					return err
+				})
+				testassert.NoError(t, err)
 			}
-			if _, err := f8.h.Fork(ctx, harness.ForkRequest{
-				SourceSessionID: other,
-				BoundaryEntryID: otherBoundary,
-				OperationID:     "fork-c",
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-			}); !errors.Is(err, harness.ErrCorrupt) {
-				t.Fatalf("retry over a corrupt located owner = err %v, want the corruption error", err)
+			{
+				_, err := f8.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: other,
+					BoundaryEntryID: otherBoundary,
+					OperationID:     "fork-c",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+				})
+				testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "retry over a corrupt located owner = err %v, want the corruption error", err)
 			}
 			// the affected cached Session is sticky-corrupt while valid siblings remain usable
-			if _, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID); !errors.Is(err, harness.ErrCorrupt) {
-				t.Fatalf("cached read of the corrupt located owner = err %v, want the sticky corruption error", err)
+			{
+				_, err := f8.h.ReadSessionHeader(ctx, res.Session.Identity.SessionID)
+				testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "cached read of the corrupt located owner = err %v, want the sticky corruption error", err)
 			}
-			if _, err := f8.h.ReadSessionHeader(ctx, other); err != nil {
-				t.Fatalf("valid sibling after the corrupt located owner = err %v, want it usable", err)
+			{
+				_, err := f8.h.ReadSessionHeader(ctx, other)
+				testassert.NoError(t, err)
 			}
 		})
 
@@ -5640,22 +5331,21 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			defer f9.close()
 			// the affected sibling is already materialized in this Harness
 			// before the corruption is reported
-			if _, err := f9.h.ReadSessionHeader(ctx, forkSiblingID); err != nil {
-				t.Fatalf("read the sibling before corruption: %v", err)
+			{
+				_, err := f9.h.ReadSessionHeader(ctx, forkSiblingID)
+				testassert.NoError(t, err)
 			}
 			res, err := f9.h.Fork(ctx, forkReq)
-			if err != nil {
-				t.Fatalf("retry past a corrupt sibling: %v", err)
-			}
-			if res.Operation.Admission.OperationID != "fork-a" {
-				t.Fatalf("retry = %+v, want the existing destination", res)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, res.Operation.Admission.OperationID == "fork-a", "retry = %+v, want the existing destination", res)
 			// the skipped corruption sticks to the cached Session while valid siblings remain usable
-			if _, err := f9.h.ReadSessionHeader(ctx, forkSiblingID); !errors.Is(err, harness.ErrCorrupt) {
-				t.Fatalf("cached read of the corrupt sibling = err %v, want the sticky corruption error", err)
+			{
+				_, err := f9.h.ReadSessionHeader(ctx, forkSiblingID)
+				testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "cached read of the corrupt sibling = err %v, want the sticky corruption error", err)
 			}
-			if _, err := f9.h.ReadSessionHeader(ctx, other); err != nil {
-				t.Fatalf("valid sibling after the corrupt sibling = err %v, want it usable", err)
+			{
+				_, err := f9.h.ReadSessionHeader(ctx, other)
+				testassert.NoError(t, err)
 			}
 		})
 	})
@@ -5687,19 +5377,16 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				OperationID:     "race-1",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if err != nil {
-				t.Fatalf("fork losing the race = err %v, want the matching first destination", err)
-			}
+			testassert.NoError(t, err)
 			decoy := <-decoyCh
-			if res.Session.Identity.SessionID != decoy || res.Session.Identity.SourceSessionID != source ||
-				res.Operation.Admission.OperationID != "race-1" {
-				t.Fatalf("race resolution = %+v, want the first destination session %q", res, decoy)
+			testassert.Require(t, res.Session.Identity.SessionID == decoy && res.Session.Identity.SourceSessionID == source && res.Operation.Admission.OperationID == "race-1", "race resolution = %+v, want the first destination session %q", res, decoy)
+			{
+				calls := race.preparationCalls()
+				testassert.Equal(t, len(calls), 1)
 			}
-			if calls := race.preparationCalls(); len(calls) != 1 {
-				t.Fatalf("preparation calls = %d, want the preparation never rerun", len(calls))
-			}
-			if got := race.opens.Load(); got != 0 {
-				t.Fatalf("opener calls = %d, want the first-writer loser to discard its prepared values without opening", got)
+			{
+				got := race.opens.Load()
+				testassert.Equal(t, got, 0)
 			}
 			assertSessionIDs(t, store, decoy, source) // the losing transaction published nothing
 		})
@@ -5711,16 +5398,18 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				seedForkDecoy(t, store, source, boundary, "race-2", false) // a root Session wins the ID
 				return racePrepared(race), nil
 			}
-			if _, err := race.h.Fork(ctx, harness.ForkRequest{
-				SourceSessionID: source,
-				BoundaryEntryID: boundary,
-				OperationID:     "race-2",
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-			}); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("fork losing to a different use of the ID = err %v, want ErrInvalid", err)
+			{
+				_, err := race.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: source,
+					BoundaryEntryID: boundary,
+					OperationID:     "race-2",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+				})
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork losing to a different use of the ID = err %v, want ErrInvalid", err)
 			}
-			if got := race.opens.Load(); got != 0 {
-				t.Fatalf("opener calls = %d, want an invalid fork resolution to discard the prepared values without opening", got)
+			{
+				got := race.opens.Load()
+				testassert.Equal(t, got, 0)
 			}
 		})
 
@@ -5734,13 +5423,14 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				insertRawRegister(t, store, harness.RegisterKey{SessionID: sid, Kind: harness.RegisterOperation, OperationID: "race-3"}, rawRunningOperationPayload(sid, "race-3", entryID))
 				return racePrepared(race), nil
 			}
-			if _, err := race.h.Fork(ctx, harness.ForkRequest{
-				SourceSessionID: source,
-				BoundaryEntryID: boundary,
-				OperationID:     "race-3",
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-			}); !errors.Is(err, harness.ErrConflict) {
-				t.Fatalf("fork losing to an unreadable owner = err %v, want the original storage conflict", err)
+			{
+				_, err := race.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: source,
+					BoundaryEntryID: boundary,
+					OperationID:     "race-3",
+					Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+				})
+				testassert.Require(t, errors.Is(err, harness.ErrConflict), "fork losing to an unreadable owner = err %v, want the original storage conflict", err)
 			}
 		})
 	})
@@ -5774,23 +5464,22 @@ func TestPublicForkSourceRevisionRace(t *testing.T) {
 			}
 			return racePrepared(race), nil
 		}
-		if _, err := race.h.Fork(ctx, harness.ForkRequest{
-			SourceSessionID: source,
-			BoundaryEntryID: boundary,
-			OperationID:     "race-1",
-			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-		}); !errors.Is(err, harness.ErrConflict) {
-			t.Fatalf("fork over a concurrently changed source = err %v, want ErrConflict", err)
+		{
+			_, err := race.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "race-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			testassert.Require(t, errors.Is(err, harness.ErrConflict), "fork over a concurrently changed source = err %v, want ErrConflict", err)
 		}
-		if got := race.opens.Load(); got != 0 {
-			t.Fatalf("opener calls = %d, want a failed fork publication to discard the prepared values without opening", got)
+		{
+			got := race.opens.Load()
+			testassert.Equal(t, got, 0)
 		}
 		assertSessionIDs(t, store, source) // nothing was published
 		after := sessionRegister(t, store, source)
-		if after.Revision != snapRegisterOf(&before, harness.RegisterSession, "").Revision+1 ||
-			!bytes.Equal(after.Payload, mustForeignPayload(t, before)) {
-			t.Fatalf("fork disturbed the foreign change: register = %+v", after)
-		}
+		testassert.Require(t, after.Revision == snapRegisterOf(&before, harness.RegisterSession, "").Revision+1 && bytes.Equal(after.Payload, mustForeignPayload(t, before)), "fork disturbed the foreign change: register = %+v", after)
 	})
 }
 
@@ -5827,55 +5516,60 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 			OperationID:     "fork-1",
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		})
-		if err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		dest := res.Session.Identity.SessionID
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 
 		// the source is archived and deleted; the fork stays usable
 		destScript := newScriptModel()
 		f3 := newPublicFixture(t, store, destScript, nil)
 		defer f3.close()
-		if _, err := f3.h.ArchiveSession(ctx, source); err != nil {
-			t.Fatalf("archive source: %v", err)
+		{
+			_, err := f3.h.ArchiveSession(ctx, source)
+			testassert.NoError(t, err)
 		}
-		if err := f3.h.DeleteSession(ctx, source); err != nil {
-			t.Fatalf("delete source: %v", err)
+		{
+			err := f3.h.DeleteSession(ctx, source)
+			testassert.NoError(t, err)
 		}
-		if _, err := f3.h.ReadSessionHeader(ctx, dest); err != nil {
-			t.Fatalf("fork read after source deletion: %v", err)
+		{
+			_, err := f3.h.ReadSessionHeader(ctx, dest)
+			testassert.NoError(t, err)
 		}
-		if _, err := f3.h.ReadOperation(ctx, dest, "fork-1"); err != nil {
-			t.Fatalf("fork operation read after source deletion: %v", err)
+		{
+			_, err := f3.h.ReadOperation(ctx, dest, "fork-1")
+			testassert.NoError(t, err)
 		}
-		if _, err := submit(t, f3.h, dest, "fork-2", harness.MessageModeRegular, "after source loss"); err != nil {
-			t.Fatalf("fork admission after source deletion: %v", err)
+		{
+			_, err := submit(t, f3.h, dest, "fork-2", harness.MessageModeRegular, "after source loss")
+			testassert.NoError(t, err)
 		}
 		<-destScript.arrived
-		if _, err := submit(t, f3.h, dest, "fork-4", harness.MessageModeQueued, "settle barrier"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f3.h, dest, "fork-4", harness.MessageModeQueued, "settle barrier")
+			testassert.NoError(t, err)
 		}
 		<-f3.prepare // the drain admitted fork-4: fork-2's terminal committed
 		<-destScript.arrived
-		if err := converge(t, f3); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f3)
+			testassert.NoError(t, err)
 		}
 		rec, err := f3.h.ReadOperation(ctx, dest, "fork-2")
-		if err != nil || rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("fork admission after source deletion = %+v err %v, want success", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess, "fork admission after source deletion = %+v err %v, want success", rec, err)
 		f4 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f4.close()
-		if _, err := f4.h.Fork(ctx, harness.ForkRequest{
-			SourceSessionID: source,
-			BoundaryEntryID: boundary,
-			OperationID:     "fork-3",
-			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-		}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("fork from a deleted source = err %v, want ErrNotFound", err)
+		{
+			_, err := f4.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-3",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "fork from a deleted source = err %v, want ErrNotFound", err)
 		}
 	})
 }
@@ -5893,13 +5587,14 @@ func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
 		probe := &rollbackProbeStore{Storage: store, failInsert: true, insertsUntilFail: 2} // the destination Operation-register insert fails after mutating
 		race := newPublicFixture(t, probe, newScriptModel(), nil)
 		defer race.close()
-		if _, err := race.h.Fork(ctx, harness.ForkRequest{
-			SourceSessionID: source,
-			BoundaryEntryID: boundary,
-			OperationID:     "fork-1",
-			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
-		}); !errors.Is(err, errInjectedRollback) {
-			t.Fatalf("fork with injected post-mutation failure = err %v, want the injected rollback", err)
+		{
+			_, err := race.h.Fork(ctx, harness.ForkRequest{
+				SourceSessionID: source,
+				BoundaryEntryID: boundary,
+				OperationID:     "fork-1",
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
+			})
+			testassert.Require(t, errors.Is(err, errInjectedRollback), "fork with injected post-mutation failure = err %v, want the injected rollback", err)
 		}
 		assertSessionIDs(t, store, source) // the rolled-back fork left no destination
 		assertForkSourceUnchanged(t, store, source, before)
@@ -5922,29 +5617,23 @@ func TestPublicCompositionProductionIsolation(t *testing.T) {
 		defer f.close()
 		sessionID := createSession(t, f.h)
 		res, err := submit(t, f.h, sessionID, "iso-1", harness.MessageModeRegular, "isolate")
-		if err != nil || res.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("Submit = %+v err %v, want admitted", res, err)
-		}
+		testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted, "Submit = %+v err %v, want admitted", res, err)
 		<-script.arrived // parked at the model boundary: the Session is active
-		if _, err := submit(t, f.h, sessionID, "iso-2", harness.MessageModeQueued, "drain"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, sessionID, "iso-2", harness.MessageModeQueued, "drain")
+			testassert.NoError(t, err)
 		}
 		script.releaseGate()
 		<-script.arrived // the drain admitted iso-2: iso-1's terminal success committed
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 		op, err := f.h.ReadOperation(context.Background(), sessionID, "iso-1")
-		if err != nil || op.State.Status != harness.OperationSuccess {
-			t.Fatalf("composed isolation turn = %+v err %v, want success", op, err)
-		}
+		testassert.Require(t, err == nil && op.State.Status == harness.OperationSuccess, "composed isolation turn = %+v err %v, want success", op, err)
 		touched, err := os.ReadDir(state)
-		if err != nil {
-			t.Fatalf("read caller state directory: %v", err)
-		}
-		if len(touched) != 0 {
-			t.Fatalf("composed inactive Harness derived production state in the caller's working directory: %v", touched)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(touched) == 0, "composed inactive Harness derived production state in the caller's working directory: %v", touched)
 	})
 }
 
@@ -6002,20 +5691,20 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 			t.Helper()
 			select {
 			case got := <-events:
-				if got != want {
-					t.Fatalf("lifetime event = %q, want %q", got, want)
-				}
+				testassert.Equal(t, got, want)
 			case <-time.After(30 * time.Second):
 				t.Fatalf("timed out waiting for lifetime event %q", want)
 			}
 		}
 
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("root submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		nextEvent("open:op-1") // the root execution opens after its commit
-		if _, err := submit(t, f.h, source, "op-2", harness.MessageModeQueued, "queued"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-2", harness.MessageModeQueued, "queued")
+			testassert.NoError(t, err)
 		}
 		nextEvent("close:op-1:success") // closed once, with its own terminal settlement already durable
 		nextEvent("open:op-2")          // the drain's successor opens only after that close
@@ -6030,31 +5719,22 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 			OperationID:     "fork-op",
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		})
-		if err != nil {
-			t.Fatalf("fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		nextEvent("open:fork-op")
 		nextEvent("close:fork-op:success")
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		openMu.Lock()
 		defer openMu.Unlock()
-		if len(opens) != 3 {
-			t.Fatalf("%d opener calls, want exactly one per admitted execution", len(opens))
-		}
+		testassert.Equal(t, len(opens), 3)
 		for i, adm := range opens {
-			if !reflect.DeepEqual(adm.Execution, publicCapture()) {
-				t.Fatalf("open %d carries capture %+v, want the prepared capture", i, adm.Execution)
-			}
+			testassert.Require(t, reflect.DeepEqual(adm.Execution, publicCapture()), "open %d carries capture %+v, want the prepared capture", i, adm.Execution)
 		}
-		if opens[0].SessionID != source || opens[1].SessionID != source {
-			t.Fatalf("root/queued opens name sessions %q and %q, want the source", opens[0].SessionID, opens[1].SessionID)
-		}
-		if opens[2].SessionID != res.Session.Identity.SessionID {
-			t.Fatalf("fork open names session %q, want the destination", opens[2].SessionID)
-		}
+		testassert.Require(t, opens[0].SessionID == source && opens[1].SessionID == source, "root/queued opens name sessions %q and %q, want the source", opens[0].SessionID, opens[1].SessionID)
+		testassert.Equal(t, opens[2].SessionID, res.Session.Identity.SessionID)
 	})
 }
 
@@ -6074,45 +5754,37 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 			ctx := context.Background()
 			sessionID, hookReserved, pending := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1"})
 			state := recoverOpStateAt(t, store, sessionID, "op-1")
-			if state.ActiveEffect == nil || state.ActiveEffect.Kind != "hook" ||
-				state.ActiveEffect.ResultEntryID != hookReserved || state.ActiveEffect.HookID != "cap.hook.one" ||
-				state.ActiveEffect.ToolCallID != "call-1" {
-				t.Fatalf("seeded operation = %+v, want the committed hook effect intent", state)
-			}
+			testassert.Require(t, state.ActiveEffect != nil && state.ActiveEffect.Kind == "hook" && state.ActiveEffect.ResultEntryID == hookReserved && state.ActiveEffect.HookID == "cap.hook.one" && state.ActiveEffect.ToolCallID == "call-1", "seeded operation = %+v, want the committed hook effect intent", state)
 
 			pre := recoverEntries(t, store, sessionID)
-			if err := harness.Recover(ctx, store); err != nil {
-				t.Fatalf("recover: %v", err)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
 			}
 			// Recovery adds its reserved hook result before the ordinary
 			// interrupted-tool, signal and settlement tail.
 			entries := recoverEntries(t, store, sessionID)
-			if len(entries) <= len(pre) {
-				t.Fatal("recovery committed no hook result")
-			}
+			testassert.Require(t, len(entries) > len(pre), "%v", "recovery committed no hook result")
 			hook := entries[len(pre)]
-			if hook.Kind != harness.EntryHookResult || hook.ID != hookReserved {
-				t.Fatalf("recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
-			}
+			testassert.Require(t, hook.Kind == harness.EntryHookResult && hook.ID == hookReserved, "recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
 			var hookWire struct {
 				HookID     string `json:"hook_id"`
 				ToolCallID string `json:"tool_call_id"`
 				Status     string `json:"status"`
 				Error      string `json:"error"`
 			}
-			if err := json.Unmarshal(hook.Payload, &hookWire); err != nil {
-				t.Fatalf("decode hook result: %v", err)
+			{
+				err := json.Unmarshal(hook.Payload, &hookWire)
+				testassert.NoError(t, err)
 			}
-			if hookWire.HookID != "cap.hook.one" || hookWire.ToolCallID != "call-1" || hookWire.Status != "interrupted" ||
-				hookWire.Error != recoveredInterruptionDetail {
-				t.Fatalf("interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
-			}
+			testassert.Require(t, hookWire.HookID == "cap.hook.one" && hookWire.ToolCallID == "call-1" && hookWire.Status == "interrupted" && hookWire.Error == recoveredInterruptionDetail, "interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
 			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", pending)
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
-			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
-				t.Fatalf("repaired operation does not materialize: %v", err)
+			{
+				_, err := h.ReadOperation(ctx, sessionID, "op-1")
+				testassert.NoError(t, err)
 			}
 		})
 	})
@@ -6126,15 +5798,17 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
 
 			pre := recoverEntries(t, store, sessionID)
-			if err := harness.Recover(ctx, store); err != nil {
-				t.Fatalf("recover: %v", err)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
 			}
 			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", pending)
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
-			if _, err := h.ReadOperation(ctx, sessionID, "op-1"); err != nil {
-				t.Fatalf("repaired operation does not materialize: %v", err)
+			{
+				_, err := h.ReadOperation(ctx, sessionID, "op-1")
+				testassert.NoError(t, err)
 			}
 		})
 	})
@@ -6149,31 +5823,27 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 			// replacement for real, then fails the transaction: every recovery
 			// commit must roll back together.
 			probed := &rollbackProbeStore{Storage: store, failReplace: true}
-			if err := harness.Recover(ctx, probed); !errors.Is(err, errInjectedRollback) {
-				t.Fatalf("recover with the injected publication failure = %v, want the injected rollback", err)
+			{
+				err := harness.Recover(ctx, probed)
+				testassert.Require(t, errors.Is(err, errInjectedRollback), "recover with the injected publication failure = %v, want the injected rollback", err)
 			}
 			assertSessionUnchanged(t, store, targetID, before)
 
-			if err := harness.Recover(ctx, store); err != nil {
-				t.Fatalf("second recover: %v", err)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
 			}
 			state := recoverOpStateAt(t, store, targetID, "op-1")
-			if state.Status != "interruption" || state.ActiveEffect != nil || state.Terminal == nil {
-				t.Fatalf("recovered state = %+v, want the terminal interruption", state)
-			}
+			testassert.Require(t, state.Status == "interruption" && state.ActiveEffect == nil && state.Terminal != nil, "recovered state = %+v, want the terminal interruption", state)
 			entries := recoverEntries(t, store, targetID)
 			hookResults := 0
 			for _, entry := range entries {
 				if entry.Kind == harness.EntryHookResult {
 					hookResults++
-					if entry.ID != hookReserved {
-						t.Fatalf("hook result = %+v, want it under the reserved identity", entry)
-					}
+					testassert.Require(t, entry.ID == hookReserved, "hook result = %+v, want it under the reserved identity", entry)
 				}
 			}
-			if hookResults != 1 {
-				t.Fatalf("%d hook results after the retried recovery, want exactly the reserved interrupted one", hookResults)
-			}
+			testassert.Equal(t, hookResults, 1)
 			assertRecoverIdempotent(t, store, targetID, "op-1")
 		})
 	})
@@ -6197,16 +5867,19 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		defer f.close()
 		source := createSession(t, f.h)
 
-		if _, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "first question"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-1", harness.MessageModeRegular, "first question")
+			testassert.NoError(t, err)
 		}
 		awaitTerminal(t, f.h, source, "op-1")
 		compactWhenIdle(t, f.h, source, "c-1")
-		if rec := awaitTerminal(t, f.h, source, "c-1"); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("manual compact = %+v, want success", rec.State)
+		{
+			rec := awaitTerminal(t, f.h, source, "c-1")
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "manual compact = %+v, want success", rec.State)
 		}
-		if _, err := submit(t, f.h, source, "op-2", harness.MessageModeRegular, "later question"); err != nil {
-			t.Fatalf("second submit: %v", err)
+		{
+			_, err := submit(t, f.h, source, "op-2", harness.MessageModeRegular, "later question")
+			testassert.NoError(t, err)
 		}
 		awaitSettled(t, f.h, source, "op-2") // submit may buffer during the compact run's retirement; admission is the rendezvous
 
@@ -6220,9 +5893,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 				sourceComp = &before.entries[i]
 			}
 		}
-		if sourceComp == nil {
-			t.Fatalf("no compaction entry in the source prefix")
-		}
+		testassert.Require(t, sourceComp != nil, "no compaction entry in the source prefix")
 		// The wire compaction entry carries its model as the string
 		// "provider/model" form; the copy observes the identity members only.
 		type compactionWire struct {
@@ -6233,12 +5904,11 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 			Usage                 *harness.UsageCount `json:"usage"`
 		}
 		var sourceWire compactionWire
-		if err := json.Unmarshal(sourceComp.Payload, &sourceWire); err != nil {
-			t.Fatalf("decode source compaction entry: %v", err)
+		{
+			err := json.Unmarshal(sourceComp.Payload, &sourceWire)
+			testassert.NoError(t, err)
 		}
-		if sourceWire.OperationID != "c-1" || sourceWire.Summary != "summary one" || sourceWire.Usage == nil {
-			t.Fatalf("source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
-		}
+		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceWire.Summary == "summary one" && sourceWire.Usage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
 
 		res, err := f.h.Fork(ctx, harness.ForkRequest{
 			SourceSessionID: source,
@@ -6246,16 +5916,10 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 			OperationID:     "fork-1",
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 		})
-		if err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		dest := res.Session.Identity.SessionID
-		if dest == source {
-			t.Fatalf("fork session identity = %q, want one fresh identity", dest)
-		}
-		if len(res.Session.State.Usage.ByModel) != 0 {
-			t.Fatalf("fork session usage = %+v, want zero inherited usage", res.Session.State.Usage)
-		}
+		testassert.Require(t, dest != source, "fork session identity = %q, want one fresh identity", dest)
+		testassert.Require(t, len(res.Session.State.Usage.ByModel) == 0, "fork session usage = %+v, want zero inherited usage", res.Session.State.Usage)
 		awaitTerminal(t, f.h, dest, "fork-1")
 
 		destEntries := recoverEntries(t, store, dest)
@@ -6277,9 +5941,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		}
 		idMap := map[string]string{}
 		for i, entry := range expectedCopied {
-			if destEntries[i].Kind != entry.Kind {
-				t.Fatalf("copied prefix %d = %s, want the source %s's %s", i, destEntries[i].Kind, entry.ID, entry.Kind)
-			}
+			testassert.Require(t, destEntries[i].Kind == entry.Kind, "copied prefix %d = %s, want the source %s's %s", i, destEntries[i].Kind, entry.ID, entry.Kind)
 			idMap[entry.ID] = destEntries[i].ID
 		}
 		// The one copied compaction entry: fresh identity, no operation
@@ -6288,78 +5950,47 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		var copied *harness.Entry
 		for i := range destEntries {
 			if destEntries[i].Kind == harness.EntryCompaction {
-				if copied != nil {
-					t.Fatalf("destination compaction entries: more than one copied")
-				}
+				testassert.Require(t, copied == nil, "destination compaction entries: more than one copied")
 				copied = &destEntries[i]
 			}
 		}
-		if copied == nil {
-			t.Fatalf("no compaction entry copied into the destination")
-		}
-		if copied.ID == sourceComp.ID || copied.OperationID != "" {
-			t.Fatalf("copied compaction entry = %q/%q, want a fresh identity with no operation ownership", copied.ID, copied.OperationID)
-		}
+		testassert.Require(t, copied != nil, "no compaction entry copied into the destination")
+		testassert.Require(t, copied.ID != sourceComp.ID && copied.OperationID == "", "copied compaction entry = %q/%q, want a fresh identity with no operation ownership", copied.ID, copied.OperationID)
 		var copiedWire compactionWire
-		if err := json.Unmarshal(copied.Payload, &copiedWire); err != nil {
-			t.Fatalf("decode copied compaction entry: %v", err)
+		{
+			err := json.Unmarshal(copied.Payload, &copiedWire)
+			testassert.NoError(t, err)
 		}
-		if copiedWire.OperationID != "" {
-			t.Fatalf("copied compaction entry operation = %q, want no operation ownership", copiedWire.OperationID)
-		}
-		if copiedWire.Usage != nil {
-			t.Fatalf("copied compaction entry usage = %+v, want none", copiedWire.Usage)
-		}
-		if copiedWire.Summary != "summary one" {
-			t.Fatalf("copied summary = %q, want the source summary", copiedWire.Summary)
-		}
+		testassert.Require(t, copiedWire.OperationID == "" && copiedWire.Usage == nil && copiedWire.Summary == "summary one", "got %v, want %v; copied compaction entry usage = %+v, want none; got %v, want %v", copiedWire.OperationID, "", copiedWire.Usage, copiedWire.Summary, "summary one")
 		expectedBoundary, ok := idMap[sourceWire.BoundaryEntryID]
-		if !ok {
-			t.Fatalf("the source boundary %q is not inside the copied prefix", sourceWire.BoundaryEntryID)
-		}
-		if copiedWire.BoundaryEntryID != expectedBoundary {
-			t.Fatalf("copied boundary %q != the mapped copy of the source boundary %q", copiedWire.BoundaryEntryID, expectedBoundary)
-		}
-		if copiedWire.ConfigurationRevision != sourceWire.ConfigurationRevision {
-			t.Fatalf("copied revision = %q, want the kept source revision %q", copiedWire.ConfigurationRevision, sourceWire.ConfigurationRevision)
-		}
+		testassert.Require(t, ok, "the source boundary %q is not inside the copied prefix", sourceWire.BoundaryEntryID)
+		testassert.Require(t, copiedWire.BoundaryEntryID == expectedBoundary && copiedWire.ConfigurationRevision == sourceWire.ConfigurationRevision, "got %v, want %v; got %v, want %v", copiedWire.BoundaryEntryID, expectedBoundary, copiedWire.ConfigurationRevision, sourceWire.ConfigurationRevision)
 		// The destination projection is recreated at the copied summary and
 		// inherits none of the source's usage: the source's compact-model
 		// piece counts never reach the destination, whose only totals are its
 		// own fork turn's conversation counts.
 		destReg, err := f.store.ReadRegister(ctx, harness.RegisterKey{SessionID: dest, Kind: harness.RegisterSession})
-		if err != nil {
-			t.Fatalf("destination session register: %v", err)
-		}
+		testassert.NoError(t, err)
 		var destState struct {
 			State struct {
 				CompactionEntryID string `json:"compaction_entry_id"`
 			} `json:"state"`
 		}
-		if err := json.Unmarshal(destReg.Payload, &destState); err != nil {
-			t.Fatalf("decode destination session register: %v", err)
+		{
+			err := json.Unmarshal(destReg.Payload, &destState)
+			testassert.NoError(t, err)
 		}
-		if destState.State.CompactionEntryID != copied.ID {
-			t.Fatalf("destination compaction_entry_id = %q, want the copied entry %q", destState.State.CompactionEntryID, copied.ID)
-		}
+		testassert.Equal(t, destState.State.CompactionEntryID, copied.ID)
 		destView, err := f.h.ReadSessionView(ctx, dest)
-		if err != nil {
-			t.Fatalf("ReadSessionView(dest): %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, mu := range destView.TotalUsage.ByModel {
-			if mu.Model == compactModelRef {
-				t.Fatalf("destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
-			}
+			testassert.Require(t, mu.Model != compactModelRef, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
 		}
 		// The fork's own turn projected at the copied summary.
 		reqs := conversation.seen()
-		if len(reqs) == 0 {
-			t.Fatalf("the fork execution never reached its model boundary")
-		}
+		testassert.Require(t, len(reqs) != 0, "the fork execution never reached its model boundary")
 		last := texts(reqs[len(reqs)-1])
-		if len(last) != 3 || !strings.Contains(last[1], "[Previous conversation summary]") || !strings.Contains(last[1], "summary one") || last[2] != "fork input" {
-			t.Fatalf("fork projection = %q, want the system prompt, the copied summary, and the fork input", last)
-		}
+		testassert.Require(t, len(last) == 3 && strings.Contains(last[1], "[Previous conversation summary]") && strings.Contains(last[1], "summary one") && last[2] == "fork input", "fork projection = %q, want the system prompt, the copied summary, and the fork input", last)
 		// The source is unchanged.
 		assertForkSourceUnchanged(t, store, source, before)
 	})
@@ -6459,14 +6090,13 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 
 		// The seeded shape: a running compact request with a live model intent.
 		state := recoverOpStateAt(t, store, sessionID, "compact-op")
-		if state.Status != "running" || state.ActiveEffect == nil || state.ActiveEffect.Kind != "model" ||
-			state.ActiveEffect.ResultEntryID != reserved {
-			t.Fatalf("seeded compact operation = %+v, want the running live model intent", state)
-		}
+		testassert.Require(t, state.Status == "running" && state.ActiveEffect != nil && state.ActiveEffect.Kind == "model" && state.ActiveEffect.ResultEntryID == reserved, "seeded compact operation = %+v, want the running live model intent", state)
 
 		pre := recoverEntries(t, store, sessionID)
-		if err := harness.Recover(ctx, store); err != nil { // quiescent: before any live Harness
-			t.Fatalf("recover: %v", err)
+		// quiescent: before any live Harness
+		{
+			err := harness.Recover(ctx, store)
+			testassert.NoError(t, err)
 		}
 		// The compact Operation settles as the runtime-loss interruption with
 		// no effect replay: the settlement consumes the reserved identity and
@@ -6482,30 +6112,23 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		for _, entry := range entries {
 			if entry.Kind == harness.EntryCompaction {
 				compactions++
-				if entry.ID != compactionID {
-					t.Fatalf("recovery committed a new compaction entry %q, want no effect replay", entry.ID)
-				}
+				testassert.Equal(t, entry.ID, compactionID)
 			}
 		}
-		if compactions != 1 {
-			t.Fatalf("compaction entries = %d, want only the seeded one", compactions)
-		}
+		testassert.Equal(t, compactions, 1)
 		sessReg, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
-		if err != nil {
-			t.Fatalf("session register: %v", err)
-		}
+		testassert.NoError(t, err)
 		var sessWire struct {
 			State struct {
 				CurrentOperationID string `json:"current_operation_id"`
 				CompactionEntryID  string `json:"compaction_entry_id"`
 			} `json:"state"`
 		}
-		if err := json.Unmarshal(sessReg.Payload, &sessWire); err != nil {
-			t.Fatalf("decode session register: %v", err)
+		{
+			err := json.Unmarshal(sessReg.Payload, &sessWire)
+			testassert.NoError(t, err)
 		}
-		if sessWire.State.CurrentOperationID != "" || sessWire.State.CompactionEntryID != compactionID {
-			t.Fatalf("recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
-		}
+		testassert.Require(t, sessWire.State.CurrentOperationID == "" && sessWire.State.CompactionEntryID == compactionID, "recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
 
 		// The next admission over the repaired state projects the prior
 		// summary, the post-boundary entries, and the interruption signal —
@@ -6513,14 +6136,13 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		script := newScriptModel(publicTurn())
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
-		if _, err := submit(t, f.h, sessionID, "op-next", harness.MessageModeRegular, "next question"); err != nil {
-			t.Fatalf("submit after recovery: %v", err)
+		{
+			_, err := submit(t, f.h, sessionID, "op-next", harness.MessageModeRegular, "next question")
+			testassert.NoError(t, err)
 		}
 		awaitTerminal(t, f.h, sessionID, "op-next")
 		reqs := script.seen()
-		if len(reqs) != 1 {
-			t.Fatalf("conversation transport calls = %d, want exactly the next admission's one request", len(reqs))
-		}
+		testassert.Equal(t, len(reqs), 1)
 		got := texts(reqs[0])
 		want := []string{
 			"system",
@@ -6530,13 +6152,9 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 			"<system-signal>Operation interrupted.</system-signal>",
 			"next question",
 		}
-		if len(got) != len(want) {
-			t.Fatalf("next admission projection = %q, want %q", got, want)
-		}
+		testassert.Require(t, len(got) == len(want), "next admission projection = %q, want %q", got, want)
 		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("next admission projection[%d] = %q, want %q", i, got[i], want[i])
-			}
+			testassert.Require(t, got[i] == want[i], "next admission projection[%d] = %q, want %q", i, got[i], want[i])
 		}
 	})
 }

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // spawnRecord wraps one spawn callback with a plain call counter that also
@@ -46,9 +48,7 @@ func advanceSessionRevision(t *testing.T, store *graphStorage, sessionID string)
 		_, err = tx.ReplaceRegister(key, reg.Revision, reg.Payload)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("foreign revision advance: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // TestStartJobRejectsBeforeSpawn proves every StartJob rejection happens
@@ -66,29 +66,19 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 		wantErr func(t *testing.T, err error)
 	}{
 		{"wrong length", "abc", stubJobStopper{}, spawn, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("wrong-length job id = %v, want ErrInvalid", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "wrong-length job id = %v, want ErrInvalid", err)
 		}},
 		{"non-hex", "zzzzzzzz", stubJobStopper{}, spawn, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("non-hex job id = %v, want ErrInvalid", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "non-hex job id = %v, want ErrInvalid", err)
 		}},
 		{"uppercase", "DEADBEEF", stubJobStopper{}, spawn, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("uppercase job id = %v, want ErrInvalid", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "uppercase job id = %v, want ErrInvalid", err)
 		}},
 		{"nil stopper", jobFixtureID, nil, spawn, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "no job stopper configured") {
-				t.Fatalf("nil stopper = %v, want the no-job-stopper rejection", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "no job stopper configured"), "nil stopper = %v, want the no-job-stopper rejection", err)
 		}},
 		{"nil spawn", jobFixtureID, stubJobStopper{}, nil, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("nil spawn = %v, want ErrInvalid", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "nil spawn = %v, want ErrInvalid", err)
 		}},
 	}
 	for _, tc := range cases {
@@ -96,13 +86,9 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 			h := newTestHarness(t, freshSessionStore(t), nil)
 			h.deps.Jobs = tc.jobs
 			err := h.StartJob(context.Background(), testSessionID, tc.jobID, tc.spawn)
-			if err == nil {
-				t.Fatalf("StartJob succeeded, want a rejection")
-			}
+			testassert.Require(t, err != nil, "StartJob succeeded, want a rejection")
 			tc.wantErr(t, err)
-			if len(spawned) != 0 {
-				t.Fatalf("the rejected start spawned %d times", len(spawned))
-			}
+			testassert.Equal(t, len(spawned), 0)
 		})
 	}
 
@@ -115,12 +101,8 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 		h.deps.Jobs = stubJobStopper{}
 		err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn)
 		want := invalidInput("session %q is archived; admission requires an open Session", testSessionID)
-		if err == nil || err.Error() != want.Error() {
-			t.Fatalf("archived start = %v, want %v", err, want)
-		}
-		if len(spawned) != 0 {
-			t.Fatalf("the archived start spawned")
-		}
+		testassert.Require(t, err != nil && err.Error() == want.Error(), "archived start = %v, want %v", err, want)
+		testassert.Equal(t, len(spawned), 0)
 	})
 
 	t.Run("closed group", func(t *testing.T) {
@@ -130,19 +112,15 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 		c.mu.Lock()
 		c.bgState = bgStopping
 		c.mu.Unlock()
-		if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); err == nil ||
-			err.Error() != "harness: invalid storage request: background group is closed or stopping" {
-			t.Fatalf("closed-group start = %v, want the closed-or-stopping rejection", err)
+		{
+			err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn)
+			testassert.Require(t, err != nil && err.Error() == "harness: invalid storage request: background group is closed or stopping", "closed-group start = %v, want the closed-or-stopping rejection", err)
 		}
-		if len(spawned) != 0 {
-			t.Fatalf("the closed-group start spawned")
-		}
+		testassert.Equal(t, len(spawned), 0)
 		c.mu.Lock()
 		hasGroup := c.group != nil
 		c.mu.Unlock()
-		if hasGroup {
-			t.Fatalf("the rejected start created a member")
-		}
+		testassert.Require(t, !hasGroup, "the rejected start created a member")
 	})
 
 	t.Run("canceled harness", func(t *testing.T) {
@@ -153,17 +131,14 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 				return PreparedExecution{}, errors.New("no preparation configured for this test")
 			},
 		})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+		testassert.NoError(t, err)
 		h.deps.Jobs = stubJobStopper{}
 		cancel()
-		if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); !errors.Is(err, context.Canceled) || err.Error() != "context canceled" {
-			t.Fatalf("canceled start = %v, want the raw context.Canceled", err)
+		{
+			err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn)
+			testassert.Require(t, errors.Is(err, context.Canceled) && err.Error() == "context canceled", "canceled start = %v, want the raw context.Canceled", err)
 		}
-		if len(spawned) != 0 {
-			t.Fatalf("the canceled start spawned")
-		}
+		testassert.Equal(t, len(spawned), 0)
 	})
 }
 
@@ -176,24 +151,20 @@ func TestStartJobHandoffLossFinishesMemberOnce(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), nil)
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		c.mu.Lock()
 		c.bgState = bgStopping
 		c.mu.Unlock()
-		if err := h.backgroundHandoffFailure(c, member); err == nil ||
-			err.Error() != "harness: invalid storage request: background group is closed or stopping" {
-			t.Fatalf("handoff loss = %v, want the closed-or-stopping rejection", err)
+		{
+			err := h.backgroundHandoffFailure(c, member)
+			testassert.Require(t, err != nil && err.Error() == "harness: invalid storage request: background group is closed or stopping", "handoff loss = %v, want the closed-or-stopping rejection", err)
 		}
 		h.claimFinishBackgroundMember(c, member.completionID)
 		waitMemberDone(t, member)
 		c.mu.Lock()
 		empty := c.group == nil || len(c.group.members) == 0
 		c.mu.Unlock()
-		if !empty {
-			t.Fatalf("the finished member stayed in the group")
-		}
+		testassert.Require(t, empty, "the finished member stayed in the group")
 		h.claimFinishBackgroundMember(c, member.completionID) // a second ending is a no-op
 	})
 
@@ -205,17 +176,14 @@ func TestStartJobHandoffLossFinishesMemberOnce(t *testing.T) {
 				return PreparedExecution{}, errors.New("no preparation configured for this test")
 			},
 		})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+		testassert.NoError(t, err)
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		cancel() // the Harness closes after the admission, before the handoff
-		if err := h.backgroundHandoffFailure(c, member); !errors.Is(err, context.Canceled) || err.Error() != "context canceled" {
-			t.Fatalf("handoff loss = %v, want the raw context.Canceled", err)
+		{
+			err := h.backgroundHandoffFailure(c, member)
+			testassert.Require(t, errors.Is(err, context.Canceled) && err.Error() == "context canceled", "handoff loss = %v, want the raw context.Canceled", err)
 		}
 	})
 }
@@ -229,21 +197,16 @@ func TestStartJobSpawnFailureFinishesMemberOnce(t *testing.T) {
 	c := leaseCoordinator(t, h, testSessionID)
 	var spawned []string
 	spawn := spawnRecord(&spawned, errors.New("spawn down"))
-	if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); err == nil || err.Error() != "spawn down" {
-		t.Fatalf("spawn failure = %v, want the unchanged spawn error", err)
+	{
+		err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn)
+		testassert.Require(t, err != nil && err.Error() == "spawn down", "spawn failure = %v, want the unchanged spawn error", err)
 	}
-	if len(spawned) != 1 {
-		t.Fatalf("spawn calls = %d, want 1", len(spawned))
-	}
-	if !completionIDShape.MatchString(spawned[0]) {
-		t.Fatalf("spawned completion id %q is not 32 lowercase hex", spawned[0])
-	}
+	testassert.Equal(t, len(spawned), 1)
+	testassert.Require(t, completionIDShape.MatchString(spawned[0]), "spawned completion id %q is not 32 lowercase hex", spawned[0])
 	c.mu.Lock()
 	empty := c.group == nil || len(c.group.members) == 0
 	c.mu.Unlock()
-	if !empty {
-		t.Fatalf("the failed spawn left the member live")
-	}
+	testassert.Require(t, empty, "the failed spawn left the member live")
 }
 
 // TestStartJobDrivesSpawnThroughAdmission proves the success path: StartJob
@@ -255,21 +218,16 @@ func TestStartJobDrivesSpawnThroughAdmission(t *testing.T) {
 	c := leaseCoordinator(t, h, testSessionID)
 	var spawned []string
 	spawn := spawnRecord(&spawned, nil)
-	if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn); err != nil {
-		t.Fatalf("StartJob: %v", err)
+	{
+		err := h.StartJob(context.Background(), testSessionID, jobFixtureID, spawn)
+		testassert.NoError(t, err)
 	}
-	if len(spawned) != 1 {
-		t.Fatalf("spawn calls = %d, want 1", len(spawned))
-	}
-	if !completionIDShape.MatchString(spawned[0]) {
-		t.Fatalf("spawned completion id %q is not 32 lowercase hex", spawned[0])
-	}
+	testassert.Equal(t, len(spawned), 1)
+	testassert.Require(t, completionIDShape.MatchString(spawned[0]), "spawned completion id %q is not 32 lowercase hex", spawned[0])
 	c.mu.Lock()
 	member := c.group.members[spawned[0]]
 	c.mu.Unlock()
-	if member == nil || member.kind != memberJob || member.id != jobFixtureID || member.claimed {
-		t.Fatalf("admitted member = %+v, want the unclaimed job member", member)
-	}
+	testassert.Require(t, member != nil && member.kind == memberJob && member.id == jobFixtureID && !member.claimed, "admitted member = %+v, want the unclaimed job member", member)
 	h.claimFinishBackgroundMember(c, member.completionID) // test hygiene
 	waitMemberDone(t, member)
 }
@@ -295,8 +253,9 @@ func TestLaunchChildSessionRejectsInvalidRequests(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := launchRequest()
 			tc.mut(&req)
-			if _, err := h.LaunchChildSession(context.Background(), req); !errors.Is(err, ErrInvalid) {
-				t.Fatalf("%s = %v, want ErrInvalid", tc.name, err)
+			{
+				_, err := h.LaunchChildSession(context.Background(), req)
+				testassert.Require(t, errors.Is(err, ErrInvalid), "%s = %v, want ErrInvalid", tc.name, err)
 			}
 		})
 	}
@@ -313,19 +272,15 @@ func TestLaunchChildSessionRefusesChildParent(t *testing.T) {
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, (&testGraph{session: childParent}).storage(t), stub.prepare)
 	c := leaseCoordinator(t, h, testSessionID)
-	if _, err := h.LaunchChildSession(context.Background(), launchRequest()); !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "child sessions cannot launch child sessions") {
-		t.Fatalf("child-parent launch = %v, want the refusal", err)
+	{
+		_, err := h.LaunchChildSession(context.Background(), launchRequest())
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "child sessions cannot launch child sessions"), "child-parent launch = %v, want the refusal", err)
 	}
-	if stub.callCount() != 0 {
-		t.Fatalf("the refused launch prepared")
-	}
+	testassert.Equal(t, stub.callCount(), 0)
 	c.mu.Lock()
 	hasGroup := c.group != nil
 	c.mu.Unlock()
-	if hasGroup {
-		t.Fatalf("the refused launch created a member")
-	}
+	testassert.Require(t, !hasGroup, "the refused launch created a member")
 }
 
 // TestLaunchChildSessionArchivedParent proves the archived-parent rejection:
@@ -340,17 +295,14 @@ func TestLaunchChildSessionArchivedParent(t *testing.T) {
 	c := leaseCoordinator(t, h, testSessionID)
 	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	want := invalidInput("session %q is archived; admission requires an open Session", testSessionID)
-	if err == nil || err.Error() != want.Error() {
-		t.Fatalf("archived launch = %v, want %v", err, want)
-	}
+	testassert.Require(t, err != nil && err.Error() == want.Error(), "archived launch = %v, want %v", err, want)
 	c.mu.Lock()
 	hasGroup := c.group != nil
 	c.mu.Unlock()
-	if hasGroup {
-		t.Fatalf("the rejected launch created a member")
-	}
-	if n := durableRegisterCount(fixtureStore(t, h)); n != 1 {
-		t.Fatalf("durable registers = %d, want only the parent session register", n)
+	testassert.Require(t, !hasGroup, "the rejected launch created a member")
+	{
+		n := durableRegisterCount(fixtureStore(t, h))
+		testassert.Equal(t, n, 1)
 	}
 }
 
@@ -358,9 +310,7 @@ func TestLaunchChildSessionArchivedParent(t *testing.T) {
 func fixtureStore(t *testing.T, h *Harness) *graphStorage {
 	t.Helper()
 	store, ok := h.deps.Storage.(*graphStorage)
-	if !ok {
-		t.Fatalf("the fixture harness does not use a graphStorage")
-	}
+	testassert.Require(t, ok, "the fixture harness does not use a graphStorage")
 	return store
 }
 
@@ -386,38 +336,30 @@ func TestLaunchChildSessionCapRejection(t *testing.T) {
 	defer cancel()
 	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, "existing-child", 0)
-	if err != nil {
-		t.Fatalf("pre-admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	req := launchRequest()
 	req.MaxConcurrent = 1
 	_, err = h.LaunchChildSession(context.Background(), req)
 	want := "harness: invalid storage request: background group is full (1/1). Wait for a background member to complete, then retry"
-	if err == nil || err.Error() != want {
-		t.Fatalf("capped launch = %v, want %q", err, want)
-	}
+	testassert.Require(t, err != nil && err.Error() == want, "capped launch = %v, want %q", err, want)
 	c.mu.Lock()
 	members := len(c.group.members)
 	c.mu.Unlock()
-	if members != 1 {
-		t.Fatalf("group holds %d members, want only the pre-admitted one", members)
-	}
-	if n := durableRegisterCount(fixtureStore(t, h)); n != 1 {
-		t.Fatalf("the rejected launch published %d registers, want only the parent", n)
+	testassert.Equal(t, members, 1)
+	{
+		n := durableRegisterCount(fixtureStore(t, h))
+		testassert.Equal(t, n, 1)
 	}
 
 	// Completing the live member frees the cap: the next public launch
 	// succeeds and publishes a fresh child identity.
 	h.finishBackgroundMember(c, member)
 	res, err := h.LaunchChildSession(context.Background(), req)
-	if err != nil {
-		t.Fatalf("post-completion launch: %v", err)
-	}
-	if !completionIDShape.MatchString(res.ChildSessionID) || res.ChildSessionID == testSessionID {
-		t.Fatalf("launched child session id %q, want a fresh generated identity", res.ChildSessionID)
-	}
-	if _, err := fixtureStore(t, h).ReadRegister(context.Background(), RegisterKey{SessionID: res.ChildSessionID, Kind: RegisterSession}); err != nil {
-		t.Fatalf("launched child session register: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, completionIDShape.MatchString(res.ChildSessionID) && res.ChildSessionID != testSessionID, "launched child session id %q, want a fresh generated identity", res.ChildSessionID)
+	{
+		_, err := fixtureStore(t, h).ReadRegister(context.Background(), RegisterKey{SessionID: res.ChildSessionID, Kind: RegisterSession})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -429,8 +371,9 @@ func TestLaunchChildSessionPrepareFailure(t *testing.T) {
 	stub.err = errors.New("prepare down")
 	h := newTestHarness(t, freshSessionStore(t), stub.prepare)
 	c := leaseCoordinator(t, h, testSessionID)
-	if _, err := h.LaunchChildSession(context.Background(), launchRequest()); err == nil || err.Error() != "prepare down" {
-		t.Fatalf("prepare failure = %v, want the unchanged preparation error", err)
+	{
+		_, err := h.LaunchChildSession(context.Background(), launchRequest())
+		testassert.Require(t, err != nil && err.Error() == "prepare down", "prepare failure = %v, want the unchanged preparation error", err)
 	}
 	if stub.callCount() != 1 {
 		t.Fatalf("prepare calls = %d, want 1", stub.callCount())
@@ -438,11 +381,10 @@ func TestLaunchChildSessionPrepareFailure(t *testing.T) {
 	c.mu.Lock()
 	hasGroup := c.group != nil
 	c.mu.Unlock()
-	if hasGroup {
-		t.Fatalf("the failed launch created a member")
-	}
-	if n := durableRegisterCount(fixtureStore(t, h)); n != 1 {
-		t.Fatalf("the failed launch published %d registers, want only the parent", n)
+	testassert.Require(t, !hasGroup, "the failed launch created a member")
+	{
+		n := durableRegisterCount(fixtureStore(t, h))
+		testassert.Equal(t, n, 1)
 	}
 }
 
@@ -457,17 +399,14 @@ func TestLaunchChildSessionPublicationFailure(t *testing.T) {
 	store.txHook = func(string) error { return fmt.Errorf("%w: storage down", ErrStorage) }
 	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	store.txHook = nil
-	if !errors.Is(err, ErrStorage) {
-		t.Fatalf("publication failure = %v, want the storage class", err)
-	}
+	testassert.Require(t, errors.Is(err, ErrStorage), "publication failure = %v, want the storage class", err)
 	c.mu.Lock()
 	empty := c.group == nil || len(c.group.members) == 0
 	c.mu.Unlock()
-	if !empty {
-		t.Fatalf("the failed launch left its member live")
-	}
-	if n := durableRegisterCount(store); n != 1 {
-		t.Fatalf("the failed launch published %d registers, want only the parent", n)
+	testassert.Require(t, empty, "the failed launch left its member live")
+	{
+		n := durableRegisterCount(store)
+		testassert.Equal(t, n, 1)
 	}
 }
 
@@ -510,46 +449,35 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 	t.Run("same-Harness advance returns the conflict on the rematerialized register", func(t *testing.T) {
 		h, store, stub, _ := newDriftHarness(t)
 		err := runLaunch(t, h, stub, func() {
-			if _, err := h.ChangeAgentType(context.Background(), testSessionID, "other"); err != nil {
-				t.Errorf("ChangeAgentType: %v", err)
+			{
+				_, err := h.ChangeAgentType(context.Background(), testSessionID, "other")
+				testassert.Check(t, err == nil, "ChangeAgentType: %v", err)
 			}
 		})
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("drifted launch = %v, want the conflict class", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrConflict), "drifted launch = %v, want the conflict class", err)
 		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if rec.Revision.DurableRevision != 2 || rec.CurrentAgentType != "other" {
-			t.Fatalf("subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision.DurableRevision, rec.CurrentAgentType)
-		}
-		if n := durableRegisterCount(store); n != 1 {
-			t.Fatalf("the drifted launch published %d registers, want only the parent", n)
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.Revision.DurableRevision == 2 && rec.CurrentAgentType == "other", "subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision.DurableRevision, rec.CurrentAgentType)
+		{
+			n := durableRegisterCount(store)
+			testassert.Equal(t, n, 1)
 		}
 	})
 
 	t.Run("storage-side advance returns the conflict without retry", func(t *testing.T) {
 		h, store, stub, c := newDriftHarness(t)
 		err := runLaunch(t, h, stub, func() { advanceSessionRevision(t, store, testSessionID) })
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("drifted launch = %v, want the conflict class", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrConflict), "drifted launch = %v, want the conflict class", err)
 		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if rec.Revision.DurableRevision != 2 {
-			t.Fatalf("subsequent read revision = %d, want the rematerialized 2", rec.Revision.DurableRevision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, rec.Revision.DurableRevision, 2)
 		c.mu.Lock()
 		empty := c.group == nil || len(c.group.members) == 0
 		c.mu.Unlock()
-		if !empty {
-			t.Fatalf("the drifted launch left its member live")
-		}
-		if n := durableRegisterCount(store); n != 1 {
-			t.Fatalf("the drifted launch published %d registers, want only the parent", n)
+		testassert.Require(t, empty, "the drifted launch left its member live")
+		{
+			n := durableRegisterCount(store)
+			testassert.Equal(t, n, 1)
 		}
 	})
 
@@ -557,30 +485,28 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 		h, store, stub, c := newDriftHarness(t)
 		err := runLaunch(t, h, stub, func() {
 			advanceSessionRevision(t, store, testSessionID)
-			if err := store.Transact(context.Background(), func(tx Transaction) error {
-				key := RegisterKey{SessionID: testSessionID, Kind: RegisterSession}
-				reg, err := tx.ReadRegister(key)
-				if err != nil {
+			{
+				err := store.Transact(context.Background(), func(tx Transaction) error {
+					key := RegisterKey{SessionID: testSessionID, Kind: RegisterSession}
+					reg, err := tx.ReadRegister(key)
+					if err != nil {
+						return err
+					}
+					_, err = tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"bogus":true}`))
 					return err
-				}
-				_, err = tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"bogus":true}`))
-				return err
-			}); err != nil {
-				t.Errorf("corrupt register: %v", err)
+				})
+				testassert.Check(t, err == nil, "corrupt register: %v", err)
 			}
 		})
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("failed-rematerialization launch = %v, want the corruption class", err)
-		}
+		testassert.Require(t, errors.As(err, &corrupt), "failed-rematerialization launch = %v, want the corruption class", err)
 		c.mu.Lock()
 		empty := c.group == nil || len(c.group.members) == 0
 		c.mu.Unlock()
-		if !empty {
-			t.Fatalf("the failed launch left its member live")
-		}
-		if n := durableRegisterCount(store); n != 1 {
-			t.Fatalf("the failed launch published %d registers, want only the parent", n)
+		testassert.Require(t, empty, "the failed launch left its member live")
+		{
+			n := durableRegisterCount(store)
+			testassert.Equal(t, n, 1)
 		}
 	})
 }
@@ -604,9 +530,7 @@ func TestLaunchChildSessionSettlesRejectedHandoff(t *testing.T) {
 	}
 	_, err := h.LaunchChildSession(context.Background(), launchRequest())
 	store.txHook = nil
-	if err == nil || err.Error() != "harness: invalid storage request: background group is closed or stopping" {
-		t.Fatalf("rejected launch = %v, want the closed-or-stopping rejection", err)
-	}
+	testassert.Require(t, err != nil && err.Error() == "harness: invalid storage request: background group is closed or stopping", "rejected launch = %v, want the closed-or-stopping rejection", err)
 
 	var childID string
 	for id := range store.registers {
@@ -614,37 +538,32 @@ func TestLaunchChildSessionSettlesRejectedHandoff(t *testing.T) {
 			childID = id
 		}
 	}
-	if childID == "" {
-		t.Fatalf("the committed child register is missing")
-	}
+	testassert.Require(t, childID != "", "the committed child register is missing")
 	rec := settledOperation(t, store, childID, "child-op-1")
-	if rec.State.Status != OperationInterruption {
-		t.Fatalf("child operation settled %q, want interruption", rec.State.Status)
-	}
+	testassert.Equal(t, rec.State.Status, OperationInterruption)
 	childRec, err := h.ReadSessionHeader(context.Background(), childID)
-	if err != nil {
-		t.Fatalf("ReadSessionHeader(child): %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, childRec.CurrentOperationID, "")
+	// input, interruption signal, settlement
+	{
+		n := storedEntryCount(store, childID)
+		testassert.Equal(t, n, 3)
 	}
-	if childRec.CurrentOperationID != "" {
-		t.Fatalf("settled child still runs operation %q", childRec.CurrentOperationID)
+	{
+		n := storedEntryCount(store, testSessionID)
+		testassert.Equal(t, n, 0)
 	}
-	if n := storedEntryCount(store, childID); n != 3 { // input, interruption signal, settlement
-		t.Fatalf("child entries = %d, want input, interruption signal and settlement", n)
-	}
-	if n := storedEntryCount(store, testSessionID); n != 0 {
-		t.Fatalf("parent entries = %d, want no completion delivery", n)
-	}
-	if signals := storedSignals(t, store, testSessionID); len(signals) != 0 {
-		t.Fatalf("the rejected launch delivered %+v, want no completion", signals)
+	{
+		signals := storedSignals(t, store, testSessionID)
+		testassert.Require(t, len(signals) == 0, "the rejected launch delivered %+v, want no completion", signals)
 	}
 	c.mu.Lock()
 	empty := c.group == nil || len(c.group.members) == 0
 	c.mu.Unlock()
-	if !empty {
-		t.Fatalf("the rejected launch left its member live")
-	}
-	if n := len(script.seen()); n != 0 {
-		t.Fatalf("the child execution ran %d model attempts, want none", n)
+	testassert.Require(t, empty, "the rejected launch left its member live")
+	{
+		n := len(script.seen())
+		testassert.Equal(t, n, 0)
 	}
 }
 
@@ -662,41 +581,32 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 				childID = id
 			}
 		}
-		if childID == "" {
-			t.Fatalf("the committed child register is missing")
-		}
-		if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status != OperationRunning {
-			t.Fatalf("child operation status = %q, want running for recovery", rec.State.Status)
+		testassert.Require(t, childID != "", "the committed child register is missing")
+		{
+			rec := settledOperation(t, store, childID, "child-op-1")
+			testassert.Equal(t, rec.State.Status, OperationRunning)
 		}
 		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: childID, Kind: RegisterSession})
-		if err != nil {
-			t.Fatalf("read child register: %v", err)
-		}
+		testassert.NoError(t, err)
 		childRec, err := decodeSessionRegister(reg)
-		if err != nil {
-			t.Fatalf("decode child register: %v", err)
-		}
-		if childRec.State.CurrentOperationID != "child-op-1" {
-			t.Fatalf("child current operation = %q, want the running launch operation", childRec.State.CurrentOperationID)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, childRec.State.CurrentOperationID, "child-op-1")
 		c.mu.Lock()
 		empty := c.group == nil || len(c.group.members) == 0
 		c.mu.Unlock()
-		if !empty {
-			t.Fatalf("the failed start left its member live")
+		testassert.Require(t, empty, "the failed start left its member live")
+		{
+			n := storedEntryCount(store, testSessionID)
+			testassert.Equal(t, n, 0)
 		}
-		if n := storedEntryCount(store, testSessionID); n != 0 {
-			t.Fatalf("parent entries = %d, want no delivery", n)
-		}
-		if n := len(script.seen()); n != 0 {
-			t.Fatalf("the child execution ran %d model attempts, want none", n)
+		{
+			n := len(script.seen())
+			testassert.Equal(t, n, 0)
 		}
 		h.mu.Lock()
 		latched := h.storageFailure != nil
 		h.mu.Unlock()
-		if !latched {
-			t.Fatalf("the storage-class start failure was not latched")
-		}
+		testassert.Require(t, latched, "the storage-class start failure was not latched")
 	}
 
 	t.Run("child materialization failure", func(t *testing.T) {
@@ -710,9 +620,7 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 		store.registersErr = fmt.Errorf("%w: storage down", ErrStorage) // the child materialization read fails
 		_, err := h.LaunchChildSession(context.Background(), launchRequest())
 		store.registersErr = nil
-		if !errors.Is(err, ErrStorage) {
-			t.Fatalf("materialization failure = %v, want the storage class", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage), "materialization failure = %v, want the storage class", err)
 		assertRecoveryState(t, h, store, c, script)
 	})
 
@@ -744,9 +652,7 @@ func TestLaunchChildSessionStartFailureLeavesChildForRecovery(t *testing.T) {
 		}
 		_, err := h.LaunchChildSession(context.Background(), launchRequest())
 		store.txHook = nil
-		if !errors.Is(err, ErrStorage) {
-			t.Fatalf("settlement failure = %v, want the storage class", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage), "settlement failure = %v, want the storage class", err)
 		assertRecoveryState(t, h, store, c, script)
 	})
 }
@@ -765,57 +671,26 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	c := leaseCoordinator(t, h, testSessionID)
 
 	res, err := h.LaunchChildSession(context.Background(), launchRequest())
-	if err != nil {
-		t.Fatalf("LaunchChildSession: %v", err)
-	}
-	if !completionIDShape.MatchString(res.ChildSessionID) || res.ChildSessionID == testSessionID {
-		t.Fatalf("child id = %q, want a fresh 32-hex identity", res.ChildSessionID)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, completionIDShape.MatchString(res.ChildSessionID) && res.ChildSessionID != testSessionID, "child id = %q, want a fresh 32-hex identity", res.ChildSessionID)
 
 	call := stub.lastCall()
-	if call.req.RequestKind != RequestKindMessage {
-		t.Fatalf("prepare request kind = %q, want %q", call.req.RequestKind, RequestKindMessage)
-	}
+	testassert.Equal(t, call.req.RequestKind, RequestKindMessage)
 	ident := call.req.Session.Identity
-	if ident.SessionID != res.ChildSessionID || ident.ParentSessionID != testSessionID ||
-		ident.Workspace != "/tmp/works" || ident.CreatedAt.IsZero() ||
-		ident.SourceSessionID != "" || ident.SourceBoundaryEntryID != "" {
-		t.Fatalf("prepared identity = %+v, want the complete child lineage", ident)
-	}
-	if call.req.Session.AgentType != "child-agent" {
-		t.Fatalf("prepared agent type = %q, want child-agent", call.req.Session.AgentType)
-	}
+	testassert.Require(t, ident.SessionID == res.ChildSessionID && ident.ParentSessionID == testSessionID && ident.Workspace == "/tmp/works" && !ident.CreatedAt.IsZero() && ident.SourceSessionID == "" && ident.SourceBoundaryEntryID == "", "prepared identity = %+v, want the complete child lineage", ident)
+	testassert.Equal(t, call.req.Session.AgentType, "child-agent")
 
 	childRec, err := h.ReadSessionHeader(context.Background(), res.ChildSessionID)
-	if err != nil {
-		t.Fatalf("ReadSessionHeader(child): %v", err)
-	}
-	if childRec.Identity.ParentSessionID != testSessionID || childRec.Identity.Workspace != "/tmp/works" ||
-		!childRec.Identity.CreatedAt.Equal(ident.CreatedAt) || childRec.Identity.SourceSessionID != "" {
-		t.Fatalf("durable child identity = %+v, want the prepared identity", childRec.Identity)
-	}
-	if childRec.Lifecycle != LifecycleOpen || childRec.CurrentAgentType != "child-agent" ||
-		childRec.CurrentOperationID != "child-op-1" || childRec.ArchivedAt != nil {
-		t.Fatalf("durable child state = %+v, want the initial launch state", childRec)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, childRec.Identity.ParentSessionID == testSessionID && childRec.Identity.Workspace == "/tmp/works" && childRec.Identity.CreatedAt.Equal(ident.CreatedAt) && childRec.Identity.SourceSessionID == "" && (childRec.Lifecycle == LifecycleOpen && childRec.CurrentAgentType == "child-agent" && childRec.CurrentOperationID == "child-op-1" && childRec.ArchivedAt == nil), "durable child identity = %+v, want the prepared identity; durable child state = %+v, want the initial launch state", childRec.Identity, childRec)
 	op := settledOperation(t, store, res.ChildSessionID, "child-op-1")
-	if op.State.Status != OperationRunning || op.Admission.RequestKind != RequestKindMessage ||
-		op.Admission.AgentType != "child-agent" {
-		t.Fatalf("durable child operation = %+v, want the running plugin admission", op)
-	}
+	testassert.Require(t, op.State.Status == OperationRunning && op.Admission.RequestKind == RequestKindMessage && op.Admission.AgentType == "child-agent", "durable child operation = %+v, want the running plugin admission", op)
 	capture := op.Admission.Execution
 	want := testCapture()
-	if !reflect.DeepEqual(capture, want) {
-		t.Fatalf("durable child capture = %+v, want the sentinel capture %+v", capture, want)
-	}
+	testassert.Require(t, reflect.DeepEqual(capture, want), "durable child capture = %+v, want the sentinel capture %+v", capture, want)
 	graph, err := validateFixture(t, store, res.ChildSessionID)
-	if err != nil {
-		t.Fatalf("child graph: %v", err)
-	}
-	if len(graph.Entries) != 1 || graph.Entries[0].Input == nil ||
-		graph.Entries[0].Input.Origin != InputOriginPlugin || graph.Entries[0].Input.Content[0].Text != "child task" {
-		t.Fatalf("child entries = %+v, want the plugin-origin input", graph.Entries)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(graph.Entries) == 1 && graph.Entries[0].Input != nil && graph.Entries[0].Input.Origin == InputOriginPlugin && graph.Entries[0].Input.Content[0].Text == "child task", "child entries = %+v, want the plugin-origin input", graph.Entries)
 
 	c.mu.Lock()
 	members := len(c.group.members)
@@ -824,16 +699,12 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 		member = m
 	}
 	c.mu.Unlock()
-	if members != 1 || member == nil || member.kind != memberChild || member.id != res.ChildSessionID || member.claimed {
-		t.Fatalf("parent members = %d (%+v), want the unclaimed child member", members, member)
-	}
+	testassert.Require(t, members == 1 && member != nil && member.kind == memberChild && member.id == res.ChildSessionID && !member.claimed, "parent members = %d (%+v), want the unclaimed child member", members, member)
 	child := cachedCoordinator(t, h, res.ChildSessionID)
 	child.mu.Lock()
 	pending := child.pendingCompletion
 	child.mu.Unlock()
-	if pending == nil || pending.completionID != member.completionID || pending.outputLimit != 1024 {
-		t.Fatalf("child pending completion = %+v, want the launch info under the reserved identity", pending)
-	}
+	testassert.Require(t, pending != nil && pending.completionID == member.completionID && pending.outputLimit == 1024, "child pending completion = %+v, want the launch info under the reserved identity", pending)
 
 	select {
 	case <-script.arrived: // the child execution started and parked at its model boundary
@@ -844,9 +715,7 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	child.mu.Lock()
 	run := child.run
 	child.mu.Unlock()
-	if run == nil {
-		t.Fatalf("the child execution is not installed")
-	}
+	testassert.Require(t, run != nil, "the child execution is not installed")
 	script.releaseGate() // let the child run converge before the harness cancels
 	cancel()
 	select {

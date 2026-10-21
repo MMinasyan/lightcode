@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -75,9 +76,7 @@ func projectionFollowUp(entryID, operationID, text, settlementID string, sequenc
 func projectionMessages(t *testing.T, h *Harness, c *coordinator) []model.Message {
 	t.Helper()
 	msgs, err := h.contextSource(c, testOpID)(context.Background())
-	if err != nil {
-		t.Fatalf("context source: %v", err)
-	}
+	testassert.NoError(t, err)
 	return msgs
 }
 
@@ -90,9 +89,7 @@ func wantSummaryMessage(t *testing.T, compaction compactionEntry) model.Message 
 		Source:  compaction.Model,
 		Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
 	})
-	if err != nil {
-		t.Fatalf("summary message: %v", err)
-	}
+	testassert.NoError(t, err)
 	return msg
 }
 
@@ -101,9 +98,7 @@ func wantSummaryMessage(t *testing.T, compaction compactionEntry) model.Message 
 // the complete assertion, including the absence of any second summary.
 func assertProjectionEqual(t *testing.T, got, want []model.Message) {
 	t.Helper()
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("projected messages = %+v, want %+v", got, want)
-	}
+	testassert.Require(t, reflect.DeepEqual(got, want), "projected messages = %+v, want %+v", got, want)
 }
 
 // TestContextSourceSummarizedProjection proves the summarized projection: with
@@ -246,9 +241,7 @@ func mustSystemMessage(t *testing.T, text string) model.Message {
 		Role:    model.RoleSystem,
 		Content: []model.ContentPart{{Kind: model.PartText, Text: text}},
 	})
-	if err != nil {
-		t.Fatalf("system message: %v", err)
-	}
+	testassert.NoError(t, err)
 	return msg
 }
 
@@ -259,9 +252,7 @@ func mustInputMessage(t *testing.T, text string) model.Message {
 		Role:    model.RoleUser,
 		Content: []model.ContentPart{{Kind: model.PartText, Text: text}},
 	})
-	if err != nil {
-		t.Fatalf("input message: %v", err)
-	}
+	testassert.NoError(t, err)
 	return msg
 }
 
@@ -273,8 +264,6 @@ func mustAssistantMessage(t *testing.T, text string) model.Message {
 		Source:  testModelRef(),
 		Content: []model.ContentPart{{Kind: model.PartText, Text: text}},
 	})
-	if err != nil {
-		t.Fatalf("assistant message: %v", err)
-	}
+	testassert.NoError(t, err)
 	return msg
 }

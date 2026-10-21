@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -45,19 +46,13 @@ func TestValidateSettlement(t *testing.T) { // nothing more to do on this very f
 	foreignCompleted := mkForeignSettlementOutput(model.OutputCompleted, "", foreignSrc)
 
 	bare, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom"}) // errored shape with no message at all: nothing model-visible was retained.
-	if ferr != nil {
-		t.Fatalf("fixture: %v", ferr)
-	}
+	testassert.NoError(t, ferr)
 	refusalMsg := &model.Message{Role: model.RoleAssistant, Source: testRef, Refusal: "declined"}
 	refusalErrored, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom", Message: refusalMsg})
-	if ferr != nil {
-		t.Fatalf("fixture: %v", ferr)
-	}
+	testassert.NoError(t, ferr)
 	extraMsg := &model.Message{Role: model.RoleAssistant, Source: testRef, Extra: model.Extra{"k": json.RawMessage(`1`)}}
 	extraErrored, ferr := model.NewOutput(model.Output{Status: model.OutputErrored, Source: testRef, Detail: "boom", Message: extraMsg})
-	if ferr != nil {
-		t.Fatalf("fixture: %v", ferr)
-	}
+	testassert.NoError(t, ferr)
 
 	cases := []struct {
 		name    string
@@ -125,50 +120,34 @@ func TestValidateModelSettlement(t *testing.T) {
 	})
 
 	t.Run("invalid-settlement-same-violation", func(t *testing.T) {
-		if _, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady}); !isBoundaryViolation(err, "model") {
-			t.Fatalf("missing ready output = %v, want the model-boundary violation", err)
+		{
+			_, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady})
+			testassert.Require(t, isBoundaryViolation(err, "model"), "missing ready output = %v, want the model-boundary violation", err)
 		}
 	})
 
 	t.Run("owned-copy-on-success", func(t *testing.T) {
 		in := mkSettlementOutput(model.OutputCompleted, "")
 		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady, Output: in})
-		if err != nil {
-			t.Fatalf("valid settlement rejected: %v", err)
-		}
-		if got.Disposition != DispoReady || got.Detail != "" {
-			t.Fatalf("owned settlement = %#v, want disposition and detail copied as plain values", got)
-		}
-		if got.Output == nil || got.Output == in {
-			t.Fatalf("owned output must be a distinct pointer, got %p", got.Output)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Disposition == DispoReady && got.Detail == "" && (got.Output != nil && got.Output != in), "owned settlement = %#v, want disposition and detail copied as plain values; owned output must be a distinct pointer, got %p", got, got.Output)
 		in.Message.Content[0].Text = "input-side" // mutate the input after validation...
-		if got.Output.Message.Content[0].Text != "x" {
-			t.Fatalf("owned copy aliased the input message: %q", got.Output.Message.Content[0].Text)
-		}
+		testassert.Equal(t, got.Output.Message.Content[0].Text, "x")
 		got.Output.Message.Content[0].Text = "owned-side" // ...then the owned side; neither may reach the other.
-		if in.Message.Content[0].Text != "input-side" {
-			t.Fatalf("input aliased the owned copy: %q", in.Message.Content[0].Text)
-		}
+		testassert.Equal(t, in.Message.Content[0].Text, "input-side")
 		in.Status = model.OutputErrored
-		if got.Output.Status != model.OutputCompleted {
-			t.Fatalf("owned copy aliased the input status: %s", got.Output.Status)
-		}
+		testassert.Equal(t, got.Output.Status, model.OutputCompleted)
 	})
 
 	t.Run("outputless-owned", func(t *testing.T) {
 		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoFailure, Detail: "d"})
-		if err != nil || got.Disposition != DispoFailure || got.Detail != "d" || got.Output != nil {
-			t.Fatalf("got %#v, %v; want the settlement copied with nil output retained", got, err)
-		}
+		testassert.Require(t, err == nil && got.Disposition == DispoFailure && got.Detail == "d" && got.Output == nil, "got %#v, %v; want the settlement copied with nil output retained", got, err)
 	})
 
 	t.Run("owned-copy-nested-fields", func(t *testing.T) {
 		in := mkNestedSettlementOutput()
 		got, err := ValidateModelSettlement(testRef, ModelSettlement{Disposition: DispoReady, Output: in})
-		if err != nil {
-			t.Fatalf("valid settlement rejected: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Input-side mutations after validation never reach the owned copy:
 		// nested tool-call argument bytes, every Extra map, and usage.
@@ -177,18 +156,9 @@ func TestValidateModelSettlement(t *testing.T) {
 		in.Message.Content[0].Extra["p"] = json.RawMessage(`"in"`)
 		in.Message.Extra["m"] = json.RawMessage(`"in"`)
 		in.Usage.InputTokens = 99
-		if string(got.Output.Message.ToolCalls[0].Arguments) != `{"x":1}` {
-			t.Fatalf("owned copy aliased the input arguments: %q", got.Output.Message.ToolCalls[0].Arguments)
-		}
-		if string(got.Output.Message.ToolCalls[0].Extra["c"]) != `3` ||
-			string(got.Output.Message.Content[0].Extra["p"]) != `1` ||
-			string(got.Output.Message.Extra["m"]) != `2` {
-			t.Fatalf("owned copy aliased an input Extra map: call=%s part=%s message=%s",
-				got.Output.Message.ToolCalls[0].Extra["c"], got.Output.Message.Content[0].Extra["p"], got.Output.Message.Extra["m"])
-		}
-		if got.Output.Usage.InputTokens != 3 {
-			t.Fatalf("owned copy aliased the input usage: %+v", got.Output.Usage)
-		}
+		testassert.Require(t, string(got.Output.Message.ToolCalls[0].Arguments) == `{"x":1}`, "owned copy aliased the input arguments: %q", got.Output.Message.ToolCalls[0].Arguments)
+		testassert.Require(t, string(got.Output.Message.ToolCalls[0].Extra["c"]) == `3` && string(got.Output.Message.Content[0].Extra["p"]) == `1` && string(got.Output.Message.Extra["m"]) == `2`, "owned copy aliased an input Extra map: call=%s part=%s message=%s", got.Output.Message.ToolCalls[0].Extra["c"], got.Output.Message.Content[0].Extra["p"], got.Output.Message.Extra["m"])
+		testassert.Require(t, got.Output.Usage.InputTokens == 3, "owned copy aliased the input usage: %+v", got.Output.Usage)
 
 		// Owned-side mutations never reach the input either: the input keeps
 		// exactly its own post-mutation values from the block above.
@@ -197,18 +167,9 @@ func TestValidateModelSettlement(t *testing.T) {
 		got.Output.Message.Content[0].Extra["p"] = json.RawMessage(`"owned"`)
 		got.Output.Message.Extra["m"] = json.RawMessage(`"owned"`)
 		got.Output.Usage.InputTokens = 1
-		if string(in.Message.ToolCalls[0].Arguments) != `z"x":1}` {
-			t.Fatalf("input arguments aliased the owned copy: %q", in.Message.ToolCalls[0].Arguments)
-		}
-		if string(in.Message.ToolCalls[0].Extra["c"]) != `"in"` ||
-			string(in.Message.Content[0].Extra["p"]) != `"in"` ||
-			string(in.Message.Extra["m"]) != `"in"` {
-			t.Fatalf("input Extra maps aliased the owned copy: call=%s part=%s message=%s",
-				in.Message.ToolCalls[0].Extra["c"], in.Message.Content[0].Extra["p"], in.Message.Extra["m"])
-		}
-		if in.Usage.InputTokens != 99 {
-			t.Fatalf("input usage aliased the owned copy: %+v", in.Usage)
-		}
+		testassert.Require(t, string(in.Message.ToolCalls[0].Arguments) == `z"x":1}`, "input arguments aliased the owned copy: %q", in.Message.ToolCalls[0].Arguments)
+		testassert.Require(t, string(in.Message.ToolCalls[0].Extra["c"]) == `"in"` && string(in.Message.Content[0].Extra["p"]) == `"in"` && string(in.Message.Extra["m"]) == `"in"`, "input Extra maps aliased the owned copy: call=%s part=%s message=%s", in.Message.ToolCalls[0].Extra["c"], in.Message.Content[0].Extra["p"], in.Message.Extra["m"])
+		testassert.Require(t, in.Usage.InputTokens == 99, "input usage aliased the owned copy: %+v", in.Usage)
 	})
 
 	t.Run("one-copy-per-validation", func(t *testing.T) {
@@ -220,9 +181,7 @@ func TestValidateModelSettlement(t *testing.T) {
 		one := testing.AllocsPerRun(200, func() {
 			_, _ = ValidateModelSettlement(testRef, set)
 		})
-		if one >= two {
-			t.Fatalf("public validator allocated %v times, not fewer than the removed two-copy shape's %v", one, two)
-		}
+		testassert.Require(t, one < two, "public validator allocated %v times, not fewer than the removed two-copy shape's %v", one, two)
 	})
 }
 

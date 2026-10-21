@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestWireSystemRoleMapping pins rule 7: canonical system messages encode with the resolved wire role exactly; every other canonical role is unchanged no matter what that value is. Empty resolves to "system"; any non-empty value outside {system, user, developer} rejects encoding before producing a body (ErrInvalidWireSystemRole).
@@ -28,21 +30,22 @@ func TestWireSystemRoleMapping(t *testing.T) {
 
 			req := Request{Messages: []Message{sys, userText("hello"), mustMsg(t, Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "hi"}}})}}
 			body, _, err := Encode(rt, req, nil)
-			if err != nil {
-				t.Fatalf("Encode returned unexpected error for wire role %q: %v", tc.role, err)
-			}
+			testassert.Require(t, err == nil, "Encode returned unexpected error for wire role %q: %v", tc.role, err)
 
 			msgs := decodeMessages(t, body)
-			if raw, ok := wireString(t, msgs[0], "role"); !ok || raw != tc.want {
-				t.Fatalf("system wire role = %q, want %q", msgs[0]["role"], tc.want)
+			{
+				raw, ok := wireString(t, msgs[0], "role")
+				testassert.Require(t, ok && raw == tc.want, "system wire role = %q, want %q", msgs[0]["role"], tc.want)
 			}
 
-			if raw, ok := wireString(t, msgs[1], "role"); !ok || raw != "user" {
-				t.Fatalf("user wire role = %q, want unchanged user", msgs[1]["role"])
+			{
+				raw, ok := wireString(t, msgs[1], "role")
+				testassert.Require(t, ok && raw == "user", "user wire role = %q, want unchanged user", msgs[1]["role"])
 			}
 
-			if raw, ok := wireString(t, msgs[2], "role"); !ok || raw != "assistant" {
-				t.Fatalf("assistant wire role = %q, want unchanged assistant", msgs[2]["role"])
+			{
+				raw, ok := wireString(t, msgs[2], "role")
+				testassert.Require(t, ok && raw == "assistant", "assistant wire role = %q, want unchanged assistant", msgs[2]["role"])
 			}
 		})
 	}
@@ -52,12 +55,7 @@ func TestWireSystemRoleMapping(t *testing.T) {
 			rt := testResolved()
 			rt.WireSystemRole = bad
 			_, _, err := Encode(rt, Request{Messages: []Message{sys}}, nil)
-			if err == nil {
-				t.Fatalf("Encode accepted invalid wire role %q", bad)
-			}
-			if !errors.Is(err, ErrInvalidWireSystemRole) {
-				t.Fatalf("error %v does not wrap ErrInvalidWireSystemRole", err)
-			}
+			testassert.Require(t, err != nil && errors.Is(err, ErrInvalidWireSystemRole), "Encode accepted invalid wire role %q; error %v does not wrap ErrInvalidWireSystemRole", bad, err)
 		}
 	})
 }
@@ -68,9 +66,7 @@ func TestProtocolWarningsOrderAndSuppression(t *testing.T) {
 	rt.MustPreserve = []string{"preserve_a", "preserve_b"}
 	mkAssistant := func(source ModelRef, extraKeys ...string) Message {
 		call, err := NewToolCall(ToolCall{ID: "c-warn", Name: "lookup", Arguments: json.RawMessage(`{}`)}) // completed-call boundary clones argument bytes like production paths do.
-		if err != nil {
-			t.Fatalf("NewToolCall(warning fixture call): %v", err)
-		}
+		testassert.NoError(t, err)
 		msg := Message{Role: RoleAssistant, Source: source, Content: []ContentPart{{Kind: PartText, Text: "x"}}, ToolCalls: []ToolCall{call}} // assistant carries a completed tool call so rule 12's must-preserve branch applies to this fixture.
 		if len(extraKeys) > 0 {                                                                                                               // fresh Message has no Extra map; writing into an absent one panics and NewMessage does not pre-allocate it here.
 			msg.Extra = Extra{}
@@ -91,22 +87,14 @@ func TestProtocolWarningsOrderAndSuppression(t *testing.T) {
 		mkAssistant(foreignModel, "preserve_a", "preserve_b")}
 
 	req, err := NewRequest(Request{Messages: msgs})
-	if err != nil {
-		t.Fatalf("NewRequest(warning fixtures): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	body, warnings, err := Encode(rt, req, nil)
-	if err != nil {
-		t.Fatalf("Encode returned unexpected error: %v", err)
-	}
+	testassert.NoError(t, err)
 
-	if body == nil {
-		t.Fatalf("Encode returned nil body on success path (warnings=%d)", len(warnings))
-	}
+	testassert.Require(t, body != nil, "Encode returned nil body on success path (warnings=%d)", len(warnings))
 
-	if len(warnings) != 3 {
-		t.Fatalf("got %d warnings, want exactly 3: %#v", len(warnings), warnings)
-	}
+	testassert.Require(t, len(warnings) == 3, "got %d warnings, want exactly 3: %#v", len(warnings), warnings)
 
 	type expectedWarning struct {
 		field string
@@ -117,37 +105,23 @@ func TestProtocolWarningsOrderAndSuppression(t *testing.T) {
 		{field: "preserve_b", idx: 0}, {field: "preserve_a", idx: 1}, {field: "preserve_b", idx: 1}}
 
 	for i, w := range warnings {
-		if w.Kind != WarningMustPreserveMissing {
-			t.Fatalf("warnings[%d].Kind = %q, want %q", i, w.Kind, WarningMustPreserveMissing)
-		}
+		testassert.Require(t, w.Kind == WarningMustPreserveMissing, "warnings[%d].Kind = %q, want %q", i, w.Kind, WarningMustPreserveMissing)
 
 		if w.Target != rt.Model {
 			t.Fatalf("warnings[%d].Target = %s, want %s", i, w.Target.String(), rt.Model.String())
 		}
 
-		if w.Field != want[i].field || w.MessageIndex != want[i].idx {
-			t.Fatalf("warnings[%d] = {field:%q idx:%d}, want {field:%q idx:%d}", i, w.Field, w.MessageIndex, want[i].field, want[i].idx)
-		}
-
-		if w.MessageIndex < 0 {
-			t.Fatalf("warnings[%d].MessageIndex negative: %d", i, w.MessageIndex)
-		}
+		testassert.Require(t, w.Field == want[i].field && w.MessageIndex == want[i].idx && w.MessageIndex >= 0, "warnings[%d] = {field:%q idx:%d}, want {field:%q idx:%d}; warnings[%d].MessageIndex negative: %d", i, w.Field, w.MessageIndex, want[i].field, want[i].idx, i, w.MessageIndex)
 	}
 
 	t.Run("no-warnings-when-mustpreserve-unset", func(t *testing.T) {
 		rt2 := testResolved()
 		reqNoWarnings, err := NewRequest(Request{Messages: []Message{mkAssistant(targetRef)}})
-		if err != nil {
-			t.Fatalf("NewRequest(no-warning fixture): %v", err)
-		}
+		testassert.NoError(t, err)
 
 		_, warnings2, err := Encode(rt2, reqNoWarnings, nil)
-		if err != nil {
-			t.Fatalf("Encode returned unexpected error: %v", err)
-		}
+		testassert.NoError(t, err)
 
-		if len(warnings2) != 0 {
-			t.Fatalf("got %d warnings with unset must-preserve list, want 0: %#v", len(warnings2), warnings2)
-		}
+		testassert.Require(t, len(warnings2) == 0, "got %d warnings with unset must-preserve list, want 0: %#v", len(warnings2), warnings2)
 	})
 }

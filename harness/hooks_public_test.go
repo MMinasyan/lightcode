@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -83,44 +84,39 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 			}, nil
 		}
 		session := createSession(t, f.h)
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the published call's turn
 		<-script.arrived // the completing turn
 		// A queued submit proves op-1's terminal committed: the drain admits
 		// it only after the terminal settlement.
-		if _, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1"); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-2", harness.MessageModeQueued, "queued-1")
+			testassert.NoError(t, err)
 		}
 		<-f.prepare // the drain admitted op-2: op-1's terminal success committed
 		<-script.arrived
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 
 		mu.Lock()
 		seen := append([]string{}, hookSeen...)
 		toolInput := append([]string{}, prepared...)
 		mu.Unlock()
-		if len(seen) != 2 || seen[0] != `{"x":1}` || seen[1] != `{"x":"\u003c"}` {
-			t.Fatalf("hook chain received %q, want the producer's committed normalization then the first hook's committed replacement", seen)
-		}
-		if len(toolInput) != 1 || toolInput[0] != `{"y":"\u0026\u003e"}` {
-			t.Fatalf("concrete tool received %q, want the final committed replacement bytes", toolInput)
-		}
+		testassert.Require(t, len(seen) == 2 && seen[0] == `{"x":1}` && seen[1] == `{"x":"\u003c"}`, "hook chain received %q, want the producer's committed normalization then the first hook's committed replacement", seen)
+		testassert.Require(t, len(toolInput) == 1 && toolInput[0] == `{"y":"\u0026\u003e"}`, "concrete tool received %q, want the final committed replacement bytes", toolInput)
 
 		rec, err := f.h.ReadOperation(ctx, session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationSuccess || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
-			t.Fatalf("hook turn = %+v err %v, want terminal success with every effect settled", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 0, "hook turn = %+v err %v, want terminal success with every effect settled", rec, err)
 
 		// The committed evidence: one success hook_result per hook, in
 		// configured order, carrying the durable replacement bytes.
 		entries, err := store.ReadEntries(ctx, session, 0)
-		if err != nil {
-			t.Fatalf("read entries: %v", err)
-		}
+		testassert.NoError(t, err)
 		type hookWire struct {
 			HookID     string          `json:"hook_id"`
 			ToolCallID string          `json:"tool_call_id"`
@@ -134,44 +130,37 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 				continue
 			}
 			var wire hookWire
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode hook result: %v", err)
+			{
+				err := json.Unmarshal(entry.Payload, &wire)
+				testassert.NoError(t, err)
 			}
 			hookResults = append(hookResults, wire)
 		}
-		if len(hookResults) != 2 ||
-			hookResults[0].HookID != "cap.hook.one" || hookResults[0].Status != "success" || string(hookResults[0].Arguments) != `{"x":"\u003c"}` ||
-			hookResults[1].HookID != "cap.hook.two" || hookResults[1].Status != "success" || string(hookResults[1].Arguments) != `{"y":"\u0026\u003e"}` {
-			t.Fatalf("committed hook results = %+v, want one success per hook with the durable bytes", hookResults)
-		}
+		testassert.Require(t, len(hookResults) == 2 && hookResults[0].HookID == "cap.hook.one" && hookResults[0].Status == "success" && string(hookResults[0].Arguments) == `{"x":"\u003c"}` && hookResults[1].HookID == "cap.hook.two" && hookResults[1].Status == "success" && string(hookResults[1].Arguments) == `{"y":"\u0026\u003e"}`, "committed hook results = %+v, want one success per hook with the durable bytes", hookResults)
 
 		// The evidence never projects as conversation: the completing turn's
 		// projection carries the call result, not the hook replacements.
 		projection := texts(script.seen()[1])
 		for _, text := range projection {
-			if text == `{"y":"\u0026\u003e"}` {
-				t.Fatalf("hook evidence projected as conversation content")
-			}
+			testassert.Require(t, text != `{"y":"\u0026\u003e"}`, "hook evidence projected as conversation content")
 		}
 
 		// A restart revalidates the Session and Operation without any plugin:
 		// the closed decoder interprets the hook evidence itself.
-		if err := harness.Recover(ctx, store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		{
+			err := harness.Recover(ctx, store)
+			testassert.NoError(t, err)
 		}
 		restarted, err := harness.New(ctx, harness.Dependencies{Storage: store, Prepare: func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
 			return harness.PreparedExecution{}, errors.New("no preparation after restart")
 		}})
-		if err != nil {
-			t.Fatalf("restarted Harness: %v", err)
-		}
-		if _, err := restarted.ReadSessionHeader(ctx, session); err != nil {
-			t.Fatalf("restarted ReadSession: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := restarted.ReadSessionHeader(ctx, session)
+			testassert.NoError(t, err)
 		}
 		rec, err = restarted.ReadOperation(ctx, session, "op-1")
-		if err != nil || rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("restarted ReadOperation = %+v err %v, want the revalidated settled Operation", rec, err)
-		}
+		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess, "restarted ReadOperation = %+v err %v, want the revalidated settled Operation", rec, err)
 
 		// A Fork copies no hook effect: the fork boundary is op-2's input, so
 		// the copied prefix actually contains op-1's committed hook evidence —
@@ -182,13 +171,12 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
 		res, err := f2.h.Fork(ctx, harness.ForkRequest{SourceSessionID: session, BoundaryEntryID: boundary.ID, OperationID: "fork-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork input"}}})
-		if err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		<-forkScript.arrived
 		forkScript.releaseGate()
-		if err := converge(t, f2); err != nil {
-			t.Fatalf("fork Wait: %v", err)
+		{
+			err := converge(t, f2)
+			testassert.NoError(t, err)
 		}
 		assertForkSourceUnchanged(t, store, session, before)
 		var sourceHooks int
@@ -197,17 +185,11 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 				sourceHooks++
 			}
 		}
-		if sourceHooks != 2 {
-			t.Fatalf("source prefix hook evidence = %d entries, want the two committed hook results before the boundary", sourceHooks)
-		}
+		testassert.Equal(t, sourceHooks, 2)
 		copied, err := store.ReadEntries(ctx, res.Session.Identity.SessionID, 0)
-		if err != nil {
-			t.Fatalf("read fork entries: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range copied {
-			if entry.Kind == harness.EntryHookResult {
-				t.Fatalf("fork copied a hook effect: entry %s", entry.ID)
-			}
+			testassert.Require(t, entry.Kind != harness.EntryHookResult, "fork copied a hook effect: entry %s", entry.ID)
 		}
 	})
 }

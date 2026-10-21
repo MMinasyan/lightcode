@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The capture-availability contract regressions: the surviving reads must
@@ -44,14 +46,14 @@ const captureBarrierWait = 5 * time.Second
 func corruptRegisterLifecyclePayload(t *testing.T, regPayload json.RawMessage) json.RawMessage {
 	t.Helper()
 	state, err := decodePayloadObject(mustState(t, regPayload))
-	mustEncode(t, err)
+	testassert.NoError(t, err)
 	state["lifecycle"] = json.RawMessage(`"stopping"`)
 	patchedState, err := json.Marshal(state)
-	mustEncode(t, err)
+	testassert.NoError(t, err)
 	obj := wireObject(t, regPayload)
 	obj["state"] = patchedState
 	patched, err := json.Marshal(obj)
-	mustEncode(t, err)
+	testassert.NoError(t, err)
 	return patched
 }
 
@@ -69,9 +71,7 @@ func foreignCorruptRegister(t *testing.T, store *graphStorage, sessionID string)
 		_, err = tx.ReplaceRegister(key, reg.Revision, patched)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("foreign corrupt register write: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // warmCorruptFixture builds one warm Session whose cached graph carries a
@@ -86,17 +86,20 @@ func warmCorruptFixture(t *testing.T) (*Harness, *graphStorage, *prepareStub, *c
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, store, stub.prepare)
 	ctx := context.Background()
-	if _, err := h.ReadSessionHeader(ctx, testSessionID); err != nil {
-		t.Fatalf("warm ReadSessionHeader: %v", err)
+	{
+		_, err := h.ReadSessionHeader(ctx, testSessionID)
+		testassert.NoError(t, err)
 	}
 	sibling := createSession(t, h)
 	c := cachedCoordinator(t, h, testSessionID)
 	mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
-	if _, err := h.commitEffectResult(ctx, c, testOpID, nil, modelResult{terminal: OperationSuccess}); err != nil {
-		t.Fatalf("terminal settlement: %v", err)
+	{
+		_, err := h.commitEffectResult(ctx, c, testOpID, nil, modelResult{terminal: OperationSuccess})
+		testassert.NoError(t, err)
 	}
-	if header, err := h.ReadSessionHeader(ctx, testSessionID); err != nil || header.CurrentOperationID != "" {
-		t.Fatalf("post-settlement header = %+v (%v), want an idle Session", header, err)
+	{
+		header, err := h.ReadSessionHeader(ctx, testSessionID)
+		testassert.Require(t, err == nil && header.CurrentOperationID == "", "post-settlement header = %+v (%v), want an idle Session", header, err)
 	}
 	foreignCorruptRegister(t, store, testSessionID)
 	return h, store, stub, c, sibling
@@ -209,13 +212,9 @@ func forkMarker(ctx context.Context, h *Harness, req ForkRequest, out chan<- err
 // error of the marked Session, not captured state.
 func assertCaptureCorruption(t *testing.T, err error, sessionID, read string) {
 	t.Helper()
-	if !isCorruption(err) {
-		t.Fatalf("%s after the mark = %v, want the typed corruption error", read, err)
-	}
+	testassert.Require(t, isCorruption(err), "%s after the mark = %v, want the typed corruption error", read, err)
 	var corrupt *CorruptionError
-	if !errors.As(err, &corrupt) || corrupt.SessionID != sessionID {
-		t.Fatalf("%s error = %v, want the typed CorruptionError naming %q", read, err, sessionID)
-	}
+	testassert.Require(t, errors.As(err, &corrupt) && corrupt.SessionID == sessionID, "%s error = %v, want the typed CorruptionError naming %q", read, err, sessionID)
 }
 
 // runMarkWindow performs the shared deterministic window rendezvous for one
@@ -275,15 +274,10 @@ func runMarkWindow(t *testing.T, ctx context.Context, h *Harness, stub *prepareS
 	releaseGate() // the transaction fails on the corrupt register and the real mark lands, with no c.mu held
 
 	marker, landed := awaitCorruptMark(h, c)
-	if !landed {
-		t.Fatalf("the real Fork transition's corruption marker did not land within %s", captureBarrierWait)
-	}
+	testassert.Require(t, landed, "the real Fork transition's corruption marker did not land within %s", captureBarrierWait)
 	releaseReader() // the reader's real capture proceeds, strictly after the mark
 	var corrupt *CorruptionError
-	if !errors.As(marker, &corrupt) || corrupt.SessionID != req.SourceSessionID ||
-		!strings.Contains(corrupt.Detail, "session register") {
-		t.Fatalf("sticky marker = %v, want the Fork transition's register corruption naming %q", marker, req.SourceSessionID)
-	}
+	testassert.Require(t, errors.As(marker, &corrupt) && corrupt.SessionID == req.SourceSessionID && strings.Contains(corrupt.Detail, "session register"), "sticky marker = %v, want the Fork transition's register corruption naming %q", marker, req.SourceSessionID)
 	return reader, forkDone
 }
 
@@ -300,16 +294,8 @@ func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
 	h, _, stub, c, _ := warmCorruptFixture(t)
 
 	view, err := h.ReadSessionView(ctx, testSessionID)
-	if err != nil {
-		t.Fatalf("pre-marker ReadSessionView: %v", err)
-	}
-	if len(view.Operations) != 1 || view.Operations[0].OperationID != testOpID ||
-		view.Operations[0].Status != OperationSuccess {
-		t.Fatalf("pre-marker operations = %+v, want the settled %s", view.Operations, testOpID)
-	}
-	if view.History.ExecutionBusy {
-		t.Fatalf("pre-marker view = busy, want the idle post-settlement state")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(view.Operations) == 1 && view.Operations[0].OperationID == testOpID && view.Operations[0].Status == OperationSuccess && !view.History.ExecutionBusy, "pre-marker operations = %+v, want the settled %s; pre-marker view = busy, want the idle post-settlement state", view.Operations, testOpID)
 	// The captured copy is owned: mutating it cannot reach the coordinator.
 	view.Operations[0].Status = OperationRunning
 	facts := view.History.HistoryFacts(historyHeaderIDs(view.History.HistoryHeaders()))
@@ -320,39 +306,23 @@ func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
 			fact.Input.Content[0].Text = "mutated"
 		}
 	}
-	if inputText == "" {
-		t.Fatal("pre-marker view carries no input fact to mutate")
-	}
+	testassert.Require(t, inputText != "", "%v", "pre-marker view carries no input fact to mutate")
 	again, err := h.ReadSessionView(ctx, testSessionID)
-	if err != nil {
-		t.Fatalf("pre-marker reread: %v", err)
-	}
+	testassert.NoError(t, err)
 	rereadFacts := again.History.HistoryFacts(historyHeaderIDs(again.History.HistoryHeaders()))
 	for _, fact := range rereadFacts {
-		if fact.Input != nil && fact.Input.Content[0].Text == "mutated" {
-			t.Fatalf("a mutation of the returned view reached the coordinator: %+v", again)
-		}
+		testassert.Require(t, fact.Input == nil || fact.Input.Content[0].Text != "mutated", "a mutation of the returned view reached the coordinator: %+v", again)
 	}
-	if again.Operations[0].Status != OperationSuccess {
-		t.Fatalf("a mutation of the returned view reached the coordinator: %+v", again)
-	}
+	testassert.Require(t, again.Operations[0].Status == OperationSuccess, "a mutation of the returned view reached the coordinator: %+v", again)
 
 	// The same window pins the Operation record's own ownership.
 	rec, err := h.ReadOperation(ctx, testSessionID, testOpID)
-	if err != nil {
-		t.Fatalf("pre-marker ReadOperation: %v", err)
-	}
-	if rec.Admission.OperationID != testOpID || rec.State.Status != OperationSuccess {
-		t.Fatalf("pre-marker record = %+v, want the settled %s", rec, testOpID)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.Admission.OperationID == testOpID && rec.State.Status == OperationSuccess, "pre-marker record = %+v, want the settled %s", rec, testOpID)
 	rec.State.Status = OperationFailure
 	reread, err := h.ReadOperation(ctx, testSessionID, testOpID)
-	if err != nil {
-		t.Fatalf("pre-marker reread: %v", err)
-	}
-	if reread.State.Status != OperationSuccess {
-		t.Fatalf("a mutation of the returned record reached the coordinator: %+v", reread)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, reread.State.Status == OperationSuccess, "a mutation of the returned record reached the coordinator: %+v", reread)
 
 	reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
 		SourceSessionID: testSessionID,
@@ -363,13 +333,9 @@ func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
 
 	outcome := receiveBounded(t, reader, "the parked capture never completed")
 	assertCaptureCorruption(t, outcome.err, testSessionID, "captureAvailable")
-	if outcome.callbackRan {
-		t.Fatal("the capture callback executed after the mark")
-	}
+	testassert.Require(t, !outcome.callbackRan, "%v", "the capture callback executed after the mark")
 	forkErr := receiveBounded(t, forkDone, "Fork never completed")
-	if !isCorruption(forkErr) {
-		t.Fatalf("Fork = %v, want its own register-decode corruption", forkErr)
-	}
+	testassert.Require(t, isCorruption(forkErr), "Fork = %v, want its own register-decode corruption", forkErr)
 }
 
 // TestCaptureAvailabilityFamily pins the surrounding semantic rows of the
@@ -381,20 +347,25 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 	t.Run("gone session answers not-found from both reads", func(t *testing.T) {
 		ctx := context.Background()
 		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSessionHeader(ctx, testSessionID); err != nil {
-			t.Fatalf("warm ReadSessionHeader: %v", err)
+		{
+			_, err := h.ReadSessionHeader(ctx, testSessionID)
+			testassert.NoError(t, err)
 		}
-		if _, err := h.ArchiveSession(ctx, testSessionID); err != nil {
-			t.Fatalf("ArchiveSession: %v", err)
+		{
+			_, err := h.ArchiveSession(ctx, testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := h.DeleteSession(ctx, testSessionID); err != nil {
-			t.Fatalf("DeleteSession: %v", err)
+		{
+			err := h.DeleteSession(ctx, testSessionID)
+			testassert.NoError(t, err)
 		}
-		if _, err := h.ReadSessionView(ctx, testSessionID); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("ReadSessionView after deletion = %v, want the not-found class", err)
+		{
+			_, err := h.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, errors.Is(err, ErrNotFound), "ReadSessionView after deletion = %v, want the not-found class", err)
 		}
-		if _, err := h.ReadOperation(ctx, testSessionID, testOpID); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("ReadOperation after deletion = %v, want the not-found class", err)
+		{
+			_, err := h.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, errors.Is(err, ErrNotFound), "ReadOperation after deletion = %v, want the not-found class", err)
 		}
 	})
 
@@ -410,27 +381,27 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 			OperationID:     "op-fork-sibling",
 			Content:         admissionContent("fork"),
 		}, forkDone)
-		if err := receiveBounded(t, forkDone, "Fork never completed"); !isCorruption(err) {
-			t.Fatalf("Fork over the corrupt register = %v, want its register-decode corruption", err)
+		{
+			err := receiveBounded(t, forkDone, "Fork never completed")
+			testassert.Require(t, isCorruption(err), "Fork over the corrupt register = %v, want its register-decode corruption", err)
 		}
 
 		listed, err := h.ListSessions(ctx)
-		if err != nil {
-			t.Fatalf("ListSessions: %v", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(listed) == 1 && listed[0].Identity.SessionID == sibling, "ListSessions = %+v, want exactly the valid sibling %q", listed, sibling)
+		{
+			_, err := h.ReadSessionView(ctx, sibling)
+			testassert.NoError(t, err)
 		}
-		if len(listed) != 1 || listed[0].Identity.SessionID != sibling {
-			t.Fatalf("ListSessions = %+v, want exactly the valid sibling %q", listed, sibling)
-		}
-		if _, err := h.ReadSessionView(ctx, sibling); err != nil {
-			t.Fatalf("sibling ReadSessionView = %v, want the valid read", err)
-		}
-		if _, err := h.ReadSessionHeader(ctx, sibling); err != nil {
-			t.Fatalf("sibling ReadSessionHeader = %v, want the valid read", err)
+		{
+			_, err := h.ReadSessionHeader(ctx, sibling)
+			testassert.NoError(t, err)
 		}
 		// The sibling's own absent Operation answers its not-found class, not
 		// the subject's corruption: the marker never crosses coordinators.
-		if _, err := h.ReadOperation(ctx, sibling, "op-absent"); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("sibling ReadOperation = %v, want the sibling's own not-found class", err)
+		{
+			_, err := h.ReadOperation(ctx, sibling, "op-absent")
+			testassert.Require(t, errors.Is(err, ErrNotFound), "sibling ReadOperation = %v, want the sibling's own not-found class", err)
 		}
 	})
 
@@ -445,24 +416,30 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 			OperationID:     "op-fork-family",
 			Content:         admissionContent("fork"),
 		}, forkDone)
-		if err := receiveBounded(t, forkDone, "Fork never completed"); !isCorruption(err) {
-			t.Fatalf("Fork over the corrupt register = %v, want its register-decode corruption", err)
+		{
+			err := receiveBounded(t, forkDone, "Fork never completed")
+			testassert.Require(t, isCorruption(err), "Fork over the corrupt register = %v, want its register-decode corruption", err)
 		}
 
-		if _, err := h.ReadSessionView(ctx, testSessionID); !isCorruption(err) {
-			t.Fatalf("fresh ReadSessionView = %v, want the corruption class", err)
+		{
+			_, err := h.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "fresh ReadSessionView = %v, want the corruption class", err)
 		}
-		if _, err := h.ReadHistoryView(ctx, testSessionID); !isCorruption(err) {
-			t.Fatalf("fresh ReadHistoryView = %v, want the corruption class", err)
+		{
+			_, err := h.ReadHistoryView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "fresh ReadHistoryView = %v, want the corruption class", err)
 		}
-		if _, err := h.ReadOperation(ctx, testSessionID, testOpID); !isCorruption(err) {
-			t.Fatalf("fresh ReadOperation = %v, want the corruption class", err)
+		{
+			_, err := h.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, isCorruption(err), "fresh ReadOperation = %v, want the corruption class", err)
 		}
-		if _, err := h.ReadSessionHeader(ctx, testSessionID); !isCorruption(err) {
-			t.Fatalf("ReadSessionHeader = %v, want the corruption class", err)
+		{
+			_, err := h.ReadSessionHeader(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "ReadSessionHeader = %v, want the corruption class", err)
 		}
-		if _, _, ok := h.ReadObservation(testSessionID); ok {
-			t.Fatal("ReadObservation reported a corrupt Session available")
+		{
+			_, _, ok := h.ReadObservation(testSessionID)
+			testassert.Require(t, !ok, "%v", "ReadObservation reported a corrupt Session available")
 		}
 	})
 
@@ -471,11 +448,13 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 		_, store, _, _, _ := warmCorruptFixture(t)
 		cold := newTestHarness(t, store, nil)
 
-		if _, err := cold.ReadSessionView(ctx, testSessionID); !isCorruption(err) {
-			t.Fatalf("cold ReadSessionView = %v, want the corruption class", err)
+		{
+			_, err := cold.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "cold ReadSessionView = %v, want the corruption class", err)
 		}
-		if _, err := cold.ReadOperation(ctx, testSessionID, testOpID); !isCorruption(err) {
-			t.Fatalf("cold ReadOperation = %v, want the corruption class", err)
+		{
+			_, err := cold.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, isCorruption(err), "cold ReadOperation = %v, want the corruption class", err)
 		}
 	})
 }

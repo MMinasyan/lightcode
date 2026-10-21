@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/agent"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -36,16 +37,12 @@ import (
 func projectedTriggerRequest(t *testing.T, h *Harness, c *coordinator) model.Request {
 	t.Helper()
 	msgs, err := h.projectContext(c, testOpID)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
+	testassert.NoError(t, err)
 	req, err := model.NewRequest(model.Request{
 		Messages: msgs,
 		Tools:    []model.ToolDefinition{testToolDefinition()},
 	})
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
+	testassert.NoError(t, err)
 	return req
 }
 
@@ -83,8 +80,9 @@ func seedConversationUsage(t *testing.T, h *Harness, c *coordinator, capture Exe
 		})), nil
 	}
 	exec := Execution{Model: modelFn, CompactModel: forbiddenConversationModel(t), NormalizeTool: objectNormalize}
-	if set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
-		t.Fatalf("seed turn settlement = %+v, err %v, want ready", set, err)
+	{
+		set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "seed turn settlement = %+v, err %v, want ready", set, err)
 	}
 }
 
@@ -114,26 +112,14 @@ func TestModelEffectCompactTriggerReportedUsageCompacts(t *testing.T) {
 	}
 	req := projectedTriggerRequest(t, h, c)
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want the reported usage above the threshold to compact first", compactCalls)
-	}
-	if conversationCalls != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly the post-compaction request", conversationCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, compactCalls, 1)
+	testassert.Equal(t, conversationCalls, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.OperationID != testOpID || comp.Summary != "summary one" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
-	}
+	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
 }
 
 // TestModelEffectCompactTriggerNoReportNeverCompacts is the missing-report
@@ -157,18 +143,10 @@ func TestModelEffectCompactTriggerNoReportNeverCompacts(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if compactCalls != 0 {
-		t.Fatalf("compact transport calls = %d, want no compaction without a reported usage", compactCalls)
-	}
-	if conversationCalls != 1 {
-		t.Fatalf("conversation transport calls = %d, want the fitting request sent unchanged", conversationCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, compactCalls, 0)
+	testassert.Equal(t, conversationCalls, 1)
 }
 
 // TestModelEffectCompactTriggerFittingRequestUntouched proves the fitting
@@ -198,37 +176,19 @@ func TestModelEffectCompactTriggerFittingRequestUntouched(t *testing.T) {
 				NormalizeTool: objectNormalize,
 			}
 			set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
-			if err != nil {
-				t.Fatalf("model effect: %v", err)
-			}
-			if set.Disposition != agent.DispoReady {
-				t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-			}
-			if len(sent) != 1 {
-				t.Fatalf("conversation transport calls = %d, want exactly one", len(sent))
-			}
-			if !reflect.DeepEqual(req.Messages, sent[0].Messages) {
-				t.Fatalf("sent messages changed through a fitting request:\nwant %+v\ngot  %+v", req.Messages, sent[0].Messages)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, set.Disposition, agent.DispoReady)
+			testassert.Equal(t, len(sent), 1)
+			testassert.Require(t, reflect.DeepEqual(req.Messages, sent[0].Messages), "sent messages changed through a fitting request:\nwant %+v\ngot  %+v", req.Messages, sent[0].Messages)
 			graph, err := validateFixture(t, store, sessionID)
-			if err != nil {
-				t.Fatalf("graph: %v", err)
-			}
-			if graph.Session.State.CompactionEntryID != "" {
-				t.Fatalf("compaction_entry_id %q, want it empty on a fitting request", graph.Session.State.CompactionEntryID)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
 			for i := range graph.Entries {
-				if graph.Entries[i].Compaction != nil {
-					t.Fatalf("compaction entry committed for a fitting request")
-				}
+				testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed for a fitting request")
 			}
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-			if err != nil {
-				t.Fatalf("ReadOperation: %v", err)
-			}
-			if rec.State.Status != OperationRunning {
-				t.Fatalf("operation status %q, want running after the fitting request", rec.State.Status)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, rec.State.Status, OperationRunning)
 		})
 	}
 }
@@ -255,17 +215,12 @@ func TestModelEffectCompactTriggerPresentZeroWithReserveOverWindowCompacts(t *te
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if compactCalls != 1 || conversationCalls != 1 {
-		t.Fatalf("compact/conversation transport calls = %d/%d, want 1/1 for the overflowing zero report", compactCalls, conversationCalls)
-	}
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph: %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Require(t, compactCalls == 1 && conversationCalls == 1, "compact/conversation transport calls = %d/%d, want 1/1 for the overflowing zero report", compactCalls, conversationCalls)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -288,15 +243,9 @@ func TestModelEffectCompactTriggerWideUsageSumCompacts(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want the exact wide sum above the threshold to compact", compactCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, compactCalls, 1)
 }
 
 // triggerCompactCommitStore holds the successful compaction transaction
@@ -418,140 +367,91 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	// was still running — a split implementation would show the entry without
 	// the register changes.
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	sreg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterSession})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	sess, err := decodeSessionRegister(sreg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	oreg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	op, err := decodeOperationRegister(oreg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	parked := struct {
 		entries   []Entry
 		session   SessionRecord
 		operation OperationRecord
 	}{entries, sess, op}
-	if len(parked.entries) == 0 || parked.entries[len(parked.entries)-1].Kind != EntryCompaction {
-		t.Fatalf("parked entry tail = %+v, want the compaction entry committed last", parked.entries)
-	}
+	testassert.Require(t, len(parked.entries) != 0 && parked.entries[len(parked.entries)-1].Kind == EntryCompaction, "parked entry tail = %+v, want the compaction entry committed last", parked.entries)
 	var parkedEntry struct {
 		EntryID         string      `json:"entry_id"`
 		BoundaryEntryID string      `json:"boundary_entry_id"`
 		Summary         string      `json:"summary"`
 		Usage           *UsageCount `json:"usage"`
 	}
-	if err := json.Unmarshal(parked.entries[len(parked.entries)-1].Payload, &parkedEntry); err != nil {
-		t.Fatalf("decode parked compaction entry: %v", err)
+	{
+		err := json.Unmarshal(parked.entries[len(parked.entries)-1].Payload, &parkedEntry)
+		testassert.NoError(t, err)
 	}
-	if parkedEntry.BoundaryEntryID != boundary {
-		t.Fatalf("parked boundary %q != the last pre-commit entry %q", parkedEntry.BoundaryEntryID, boundary)
-	}
-	if parkedEntry.Summary != "summary one" || parkedEntry.Usage == nil || *parkedEntry.Usage != summaryUsage {
-		t.Fatalf("parked compaction summary/usage = %+v", parkedEntry)
-	}
-	if parked.session.State.CompactionEntryID != parkedEntry.EntryID {
-		t.Fatalf("parked compaction_entry_id = %q, want the committed entry %q", parked.session.State.CompactionEntryID, parkedEntry.EntryID)
-	}
+	testassert.Require(t, parkedEntry.BoundaryEntryID == boundary && (parkedEntry.Summary == "summary one" && parkedEntry.Usage != nil && *parkedEntry.Usage == summaryUsage), "got %v, want %v; parked compaction summary/usage = %+v", parkedEntry.BoundaryEntryID, boundary, parkedEntry)
+	testassert.Equal(t, parked.session.State.CompactionEntryID, parkedEntry.EntryID)
 	parkedSessionUsage := UsageTotals{}
 	for _, mu := range parked.session.State.Usage.ByModel {
 		if mu.Model == compactRef {
 			parkedSessionUsage.ByModel = append(parkedSessionUsage.ByModel, mu)
 		}
 	}
-	if len(parkedSessionUsage.ByModel) != 1 || parkedSessionUsage.ByModel[0].Usage != summaryUsage {
-		t.Fatalf("parked session usage = %+v, want the summary's counts", parked.session.State.Usage)
-	}
-	if parked.operation.State.Status != OperationRunning || parked.operation.State.Terminal != nil {
-		t.Fatalf("parked operation status = %q, want the enclosing Operation still running", parked.operation.State.Status)
-	}
+	testassert.Require(t, len(parkedSessionUsage.ByModel) == 1 && parkedSessionUsage.ByModel[0].Usage == summaryUsage, "parked session usage = %+v, want the summary's counts", parked.session.State.Usage)
+	testassert.Require(t, parked.operation.State.Status == OperationRunning && parked.operation.State.Terminal == nil, "parked operation status = %q, want the enclosing Operation still running", parked.operation.State.Status)
 	parkedOperationUsage := UsageTotals{}
 	for _, mu := range parked.operation.State.Usage.ByModel {
 		if mu.Model == compactRef {
 			parkedOperationUsage.ByModel = append(parkedOperationUsage.ByModel, mu)
 		}
 	}
-	if len(parkedOperationUsage.ByModel) != 1 || parkedOperationUsage.ByModel[0].Usage != summaryUsage {
-		t.Fatalf("parked operation usage = %+v, want the summary's counts", parked.operation.State.Usage)
-	}
+	testassert.Require(t, len(parkedOperationUsage.ByModel) == 1 && parkedOperationUsage.ByModel[0].Usage == summaryUsage, "parked operation usage = %+v, want the summary's counts", parked.operation.State.Usage)
 	select {
 	case result := <-done:
 		t.Fatalf("automatic effect returned while compaction transaction return held: %+v", result)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if conversationCalls.Load() != 0 {
-		t.Fatal("conversation callback ran before compaction transaction return")
-	}
+	testassert.Require(t, conversationCalls.Load() == 0, "%v", "conversation callback ran before compaction transaction return")
 	close(gated.release)
 	select {
 	case result := <-done:
-		if result.err != nil || result.set.Disposition != agent.DispoReady {
-			t.Fatalf("automatic effect after release = %+v", result)
-		}
+		testassert.Require(t, result.err == nil && result.set.Disposition == agent.DispoReady, "automatic effect after release = %+v", result)
 	case <-time.After(2 * time.Second):
 		t.Fatal("automatic effect did not finish after compaction transaction release")
 	}
-	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one summary request", compactCalls)
-	}
-	if len(sent) != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly one after the compaction", len(sent))
-	}
+	testassert.Equal(t, compactCalls, 1)
+	testassert.Equal(t, len(sent), 1)
 	sentMsgs := sent[0].Messages
-	if len(sentMsgs) != 2 {
-		t.Fatalf("sent messages = %d, want the system message and the summary with no post-boundary entries:\n%+v", len(sentMsgs), sentMsgs)
-	}
-	if sentMsgs[0].Role != model.RoleSystem || sentMsgs[0].TextContent() != capture.SystemPrompt {
-		t.Fatalf("sent system message = %+v, want the captured prompt", sentMsgs[0])
-	}
-	if sentMsgs[1].Role != model.RoleAssistant || sentMsgs[1].Source != compactRef {
-		t.Fatalf("sent summary message = %+v, want an assistant message sourced by the compact model", sentMsgs[1])
-	}
-	if got := sentMsgs[1].TextContent(); got != "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" {
-		t.Fatalf("sent summary text %q, want the verbatim framing around the committed summary", got)
+	testassert.Require(t, len(sentMsgs) == 2, "sent messages = %d, want the system message and the summary with no post-boundary entries:\n%+v", len(sentMsgs), sentMsgs)
+	testassert.Require(t, sentMsgs[0].Role == model.RoleSystem && sentMsgs[0].TextContent() == capture.SystemPrompt, "sent system message = %+v, want the captured prompt", sentMsgs[0])
+	testassert.Require(t, sentMsgs[1].Role == model.RoleAssistant && sentMsgs[1].Source == compactRef, "sent summary message = %+v, want an assistant message sourced by the compact model", sentMsgs[1])
+	{
+		got := sentMsgs[1].TextContent()
+		testassert.Equal(t, got, "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]")
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.OperationID != testOpID || comp.Summary != "summary one" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
-	}
-	if comp.Usage == nil || *comp.Usage != summaryUsage {
-		t.Fatalf("compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
-	}
-	if graph.Session.State.CompactionEntryID != comp.EntryID {
-		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
-	}
+	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
+	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
 	compactionUsage := UsageTotals{}
 	for _, mu := range graph.Session.State.Usage.ByModel {
 		if mu.Model == compactRef {
 			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
 		}
 	}
-	if len(compactionUsage.ByModel) != 1 || compactionUsage.ByModel[0].Usage != summaryUsage {
-		t.Fatalf("session usage = %+v, want the summary's counts keyed by the compact model", graph.Session.State.Usage)
-	}
+	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session usage = %+v, want the summary's counts keyed by the compact model", graph.Session.State.Usage)
 	assistants := 0
 	for i := range graph.Entries {
 		if graph.Entries[i].Assistant != nil {
 			assistants++
 		}
 	}
-	if assistants != 2 {
-		t.Fatalf("assistant entries = %d, want the seed turn and the one turn committed after the compaction", assistants)
-	}
+	testassert.Equal(t, assistants, 2)
 }
 
 // TestModelEffectCompactTriggerCheckpointFailureUnsent proves the failure
@@ -577,37 +477,32 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		},
 		NormalizeTool: objectNormalize,
 	}
-	if result, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, priorExec, priorCapture), priorRequest); err != nil || result.Disposition != agent.DispoReady {
-		t.Fatalf("prior automatic checkpoint = %+v, %v", result, err)
+	{
+		result, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, priorExec, priorCapture), priorRequest)
+		testassert.Require(t, err == nil && result.Disposition == agent.DispoReady, "prior automatic checkpoint = %+v, %v", result, err)
 	}
-	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background()); err != nil {
-		t.Fatal(err)
+	{
+		err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background())
+		testassert.NoError(t, err)
 	}
 	priorGraph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	prior := *compactedEntryOf(t, priorGraph)
-	if prior.EntryID == "" || prior.Summary != "prior summary" || prior.Usage == nil || *prior.Usage != priorUsage || operationStateOf(t, priorGraph, testOpID).Status != OperationSuccess {
-		t.Fatalf("successful nonempty prior checkpoint missing: %+v", prior)
-	}
+	testassert.Require(t, prior.EntryID != "" && prior.Summary == "prior summary" && prior.Usage != nil && *prior.Usage == priorUsage && operationStateOf(t, priorGraph, testOpID).Status == OperationSuccess, "successful nonempty prior checkpoint missing: %+v", prior)
 	const laterOperation = "op-2"
 	const failingOperation = "op-3"
 	// Two durable admitted inputs — the split-Operation shape of two
 	// delivered messages.
 	mustAdmitWithoutExecution(t, h, sessionID, laterOperation, admissionContent("later input"))
-	if err := h.settleAgentTerminal(c, laterOperation, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background()); err != nil {
-		t.Fatal(err)
+	{
+		err := h.settleAgentTerminal(c, laterOperation, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background())
+		testassert.NoError(t, err)
 	}
 	mustAdmitWithoutExecution(t, h, sessionID, failingOperation, admissionContent("failing input"))
 	before, err := h.projectContext(c, failingOperation)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
+	testassert.NoError(t, err)
 	preexisting, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	for i := range preexisting {
 		preexisting[i].Payload = append(json.RawMessage(nil), preexisting[i].Payload...)
 	}
@@ -617,9 +512,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		Messages: before,
 		Tools:    []model.ToolDefinition{testToolDefinition()},
 	})
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
+	testassert.NoError(t, err)
 	capture := triggerUsageCapture(-1) // the prior turn's zero report overflows a negative threshold
 	compactRef := testCompactCapture().Model
 	summaryCalls := 0
@@ -643,45 +536,26 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, failingOperation, exec, capture), req)
-	if err != nil {
-		t.Fatalf("model effect = %v, want the settled failure with a nil error", err)
-	}
-	if set.Disposition != agent.DispoFailure || set.Output != nil || !strings.Contains(set.Detail, "provider failure") {
-		t.Fatalf("settlement = %+v, want the outputless failure carrying the summary failure detail", set)
-	}
-	if summaryCalls != 1 || conversationCalls != 0 {
-		t.Fatalf("later compact/conversation calls = %d/%d, want 1/0", summaryCalls, conversationCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, set.Disposition == agent.DispoFailure && set.Output == nil && strings.Contains(set.Detail, "provider failure"), "settlement = %+v, want the outputless failure carrying the summary failure detail", set)
+	testassert.Require(t, summaryCalls == 1 && conversationCalls == 0, "later compact/conversation calls = %d/%d, want 1/0", summaryCalls, conversationCalls)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	var settlement *operationSettlementEntry
 	for _, entry := range graph.Entries {
 		if entry.Settlement != nil && entry.Envelope.OperationID == failingOperation {
 			settlement = entry.Settlement
 		}
 	}
-	if settlement == nil {
-		t.Fatal("later failed Operation settlement missing")
-	}
-	if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "provider failure") {
-		t.Fatalf("settlement entry = %+v, want the failure terminal", settlement)
-	}
-	if settlement.Model == nil || *settlement.Model != compactRef {
-		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-	}
-	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 4, OutputTokens: 2}) {
-		t.Fatalf("settlement usage = %+v, want the failed summary's reported usage", settlement.Usage)
-	}
-	if !settlement.CompactionUsage {
-		t.Fatalf("settlement compaction_usage = false, want the summary usage provenance marked")
-	}
+	testassert.Require(t, settlement != nil && (settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "provider failure")), "%v; settlement entry = %+v, want the failure terminal", "later failed Operation settlement missing", settlement)
+	testassert.Require(t, settlement.Model != nil && *settlement.Model == compactRef, "settlement model = %+v, want the compact model identity", settlement.Model)
+	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 4, OutputTokens: 2}) && settlement.CompactionUsage, "settlement usage = %+v, want the failed summary's reported usage; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
 	// The failed checkpoint's reported usage reaches both totals keyed by
 	// the compact model: the Operation register and the Session register.
 	wantTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 4, OutputTokens: 2}}}}
-	if state := operationStateOf(t, graph, failingOperation); state.Status != OperationFailure || !usageTotalsEqual(state.Usage, wantTotals) {
-		t.Fatalf("operation usage = %+v, want the reported summary counts keyed by the compact model", state.Usage)
+	{
+		state := operationStateOf(t, graph, failingOperation)
+		testassert.Require(t, state.Status == OperationFailure && usageTotalsEqual(state.Usage, wantTotals), "operation usage = %+v, want the reported summary counts keyed by the compact model", state.Usage)
 	}
 	compactSessionTotals := UsageTotals{}
 	for _, contribution := range graph.Session.State.Usage.ByModel {
@@ -690,36 +564,21 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		}
 	}
 	wantSessionTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 11, OutputTokens: 5}}}}
-	if !usageTotalsEqual(compactSessionTotals, wantSessionTotals) {
-		t.Fatalf("session compact usage = %+v, want prior plus failed summary counts", compactSessionTotals)
-	}
-	if graph.Session.State.CompactionEntryID != prior.EntryID {
-		t.Fatalf("compaction_entry_id %q, want prior %q on failed checkpoint", graph.Session.State.CompactionEntryID, prior.EntryID)
-	}
-	if current := compactedEntryOf(t, graph); current.EntryID != prior.EntryID || current.Summary != prior.Summary {
-		t.Fatalf("prior compaction replaced: before=%+v after=%+v", prior, current)
+	testassert.Require(t, usageTotalsEqual(compactSessionTotals, wantSessionTotals), "session compact usage = %+v, want prior plus failed summary counts", compactSessionTotals)
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, prior.EntryID)
+	{
+		current := compactedEntryOf(t, graph)
+		testassert.Require(t, current.EntryID == prior.EntryID && current.Summary == prior.Summary, "prior compaction replaced: before=%+v after=%+v", prior, current)
 	}
 	afterEntries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(afterEntries) < len(preexisting) || !reflect.DeepEqual(preexisting, afterEntries[:len(preexisting)]) {
-		t.Fatal("pre-existing entry envelope/payload bytes changed through later failure")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(afterEntries) >= len(preexisting) && reflect.DeepEqual(preexisting, afterEntries[:len(preexisting)]), "%v", "pre-existing entry envelope/payload bytes changed through later failure")
 	tail, err := store.ReadEntries(context.Background(), sessionID, preexisting[len(preexisting)-1].Sequence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(tail) != 1 || tail[0].Kind != EntryOperationSettlement || tail[0].OperationID != failingOperation {
-		t.Fatalf("exact later-checkpoint tail = %+v, want only failed Operation settlement and no replacement compaction", tail)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(tail) == 1 && tail[0].Kind == EntryOperationSettlement && tail[0].OperationID == failingOperation, "exact later-checkpoint tail = %+v, want only failed Operation settlement and no replacement compaction", tail)
 	after, err := h.projectContext(c, failingOperation)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
-	if !reflect.DeepEqual(before, after) {
-		t.Fatalf("projection changed through the failed checkpoint:\nwant %+v\ngot  %+v", before, after)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through the failed checkpoint:\nwant %+v\ngot  %+v", before, after)
 }
 
 // TestModelEffectCompactTriggerSteeringStaysBuffered proves the steering row:
@@ -756,59 +615,50 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
+	testassert.NoError(t, err)
 	// The completed turn settles ready: waiting steering never keeps the
 	// Operation running inside the model effect, and no compact summary
 	// request drains or exits at a boundary for the steering.
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want the ordinary ready settlement", set.Disposition)
-	}
-	if len(sent) != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly one", len(sent))
-	}
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, len(sent), 1)
 	for _, msg := range sent[0].Messages {
-		if strings.Contains(msg.TextContent(), "s1") {
-			t.Fatalf("the rebuilt request carried the buffered steering: %+v", sent[0].Messages)
-		}
+		testassert.Require(t, !strings.Contains(msg.TextContent(), "s1"), "the rebuilt request carried the buffered steering: %+v", sent[0].Messages)
 	}
 	c.mu.Lock()
 	buffered := len(c.steering)
 	c.mu.Unlock()
-	if buffered != 1 {
-		t.Fatalf("steering buffered = %d, want the steering submitted during compaction to stay buffered", buffered)
-	}
-	if got := strings.Join(entryTexts(t, store, sessionID), ","); got != "hello" {
-		t.Fatalf("committed inputs = %q, want the steering never committed in place", got)
+	testassert.Equal(t, buffered, 1)
+	{
+		got := strings.Join(entryTexts(t, store, sessionID), ",")
+		testassert.Equal(t, got, "hello")
 	}
 	// The steering stays pending under its own identity for the successor
 	// admission after the compaction-owning Operation's terminal: no separate
 	// Operation was ever admitted while the orchestration ran.
-	if storedOperationExists(store, sessionID, "op-2") {
-		t.Fatalf("the steering submitted during compaction admitted its own operation")
-	}
+	testassert.Require(t, !storedOperationExists(store, sessionID, "op-2"), "the steering submitted during compaction admitted its own operation")
 	// After the orchestration, the ordinary completion owner admits the head
 	// under its own caller identity.
-	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background()); err != nil {
-		t.Fatalf("terminal settlement: %v", err)
+	{
+		err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, context.Background())
+		testassert.NoError(t, err)
 	}
 	release, err := h.reserve(h.ctx, c) // direct drain tests own the reservation around the body
-	if err != nil {
-		t.Fatalf("drain reservation: %v", err)
-	}
+	testassert.NoError(t, err)
 	h.drainBuffers(c, &activeExecution{done: make(chan struct{}), execCtx: context.Background(), cancel: func() {}})
 	release()
 	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess)
 	awaitHarnessQuiet(t, h, sessionID)
-	if got := strings.Join(entryTexts(t, store, sessionID), ","); got != "hello,s1" {
-		t.Fatalf("committed inputs = %q, want the head admitted as its own input after orchestration", got)
+	{
+		got := strings.Join(entryTexts(t, store, sessionID), ",")
+		testassert.Equal(t, got, "hello,s1")
 	}
-	if owner, _ := steeringInputOwner(t, store, sessionID, "s1"); owner != "op-2" {
-		t.Fatalf("steering input owned by %q, want its own caller-ID Operation", owner)
+	{
+		owner, _ := steeringInputOwner(t, store, sessionID, "s1")
+		testassert.Equal(t, owner, "op-2")
 	}
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph: %v", err)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -845,48 +695,34 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	me := h.modelEffect(c, testOpID, exec, capture)
-	if set, err := invokeTriggerEffect(t, me, req1); err != nil || set.Disposition != agent.DispoReady {
-		t.Fatalf("first request: settlement %+v err %v, want ready", set, err)
+	{
+		set, err := invokeTriggerEffect(t, me, req1)
+		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "first request: settlement %+v err %v, want ready", set, err)
 	}
 	req2 := projectedTriggerRequest(t, h, c)
-	if set, err := invokeTriggerEffect(t, me, req2); err != nil || set.Disposition != agent.DispoReady {
-		t.Fatalf("second request: settlement %+v err %v, want ready", set, err)
+	{
+		set, err := invokeTriggerEffect(t, me, req2)
+		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "second request: settlement %+v err %v, want ready", set, err)
 	}
-	if compactCalls != 2 {
-		t.Fatalf("compact transport calls = %d, want one summary request per compaction", compactCalls)
-	}
-	if len(sentTexts) != 2 {
-		t.Fatalf("conversation transport calls = %d, want one per boundary", len(sentTexts))
-	}
+	testassert.Equal(t, compactCalls, 2)
+	testassert.Equal(t, len(sentTexts), 2)
 	// The second request was built against the first compaction's projection
 	// and the second against the newest one.
-	if len(sentTexts[0]) != 2 || !strings.Contains(sentTexts[0][1], "S1") {
-		t.Fatalf("first sent request = %+v, want the system message and the first summary", sentTexts[0])
-	}
-	if len(sentTexts[1]) != 2 || !strings.Contains(sentTexts[1][1], "S2") {
-		t.Fatalf("second sent request = %+v, want the system message and the second summary", sentTexts[1])
-	}
+	testassert.Require(t, len(sentTexts[0]) == 2 && strings.Contains(sentTexts[0][1], "S1"), "first sent request = %+v, want the system message and the first summary", sentTexts[0])
+	testassert.Require(t, len(sentTexts[1]) == 2 && strings.Contains(sentTexts[1][1], "S2"), "second sent request = %+v, want the system message and the second summary", sentTexts[1])
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	var comps []*compactionEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Compaction != nil {
 			comps = append(comps, graph.Entries[i].Compaction)
 		}
 	}
-	if len(comps) != 2 {
-		t.Fatalf("compaction entries = %d, want one per overflow in the same Operation", len(comps))
-	}
+	testassert.Equal(t, len(comps), 2)
 	for i, comp := range comps {
-		if comp.OperationID != testOpID || comp.Summary != summaries[i] {
-			t.Fatalf("compaction entry %d = %+v, want the Operation-owned %q summary", i, comp, summaries[i])
-		}
+		testassert.Require(t, comp.OperationID == testOpID && comp.Summary == summaries[i], "compaction entry %d = %+v, want the Operation-owned %q summary", i, comp, summaries[i])
 	}
-	if graph.Session.State.CompactionEntryID != comps[1].EntryID {
-		t.Fatalf("compaction_entry_id %q, want the newest entry %q", graph.Session.State.CompactionEntryID, comps[1].EntryID)
-	}
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, comps[1].EntryID)
 }
 
 // TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly proves the
@@ -914,35 +750,27 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	me := h.modelEffect(c, testOpID, exec, capture)
-	if set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
-		t.Fatalf("overflow checkpoint: settlement %+v err %v, want ready", set, err)
+	{
+		set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c))
+		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "overflow checkpoint: settlement %+v err %v, want ready", set, err)
 	}
-	if set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c)); err != nil || set.Disposition != agent.DispoReady {
-		t.Fatalf("fitting checkpoint: settlement %+v err %v, want ready", set, err)
+	{
+		set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c))
+		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "fitting checkpoint: settlement %+v err %v, want ready", set, err)
 	}
-	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want the billed summary usage and the bounded seed report to leave the second checkpoint fitting", compactCalls)
-	}
-	if conversationCalls != 2 {
-		t.Fatalf("conversation transport calls = %d, want one per checkpoint", conversationCalls)
-	}
+	testassert.Equal(t, compactCalls, 1)
+	testassert.Equal(t, conversationCalls, 2)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph) // exactly one compaction entry
-	if comp.Usage == nil || *comp.Usage != summaryUsage {
-		t.Fatalf("compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
-	}
+	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
 	compactionUsage := UsageTotals{}
 	for _, mu := range graph.Session.State.Usage.ByModel {
 		if mu.Model == testCompactCapture().Model {
 			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
 		}
 	}
-	if len(compactionUsage.ByModel) != 1 || compactionUsage.ByModel[0].Usage != summaryUsage {
-		t.Fatalf("session compact usage = %+v, want the summary's counts billed exactly once", graph.Session.State.Usage)
-	}
+	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session compact usage = %+v, want the summary's counts billed exactly once", graph.Session.State.Usage)
 }
 
 // TestModelEffectCompactRequestNeverTriggers proves the structural recursion
@@ -969,26 +797,14 @@ func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 	}
 	req := projectedTriggerRequest(t, h, c)
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if compactCalls != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one summary request with no recursion", compactCalls)
-	}
-	if conversationCalls != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly the post-compaction request", conversationCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, compactCalls, 1)
+	testassert.Equal(t, conversationCalls, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph) // exactly one compaction entry
-	if comp.OperationID != testOpID || comp.Summary != "summary one" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
-	}
+	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
 }
 
 // TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled proves the
@@ -1022,26 +838,15 @@ func TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled(t *testing.T
 		NormalizeTool: objectNormalize,
 	}
 	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
-	if !errors.Is(err, injected) {
-		t.Fatalf("model effect = %v, want the raw storage error returned unsettled", err)
-	}
-	if !reflect.DeepEqual(set, agent.ModelSettlement{}) {
-		t.Fatalf("settlement = %+v, want no settlement shape behind the raw error", set)
-	}
+	testassert.Require(t, errors.Is(err, injected), "model effect = %v, want the raw storage error returned unsettled", err)
+	testassert.Require(t, reflect.DeepEqual(set, agent.ModelSettlement{}), "settlement = %+v, want no settlement shape behind the raw error", set)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
-		t.Fatalf("operation state = %+v, want the committed running/intent state for recovery", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect != nil, "operation state = %+v, want the committed running/intent state for recovery", rec.State)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
-	if len(graph.Entries) != 2 { // the admitted input and the seed turn: the failed ready commit rolled back
-		t.Fatalf("entries = %d, want the admitted input and the seed turn after the rollback", len(graph.Entries))
-	}
+	testassert.NoError(t, err)
+	// the admitted input and the seed turn: the failed ready commit rolled back
+	testassert.Equal(t, len(graph.Entries), 2)
 }
 
 // TestCompactTriggerUnsettledStorageFailureReachesWait proves the full latch
@@ -1085,22 +890,23 @@ func TestCompactTriggerUnsettledStorageFailureReachesWait(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	awaitOperationTerminal(t, store, session, "op-1", OperationSuccess) // the ordinary turn commits the report
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow"); err != nil {
-		t.Fatalf("second submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow")
+		testassert.NoError(t, err)
 	}
 	<-fired // the checkpoint's summary result commit failed at its operation-register write
 	cancel()
-	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
-		t.Fatalf("Wait = %v, want the injected storage error reported over the running Operation", err)
+	{
+		err := h.Wait(context.Background())
+		testassert.Require(t, errors.Is(err, injected), "Wait = %v, want the injected storage error reported over the running Operation", err)
 	}
 	rec := settledOperation(t, store, session, "op-2")
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
-		t.Fatalf("operation state = %+v, want the running state with its live intent for recovery", rec.State)
-	}
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect != nil, "operation state = %+v, want the running state with its live intent for recovery", rec.State)
 }
 
 // TestCompactTriggerQuietSettlementStorageFailureReachesWait proves the quiet
@@ -1145,41 +951,35 @@ func TestCompactTriggerQuietSettlementStorageFailureReachesWait(t *testing.T) {
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()
 	session := createSession(t, h)
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	awaitOperationTerminal(t, store, session, "op-1", OperationSuccess) // the ordinary turn commits the report
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow"); err != nil {
-		t.Fatalf("second submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "overflow")
+		testassert.NoError(t, err)
 	}
 	<-fired // the direct settlement failed at its settlement entry insert
 	cancel()
-	if err := h.Wait(context.Background()); !errors.Is(err, injected) {
-		t.Fatalf("Wait = %v, want the injected storage error reported over the running quiet Operation", err)
+	{
+		err := h.Wait(context.Background())
+		testassert.Require(t, errors.Is(err, injected), "Wait = %v, want the injected storage error reported over the running quiet Operation", err)
 	}
 	rec := settledOperation(t, store, session, "op-2")
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
-		t.Fatalf("operation state = %+v, want the running quiet state for recovery", rec.State)
-	}
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil, "operation state = %+v, want the running quiet state for recovery", rec.State)
 	graph, err := validateFixture(t, store, session)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlements := 0
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on the failed direct settlement")
-		}
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on the failed direct settlement")
 		if graph.Entries[i].Settlement != nil {
 			settlements++
-			if graph.Entries[i].Envelope.OperationID != "op-1" {
-				t.Fatalf("settlement entry for %q, want only op-1's ordinary terminal", graph.Entries[i].Envelope.OperationID)
-			}
+			testassert.Equal(t, graph.Entries[i].Envelope.OperationID, "op-1")
 		}
 	}
-	if settlements != 1 { // only op-1's ordinary terminal: no checkpoint settlement committed
-		t.Fatalf("settlement entries = %d, want only op-1's with none for the failed checkpoint", settlements)
-	}
+	// only op-1's ordinary terminal: no checkpoint settlement committed
+	testassert.Equal(t, settlements, 1)
 }
 
 // TestModelEffectCompactBoundaryExcludesPostFreezeAppends proves the frozen
@@ -1193,12 +993,8 @@ func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 	capture := triggerUsageCapture(4)
 	seedConversationUsage(t, h, c, capture, UsageCount{InputTokens: 13})
 	seeded, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(seeded) != 2 || seeded[1].Kind != EntryAssistant {
-		t.Fatalf("seed entries = %+v, want the admitted input and the seed assistant", seeded)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(seeded) == 2 && seeded[1].Kind == EntryAssistant, "seed entries = %+v, want the admitted input and the seed assistant", seeded)
 	req := projectedTriggerRequest(t, h, c)
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -1229,60 +1025,31 @@ func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 	// the closed group makes the delivery commit the durable signal
 	// regardless of the running Operation.
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	closeBackgroundMode(c)
-	if err := h.DeliverBackgroundCompletion(context.Background(), sessionID, member.completionID, "Task completed."); err != nil {
-		t.Fatalf("closed delivery: %v", err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), sessionID, member.completionID, "Task completed.")
+		testassert.NoError(t, err)
 	}
 	signals := storedSignals(t, store, sessionID)
-	if len(signals) != 1 {
-		t.Fatalf("durable background_completion signals = %d, want the one closed-path completion", len(signals))
-	}
-	if signals[0].OperationID != "" || signals[0].RelatedMember == nil || signals[0].RelatedMember.Kind != "child" ||
-		signals[0].RelatedMember.ID != completionChildID || signals[0].Content != "Task completed." {
-		t.Fatalf("committed signal = %+v, want the operationless child-member completion", signals[0])
-	}
+	testassert.Equal(t, len(signals), 1)
+	testassert.Require(t, signals[0].OperationID == "" && signals[0].RelatedMember != nil && signals[0].RelatedMember.Kind == "child" && signals[0].RelatedMember.ID == completionChildID && signals[0].Content == "Task completed.", "committed signal = %+v, want the operationless child-member completion", signals[0])
 	close(release)
 	out := <-done
-	if out.err != nil {
-		t.Fatalf("model effect: %v", out.err)
-	}
-	if out.set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready after the rebuilt request", out.set.Disposition)
-	}
+	testassert.Require(t, out.err == nil && out.set.Disposition == agent.DispoReady, "model effect: %v; got %v, want %v", out.err, out.set.Disposition, agent.DispoReady)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.BoundaryEntryID != seeded[1].ID {
-		t.Fatalf("boundary %q, want the freeze-time last projectable entry %q", comp.BoundaryEntryID, seeded[1].ID)
-	}
+	testassert.Equal(t, comp.BoundaryEntryID, seeded[1].ID)
 	// The rebuilt request carried the appended signal after the summary.
-	if len(sent) != 1 {
-		t.Fatalf("conversation transport calls = %d, want exactly the rebuilt request", len(sent))
-	}
+	testassert.Equal(t, len(sent), 1)
 	sentMsgs := sent[0].Messages
-	if len(sentMsgs) != 3 || sentMsgs[0].Role != model.RoleSystem ||
-		sentMsgs[1].Role != model.RoleAssistant || sentMsgs[1].Source != testCompactCapture().Model ||
-		sentMsgs[2].Role != model.RoleUser || sentMsgs[2].TextContent() != "<system-signal>Task completed.</system-signal>" {
-		t.Fatalf("rebuilt request = %+v, want the system message, the summary, and the wrapped post-freeze signal", sentMsgs)
-	}
+	testassert.Require(t, len(sentMsgs) == 3 && sentMsgs[0].Role == model.RoleSystem && sentMsgs[1].Role == model.RoleAssistant && sentMsgs[1].Source == testCompactCapture().Model && sentMsgs[2].Role == model.RoleUser && sentMsgs[2].TextContent() == "<system-signal>Task completed.</system-signal>", "rebuilt request = %+v, want the system message, the summary, and the wrapped post-freeze signal", sentMsgs)
 	// The post-commit projection keeps the signal visible after the
 	// summary, ahead of the turn the settled request committed.
 	after, err := h.projectContext(c, testOpID)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
-	if len(after) != 4 || after[0].Role != model.RoleSystem ||
-		after[1].Role != model.RoleAssistant || after[1].Source != testCompactCapture().Model ||
-		after[1].TextContent() != "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" ||
-		after[2].Role != model.RoleUser || after[2].TextContent() != "<system-signal>Task completed.</system-signal>" ||
-		after[3].Role != model.RoleAssistant || after[3].TextContent() != "done" {
-		t.Fatalf("post-commit projection = %+v, want the system message, the summary, the wrapped post-freeze signal, and the settled turn", after)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(after) == 4 && after[0].Role == model.RoleSystem && after[1].Role == model.RoleAssistant && after[1].Source == testCompactCapture().Model && after[1].TextContent() == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" && after[2].Role == model.RoleUser && after[2].TextContent() == "<system-signal>Task completed.</system-signal>" && after[3].Role == model.RoleAssistant && after[3].TextContent() == "done", "post-commit projection = %+v, want the system message, the summary, the wrapped post-freeze signal, and the settled turn", after)
 }
 
 // TestModelEffectCompactTriggerFullInputCommitAttributesUsage is the
@@ -1314,79 +1081,51 @@ func TestModelEffectCompactTriggerFullInputCommitAttributesUsage(t *testing.T) {
 	snapshot := append(append([]model.Message(nil), rich...), tail...)
 
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
-	if err != nil {
-		t.Fatalf("runCompaction: %v", err)
-	}
-	if summary != "full summary" {
-		t.Fatalf("summary = %q, want the request output", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 5, OutputTokens: 3}) {
-		t.Fatalf("run usage = %+v, want the one request's reported counts", usage)
-	}
-	if len(requests) != 1 {
-		t.Fatalf("compact transport calls = %d, want one full-input request", len(requests))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, summary, "full summary")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 5, OutputTokens: 3}), "run usage = %+v, want the one request's reported counts", usage)
+	testassert.Equal(t, len(requests), 1)
 	// Consumed exactly once in order: the request's user text carries every
 	// serialized snapshot line whole in snapshot order.
 	wantLines := mustSerializeCompaction(t, snapshot)
 	userText := requests[0].Messages[1].TextContent()
-	if userText != strings.Join(wantLines, "\n") {
-		t.Fatalf("request user text = %q, want every snapshot line whole in order", userText)
-	}
-	if strings.Contains(userText, "Previous summary:") || strings.Contains(userText, "Continuation:") {
-		t.Fatalf("the request carries continuation framing: %q", userText)
-	}
+	testassert.Require(t, userText == strings.Join(wantLines, "\n") && (!strings.Contains(userText, "Previous summary:") && !strings.Contains(userText, "Continuation:")), "got %v, want %v; the request carries continuation framing: %q", userText, strings.Join(wantLines, "\n"), userText)
 	// The rich lines on the wire: the errored partial, the wrapped failure
 	// signal, the ordered content parts, the raw tool-call arguments, the
 	// complete tool result and the refusal turn.
 	for i, line := range strings.Split(userText, "\n")[:len(rich)] {
 		var got compactPieceWireLine
-		if err := json.Unmarshal([]byte(line), &got); err != nil {
-			t.Fatalf("request line %d unmarshal: %v", i, err)
+		{
+			err := json.Unmarshal([]byte(line), &got)
+			testassert.Require(t, err == nil, "request line %d unmarshal: %v", i, err)
 		}
 		if i == 3 { // the call's raw arguments ride the quoted representation
-			if len(got.ToolCalls) != 1 || got.ToolCalls[0].ID != "call-rich" || got.ToolCalls[0].Name != "noop" {
-				t.Fatalf("request line 3 tool calls = %+v, want exactly the one noop call", got.ToolCalls)
-			}
+			testassert.Require(t, len(got.ToolCalls) == 1 && got.ToolCalls[0].ID == "call-rich" && got.ToolCalls[0].Name == "noop", "request line 3 tool calls = %+v, want exactly the one noop call", got.ToolCalls)
 			args, uerr := strconv.Unquote(got.ToolCalls[0].Arguments)
-			if uerr != nil || args != `{"x":1}` {
-				t.Fatalf("serialized tool-call arguments = %q (unquote error %v), want the submitted bytes", got.ToolCalls[0].Arguments, uerr)
-			}
+			testassert.Require(t, uerr == nil && args == `{"x":1}`, "serialized tool-call arguments = %q (unquote error %v), want the submitted bytes", got.ToolCalls[0].Arguments, uerr)
 			got.ToolCalls[0].Arguments = ""
 		}
-		if !reflect.DeepEqual(got, wantRichPieceLines[i]) {
-			t.Fatalf("request line %d = %+v, want %+v", i, got, wantRichPieceLines[i])
-		}
+		testassert.Require(t, reflect.DeepEqual(got, wantRichPieceLines[i]), "request line %d = %+v, want %+v", i, got, wantRichPieceLines[i])
 	}
 	// The commit attributes the same reported total to the Operation-owned
 	// compaction entry and both registers in one transaction.
-	if err := h.commitCompaction(c, testOpID, capture, summary, 1, usage, false); err != nil {
-		t.Fatalf("commitCompaction: %v", err)
+	{
+		err := h.commitCompaction(c, testOpID, capture, summary, 1, usage, false)
+		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.OperationID != testOpID || comp.Summary != "full summary" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned summary", comp)
-	}
-	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
-		t.Fatalf("boundary %q, want the last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
-	}
-	if comp.Usage == nil || *comp.Usage != (UsageCount{InputTokens: 5, OutputTokens: 3}) {
-		t.Fatalf("compaction entry usage = %+v, want the reported counts {5,3}", comp.Usage)
-	}
-	if graph.Session.State.CompactionEntryID != comp.EntryID {
-		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
-	}
+	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "full summary", "compaction entry = %+v, want the Operation-owned summary", comp)
+	testassert.Equal(t, comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
+	testassert.Require(t, comp.Usage != nil && *comp.Usage == (UsageCount{InputTokens: 5, OutputTokens: 3}), "compaction entry usage = %+v, want the reported counts {5,3}", comp.Usage)
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
 	want := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 5, OutputTokens: 3}}}}
-	if state := operationStateOf(t, graph, testOpID); !usageTotalsEqual(state.Usage, want) {
-		t.Fatalf("operation usage = %+v, want the reported counts keyed by the compact model", state.Usage)
+	{
+		state := operationStateOf(t, graph, testOpID)
+		testassert.Require(t, usageTotalsEqual(state.Usage, want), "operation usage = %+v, want the reported counts keyed by the compact model", state.Usage)
 	}
-	if !usageTotalsEqual(graph.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want the reported counts keyed by the compact model", graph.Session.State.Usage)
-	}
+	testassert.Require(t, usageTotalsEqual(graph.Session.State.Usage, want), "session usage = %+v, want the reported counts keyed by the compact model", graph.Session.State.Usage)
 }
 
 // compactPieceWireLine is one serialized compaction line's observed shape: the
@@ -1437,9 +1176,7 @@ func completeCompactionInputMessages(t *testing.T) []model.Message {
 	t.Helper()
 	build := func(m model.Message) model.Message {
 		msg, err := model.NewMessage(m)
-		if err != nil {
-			t.Fatalf("fixture message: %v", err)
-		}
+		testassert.NoError(t, err)
 		return msg
 	}
 	return []model.Message{
@@ -1466,8 +1203,6 @@ func completeCompactionInputMessages(t *testing.T) []model.Message {
 func mustSerializeCompaction(t *testing.T, messages []model.Message) []string {
 	t.Helper()
 	lines, err := serializeCompactionMessages(messages)
-	if err != nil {
-		t.Fatalf("serializeCompactionMessages: %v", err)
-	}
+	testassert.NoError(t, err)
 	return lines
 }

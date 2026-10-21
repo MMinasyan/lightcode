@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -47,12 +48,8 @@ func TestColdChildNoExternalIO(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.timeout=120s")
 	cmd.Env = append(os.Environ(), coldChildEnv+"=1")
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("cold child: %v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), coldChildDone) {
-		t.Fatalf("the cold child ran no completed work:\n%s", out)
-	}
+	testassert.Require(t, err == nil, "cold child: %v\n%s", err, out)
+	testassert.Require(t, strings.Contains(string(out), coldChildDone), "the cold child ran no completed work:\n%s", out)
 }
 
 // runColdChild is the child body: a completed Operation, a parked Operation
@@ -76,32 +73,39 @@ func runColdChild(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	watch.next()
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationSuccess {
-		t.Fatalf("op-1 status = %s, want success", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-1")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "park"); err != nil {
-		t.Fatalf("second submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "park")
+		testassert.NoError(t, err)
 	}
 	<-started
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 	watch.next()
-	if rec := settledOperation(t, store, session, "op-2"); rec.State.Status != OperationInterruption {
-		t.Fatalf("op-2 status = %s, want interruption", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-2")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
 	cancel()
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer waitCancel()
-	if err := h.Wait(waitCtx); err != nil {
-		t.Fatalf("Wait: %v", err)
+	{
+		err := h.Wait(waitCtx)
+		testassert.NoError(t, err)
 	}
-	if attempts := transport.attempts.Load(); attempts != 0 {
-		t.Fatalf("the cold child contacted the external transport %d time(s)", attempts)
+	{
+		attempts := transport.attempts.Load()
+		testassert.Equal(t, attempts, 0)
 	}
 	fmt.Println(coldChildDone)
 }

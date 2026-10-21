@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -37,39 +38,26 @@ func TestResolveAgentTypeSelectsExactName(t *testing.T) {
 	available := testAgentTypes()
 
 	selected, err := ResolveAgentType("primary", available)
-	if err != nil {
-		t.Fatalf("ResolveAgentType(primary): %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, selected.Name == "primary" && selected.Model == available[0].Model && selected.SystemPrompt == "full" && selected.Prompt == "primary prompt", "selected = %+v, want the primary fields unchanged", selected)
+	{
+		want := []string{"read_file", "write_file", "read_file"}
+		testassert.Require(t, len(selected.Tools) == 3 && selected.Tools[0] == want[0] && selected.Tools[1] == want[1] && selected.Tools[2] == want[2], "tools = %q, want loaded order with duplicates retained", selected.Tools)
 	}
-	if selected.Name != "primary" || selected.Model != available[0].Model ||
-		selected.SystemPrompt != "full" || selected.Prompt != "primary prompt" {
-		t.Fatalf("selected = %+v, want the primary fields unchanged", selected)
-	}
-	if want := []string{"read_file", "write_file", "read_file"}; len(selected.Tools) != 3 ||
-		selected.Tools[0] != want[0] || selected.Tools[1] != want[1] || selected.Tools[2] != want[2] {
-		t.Fatalf("tools = %q, want loaded order with duplicates retained", selected.Tools)
-	}
-	if want := []string{"cap-b", "cap-a"}; len(selected.Capabilities) != 2 ||
-		selected.Capabilities[0] != want[0] || selected.Capabilities[1] != want[1] {
-		t.Fatalf("capabilities = %q, want selected order", selected.Capabilities)
+	{
+		want := []string{"cap-b", "cap-a"}
+		testassert.Require(t, len(selected.Capabilities) == 2 && selected.Capabilities[0] == want[0] && selected.Capabilities[1] == want[1], "capabilities = %q, want selected order", selected.Capabilities)
 	}
 
 	other, err := ResolveAgentType("explore", available)
-	if err != nil {
-		t.Fatalf("ResolveAgentType(explore): %v", err)
-	}
-	if other.Model != (model.ModelRef{}) || other.Capabilities != nil || other.Readonly || other.WriteDir != "" {
-		t.Fatalf("two Agent types share selection state: %+v", other)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, other.Model == (model.ModelRef{}) && other.Capabilities == nil && !other.Readonly && other.WriteDir == "", "two Agent types share selection state: %+v", other)
 
 	selected.Tools[0] = "tampered"
 	selected.Capabilities[0] = "tampered"
 	again, err := ResolveAgentType("primary", available)
-	if err != nil {
-		t.Fatalf("re-resolve: %v", err)
-	}
-	if again.Tools[0] != "read_file" || again.Capabilities[0] != "cap-b" {
-		t.Fatalf("selection aliases the supplied definitions: %+v", again)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, again.Tools[0] == "read_file" && again.Capabilities[0] == "cap-b", "selection aliases the supplied definitions: %+v", again)
 }
 
 // TestResolveAgentTypeRejections proves the invalid-input matrix: an empty or
@@ -110,12 +98,8 @@ func TestResolveAgentTypeRejections(t *testing.T) {
 				got, err = ResolveAgentType("x", row.available)
 			}
 		}
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("%s: err = %v, want ErrInvalid", row.name, err)
-		}
-		if got.Name != "" || got.Model != (model.ModelRef{}) || got.SystemPrompt != "" || got.Prompt != "" || got.Tools != nil || got.Capabilities != nil {
-			t.Fatalf("%s: returned %+v alongside the error, want the zero value", row.name, got)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid), "%s: err = %v, want ErrInvalid", row.name, err)
+		testassert.Require(t, got.Name == "" && got.Model == (model.ModelRef{}) && got.SystemPrompt == "" && got.Prompt == "" && got.Tools == nil && got.Capabilities == nil, "%s: returned %+v alongside the error, want the zero value", row.name, got)
 	}
 }
 
@@ -126,13 +110,6 @@ func TestResolveAgentTypeRejections(t *testing.T) {
 func TestResolveAgentTypeAcceptsEmptySelection(t *testing.T) {
 	available := []AgentType{{Name: "bare", SystemPrompt: "none", Tools: []string{"t", "t"}}}
 	selected, err := ResolveAgentType("bare", available)
-	if err != nil {
-		t.Fatalf("ResolveAgentType(bare): %v", err)
-	}
-	if !selected.Model.IsZero() || selected.Prompt != "" || selected.Capabilities != nil {
-		t.Fatalf("selected = %+v", selected)
-	}
-	if len(selected.Tools) != 2 {
-		t.Fatalf("tools = %q, want duplicates retained", selected.Tools)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, selected.Model.IsZero() && selected.Prompt == "" && selected.Capabilities == nil && len(selected.Tools) == 2, "selected = %+v; tools = %q, want duplicates retained", selected, selected.Tools)
 }

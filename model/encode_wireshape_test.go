@@ -3,6 +3,8 @@ package model
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // targetRef is the identity same-source fixtures in this file carry so replay keeps their extras on the wire; it equals testResolved().Model by construction of that helper's baseline.
@@ -11,8 +13,9 @@ var targetRef = ModelRef{Provider: "openai", Model: "gpt-test"}
 func unmarshalContentParts(t *testing.T, obj map[string]json.RawMessage) []map[string]json.RawMessage { // decodes one wire object's content key into ordered raw part objects (array form only; string-form rows use assertUserTextWire instead).
 	t.Helper()                             // a missing or non-array content key is the failure mode this helper reports, which is exactly what shape-regression rows want surfaced.
 	var parts []map[string]json.RawMessage // raw objects keep every key visible, so forbidden-key leaks are distinguishable from absence (typed decoding would drop unknowns silently).
-	if err := json.Unmarshal(obj["content"], &parts); err != nil || parts == nil {
-		t.Fatalf("content not an object array: %s", obj["content"])
+	{
+		err := json.Unmarshal(obj["content"], &parts)
+		testassert.Require(t, err == nil && parts != nil, "content not an object array: %s", obj["content"])
 	}
 	return parts // wire order equals request part order by encoder contract; rows below index into it directly.
 }
@@ -20,12 +23,12 @@ func unmarshalContentParts(t *testing.T, obj map[string]json.RawMessage) []map[s
 func assertStringField(t *testing.T, obj map[string]json.RawMessage, key, want string) {
 	t.Helper() // shared by every row pinning structural kind/identity fields on otherwise-raw objects in this file.
 	rawVal, ok := obj[key]
-	if !ok {
-		t.Fatalf("object missing %q: %#v", key, obj)
-	}
+	testassert.Require(t, ok, "object missing %q: %#v", key, obj)
 	var got string
-	if err := json.Unmarshal(rawVal, &got); err != nil || got != want { // type mismatch and value mismatch share one message so the failure class is obvious from output alone.
-		t.Fatalf("%s = %s (unmarshal error=%v), want %q", key, rawVal, err, want)
+	// type mismatch and value mismatch share one message so the failure class is obvious from output alone.
+	{
+		err := json.Unmarshal(rawVal, &got)
+		testassert.Require(t, err == nil && got == want, "%s = %s (unmarshal error=%v), want %q", key, rawVal, err, want)
 	}
 }
 
@@ -33,12 +36,11 @@ func assertStringField(t *testing.T, obj map[string]json.RawMessage, key, want s
 func assertUserTextWire(t *testing.T, obj map[string]json.RawMessage, text string) { // an object/number here is a shape regression: this helper fails on any non-string content type too.
 	t.Helper() // shared across the wire-shape and scope tests in this file so every call site has identical strength by delegation to one code path.
 	rawContent, ok := obj["content"]
-	if !ok {
-		t.Fatalf("object has no content key: %#v", obj)
-	}
+	testassert.Require(t, ok, "object has no content key: %#v", obj)
 	var got string
-	if err := json.Unmarshal(rawContent, &got); err != nil || got != text {
-		t.Fatalf("content = %s, want plain string %q (unmarshal error=%v)", rawContent, text, err)
+	{
+		err := json.Unmarshal(rawContent, &got)
+		testassert.Require(t, err == nil && got == text, "content = %s, want plain string %q (unmarshal error=%v)", rawContent, text, err)
 	}
 }
 
@@ -47,47 +49,38 @@ func TestMessageWireShapesPinsCanonicalFields(t *testing.T) {
 	rt := testResolved()
 
 	assistant, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "ok"}}}) // empty refusal/name must produce neither key on its wire object.
-	if err != nil {
-		t.Fatalf("NewMessage(assistant): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	callArgs := json.RawMessage(`{"path":"a/b","n":[1,2]}`)                                    // non-trivial raw bytes: quoting depth and inner commas are both observable on the wire after encoding.
 	called, err := NewToolCall(ToolCall{ID: "call_9", Name: "read_file", Arguments: callArgs}) // completed-call boundary clones argument bytes like production paths do (ownership pinned separately by TestEncodeCallerImmutability).
-	if err != nil {
-		t.Fatalf("NewToolCall: %v", err)
-	}
+	testassert.NoError(t, err)
 	calledMsg, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "go"}}, ToolCalls: []ToolCall{called}}) // tool-call-only assistant messages are valid by contract.
-	if err != nil {
-		t.Fatalf("NewMessage(assistant with call): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	namedResult := mustMsg(t, Message{Role: RoleTool, ToolCallID: "call_9", Name: "read_file", Content: []ContentPart{{Kind: PartText, Text: "file contents"}}}) // tool result carrying both its required call id and optional name.
 	emptyResult := mustMsg(t, Message{Role: RoleTool, ToolCallID: "call_empty"})
 	refused, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "no"}}, Refusal: "blocked"}) // positive side of the refusal field (message 1 above pins its negative absence).
-	if err != nil {
-		t.Fatalf("NewMessage(refusal): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	body := mustEncode(t, rt, Request{Messages: []Message{userText("hi"), assistant, calledMsg, namedResult}}) // four messages in request order; every row below indexes this single body.
 	msgs := decodeMessages(t, body)                                                                            // count mismatch is a structural failure reported before any field-level rows run.
-	if len(msgs) != 4 {
-		t.Fatalf("encoded %d messages, want 4: %s", len(msgs), string(body))
-	}
+	testassert.Require(t, len(msgs) == 4, "encoded %d messages, want 4: %s", len(msgs), string(body))
 
-	assertUserTextWire(t, msgs[0], "hi")                                      // user text encodes as a plain JSON string with nothing else on the object.
-	if raw, ok := wireString(t, msgs[1], "role"); !ok || raw != "assistant" { // non-system roles pass through unchanged (system mapping is pinned by its dedicated test).
-		t.Fatalf("message[1] role = %v want assistant", msgs[1]["role"])
+	assertUserTextWire(t, msgs[0], "hi") // user text encodes as a plain JSON string with nothing else on the object.
+	// non-system roles pass through unchanged (system mapping is pinned by its dedicated test).
+	{
+		raw, ok := wireString(t, msgs[1], "role")
+		testassert.Require(t, ok && raw == "assistant", "message[1] role = %v want assistant", msgs[1]["role"])
 	}
 	for _, key := range []string{"refusal", "name", "tool_call_id"} { // empty optional fields produce no keys at all (not null, not empty string): absence is the pinned behavior.
-		if _, ok := msgs[1][key]; ok {
-			t.Fatalf("message[1] must not carry %q: %#v", key, msgs[1])
+		{
+			_, ok := msgs[1][key]
+			testassert.Require(t, !ok, "message[1] must not carry %q: %#v", key, msgs[1])
 		}
 	}
 
 	rawCalls, ok := msgs[2]["tool_calls"] // the whole array is under test at message 2 (count and per-call shape both pinned here).
-	if !ok {
-		t.Fatalf("message[2] missing tool_calls: %#v", msgs[2])
-	}
+	testassert.Require(t, ok, "message[2] missing tool_calls: %#v", msgs[2])
 	var calls []struct {
 		ID   string `json:"id"` // typed view for the three canonical fields; raw key-presence checks cover everything else (extras, private keys).
 		Type string `json:"type"`
@@ -96,36 +89,47 @@ func TestMessageWireShapesPinsCanonicalFields(t *testing.T) {
 			Arguments json.RawMessage `json:"arguments"` // must decode back to exactly the raw bytes sent in.
 		} `json:"function"`
 	}
-	if err := json.Unmarshal(rawCalls, &calls); err != nil || len(calls) != 1 {
-		t.Fatalf("tool_calls wrong: %s", string(rawCalls))
+	{
+		err := json.Unmarshal(rawCalls, &calls)
+		testassert.Require(t, err == nil && len(calls) == 1, "tool_calls wrong: %s", string(rawCalls))
 	}
-	if calls[0].ID != "call_9" || calls[0].Type != "function" || calls[0].Fn.Name != "read_file" { // id present, explicit function type, nested name (no inner type field per the retained shape).
-		t.Fatalf("call identity/type/name = %+v, want call_9/function/read_file: %s", calls[0], string(rawCalls))
-	}
+	// id present, explicit function type, nested name (no inner type field per the retained shape).
+	testassert.Require(t, calls[0].ID == "call_9" && calls[0].Type == "function" && calls[0].Fn.Name == "read_file", "call identity/type/name = %+v, want call_9/function/read_file: %s", calls[0], string(rawCalls))
 	var argsAsString string
-	if err := json.Unmarshal(calls[0].Fn.Arguments, &argsAsString); err != nil || argsAsString != `{"path":"a/b","n":[1,2]}` { // its unescaped content must equal the exact argument bytes sent in (byte fidelity of the rendering itself, not merely semantic JSON equality).
-		t.Fatalf("arguments = %s, want exactly the raw-JSON string form of the original argument bytes", calls[0].Fn.Arguments)
+	// its unescaped content must equal the exact argument bytes sent in (byte fidelity of the rendering itself, not merely semantic JSON equality).
+	{
+		err := json.Unmarshal(calls[0].Fn.Arguments, &argsAsString)
+		testassert.Require(t, err == nil && argsAsString == `{"path":"a/b","n":[1,2]}`, "arguments = %s, want exactly the raw-JSON string form of the original argument bytes", calls[0].Fn.Arguments)
 	}
 
-	if rawID, ok := wireString(t, msgs[3], "tool_call_id"); !ok || rawID != "call_9" { // tool results carry the original call id they answer.
-		t.Fatalf("message[3] tool_call_id = %v want call_9", msgs[3]["tool_call_id"])
+	// tool results carry the original call id they answer.
+	{
+		rawID, ok := wireString(t, msgs[3], "tool_call_id")
+		testassert.Require(t, ok && rawID == "call_9", "message[3] tool_call_id = %v want call_9", msgs[3]["tool_call_id"])
 	}
-	if rawName, ok := wireString(t, msgs[3], "name"); !ok || rawName != "read_file" { // optional name emits exactly when present.
-		t.Fatalf("message[3] name = %v want read_file", msgs[3]["name"])
+	// optional name emits exactly when present.
+	{
+		rawName, ok := wireString(t, msgs[3], "name")
+		testassert.Require(t, ok && rawName == "read_file", "message[3] name = %v want read_file", msgs[3]["name"])
 	}
 
-	body2 := mustEncode(t, rt, Request{Messages: []Message{refused}})                         // separate encode keeps refusal's positive assertion independent from message 1's negative one above.
-	msgs2 := decodeMessages(t, body2)                                                         // exactly one wire object for this single-message request.
-	if rawRefusal, ok := wireString(t, msgs2[0], "refusal"); !ok || rawRefusal != "blocked" { // non-empty refusal appears with its exact value on the assistant path.
-		t.Fatalf("refusal = %v want blocked", msgs2[0]["refusal"])
+	body2 := mustEncode(t, rt, Request{Messages: []Message{refused}}) // separate encode keeps refusal's positive assertion independent from message 1's negative one above.
+	msgs2 := decodeMessages(t, body2)                                 // exactly one wire object for this single-message request.
+	// non-empty refusal appears with its exact value on the assistant path.
+	{
+		rawRefusal, ok := wireString(t, msgs2[0], "refusal")
+		testassert.Require(t, ok && rawRefusal == "blocked", "refusal = %v want blocked", msgs2[0]["refusal"])
 	}
-	if _, ok := msgs2[0]["name"]; ok { // name still absent: empty-value omission does not change when other optional fields are present (per-field independence).
-		t.Fatalf("message must not carry an empty name key: %#v", msgs2[0])
+	// name still absent: empty-value omission does not change when other optional fields are present (per-field independence).
+	{
+		_, ok := msgs2[0]["name"]
+		testassert.Require(t, !ok, "message must not carry an empty name key: %#v", msgs2[0])
 	}
 
 	emptyWire := decodeMessages(t, mustEncode(t, rt, Request{Messages: []Message{emptyResult}}))[0]
-	if content, ok := wireString(t, emptyWire, "content"); !ok || content != "" {
-		t.Fatalf("empty tool result content = %q, present=%v; want a present empty string", content, ok)
+	{
+		content, ok := wireString(t, emptyWire, "content")
+		testassert.Require(t, ok && content == "", "empty tool result content = %q, present=%v; want a present empty string", content, ok)
 	}
 }
 
@@ -135,9 +139,7 @@ func TestContentWireShapesPinsStringVsArray(t *testing.T) {
 
 	t.Run("multiple-parts-ordered-array", func(t *testing.T) { // text then image_url: both objects appear in request order with exact kind fields and no invented keys.
 		m, err := NewMessage(Message{Role: RoleUser, Content: []ContentPart{{Kind: PartText, Text: "look"}, {Kind: PartImageURL, URL: "https://img/x.png"}}}) // user messages carry the zero source by contract.
-		if err != nil {
-			t.Fatalf("NewMessage(multi-part): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}})
 		msgs := decodeMessages(t, body)                     // one wire object for this request.
 		parts := unmarshalContentParts(t, msgs[0])          // array form is forced by having two parts; a bare string would fail inside the helper above with its diagnostic naming exactly this row.
@@ -147,8 +149,9 @@ func TestContentWireShapesPinsStringVsArray(t *testing.T) {
 		var image struct {
 			URL string `json:"url"`
 		} // nested object shape fixed by the retained encoder: exactly one url field.
-		if err := json.Unmarshal(parts[1]["image_url"], &image); err != nil || image.URL != "https://img/x.png" {
-			t.Fatalf("image_url = %s, want url https://img/x.png", parts[1]["image_url"])
+		{
+			err := json.Unmarshal(parts[1]["image_url"], &image)
+			testassert.Require(t, err == nil && image.URL == "https://img/x.png", "image_url = %s, want url https://img/x.png", parts[1]["image_url"])
 		}
 	})
 
@@ -159,8 +162,9 @@ func TestContentWireShapesPinsStringVsArray(t *testing.T) {
 		parts := unmarshalContentParts(t, msgs[0])     // must be the array form now — a bare string fails inside that helper with content-not-an-object-array.
 		assertStringField(t, parts[0], "type", "text") // kind field appears in object form (string-form rows never see one at all).
 		assertStringField(t, parts[0], "text", "hi")   // text under its canonical key alongside the extra.
-		if got, ok := parts[0]["part_marker"]; !ok || string(got) != `1` {
-			t.Fatalf("kept part extra missing or altered from the array-form object: %#v", parts[0])
+		{
+			got, ok := parts[0]["part_marker"]
+			testassert.Require(t, ok && string(got) == `1`, "kept part extra missing or altered from the array-form object: %#v", parts[0])
 		}
 	})
 
@@ -169,20 +173,22 @@ func TestContentWireShapesPinsStringVsArray(t *testing.T) {
 		body2 := mustEncode(t, rt, Request{Messages: []Message{stripped}})                                                                                                                  // encode of the stripped fixture produces the observable wire bytes below.
 		msgsA := decodeMessages(t, body2)                                                                                                                                                   // one message for this request.
 		assertUserTextWire(t, msgsA[0], "hi")                                                                                                                                               // stripped extras never promote to array form: plain string is exactly what rule 10 mandates when nothing survives at that position.
-		if _, ok := msgsA[0]["name"]; ok {                                                                                                                                                  // guard against invented keys riding alongside content on this minimal fixture (none were set in the source).
-			t.Fatalf("stripped message must not carry invented keys: %#v", msgsA[0])
+		// guard against invented keys riding alongside content on this minimal fixture (none were set in the source).
+		{
+			_, ok := msgsA[0]["name"]
+			testassert.Require(t, !ok, "stripped message must not carry invented keys: %#v", msgsA[0])
 		}
 	})
 
 	t.Run("all-opaque-stripped-omits-content-key", func(t *testing.T) {
 		opaque, err := NewMessage(Message{Role: RoleAssistant, Source: foreignModel, Content: []ContentPart{{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"s"`)}}}}) // opaque part with its original wire fields in extras; cross-provider source strips everything.
-		if err != nil {
-			t.Fatalf("NewMessage(opaque): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{opaque}})
-		msgs := decodeMessages(t, body)      // one wire object for this request.
-		if _, ok := msgs[0]["content"]; ok { // absence of the key entirely is the pinned behavior (null or an empty array would each be a different observable outcome not specified here).
-			t.Fatalf("stripped all-opaque message must omit content, got %#v", msgs[0])
+		msgs := decodeMessages(t, body) // one wire object for this request.
+		// absence of the key entirely is the pinned behavior (null or an empty array would each be a different observable outcome not specified here).
+		{
+			_, ok := msgs[0]["content"]
+			testassert.Require(t, !ok, "stripped all-opaque message must omit content, got %#v", msgs[0])
 		}
 	})
 }
@@ -193,25 +199,22 @@ func TestOpaquePartReplayKeptAndStripped(t *testing.T) {
 
 	t.Run("kept-reconstructs-original-wire-object", func(t *testing.T) {
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "preamble"}, {Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"hidden"`), "_lightcode_private": json.RawMessage(`1`)}}}}) // text first so order is observable; the private field must still be filtered out inside a kept scope.
-		if err != nil {
-			t.Fatalf("NewMessage(opaque kept fixture): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}})
 		msgs := decodeMessages(t, body)                    // one wire object for this request.
 		parts := unmarshalContentParts(t, msgs[0])         // two objects in original order on the wire (count enforced inside the helper's own check).
 		assertStringField(t, parts[1], "type", "thinking") // structural OpaqueWireType lands as type — not the literal internal kind name and not any extra value.
 		assertStringField(t, parts[1], "summary", `hidden`)
-		if _, ok := parts[1]["_lightcode_private"]; ok {
-			// private persistence fields never reconstruct even under full retention.
-			t.Fatalf("private field leaked onto a reconstructed opaque part: %#v", parts[1])
+		// private persistence fields never reconstruct even under full retention.
+		{
+			_, ok := parts[1]["_lightcode_private"]
+			testassert.Require(t, !ok, "private field leaked onto a reconstructed opaque part: %#v", parts[1])
 		}
 	})
 
 	t.Run("stripped-drops-opaque-keeps-siblings", func(t *testing.T) {
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: foreignModel, Content: []ContentPart{{Kind: PartText, Text: "preamble"}, {Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"hidden"`)}}}}) // same shape as above but under a stripping source.
-		if err != nil {
-			t.Fatalf("NewMessage(opaque stripped fixture): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}})
 		msgs := decodeMessages(t, body)                    // one wire object for this request.
 		parts := unmarshalContentParts(t, msgs[0])         // exactly the text part may remain (count 1 enforced inside the helper).
@@ -221,13 +224,13 @@ func TestOpaquePartReplayKeptAndStripped(t *testing.T) {
 
 	t.Run("stripped-all-opaque-omits-content-key", func(t *testing.T) {
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: foreignModel, Content: []ContentPart{{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"h"`)}}}}) // single opaque part only under a stripping source (minimal fixture for the absence-of-key outcome class).
-		if err != nil {
-			t.Fatalf("NewMessage(all-opaque): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}})
-		msgs := decodeMessages(t, body)      // one wire object for this request.
-		if _, ok := msgs[0]["content"]; ok { // absence again through a tool-call-free assistant entry shape (the sibling test pins the same outcome from its own fixture construction path).
-			t.Fatalf("all-opaque stripped message must omit content, got %#v", msgs[0])
+		msgs := decodeMessages(t, body) // one wire object for this request.
+		// absence again through a tool-call-free assistant entry shape (the sibling test pins the same outcome from its own fixture construction path).
+		{
+			_, ok := msgs[0]["content"]
+			testassert.Require(t, !ok, "all-opaque stripped message must omit content, got %#v", msgs[0])
 		}
 	})
 }
@@ -245,22 +248,17 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			"_lightcode_x":  json.RawMessage(`1`),           // private floor applies inside a tool call too (rule 9 is shared across every scope).
 			"n":             json.RawMessage(`7`),           // reserved top-level key: never from extras at any scope including this nested one.
 		}})
-		if err != nil {
-			t.Fatalf("NewToolCall(call-scope fixture): %v", err)
-		}
+		testassert.NoError(t, err)
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "go"}}, ToolCalls: []ToolCall{call}}) // content present keeps this row focused on call-scope filtering rather than payload-validation rules owned by other suites.
-		if err != nil {
-			t.Fatalf("NewMessage(call-scope msg): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}}) // single encode covers every call-scope assertion below (subtest stays self-contained by design).
 		msgs := decodeMessages(t, body)                            // one wire object for this request.
 		rawCalls, ok := msgs[0]["tool_calls"]                      // the array itself must survive encoding before any per-call field rows can be evaluated against it.
-		if !ok {
-			t.Fatalf("message lost its tool_call array: %#v", msgs[0])
-		}
+		testassert.Require(t, ok, "message lost its tool_call array: %#v", msgs[0])
 		var calls []map[string]json.RawMessage
-		if err := json.Unmarshal(rawCalls, &calls); err != nil || len(calls) != 1 {
-			t.Fatalf("tool_calls not a one-object array: %s", string(rawCalls))
+		{
+			err := json.Unmarshal(rawCalls, &calls)
+			testassert.Require(t, err == nil && len(calls) == 1, "tool_calls not a one-object array: %s", string(rawCalls))
 		}
 		assertStringField(t, calls[0], "id", "c1")
 		assertStringField(t, calls[0], "type", "function") // explicit function type survives any forged extra attempt for the same dual-mechanism reason as above.
@@ -268,15 +266,19 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal(calls[0]["function"], &fn); err != nil || fn.Name != "lookup" { // nested function intact under its canonical key (no inner type field per the retained shape).
-			t.Fatalf("call.function = %s, want name lookup: %s", calls[0]["function"], string(rawCalls))
+		// nested function intact under its canonical key (no inner type field per the retained shape).
+		{
+			err := json.Unmarshal(calls[0]["function"], &fn)
+			testassert.Require(t, err == nil && fn.Name == "lookup", "call.function = %s, want name lookup: %s", calls[0]["function"], string(rawCalls))
 		}
-		if got, ok := calls[0]["provider_hint"]; !ok || string(got) != `42` {
-			t.Fatalf("kept call-scope extra missing or altered: %#v", calls[0])
+		{
+			got, ok := calls[0]["provider_hint"]
+			testassert.Require(t, ok && string(got) == `42`, "kept call-scope extra missing or altered: %#v", calls[0])
 		}
 		for _, key := range []string{"_lightcode_x", "n", "index"} { // private floor, reserved top-level keys, and streaming-only call fields never reach this wire object.
-			if _, ok := calls[0][key]; ok {
-				t.Fatalf("forbidden key %q leaked onto the wire object of a tool call: %#v", key, calls[0])
+			{
+				_, ok := calls[0][key]
+				testassert.Require(t, !ok, "forbidden key %q leaked onto the wire object of a tool call: %#v", key, calls[0])
 			}
 		}
 	})
@@ -295,23 +297,25 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 		base.Extra = forged
 		// mutation of the owned copy is safe: Encode deep-copies at entry (pinned separately by TestEncodeCallerImmutability for this boundary class).
 		validated, err := NewMessage(base) // re-run construction so the stored value obeys ownership/clone rules like every other fixture reaching an accepting boundary.
-		if err != nil {
-			t.Fatalf("NewMessage(forgery-set message): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{validated}}) // one encode of the fully-forged kept message pins every row below at once.
 		msgs := decodeMessages(t, body)                                    // single wire object for this request.
 		obj := msgs[0]                                                     // the only message on this wire; all assertions read it directly without further fixtures by design.
 
-		if rawRole, ok := wireString(t, obj, "role"); !ok || rawRole != "assistant" {
-			t.Fatalf("wire role = %v want assistant: %#v", obj["role"], obj)
+		{
+			rawRole, ok := wireString(t, obj, "role")
+			testassert.Require(t, ok && rawRole == "assistant", "wire role = %v want assistant: %#v", obj["role"], obj)
 		}
-		assertUserTextWire(t, obj, "body")              // content is the real part text, not a forged string from an extra of that same key name.
-		if _, ok := wireString(t, obj, "marker"); !ok { // legitimate retention still happened: marker survived next to every forgery on its message (positive counterweight keeping balance visible).
-			t.Fatalf("legitimate marker lost while forging siblings present: %#v", obj)
+		assertUserTextWire(t, obj, "body") // content is the real part text, not a forged string from an extra of that same key name.
+		// legitimate retention still happened: marker survived next to every forgery on its message (positive counterweight keeping balance visible).
+		{
+			_, ok := wireString(t, obj, "marker")
+			testassert.Require(t, ok, "legitimate marker lost while forging siblings present: %#v", obj)
 		}
 		for _, key := range []string{"_lightcode_state", "refusal", "tool_call_id", "name", "function_call", "system_fingerprint", "service_tier", "id", "created", "object", "stream"} { // the reserved top-level stream forgery must be omitted by the shared message-scope filter exactly like its canonical/private siblings.
-			if _, ok := obj[key]; ok {
-				t.Fatalf("forbidden message-scope key %q reached the wire: %#v", key, obj)
+			{
+				_, ok := obj[key]
+				testassert.Require(t, !ok, "forbidden message-scope key %q reached the wire: %#v", key, obj)
 			}
 		}
 	})
@@ -324,20 +328,20 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			"n":            json.RawMessage(`7`),             // reserved top-level name never comes from extras at any scope, including this nested one.
 		}}
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{part}, Name: ""})
-		if err != nil {
-			t.Fatalf("NewMessage(part-scope fixture): %v", err)
-		}
+		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}}) // single encode of the fully-forged kept part pins every row below at once (no further fixtures needed for this subtest by design).
 		msgs := decodeMessages(t, body)                            // one wire message expected back from that request above.
 		parts := unmarshalContentParts(t, msgs[0])
 		assertStringField(t, parts[0], "type", "text")
 		assertStringField(t, parts[0], "text", "real text")
-		if got, ok := parts[0]["note"]; !ok || string(got) != `7` {
-			t.Fatalf("kept part-scope extra missing or altered: %#v", parts[0])
+		{
+			got, ok := parts[0]["note"]
+			testassert.Require(t, ok && string(got) == `7`, "kept part-scope extra missing or altered: %#v", parts[0])
 		}
 		for _, key := range []string{"_lightcode_p", "n"} { // private floor and reserved top-level keys never reach this wire object.
-			if _, ok := parts[0][key]; ok {
-				t.Fatalf("forbidden key %q leaked onto the wire object of a content part: %#v", key, parts[0])
+			{
+				_, ok := parts[0][key]
+				testassert.Require(t, !ok, "forbidden key %q leaked onto the wire object of a content part: %#v", key, parts[0])
 			}
 		}
 	})

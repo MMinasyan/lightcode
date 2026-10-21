@@ -3,44 +3,55 @@ package model
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestExtraAccumulatorConcatenatesStrings(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("reasoning_content", json.RawMessage(`"hello "`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning_content", json.RawMessage(`"hello "`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("reasoning_content", json.RawMessage(`"world"`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning_content", json.RawMessage(`"world"`))
+		testassert.NoError(t, err)
 	}
-	if got := string(acc.Finalize()["reasoning_content"]); got != `"hello world"` {
-		t.Fatalf("reasoning_content = %s", got)
+	{
+		got := string(acc.Finalize()["reasoning_content"])
+		testassert.Equal(t, got, `"hello world"`)
 	}
 }
 
 func TestExtraAccumulatorAppendsArrays(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("reasoning_details", json.RawMessage(`[{"type":"text","text":"a"}]`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning_details", json.RawMessage(`[{"type":"text","text":"a"}]`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("reasoning_details", json.RawMessage(`[{"type":"encrypted","data":"b"}]`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning_details", json.RawMessage(`[{"type":"encrypted","data":"b"}]`))
+		testassert.NoError(t, err)
 	}
-	if got := string(acc.Finalize()["reasoning_details"]); got != `[{"type":"text","text":"a"},{"type":"encrypted","data":"b"}]` {
-		t.Fatalf("reasoning_details = %s", got)
+	{
+		got := string(acc.Finalize()["reasoning_details"])
+		testassert.Equal(t, got, `[{"type":"text","text":"a"},{"type":"encrypted","data":"b"}]`)
 	}
 }
 
 func TestExtraAccumulatorObjectLastWriteWins(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("reasoning", json.RawMessage(`{"first":true}`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning", json.RawMessage(`{"first":true}`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("reasoning", json.RawMessage(`{"second":true}`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning", json.RawMessage(`{"second":true}`))
+		testassert.NoError(t, err)
 	}
-	if got := string(acc.Finalize()["reasoning"]); got != `{"second":true}` {
-		t.Fatalf("reasoning = %s", got)
+	{
+		got := string(acc.Finalize()["reasoning"])
+		testassert.Equal(t, got, `{"second":true}`)
 	}
 }
 
@@ -49,21 +60,25 @@ func TestExtraAccumulatorNumberAndBooleanAreOtherKind(t *testing.T) {
 	for _, pair := range pairs {
 		t.Run(pair[0]+" to "+pair[1], func(t *testing.T) {
 			acc := NewExtraAccumulator()
-			if err := acc.Add("n", json.RawMessage(pair[0])); err != nil {
-				t.Fatalf("Add(%s) returned error: %v", pair[0], err)
+			{
+				err := acc.Add("n", json.RawMessage(pair[0]))
+				testassert.Require(t, err == nil, "Add(%s) returned error: %v", pair[0], err)
 			}
-			if err := acc.Add("n", json.RawMessage(pair[1])); err != nil {
-				t.Fatalf("%s to %s must replace within the other kind without error, got %v", pair[0], pair[1], err)
+			{
+				err := acc.Add("n", json.RawMessage(pair[1]))
+				testassert.Require(t, err == nil, "%s to %s must replace within the other kind without error, got %v", pair[0], pair[1], err)
 			}
-			if got := string(acc.Finalize()["n"]); got != pair[1] {
-				t.Fatalf("n = %s, want latest value replacing the previous same-kind one (%s)", got, pair[1])
+			{
+				got := string(acc.Finalize()["n"])
+				testassert.Equal(t, got, pair[1])
 			}
 		})
 	}
 
 	mixed := NewExtraAccumulator() // number to boolean is still the same other kind: replace without error.
-	if err := mixed.Add("m", json.RawMessage(`5`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := mixed.Add("m", json.RawMessage(`5`))
+		testassert.NoError(t, err)
 	}
 	if err := mixed.Add("m", json.RawMessage(`true`)); err != nil {
 		t.Fatalf("number to boolean must replace within the other kind without error, got %v", err)
@@ -72,8 +87,9 @@ func TestExtraAccumulatorNumberAndBooleanAreOtherKind(t *testing.T) {
 	}
 
 	toOther := NewExtraAccumulator() // string to number crosses kinds: error plus keep latest.
-	if err := toOther.Add("o", json.RawMessage(`"text"`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := toOther.Add("o", json.RawMessage(`"text"`))
+		testassert.NoError(t, err)
 	}
 	if err := toOther.Add("o", json.RawMessage(`7`)); err == nil {
 		t.Fatal("string to number must return a kind-change accumulator error")
@@ -82,54 +98,65 @@ func TestExtraAccumulatorNumberAndBooleanAreOtherKind(t *testing.T) {
 	}
 
 	fromNull := NewExtraAccumulator()
-	if err := fromNull.Add("z", json.RawMessage(`null`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := fromNull.Add("z", json.RawMessage(`null`))
+		testassert.NoError(t, err)
 	}
 	if err := fromNull.Add("z", json.RawMessage(`"s"`)); err == nil {
 		t.Fatal("null to string must return a kind-change accumulator error")
 	} else if _, ok := fromNull.Finalize()["z"]; !ok {
 		t.Fatalf("latest value after null->string change not kept: %#v", fromNull.Finalize())
 	}
-	if got, present := fromNull.Finalize()["z"]; !present || string(got) != `"s"` {
-		t.Fatalf("finalized z = %q (present=%v), want \"s\"", got, present)
+	{
+		got, present := fromNull.Finalize()["z"]
+		testassert.Require(t, present && string(got) == `"s"`, "finalized z = %q (present=%v), want \"s\"", got, present)
 	}
 }
 
 func TestExtraAccumulatorKindChangeReturnsErrorAndKeepsLastValue(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("reasoning", json.RawMessage(`"text"`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("reasoning", json.RawMessage(`"text"`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("reasoning", json.RawMessage(`[{"type":"text"}]`)); err == nil {
-		t.Fatal("Add returned nil error for kind change")
+	{
+		err := acc.Add("reasoning", json.RawMessage(`[{"type":"text"}]`))
+		testassert.Require(t, err != nil, "%v", "Add returned nil error for kind change")
 	}
-	if got := string(acc.Finalize()["reasoning"]); got != `[{"type":"text"}]` {
-		t.Fatalf("reasoning = %s", got)
+	{
+		got := string(acc.Finalize()["reasoning"])
+		testassert.Equal(t, got, `[{"type":"text"}]`)
 	}
 }
 
 func TestExtraAccumulatorOmitsNullValuesOnFinalize(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("drop", json.RawMessage(`null`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("drop", json.RawMessage(`null`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("keep", json.RawMessage(`""`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("keep", json.RawMessage(`""`))
+		testassert.NoError(t, err)
 	}
 	out := acc.Finalize()
-	if _, ok := out["drop"]; ok {
-		t.Fatalf("null value was kept: %#v", out)
+	{
+		_, ok := out["drop"]
+		testassert.Require(t, !ok, "null value was kept: %#v", out)
 	}
-	if got := string(out["keep"]); got != `""` {
-		t.Fatalf("keep = %s", got)
+	{
+		got := string(out["keep"])
+		testassert.Equal(t, got, `""`)
 	}
 
 	replacedNull := NewExtraAccumulator()
-	if err := replacedNull.Add("k", json.RawMessage(`"a"`)); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := replacedNull.Add("k", json.RawMessage(`"a"`))
+		testassert.NoError(t, err)
 	}
-	if err := replacedNull.Add("k", json.RawMessage(`null`)); err == nil {
-		t.Fatal("string to null must return a kind-change accumulator error")
+	{
+		err := replacedNull.Add("k", json.RawMessage(`null`))
+		testassert.Require(t, err != nil, "%v", "string to null must return a kind-change accumulator error")
 	}
 	if _, ok := replacedNull.Finalize()["k"]; ok {
 		t.Fatalf("latest value is null and must be omitted: %#v", replacedNull.Finalize())
@@ -138,14 +165,17 @@ func TestExtraAccumulatorOmitsNullValuesOnFinalize(t *testing.T) {
 
 func TestExtraAccumulatorIgnoresEmptyKeyAndValue(t *testing.T) {
 	acc := NewExtraAccumulator()
-	if err := acc.Add("", json.RawMessage(`"x"`)); err != nil {
-		t.Fatalf("Add empty key returned error: %v", err)
+	{
+		err := acc.Add("", json.RawMessage(`"x"`))
+		testassert.NoError(t, err)
 	}
-	if err := acc.Add("k", json.RawMessage(nil)); err != nil {
-		t.Fatalf("Add empty value returned error: %v", err)
+	{
+		err := acc.Add("k", json.RawMessage(nil))
+		testassert.NoError(t, err)
 	}
-	if got := acc.Finalize(); len(got) != 0 {
-		t.Fatalf("Finalize = %#v, want empty", got)
+	{
+		got := acc.Finalize()
+		testassert.Require(t, len(got) == 0, "Finalize = %#v, want empty", got)
 	}
 }
 
@@ -153,24 +183,20 @@ func TestExtraCloneDeepCopiesValues(t *testing.T) {
 	srcRaw := json.RawMessage(`"hello"`)
 	in := Extra{"a": srcRaw} // direct assignment shares bytes by caller choice; Clone is the accepting boundary.
 	out := in.Clone()
-	if string(out["a"]) != `"hello"` {
-		t.Fatalf("clone a = %s", out["a"])
-	}
-	if len(srcRaw) > 0 && &out["a"][0] == &srcRaw[0] {
-		t.Fatal("Clone shares bytes with its input")
-	}
+	testassert.Require(t, string(out["a"]) == `"hello"`, "clone a = %s", out["a"])
+	testassert.Require(t, len(srcRaw) <= 0 || &out["a"][0] != &srcRaw[0], "%v", "Clone shares bytes with its input")
 	out["a"][1] = 'H' // corrupt the clone's retained copy.
-	if got := string(in["a"]); got != `"hello"` {
-		t.Fatalf("original extra mutated through a Clone result: %s", in["a"])
+	{
+		got := string(in["a"])
+		testassert.Require(t, got == `"hello"`, "original extra mutated through a Clone result: %s", in["a"])
 	}
 
 	var nilExtra Extra
-	if got := nilExtra.Clone(); got != nil {
-		t.Fatalf("nil Clone = %#v, want nil", got)
+	{
+		got := nilExtra.Clone()
+		testassert.Require(t, got == nil, "nil Clone = %#v, want nil", got)
 	}
-	if len(out) != 1 {
-		t.Fatalf("clone of one-entry extra wrong: %#v", out)
-	}
+	testassert.Require(t, len(out) == 1, "clone of one-entry extra wrong: %#v", out)
 }
 
 func TestExtraFinalizeDropsNullsAndDeepCopies(t *testing.T) {
@@ -179,23 +205,24 @@ func TestExtraFinalizeDropsNullsAndDeepCopies(t *testing.T) {
 		"keep": json.RawMessage(`""`),
 	}
 	clean := extra.Finalize()
-	if _, ok := clean["drop"]; ok {
-		t.Fatalf("null value was kept: %#v", clean)
+	{
+		_, ok := clean["drop"]
+		testassert.Require(t, !ok, "null value was kept: %#v", clean)
 	}
-	if got := string(clean["keep"]); got != `""` {
-		t.Fatalf("keep = %s", got)
+	{
+		got := string(clean["keep"])
+		testassert.Equal(t, got, `""`)
 	}
 
 	srcRaw := json.RawMessage(`"x"`)
 	withNull := Extra{"n": json.RawMessage(`null`), "k": srcRaw}
 	out := withNull.Finalize()
-	if out["k"] == nil || &out["k"][0] == &srcRaw[0] {
-		t.Fatal("finalize did not deep copy retained values")
-	}
+	testassert.Require(t, out["k"] != nil && &out["k"][0] != &srcRaw[0], "%v", "finalize did not deep copy retained values")
 
 	var zero Extra
-	if z := zero.Finalize(); z != nil {
-		t.Fatalf("zero Finalize = %#v, want nil", z)
+	{
+		z := zero.Finalize()
+		testassert.Require(t, z == nil, "zero Finalize = %#v, want nil", z)
 	}
 	allNull := Extra{"only": json.RawMessage(`null`)}
 	if len(allNull.Finalize()) != 0 {
@@ -206,38 +233,32 @@ func TestExtraFinalizeDropsNullsAndDeepCopies(t *testing.T) {
 func TestCloneRawCopiesBytes(t *testing.T) {
 	src := json.RawMessage(`"abc"`)
 	dst := CloneRaw(src)
-	if string(dst) != `"abc"` || len(dst) == 0 || &dst[0] == &src[0] {
-		t.Fatalf("CloneRaw = %s, want independent copy", dst)
-	}
+	testassert.Require(t, string(dst) == `"abc"` && len(dst) != 0 && &dst[0] != &src[0], "CloneRaw = %s, want independent copy", dst)
 	var nilSrc json.RawMessage
-	if got := CloneRaw(nilSrc); len(got) != 0 {
-		t.Fatalf("CloneRaw(nil) = %#v, want empty", got)
+	{
+		got := CloneRaw(nilSrc)
+		testassert.Require(t, len(got) == 0, "CloneRaw(nil) = %#v, want empty", got)
 	}
 	dst[1] = 'x'
-	if string(src) != `"abc"` {
-		t.Fatal("mutating the copy changed the source")
-	}
+	testassert.Require(t, string(src) == `"abc"`, "%v", "mutating the copy changed the source")
 }
 
 func TestExtraAccumulatorAddDeepCopiesInput(t *testing.T) {
 	srcRaw := json.RawMessage(`"first"`)
 	acc := NewExtraAccumulator()
-	if err := acc.Add("k", srcRaw); err != nil {
-		t.Fatalf("Add returned error: %v", err)
+	{
+		err := acc.Add("k", srcRaw)
+		testassert.NoError(t, err)
 	}
 	srcRaw[1] = 'X'
 	got := acc.Finalize()["k"]
-	if string(got)[:1] == `"X` || &got[0] == &srcRaw[0] {
-		t.Fatalf("accumulator stored caller bytes: %s", got)
-	}
+	testassert.Require(t, string(got)[:1] != `"X` && &got[0] != &srcRaw[0], "accumulator stored caller bytes: %s", got)
 
 	out := acc.Finalize()
 	src2 := json.RawMessage(`"second"`)
 	in := Extra{"k": src2}
 	clonedExtra := in.Clone()
-	if &clonedExtra["k"][0] == &src2[0] {
-		t.Fatal("Clone shared bytes with input")
-	}
+	testassert.Require(t, &clonedExtra["k"][0] != &src2[0], "%v", "Clone shared bytes with input")
 	_ = out
 }
 
@@ -258,15 +279,14 @@ func TestExtraHasValuesMatchesFinalizedRetention(t *testing.T) {
 		{"object": json.RawMessage(`{}`)},
 	}
 	for _, e := range extras {
-		if got, want := e.HasValues(), len(e.Finalize()) > 0; got != want {
-			t.Fatalf("Extra %#v: HasValues = %v, want %v", map[string]json.RawMessage(e), got, want)
+		{
+			got, want := e.HasValues(), len(e.Finalize()) > 0
+			testassert.Require(t, got == want, "Extra %#v: HasValues = %v, want %v", map[string]json.RawMessage(e), got, want)
 		}
 	}
 
 	var nilAcc *ExtraAccumulator
-	if nilAcc.HasValues() {
-		t.Fatal("nil accumulator reports values")
-	}
+	testassert.Require(t, !nilAcc.HasValues(), "%v", "nil accumulator reports values")
 
 	type add struct {
 		key   string
@@ -286,8 +306,9 @@ func TestExtraHasValuesMatchesFinalizedRetention(t *testing.T) {
 		for _, step := range script {
 			_ = acc.Add(step.key, step.value) // accumulation errors keep the latest value; the query sees the same retained state either way.
 		}
-		if got, want := acc.HasValues(), len(acc.Finalize()) > 0; got != want {
-			t.Fatalf("accumulator %#v: HasValues = %v, want %v", script, got, want)
+		{
+			got, want := acc.HasValues(), len(acc.Finalize()) > 0
+			testassert.Require(t, got == want, "accumulator %#v: HasValues = %v, want %v", script, got, want)
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -144,19 +145,13 @@ func joinedIDs(calls []model.ToolCall) string {
 
 func requireZeroTerminal(t *testing.T, res TerminalResult) {
 	t.Helper()
-	if res.Status != "" || res.LastOutput != nil || res.UnstartedCalls != nil || res.Detail != "" {
-		t.Fatalf("expected zero terminal result, got %#v", res)
-	}
+	testassert.Require(t, res.Status == "" && res.LastOutput == nil && res.UnstartedCalls == nil && res.Detail == "", "expected zero terminal result, got %#v", res)
 }
 
 func requireRunInterrupted(t *testing.T, res TerminalResult, err error, wantDetail string) {
 	t.Helper()
-	if err != nil {
-		t.Fatalf("expected terminal interruption, got Go error: %v", err)
-	}
-	if res.Status != TerminalInterruption || res.Detail != wantDetail {
-		t.Fatalf("interruption = %s/%q, want interruption/%q", res.Status, res.Detail, wantDetail)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == TerminalInterruption && res.Detail == wantDetail, "interruption = %s/%q, want interruption/%q", res.Status, res.Detail, wantDetail)
 }
 
 // TestRunInvalidInvocation pins every invalid entry value returning the typed boundary-protocol error with boundary "agent" and a zero terminal result before any caller function runs: a nil run context is rejected, never normalized, and the same no-run guarantee holds for every other row.
@@ -205,9 +200,7 @@ func TestRunInvalidInvocation(t *testing.T) {
 			res, err := Run(ctx, inv)
 			requireBoundaryViolation(t, err, "agent")
 			requireZeroTerminal(t, res)
-			if f.sourceCalls != 0 || f.modelCalls != 0 || f.toolCalls != 0 {
-				t.Fatalf("rejected invocation ran caller functions: source=%d model=%d tool=%d", f.sourceCalls, f.modelCalls, f.toolCalls)
-			}
+			testassert.Require(t, f.sourceCalls == 0 && f.modelCalls == 0 && f.toolCalls == 0, "rejected invocation ran caller functions: source=%d model=%d tool=%d", f.sourceCalls, f.modelCalls, f.toolCalls)
 		})
 	}
 }
@@ -219,24 +212,11 @@ func TestRunSuccessSingleEffect(t *testing.T) {
 	f.modelSet = readyOutputs(out)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if res.Status != TerminalSuccess || res.Detail != "" || res.UnstartedCalls != nil {
-		t.Fatalf("terminal = %#v, want success with empty detail and no unstarted calls", res)
-	}
-	if res.LastOutput != out {
-		t.Fatalf("success must transfer the settlement output pointer, got %p want %p", res.LastOutput, out)
-	}
-	if f.sourceCalls != 1 || f.modelCalls != 1 || f.toolCalls != 0 {
-		t.Fatalf("calls source=%d model=%d tool=%d, want 1/1/0", f.sourceCalls, f.modelCalls, f.toolCalls)
-	}
-	if len(f.reqs[0].Tools) != 1 || f.reqs[0].Tools[0].Name != "t" {
-		t.Fatalf("request tools = %#v, want the one advertised definition", f.reqs[0].Tools)
-	}
-	if len(f.reqs[0].Messages) != 1 || f.reqs[0].Messages[0].TextContent() != "go" {
-		t.Fatalf("request messages = %#v, want the fresh snapshot", f.reqs[0].Messages)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == TerminalSuccess && res.Detail == "" && res.UnstartedCalls == nil && res.LastOutput == out, "terminal = %#v, want success with empty detail and no unstarted calls; got %v, want %v", res, res.LastOutput, out)
+	testassert.Require(t, f.sourceCalls == 1 && f.modelCalls == 1 && f.toolCalls == 0, "calls source=%d model=%d tool=%d, want 1/1/0", f.sourceCalls, f.modelCalls, f.toolCalls)
+	testassert.Require(t, len(f.reqs[0].Tools) == 1 && f.reqs[0].Tools[0].Name == "t", "request tools = %#v, want the one advertised definition", f.reqs[0].Tools)
+	testassert.Require(t, len(f.reqs[0].Messages) == 1 && f.reqs[0].Messages[0].TextContent() == "go", "request messages = %#v, want the fresh snapshot", f.reqs[0].Messages)
 }
 
 // TestRunNoAdvertisedToolsSucceeds pins that an absent advertised list is a valid entry value — tool advertisement selection is not Agent's to make.
@@ -248,12 +228,8 @@ func TestRunNoAdvertisedToolsSucceeds(t *testing.T) {
 	inv.Tools = nil
 
 	res, err := Run(context.Background(), inv)
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
-	}
-	if len(f.reqs[0].Tools) != 0 {
-		t.Fatalf("request carries tools %#v", f.reqs[0].Tools)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Require(t, len(f.reqs[0].Tools) == 0, "request carries tools %#v", f.reqs[0].Tools)
 }
 
 // TestRunAssemblyCallbackProducesSettlement pins the callback wiring: the model effect receives a working assembler bound to the run context, its returned output settles as a ready disposition verbatim, and the handed-over stream is released exactly once.
@@ -271,18 +247,10 @@ func TestRunAssemblyCallbackProducesSettlement(t *testing.T) {
 	}
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if cbCalls != 1 || f.modelCalls != 1 {
-		t.Fatalf("callback calls=%d model calls=%d, want 1/1", cbCalls, f.modelCalls)
-	}
-	if res.Status != TerminalSuccess || res.LastOutput.Message.TextContent() != "hi" {
-		t.Fatalf("terminal = %#v, want success carrying the assembled output", res)
-	}
-	if stream.closeCount != 1 || stream.recvsAfterClose != 0 {
-		t.Fatalf("stream close=%d recvs-after-close=%d, want 1/0", stream.closeCount, stream.recvsAfterClose)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, cbCalls == 1 && f.modelCalls == 1, "callback calls=%d model calls=%d, want 1/1", cbCalls, f.modelCalls)
+	testassert.Require(t, res.Status == TerminalSuccess && res.LastOutput.Message.TextContent() == "hi", "terminal = %#v, want success carrying the assembled output", res)
+	testassert.Require(t, stream.closeCount == 1 && stream.recvsAfterClose == 0, "stream close=%d recvs-after-close=%d, want 1/0", stream.closeCount, stream.recvsAfterClose)
 }
 
 // TestRunSubstitutedValidSettlementOutputAccepted pins the documented non-rule: Agent compares the callback's invocation discipline (count, source, error handling) but never compares the callback and settlement outputs for deep or byte equality, so a different otherwise-valid substitution stays a trusted-caller matter, not another protocol path.
@@ -298,15 +266,9 @@ func TestRunSubstitutedValidSettlementOutputAccepted(t *testing.T) {
 	}
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if res.Status != TerminalSuccess || res.LastOutput != substitute {
-		t.Fatalf("terminal = %#v, want success carrying the substituted pointer", res)
-	}
-	if stream.closeCount != 1 {
-		t.Fatalf("callback stream close = %d, want 1", stream.closeCount)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == TerminalSuccess && res.LastOutput == substitute, "terminal = %#v, want success carrying the substituted pointer", res)
+	testassert.Equal(t, stream.closeCount, 1)
 }
 
 // TestRunRawToolArgumentsPassUnchanged pins byte-for-byte argument transit through every JSON shape — object, array, null, malformed, and absent — into the caller-owned tool boundary; Agent never decodes, rejects, or rewrites them, and the whole batch continues to a final text response.
@@ -321,19 +283,11 @@ func TestRunRawToolArgumentsPassUnchanged(t *testing.T) {
 	f.modelSet = readyOutputs(callsOut, mkOutput(model.OutputCompleted, "", nil))
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
-	}
-	if f.toolCalls != len(args) {
-		t.Fatalf("tool calls = %d, want %d", f.toolCalls, len(args))
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Equal(t, f.toolCalls, len(args))
 	for i, seen := range f.calls {
 		want := args[i]
-		if string(seen.Arguments) != string(want) || len(seen.Arguments) != len(want) {
-			t.Fatalf("call %d arguments = %q, want verbatim %q", i, string(seen.Arguments), string(want))
-		}
-		if seen.ID != calls[i].ID || seen.Name != calls[i].Name {
-			t.Fatalf("call %d identity = %q/%q, want %q/%q", i, seen.ID, seen.Name, calls[i].ID, calls[i].Name)
-		}
+		testassert.Require(t, string(seen.Arguments) == string(want) && len(seen.Arguments) == len(want), "call %d arguments = %q, want verbatim %q", i, string(seen.Arguments), string(want))
+		testassert.Require(t, seen.ID == calls[i].ID && seen.Name == calls[i].Name, "call %d identity = %q/%q, want %q/%q", i, seen.ID, seen.Name, calls[i].ID, calls[i].Name)
 	}
 }

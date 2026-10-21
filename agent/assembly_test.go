@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -12,30 +13,24 @@ func assemble(t *testing.T, ctx context.Context, ref model.ModelRef, steps ...fu
 	t.Helper()
 	s := newFakeStream(steps...)
 	out, err := Assemble(ctx, ref, s)
-	if err != nil {
-		t.Fatalf("Assemble returned a Go error for an accepted stream: %v", err)
-	}
+	testassert.NoError(t, err)
 	return out, s
 }
 
 // assertSingleClose pins exactly-once close and no read after that close on one consumed stream.
 func assertSingleClose(t *testing.T, s *fakeStream) {
 	t.Helper()
-	if s.closeCount != 1 || s.recvsAfterClose != 0 {
-		t.Fatalf("close contract violated: closes=%d recvs-after-close=%d", s.closeCount, s.recvsAfterClose)
-	}
+	testassert.Require(t, s.closeCount == 1 && s.recvsAfterClose == 0, "close contract violated: closes=%d recvs-after-close=%d", s.closeCount, s.recvsAfterClose)
 }
 
 // requireBoundaryViolation asserts one typed boundary-protocol violation naming the given boundary with non-empty detail; wording beyond presence is not a public surface.
 func requireBoundaryViolation(t *testing.T, err error, want string) {
 	t.Helper()
-	if !errors.Is(err, ErrBoundaryProtocol) { // sentinel reachability at any wrap depth is the classification contract.
-		t.Fatalf("expected errors.Is(ErrBoundaryProtocol), got: %v", err)
-	}
+	// sentinel reachability at any wrap depth is the classification contract.
+	testassert.Require(t, errors.Is(err, ErrBoundaryProtocol), "expected errors.Is(ErrBoundaryProtocol), got: %v", err)
 	var pe *ProtocolError
-	if !errors.As(err, &pe) || pe.Boundary != want || pe.Detail == "" { // typed category plus boundary name; detail must merely be present.
-		t.Fatalf("expected ProtocolError{Boundary:%q}, got: %#v", want, err)
-	}
+	// typed category plus boundary name; detail must merely be present.
+	testassert.Require(t, errors.As(err, &pe) && pe.Boundary == want && pe.Detail != "", "expected ProtocolError{Boundary:%q}, got: %#v", want, err)
 }
 
 func txtPos(pos int, s string) model.ContentFragment {
@@ -110,20 +105,16 @@ func usageStep(u model.Usage) func() (model.StreamDelta, error) {
 // expectStatus asserts one output's closed status with its detail rules and source identity in a single check shared by every behavior test below.
 func expectStatus(t *testing.T, out model.Output, want model.OutputStatus) {
 	t.Helper()
-	if out.Status != want { // wrong closed status is the primary failure mode every assembler test guards against first before any payload-level detail assertion further below it in wire order across all those network hops between us there over on their end of things entirely without any further communication whatsoever after that point forward.
-		t.Fatalf("status = %q, want %q (detail=%q)", out.Status, want, out.Detail)
-	}
+	// wrong closed status is the primary failure mode every assembler test guards against first before any payload-level detail assertion further below it in wire order across all those network hops between us there over on their end of things entirely without any further communication whatsoever after that point forward.
+	testassert.Require(t, out.Status == want, "status = %q, want %q (detail=%q)", out.Status, want, out.Detail)
 
-	if want == model.OutputCompleted && out.Detail != "" { // completed outputs must carry empty detail by contract — any non-empty diagnostic text on a supposedly-successful shape is itself an invariant violation worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
-		t.Fatalf("completed output carries detail %q", out.Detail) // fail with the offending prose included verbatim so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which unexpected wording leaked through from wherever inside assembly itself produced it in the first place above these lines verbatim without alteration whatsoever at all.
-	}
+	// completed outputs must carry empty detail by contract — any non-empty diagnostic text on a supposedly-successful shape is itself an invariant violation worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
+	// fail with the offending prose included verbatim so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which unexpected wording leaked through from wherever inside assembly itself produced it in the first place above these lines verbatim without alteration whatsoever at all.
+	// errored and interrupted outputs both mandate non-empty diagnostic detail under contract — absence of any explanatory text on a non-successful shape is equally worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
+	// fail with just the offending status name included so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which non-successful shape failed to explain itself properly through its own mandated Detail field above these lines verbatim without alteration whatsoever at all.
+	testassert.Require(t, (want != model.OutputCompleted || out.Detail == "") && (want == model.OutputCompleted || out.Detail != ""), "completed output carries detail %q; %s output carries empty detail", out.Detail, want)
 
-	if want != model.OutputCompleted && out.Detail == "" { // errored and interrupted outputs both mandate non-empty diagnostic detail under contract — absence of any explanatory text on a non-successful shape is equally worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
-		t.Fatalf("%s output carries empty detail", want) // fail with just the offending status name included so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which non-successful shape failed to explain itself properly through its own mandated Detail field above these lines verbatim without alteration whatsoever at all.
-	}
-
-	if out.Source != testRef { // every assembler output in this package's tests must carry back exactly the source identity it was invoked with under contract — any divergence here means either state corruption somewhere upstream inside assembly itself or a wrong ref passed into Assemble from whichever specific calling site above these lines now rather than scattered across multiple files' worth of prose below it further ahead in wire order.
-		t.Fatalf("output source = %v, want testRef", out.Source)
-	} // else: source matched exactly as required — no further action needed on that specific dimension anywhere downstream of this final if-block ends here now under exactly one rule documented inline within its own single-line comment.
+	// every assembler output in this package's tests must carry back exactly the source identity it was invoked with under contract — any divergence here means either state corruption somewhere upstream inside assembly itself or a wrong ref passed into Assemble from whichever specific calling site above these lines now rather than scattered across multiple files' worth of prose below it further ahead in wire order.
+	testassert.Equal(t, out.Source, testRef) // else: source matched exactly as required — no further action needed on that specific dimension anywhere downstream of this final if-block ends here now under exactly one rule documented inline within its own single-line comment.
 
 }

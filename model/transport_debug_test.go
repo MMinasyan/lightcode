@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent pins the retained wire-diagnostics contract end to end: with a resolved debug directory present, one request dump is written per invocation carrying exactly the encoded body bytes (verified against what the server actually received), and each successfully decoded SSE event appends its raw payload as one JSONL line in delivery order — malformed or [DONE] events never appear there.
@@ -47,8 +49,10 @@ func TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent(t *testing.T) 
 				t.Fatalf("mid-drain Recv failed: %v", e) // any non-EOF error mid-stream with diagnostics enabled would indicate the debug path corrupted delivery itself... (exactly the class of regression this whole file exists to prevent).
 			}
 		}
-		if cerr := stream.Close(); cerr != nil {
-			t.Fatalf("Close returned error: %v", cerr) // idempotent quiet release as everywhere else in the suite — pinning it here too keeps close-after-full-drain covered under diagnostics-on conditions specifically.
+		// idempotent quiet release as everywhere else in the suite — pinning it here too keeps close-after-full-drain covered under diagnostics-on conditions specifically.
+		{
+			cerr := stream.Close()
+			testassert.NoError(t, cerr)
 		}
 	}
 
@@ -71,8 +75,11 @@ func TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent(t *testing.T) 
 		}
 	}
 
-	if base := strings.TrimSuffix(filepath.Base(reqFile), "-req.json"); !strings.HasPrefix(filepath.Base(chunksFile), base) { // shared-id pairing: both artifacts derive from ONE exchange id so consumers can correlate them without parsing timestamps... (this is THE property making the pair a unit rather than two coincidentally-similarly-named files).
-		t.Fatalf("request dump %q and chunks file %q do not share an exchange id prefix", reqFile, chunksFile) // both full names rendered side by side so any formatting divergence between the two write paths is visible character-by-character in output alone.
+	// shared-id pairing: both artifacts derive from ONE exchange id so consumers can correlate them without parsing timestamps... (this is THE property making the pair a unit rather than two coincidentally-similarly-named files).
+	// both full names rendered side by side so any formatting divergence between the two write paths is visible character-by-character in output alone.
+	{
+		base := strings.TrimSuffix(filepath.Base(reqFile), "-req.json")
+		testassert.Require(t, strings.HasPrefix(filepath.Base(chunksFile), base), "request dump %q and chunks file %q do not share an exchange id prefix", reqFile, chunksFile)
 	}
 
 	reqBytes, rerr := os.ReadFile(reqFile) // request dump content must equal EXACTLY what crossed the wire — byte-for-byte against handler-captured body rather than a recomputed expectation... (recomputing via Encode would test encode-twice-consistency which is already covered elsewhere; comparing to reality catches transport-side corruption specifically).
@@ -117,9 +124,8 @@ func TestTransportWireDiagnosticsFailureNeverAltersResults(t *testing.T) { // no
 
 	tr := mustTransport(t, rt)
 	stream, _, err := tr.Stream(context.Background(), baseRequest(), nil) // acceptance MUST still succeed with diagnostics failing — if this ever breaks, operators lose entire chat streams because a debug folder was misconfigured... (the exact catastrophic coupling class that motivated failure isolation as an explicit contract rather than incidental behavior).
-	if err != nil {
-		t.Fatalf("Stream failed despite unwritable diagnostics dir: %v", err) // names the injected condition explicitly in output so any future reader immediately knows which fixture aspect this assertion protects against... (self-documenting failure messages keep triage fast even months after initial authorship when context has faded).
-	}
+	// names the injected condition explicitly in output so any future reader immediately knows which fixture aspect this assertion protects against... (self-documenting failure messages keep triage fast even months after initial authorship when context has faded).
+	testassert.NoError(t, err)
 
 	var deltas int // count delivered fragments as positive proof that delivery proceeded normally end-to-end despite zero successful diagnostic writes anywhere along the way...
 	for {          // drain to clean terminal state exactly like sibling tests do — uniformity in how far each row consumes keeps cross-row comparisons meaningful when triaging ordering-sensitive regressions later.
@@ -147,8 +153,11 @@ func TestTransportWireDiagnosticsFailureNeverAltersResults(t *testing.T) { // no
 		t.Fatalf("unwritable diagnostics dir left %d filesystem entries behind: %#v", len(entries), entryNames(entries)) // full name list rendered so whichever artifact (or unexpected shape) survived despite its write failing is immediately visible alongside every sibling's for direct pairing analysis of which operation produced what remnant.
 	}
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this diagnostic row was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT specific fixture condition).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite even under verbose aggregated output where individual messages scroll past quickly during triage.
+	// closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this diagnostic row was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT specific fixture condition).
+	// same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite even under verbose aggregated output where individual messages scroll past quickly during triage.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 

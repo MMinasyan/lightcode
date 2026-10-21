@@ -11,6 +11,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // richOutputFixture builds one deterministic completed output carrying every
@@ -106,9 +108,7 @@ var benchRichRequest = Request{
 // verdict with byte-identical error detail for one input.
 func requireEqualConstructorVerdict(t *testing.T, name string, newErr, validateErr error) {
 	t.Helper()
-	if (newErr == nil) != (validateErr == nil) {
-		t.Fatalf("%s: New error = %v, Validate error = %v; verdicts diverge", name, newErr, validateErr)
-	}
+	testassert.Require(t, (newErr == nil) == (validateErr == nil), "%s: New error = %v, Validate error = %v; verdicts diverge", name, newErr, validateErr)
 	if newErr != nil && newErr.Error() != validateErr.Error() {
 		t.Fatalf("%s: New detail = %q, Validate detail = %q", name, newErr.Error(), validateErr.Error())
 	}
@@ -160,12 +160,8 @@ func TestValidateOutputMatchesNewOutput(t *testing.T) {
 			_, newErr := NewOutput(row.out)
 			validateErr := ValidateOutput(row.out)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
-			if row.errContains != "" && !strings.Contains(newErr.Error(), row.errContains) {
-				t.Fatalf("fixture %s reached the wrong rule: %v, want a failure naming %q", row.name, newErr, row.errContains)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			testassert.Require(t, row.errContains == "" || strings.Contains(newErr.Error(), row.errContains), "fixture %s reached the wrong rule: %v, want a failure naming %q", row.name, newErr, row.errContains)
 		})
 	}
 
@@ -173,12 +169,11 @@ func TestValidateOutputMatchesNewOutput(t *testing.T) {
 	// sibling compares equal after the call, nested reference types included.
 	in := richOutputFixture()
 	before := richOutputFixture()
-	if err := ValidateOutput(in); err != nil {
-		t.Fatalf("ValidateOutput rejected the rich fixture: %v", err)
+	{
+		err := ValidateOutput(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateOutput mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateOutput mutated its input")
 }
 
 // TestValidateStreamDeltaMatchesNewStreamDelta pins the StreamDelta
@@ -208,21 +203,18 @@ func TestValidateStreamDeltaMatchesNewStreamDelta(t *testing.T) {
 			_, newErr := NewStreamDelta(row.delta)
 			validateErr := ValidateStreamDelta(row.delta)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
 		})
 	}
 
 	// The validator mutates nothing, nested fragments and extras included.
 	in := richDeltaFixture()
 	before := richDeltaFixture()
-	if err := ValidateStreamDelta(in); err != nil {
-		t.Fatalf("ValidateStreamDelta rejected the rich fixture: %v", err)
+	{
+		err := ValidateStreamDelta(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateStreamDelta mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateStreamDelta mutated its input")
 }
 
 // TestValidateToolCallMatchesNewToolCall pins the ToolCall differential: the
@@ -253,24 +245,19 @@ func TestValidateToolCallMatchesNewToolCall(t *testing.T) {
 			_, newErr := NewToolCall(row.call)
 			validateErr := ValidateToolCall(row.call)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
-			if row.name == "id precedence over malformed extra" && !strings.Contains(newErr.Error(), "non-empty id and name") {
-				t.Fatalf("precedence row reported the wrong failure: %v", newErr)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			testassert.Require(t, row.name != "id precedence over malformed extra" || strings.Contains(newErr.Error(), "non-empty id and name"), "precedence row reported the wrong failure: %v", newErr)
 		})
 	}
 
 	// The validator mutates nothing, argument bytes and extras included.
 	in := richToolCallFixture()
 	before := richToolCallFixture()
-	if err := ValidateToolCall(in); err != nil {
-		t.Fatalf("ValidateToolCall rejected the rich fixture: %v", err)
+	{
+		err := ValidateToolCall(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateToolCall mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateToolCall mutated its input")
 }
 
 // TestValidateContentPartMatchesNewContentPart pins the ContentPart
@@ -305,9 +292,7 @@ func TestValidateContentPartMatchesNewContentPart(t *testing.T) {
 			_, newErr := NewContentPart(row.part)
 			validateErr := ValidateContentPart(row.part)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
 		})
 	}
 
@@ -315,12 +300,11 @@ func TestValidateContentPartMatchesNewContentPart(t *testing.T) {
 	// equal after the call, extras included.
 	in := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
 	before := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
-	if err := ValidateContentPart(in); err != nil {
-		t.Fatalf("ValidateContentPart rejected the rich fixture: %v", err)
+	{
+		err := ValidateContentPart(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateContentPart mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateContentPart mutated its input")
 }
 
 // TestValidateToolDefinitionMatchesNewToolDefinition pins the ToolDefinition
@@ -350,21 +334,18 @@ func TestValidateToolDefinitionMatchesNewToolDefinition(t *testing.T) {
 			_, newErr := NewToolDefinition(row.def)
 			validateErr := ValidateToolDefinition(row.def)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
 		})
 	}
 
 	// The validator mutates nothing, parameter bytes included.
 	in := ToolDefinition{Name: "echo", Description: "d", Parameters: json.RawMessage(`{"deep":{"a":[1,2]}}`)}
 	before := ToolDefinition{Name: "echo", Description: "d", Parameters: json.RawMessage(`{"deep":{"a":[1,2]}}`)}
-	if err := ValidateToolDefinition(in); err != nil {
-		t.Fatalf("ValidateToolDefinition rejected the rich fixture: %v", err)
+	{
+		err := ValidateToolDefinition(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateToolDefinition mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateToolDefinition mutated its input")
 }
 
 // TestValidateRequestMatchesNewRequest pins the Request differential over the
@@ -404,15 +385,8 @@ func TestValidateRequestMatchesNewRequest(t *testing.T) {
 			_, newErr := NewRequest(row.req)
 			validateErr := ValidateRequest(row.req)
 			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
-			if (newErr != nil) != row.wantErr {
-				t.Fatalf("fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
-			}
-			if row.prefix != "" && !strings.HasPrefix(newErr.Error(), row.prefix) {
-				t.Fatalf("fixture %s error = %q, want the %q prefix", row.name, newErr, row.prefix)
-			}
-			if row.contains != "" && !strings.Contains(newErr.Error(), row.contains) {
-				t.Fatalf("fixture %s reached the wrong rule: %v, want a failure naming %q", row.name, newErr, row.contains)
-			}
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			testassert.Require(t, (row.prefix == "" || strings.HasPrefix(newErr.Error(), row.prefix)) && (row.contains == "" || strings.Contains(newErr.Error(), row.contains)), "fixture %s error = %q, want the %q prefix; fixture %s reached the wrong rule: %v, want a failure naming %q", row.name, newErr, row.prefix, row.name, newErr, row.contains)
 		})
 	}
 
@@ -426,12 +400,11 @@ func TestValidateRequestMatchesNewRequest(t *testing.T) {
 		Messages: []Message{validMessage()},
 		Tools:    []ToolDefinition{validTool("echo")},
 	}
-	if err := ValidateRequest(in); err != nil {
-		t.Fatalf("ValidateRequest rejected the rich fixture: %v", err)
+	{
+		err := ValidateRequest(in)
+		testassert.NoError(t, err)
 	}
-	if !reflect.DeepEqual(in, before) {
-		t.Fatal("ValidateRequest mutated its input")
-	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateRequest mutated its input")
 }
 
 // Benchmarks: the validation-only path against the owning constructor over

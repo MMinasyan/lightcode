@@ -25,6 +25,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -56,8 +57,9 @@ func newAttemptTableFixture(t *testing.T, store harness.Storage, conversationFn,
 	}
 	t.Cleanup(func() {
 		cancel()
-		if err := h.Wait(context.Background()); err != nil {
-			t.Errorf("harness retirement: %v", err)
+		{
+			err := h.Wait(context.Background())
+			testassert.Check(t, err == nil, "harness retirement: %v", err)
 		}
 	})
 	return &attemptTableFixture{h: h}
@@ -143,9 +145,7 @@ func attemptTableStatusServer(t *testing.T, status int) (*httptest.Server, *atom
 func attemptTableTransport(t *testing.T, srv *httptest.Server, apiKey string) func(context.Context, model.Request) (model.Stream, error) {
 	t.Helper()
 	tr, err := model.NewTransport(model.ResolvedTransport{Model: publicModelRef, BaseURL: srv.URL, APIKey: apiKey})
-	if err != nil {
-		t.Fatalf("transport construction failed for a valid resolved input: %v", err)
-	}
+	testassert.NoError(t, err)
 	return func(ctx context.Context, req model.Request) (model.Stream, error) {
 		stream, _, err := tr.Stream(ctx, req, nil)
 		return stream, err
@@ -157,9 +157,7 @@ func attemptTableTransport(t *testing.T, srv *httptest.Server, apiKey string) fu
 func attemptTableRunConversation(t *testing.T, f *attemptTableFixture, session, operation string) harness.OperationRecord {
 	t.Helper()
 	res, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello")
-	if err != nil || res.Disposition != harness.DispositionAdmitted {
-		t.Fatalf("submit = %+v err %v, want admitted", res, err)
-	}
+	testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted, "submit = %+v err %v, want admitted", res, err)
 	return awaitTerminal(t, f.h, session, operation)
 }
 
@@ -167,8 +165,9 @@ func attemptTableRunConversation(t *testing.T, f *attemptTableFixture, session, 
 // carries compactable history and is idle again.
 func attemptTableSeedHistory(t *testing.T, f *attemptTableFixture, session string) {
 	t.Helper()
-	if rec := attemptTableRunConversation(t, f, session, "op-seed"); rec.State.Status != harness.OperationSuccess {
-		t.Fatalf("seed turn state = %+v, want success", rec.State)
+	{
+		rec := attemptTableRunConversation(t, f, session, "op-seed")
+		testassert.Require(t, rec.State.Status == harness.OperationSuccess, "seed turn state = %+v, want success", rec.State)
 	}
 }
 
@@ -184,12 +183,7 @@ func attemptTableRunCompact(t *testing.T, f *attemptTableFixture, session, opera
 // detail.
 func attemptTableRequireTerminal(t *testing.T, rec harness.OperationRecord, want harness.OperationState, detailContains string) {
 	t.Helper()
-	if rec.State.Status != want {
-		t.Fatalf("operation state = %+v, want %s", rec.State, want)
-	}
-	if rec.State.Terminal == nil || !strings.Contains(rec.State.Terminal.Detail, detailContains) {
-		t.Fatalf("operation terminal = %+v, want detail containing %q", rec.State.Terminal, detailContains)
-	}
+	testassert.Require(t, rec.State.Status == want && (rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, detailContains)), "operation state = %+v, want %s; operation terminal = %+v, want detail containing %q", rec.State, want, rec.State.Terminal, detailContains)
 }
 
 // parkedAttempt returns the park function one physical callback calls before
@@ -211,8 +205,9 @@ func parkedAttempt() (park func(context.Context), arrived <-chan struct{}) {
 func interruptParkedAttempt(t *testing.T, f *attemptTableFixture, session string, arrived <-chan struct{}) {
 	t.Helper()
 	<-arrived
-	if err := f.h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := f.h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -230,9 +225,7 @@ func TestPublicSharedAttemptOrchestrationTable(t *testing.T) {
 		{"memory", func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{"sqlite", func(t *testing.T) harness.Storage {
 			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
-			if err != nil {
-				t.Fatalf("OpenSQLite: %v", err)
-			}
+			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store
 		}},
@@ -272,23 +265,20 @@ var publicAttemptTableRows = []struct {
 				rec := attemptTableRunConversation(t, f, session, "op-1")
 				attemptTableRequireTerminal(t, rec, harness.OperationSuccess, "")
 				kinds := entryKindsByOperation(t, store, session, "op-1")
-				if !slices.Contains(kinds, harness.EntryAssistant) {
-					t.Fatalf("operation entries = %v, want the accepted turn's assistant entry", kinds)
-				}
+				testassert.Require(t, slices.Contains(kinds, harness.EntryAssistant), "operation entries = %v, want the accepted turn's assistant entry", kinds)
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				rec := attemptTableRunCompact(t, f, session, "c-1")
 				attemptTableRequireTerminal(t, rec, harness.OperationSuccess, "")
 				kinds := entryKindsByOperation(t, store, session, "c-1")
-				if len(kinds) != 2 || kinds[0] != harness.EntryCompaction || kinds[1] != harness.EntryOperationSettlement {
-					t.Fatalf("compact operation entries = %v, want the compaction entry and its settlement", kinds)
-				}
+				testassert.Require(t, len(kinds) == 2 && kinds[0] == harness.EntryCompaction && kinds[1] == harness.EntryOperationSettlement, "compact operation entries = %v, want the compaction entry and its settlement", kinds)
 			}
 			if hits.Load() != 1 {
 				t.Fatalf("physical requests = %d, want the one accepted attempt", hits.Load())
 			}
-			if got := auth.Load().(string); got != "Bearer table-key" {
-				t.Fatalf("Authorization header = %q, want the keyed transport's credential", got)
+			{
+				got := auth.Load().(string)
+				testassert.Equal(t, got, "Bearer table-key")
 			}
 		},
 	},
@@ -311,8 +301,9 @@ var publicAttemptTableRows = []struct {
 			if hits.Load() != 1 {
 				t.Fatalf("physical requests = %d, want the one accepted attempt", hits.Load())
 			}
-			if got := auth.Load().(string); got != "" {
-				t.Fatalf("Authorization header = %q, want none from the keyless transport", got)
+			{
+				got := auth.Load().(string)
+				testassert.Equal(t, got, "")
 			}
 		},
 	},
@@ -327,17 +318,16 @@ var publicAttemptTableRows = []struct {
 			operation := "op-1"
 			if conversation {
 				res, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello")
-				if err != nil || res.Disposition != harness.DispositionAdmitted {
-					t.Fatalf("submit = %+v err %v, want admitted", res, err)
-				}
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted, "submit = %+v err %v, want admitted", res, err)
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
 				compactWhenIdle(t, f.h, session, operation)
 			}
 			<-requests // the first attempt failed into the standard backoff
-			if err := f.h.Interrupt(context.Background(), session); err != nil {
-				t.Fatalf("Interrupt: %v", err)
+			{
+				err := f.h.Interrupt(context.Background(), session)
+				testassert.NoError(t, err)
 			}
 			rec := awaitTerminal(t, f.h, session, operation)
 			attemptTableRequireTerminal(t, rec, harness.OperationInterruption, "agent interrupted")
@@ -366,9 +356,7 @@ var publicAttemptTableRows = []struct {
 				rec := attemptTableRunConversation(t, f, session, operation)
 				attemptTableRequireTerminal(t, rec, harness.OperationFailure, "provider dropped")
 				kinds := entryKindsByOperation(t, store, session, operation)
-				if slices.Contains(kinds, harness.EntryAssistant) || !slices.Contains(kinds, harness.EntryOperationSettlement) {
-					t.Fatalf("operation entries = %v, want the settlement entry and no assistant", kinds)
-				}
+				testassert.Require(t, !slices.Contains(kinds, harness.EntryAssistant) && slices.Contains(kinds, harness.EntryOperationSettlement), "operation entries = %v, want the settlement entry and no assistant", kinds)
 			} else {
 				attemptTableSeedHistory(t, f, session)
 				operation = "c-1"
@@ -423,8 +411,9 @@ var publicAttemptTableRows = []struct {
 			session := createSession(t, f.h)
 			operation := "op-1"
 			if conversation {
-				if _, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("submit: %v", err)
+				{
+					_, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 			} else {
 				attemptTableSeedHistory(t, f, session)
@@ -450,8 +439,9 @@ var publicAttemptTableRows = []struct {
 			session := createSession(t, f.h)
 			operation := "op-1"
 			if conversation {
-				if _, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("submit: %v", err)
+				{
+					_, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 			} else {
 				attemptTableSeedHistory(t, f, session)
@@ -464,9 +454,7 @@ var publicAttemptTableRows = []struct {
 			// nearest sibling of failure-under-cancellation settles the
 			// boundary failure, not the interruption.
 			attemptTableRequireTerminal(t, rec, harness.OperationFailure, "neither exactly one stream nor one error")
-			if stream.closes != 1 {
-				t.Fatalf("supplied stream closes = %d, want exactly one before the boundary failure", stream.closes)
-			}
+			testassert.Equal(t, stream.closes, 1)
 		},
 	},
 	{
@@ -482,8 +470,9 @@ var publicAttemptTableRows = []struct {
 			session := createSession(t, f.h)
 			operation := "op-1"
 			if conversation {
-				if _, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("submit: %v", err)
+				{
+					_, err := submit(t, f.h, session, operation, harness.MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 			} else {
 				attemptTableSeedHistory(t, f, session)
@@ -546,20 +535,14 @@ var publicAttemptTableRows = []struct {
 			}
 			intentMu.Lock()
 			defer intentMu.Unlock()
-			if len(intentIDs) != 4 || intentIDs[0] == "" {
-				t.Fatalf("attempt-intent identities %v, want one durable intent observed by every attempt", intentIDs)
-			}
+			testassert.Require(t, len(intentIDs) == 4 && intentIDs[0] != "", "attempt-intent identities %v, want one durable intent observed by every attempt", intentIDs)
 			for i, id := range intentIDs {
-				if id != intentIDs[0] {
-					t.Fatalf("attempt %d observed intent identity %q, want the one intent %q committed before the first attempt", i, id, intentIDs[0])
-				}
+				testassert.Require(t, id == intentIDs[0], "attempt %d observed intent identity %q, want the one intent %q committed before the first attempt", i, id, intentIDs[0])
 			}
 			if requests.Load() != 4 || policyCalls.Load() != 3 {
 				t.Fatalf("requests = %d policy calls = %d, want three retries and the accepted fourth attempt", requests.Load(), policyCalls.Load())
 			}
-			if stream.closes != 1 {
-				t.Fatalf("accepted stream closes = %d, want exactly once", stream.closes)
-			}
+			testassert.Equal(t, stream.closes, 1)
 			if kinds := entryKindsByOperation(t, store, session, operation); conversation && !slices.Contains(kinds, harness.EntryAssistant) {
 				t.Fatalf("operation entries = %v, want the accepted turn's assistant entry", kinds)
 			} else if !conversation && !slices.Contains(kinds, harness.EntryCompaction) {

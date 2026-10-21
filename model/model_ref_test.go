@@ -4,18 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestParseSplitsOnFirstSlash(t *testing.T) {
 	ref, err := Parse("openrouter/openai/gpt-5.4-mini")
-	if err != nil {
-		t.Fatalf("Parse returned error: %v", err)
-	}
-	if ref.Provider != "openrouter" || ref.Model != "openai/gpt-5.4-mini" {
-		t.Fatalf("unexpected ref: %#v", ref)
-	}
-	if got := ref.String(); got != "openrouter/openai/gpt-5.4-mini" {
-		t.Fatalf("String() = %q", got)
+	testassert.NoError(t, err)
+	testassert.Require(t, ref.Provider == "openrouter" && ref.Model == "openai/gpt-5.4-mini", "unexpected ref: %#v", ref)
+	{
+		got := ref.String()
+		testassert.Equal(t, got, "openrouter/openai/gpt-5.4-mini")
 	}
 }
 
@@ -33,19 +32,13 @@ func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.ref.String()
-			if got != tc.want {
-				t.Fatalf("String() = %q, want %q", got, tc.want)
-			}
+			testassert.Equal(t, got, tc.want)
 			if got == "" {
 				return
 			}
 			parsed, err := Parse(got)
-			if err != nil {
-				t.Fatalf("Parse(%q) returned error: %v", got, err)
-			}
-			if parsed != tc.ref {
-				t.Fatalf("parsed = %#v, want %#v", parsed, tc.ref)
-			}
+			testassert.Require(t, err == nil, "Parse(%q) returned error: %v", got, err)
+			testassert.Equal(t, parsed, tc.ref)
 		})
 	}
 }
@@ -53,20 +46,15 @@ func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
 func TestModelRefJSONUsesPrefixString(t *testing.T) {
 	ref := ModelRef{Provider: "openai", Model: "gpt-5.4-mini"}
 	b, err := json.Marshal(ref)
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	if string(b) != `"openai/gpt-5.4-mini"` {
-		t.Fatalf("Marshal = %s", b)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(b) == `"openai/gpt-5.4-mini"`, "Marshal = %s", b)
 
 	var parsed ModelRef
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		t.Fatalf("Unmarshal returned error: %v", err)
+	{
+		err := json.Unmarshal(b, &parsed)
+		testassert.NoError(t, err)
 	}
-	if parsed != ref {
-		t.Fatalf("parsed = %#v, want %#v", parsed, ref)
-	}
+	testassert.Equal(t, parsed, ref)
 }
 
 func TestModelRefJSONZeroMarshalsAsEmptyString(t *testing.T) {
@@ -76,12 +64,8 @@ func TestModelRefJSONZeroMarshalsAsEmptyString(t *testing.T) {
 			ref = ModelRef{Provider: "openai"}
 		}
 		b, err := json.Marshal(ref)
-		if err != nil {
-			t.Fatalf("%s Marshal returned error: %v", name, err)
-		}
-		if string(b) != `""` {
-			t.Fatalf("%s Marshal = %s, want \"\"", name, b)
-		}
+		testassert.Require(t, err == nil, "%s Marshal returned error: %v", name, err)
+		testassert.Require(t, string(b) == `""`, "%s Marshal = %s, want \"\"", name, b)
 	}
 }
 
@@ -89,28 +73,21 @@ func TestModelRefJSONUnmarshalRejectsInvalidStrings(t *testing.T) {
 	for _, input := range []string{`null`, `""`, `"openai"`, `"/gpt-5.4-mini"`, `"openai/"`} {
 		var ref ModelRef
 		err := json.Unmarshal([]byte(input), &ref)
-		if !errors.Is(err, ErrInvalidModelRef) {
-			t.Fatalf("Unmarshal(%s) error = %v, want ErrInvalidModelRef", input, err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "Unmarshal(%s) error = %v, want ErrInvalidModelRef", input, err)
 	}
 }
 
 func TestParseRejectsMissingParts(t *testing.T) {
 	for _, input := range []string{"", "openai", "/gpt-5.4-mini", "openai/"} {
-		if _, err := Parse(input); !errors.Is(err, ErrInvalidModelRef) {
-			t.Fatalf("Parse(%q) error = %v, want ErrInvalidModelRef", input, err)
+		{
+			_, err := Parse(input)
+			testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "Parse(%q) error = %v, want ErrInvalidModelRef", input, err)
 		}
 	}
 }
 
 func TestModelRefIsZero(t *testing.T) {
-	if !(ModelRef{}).IsZero() {
-		t.Fatal("zero ref did not report IsZero")
-	}
-	if (ModelRef{Provider: "openai"}).IsZero() {
-		t.Fatal("partial ref reported IsZero")
-	}
-	if (ModelRef{Provider: "openai", Model: "gpt-5.4-mini"}).IsZero() {
-		t.Fatal("complete ref reported IsZero")
-	}
+	testassert.Require(t, (ModelRef{}).IsZero(), "%v", "zero ref did not report IsZero")
+	testassert.Require(t, !(ModelRef{Provider: "openai"}).IsZero(), "%v", "partial ref reported IsZero")
+	testassert.Require(t, !(ModelRef{Provider: "openai", Model: "gpt-5.4-mini"}).IsZero(), "%v", "complete ref reported IsZero")
 }

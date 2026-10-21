@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // assistantMsg builds a valid assistant message on the full test source and applies an optional mutation to it.
@@ -47,15 +49,9 @@ func TestNewOutputStatusAndSourceRules(t *testing.T) {
 	for _, tc := range valid {
 		t.Run(tc.name+" accepts", func(t *testing.T) {
 			out, err := NewOutput(Output{Status: tc.status, Source: fullRef, Message: tc.msg, Detail: tc.detail})
-			if err != nil {
-				t.Fatalf("NewOutput returned error: %v", err)
-			}
-			if out.Status != tc.status || out.Source != fullRef || out.Detail != tc.detail {
-				t.Fatalf("output not preserved: %#v", out)
-			}
-			if (tc.msg == nil) != (out.Message == nil) {
-				t.Fatal("message presence changed")
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, out.Status == tc.status && out.Source == fullRef && out.Detail == tc.detail, "output not preserved: %#v", out)
+			testassert.Require(t, (tc.msg == nil) == (out.Message == nil), "%v", "message presence changed")
 		})
 	}
 
@@ -80,24 +76,28 @@ func TestNewOutputStatusAndSourceRules(t *testing.T) {
 
 	for i, status := range []string{"", "done", "COMPLETED"} {
 		outIn := Output{Status: OutputStatus(status), Source: fullRef, Detail: "d"}
-		if _, err := NewOutput(outIn); !errors.Is(err, ErrInvalidStatus) {
-			t.Fatalf("case %d status=%q error = %v, want ErrInvalidStatus", i, status, err)
+		{
+			_, err := NewOutput(outIn)
+			testassert.Require(t, errors.Is(err, ErrInvalidStatus), "case %d status=%q error = %v, want ErrInvalidStatus", i, status, err)
 		}
 	}
 
 	mismatchedMsg := assistantMsg(t, nil)
 	outIn := Output{Status: OutputCompleted, Source: ModelRef{Provider: "openrouter", Model: "other"}, Message: &mismatchedMsg, Detail: ""}
-	if _, err := NewOutput(outIn); !errors.Is(err, ErrSourceMismatch) {
-		t.Fatalf("message source != output source error = %v, want ErrSourceMismatch", err)
+	{
+		_, err := NewOutput(outIn)
+		testassert.Require(t, errors.Is(err, ErrSourceMismatch), "message source != output source error = %v, want ErrSourceMismatch", err)
 	}
 
 	completedWithDetail := Output{Status: OutputCompleted, Source: fullRef, Message: &textMsg, Detail: "boom"}
-	if _, err := NewOutput(completedWithDetail); err == nil {
-		t.Fatal("completed with non-empty detail accepted")
+	{
+		_, err := NewOutput(completedWithDetail)
+		testassert.Require(t, err != nil, "%v", "completed with non-empty detail accepted")
 	}
 	erroredNoDetail := Output{Status: OutputErrored, Source: fullRef, Detail: ""}
-	if _, err := NewOutput(erroredNoDetail); !errors.Is(err, ErrMissingField) {
-		t.Fatalf("errored without detail error = %v, want ErrMissingField", err)
+	{
+		_, err := NewOutput(erroredNoDetail)
+		testassert.Require(t, errors.Is(err, ErrMissingField), "errored without detail error = %v, want ErrMissingField", err)
 	}
 
 	msgWithCalls := assistantMsg(t, func(m *Message) {
@@ -105,45 +105,37 @@ func TestNewOutputStatusAndSourceRules(t *testing.T) {
 		m.ToolCalls = []ToolCall{c}
 	})
 	interruptedWithCalls := Output{Status: OutputInterrupted, Source: fullRef, Message: &msgWithCalls, Detail: "agent interrupted"}
-	if _, err := NewOutput(interruptedWithCalls); err == nil {
-		t.Fatal("interrupted output with tool calls accepted")
+	{
+		_, err := NewOutput(interruptedWithCalls)
+		testassert.Require(t, err != nil, "%v", "interrupted output with tool calls accepted")
 	}
 
 	userRoleMsg := mustMessage(t, Message{Role: RoleUser})
 	wrongRoleOut := Output{Status: OutputCompleted, Source: fullRef, Message: &userRoleMsg, Detail: ""}
-	if _, err := NewOutput(wrongRoleOut); !errors.Is(err, ErrInvalidRole) {
-		t.Fatalf("output message with non-assistant role error = %v, want ErrInvalidRole", err)
+	{
+		_, err := NewOutput(wrongRoleOut)
+		testassert.Require(t, errors.Is(err, ErrInvalidRole), "output message with non-assistant role error = %v, want ErrInvalidRole", err)
 	}
 
 	var zeroUsage Usage
 	outWithZeroUsage, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: &textMsg, Usage: &zeroUsage})
-	if err != nil || outWithZeroUsage.Usage == nil {
-		t.Fatalf("present all-zero usage must be retained (known zero): %#v (err %v)", outWithZeroUsage, err)
-	}
+	testassert.Require(t, err == nil && outWithZeroUsage.Usage != nil, "present all-zero usage must be retained (known zero): %#v (err %v)", outWithZeroUsage, err)
 
 	outNoUsage := Output{Status: OutputCompleted, Source: fullRef, Message: &textMsg}
 	gotOut, _ := NewOutput(outNoUsage)
-	if gotOut.Usage != nil {
-		t.Fatalf("absent usage must stay absent (unknown/not reported): %#v", gotOut.Usage)
-	}
+	testassert.Require(t, gotOut.Usage == nil, "absent usage must stay absent (unknown/not reported): %#v", gotOut.Usage)
 
 	negIn := Usage{InputTokens: -1, CachedInputTokens: 0, OutputTokens: -2}
 	gotNeg, err := NewOutput(Output{Status: OutputErrored, Source: fullRef, Detail: "d", Usage: &negIn})
-	if err != nil || gotNeg.Usage == nil || *gotNeg.Usage != negIn {
-		t.Fatalf("signed int usage not preserved verbatim: %#v (err %v)", gotNeg.Usage, err)
-	}
+	testassert.Require(t, err == nil && gotNeg.Usage != nil && *gotNeg.Usage == negIn, "signed int usage not preserved verbatim: %#v (err %v)", gotNeg.Usage, err)
 
 	srcRaw := json.RawMessage(`"thinking"`)
 	extraMsgSrc := assistantMsg(t, func(m *Message) { m.Extra = Extra{"reasoning_content": srcRaw} })
 	gotExtraOut, err := NewOutput(Output{Status: OutputErrored, Source: fullRef, Message: &extraMsgSrc, Detail: "d"})
-	if err != nil || gotExtraOut.Message == nil {
-		t.Fatalf("NewOutput returned error or dropped message: %v", err)
-	}
+	testassert.Require(t, err == nil && gotExtraOut.Message != nil, "NewOutput returned error or dropped message: %v", err)
 	srcRaw[1] = 'X' // corrupt caller bytes after construction.
 	stored := string(gotExtraOut.Message.Extra["reasoning_content"])
-	if len(stored) < 2 || stored[:2] != `"t` {
-		t.Fatalf("output message extra not deep copied at accepting boundary: %s", gotExtraOut.Message.Extra["reasoning_content"])
-	}
+	testassert.Require(t, len(stored) >= 2 && stored[:2] == `"t`, "output message extra not deep copied at accepting boundary: %s", gotExtraOut.Message.Extra["reasoning_content"])
 
 }
 
@@ -167,15 +159,17 @@ func TestNewOutputAssistantPayloadDefinition(t *testing.T) {
 	}
 	for _, tc := range valid {
 		t.Run(tc.name+" accepts", func(t *testing.T) {
-			if _, err := NewOutput(tc.out); err != nil {
-				t.Fatalf("NewOutput returned error: %v", err)
+			{
+				_, err := NewOutput(tc.out)
+				testassert.NoError(t, err)
 			}
 		})
 	}
 
 	refusalOnly, _ := NewMessage(Message{Role: RoleAssistant, Source: fullRef, Refusal: "no"})
-	if _, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: &refusalOnly}); err != nil {
-		t.Fatalf("non-empty refusal must count as payload: %v", err)
+	{
+		_, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: &refusalOnly})
+		testassert.NoError(t, err)
 	}
 
 	msgEmptyPart := assistantMsg(t, func(m *Message) { m.Content = []ContentPart{{Kind: PartText}} })
@@ -194,15 +188,17 @@ func TestNewOutputAssistantPayloadDefinition(t *testing.T) {
 	}
 	for _, tc := range noPayloadCases {
 		t.Run(tc.name+" rejects completed output", func(t *testing.T) {
-			if _, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: tc.msg}); err == nil {
-				t.Fatal("completed output without eligible payload accepted")
+			{
+				_, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: tc.msg})
+				testassert.Require(t, err != nil, "%v", "completed output without eligible payload accepted")
 			}
 		})
 	}
 
 	bareAssistant := assistantMsg(t, nil)
-	if _, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: &bareAssistant}); err == nil {
-		t.Fatal("bare assistant message (no parts/refusal/calls/extras) accepted as completed payload")
+	{
+		_, err := NewOutput(Output{Status: OutputCompleted, Source: fullRef, Message: &bareAssistant})
+		testassert.Require(t, err != nil, "%v", "bare assistant message (no parts/refusal/calls/extras) accepted as completed payload")
 	}
 }
 
@@ -231,23 +227,21 @@ func TestAssistantContentAndPayloadQueries(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := HasAssistantContent(tc.msg); got != tc.content {
-				t.Fatalf("HasAssistantContent = %v, want %v", got, tc.content)
+			{
+				got := HasAssistantContent(tc.msg)
+				testassert.Equal(t, got, tc.content)
 			}
-			if got := hasAssistantPayload(tc.msg); got != tc.payload {
-				t.Fatalf("hasAssistantPayload = %v, want %v", got, tc.payload)
+			{
+				got := hasAssistantPayload(tc.msg)
+				testassert.Equal(t, got, tc.payload)
 			}
 		})
 	}
 
 	p := ContentPart{Kind: PartText, Extra: Extra{"k": json.RawMessage(`null`), "m": json.RawMessage(`0`)}}
-	if !ContentPartHasPayload(p) {
-		t.Fatal("part with one surviving extra reported empty")
-	}
+	testassert.Require(t, ContentPartHasPayload(p), "%v", "part with one surviving extra reported empty")
 	empty := ContentPart{Kind: PartText, Extra: Extra{"k": json.RawMessage(`null`)}}
-	if ContentPartHasPayload(empty) {
-		t.Fatal("part with null-only extras reported payload")
-	}
+	testassert.Require(t, !ContentPartHasPayload(empty), "%v", "part with null-only extras reported payload")
 }
 
 // TestNewRequest pins the logical request contract: owned messages + tools only.
@@ -258,51 +252,39 @@ func TestNewRequestValidAndOwnership(t *testing.T) {
 
 	reqIn := Request{Messages: msgs, Tools: defs}
 	out, err := NewRequest(reqIn)
-	if err != nil {
-		t.Fatalf("NewRequest returned error: %v", err)
-	}
-	if len(out.Messages) != 1 || out.Messages[0].TextContent() != "hi" {
-		t.Fatalf("messages not preserved: %#v", out.Messages)
-	}
-	if len(out.Tools) != 1 || out.Tools[0].Name != "read_file" {
-		t.Fatalf("tools not preserved: %#v", out.Tools)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(out.Messages) == 1 && out.Messages[0].TextContent() == "hi" && (len(out.Tools) == 1 && out.Tools[0].Name == "read_file"), "messages not preserved: %#v; tools not preserved: %#v", out.Messages, out.Tools)
 
 	msgs[0].Content = nil // corrupt caller slices after construction.
 	d1.Parameters = json.RawMessage(`{}`)
-	if len(out.Messages[0].Content) != 1 || out.Messages[0].TextContent() != "hi" {
-		t.Fatalf("owned request messages must survive input mutation: %#v", out.Messages)
-	}
+	testassert.Require(t, len(out.Messages[0].Content) == 1 && out.Messages[0].TextContent() == "hi", "owned request messages must survive input mutation: %#v", out.Messages)
 
 	got, err := NewRequest(Request{})
-	if err != nil || len(got.Messages) != 0 || len(got.Tools) != 0 {
-		t.Fatalf("empty request = %#v (err %v), want no messages or tools", got, err)
-	}
+	testassert.Require(t, err == nil && len(got.Messages) == 0 && len(got.Tools) == 0, "empty request = %#v (err %v), want no messages or tools", got, err)
 
 	defParams := json.RawMessage(`{"type":"object"}`)
 	dIn := ToolDefinition{Name: "x", Parameters: defParams}
 	out3, err := NewRequest(Request{Tools: []ToolDefinition{dIn}})
-	if err != nil {
-		t.Fatalf("NewRequest returned error: %v", err)
-	}
+	testassert.NoError(t, err)
 	defParams[1] = 'X' // corrupt caller bytes after construction.
 	storedParams := string(out3.Tools[0].Parameters)
-	if len(storedParams) == 0 || storedParams[:2] != `{"` {
-		t.Fatalf("request tool parameters not deep copied: %s", out3.Tools[0].Parameters)
-	}
+	testassert.Require(t, len(storedParams) != 0 && storedParams[:2] == `{"`, "request tool parameters not deep copied: %s", out3.Tools[0].Parameters)
 
 	badMsg := Request{Messages: []Message{{Role: RoleAssistant}}} // assistant without source.
-	if _, err := NewRequest(badMsg); !errors.Is(err, ErrMissingSource) {
-		t.Fatalf("request with invalid embedded message error = %v, want ErrMissingSource", err)
+	{
+		_, err := NewRequest(badMsg)
+		testassert.Require(t, errors.Is(err, ErrMissingSource), "request with invalid embedded message error = %v, want ErrMissingSource", err)
 	}
 
-	if _, err := NewRequest(Request{Tools: []ToolDefinition{{Name: "", Parameters: json.RawMessage(`[1]`)}}}); !errors.Is(err, ErrMissingField) && !errors.Is(err, ErrInvalidParameters) {
-		t.Fatalf("request with invalid definition error = %v", err)
+	{
+		_, err := NewRequest(Request{Tools: []ToolDefinition{{Name: "", Parameters: json.RawMessage(`[1]`)}}})
+		testassert.Require(t, errors.Is(err, ErrMissingField) || errors.Is(err, ErrInvalidParameters), "request with invalid definition error = %v", err)
 	}
 
 	dupA := ToolDefinition{Name: "t", Parameters: json.RawMessage(`{}`)}
-	if _, err := NewRequest(Request{Tools: []ToolDefinition{dupA, dupA}}); !errors.Is(err, ErrDuplicateToolName) {
-		t.Fatalf("duplicate tool name error = %v, want ErrDuplicateToolName", err)
+	{
+		_, err := NewRequest(Request{Tools: []ToolDefinition{dupA, dupA}})
+		testassert.Require(t, errors.Is(err, ErrDuplicateToolName), "duplicate tool name error = %v, want ErrDuplicateToolName", err)
 	}
 }
 
@@ -314,14 +296,10 @@ func TestNewRequestNeverRetainsZeroLengthSliceBacking(t *testing.T) {
 	zeroCalls := fullCallsBase[:0]                                                           // zero length with that capacity now riding along on the caller's own array.
 
 	inMsg, err := NewMessage(Message{Role: RoleAssistant, Source: fullRef, Content: zeroContent, ToolCalls: zeroCalls}) // valid assistant shape so the fixture reaches the clone path exactly as Encode's boundary would.
-	if err != nil {
-		t.Fatalf("NewRequest(fixture) rejected a valid message with spare-capacity empty slices: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	out, outErr := NewRequest(Request{Messages: []Message{inMsg}}) // same shared clone path the encoder invokes per call — this row judges ITS retention behavior.
-	if outErr != nil {
-		t.Fatalf("NewRequest returned error for valid spare-capacity empty slices: %v", outErr)
-	}
+	testassert.NoError(t, outErr)
 
 	out.Messages[0].Content = append(out.Messages[0].Content, ContentPart{Kind: PartText, Text: "out-1"}, ContentPart{Kind: PartText, Text: "out-2"}) // retained-side appends into whatever backing it was given... (must land in storage the caller never owned).
 	inMsg.Content = append(inMsg.Content, ContentPart{Kind: PartText, Text: "in-1"}, ContentPart{Kind: PartText, Text: "in-2"})                       // ...and vice versa from the caller side.
@@ -349,14 +327,16 @@ func TestNewOutputSourceIdentityComparedByFields(t *testing.T) {
 
 	msgIn := assistantMsg(t, func(m *Message) { m.Source = splitOther; m.Content = []ContentPart{{Kind: PartText, Text: "x"}} })
 	outIn := Output{Status: OutputCompleted, Source: colliding, Message: &msgIn}
-	if _, err := NewOutput(outIn); !errors.Is(err, ErrSourceMismatch) {
-		t.Fatalf("rendering-colliding identities accepted; error = %v (want ErrSourceMismatch)", err)
+	{
+		_, err := NewOutput(outIn)
+		testassert.Require(t, errors.Is(err, ErrSourceMismatch), "rendering-colliding identities accepted; error = %v (want ErrSourceMismatch)", err)
 	}
 
 	slashyRef := ModelRef{Provider: "prov/er", Model: "model/x"} // complete identity with slashes in both fields.
 	msgIn2 := assistantMsg(t, func(m *Message) { m.Source = slashyRef; m.Content = []ContentPart{{Kind: PartText, Text: "x"}} })
 	outIn2 := Output{Status: OutputCompleted, Source: slashyRef, Message: &msgIn2}
-	if _, err := NewOutput(outIn2); err != nil {
-		t.Fatalf("field-identical identities rejected: %v", err)
+	{
+		_, err := NewOutput(outIn2)
+		testassert.NoError(t, err)
 	}
 }

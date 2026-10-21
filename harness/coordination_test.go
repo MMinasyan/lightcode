@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -153,18 +154,14 @@ func newCancelableHarness(t *testing.T, store Storage, prepared PreparedExecutio
 	}
 	hctx, cancel := context.WithCancel(context.Background())
 	h, err := New(hctx, Dependencies{Storage: store, Prepare: prepare})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 	return h, cancel
 }
 
 func createSession(t *testing.T, h *Harness) string {
 	t.Helper()
 	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	return session.Identity.SessionID
 }
 
@@ -186,9 +183,7 @@ func submitText(t *testing.T, h *Harness, sessionID, operationID string, mode Me
 func entryTexts(t *testing.T, store *graphStorage, sessionID string) []string {
 	t.Helper()
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("session graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	out := []string{}
 	for _, entry := range graph.Entries {
 		if entry.Input != nil {
@@ -205,9 +200,7 @@ func entryTexts(t *testing.T, store *graphStorage, sessionID string) []string {
 func steeringInputOwner(t *testing.T, store Storage, sessionID, text string) (string, InputOrigin) {
 	t.Helper()
 	graph, err := validateSessionGraph(context.Background(), store, sessionID)
-	if err != nil {
-		t.Fatalf("session graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
 		if entry.Input != nil && len(entry.Input.Content) > 0 && entry.Input.Content[0].Text == text {
 			return entry.Envelope.OperationID, entry.Input.Origin
@@ -224,13 +217,9 @@ func steeringInputOwner(t *testing.T, store Storage, sessionID, text string) (st
 func settledOperation(t *testing.T, store *graphStorage, sessionID, operationID string) OperationRecord {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID})
-	if err != nil {
-		t.Fatalf("read operation register %q: %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "read operation register %q: %v", operationID, err)
 	rec, err := decodeOperationRegister(reg)
-	if err != nil {
-		t.Fatalf("decode operation register %q: %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "decode operation register %q: %v", operationID, err)
 	return rec
 }
 
@@ -243,21 +232,15 @@ func awaitOperationTerminal(t *testing.T, store *graphStorage, sessionID, operat
 		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID})
 		if err == nil {
 			rec, derr := decodeOperationRegister(reg)
-			if derr != nil {
-				t.Fatalf("decode operation register %q: %v", operationID, derr)
-			}
+			testassert.Require(t, derr == nil, "decode operation register %q: %v", operationID, derr)
 			if rec.State.Terminal != nil {
-				if rec.State.Status != want {
-					t.Fatalf("operation %q status = %s, want %s", operationID, rec.State.Status, want)
-				}
+				testassert.Require(t, rec.State.Status == want, "operation %q status = %s, want %s", operationID, rec.State.Status, want)
 				return rec
 			}
 		} else if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("read operation register %q: %v", operationID, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("operation %q never settled as %s", operationID, want)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "operation %q never settled as %s", operationID, want)
 		time.Sleep(2 * time.Millisecond)
 	}
 }
@@ -276,38 +259,29 @@ func TestSubmitRoutesIdleAndActive(t *testing.T) {
 	session := createSession(t, h)
 
 	res, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
-	if err != nil || res.Disposition != DispositionAdmitted || res.Operation == nil || res.Operation.State.Status != OperationRunning {
-		t.Fatalf("idle regular submit = %+v err %v, want admitted with the record", res, err)
-	}
+	testassert.Require(t, err == nil && res.Disposition == DispositionAdmitted && res.Operation != nil && res.Operation.State.Status == OperationRunning, "idle regular submit = %+v err %v, want admitted with the record", res, err)
 	<-script.arrived // the execution reached its parked model boundary: the Session is active
 
 	steered, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1")
-	if err != nil || steered.Disposition != DispositionSteering || steered.Operation != nil {
-		t.Fatalf("active regular submit = %+v err %v, want steering without a record", steered, err)
-	}
+	testassert.Require(t, err == nil && steered.Disposition == DispositionSteering && steered.Operation == nil, "active regular submit = %+v err %v, want steering without a record", steered, err)
 	queued, err := submitText(t, h, session, "op-3", MessageModeQueued, "q1")
-	if err != nil || queued.Disposition != DispositionQueued || queued.Operation != nil {
-		t.Fatalf("active queued submit = %+v err %v, want queued without a record", queued, err)
-	}
+	testassert.Require(t, err == nil && queued.Disposition == DispositionQueued && queued.Operation == nil, "active queued submit = %+v err %v, want queued without a record", queued, err)
 	existing, err := submitText(t, h, session, "op-1", MessageModeRegular, "retry")
-	if err != nil || existing.Disposition != DispositionExisting || existing.Operation == nil ||
-		existing.Operation.Admission.OperationID != "op-1" {
-		t.Fatalf("active existing submit = %+v err %v, want the first record before routing", existing, err)
-	}
-	if entries, regs := storedSessionState(store, session); len(entries) != 1 || len(regs) != 2 {
-		t.Fatalf("buffered submits published entries %v registers %v", entries, regs)
+	testassert.Require(t, err == nil && existing.Disposition == DispositionExisting && existing.Operation != nil && existing.Operation.Admission.OperationID == "op-1", "active existing submit = %+v err %v, want the first record before routing", existing, err)
+	{
+		entries, regs := storedSessionState(store, session)
+		testassert.Require(t, len(entries) == 1 && len(regs) == 2, "buffered submits published entries %v registers %v", entries, regs)
 	}
 
-	if _, err := submitText(t, h, session, "op-4", MessageMode("urgent"), "x"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("unknown mode = %v, want ErrInvalid", err)
+	{
+		_, err := submitText(t, h, session, "op-4", MessageMode("urgent"), "x")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "unknown mode = %v, want ErrInvalid", err)
 	}
 
 	// Idle queued input uses normal admission: a fresh idle Session admits it.
 	other := createSession(t, h)
 	idleQueued, err := submitText(t, h, other, "idle-queued", MessageModeQueued, "queued-idle")
-	if err != nil || idleQueued.Disposition != DispositionAdmitted || idleQueued.Operation == nil {
-		t.Fatalf("idle queued submit = %+v err %v, want normal admission", idleQueued, err)
-	}
+	testassert.Require(t, err == nil && idleQueued.Disposition == DispositionAdmitted && idleQueued.Operation != nil, "idle queued submit = %+v err %v, want normal admission", idleQueued, err)
 }
 
 // TestSteeringAdmitsHeadsInFIFOOrder proves the steering row: while an
@@ -345,26 +319,30 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	receiveBounded(t, openerArrived, "the predecessor's Open")
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1"); err != nil {
-		t.Fatalf("steering submit 1: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1")
+		testassert.NoError(t, err)
 	}
 	close(openerGate) // the next head is buffered from the predecessor's Open, before its first request
 	receiveBounded(t, script.arrived, "op-1's first model request")
-	if _, err := h.Submit(context.Background(), SubmitRequest{
-		SessionID: session, OperationID: "op-3", Origin: InputOriginRuntime,
-		Content: admissionContent("s2"), Mode: MessageModeRegular,
-	}); err != nil {
-		t.Fatalf("steering submit 2: %v", err)
+	{
+		_, err := h.Submit(context.Background(), SubmitRequest{
+			SessionID: session, OperationID: "op-3", Origin: InputOriginRuntime,
+			Content: admissionContent("s2"), Mode: MessageModeRegular,
+		})
+		testassert.NoError(t, err)
 	}
-	if _, err := h.Submit(context.Background(), SubmitRequest{
-		SessionID: session, OperationID: "op-4", Origin: InputOriginPlugin,
-		Content: admissionContent("q1"), Mode: MessageModeQueued,
-	}); err != nil {
-		t.Fatalf("queued submit: %v", err)
+	{
+		_, err := h.Submit(context.Background(), SubmitRequest{
+			SessionID: session, OperationID: "op-4", Origin: InputOriginPlugin,
+			Content: admissionContent("q1"), Mode: MessageModeQueued,
+		})
+		testassert.NoError(t, err)
 	}
 
 	script.releaseGate() // the first model result settles with steering waiting: the boundary exits through the token
@@ -377,46 +355,49 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 		}
 	}
 	reqs := script.seen()
-	if len(reqs) != 5 {
-		t.Fatalf("model requests = %d, want one per head plus the reused-call successor's continuation", len(reqs))
+	testassert.Equal(t, len(reqs), 5)
+	{
+		texts := strings.Join(textsOf(reqs[0]), "|")
+		testassert.Equal(t, texts, "system|hello")
 	}
-	if texts := strings.Join(textsOf(reqs[0]), "|"); texts != "system|hello" {
-		t.Fatalf("first request = %q, want the admitted input only despite the buffered head", texts)
+	{
+		texts := strings.Join(textsOf(reqs[1]), "|")
+		testassert.Equal(t, texts, "system|hello|done|s1")
 	}
-	if texts := strings.Join(textsOf(reqs[1]), "|"); texts != "system|hello|done|s1" {
-		t.Fatalf("successor request = %q, want s1 as its own Operation's first receiving request", texts)
+	{
+		texts := strings.Join(textsOf(reqs[2]), "|")
+		testassert.Equal(t, texts, "system|hello|done|s1|done|ok|s2")
 	}
-	if texts := strings.Join(textsOf(reqs[2]), "|"); texts != "system|hello|done|s1|done|ok|s2" {
-		t.Fatalf("third request = %q, want s2 delivered after s1's own turn", texts)
+	{
+		texts := strings.Join(textsOf(reqs[3]), "|")
+		testassert.Equal(t, texts, "system|hello|done|s1|done|ok|s2|done|ok")
 	}
-	if texts := strings.Join(textsOf(reqs[3]), "|"); texts != "system|hello|done|s1|done|ok|s2|done|ok" {
-		t.Fatalf("continuation request = %q, want the reused call id's result under its own Operation", texts)
-	}
-	if texts := strings.Join(textsOf(reqs[4]), "|"); texts != "system|hello|done|s1|done|ok|s2|done|ok|done|q1" {
-		t.Fatalf("queued request = %q, want q1 trailing every steering head", texts)
+	{
+		texts := strings.Join(textsOf(reqs[4]), "|")
+		testassert.Equal(t, texts, "system|hello|done|s1|done|ok|s2|done|ok|done|q1")
 	}
 	awaitOperationTerminal(t, store, session, "op-4", OperationSuccess) // the explicit successor rendezvous
 	awaitHarnessQuiet(t, h, session)
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,s1,s2,q1" {
-		t.Fatalf("committed inputs = %q, want steering admitted in FIFO order before the queued follower", got)
+	{
+		got := strings.Join(entryTexts(t, store, session), ",")
+		testassert.Equal(t, got, "hello,s1,s2,q1")
 	}
-	if owner, origin := steeringInputOwner(t, store, session, "s1"); owner != "op-2" || origin != InputOriginUser {
-		t.Fatalf("steering input s1 owner/origin = %q/%v, want op-2/user", owner, origin)
+	{
+		owner, origin := steeringInputOwner(t, store, session, "s1")
+		testassert.Require(t, owner == "op-2" && origin == InputOriginUser, "steering input s1 owner/origin = %q/%v, want op-2/user", owner, origin)
 	}
-	if owner, origin := steeringInputOwner(t, store, session, "s2"); owner != "op-3" || origin != InputOriginRuntime {
-		t.Fatalf("steering input s2 owner/origin = %q/%v, want op-3/runtime", owner, origin)
+	{
+		owner, origin := steeringInputOwner(t, store, session, "s2")
+		testassert.Require(t, owner == "op-3" && origin == InputOriginRuntime, "steering input s2 owner/origin = %q/%v, want op-3/runtime", owner, origin)
 	}
-	if owner, origin := steeringInputOwner(t, store, session, "q1"); owner != "op-4" || origin != InputOriginPlugin {
-		t.Fatalf("queued input q1 owner/origin = %q/%v, want op-4/plugin", owner, origin)
+	{
+		owner, origin := steeringInputOwner(t, store, session, "q1")
+		testassert.Require(t, owner == "op-4" && origin == InputOriginPlugin, "queued input q1 owner/origin = %q/%v, want op-4/plugin", owner, origin)
 	}
 	graph, err := validateFixture(t, store, session)
-	if err != nil {
-		t.Fatalf("graph after the deliveries: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
-		if entry.Signal != nil {
-			t.Fatalf("entry %s added a signal behind a boundary exit", entry.Envelope.ID)
-		}
+		testassert.Require(t, entry.Signal == nil, "entry %s added a signal behind a boundary exit", entry.Envelope.ID)
 	}
 }
 
@@ -449,27 +430,32 @@ func TestSteeringContinuationAcrossOutputShapes(t *testing.T) {
 			session := createSession(t, h)
 			watch := watchSettlements(store)
 
-			if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("first submit: %v", err)
+			{
+				_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			receiveBounded(t, script.arrived, "op-1's first model request")
-			if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
-				t.Fatalf("steering submit: %v", err)
+			{
+				_, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer")
+				testassert.NoError(t, err)
 			}
 			script.releaseGate()
 
 			receiveBounded(t, watch.seen, "op-1's terminal settlement")
-			if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != tc.wantEnd {
-				t.Fatalf("operation settled %q, want %q", rec.State.Status, tc.wantEnd)
+			{
+				rec := settledOperation(t, store, session, "op-1")
+				testassert.Equal(t, rec.State.Status, tc.wantEnd)
 			}
 			receiveBounded(t, watch.seen, "the steering successor's settlement")
-			if texts := strings.Join(script.lastTexts(), "|"); !strings.Contains(texts, "steer") {
-				t.Fatalf("delivered projection = %q, want the steering carried by its own Operation's request", texts)
+			{
+				texts := strings.Join(script.lastTexts(), "|")
+				testassert.Require(t, strings.Contains(texts, "steer"), "delivered projection = %q, want the steering carried by its own Operation's request", texts)
 			}
 			awaitOperationTerminal(t, store, session, "op-2", OperationSuccess) // the explicit successor rendezvous
 			awaitHarnessQuiet(t, h, session)
-			if owner, _ := steeringInputOwner(t, store, session, "steer"); owner != "op-2" {
-				t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
+			{
+				owner, _ := steeringInputOwner(t, store, session, "steer")
+				testassert.Equal(t, owner, "op-2")
 			}
 		})
 	}
@@ -489,32 +475,39 @@ func TestPostTerminalQueuedDrain(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-script.arrived
-	if _, err := submitText(t, h, session, "turn-2", MessageModeQueued, "q1"); err != nil {
-		t.Fatalf("queued submit 1: %v", err)
+	{
+		_, err := submitText(t, h, session, "turn-2", MessageModeQueued, "q1")
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, h, session, "turn-3", MessageModeQueued, "q2"); err != nil {
-		t.Fatalf("queued submit 2: %v", err)
+	{
+		_, err := submitText(t, h, session, "turn-3", MessageModeQueued, "q2")
+		testassert.NoError(t, err)
 	}
 
 	script.releaseGate() //turn-1 settles; the drain admits q1, then q2 after its terminal
 	watch.next()
 	watch.next()
-	if rec := settledOperation(t, store, session, "turn-2"); rec.State.Status != OperationSuccess {
-		t.Fatalf("first drained turn settled %q, want success", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "turn-2")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 	watch.next()
-	if rec := settledOperation(t, store, session, "turn-3"); rec.State.Status != OperationSuccess {
-		t.Fatalf("second drained turn settled %q, want success", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "turn-3")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
-	if texts := strings.Join(script.lastTexts(), "|"); texts != "system|hello|done|q1|done|q2" {
-		t.Fatalf("last drained projection = %q, want FIFO order through q2", texts)
+	{
+		texts := strings.Join(script.lastTexts(), "|")
+		testassert.Equal(t, texts, "system|hello|done|q1|done|q2")
 	}
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,q1,q2" {
-		t.Fatalf("committed inputs = %q, want one admitted queued item per turn", got)
+	{
+		got := strings.Join(entryTexts(t, store, session), ",")
+		testassert.Equal(t, got, "hello,q1,q2")
 	}
 }
 
@@ -543,31 +536,35 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 				session := createSession(t, h)
 				watch := watchSettlements(store)
 
-				if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("first submit: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 				<-script.arrived
-				if _, err := submitText(t, h, session, "turn-2", mode, "q1"); err != nil {
-					t.Fatalf("queued submit 1: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-2", mode, "q1")
+					testassert.NoError(t, err)
 				}
-				if _, err := submitText(t, h, session, "turn-3", mode, "q2"); err != nil {
-					t.Fatalf("queued submit 2: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-3", mode, "q2")
+					testassert.NoError(t, err)
 				}
 				script.releaseGate()
 
 				watch.next()
 				watch.next()
-				if rec := settledOperation(t, store, session, "turn-3"); rec.State.Status != OperationSuccess {
-					t.Fatalf("next buffered message settled %+v, want q2 admitted and successful", rec.State)
+				{
+					rec := settledOperation(t, store, session, "turn-3")
+					testassert.Require(t, rec.State.Status == OperationSuccess, "next buffered message settled %+v, want q2 admitted and successful", rec.State)
 				}
-				if calls != 3 {
-					t.Fatalf("preparation calls = %d, want one per admitted turn with the failed item dropped", calls)
+				testassert.Equal(t, calls, 3)
+				{
+					got := strings.Join(entryTexts(t, store, session), ",")
+					testassert.Equal(t, got, "hello,q2")
 				}
-				if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,q2" {
-					t.Fatalf("committed inputs = %q, want the failed item gone without retry", got)
-				}
-				if _, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: session, Kind: RegisterOperation, OperationID: "turn-2"}); !errors.Is(err, ErrNotFound) {
-					t.Fatalf("failed item's operation register = %v, want nothing retained in storage", err)
+				{
+					_, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: session, Kind: RegisterOperation, OperationID: "turn-2"})
+					testassert.Require(t, errors.Is(err, ErrNotFound), "failed item's operation register = %v, want nothing retained in storage", err)
 				}
 			})
 
@@ -590,25 +587,30 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 					return nil
 				}
 
-				if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("first submit: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 				<-script.arrived
-				if _, err := submitText(t, h, session, "turn-2", mode, "q1"); err != nil {
-					t.Fatalf("queued submit 1: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-2", mode, "q1")
+					testassert.NoError(t, err)
 				}
-				if _, err := submitText(t, h, session, "turn-3", mode, "q2"); err != nil {
-					t.Fatalf("queued submit 2: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-3", mode, "q2")
+					testassert.NoError(t, err)
 				}
 				script.releaseGate()
 
 				watch.next()
 				watch.next()
-				if rec := settledOperation(t, store, session, "turn-3"); rec.State.Status != OperationSuccess {
-					t.Fatalf("next buffered message settled %+v, want q2 admitted and successful", rec.State)
+				{
+					rec := settledOperation(t, store, session, "turn-3")
+					testassert.Require(t, rec.State.Status == OperationSuccess, "next buffered message settled %+v, want q2 admitted and successful", rec.State)
 				}
-				if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,q2" {
-					t.Fatalf("committed inputs = %q, want the failed item gone without retry", got)
+				{
+					got := strings.Join(entryTexts(t, store, session), ",")
+					testassert.Equal(t, got, "hello,q2")
 				}
 			})
 
@@ -627,29 +629,35 @@ func TestBufferedItemFailureIsFinal(t *testing.T) {
 				session := createSession(t, h)
 				watch := watchSettlements(store)
 
-				if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("first submit: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
 				<-script.arrived // parked at the first model boundary: the queued items buffer before any terminal
-				if _, err := submitText(t, h, session, "turn-2", mode, "q1"); err != nil {
-					t.Fatalf("queued submit 1: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-2", mode, "q1")
+					testassert.NoError(t, err)
 				}
-				if _, err := submitText(t, h, session, "turn-3", mode, "q2"); err != nil {
-					t.Fatalf("queued submit 2: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-3", mode, "q2")
+					testassert.NoError(t, err)
 				}
 				script.releaseGate()
 
 				watch.next() // turn-1 succeeds
 				watch.next() // the drain admits q1, whose Operation settles failure
-				if rec := settledOperation(t, store, session, "turn-2"); rec.State.Status != OperationFailure {
-					t.Fatalf("first drained turn settled %q, want failure", rec.State.Status)
+				{
+					rec := settledOperation(t, store, session, "turn-2")
+					testassert.Equal(t, rec.State.Status, OperationFailure)
 				}
 				watch.next() // the next buffered message proceeds
-				if rec := settledOperation(t, store, session, "turn-3"); rec.State.Status != OperationSuccess {
-					t.Fatalf("next buffered message settled %+v, want q2 admitted and successful", rec.State)
+				{
+					rec := settledOperation(t, store, session, "turn-3")
+					testassert.Require(t, rec.State.Status == OperationSuccess, "next buffered message settled %+v, want q2 admitted and successful", rec.State)
 				}
-				if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,q1,q2" {
-					t.Fatalf("committed inputs = %q, want both queued items delivered in order", got)
+				{
+					got := strings.Join(entryTexts(t, store, session), ",")
+					testassert.Equal(t, got, "hello,q1,q2")
 				}
 			})
 		})
@@ -675,8 +683,9 @@ func TestFinalBoundarySerialization(t *testing.T) {
 		script.model = func(ctx context.Context, req model.Request) (model.Stream, error) {
 			if first { // submit at the model-result boundary, before the settlement returns
 				first = false
-				if _, err := submitText(t, h, session, "boundary", MessageModeRegular, "at-boundary"); err != nil {
-					t.Errorf("boundary submit: %v", err)
+				{
+					_, err := submitText(t, h, session, "boundary", MessageModeRegular, "at-boundary")
+					testassert.Check(t, err == nil, "boundary submit: %v", err)
 				}
 			}
 			return inner(ctx, req)
@@ -687,26 +696,32 @@ func TestFinalBoundarySerialization(t *testing.T) {
 		session = createSession(t, h)
 		watch := watchSettlements(store)
 
-		if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		receiveBounded(t, watch.seen, "turn-1's quiet success settlement") // the natural-success boundary exit
 		receiveBounded(t, watch.seen, "the boundary input's own settlement")
-		if rec := settledOperation(t, store, session, "turn-1"); rec.State.Status != OperationSuccess {
-			t.Fatalf("operation settled %q, want the boundary's quiet success", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, "turn-1")
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
-		if rec := settledOperation(t, store, session, "boundary"); rec.State.Status != OperationSuccess {
-			t.Fatalf("boundary operation settled %q, want the boundary input admitted and successful", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, "boundary")
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
-		if texts := strings.Join(script.lastTexts(), "|"); texts != "system|hello|done|at-boundary" {
-			t.Fatalf("final projection = %q, want the boundary steering as the successor's first request", texts)
+		{
+			texts := strings.Join(script.lastTexts(), "|")
+			testassert.Equal(t, texts, "system|hello|done|at-boundary")
 		}
 		awaitHarnessQuiet(t, h, session) // raw graph readers await Session convergence after the successor's terminal
-		if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,at-boundary" {
-			t.Fatalf("committed inputs = %q, want each input owned by its own Operation", got)
+		{
+			got := strings.Join(entryTexts(t, store, session), ",")
+			testassert.Equal(t, got, "hello,at-boundary")
 		}
-		if owner, _ := steeringInputOwner(t, store, session, "at-boundary"); owner != "boundary" {
-			t.Fatalf("boundary input owned by %q, want its own Operation", owner)
+		{
+			owner, _ := steeringInputOwner(t, store, session, "at-boundary")
+			testassert.Equal(t, owner, "boundary")
 		}
 	})
 
@@ -722,8 +737,9 @@ func TestFinalBoundarySerialization(t *testing.T) {
 		script.model = func(ctx context.Context, req model.Request) (model.Stream, error) {
 			if first { // defer one queued message at the final model-result boundary
 				first = false
-				if _, err := submitText(t, h, session, "turn-2", MessageModeQueued, "at-boundary"); err != nil {
-					t.Errorf("boundary submit: %v", err)
+				{
+					_, err := submitText(t, h, session, "turn-2", MessageModeQueued, "at-boundary")
+					testassert.Check(t, err == nil, "boundary submit: %v", err)
 				}
 			}
 			return inner(ctx, req)
@@ -734,16 +750,19 @@ func TestFinalBoundarySerialization(t *testing.T) {
 		session = createSession(t, h)
 		watch := watchSettlements(store)
 
-		if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		watch.next()
 		watch.next()
-		if rec := settledOperation(t, store, session, "turn-2"); rec.State.Status != OperationSuccess {
-			t.Fatalf("drained turn settled %+v, want the boundary queued input admitted after the terminal", rec.State)
+		{
+			rec := settledOperation(t, store, session, "turn-2")
+			testassert.Require(t, rec.State.Status == OperationSuccess, "drained turn settled %+v, want the boundary queued input admitted after the terminal", rec.State)
 		}
-		if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,at-boundary" {
-			t.Fatalf("committed inputs = %q, want the boundary queued input delivered", got)
+		{
+			got := strings.Join(entryTexts(t, store, session), ",")
+			testassert.Equal(t, got, "hello,at-boundary")
 		}
 	})
 }
@@ -771,32 +790,31 @@ func TestAgentTypeChangeDuringBlockedEffect(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-script.arrived
-	if _, err := submitText(t, h, session, "turn-2", MessageModeQueued, "q1"); err != nil {
-		t.Fatalf("queued submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "turn-2", MessageModeQueued, "q1")
+		testassert.NoError(t, err)
 	}
-	if _, err := h.ChangeAgentType(context.Background(), session, "reviewer"); err != nil {
-		t.Fatalf("ChangeAgentType during the blocked effect: %v", err)
+	{
+		_, err := h.ChangeAgentType(context.Background(), session, "reviewer")
+		testassert.NoError(t, err)
 	}
 
 	script.releaseGate()
 	watch.next()
 	watch.next()
-	if rec := settledOperation(t, store, session, "turn-2"); rec.State.Status != OperationSuccess {
-		t.Fatalf("drained turn settled %+v, want success", rec.State)
+	{
+		rec := settledOperation(t, store, session, "turn-2")
+		testassert.Require(t, rec.State.Status == OperationSuccess, "drained turn settled %+v, want success", rec.State)
 	}
 	prepareMu.Lock()
 	defer prepareMu.Unlock()
-	if len(prepareReqs) != 2 {
-		t.Fatalf("preparation calls = %d, want the drained admission to prepare again", len(prepareReqs))
-	}
-	if prepareReqs[0].Session.AgentType != "coder" || prepareReqs[1].Session.AgentType != "reviewer" {
-		t.Fatalf("preparation agent types = %q then %q, want the capture-time value then the changed one",
-			prepareReqs[0].Session.AgentType, prepareReqs[1].Session.AgentType)
-	}
+	testassert.Equal(t, len(prepareReqs), 2)
+	testassert.Require(t, prepareReqs[0].Session.AgentType == "coder" && prepareReqs[1].Session.AgentType == "reviewer", "preparation agent types = %q then %q, want the capture-time value then the changed one", prepareReqs[0].Session.AgentType, prepareReqs[1].Session.AgentType)
 }
 
 // TestWaitConvergence proves the Harness-lifetime row: Wait returns only after
@@ -815,8 +833,9 @@ func TestWaitConvergence(t *testing.T) {
 		session := createSession(t, h)
 		watch := watchSettlements(store)
 
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived
 		waited := make(chan error, 1)
@@ -824,12 +843,14 @@ func TestWaitConvergence(t *testing.T) {
 
 		cancel()             // Harness loss closes admission and ends the run
 		script.releaseGate() // the already-started callback publishes, then the run interrupts
-		if err := <-waited; err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := <-waited
+			testassert.NoError(t, err)
 		}
 		watch.next()
-		if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationInterruption {
-			t.Fatalf("converged operation = %q, want interruption", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, "op-1")
+			testassert.Equal(t, rec.State.Status, OperationInterruption)
 		}
 	})
 
@@ -843,9 +864,7 @@ func TestWaitConvergence(t *testing.T) {
 			<-gate
 			return PreparedExecution{}, prepCtx.Err() // the dead harness context fails the parked preparation
 		}})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+		testassert.NoError(t, err)
 		session := createSession(t, h)
 		admitted := make(chan error, 1)
 		go func() {
@@ -859,14 +878,17 @@ func TestWaitConvergence(t *testing.T) {
 		cancel()    // the Harness context dies while preparation is parked
 		close(gate) // the parked preparation fails on the dead context
 
-		if err := <-admitted; err == nil {
-			t.Fatalf("preparation over a lost Harness context succeeded, want an error")
+		{
+			err := <-admitted
+			testassert.Require(t, err != nil, "preparation over a lost Harness context succeeded, want an error")
 		}
-		if err := <-waited; err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := <-waited
+			testassert.NoError(t, err)
 		}
-		if _, regs := storedSessionState(store, session); len(regs) != 1 {
-			t.Fatalf("converged store holds %d registers, want the session register only", len(regs))
+		{
+			_, regs := storedSessionState(store, session)
+			testassert.Equal(t, len(regs), 1)
 		}
 	})
 
@@ -891,8 +913,9 @@ func TestWaitConvergence(t *testing.T) {
 		session := createSession(t, h)
 		watch := watchSettlements(store)
 
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived
 		script.releaseGate() // the completed output with one call dispatches the tool
@@ -903,14 +926,13 @@ func TestWaitConvergence(t *testing.T) {
 		cancel()
 		close(toolGate) // the produced result publishes, the run interrupts
 
-		if err := <-waited; err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := <-waited
+			testassert.NoError(t, err)
 		}
 		watch.next()
 		rec := settledOperation(t, store, session, "op-1")
-		if rec.State.Status != OperationInterruption || len(rec.State.PendingToolCalls) != 0 {
-			t.Fatalf("converged operation = %+v, want interruption with the produced call settled", rec.State)
-		}
+		testassert.Require(t, rec.State.Status == OperationInterruption && len(rec.State.PendingToolCalls) == 0, "converged operation = %+v, want interruption with the produced call settled", rec.State)
 	})
 
 	t.Run("the first storage failure that stopped admitted work is retained", func(t *testing.T) {
@@ -939,22 +961,26 @@ func TestWaitConvergence(t *testing.T) {
 			}
 		}
 		sessionA := createSession(t, h)
-		if _, err := submitText(t, h, sessionA, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionA, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-failed // the admitted work stopped at the intent publication
 
 		sessionB := createSession(t, h)
-		if _, err := submitText(t, h, sessionB, "op-1", MessageModeRegular, "hello"); err == nil {
-			t.Fatalf("later storage failure did not surface from Submit")
+		{
+			_, err := submitText(t, h, sessionB, "op-1", MessageModeRegular, "hello")
+			testassert.Require(t, err != nil, "later storage failure did not surface from Submit")
 		}
 
 		cancel()
-		if err := h.Wait(context.Background()); !errors.Is(err, firstErr) {
-			t.Fatalf("Wait = %v, want the first retained storage error (later: %v)", err, laterErr)
+		{
+			err := h.Wait(context.Background())
+			testassert.Require(t, errors.Is(err, firstErr), "Wait = %v, want the first retained storage error (later: %v)", err, laterErr)
 		}
-		if rec := settledOperation(t, store, sessionA, "op-1"); rec.State.Status != OperationRunning {
-			t.Fatalf("stopped operation = %q, want the last committed running state for recovery", rec.State.Status)
+		{
+			rec := settledOperation(t, store, sessionA, "op-1")
+			testassert.Equal(t, rec.State.Status, OperationRunning)
 		}
 	})
 
@@ -991,29 +1017,28 @@ func TestWaitConvergence(t *testing.T) {
 			return nil
 		}
 		sessionA := createSession(t, h)
-		if _, err := submitText(t, h, sessionA, "op-a", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionA, "op-a", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-closedA // the cleanup ran after the failed terminal-settlement attempt
 		sessionB := createSession(t, h)
-		if _, err := submitText(t, h, sessionB, "op-b", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("second submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionB, "op-b", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-closedB
 
 		cancel()
 		err := h.Wait(context.Background())
-		if !errors.Is(err, firstErr) || !errors.Is(err, cleanupErr) {
-			t.Fatalf("Wait = %v, want the join of the retained storage failure and the retained cleanup failure", err)
+		testassert.Require(t, errors.Is(err, firstErr) && errors.Is(err, cleanupErr) && !errors.Is(err, laterCleanupErr), "Wait = %v, want the join of the retained storage failure and the retained cleanup failure; Wait = %v, want the first retained cleanup failure not replaced by a later one", err, err)
+		{
+			rec := settledOperation(t, store, sessionA, "op-a")
+			testassert.Equal(t, rec.State.Status, OperationRunning)
 		}
-		if errors.Is(err, laterCleanupErr) {
-			t.Fatalf("Wait = %v, want the first retained cleanup failure not replaced by a later one", err)
-		}
-		if rec := settledOperation(t, store, sessionA, "op-a"); rec.State.Status != OperationRunning {
-			t.Fatalf("A stopped operation = %q, want the last committed running state for recovery", rec.State.Status)
-		}
-		if rec := settledOperation(t, store, sessionB, "op-b"); rec.State.Status != OperationSuccess {
-			t.Fatalf("B operation = %q, want the failed cleanup to leave the settled terminal unchanged", rec.State.Status)
+		{
+			rec := settledOperation(t, store, sessionB, "op-b")
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
 	})
 }
@@ -1048,37 +1073,38 @@ func TestWaitDiscardsBuffersOfStuckSessions(t *testing.T) {
 		}
 	}
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-failed // the admitted work stopped; the Operation stays running for recovery
 	c := leaseCoordinator(t, h, session)
 	// The stuck Operation keeps the Session active: both submits buffer.
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
-		t.Fatalf("steering submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer")
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, h, session, "op-3", MessageModeQueued, "queued-1"); err != nil {
-		t.Fatalf("queued submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-3", MessageModeQueued, "queued-1")
+		testassert.NoError(t, err)
 	}
 	c.mu.Lock()
 	buffered := len(c.steering) + len(c.queued)
 	c.mu.Unlock()
-	if buffered != 2 {
-		t.Fatalf("buffered items = %d, want both FIFOs present before cancellation", buffered)
-	}
+	testassert.Equal(t, buffered, 2)
 
 	cancel()
-	if err := h.Wait(context.Background()); !errors.Is(err, firstErr) {
-		t.Fatalf("Wait = %v, want the retained storage error", err)
+	{
+		err := h.Wait(context.Background())
+		testassert.Require(t, errors.Is(err, firstErr), "Wait = %v, want the retained storage error", err)
 	}
 	c.mu.Lock()
 	left := len(c.steering) + len(c.queued)
 	c.mu.Unlock()
-	if left != 0 {
-		t.Fatalf("%d buffered items survived cancellation + Wait, want both FIFOs cleared", left)
-	}
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationRunning {
-		t.Fatalf("stopped operation = %q, want the last committed running state for recovery", rec.State.Status)
+	testassert.Equal(t, left, 0)
+	{
+		rec := settledOperation(t, store, session, "op-1")
+		testassert.Equal(t, rec.State.Status, OperationRunning)
 	}
 }
 
@@ -1095,31 +1121,38 @@ func TestHarnessLossDiscardsBuffers(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-script.arrived
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1"); err != nil {
-		t.Fatalf("steering submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1")
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, h, session, "op-3", MessageModeQueued, "q1"); err != nil {
-		t.Fatalf("queued submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-3", MessageModeQueued, "q1")
+		testassert.NoError(t, err)
 	}
 
 	cancel() // Harness loss
-	if _, err := submitText(t, h, session, "op-4", MessageModeRegular, "late"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("submit after Harness loss = %v, want a context error", err)
+	{
+		_, err := submitText(t, h, session, "op-4", MessageModeRegular, "late")
+		testassert.Require(t, errors.Is(err, context.Canceled), "submit after Harness loss = %v, want a context error", err)
 	}
 	script.releaseGate() // the produced result publishes, the run interrupts, the buffers discard
-	if err := h.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
+	{
+		err := h.Wait(context.Background())
+		testassert.NoError(t, err)
 	}
 	watch.next()
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationInterruption {
-		t.Fatalf("converged operation = %q, want interruption", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-1")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello" {
-		t.Fatalf("committed inputs = %q, want both buffers discarded without delivery", got)
+	{
+		got := strings.Join(entryTexts(t, store, session), ",")
+		testassert.Equal(t, got, "hello")
 	}
 }
 
@@ -1139,8 +1172,9 @@ func TestSubmitCancellationGate(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the Session is active
 
@@ -1162,18 +1196,14 @@ func TestSubmitCancellationGate(t *testing.T) {
 
 		select {
 		case err := <-errCh:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("gated submit = %v, want a context error", err)
-			}
+			testassert.Require(t, errors.Is(err, context.Canceled), "gated submit = %v, want a context error", err)
 		case res := <-done:
 			t.Fatalf("gated submit returned %+v, want a context error", res)
 		}
 		c.mu.Lock()
 		buffered := len(c.steering) + len(c.queued)
 		c.mu.Unlock()
-		if buffered != 0 {
-			t.Fatalf("%d items buffered over a canceled context, want nothing published", buffered)
-		}
+		testassert.Equal(t, buffered, 0)
 		script.releaseGate()
 	})
 
@@ -1187,21 +1217,21 @@ func TestSubmitCancellationGate(t *testing.T) {
 		defer cancel()
 		session := createSession(t, h)
 
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("first submit: %v", err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the Session is active
 		submitCtx, cancelSubmit := context.WithCancel(context.Background())
 		res, err := h.Submit(submitCtx, SubmitRequest{SessionID: session, OperationID: "op-2", Origin: InputOriginUser, Content: admissionContent("late"), Mode: MessageModeRegular})
-		if err != nil || res.Disposition != DispositionSteering {
-			t.Fatalf("steering submit = %+v err %v, want the enqueue to win", res, err)
-		}
+		testassert.Require(t, err == nil && res.Disposition == DispositionSteering, "steering submit = %+v err %v, want the enqueue to win", res, err)
 		cancelSubmit() // later caller cancellation does not own the item
 
 		script.releaseGate()
 		<-script.arrived
-		if got := strings.Join(script.lastTexts(), "|"); !strings.Contains(got, "late") {
-			t.Fatalf("continuation projection = %q, want the item delivered despite the later cancellation", got)
+		{
+			got := strings.Join(script.lastTexts(), "|")
+			testassert.Require(t, strings.Contains(got, "late"), "continuation projection = %q, want the item delivered despite the later cancellation", got)
 		}
 	})
 }
@@ -1221,15 +1251,15 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 			return validPrepared(), nil
 		})
 		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-		if err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
-		if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
-			t.Fatalf("disposition %q, want admitted", disposition)
+		testassert.NoError(t, err)
+		{
+			_, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
+			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := leaseCoordinator(t, h, session.Identity.SessionID)
-		if _, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess}); err != nil {
-			t.Fatalf("settle the admitted operation: %v", err)
+		{
+			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
+			testassert.NoError(t, err)
 		}
 		return h, c
 	}
@@ -1242,18 +1272,14 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 		c.mu.Unlock()
 
 		release, err := h.reserve(h.ctx, c) // direct drain tests own the reservation around the body
-		if err != nil {
-			t.Fatalf("drain reservation: %v", err)
-		}
+		testassert.NoError(t, err)
 		h.drainBuffers(c, run) // synchronous: the empty FIFOs retire the slot in the scan's critical section
 		release()
 
 		c.mu.Lock()
 		got := c.run
 		c.mu.Unlock()
-		if got != nil {
-			t.Fatalf("empty drain left a run slot installed: %+v", got)
-		}
+		testassert.Require(t, got == nil, "empty drain left a run slot installed: %+v", got)
 	})
 
 	t.Run("an empty drain never clears a replacement run", func(t *testing.T) {
@@ -1265,18 +1291,14 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 		c.mu.Unlock()
 
 		release, err := h.reserve(h.ctx, c)
-		if err != nil {
-			t.Fatalf("drain reservation: %v", err)
-		}
+		testassert.NoError(t, err)
 		h.drainBuffers(c, oldRun)
 		release()
 
 		c.mu.Lock()
 		got := c.run
 		c.mu.Unlock()
-		if got != replacement {
-			t.Fatalf("empty drain cleared a replacement run: got %+v", got)
-		}
+		testassert.Equal(t, got, replacement)
 	})
 }
 
@@ -1306,24 +1328,28 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 	sessionB := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, sessionA, "op-a", MessageModeRegular, "first"); err != nil {
-		t.Fatalf("first session submit: %v", err)
+	{
+		_, err := submitText(t, h, sessionA, "op-a", MessageModeRegular, "first")
+		testassert.NoError(t, err)
 	}
 	<-first.arrived // session A parked at its model boundary
 
-	if _, err := submitText(t, h, sessionB, "op-b", MessageModeRegular, "second"); err != nil {
-		t.Fatalf("second session submit: %v", err)
+	{
+		_, err := submitText(t, h, sessionB, "op-b", MessageModeRegular, "second")
+		testassert.NoError(t, err)
 	}
 	<-second.arrived // session B reached its model boundary while A stays parked
 	watch.next()
-	if rec := settledOperation(t, store, sessionB, "op-b"); rec.State.Status != OperationSuccess {
-		t.Fatalf("second session settled %q while the first is parked, want concurrent progress", rec.State.Status)
+	{
+		rec := settledOperation(t, store, sessionB, "op-b")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 
 	first.releaseGate()
 	watch.next()
-	if rec := settledOperation(t, store, sessionA, "op-a"); rec.State.Status != OperationSuccess {
-		t.Fatalf("first session settled %q, want success after its release", rec.State.Status)
+	{
+		rec := settledOperation(t, store, sessionA, "op-a")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 }
 
@@ -1335,19 +1361,14 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 func TestSnapshotCoordinatorsReleasesRegistryMutex(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
 	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 
 	c.mu.Lock() // a coordinator mutex held across the snapshot call
 	got := h.snapshotCoordinators()
 	c.mu.Unlock()
-	if len(got) != 1 || got[0] != c {
-		t.Fatalf("snapshot = %d coordinators, want exactly the materialized one", len(got))
-	}
-	if !h.mu.TryLock() { // the registry mutex is released once the snapshot returns
-		t.Fatalf("snapshotCoordinators retained the registry mutex")
-	}
+	testassert.Require(t, len(got) == 1 && got[0] == c, "snapshot = %d coordinators, want exactly the materialized one", len(got))
+	// the registry mutex is released once the snapshot returns
+	testassert.Require(t, h.mu.TryLock(), "snapshotCoordinators retained the registry mutex")
 	h.mu.Unlock()
 }

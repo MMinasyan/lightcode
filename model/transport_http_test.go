@@ -15,15 +15,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // mustTransport builds a transport from the given resolved input, failing the test on any construction error. Valid-input fixtures only; every rejection case is asserted explicitly where it belongs (TestNewTransportRejectsInvalidResolvedInput).
 func mustTransport(t *testing.T, rt ResolvedTransport) *Transport { // shared fixture helper for this file and sibling transport/stream tests in the package — all of them construct before dialing anything.
 	t.Helper()
 	tr, err := NewTransport(rt)
-	if err != nil {
-		t.Fatalf("NewTransport returned error for a valid resolved input: %v", err)
-	}
+	testassert.NoError(t, err)
 	return tr
 }
 
@@ -33,32 +33,41 @@ func baseRequest() Request { return Request{Messages: []Message{userText("hi")}}
 // TestNewTransportRejectsInvalidResolvedInput pins construction-time validation with typed errors naming the offending field: zero and partial target identities fail via ErrInvalidModelRef, an out-of-set wire system role fails via ErrInvalidWireSystemRole (with the value in context), and every closed-set member plus a valid baseline construct cleanly without any I/O side effect.
 func TestNewTransportRejectsInvalidResolvedInput(t *testing.T) { // resolved-input validity at construction is exactly this matrix — nothing else may fail here, since request-level concerns belong to Stream's trust boundary instead... (that split keeps each error surface owning its own inputs).
 
-	if _, err := NewTransport(ResolvedTransport{}); !errors.Is(err, ErrInvalidModelRef) || !errors.Is(err, ErrInvalidInput) { // zero identity: provider and model both empty.
-		t.Fatalf("zero-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
+	// zero identity: provider and model both empty.
+	{
+		_, err := NewTransport(ResolvedTransport{})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef) && errors.Is(err, ErrInvalidInput), "zero-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
 	}
 
 	partial := testResolved()
 	partial.Model = ModelRef{Provider: "openai"} // provider-only is not complete — same rule as everywhere else in this package where a nonzero identity is required.
-	if _, err := NewTransport(partial); !errors.Is(err, ErrInvalidModelRef) || !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("partial-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
+	{
+		_, err := NewTransport(partial)
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef) && errors.Is(err, ErrInvalidInput), "partial-model error = %v, want ErrInvalidModelRef and ErrInvalidInput", err)
 	}
 
 	badRole := testResolved()
 	badRole.WireSystemRole = "assistant" // outside the closed system/user/developer wire-role set — assistant is a canonical conversation role, not a wire system role.
-	if _, err := NewTransport(badRole); !errors.Is(err, ErrInvalidWireSystemRole) || !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("bad-wire-role error = %v, want ErrInvalidWireSystemRole and ErrInvalidInput", err)
+	{
+		_, err := NewTransport(badRole)
+		testassert.Require(t, errors.Is(err, ErrInvalidWireSystemRole) && errors.Is(err, ErrInvalidInput), "bad-wire-role error = %v, want ErrInvalidWireSystemRole and ErrInvalidInput", err)
 	}
 
 	for _, role := range []string{"system", "user", "developer"} { // every closed-set member constructs — pinning that validation rejects exactly out-of-set values and nothing else... (an over-strict implementation would fail one of these rows instead of the badRole row above).
 		valid := testResolved()
 		valid.WireSystemRole = role
-		if _, err := NewTransport(valid); err != nil {
-			t.Fatalf("wire role %q rejected at construction: %v", role, err) // no I/O happens on any success path — the type performs none by contract (no files appear, nothing dials)... which is why this loop can run without a server.
+		// no I/O happens on any success path — the type performs none by contract (no files appear, nothing dials)... which is why this loop can run without a server.
+		{
+			_, err := NewTransport(valid)
+			testassert.Require(t, err == nil, "wire role %q rejected at construction: %v", role, err)
 		}
 	}
 
-	if _, err := NewTransport(testResolved()); err != nil { // plain valid baseline: the happy construction itself must be an error-free no-op... (it is asserted last so its green cannot mask any rejection-row failure above).
-		t.Fatalf("valid resolved input rejected at construction: %v", err) // a regression here would mean NewTransport started validating something outside its contract surface — worth failing loudly and specifically rather than discovering mid-suite.
+	// plain valid baseline: the happy construction itself must be an error-free no-op... (it is asserted last so its green cannot mask any rejection-row failure above).
+	// a regression here would mean NewTransport started validating something outside its contract surface — worth failing loudly and specifically rather than discovering mid-suite.
+	{
+		_, err := NewTransport(testResolved())
+		testassert.NoError(t, err)
 	}
 }
 
@@ -97,9 +106,7 @@ func TestNewTransportRejectsInvalidResolvedExtras(t *testing.T) { // constructio
 		rt := testResolved()
 		rt.ModelExtraBody = Extra{"stream_options": json.RawMessage(`{broken`)} // a reserved key whose own value cannot parse: identification must never depend on parsing it.
 		_, err := NewTransport(rt)
-		if !errors.Is(err, ErrReservedKeys) || errors.Is(err, ErrInvalidInput) {
-			t.Fatalf("error = %v; want the reserved-key identity alone even though the reserved value itself is malformed", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrReservedKeys) && !errors.Is(err, ErrInvalidInput), "error = %v; want the reserved-key identity alone even though the reserved value itself is malformed", err)
 	})
 
 	t.Run("reservedPresencePrecedesMalformedSiblingLayer", func(t *testing.T) {
@@ -107,9 +114,7 @@ func TestNewTransportRejectsInvalidResolvedExtras(t *testing.T) { // constructio
 		rt.ProviderExtraBody = Extra{"n": json.RawMessage(`1`)}        // reserved key in provider layer...
 		rt.ModelExtraBody = Extra{"junk": json.RawMessage(`not-json`)} // ...and a malformed non-reserved value in the model layer: the reserved-key pass runs first across both layers.
 		_, err := NewTransport(rt)
-		if !errors.Is(err, ErrReservedKeys) || errors.Is(err, ErrInvalidInput) {
-			t.Fatalf("error = %v; want ErrReservedKeys alone when a reserved key coexists with a malformed sibling value", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrReservedKeys) && !errors.Is(err, ErrInvalidInput), "error = %v; want ErrReservedKeys alone when a reserved key coexists with a malformed sibling value", err)
 	})
 
 	t.Run("malformedProviderExtraClassifiesAsTypedInvalidInput", func(t *testing.T) {
@@ -154,8 +159,10 @@ func TestNewTransportRejectsInvalidResolvedExtras(t *testing.T) { // constructio
 		rt := testResolved()
 		rt.ProviderExtraBody = Extra{"temperature": json.RawMessage(`0.1`)} // well-formed non-reserved values succeed...
 		rt.ModelExtraBody = Extra{"top_k": json.RawMessage(`40`)}
-		if _, err := NewTransport(rt); err != nil {
-			t.Fatalf("valid resolved extras rejected at construction: %v", err) // ...the checks above must reject exactly malformed/reserved input and nothing else.
+		// ...the checks above must reject exactly malformed/reserved input and nothing else.
+		{
+			_, err := NewTransport(rt)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -179,9 +186,8 @@ func TestNewTransportDeepCopiesResolvedInput(t *testing.T) { // one mutation pas
 	}
 
 	tr, err := NewTransport(rt) // construction must own deep copies before any of the mutations below can observe anything about them... (this is also why BaseURL was set pre-construction above rather than via mutation after).
-	if err != nil {
-		t.Fatalf("NewTransport returned error: %v", err) // a failure here would make every later assertion meaningless — stop with context instead of chasing phantom wire mismatches below.
-	}
+	// a failure here would make every later assertion meaningless — stop with context instead of chasing phantom wire mismatches below.
+	testassert.NoError(t, err)
 
 	rt.Headers["X-From"] = "mutated"            // mutating the original header map after construction... (must not change what this transport posts next).
 	delete(rt.ProviderExtraBody, "temperature") // ...and deleting a layer key from the caller's own copy of it... (the retained body must still carry temperature on its request bytes).
@@ -200,8 +206,11 @@ func TestNewTransportDeepCopiesResolvedInput(t *testing.T) { // one mutation pas
 	}
 
 	var posted map[string]json.RawMessage
-	if err := json.Unmarshal(rawBody, &posted); err != nil { // decode what was actually sent so field-level comparisons below read naturally in failure messages too.
-		t.Fatalf("posted body is not a JSON object: %v (%s)", err, rawBody) // unparseable bytes here would mean the ownership copy corrupted structure — fail loudly with both sides visible for diagnosis... (nothing else in this test can distinguish that shape from others).
+	// decode what was actually sent so field-level comparisons below read naturally in failure messages too.
+	// unparseable bytes here would mean the ownership copy corrupted structure — fail loudly with both sides visible for diagnosis... (nothing else in this test can distinguish that shape from others).
+	{
+		err := json.Unmarshal(rawBody, &posted)
+		testassert.Require(t, err == nil, "posted body is not a JSON object: %v (%s)", err, rawBody)
 	}
 
 	rawTemp, ok := posted["temperature"] // temperature must still ride on the wire exactly as constructed: present AND byte-identical to 0.1's raw form after every caller mutation above.
@@ -211,12 +220,18 @@ func TestNewTransportDeepCopiesResolvedInput(t *testing.T) { // one mutation pas
 		t.Fatalf("posted temperature = %s, want exactly 0.1's bytes (caller rewrote its own copy to another digit)", rawTemp) // a different-but-valid number here means in-place byte mutation crossed an ownership boundary somewhere between construction and Do... (narrowing it further is the suite reader's job once this row names where).
 	}
 
-	if got := posted["model"]; string(got) != `"gpt-test"` { // sanity anchor that we captured THIS transport's request at all — a stray capture from elsewhere would make every other assertion above vacuous... (kept cheap: one field comparison, no server round trip needed to prove identity of origin).
-		t.Fatalf("captured body model = %s; test may have observed the wrong exchange", got) // this guard exists purely so failures above are trustworthy evidence about THIS transport's retained state and nothing else running in parallel could explain them.
+	// sanity anchor that we captured THIS transport's request at all — a stray capture from elsewhere would make every other assertion above vacuous... (kept cheap: one field comparison, no server round trip needed to prove identity of origin).
+	// this guard exists purely so failures above are trustworthy evidence about THIS transport's retained state and nothing else running in parallel could explain them.
+	{
+		got := posted["model"]
+		testassert.Require(t, string(got) == `"gpt-test"`, "captured body model = %s; test may have observed the wrong exchange", got)
 	}
 
-	if _, ok := posted["X-From"]; ok { // negative anchor: header names must not leak into body keys — they travel on the wire separately by construction design... (a merged capture bug between the two channels would otherwise pass every positive check above while being structurally wrong).
-		t.Fatalf("header name found inside request body keys; headers and extras were conflated somewhere") // no production code path writes header names into extra-body layers, so any hit here is a test-harness or transport defect rather than legitimate content... (failing it keeps the two capture channels provably distinct for all other rows in this file).
+	// negative anchor: header names must not leak into body keys — they travel on the wire separately by construction design... (a merged capture bug between the two channels would otherwise pass every positive check above while being structurally wrong).
+	// no production code path writes header names into extra-body layers, so any hit here is a test-harness or transport defect rather than legitimate content... (failing it keeps the two capture channels provably distinct for all other rows in this file).
+	{
+		_, ok := posted["X-From"]
+		testassert.Require(t, !ok, "header name found inside request body keys; headers and extras were conflated somewhere")
 	}
 
 	_ = rewritten // retained only to keep the mutation pass above readable as one coherent block; its effect is fully exercised through posted["temperature"] assertions already made. The variable itself carries no further state worth asserting on directly (its bytes are what temperature should NOT show, which that check proves by positive comparison instead).
@@ -245,9 +260,8 @@ func TestStreamPostsEncodedBodyWithBuiltHeaders(t *testing.T) { // request-shape
 		tr := mustTransport(t, rt)                               // construction happens once per sub-case as everywhere else in this file; shared servers would blur captured state between rows and make failures unattributable.
 
 		wantBody, _, err := Encode(rt, baseRequest(), nil) // independent direct encoder invocation is the byte oracle: same inputs through two different public entry points must produce identical posted bytes... (any divergence means transport and encoder disagree on ownership/copying somewhere).
-		if err != nil {
-			t.Fatalf("Encode returned error for an otherwise-valid fixture set: %v", err) // failing here rather than comparing against a zero-value body keeps the assertion below meaningful — no silent empty-vs-empty pass is possible.
-		}
+		// failing here rather than comparing against a zero-value body keeps the assertion below meaningful — no silent empty-vs-empty pass is possible.
+		testassert.NoError(t, err)
 
 		stream, warnings, streamErr := tr.Stream(context.Background(), baseRequest(), nil)
 		if streamErr != nil {
@@ -263,8 +277,10 @@ func TestStreamPostsEncodedBodyWithBuiltHeaders(t *testing.T) { // request-shape
 		}
 
 		for key, value := range map[string]string{"Content-Type": "application/json", "Accept": "text/event-stream"} { // both defaults present at exactly their contract values — BuildHeaders owns them and nothing else in this transport may override or drop one... (resolved-header overwrite behavior is pinned by a sibling row with its own server rather than mixed into these baseline assertions).
-			if got := gotHeader.Get(key); got != value {
-				t.Fatalf("header %s = %q, want %q", key, got, value) // per-key message keeps the failing name visible without dumping the whole header map on every mismatch... (the full clone is still available in scope if a human wants it during triage of this specific row).
+			// per-key message keeps the failing name visible without dumping the whole header map on every mismatch... (the full clone is still available in scope if a human wants it during triage of this specific row).
+			{
+				got := gotHeader.Get(key)
+				testassert.Require(t, got == value, "header %s = %q, want %q", key, got, value)
 			}
 		}
 
@@ -279,12 +295,18 @@ func TestStreamPostsEncodedBodyWithBuiltHeaders(t *testing.T) { // request-shape
 			t.Fatalf("parsed first delta = %#v, want one text fragment \"ok\"", delta) // anything else means parser normalization drifted from its documented contract — this row is the cheapest place that drift would surface first... (deeper structural cases have their own dedicated files; keep comparing only what THIS response actually contains).
 		}
 
-		if _, err := stream.Recv(); !errors.Is(err, io.EOF) { // [DONE] terminator lands as EOF exactly per contract — pinning it here too keeps this row self-contained rather than depending on sibling tests for the terminal behavior of its own fixture... (cheap: one extra receive call with an exact expected sentinel).
-			t.Fatalf("Recv after [DONE] = %v, want io.EOF", err) // message mirrors every other terminator assertion in the suite so cross-file greps stay consistent when hunting related regressions later.
+		// [DONE] terminator lands as EOF exactly per contract — pinning it here too keeps this row self-contained rather than depending on sibling tests for the terminal behavior of its own fixture... (cheap: one extra receive call with an exact expected sentinel).
+		// message mirrors every other terminator assertion in the suite so cross-file greps stay consistent when hunting related regressions later.
+		{
+			_, err := stream.Recv()
+			testassert.Require(t, errors.Is(err, io.EOF), "Recv after [DONE] = %v, want io.EOF", err)
 		}
 
-		if cerr := stream.Close(); cerr != nil { // full consumption then release: Close on a cleanly terminated body must be quiet — no cleanup path may surface transport facts to consumers at this point... (any non-nil here would indicate state corruption beyond what the read assertions above could have caught).
-			t.Fatalf("Close returned error after clean consumption: %v", cerr) // included for completeness of THIS row's end-to-end story rather than as independent coverage — sibling close-behavior tests pin pathological shapes separately.
+		// full consumption then release: Close on a cleanly terminated body must be quiet — no cleanup path may surface transport facts to consumers at this point... (any non-nil here would indicate state corruption beyond what the read assertions above could have caught).
+		// included for completeness of THIS row's end-to-end story rather than as independent coverage — sibling close-behavior tests pin pathological shapes separately.
+		{
+			cerr := stream.Close()
+			testassert.NoError(t, cerr)
 		}
 	})
 
@@ -310,12 +332,14 @@ func TestStreamPostsEncodedBodyWithBuiltHeaders(t *testing.T) { // request-shape
 
 				tr := mustTransport(t, rt) // standard construction helper — the auth dimension is just another plain string field flowing through retained state normally.
 				stream, _, err := tr.Stream(context.Background(), baseRequest(), nil)
-				if err != nil {
-					t.Fatalf("Stream returned error for key state %q: %v", tc.name, err) // names which branch failed so a table-row mixup during editing is caught immediately rather than discovered much later in output.
-				}
+				// names which branch failed so a table-row mixup during editing is caught immediately rather than discovered much later in output.
+				testassert.Require(t, err == nil, "Stream returned error for key state %q: %v", tc.name, err)
 
-				if got := capturedAuth; (got != "") != tc.wantAuth || (tc.wantAuth && got != "Bearer "+tc.apiKey) { // one compound check covering presence, absence, AND exact value where present — partial failures like "present but wrong value" must be caught as clearly as total absence would be.
-					t.Fatalf("Authorization = %q for key state %q; want presence=%v and exact form when present", got, tc.name, tc.wantAuth) // both actual and expected shapes rendered so triage never needs to reconstruct which branch ran from the test name alone.
+				// one compound check covering presence, absence, AND exact value where present — partial failures like "present but wrong value" must be caught as clearly as total absence would be.
+				// both actual and expected shapes rendered so triage never needs to reconstruct which branch ran from the test name alone.
+				{
+					got := capturedAuth
+					testassert.Require(t, (got != "") == tc.wantAuth && (!tc.wantAuth || got == "Bearer "+tc.apiKey), "Authorization = %q for key state %q; want presence=%v and exact form when present", got, tc.name, tc.wantAuth)
 				}
 
 				if _, rerr := stream.Recv(); !errors.Is(rerr, io.EOF) { // 204 carries no body: first receive must be a clean EOF — pinning that an empty accepted response does not error the consumer path either.
@@ -327,8 +351,11 @@ func TestStreamPostsEncodedBodyWithBuiltHeaders(t *testing.T) { // request-shape
 		}
 	})
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "p"}, WireSystemRole: ""}); !errors.Is(err, ErrInvalidModelRef) { // trailing sanity anchor reused from sibling file's conventions — confirms this test's own assumptions about which validation layer owns which error have not drifted since it was written... (cheap insurance that a future refactor doesn't silently move model-completeness checking into Stream and leave construction accepting partial refs here).
-		t.Fatalf("premise broken: NewTransport no longer rejects incomplete identities at construction") // if this fires, every other row in THIS file set still passes but the suite's overall story about where errors surface has changed — flagging it explicitly keeps that decision visible rather than implicit.
+	// trailing sanity anchor reused from sibling file's conventions — confirms this test's own assumptions about which validation layer owns which error have not drifted since it was written... (cheap insurance that a future refactor doesn't silently move model-completeness checking into Stream and leave construction accepting partial refs here).
+	// if this fires, every other row in THIS file set still passes but the suite's overall story about where errors surface has changed — flagging it explicitly keeps that decision visible rather than implicit.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "p"}, WireSystemRole: ""})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: NewTransport no longer rejects incomplete identities at construction")
 	}
 }
 
@@ -380,9 +407,8 @@ func TestStreamIssuesExactlyOnePhysicalAttempt(t *testing.T) { // no alternate D
 		tr := mustTransport(t, rt) // standard construction helper — no auth or extras configured so the only interesting dimension remains attempt-counting itself.
 
 		stream, _, err := tr.Stream(context.Background(), baseRequest(), nil) // 2xx acceptance: Stream returns BEFORE payload validity is known anywhere... (this ordering is precisely why mid-stream failures exist as a distinct category from request-level ones).
-		if err != nil {
-			t.Fatalf("Stream returned error for an accepted response: %v", err) // failing here would mean something broke before we even got to test the interesting part — stop with context rather than letting later assertions run against a missing stream.
-		}
+		// failing here would mean something broke before we even got to test the interesting part — stop with context rather than letting later assertions run against a missing stream.
+		testassert.NoError(t, err)
 
 		var recvErr error                                                 // captured separately so both its sentinel identity AND absence-of-retry can be asserted in distinct checks below... (one combined check would hide which half failed when output is skimmed).
 		if _, recvErr = stream.Recv(); !errors.Is(recvErr, ErrProtocol) { // the malformed event must surface as a typed protocol failure — nothing more exotic (raw unmarshal error unwrapped...) may reach consumers here.
@@ -391,12 +417,18 @@ func TestStreamIssuesExactlyOnePhysicalAttempt(t *testing.T) { // no alternate D
 			t.Fatalf("%d attempts recorded after a mid-stream protocol failure, want exactly 1 for that whole invocation", got) // any number above one here would be direct evidence of retry behavior living somewhere in this package — which is forbidden by contract and worth failing loudly on the first sight... (this row exists specifically because such regressions are invisible everywhere else).
 		}
 
-		if cerr := stream.Close(); cerr != nil { // releasing after a failed read must still behave like every other Close: quiet, idempotent-friendly cleanup with no transport facts surfaced to consumers at this point.
-			t.Fatalf("Close returned error following protocol failure: %v", cerr) // included because close-after-error is exactly the kind of edge where state corruption hides best — asserting it here costs one line and removes an entire class of silent bugs from later review... (not redundant with sibling close tests since those cover different prior-state shapes).
+		// releasing after a failed read must still behave like every other Close: quiet, idempotent-friendly cleanup with no transport facts surfaced to consumers at this point.
+		// included because close-after-error is exactly the kind of edge where state corruption hides best — asserting it here costs one line and removes an entire class of silent bugs from later review... (not redundant with sibling close tests since those cover different prior-state shapes).
+		{
+			cerr := stream.Close()
+			testassert.NoError(t, cerr)
 		}
 
-		if _, againErr := stream.Recv(); !errors.Is(againErr, io.EOF) { // post-failure terminal state: further receives see EOF through the done flag rather than re-attempting reads or errors... (pinning it here completes this row's end-to-end story about what a mid-stream failure leaves behind).
-			t.Fatalf("Recv after protocol failure + Close = %v, want io.EOF", againErr) // mirrors every other terminal-state assertion in the suite for consistency — future readers should never have to wonder whether THIS particular shape was intentionally left unasserted.
+		// post-failure terminal state: further receives see EOF through the done flag rather than re-attempting reads or errors... (pinning it here completes this row's end-to-end story about what a mid-stream failure leaves behind).
+		// mirrors every other terminal-state assertion in the suite for consistency — future readers should never have to wonder whether THIS particular shape was intentionally left unasserted.
+		{
+			_, againErr := stream.Recv()
+			testassert.Require(t, errors.Is(againErr, io.EOF), "Recv after protocol failure + Close = %v, want io.EOF", againErr)
 		}
 	})
 }
@@ -446,18 +478,21 @@ func TestStreamReturnsHTTPStatusErrorWithProviderMessage(t *testing.T) { // one 
 				}
 			}
 
-			if errors.Is(err, ErrAuthFailed) { // no auth sentinel for ANY of these ordinary failure codes: 429/503/502/504 are all non-auth by contract... (pinning it once per table iteration rather than only in the dedicated auth row because forgetting to check here would let a blanket-join regression hide inside otherwise-green extraction tests).
-				t.Fatalf("ErrAuthFailed present on ordinary %d failure", tc.wantCode) // message names the specific status so output stays actionable without cross-referencing which table row ran... (cheap specificity costs nothing per iteration given how cheap this check itself is).
-			}
+			// no auth sentinel for ANY of these ordinary failure codes: 429/503/502/504 are all non-auth by contract... (pinning it once per table iteration rather than only in the dedicated auth row because forgetting to check here would let a blanket-join regression hide inside otherwise-green extraction tests).
+			// message names the specific status so output stays actionable without cross-referencing which table row ran... (cheap specificity costs nothing per iteration given how cheap this check itself is).
+			testassert.Require(t, !errors.Is(err, ErrAuthFailed), "ErrAuthFailed present on ordinary %d failure", tc.wantCode)
 
-			if len(warnings) != 0 { // warning-free fixtures must stay silent on failed attempts too — same negative anchor as elsewhere in this file with identical rationale about noise vs signal distinguishability later.
-				t.Fatalf("unexpected protocol warnings from a failure-path encoding: %#v", warnings) // included for parity with sibling rows' discipline rather than because extraction itself could produce them (it cannot today, but the guard is free and future-proofs against accidental coupling).
-			}
+			// warning-free fixtures must stay silent on failed attempts too — same negative anchor as elsewhere in this file with identical rationale about noise vs signal distinguishability later.
+			// included for parity with sibling rows' discipline rather than because extraction itself could produce them (it cannot today, but the guard is free and future-proofs against accidental coupling).
+			testassert.Require(t, len(warnings) == 0, "unexpected protocol warnings from a failure-path encoding: %#v", warnings)
 		})
 	}
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai", Model: ""}}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring the one in sibling test files — confirms construction-time validation surface has not drifted since this file was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // if this fires, the suite's story about where validation happens has changed and every file using that assumption needs a re-read — flagging it here makes that maintenance debt visible immediately rather than buried in unrelated later failures.
+	// closing sanity anchor mirroring the one in sibling test files — confirms construction-time validation surface has not drifted since this file was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
+	// if this fires, the suite's story about where validation happens has changed and every file using that assumption needs a re-read — flagging it here makes that maintenance debt visible immediately rather than buried in unrelated later failures.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai", Model: ""}})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 
@@ -494,9 +529,9 @@ func TestStreamReadsErrorBodyThroughOneMiBLimit(t *testing.T) { // one dedicated
 		t.Fatalf("ErrAuthFailed present on ordinary 503 failure") // same non-auth negative anchor as sibling rows — cheap and consistent across the whole file set.
 	}
 
-	if len(warnings) != 0 { // warning-free fixtures stay silent even under oversized-body conditions — identical rationale to every other such anchor in this suite about noise vs signal distinguishability later on.
-		t.Fatalf("unexpected protocol warnings from an oversized error body: %#v", warnings) // included for parity with sibling rows' discipline rather than because size-bounding logic itself could produce them (it cannot today, but the guard is free and future-proofs against accidental coupling).
-	}
+	// warning-free fixtures stay silent even under oversized-body conditions — identical rationale to every other such anchor in this suite about noise vs signal distinguishability later on.
+	// included for parity with sibling rows' discipline rather than because size-bounding logic itself could produce them (it cannot today, but the guard is free and future-proofs against accidental coupling).
+	testassert.Require(t, len(warnings) == 0, "unexpected protocol warnings from an oversized error body: %#v", warnings)
 
 	var statusAgain *HTTPStatusError                                      // pointer to the concrete error type so errors.As can fill its fields on success — Error() is defined on the pointer, a value here would be an invalid target.
 	_, _, againErr := tr.Stream(context.Background(), baseRequest(), nil) // a second invocation on the same transport must fail identically and independently — proving the bound applies per-invocation rather than being some one-shot state that only worked once by accident of ordering... (this is the row a future "cache truncated bodies across calls" optimization would break first).
@@ -546,8 +581,11 @@ func TestStreamJoinsAuthSentinelOn401And403(t *testing.T) { // auth-failure iden
 		})
 	}
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}, WireSystemRole: "system"}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this file was written... (cheap local insurance against silent drift in where errors are produced).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as the equivalent anchors elsewhere so a grep for that phrase finds every such guard consistently across the suite.
+	// closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this file was written... (cheap local insurance against silent drift in where errors are produced).
+	// same explicit framing as the equivalent anchors elsewhere so a grep for that phrase finds every such guard consistently across the suite.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}, WireSystemRole: "system"})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 
@@ -602,9 +640,8 @@ func TestStreamMidFlightCancellationUnblocksBodyRead(t *testing.T) { // modeled 
 
 	ctx, cancel := context.WithCancel(context.Background()) // fresh cancellable parent; live through most of this test's body on purpose... (its lifetime IS what we're measuring behavior against).
 	stream, _, err := tr.Stream(ctx, baseRequest(), nil)    // acceptance must succeed while ctx is still healthy — any failure here means something broke before the interesting part even started.
-	if err != nil {
-		t.Fatalf("Stream returned error before cancellation: %v", err) // stop with context rather than letting later assertions run against a missing stream object entirely... (cheap early exit keeps output focused on whichever phase actually failed).
-	}
+	// stop with context rather than letting later assertions run against a missing stream object entirely... (cheap early exit keeps output focused on whichever phase actually failed).
+	testassert.NoError(t, err)
 
 	first, recvErr := stream.Recv() // the flushed event arrives normally as any other well-formed first delta would in this suite's fixtures... (pinning its exact parsed shape below doubles as proof that pre-cancel reads behave identically to non-canceled ones everywhere else).
 	if recvErr != nil {
@@ -680,9 +717,8 @@ func TestStreamHonorsStandardRedirects(t *testing.T) { // modeled as: first hit 
 	tr := mustTransport(t, rt)                                             // construction helper — same rationale throughout this file for one shared path to valid transport values.
 
 	stream, _, err := tr.Stream(context.Background(), baseRequest(), nil) // the entire redirect dance happens inside THIS ONE invocation's lifetime... (no separate "follow-up call" exists or may be invented by later edits).
-	if err != nil {
-		t.Fatalf("Stream failed while following a standard library-supported redirect: %v", err) // failure here would mean default client behavior regressed somewhere — fail with that specific framing since everything else in this row is trivially correct by construction... (message names the capability under test explicitly).
-	}
+	// failure here would mean default client behavior regressed somewhere — fail with that specific framing since everything else in this row is trivially correct by construction... (message names the capability under test explicitly).
+	testassert.NoError(t, err)
 
 	delta, recvErr := stream.Recv() // acceptance must come from post-redirect target's body specifically... (proven next via content marker below rather than assumed from status codes alone which both hops share nominally as 2xx-equivalent outcomes differently worded).
 	if recvErr != nil {
@@ -717,9 +753,8 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 			Arguments: json.RawMessage(`{}`), // empty object arguments fine here since NO validation of argument content happens at warning-trigger level... (they just need to exist structurally as a completed call).
 		}}, // single call suffices — multiple would only add noise without changing whether the one expected warning appears or not.
 	})
-	if err != nil {
-		t.Fatalf("NewMessage fixture failed: %v", err) // stop with context rather than continuing against an invalid trigger message whose absence of warnings could be misread as transport behavior... (premises must hold before conclusions can mean anything).
-	}
+	// stop with context rather than continuing against an invalid trigger message whose absence of warnings could be misread as transport behavior... (premises must hold before conclusions can mean anything).
+	testassert.NoError(t, err)
 
 	req := Request{Messages: []Message{userText("hi"), assistant}} // two-message request puts the warning-bearing assistant at index 1 specifically — assertion below pins that exact position rather than just count for unambiguous attribution.
 
@@ -795,8 +830,11 @@ func TestStreamReturnsEncoderWarningsOnAttemptFailure(t *testing.T) { // warning
 		}
 	})
 
-	if _, err := NewMessage(Message{Role: RoleAssistant}); !errors.Is(err, ErrMissingSource) { // sanity guard on the fixture's own assumptions used above (assistant without source is invalid — our real one carries it deliberately)... if this fires then warning-trigger reasoning in wantWarning no longer holds and every row must be re-derived from scratch.
-		t.Fatalf("fixture premise broken: assistant message WITHOUT complete source unexpectedly accepted") // explicit about which assumption failed rather than generic "something wrong" phrasing that would leave triage starting over from zero each time... (cheap specificity keeps maintenance of this file tractable long-term).
+	// sanity guard on the fixture's own assumptions used above (assistant without source is invalid — our real one carries it deliberately)... if this fires then warning-trigger reasoning in wantWarning no longer holds and every row must be re-derived from scratch.
+	// explicit about which assumption failed rather than generic "something wrong" phrasing that would leave triage starting over from zero each time... (cheap specificity keeps maintenance of this file tractable long-term).
+	{
+		_, err := NewMessage(Message{Role: RoleAssistant})
+		testassert.Require(t, errors.Is(err, ErrMissingSource), "fixture premise broken: assistant message WITHOUT complete source unexpectedly accepted")
 	}
 }
 
@@ -956,8 +994,11 @@ func TestStreamClassifiesInvalidInputErrors(t *testing.T) { // one transport ove
 		}
 	})
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this classification row was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT specific error-class question).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	// closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this classification row was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT specific error-class question).
+	// same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 
@@ -967,8 +1008,10 @@ func TestTransportHasNoPublicClientSeam(t *testing.T) { // reflection over the t
 	structType := typ.Elem()                 // field checks run against the underlying struct shape; a pointer type itself has no fields to inspect.
 
 	for i := 0; i < structType.NumField(); i++ { // every stored field must stay package-private — the seam this test forbids would have to be a FIELD (behavior pinned separately by method loop below).
-		if f := structType.Field(i); f.PkgPath == "" {
-			t.Fatalf("Transport exposes public field %s; no alternate client or RoundTripper seam may exist on this type", f.Name) // naming the exact offending member makes any future accidental export immediately visible and attributable in CI output without re-reading source... (this is a structural invariant worth failing loudly on first sight).
+		// naming the exact offending member makes any future accidental export immediately visible and attributable in CI output without re-reading source... (this is a structural invariant worth failing loudly on first sight).
+		{
+			f := structType.Field(i)
+			testassert.Require(t, f.PkgPath != "", "Transport exposes public field %s; no alternate client or RoundTripper seam may exist on this type", f.Name)
 		}
 	}
 
@@ -979,17 +1022,23 @@ func TestTransportHasNoPublicClientSeam(t *testing.T) { // reflection over the t
 		} // unexported helpers never appear here by definition — only genuinely public API surface enters consideration at all.
 	}
 
-	sort.Strings(exportedMethods)                  // deterministic ordering before comparison so element-wise equality below is meaningful regardless of iteration order from reflection internals... (cheap insurance against flaky-looking failures that are really just nondeterministic enumeration).
-	want := []string{"Stream"}                     // THE complete expected public method set on this type: nothing more, nothing less than exactly Stream itself.
-	if !reflect.DeepEqual(exportedMethods, want) { // exact-set comparison — any extra export (a Do alias, Client getter...) would reopen the seam this test exists to keep closed forever... (and its absence is equally pinned here since removing Stream entirely would also fail loudly rather than silently).
-		t.Fatalf("public methods on Transport = %v; want exactly [Stream]", exportedMethods) // rendered both sides side-by-side so whatever drifted — added OR removed member alike — is immediately obvious from output alone.
+	sort.Strings(exportedMethods) // deterministic ordering before comparison so element-wise equality below is meaningful regardless of iteration order from reflection internals... (cheap insurance against flaky-looking failures that are really just nondeterministic enumeration).
+	want := []string{"Stream"}    // THE complete expected public method set on this type: nothing more, nothing less than exactly Stream itself.
+	// exact-set comparison — any extra export (a Do alias, Client getter...) would reopen the seam this test exists to keep closed forever... (and its absence is equally pinned here since removing Stream entirely would also fail loudly rather than silently).
+	// rendered both sides side-by-side so whatever drifted — added OR removed member alike — is immediately obvious from output alone.
+	testassert.Require(t, reflect.DeepEqual(exportedMethods, want), "public methods on Transport = %v; want exactly [Stream]", exportedMethods)
+
+	// closing sanity anchor mirroring sibling files' convention one final time in THIS file as well — construction-time validation surface unchanged since this structural test was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
+	// same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}, WireSystemRole: ""})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}, WireSystemRole: ""}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention one final time in THIS file as well — construction-time validation surface unchanged since this structural test was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
-	}
-
-	if _, ok := interface{}(mustTransport(t, testResolved())).(*http.Client); ok { // unreachability guard documenting that Transport itself is never an http.Client under any aliasing or embedding trick — kept more as compile-time reminder than runtime check... (its real value is forcing anyone reading this line to consciously acknowledge type-identity distinction).
-		t.Fatal("Transport must not be or masquerade as *http.Client by type identity") // if someone ever aliases/embeds these types, fail loudly instead of letting the forbidden seam creep back in through pure type-substitution without any visible field-level change... (structural tests catch fields; this one catches whole-type substitution attempts specifically).
+	// unreachability guard documenting that Transport itself is never an http.Client under any aliasing or embedding trick — kept more as compile-time reminder than runtime check... (its real value is forcing anyone reading this line to consciously acknowledge type-identity distinction).
+	// if someone ever aliases/embeds these types, fail loudly instead of letting the forbidden seam creep back in through pure type-substitution without any visible field-level change... (structural tests catch fields; this one catches whole-type substitution attempts specifically).
+	{
+		_, ok := interface{}(mustTransport(t, testResolved())).(*http.Client)
+		testassert.Require(t, !ok, "%v", "Transport must not be or masquerade as *http.Client by type identity")
 	}
 }

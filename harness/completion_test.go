@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -32,9 +33,7 @@ func cachedCoordinator(t *testing.T, h *Harness, sessionID string) *coordinator 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	c := h.sessions[sessionID]
-	if c == nil {
-		t.Fatalf("no cached coordinator for session %q", sessionID)
-	}
+	testassert.Require(t, c != nil, "no cached coordinator for session %q", sessionID)
 	return c
 }
 
@@ -97,12 +96,13 @@ func addRootSession(t *testing.T, store *graphStorage, sessionID string) {
 	rec := validSessionRecord()
 	rec.Identity.SessionID = sessionID
 	raw, err := encodeSessionRegister(rec)
-	mustEncode(t, err)
-	if err := store.Transact(context.Background(), func(tx Transaction) error {
-		_, err := tx.InsertRegister(RegisterDraft{Key: RegisterKey{SessionID: sessionID, Kind: RegisterSession}, Payload: raw})
-		return err
-	}); err != nil {
-		t.Fatalf("insert session %q: %v", sessionID, err)
+	testassert.NoError(t, err)
+	{
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			_, err := tx.InsertRegister(RegisterDraft{Key: RegisterKey{SessionID: sessionID, Kind: RegisterSession}, Payload: raw})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert session %q: %v", sessionID, err)
 	}
 }
 
@@ -118,9 +118,7 @@ func storedSignals(t *testing.T, store *graphStorage, sessionID string) []signal
 			continue
 		}
 		v, err := decodeSignalEntry(env)
-		if err != nil {
-			t.Fatalf("decode signal entry %s: %v", env.ID, err)
-		}
+		testassert.Require(t, err == nil, "decode signal entry %s: %v", env.ID, err)
 		if v.Signal == SignalBackgroundCompletion {
 			out = append(out, v)
 		}
@@ -162,9 +160,7 @@ func waitMemberDone(t *testing.T, m *backgroundMember) {
 func runtimeInputText(t *testing.T, store *graphStorage, sessionID string) string {
 	t.Helper()
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("session graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
 		if entry.Input != nil && entry.Input.Origin == InputOriginRuntime {
 			return entry.Input.Content[0].Text
@@ -188,27 +184,22 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		session := createSession(t, h)
 		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the run is parked at its model boundary
 		cancel()         // harness loss while the run still settles
 
-		if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "lost work"); err != nil {
-			t.Fatalf("closed delivery: %v", err)
+		{
+			err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "lost work")
+			testassert.NoError(t, err)
 		}
 		signals := storedSignals(t, store, session)
-		if len(signals) != 1 {
-			t.Fatalf("durable background_completion signals = %d, want 1", len(signals))
-		}
+		testassert.Equal(t, len(signals), 1)
 		sig := signals[0]
-		if sig.OperationID != "" || sig.RelatedMember == nil || sig.RelatedMember.Kind != "child" ||
-			sig.RelatedMember.ID != completionChildID || sig.Content != "lost work" {
-			t.Fatalf("committed signal = %+v, want the operationless child-member completion", sig)
-		}
+		testassert.Require(t, sig.OperationID == "" && sig.RelatedMember != nil && sig.RelatedMember.Kind == "child" && sig.RelatedMember.ID == completionChildID && sig.Content == "lost work", "committed signal = %+v, want the operationless child-member completion", sig)
 		waitMemberDone(t, member)
 
 		script.releaseGate() // let the parked run converge
@@ -233,24 +224,26 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		watch := watchSettlements(store)
 		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 
-		if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "background answer"); err != nil {
-			t.Fatalf("idle delivery: %v", err)
+		{
+			err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "background answer")
+			testassert.NoError(t, err)
 		}
 		waitMemberDone(t, member)
 		watch.next() // the admitted completion settles
 
-		if rec := settledOperation(t, store, session, member.completionID); rec.State.Status != OperationSuccess {
-			t.Fatalf("completion operation settled %q, want success", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, member.completionID)
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
-		if signals := storedSignals(t, store, session); len(signals) != 0 {
-			t.Fatalf("a receivable parent recorded %d signal entries, want none", len(signals))
+		{
+			signals := storedSignals(t, store, session)
+			testassert.Equal(t, len(signals), 0)
 		}
-		if got := runtimeInputText(t, store, session); got != "background answer" {
-			t.Fatalf("admitted input = %q, want the completion content", got)
+		{
+			got := runtimeInputText(t, store, session)
+			testassert.Equal(t, got, "background answer")
 		}
 	})
 
@@ -264,40 +257,45 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		watch := watchSettlements(store)
 		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // the operation is parked at its model boundary
 
-		if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "steered completion"); err != nil {
-			t.Fatalf("steering delivery: %v", err)
+		{
+			err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "steered completion")
+			testassert.NoError(t, err)
 		}
 		waitMemberDone(t, member)
-		if n := storedEntryCount(store, session); n != 1 {
-			t.Fatalf("steering committed %d durable entries, want only the admitted input", n)
+		{
+			n := storedEntryCount(store, session)
+			testassert.Equal(t, n, 1)
 		}
 
 		script.releaseGate()
 		<-script.arrived // the completion identity's own Operation carries the steered completion
-		if texts := strings.Join(script.lastTexts(), "|"); !strings.Contains(texts, "steered completion") {
-			t.Fatalf("continuation projection = %q, want the steered completion", texts)
+		{
+			texts := strings.Join(script.lastTexts(), "|")
+			testassert.Require(t, strings.Contains(texts, "steered completion"), "continuation projection = %q, want the steered completion", texts)
 		}
 		watch.next()
-		if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationSuccess {
-			t.Fatalf("steered operation settled %q, want success", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, "op-1")
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
 		// The delivered completion runs as its own successor Operation: wait
 		// for its terminal commit and Session quiet before raw graph reads.
 		awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
 		awaitHarnessQuiet(t, h, session)
-		if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"hello", "steered completion"}) {
-			t.Fatalf("committed inputs = %q, want the steered completion after the first input", got)
+		{
+			got := entryTexts(t, store, session)
+			testassert.Require(t, reflect.DeepEqual(got, []string{"hello", "steered completion"}), "committed inputs = %q, want the steered completion after the first input", got)
 		}
-		if got := runtimeInputText(t, store, session); got != "steered completion" {
-			t.Fatalf("steered input origin/content = %q, want the runtime completion", got)
+		{
+			got := runtimeInputText(t, store, session)
+			testassert.Equal(t, got, "steered completion")
 		}
 	})
 
@@ -311,27 +309,29 @@ func TestDeliverBackgroundCompletionModes(t *testing.T) {
 		watch := watchSettlements(store)
 		c := leaseCoordinator(t, h, session)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
-		if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived
 
-		if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "queued completion"); err != nil {
-			t.Fatalf("steering delivery: %v", err)
+		{
+			err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "queued completion")
+			testassert.NoError(t, err)
 		}
 		waitMemberDone(t, member)
 		script.releaseGate() // op-1 settles failure; the preserved steering drains through admission
 		watch.next()         // op-1's settlement
 		watch.next()         // the drain-admitted completion's settlement
 
-		if rec := settledOperation(t, store, session, member.completionID); rec.State.Status != OperationSuccess {
-			t.Fatalf("completion operation settled %q, want success", rec.State.Status)
+		{
+			rec := settledOperation(t, store, session, member.completionID)
+			testassert.Equal(t, rec.State.Status, OperationSuccess)
 		}
-		if got := runtimeInputText(t, store, session); got != "queued completion" {
-			t.Fatalf("admitted input = %q, want the completion content under its identity", got)
+		{
+			got := runtimeInputText(t, store, session)
+			testassert.Equal(t, got, "queued completion")
 		}
 	})
 }
@@ -342,18 +342,15 @@ func TestDeliverBackgroundCompletionEmptyContentRejected(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
-	if err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, ""); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("empty content = %v, want ErrInvalid", err)
+	testassert.NoError(t, err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "empty content = %v, want ErrInvalid", err)
 	}
 	c.mu.Lock()
 	claimed := member.claimed
 	c.mu.Unlock()
-	if claimed {
-		t.Fatalf("the rejected delivery claimed the member")
-	}
+	testassert.Require(t, !claimed, "the rejected delivery claimed the member")
 }
 
 // TestDeliverBackgroundCompletionSecondDeliveryIsNoOp proves the first-writer
@@ -369,42 +366,42 @@ func TestDeliverBackgroundCompletionSecondDeliveryIsNoOp(t *testing.T) {
 	watch := watchSettlements(store)
 	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 
-	if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "first"); err != nil {
-		t.Fatalf("first delivery: %v", err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "first")
+		testassert.NoError(t, err)
 	}
 	waitMemberDone(t, member)
 	watch.next() // the delivered completion's own Operation settles
 	awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
-	if calls := len(script.seen()); calls != 1 {
-		t.Fatalf("first-delivery model requests = %d, want exactly one", calls)
+	{
+		calls := len(script.seen())
+		testassert.Equal(t, calls, 1)
 	}
 	beforeEntries, beforeRegs := storedSessionState(store, session)
 
-	if err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "second"); err != nil {
-		t.Fatalf("second delivery = %v, want a no-op success", err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "second")
+		testassert.NoError(t, err)
 	}
 
 	afterEntries, afterRegs := storedSessionState(store, session)
-	if !reflect.DeepEqual(beforeEntries, afterEntries) || !reflect.DeepEqual(beforeRegs, afterRegs) {
-		t.Fatalf("the duplicate delivery changed the durable registers or entries")
+	testassert.Require(t, reflect.DeepEqual(beforeEntries, afterEntries) && reflect.DeepEqual(beforeRegs, afterRegs), "the duplicate delivery changed the durable registers or entries")
+	{
+		calls := len(script.seen())
+		testassert.Equal(t, calls, 1)
 	}
-	if calls := len(script.seen()); calls != 1 {
-		t.Fatalf("model requests after the duplicate = %d, want no second model call", calls)
-	}
-	if signals := storedSignals(t, store, session); len(signals) != 0 {
-		t.Fatalf("the duplicate committed signal entries %+v, want no parent signal", signals)
+	{
+		signals := storedSignals(t, store, session)
+		testassert.Require(t, len(signals) == 0, "the duplicate committed signal entries %+v, want no parent signal", signals)
 	}
 
-	if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"first"}) {
-		t.Fatalf("committed inputs = %q, want exactly the first delivery", got)
+	{
+		got := entryTexts(t, store, session)
+		testassert.Require(t, reflect.DeepEqual(got, []string{"first"}), "committed inputs = %q, want exactly the first delivery", got)
 	}
-	if !storedOperationExists(store, session, member.completionID) {
-		t.Fatalf("the completion identity was not admitted")
-	}
+	testassert.Require(t, storedOperationExists(store, session, member.completionID), "the completion identity was not admitted")
 }
 
 // TestDeliverBackgroundCompletionCorruptParent proves an unavailable parent
@@ -416,13 +413,9 @@ func TestDeliverBackgroundCompletionCorruptParent(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	childMember, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("child admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	jobMember, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-	if err != nil {
-		t.Fatalf("job admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	h.mu.Lock()
 	c.corru = corruptSession(testSessionID, "injected corruption")
 	h.mu.Unlock()
@@ -430,19 +423,16 @@ func TestDeliverBackgroundCompletionCorruptParent(t *testing.T) {
 	for _, member := range []*backgroundMember{childMember, jobMember} {
 		err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "x")
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("%s delivery = %v, want a corruption error", member.kind, err)
-		}
+		testassert.Require(t, errors.As(err, &corrupt), "%s delivery = %v, want a corruption error", member.kind, err)
 	}
 	entries, regs := storedSessionState(store, testSessionID)
-	if len(entries) != 0 || len(regs) != 1 {
-		t.Fatalf("corrupt-parent delivery wrote entries %d registers %d, want none beyond the session register", len(entries), len(regs))
-	}
+	testassert.Require(t, len(entries) == 0 && len(regs) == 1, "corrupt-parent delivery wrote entries %d registers %d, want none beyond the session register", len(entries), len(regs))
 	waitMemberDone(t, childMember)
 	waitMemberDone(t, jobMember)
 
-	if err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, childMember.completionID, "x"); err != nil {
-		t.Fatalf("duplicate callback = %v, want a no-op success", err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, childMember.completionID, "x")
+		testassert.NoError(t, err)
 	}
 }
 
@@ -460,9 +450,7 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 	session := createSession(t, h)
 	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	submitted := make(chan error, 1)
 	go func() {
@@ -482,19 +470,19 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 		delivered <- h.DeliverBackgroundCompletion(context.Background(), session, member.completionID, "raced")
 	}()
 	close(stub.gate) // the submission publishes, installs its run, releases the reservation
-	if err := <-submitted; err != nil {
-		t.Fatalf("submit: %v", err)
+	{
+		err := <-submitted
+		testassert.NoError(t, err)
 	}
-	if err := <-delivered; err != nil {
-		t.Fatalf("raced delivery: %v", err)
+	{
+		err := <-delivered
+		testassert.NoError(t, err)
 	}
 
 	// The rerouted completion is steering, never a separate admission while
 	// it waits: it is either still buffered or already delivered through its
 	// own successor admission after the boundary exit.
-	if storedOperationExists(store, session, member.completionID) {
-		t.Fatalf("the raced completion admitted a new operation")
-	}
+	testassert.Require(t, !storedOperationExists(store, session, member.completionID), "the raced completion admitted a new operation")
 
 	script.releaseGate()
 	<-script.arrived // the boundary exits; the successor admission delivers the steering
@@ -514,18 +502,21 @@ func TestDeliverBackgroundCompletionIdleRaceReRoutesToSteering(t *testing.T) {
 			t.Fatalf("the rerouted completion never reached a model boundary (requests %d)", len(reqs))
 		}
 	}
-	if reqs := script.seen(); len(reqs) > 2 {
-		t.Fatalf("model requests = %d, want the boundary plus at most the drained continuation", len(reqs))
+	{
+		reqs := script.seen()
+		testassert.Require(t, len(reqs) <= 2, "model requests = %d, want the boundary plus at most the drained continuation", len(reqs))
 	}
 	// The completion executes as its own successor Operation: wait for its
 	// terminal commit and Session quiet before any raw graph validation.
 	awaitOperationTerminal(t, store, session, member.completionID, OperationSuccess)
 	awaitHarnessQuiet(t, h, session)
-	if got := entryTexts(t, store, session); !reflect.DeepEqual(got, []string{"hello", "raced"}) {
-		t.Fatalf("committed inputs = %q, want the rerouted completion as steering", got)
+	{
+		got := entryTexts(t, store, session)
+		testassert.Require(t, reflect.DeepEqual(got, []string{"hello", "raced"}), "committed inputs = %q, want the rerouted completion as steering", got)
 	}
-	if owner, origin := steeringInputOwner(t, store, session, "raced"); owner != member.completionID || origin != InputOriginRuntime {
-		t.Fatalf("raced input owner/origin = %q/%v, want %q/%v", owner, origin, member.completionID, InputOriginRuntime)
+	{
+		owner, origin := steeringInputOwner(t, store, session, "raced")
+		testassert.Require(t, owner == member.completionID && origin == InputOriginRuntime, "raced input owner/origin = %q/%v, want %q/%v", owner, origin, member.completionID, InputOriginRuntime)
 	}
 	waitMemberDone(t, member)
 }
@@ -542,24 +533,19 @@ func TestDeliverBackgroundCompletionReserveFailureTakesClosedPath(t *testing.T) 
 	session := createSession(t, h)
 	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	release, err := h.reserve(context.Background(), c) // the test holds the admission reservation
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer release()
 	cancel() // the idle delivery's reserve call fails against the dead context
 
-	if err := h.deliverIdleCompletion(c, member, admissionContent("closed on failure"), "closed on failure"); err != nil {
-		t.Fatalf("reserve-failure delivery = %v, want the closed path success", err)
+	{
+		err := h.deliverIdleCompletion(c, member, admissionContent("closed on failure"), "closed on failure")
+		testassert.NoError(t, err)
 	}
 	signals := storedSignals(t, store, session)
-	if len(signals) != 1 || signals[0].Content != "closed on failure" {
-		t.Fatalf("durable signals = %+v, want the closed-path record", signals)
-	}
+	testassert.Require(t, len(signals) == 1 && signals[0].Content == "closed on failure", "durable signals = %+v, want the closed-path record", signals)
 	h.finishBackgroundMember(c, member)
 	waitMemberDone(t, member)
 }
@@ -577,14 +563,10 @@ func TestDeliverBackgroundCompletionAdmissionFailuresFinal(t *testing.T) {
 		wantErr     func(t *testing.T, err error)
 	}{
 		{"storage failure", fmt.Errorf("%w: injected storage failure", ErrStorage), true, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrStorage) {
-				t.Fatalf("delivery error = %v, want the storage class", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrStorage), "delivery error = %v, want the storage class", err)
 		}},
 		{"conflict failure", fmt.Errorf("%w: injected conflict", ErrConflict), false, func(t *testing.T, err error) {
-			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "already exists in another session") {
-				t.Fatalf("delivery error = %v, want the cross-session reuse rejection", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "already exists in another session"), "delivery error = %v, want the cross-session reuse rejection", err)
 		}},
 	}
 	for _, tc := range cases {
@@ -595,9 +577,7 @@ func TestDeliverBackgroundCompletionAdmissionFailuresFinal(t *testing.T) {
 			})
 			c := leaseCoordinator(t, h, testSessionID)
 			member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-			if err != nil {
-				t.Fatalf("admission: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			store.txHook = func(string) error { return tc.err } // the delivery's admission transaction fails once
 			err = h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "content")
@@ -605,23 +585,22 @@ func TestDeliverBackgroundCompletionAdmissionFailuresFinal(t *testing.T) {
 			tc.wantErr(t, err)
 
 			waitMemberDone(t, member)
-			if storedOperationExists(store, testSessionID, member.completionID) {
-				t.Fatalf("the failed admission published a replacement Operation")
+			testassert.Require(t, !storedOperationExists(store, testSessionID, member.completionID), "the failed admission published a replacement Operation")
+			{
+				n := storedEntryCount(store, testSessionID)
+				testassert.Equal(t, n, 0)
 			}
-			if n := storedEntryCount(store, testSessionID); n != 0 {
-				t.Fatalf("the failed admission or a retry wrote %d entries, want none", n)
-			}
-			if signals := storedSignals(t, store, testSessionID); len(signals) != 0 {
-				t.Fatalf("a fallback signal write committed %+v, want none", signals)
+			{
+				signals := storedSignals(t, store, testSessionID)
+				testassert.Require(t, len(signals) == 0, "a fallback signal write committed %+v, want none", signals)
 			}
 			h.mu.Lock()
 			latched := h.storageFailure != nil
 			h.mu.Unlock()
-			if latched != tc.wantLatched {
-				t.Fatalf("storage failure latched = %v, want %v", latched, tc.wantLatched)
-			}
-			if err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "content"); err != nil {
-				t.Fatalf("duplicate completion = %v, want a no-op success", err)
+			testassert.Equal(t, latched, tc.wantLatched)
+			{
+				err := h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "content")
+				testassert.NoError(t, err)
 			}
 		})
 	}
@@ -637,9 +616,7 @@ func TestClosedDeliveryCommitsBeforeDoneCloses(t *testing.T) {
 	session := createSession(t, h)
 	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	closeBackgroundMode(c)
 
 	arrived := make(chan struct{}, 1)
@@ -665,15 +642,13 @@ func TestClosedDeliveryCommitsBeforeDoneCloses(t *testing.T) {
 	default:
 	}
 	close(gate)
-	if err := <-delivered; err != nil {
-		t.Fatalf("closed delivery: %v", err)
+	{
+		err := <-delivered
+		testassert.NoError(t, err)
 	}
 	waitMemberDone(t, member)
 	signals := storedSignals(t, store, session)
-	if len(signals) != 1 || signals[0].RelatedMember == nil || signals[0].RelatedMember.Kind != "job" ||
-		signals[0].RelatedMember.ID != jobFixtureID || signals[0].Content != "durable first" {
-		t.Fatalf("committed signal = %+v, want the job-member completion", signals)
-	}
+	testassert.Require(t, len(signals) == 1 && signals[0].RelatedMember != nil && signals[0].RelatedMember.Kind == "job" && signals[0].RelatedMember.ID == jobFixtureID && signals[0].Content == "durable first", "committed signal = %+v, want the job-member completion", signals)
 }
 
 // TestClosedDeliveryFailureRetainedBeforeMemberFinish proves the shutdown
@@ -690,9 +665,7 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	session := createSession(t, h)
 	c := leaseCoordinator(t, h, session)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	// The closed delivery's signal insert fails before any durable write with
 	// a storage-class error.
@@ -736,23 +709,21 @@ func TestClosedDeliveryFailureRetainedBeforeMemberFinish(t *testing.T) {
 	}
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer waitCancel()
-	if err := h.Wait(waitCtx); !errors.Is(err, ErrStorage) || !strings.Contains(err.Error(), "injected storage failure") {
-		t.Fatalf("Wait while the failed delivery is parked after member finish = %v, want the retained storage failure", err)
+	{
+		err := h.Wait(waitCtx)
+		testassert.Require(t, errors.Is(err, ErrStorage) && strings.Contains(err.Error(), "injected storage failure"), "Wait while the failed delivery is parked after member finish = %v, want the retained storage failure", err)
 	}
 
 	release()
-	if err := <-produced; !errors.Is(err, ErrStorage) {
-		t.Fatalf("closed delivery = %v, want the storage class", err)
+	{
+		err := <-produced
+		testassert.Require(t, errors.Is(err, ErrStorage), "closed delivery = %v, want the storage class", err)
 	}
 	c.mu.Lock()
 	_, present := c.group.members[member.completionID]
 	c.mu.Unlock()
-	if present {
-		t.Fatalf("the member survived its finish")
-	}
-	if finished != 1 {
-		t.Fatalf("the Job's finish invalidation fired %d time(s), want exactly once", finished)
-	}
+	testassert.Require(t, !present, "the member survived its finish")
+	testassert.Equal(t, finished, 1)
 }
 
 // TestConcurrentClosedDeliveriesSerialize proves two closed deliveries
@@ -767,13 +738,9 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	session := createSession(t, h)
 	c := leaseCoordinator(t, h, session)
 	memberA, err := admitLocked(h, c, memberChild, completionChildID, 0)
-	if err != nil {
-		t.Fatalf("child admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	memberB, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-	if err != nil {
-		t.Fatalf("job admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	closeBackgroundMode(c)
 
 	arrived := make(chan struct{}, 2)
@@ -802,19 +769,19 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	close(gate)
 	<-arrived // the second delivery's transaction enters storage only after the release
 
-	if err := <-resA; err != nil {
-		t.Fatalf("child delivery: %v", err)
+	{
+		err := <-resA
+		testassert.NoError(t, err)
 	}
-	if err := <-resB; err != nil {
-		t.Fatalf("job delivery: %v", err)
+	{
+		err := <-resB
+		testassert.NoError(t, err)
 	}
 	waitMemberDone(t, memberA)
 	waitMemberDone(t, memberB)
 
 	signals := storedSignals(t, store, session)
-	if len(signals) != 2 {
-		t.Fatalf("durable signals = %d, want both completions", len(signals))
-	}
+	testassert.Equal(t, len(signals), 2)
 	c.mu.Lock()
 	var cached []string
 	for _, entry := range c.graph.Entries {
@@ -824,9 +791,7 @@ func TestConcurrentClosedDeliveriesSerialize(t *testing.T) {
 	}
 	c.mu.Unlock()
 	durable := []string{signals[0].RelatedMember.Kind, signals[1].RelatedMember.Kind}
-	if !reflect.DeepEqual(cached, durable) {
-		t.Fatalf("cached signal order %v disagrees with durable order %v", cached, durable)
-	}
+	testassert.Require(t, reflect.DeepEqual(cached, durable), "cached signal order %v disagrees with durable order %v", cached, durable)
 }
 
 // TestClosedDeliveryRevisionDrift proves the closed path never retries: a
@@ -845,9 +810,7 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 			_, err = tx.ReplaceRegister(key, reg.Revision, reg.Payload)
 			return err
 		})
-		if err != nil {
-			t.Fatalf("foreign revision advance: %v", err)
-		}
+		testassert.NoError(t, err)
 	}
 
 	t.Run("drift returns the conflict, rematerializes once, finishes the member", func(t *testing.T) {
@@ -857,26 +820,21 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		defer cancel()
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		closeBackgroundMode(c)
 		advanceRevision(t, store)
 
 		err = h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "x")
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("drifted delivery = %v, want the conflict class", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrConflict), "drifted delivery = %v, want the conflict class", err)
 		waitMemberDone(t, member)
-		if n := storedEntryCount(store, testSessionID); n != 0 {
-			t.Fatalf("the drifted delivery or a retry committed %d entries, want none", n)
+		{
+			n := storedEntryCount(store, testSessionID)
+			testassert.Equal(t, n, 0)
 		}
 		c.mu.Lock()
 		revision := c.graph.Session.Revision
 		c.mu.Unlock()
-		if revision != 2 {
-			t.Fatalf("cached revision %d, want the rematerialized revision 2", revision)
-		}
+		testassert.Equal(t, revision, 2)
 	})
 
 	t.Run("failing rematerialization returns corruption", func(t *testing.T) {
@@ -886,31 +844,29 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		defer cancel()
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		closeBackgroundMode(c)
 		advanceRevision(t, store)
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			key := RegisterKey{SessionID: testSessionID, Kind: RegisterSession}
-			reg, err := tx.ReadRegister(key)
-			if err != nil {
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				key := RegisterKey{SessionID: testSessionID, Kind: RegisterSession}
+				reg, err := tx.ReadRegister(key)
+				if err != nil {
+					return err
+				}
+				_, err = tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"bogus":true}`))
 				return err
-			}
-			_, err = tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"bogus":true}`))
-			return err
-		}); err != nil {
-			t.Fatalf("corrupt register: %v", err)
+			})
+			testassert.NoError(t, err)
 		}
 
 		err = h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "x")
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("delivery = %v, want the rematerialization corruption", err)
-		}
+		testassert.Require(t, errors.As(err, &corrupt), "delivery = %v, want the rematerialization corruption", err)
 		waitMemberDone(t, member)
-		if n := storedEntryCount(store, testSessionID); n != 0 {
-			t.Fatalf("the failed delivery committed %d entries, want none", n)
+		{
+			n := storedEntryCount(store, testSessionID)
+			testassert.Equal(t, n, 0)
 		}
 	})
 
@@ -921,23 +877,17 @@ func TestClosedDeliveryRevisionDrift(t *testing.T) {
 		defer cancel()
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		closeBackgroundMode(c)
 		advanceRevision(t, store)
 		store.registersErr = fmt.Errorf("%w: storage down", ErrStorage)
 
 		err = h.DeliverBackgroundCompletion(context.Background(), testSessionID, member.completionID, "x")
-		if !errors.Is(err, ErrStorage) {
-			t.Fatalf("delivery = %v, want the rematerialization storage failure", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage), "delivery = %v, want the rematerialization storage failure", err)
 		h.mu.Lock()
 		latched := h.storageFailure != nil
 		h.mu.Unlock()
-		if !latched {
-			t.Fatalf("the storage-class rematerialization failure was not latched")
-		}
+		testassert.Require(t, latched, "the storage-class rematerialization failure was not latched")
 		waitMemberDone(t, member)
 	})
 }
@@ -973,41 +923,35 @@ func TestJobCompletionWaitsForChildSuccessorRetirement(t *testing.T) {
 			cP := leaseCoordinator(t, h, completionParentID)
 			cC := leaseCoordinator(t, h, completionChildID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
-			if err != nil {
-				t.Fatalf("child member admission: %v", err)
-			}
+			testassert.NoError(t, err)
 			cC.mu.Lock()
 			cC.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: 1024}
 			cC.mu.Unlock()
 			jobMember, err := admitLocked(h, cC, memberJob, jobFixtureID, 0)
-			if err != nil {
-				t.Fatalf("job admission: %v", err)
-			}
+			testassert.NoError(t, err)
 
-			if _, err := h.Submit(context.Background(), SubmitRequest{
-				SessionID:   completionChildID,
-				OperationID: "op-1",
-				Origin:      InputOriginUser,
-				Content:     admissionContent("hello"),
-				Mode:        MessageModeRegular,
-			}); err != nil {
-				t.Fatalf("child submit: %v", err)
+			{
+				_, err := h.Submit(context.Background(), SubmitRequest{
+					SessionID:   completionChildID,
+					OperationID: "op-1",
+					Origin:      InputOriginUser,
+					Content:     admissionContent("hello"),
+					Mode:        MessageModeRegular,
+				})
+				testassert.NoError(t, err)
 			}
 			<-script.arrived // the child run is parked at its model boundary
 
-			if err := h.DeliverBackgroundCompletion(context.Background(), completionChildID, jobMember.completionID, "job done"); err != nil {
-				t.Fatalf("job completion delivery: %v", err)
+			{
+				err := h.DeliverBackgroundCompletion(context.Background(), completionChildID, jobMember.completionID, "job done")
+				testassert.NoError(t, err)
 			}
 			waitMemberDone(t, jobMember)
 			cC.mu.Lock()
 			pending, steering := cC.pendingCompletion != nil, len(cC.steering)
 			cC.mu.Unlock()
-			if !pending || steering != 1 {
-				t.Fatalf("after the job delivery: pending %v steering %d, want the obligation deferred and the completion queued", pending, steering)
-			}
-			if storedOperationExists(store, completionChildID, jobMember.completionID) {
-				t.Fatalf("the job completion admitted an operation while the run was active")
-			}
+			testassert.Require(t, pending && steering == 1, "after the job delivery: pending %v steering %d, want the obligation deferred and the completion queued", pending, steering)
+			testassert.Require(t, !storedOperationExists(store, completionChildID, jobMember.completionID), "the job completion admitted an operation while the run was active")
 
 			stub.gate = make(chan struct{}) // the drain's admission of the completion will park here
 			script.releaseGate()            // op-1 settles quiet success with the completion still queued
@@ -1019,29 +963,25 @@ func TestJobCompletionWaitsForChildSuccessorRetirement(t *testing.T) {
 			cC.mu.Lock()
 			pendingDeferred, runInstalled := cC.pendingCompletion != nil, cC.run != nil
 			cC.mu.Unlock()
-			if !pendingDeferred || !runInstalled {
-				t.Fatalf("deferred check: pending %v run %v, want the obligation held on the installed run", pendingDeferred, runInstalled)
-			}
-			if storedOperationExists(store, completionParentID, member.completionID) {
-				t.Fatalf("the parent received the completion before the successor retired")
-			}
+			testassert.Require(t, pendingDeferred && runInstalled, "deferred check: pending %v run %v, want the obligation held on the installed run", pendingDeferred, runInstalled)
+			testassert.Require(t, !storedOperationExists(store, completionParentID, member.completionID), "the parent received the completion before the successor retired")
 
 			close(stub.gate) // the drain admits the completion as the successor operation
 			watch.next()     // the successor's settlement committed
 			watch.next()     // the parent completion's settlement committed
 
-			if rec := settledOperation(t, store, completionParentID, member.completionID); rec.State.Status != OperationSuccess {
-				t.Fatalf("parent completion settled %q, want success", rec.State.Status)
+			{
+				rec := settledOperation(t, store, completionParentID, member.completionID)
+				testassert.Equal(t, rec.State.Status, OperationSuccess)
 			}
-			if got := runtimeInputText(t, store, completionParentID); got != tc.want || strings.Contains(got, "earlier") {
-				t.Fatalf("delivered completion = %q, want %q and never the predecessor's earlier text", got, tc.want)
+			{
+				got := runtimeInputText(t, store, completionParentID)
+				testassert.Require(t, got == tc.want && !strings.Contains(got, "earlier"), "delivered completion = %q, want %q and never the predecessor's earlier text", got, tc.want)
 			}
 			cC.mu.Lock()
 			pendingAfter := cC.pendingCompletion
 			cC.mu.Unlock()
-			if pendingAfter != nil {
-				t.Fatalf("the pending obligation survived the completed delivery")
-			}
+			testassert.Require(t, pendingAfter == nil, "the pending obligation survived the completed delivery")
 			waitMemberDone(t, member)
 		})
 	}
@@ -1059,9 +999,7 @@ func TestChildCompletionSettledAbandonment(t *testing.T) {
 		cC := leaseCoordinator(t, h, completionChildID)
 		cP := leaseCoordinator(t, h, completionParentID)
 		member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("member admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		cC.mu.Lock()
 		cC.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: 1024}
 		cC.mu.Unlock()
@@ -1075,11 +1013,10 @@ func TestChildCompletionSettledAbandonment(t *testing.T) {
 		cC.mu.Lock()
 		pending := cC.pendingCompletion
 		cC.mu.Unlock()
-		if pending != nil {
-			t.Fatalf("the abandoned obligation survived")
-		}
-		if n := storedEntryCount(store, completionParentID); n != 0 {
-			t.Fatalf("abandonment wrote %d durable entries, want none", n)
+		testassert.Require(t, pending == nil, "the abandoned obligation survived")
+		{
+			n := storedEntryCount(store, completionParentID)
+			testassert.Equal(t, n, 0)
 		}
 	})
 
@@ -1094,9 +1031,7 @@ func TestChildCompletionSettledAbandonment(t *testing.T) {
 		cC.mu.Lock()
 		pending := cC.pendingCompletion != nil
 		cC.mu.Unlock()
-		if !pending {
-			t.Fatalf("the deferred obligation was taken")
-		}
+		testassert.Require(t, pending, "the deferred obligation was taken")
 	})
 }
 
@@ -1128,9 +1063,7 @@ func TestChildCompletionRendersParentFacingText(t *testing.T) {
 			cC := leaseCoordinator(t, h, completionChildID)
 			cP := leaseCoordinator(t, h, completionParentID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
-			if err != nil {
-				t.Fatalf("member admission: %v", err)
-			}
+			testassert.NoError(t, err)
 			cC.mu.Lock()
 			cC.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: 1024}
 			cC.mu.Unlock()
@@ -1138,18 +1071,18 @@ func TestChildCompletionRendersParentFacingText(t *testing.T) {
 			h.childCompletionSettled(cC, "")
 			waitMemberDone(t, member)
 			watch.next() // the parent completion's settlement committed
-			if rec := settledOperation(t, store, completionParentID, member.completionID); rec.State.Status != OperationSuccess {
-				t.Fatalf("parent completion settled %q, want success", rec.State.Status)
+			{
+				rec := settledOperation(t, store, completionParentID, member.completionID)
+				testassert.Equal(t, rec.State.Status, OperationSuccess)
 			}
-			if got := runtimeInputText(t, store, completionParentID); got != tc.want {
-				t.Fatalf("rendered completion = %q, want %q", got, tc.want)
+			{
+				got := runtimeInputText(t, store, completionParentID)
+				testassert.Equal(t, got, tc.want)
 			}
 			cC.mu.Lock()
 			pending := cC.pendingCompletion
 			cC.mu.Unlock()
-			if pending != nil {
-				t.Fatalf("the delivered obligation survived")
-			}
+			testassert.Require(t, pending == nil, "the delivered obligation survived")
 		})
 	}
 }
@@ -1176,9 +1109,7 @@ func TestChildCompletionTruncatesAtOutputLimit(t *testing.T) {
 			cC := leaseCoordinator(t, h, completionChildID)
 			cP := leaseCoordinator(t, h, completionParentID)
 			member, err := admitLocked(h, cP, memberChild, completionChildID, 0)
-			if err != nil {
-				t.Fatalf("member admission: %v", err)
-			}
+			testassert.NoError(t, err)
 			closeBackgroundMode(cP) // the closed path records the rendered content verbatim
 			cC.mu.Lock()
 			cC.pendingCompletion = &launchInfo{completionID: member.completionID, outputLimit: tc.limit}
@@ -1187,15 +1118,12 @@ func TestChildCompletionTruncatesAtOutputLimit(t *testing.T) {
 			h.childCompletionSettled(cC, "")
 			waitMemberDone(t, member)
 			signals := storedSignals(t, store, completionParentID)
-			if len(signals) != 1 {
-				t.Fatalf("durable signals = %d, want the closed-path record", len(signals))
+			testassert.Equal(t, len(signals), 1)
+			{
+				got := signals[0].Content
+				testassert.Equal(t, got, tc.want)
 			}
-			if got := signals[0].Content; got != tc.want {
-				t.Fatalf("truncated content = %q, want %q", got, tc.want)
-			}
-			if len(signals[0].Content) > tc.limit {
-				t.Fatalf("truncated content exceeds the limit: %d > %d", len(signals[0].Content), tc.limit)
-			}
+			testassert.Require(t, len(signals[0].Content) <= tc.limit, "truncated content exceeds the limit: %d > %d", len(signals[0].Content), tc.limit)
 		})
 	}
 }

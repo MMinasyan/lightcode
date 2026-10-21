@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // tinyChunkReader delivers at most chunk bytes per Read call, proving the framing logic is independent of how the underlying reader happens to split data — arbitrary boundary positions must never change which events are produced.
@@ -69,24 +71,30 @@ func TestSSEFramingRules(t *testing.T) { // single combined body per sub-case ke
 			t.Fatalf("received %d deltas, want exactly 3 (one per real payload): %#v", len(got), got) // full slice rendered so any extra-or-missing element is immediately visible with its position in sequence... (count mismatches are always the cheapest class of framing bug to spot this way).
 		}
 
-		if !got[0].HasChoice || len(got[0].ContentFragments) != 1 || got[0].ContentFragments[0].Text != "one" { // first event's exact fragment shape: single text piece at position zero carrying our literal value... (same expectation as every other simple-content row across the suite).
-			t.Fatalf("first delta = %#v, want one choice with content \"one\"", got[0]) // full struct rendered so any mismatch dimension — HasChoice vs fragment count vs actual text — is visible without re-running under verbose mode.
+		// first event's exact fragment shape: single text piece at position zero carrying our literal value... (same expectation as every other simple-content row across the suite).
+		// full struct rendered so any mismatch dimension — HasChoice vs fragment count vs actual text — is visible without re-running under verbose mode.
+		testassert.Require(t, got[0].HasChoice && len(got[0].ContentFragments) == 1 && got[0].ContentFragments[0].Text == "one", "first delta = %#v, want one choice with content \"one\"", got[0])
+
+		// second REAL event (the mixed-fields one): empty choices array means NO choice exists at all in that delta... (distinguishable from "choice present but empty" which would set HasChoice=true instead).
+		// naming specifically WHICH structural fact is expected here keeps this row's intent readable even when skimmed quickly later.
+		testassert.Require(t, !got[1].HasChoice && len(got[1].ContentFragments) == 0, "second real delta = %#v, want no-choice marker for the empty-choices payload", got[1])
+
+		// THE join proof: two physical data lines became ONE logical payload carrying exactly this assembled content value... (any per-line parsing would have produced either garbage or a different count entirely).
+		// full rendering again — same rationale as every other row in this file set about making failures self-explanatory on first sight.
+		testassert.Require(t, got[2].HasChoice && len(got[2].ContentFragments) == 1 && got[2].ContentFragments[0].Text == "joined", "third delta = %#v, want the joined-payload text fragment \"joined\"", got[2])
+
+		// releasing after clean [DONE] termination must be quiet like everywhere else in the suite... (idempotent-friendly cleanup pinned here for parity with sibling rows).
+		// explicit about which phase produced it so output stays attributable even in dense failure logs later.
+		{
+			cerr := s.Close()
+			testassert.NoError(t, cerr)
 		}
 
-		if got[1].HasChoice || len(got[1].ContentFragments) != 0 { // second REAL event (the mixed-fields one): empty choices array means NO choice exists at all in that delta... (distinguishable from "choice present but empty" which would set HasChoice=true instead).
-			t.Fatalf("second real delta = %#v, want no-choice marker for the empty-choices payload", got[1]) // naming specifically WHICH structural fact is expected here keeps this row's intent readable even when skimmed quickly later.
-		}
-
-		if !got[2].HasChoice || len(got[2].ContentFragments) != 1 || got[2].ContentFragments[0].Text != "joined" { // THE join proof: two physical data lines became ONE logical payload carrying exactly this assembled content value... (any per-line parsing would have produced either garbage or a different count entirely).
-			t.Fatalf("third delta = %#v, want the joined-payload text fragment \"joined\"", got[2]) // full rendering again — same rationale as every other row in this file set about making failures self-explanatory on first sight.
-		}
-
-		if cerr := s.Close(); cerr != nil { // releasing after clean [DONE] termination must be quiet like everywhere else in the suite... (idempotent-friendly cleanup pinned here for parity with sibling rows).
-			t.Fatalf("Close returned error: %v", cerr) // explicit about which phase produced it so output stays attributable even in dense failure logs later.
-		}
-
-		if _, again := s.Recv(); !errors.Is(again, io.EOF) { // post-termination + post-close state: further receives see EOF through done flag regardless of what remains unread (nothing does here anyway)... (pinning it completes this row's end-to-end story about terminal stability).
-			t.Fatalf("Recv after [DONE]+Close = %v, want io.EOF", again) // consistent phrasing with every other post-terminal receive check in the suite so future readers find them all via identical search terms.
+		// post-termination + post-close state: further receives see EOF through done flag regardless of what remains unread (nothing does here anyway)... (pinning it completes this row's end-to-end story about terminal stability).
+		// consistent phrasing with every other post-terminal receive check in the suite so future readers find them all via identical search terms.
+		{
+			_, again := s.Recv()
+			testassert.Require(t, errors.Is(again, io.EOF), "Recv after [DONE]+Close = %v, want io.EOF", again)
 		}
 	})
 
@@ -104,13 +112,13 @@ func TestSSEFramingRules(t *testing.T) { // single combined body per sub-case ke
 			t.Fatalf("received %d deltas, want exactly 2 under CRLF framing", len(got)) // full count mismatch message mirrors LF-row phrasing for consistency across both line-ending variants.
 		}
 
-		if !got[0].HasChoice || got[0].ContentFragments == nil || got[0].ContentFragments[0].Text != "crlf-one" { // first CRLF event's content must survive trimming intact — no stray \r characters may appear inside delivered text values themselves.
-			t.Fatalf("first CRLF delta = %#v, want content fragment \"crlf-one\" with no carriage-return contamination", got[0]) // naming the exact defect class (leftover CR bytes) makes any such regression immediately recognizable in output without re-reading trimming code first.
-		}
+		// first CRLF event's content must survive trimming intact — no stray \r characters may appear inside delivered text values themselves.
+		// naming the exact defect class (leftover CR bytes) makes any such regression immediately recognizable in output without re-reading trimming code first.
+		testassert.Require(t, got[0].HasChoice && got[0].ContentFragments != nil && got[0].ContentFragments[0].Text == "crlf-one", "first CRLF delta = %#v, want content fragment \"crlf-one\" with no carriage-return contamination", got[0])
 
-		if !got[1].HasChoice || len(got[1].ContentFragments) != 1 || got[1].ContentFragments[0].Text != "crlf-two" { // second CRLF event — note its body ended with a single trailing newline rather than full double-line terminator before the next comment started... (proves that a lone \r\n after payload content does NOT prematurely terminate an already-complete earlier event).
-			t.Fatalf("second CRLF delta = %#v, want content fragment \"crlf-two\"", got[1]) // same rendering discipline as every other row in this file: full actual value visible next to expectation for immediate triage.
-		}
+		// second CRLF event — note its body ended with a single trailing newline rather than full double-line terminator before the next comment started... (proves that a lone \r\n after payload content does NOT prematurely terminate an already-complete earlier event).
+		// same rendering discipline as every other row in this file: full actual value visible next to expectation for immediate triage.
+		testassert.Require(t, got[1].HasChoice && len(got[1].ContentFragments) == 1 && got[1].ContentFragments[0].Text == "crlf-two", "second CRLF delta = %#v, want content fragment \"crlf-two\"", got[1])
 
 		if cerr := s.Close(); cerr != nil {
 			t.Fatalf("Close returned error after CRLF sub-case completion: %v", cerr) // quiet release pinned here too — idempotent cleanup behavior is variant-independent by design... (asserting it in BOTH line-ending rows keeps that claim test-backed rather than assumed).
@@ -170,8 +178,11 @@ func TestSSEPendsUnterminatedDataEventsAtEOF(t *testing.T) { // two sub-cases be
 		}
 	})
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "p"}, WireSystemRole: ""}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention one final time in THIS file as well — construction-time validation surface unchanged since this structural test was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	// closing sanity anchor mirroring sibling files' convention one final time in THIS file as well — construction-time validation surface unchanged since this structural test was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
+	// same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "p"}, WireSystemRole: ""})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 
@@ -202,8 +213,11 @@ func TestSSEMalformedPayloadsAreTypedProtocolErrorsNotSkipped(t *testing.T) { //
 				t.Fatalf("Close returned error following protocol failure: %v", cerr) // releasing after a failed read must still behave like every other Close in the suite — quiet, idempotent-friendly cleanup with no transport facts surfaced to consumers at this point... (included because close-after-error is exactly the kind of edge where state corruption hides best).
 			}
 
-			if _, ok := interface{}(s).(interface{ Retry() bool }); ok { // unreachable type-assertion guard documenting that NO retry-related method surface exists on our stream type under any name — its real value is forcing conscious acknowledgment that skipping/retrying malformed events is categorically impossible by construction rather than merely unimplemented today... (structural tests catch fields; this catches behavioral-method additions specifically at the stream boundary level).
-				t.Fatal("stream types must never expose retry/skip handles publicly") // if someone ever adds one, fail loudly instead of letting event-skipping creep back in through a public accessor without any visible field-level change first — exactly the regression class this entire test file exists to prevent.
+			// unreachable type-assertion guard documenting that NO retry-related method surface exists on our stream type under any name — its real value is forcing conscious acknowledgment that skipping/retrying malformed events is categorically impossible by construction rather than merely unimplemented today... (structural tests catch fields; this catches behavioral-method additions specifically at the stream boundary level).
+			// if someone ever adds one, fail loudly instead of letting event-skipping creep back in through a public accessor without any visible field-level change first — exactly the regression class this entire test file exists to prevent.
+			{
+				_, ok := interface{}(s).(interface{ Retry() bool })
+				testassert.Require(t, !ok, "%v", "stream types must never expose retry/skip handles publicly")
 			}
 		})
 	}
@@ -223,8 +237,11 @@ func TestSSERecvAfterCloseReportsEOF(t *testing.T) { // modeled on real-world co
 		t.Fatalf("pre-close delta = %#v; want the single expected text fragment proving normal delivery worked first", first) // full rendering so any mismatch dimension is immediately visible without re-running under more detailed logging configuration.
 	}
 
-	if cerr := s.Close(); cerr != nil { // THE early-abort action itself: releasing mid-stream with unconsumed content still available on the wire behind us... (this single call is what everything below measures reaction to).
-		t.Fatalf("early Close returned error: %v", cerr) // a non-nil return here would mean cleanup logic depends on some condition our fixture deliberately did not provide — fail loudly rather than continuing against possibly-corrupted internal state.
+	// THE early-abort action itself: releasing mid-stream with unconsumed content still available on the wire behind us... (this single call is what everything below measures reaction to).
+	// a non-nil return here would mean cleanup logic depends on some condition our fixture deliberately did not provide — fail loudly rather than continuing against possibly-corrupted internal state.
+	{
+		cerr := s.Close()
+		testassert.NoError(t, cerr)
 	}
 
 	if _, againErr := s.Recv(); !errors.Is(againErr, io.EOF) { // FIRST post-close receive must be immediate clean EOF — no buffered events may leak through after release... (this is the core observable guarantee of "close stops delivery" semantics).

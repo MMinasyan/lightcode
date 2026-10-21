@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -36,15 +37,14 @@ func TestCompleteCallCountMatchesBuildCalls(t *testing.T) {
 			st := newAssemblyState(testRef)
 			st.applyToolEvent(tc.frags)
 
-			if got := st.completeCallCount(); got != tc.want {
-				t.Fatalf("completeCallCount = %d, want %d", got, tc.want)
+			{
+				got := st.completeCallCount()
+				testassert.Equal(t, got, tc.want)
 			}
 
 			// The scalar reads above must not alter the eventual owning construction.
 			calls := st.buildCalls()
-			if len(calls) != tc.want {
-				t.Fatalf("buildCalls length = %d, want %d", len(calls), tc.want)
-			}
+			testassert.Equal(t, len(calls), tc.want)
 			if st.completeCallCount() != len(calls) {
 				t.Fatalf("completeCallCount = %d, want len(buildCalls()) = %d", st.completeCallCount(), len(calls))
 			}
@@ -71,15 +71,12 @@ func TestCompleteCallCountMatchesBuildCalls(t *testing.T) {
 		{id: "b", name: "fnB", args: ``},
 		{id: "c", name: "fnC", args: `{"z":`},
 	}
-	if len(calls) != len(want) {
-		t.Fatalf("built calls = %d, want %d", len(calls), len(want))
-	}
+	testassert.Equal(t, len(calls), len(want))
 	for i, w := range want {
-		if calls[i].ID != w.id || calls[i].Name != w.name || string(calls[i].Arguments) != w.args {
-			t.Fatalf("call[%d] = %#v, want id=%s name=%s args=%s", i, calls[i], w.id, w.name, w.args)
-		}
+		testassert.Require(t, calls[i].ID == w.id && calls[i].Name == w.name && string(calls[i].Arguments) == w.args, "call[%d] = %#v, want id=%s name=%s args=%s", i, calls[i], w.id, w.name, w.args)
 	}
-	if got := string(calls[1].Extra["meta"]); got != `{"k":1}` {
-		t.Fatalf("call extras not finalized verbatim: %s", got)
+	{
+		got := string(calls[1].Extra["meta"])
+		testassert.Equal(t, got, `{"k":1}`)
 	}
 }

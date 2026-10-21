@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -111,15 +112,11 @@ func awaitPublicQuiet(t *testing.T, h *harness.Harness, session string, sink *pu
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		view, err := h.ReadSessionView(context.Background(), session)
-		if err != nil {
-			t.Fatalf("ReadSessionView: %v", err)
-		}
+		testassert.NoError(t, err)
 		if !view.History.ExecutionBusy && view.Header.CurrentOperationID == "" && len(sink.invalidations()) > 0 {
 			return view
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("session %s never reached the observed quiet pair", session)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "session %s never reached the observed quiet pair", session)
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -217,20 +214,20 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		}
 		defer func() {
 			cancel()
-			if err := h.Wait(context.Background()); err != nil {
-				t.Errorf("Wait: %v", err)
+			{
+				err := h.Wait(context.Background())
+				testassert.Check(t, err == nil, "Wait: %v", err)
 			}
 		}()
 		root = createSession(t, h)
 		launch := publicChildLaunch(root)
 		launch.Content = []model.ContentPart{{Kind: model.PartText, Text: first}}
 		res, err := h.LaunchChildSession(context.Background(), launch)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		child := res.ChildSessionID
-		if rec := awaitTerminal(t, h, child, "child-op-1"); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("first child operation: %+v", rec.State)
+		{
+			rec := awaitTerminal(t, h, child, "child-op-1")
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "first child operation: %+v", rec.State)
 		}
 		// A terminal child register does not prove that its completion reached
 		// the parent. Join the actual parent execution and its lifetime.
@@ -240,24 +237,19 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("first child completion never reached the parent model boundary")
 		}
-		if completionID == "" || completionID == launch.OperationID {
-			t.Fatalf("parent completion identity = %q", completionID)
-		}
-		if rec := awaitTerminal(t, h, root, completionID); rec.State.Status != harness.OperationSuccess || rec.Admission.RequestKind != harness.RequestKindMessage {
-			t.Fatalf("parent completion operation: %+v", rec)
+		testassert.Require(t, completionID != "" && completionID != launch.OperationID, "parent completion identity = %q", completionID)
+		{
+			rec := awaitTerminal(t, h, root, completionID)
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess && rec.Admission.RequestKind == harness.RequestKindMessage, "parent completion operation: %+v", rec)
 		}
 		select {
 		case closed := <-parentClose:
-			if closed != completionID {
-				t.Fatalf("closed parent operation %q, want %q", closed, completionID)
-			}
+			testassert.Equal(t, closed, completionID)
 		case <-time.After(2 * time.Second):
 			t.Fatal("parent completion execution never closed")
 		}
 		parentQuiet := awaitPublicQuiet(t, h, root, sink)
-		if len(parentQuiet.Background) != 0 {
-			t.Fatalf("first child membership not retired: %+v", parentQuiet.Background)
-		}
+		testassert.Require(t, len(parentQuiet.Background) == 0, "first child membership not retired: %+v", parentQuiet.Background)
 		awaitPublicQuiet(t, h, child, sink)
 		parentBefore := snapshotSession(t, store, root)
 
@@ -273,21 +265,19 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 				foundParent = len(got) == 2 && got[1] == "child answer"
 			}
 		}
-		if len(compactRequests) != 0 {
-			t.Errorf("ordinary first child turn compacted")
-		}
+		testassert.Check(t, len(compactRequests) == 0, "ordinary first child turn compacted")
 		mu.Unlock()
-		if !foundFirst || !foundParent {
-			t.Fatalf("missing first child or actual parent completion request: child=%v parent=%v", foundFirst, foundParent)
-		}
-		if got := texts(firstRequest); len(got) != 2 || got[1] != first {
-			t.Fatalf("first child projection = %q", got)
+		testassert.Require(t, foundFirst && foundParent, "missing first child or actual parent completion request: child=%v parent=%v", foundFirst, foundParent)
+		{
+			got := texts(firstRequest)
+			testassert.Require(t, len(got) == 2 && got[1] == first, "first child projection = %q", got)
 		}
 		mu.Lock()
 		window, compactRef := capture.ContextWindow, capture.Compact.Model
 		mu.Unlock()
-		if result, err := submit(t, h, child, "child-op-2", harness.MessageModeRegular, huge); err != nil || result.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("second child submit = %+v, %v", result, err)
+		{
+			result, err := submit(t, h, child, "child-op-2", harness.MessageModeRegular, huge)
+			testassert.Require(t, err == nil && result.Disposition == harness.DispositionAdmitted, "second child submit = %+v, %v", result, err)
 		}
 		select {
 		case <-compactArrived: // the overflowing turn is inside its frozen compact checkpoint
@@ -297,43 +287,30 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		// a user steering head submitted during the frozen checkpoint stays
 		// pending: no compact piece exits at a boundary and no successor is scoped
 		steered, err := submit(t, h, child, "child-op-3", harness.MessageModeRegular, "steered child")
-		if err != nil || steered.Disposition != harness.DispositionSteering || steered.Operation != nil {
-			t.Fatalf("checkpoint steering submit = %+v, %v", steered, err)
-		}
+		testassert.Require(t, err == nil && steered.Disposition == harness.DispositionSteering && steered.Operation == nil, "checkpoint steering submit = %+v, %v", steered, err)
 		frozen, err := h.ReadSessionView(context.Background(), child)
-		if err != nil {
-			t.Fatalf("frozen read: %v", err)
-		}
-		if len(frozen.Steering) != 1 || frozen.Steering[0].OperationID != "child-op-3" {
-			t.Fatalf("steering during the checkpoint = %+v, want the head pending", frozen.Steering)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(frozen.Steering) == 1 && frozen.Steering[0].OperationID == "child-op-3", "steering during the checkpoint = %+v, want the head pending", frozen.Steering)
 		for _, op := range frozen.Operations {
-			if op.OperationID == "child-op-3" {
-				t.Fatalf("the pending head was scoped as an Operation inside the frozen checkpoint")
-			}
+			testassert.Require(t, op.OperationID != "child-op-3", "the pending head was scoped as an Operation inside the frozen checkpoint")
 		}
 		close(compactGate) // the pieces complete and the turn settles
 
 		secondOperation := awaitTerminal(t, h, child, "child-op-2")
-		if rec := secondOperation; rec.State.Status != harness.OperationSuccess || rec.Admission.Execution.ContextWindow != window {
-			t.Fatalf("second child capture/terminal: %+v", rec)
+		{
+			rec := secondOperation
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess && rec.Admission.Execution.ContextWindow == window, "second child capture/terminal: %+v", rec)
 		}
 		thirdOperation := awaitSettled(t, h, child, "child-op-3")
-		if thirdOperation.State.Status != harness.OperationSuccess {
-			t.Fatalf("checkpoint successor terminal: %+v", thirdOperation.State)
-		}
+		testassert.Require(t, thirdOperation.State.Status == harness.OperationSuccess, "checkpoint successor terminal: %+v", thirdOperation.State)
 		childQuiet := awaitPublicQuiet(t, h, child, sink)
 		mu.Lock()
 		observedPieces := append([]model.Request(nil), compactRequests...)
 		observedRequests := append([]requestObservation(nil), requests...)
 		observedPrepares := append([]harness.PreparationRequest(nil), prepares...)
 		mu.Unlock()
-		if len(observedRequests) != 4 {
-			t.Fatalf("conversation requests = %d, want child, parent completion, rebuilt child, checkpoint successor", len(observedRequests))
-		}
-		if len(observedPieces) != 1 {
-			t.Fatalf("child compact calls = %d, want one complete piece", len(observedPieces))
-		}
+		testassert.Equal(t, len(observedRequests), 4)
+		testassert.Equal(t, len(observedPieces), 1)
 		var rebuilt model.Request
 		var successor model.Request
 		rebuiltCalls, successorCalls := 0, 0
@@ -346,55 +323,40 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			}
 		}
 		got := texts(rebuilt)
-		if rebuiltCalls != 1 || len(got) != 2 || got[1] != publicChildSummary || rebuilt.Messages[1].Source != compactRef {
-			t.Fatalf("child rebuilt calls/projection = %d/%q", rebuiltCalls, got)
-		}
+		testassert.Require(t, rebuiltCalls == 1 && len(got) == 2 && got[1] == publicChildSummary && rebuilt.Messages[1].Source == compactRef, "child rebuilt calls/projection = %d/%q", rebuiltCalls, got)
 		successorGot := texts(successor)
-		if successorCalls != 1 || len(successorGot) != 4 || successorGot[1] != got[1] || successorGot[2] != "child answer" || successorGot[3] != "steered child" {
-			t.Fatalf("checkpoint successor calls/projection = %d/%v, want the summary, the post-checkpoint turn, then its own admitted input", successorCalls, successorGot)
-		}
+		testassert.Require(t, successorCalls == 1 && len(successorGot) == 4 && successorGot[1] == got[1] && successorGot[2] == "child answer" && successorGot[3] == "steered child", "checkpoint successor calls/projection = %d/%v, want the summary, the post-checkpoint turn, then its own admitted input", successorCalls, successorGot)
 		childFacts := childQuiet.History.HistoryFacts(historyIDsOf(childQuiet.History.HistoryHeaders()))
 		childBoundaryReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: child, Kind: harness.RegisterSession})
-		if err != nil {
-			t.Fatalf("child session register: %v", err)
-		}
+		testassert.NoError(t, err)
 		var childSessionState struct {
 			State struct {
 				CompactionEntryID string `json:"compaction_entry_id"`
 			} `json:"state"`
 		}
-		if err := json.Unmarshal(childBoundaryReg.Payload, &childSessionState); err != nil {
-			t.Fatalf("decode child session register: %v", err)
+		{
+			err := json.Unmarshal(childBoundaryReg.Payload, &childSessionState)
+			testassert.NoError(t, err)
 		}
 		steerOwned := false
 		for _, fact := range childFacts {
 			if fact.Kind == harness.EntryInput && fact.Input != nil && len(fact.Input.Content) > 0 &&
 				fact.Input.Content[0].Text == "steered child" {
-				if fact.OperationID != "child-op-3" {
-					t.Fatalf("checkpoint steering input owned by %q, want child-op-3", fact.OperationID)
-				}
+				testassert.Equal(t, fact.OperationID, "child-op-3")
 				steerOwned = true
 			}
 		}
-		if !steerOwned {
-			t.Fatalf("the checkpoint steering head never committed under its own Operation")
-		}
+		testassert.Require(t, steerOwned, "the checkpoint steering head never committed under its own Operation")
 		compactions := 0
 		for _, fact := range childFacts {
 			if fact.Kind == harness.EntryCompaction {
 				comp := fact.Compaction
-				if comp == nil {
-					t.Fatal("compaction fact has no payload")
-				}
+				testassert.Require(t, comp != nil, "%v", "compaction fact has no payload")
 				compactions++
-				if comp.OperationID != "child-op-2" || comp.Summary != "child summary" || comp.Usage == nil || *comp.Usage != (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) || childSessionState.State.CompactionEntryID != comp.EntryID {
-					t.Fatalf("child compaction/projection = %+v", comp)
-				}
+				testassert.Require(t, comp.OperationID == "child-op-2" && comp.Summary == "child summary" && comp.Usage != nil && *comp.Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) && childSessionState.State.CompactionEntryID == comp.EntryID, "child compaction/projection = %+v", comp)
 			}
 		}
-		if compactions != 1 {
-			t.Fatalf("child committed compactions = %d, want one", compactions)
-		}
+		testassert.Equal(t, compactions, 1)
 		pieceCount := func(totals harness.UsageTotals) bool {
 			for _, usage := range totals.ByModel {
 				if usage.Model == compactRef {
@@ -403,16 +365,10 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			}
 			return false
 		}
-		if !pieceCount(secondOperation.State.Usage) || !pieceCount(childQuiet.TotalUsage) {
-			t.Fatalf("child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.TotalUsage)
-		}
-		if len(observedPrepares) != 4 || observedPrepares[0].Session.Identity.SessionID != child || observedPrepares[1].Session.Identity.SessionID != root || observedPrepares[2].Session.Identity.SessionID != child || observedPrepares[3].Session.Identity.SessionID != child {
-			t.Fatalf("shared preparation lineage = %+v", observedPrepares)
-		}
+		testassert.Require(t, pieceCount(secondOperation.State.Usage) && pieceCount(childQuiet.TotalUsage), "child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.TotalUsage)
+		testassert.Require(t, len(observedPrepares) == 4 && observedPrepares[0].Session.Identity.SessionID == child && observedPrepares[1].Session.Identity.SessionID == root && observedPrepares[2].Session.Identity.SessionID == child && observedPrepares[3].Session.Identity.SessionID == child, "shared preparation lineage = %+v", observedPrepares)
 		for _, preparation := range observedPrepares {
-			if preparation.RequestKind != harness.RequestKindMessage {
-				t.Fatalf("preparation kind = %q, want message", preparation.RequestKind)
-			}
+			testassert.Equal(t, preparation.RequestKind, harness.RequestKindMessage)
 		}
 		assertForkSourceUnchanged(t, store, root, parentBefore)
 	})
@@ -432,11 +388,13 @@ func TestObservePublicBothStores(t *testing.T) {
 			_ = h.Wait(context.Background())
 		}()
 		session := createSession(t, h)
-		if _, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		{
+			_, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
-		if rec := awaitTerminal(t, h, session, "op-1"); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("operation status = %s, want success", rec.State.Status)
+		{
+			rec := awaitTerminal(t, h, session, "op-1")
+			testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 		}
 		snap := awaitPublicQuiet(t, h, session, sink)
 
@@ -446,26 +404,18 @@ func TestObservePublicBothStores(t *testing.T) {
 			finished int
 		)
 		for _, fact := range sink.snapshot() {
-			if fact.SessionID != session {
-				t.Fatalf("fact names a foreign session: %+v", fact)
-			}
+			testassert.Require(t, fact.SessionID == session, "fact names a foreign session: %+v", fact)
 			switch fact.Kind {
 			case harness.FactInvalidation:
 			case harness.FactTextDelta:
 				deltas++
-				if fact.OperationID != "op-1" || fact.Position < 0 || fact.Content == "" {
-					t.Fatalf("text delta fact = %+v", fact)
-				}
+				testassert.Require(t, fact.OperationID == "op-1" && fact.Position >= 0 && fact.Content != "", "text delta fact = %+v", fact)
 			case harness.FactToolStarted:
 				started++
-				if fact.OperationID != "op-1" || fact.CallID != "call-1" || fact.Ordinal != 0 || fact.Name != "echo" {
-					t.Fatalf("tool started fact = %+v", fact)
-				}
+				testassert.Require(t, fact.OperationID == "op-1" && fact.CallID == "call-1" && fact.Ordinal == 0 && fact.Name == "echo", "tool started fact = %+v", fact)
 			case harness.FactToolFinished:
 				finished++
-				if fact.OperationID != "op-1" || fact.CallID != "call-1" || fact.Status != model.ResultSuccess {
-					t.Fatalf("tool finished fact = %+v", fact)
-				}
+				testassert.Require(t, fact.OperationID == "op-1" && fact.CallID == "call-1" && fact.Status == model.ResultSuccess, "tool finished fact = %+v", fact)
 			default:
 				t.Fatalf("fact kind %q is outside the closed set", fact.Kind)
 			}
@@ -474,41 +424,48 @@ func TestObservePublicBothStores(t *testing.T) {
 			t.Fatalf("no invalidation was delivered: %+v", sink.snapshot())
 		}
 		current := harness.SessionRevision{DurableRevision: snap.Header.Revision.DurableRevision, LocalRevision: snap.Header.Revision.LocalRevision}
-		if _, pair, ok := h.ReadObservation(session); !ok || pair != current {
-			t.Fatalf("cached publication read = %+v %v, quiet snapshot = %+v", pair, ok, current)
+		{
+			_, pair, ok := h.ReadObservation(session)
+			testassert.Require(t, ok && pair == current, "cached publication read = %+v %v, quiet snapshot = %+v", pair, ok, current)
 		}
-		if deltas != 2 || started != 1 || finished != 1 {
-			t.Fatalf("progress counts = deltas %d started %d finished %d", deltas, started, finished)
-		}
+		testassert.Require(t, deltas == 2 && started == 1 && finished == 1, "progress counts = deltas %d started %d finished %d", deltas, started, finished)
 
 		// Restart: recovery and the new owner's reads replay nothing.
 		cancel()
-		if err := h.Wait(context.Background()); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := h.Wait(context.Background())
+			testassert.NoError(t, err)
 		}
-		if err := harness.Recover(context.Background(), store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		{
+			err := harness.Recover(context.Background(), store)
+			testassert.NoError(t, err)
 		}
 		restartSink := &publicFactSink{}
 		restarted, restartCancel := newObservedPublicHarness(t, store, newScriptModel(), nil, restartSink.observe)
 		defer restartCancel()
-		if _, err := restarted.ListSessions(context.Background()); err != nil {
-			t.Fatalf("ListSessions: %v", err)
+		{
+			_, err := restarted.ListSessions(context.Background())
+			testassert.NoError(t, err)
 		}
-		if _, err := restarted.ReadSessionHeader(context.Background(), session); err != nil {
-			t.Fatalf("ReadSession: %v", err)
+		{
+			_, err := restarted.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
 		}
-		if _, err := restarted.ReadHistoryView(context.Background(), session); err != nil {
-			t.Fatalf("ReadHistoryView: %v", err)
+		{
+			_, err := restarted.ReadHistoryView(context.Background(), session)
+			testassert.NoError(t, err)
 		}
-		if got := restartSink.snapshot(); len(got) != 0 {
-			t.Fatalf("the restarted owner replayed %+v", got)
+		{
+			got := restartSink.snapshot()
+			testassert.Require(t, len(got) == 0, "the restarted owner replayed %+v", got)
 		}
-		if _, err := restarted.ChangeAgentType(context.Background(), session, "planner"); err != nil {
-			t.Fatalf("ChangeAgentType: %v", err)
+		{
+			_, err := restarted.ChangeAgentType(context.Background(), session, "planner")
+			testassert.NoError(t, err)
 		}
-		if got := restartSink.invalidations(); len(got) != 1 {
-			t.Fatalf("the restarted owner's first publication emitted %+v", got)
+		{
+			got := restartSink.invalidations()
+			testassert.Require(t, len(got) == 1, "the restarted owner's first publication emitted %+v", got)
 		}
 		restartCancel()
 		_ = restarted.Wait(context.Background())
@@ -544,11 +501,13 @@ func TestObservePublicObserverFailures(t *testing.T) {
 					_ = h.Wait(context.Background())
 				}()
 				session := createSession(t, h)
-				if _, err := submit(t, h, session, "op-"+mode.name, harness.MessageModeRegular, "hello"); err != nil {
-					t.Fatalf("submit: %v", err)
+				{
+					_, err := submit(t, h, session, "op-"+mode.name, harness.MessageModeRegular, "hello")
+					testassert.NoError(t, err)
 				}
-				if rec := awaitTerminal(t, h, session, "op-"+mode.name); rec.State.Status != harness.OperationSuccess {
-					t.Fatalf("operation status = %s, want success", rec.State.Status)
+				{
+					rec := awaitTerminal(t, h, session, "op-"+mode.name)
+					testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 				}
 			})
 		}
@@ -571,63 +530,44 @@ func TestObservePublicJobAndChild(t *testing.T) {
 		root := createSession(t, h)
 
 		beforeAdmit, err := h.ReadSessionHeader(context.Background(), root)
-		if err != nil {
-			t.Fatalf("ReadSessionHeader before the job admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		var completionID string
-		if err := h.StartJob(context.Background(), root, "deadbeef", func(_ context.Context, id string) error {
-			completionID = id
-			return nil
-		}); err != nil {
-			t.Fatalf("StartJob: %v", err)
+		{
+			err := h.StartJob(context.Background(), root, "deadbeef", func(_ context.Context, id string) error {
+				completionID = id
+				return nil
+			})
+			testassert.NoError(t, err)
 		}
 		jobFacts := jobInvalidations(sink, root)
-		if len(jobFacts) != 1 {
-			t.Fatalf("job admission facts = %+v, want one job-attributed invalidation", jobFacts)
-		}
+		testassert.Require(t, len(jobFacts) == 1, "job admission facts = %+v, want one job-attributed invalidation", jobFacts)
 		afterAdmit, err := h.ReadSessionHeader(context.Background(), root)
-		if err != nil {
-			t.Fatalf("ReadSessionHeader after the job admission: %v", err)
-		}
-		if afterAdmit.Revision.DurableRevision != beforeAdmit.Revision.DurableRevision || afterAdmit.Revision.LocalRevision != beforeAdmit.Revision.LocalRevision+1 {
-			t.Fatalf("job admission pair = %d/%d, want one local publication over %d/%d",
-				afterAdmit.Revision.DurableRevision, afterAdmit.Revision.LocalRevision, beforeAdmit.Revision.DurableRevision, beforeAdmit.Revision.LocalRevision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, afterAdmit.Revision.DurableRevision == beforeAdmit.Revision.DurableRevision && afterAdmit.Revision.LocalRevision == beforeAdmit.Revision.LocalRevision+1, "job admission pair = %d/%d, want one local publication over %d/%d", afterAdmit.Revision.DurableRevision, afterAdmit.Revision.LocalRevision, beforeAdmit.Revision.DurableRevision, beforeAdmit.Revision.LocalRevision)
 
 		beforeFinish, err := h.ReadSessionHeader(context.Background(), root)
-		if err != nil {
-			t.Fatalf("ReadSessionHeader before the job finish: %v", err)
-		}
-		if err := h.DeliverBackgroundCompletion(context.Background(), root, completionID, "job done"); err != nil {
-			t.Fatalf("DeliverBackgroundCompletion: %v", err)
+		testassert.NoError(t, err)
+		{
+			err := h.DeliverBackgroundCompletion(context.Background(), root, completionID, "job done")
+			testassert.NoError(t, err)
 		}
 		afterFinish, err := h.ReadSessionHeader(context.Background(), root)
-		if err != nil {
-			t.Fatalf("ReadSessionHeader after the job finish: %v", err)
-		}
+		testassert.NoError(t, err)
 		jobFacts = jobInvalidations(sink, root)
-		if len(jobFacts) != 2 {
-			t.Fatalf("job facts = %+v, want the admission and the finish", jobFacts)
-		}
-		if afterFinish.Revision.DurableRevision <= beforeFinish.Revision.DurableRevision {
-			t.Fatalf("job finish pair = %d/%d, want a durable advance past the before read %d",
-				afterFinish.Revision.DurableRevision, afterFinish.Revision.LocalRevision, beforeFinish.Revision.DurableRevision)
-		}
+		testassert.Require(t, len(jobFacts) == 2, "job facts = %+v, want the admission and the finish", jobFacts)
+		testassert.Require(t, afterFinish.Revision.DurableRevision > beforeFinish.Revision.DurableRevision, "job finish pair = %d/%d, want a durable advance past the before read %d", afterFinish.Revision.DurableRevision, afterFinish.Revision.LocalRevision, beforeFinish.Revision.DurableRevision)
 		script.releaseGate()
-		if rec := awaitTerminal(t, h, root, completionID); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("completion operation status = %s, want success", rec.State.Status)
+		{
+			rec := awaitTerminal(t, h, root, completionID)
+			testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 		}
 
 		before := len(sink.snapshot())
 		res, err := h.LaunchChildSession(context.Background(), publicChildLaunch(root))
-		if err != nil {
-			t.Fatalf("LaunchChildSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		var childCreate bool
 		for _, fact := range sink.snapshot()[before:] {
-			if fact.JobID != "" {
-				t.Fatalf("child flow fact carries a Job identity: %+v", fact)
-			}
+			testassert.Require(t, fact.JobID == "", "child flow fact carries a Job identity: %+v", fact)
 			if fact.SessionID == res.ChildSessionID {
 				childCreate = true
 			}
@@ -636,9 +576,7 @@ func TestObservePublicJobAndChild(t *testing.T) {
 			t.Fatalf("the child creation emitted no fact: %+v", sink.snapshot())
 		}
 		for _, fact := range sink.snapshot() {
-			if fact.Kind != harness.FactInvalidation && fact.JobID != "" {
-				t.Fatalf("non-invalidation fact carries a Job identity: %+v", fact)
-			}
+			testassert.Require(t, fact.Kind == harness.FactInvalidation || fact.JobID == "", "non-invalidation fact carries a Job identity: %+v", fact)
 		}
 	})
 }
@@ -692,25 +630,17 @@ func observedBlockedStreamFixture(t *testing.T, store harness.Storage) (*publicF
 func assertRunningTextDelta(t *testing.T, h *harness.Harness, sink *publicFactSink, session, operation string) {
 	t.Helper()
 	rec, err := h.ReadOperation(context.Background(), session, operation)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != harness.OperationRunning || rec.State.Terminal != nil {
-		t.Fatalf("operation state = %+v, want still running", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == harness.OperationRunning && rec.State.Terminal == nil, "operation state = %+v, want still running", rec.State)
 	var deltas int
 	for _, fact := range sink.snapshot() {
 		if fact.Kind != harness.FactTextDelta {
 			continue
 		}
 		deltas++
-		if fact.SessionID != session || fact.OperationID != operation || fact.Position != 3 || fact.Content != "partial" {
-			t.Fatalf("text delta fact = %+v", fact)
-		}
+		testassert.Require(t, fact.SessionID == session && fact.OperationID == operation && fact.Position == 3 && fact.Content == "partial", "text delta fact = %+v", fact)
 	}
-	if deltas != 1 {
-		t.Fatalf("text delta facts = %d, want one", deltas)
-	}
+	testassert.Equal(t, deltas, 1)
 }
 
 // TestObservePublicAcceptedStreamRootAndChild proves a nonempty accepted-stream
@@ -726,14 +656,16 @@ func TestObservePublicAcceptedStreamRootAndChild(t *testing.T) {
 				_ = h.Wait(context.Background())
 			}()
 			session := createSession(t, h)
-			if _, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("submit: %v", err)
+			{
+				_, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-arrived
 			assertRunningTextDelta(t, h, sink, session, "op-1")
 			release()
-			if rec := awaitTerminal(t, h, session, "op-1"); rec.State.Status != harness.OperationSuccess {
-				t.Fatalf("operation status = %s, want success", rec.State.Status)
+			{
+				rec := awaitTerminal(t, h, session, "op-1")
+				testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 			}
 		})
 		t.Run("child", func(t *testing.T) {
@@ -745,14 +677,13 @@ func TestObservePublicAcceptedStreamRootAndChild(t *testing.T) {
 			}()
 			root := createSession(t, h)
 			res, err := h.LaunchChildSession(context.Background(), publicChildLaunch(root))
-			if err != nil {
-				t.Fatalf("LaunchChildSession: %v", err)
-			}
+			testassert.NoError(t, err)
 			<-arrived
 			assertRunningTextDelta(t, h, sink, res.ChildSessionID, "child-op-1")
 			release()
-			if rec := awaitTerminal(t, h, res.ChildSessionID, "child-op-1"); rec.State.Status != harness.OperationSuccess {
-				t.Fatalf("child operation status = %s, want success", rec.State.Status)
+			{
+				rec := awaitTerminal(t, h, res.ChildSessionID, "child-op-1")
+				testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 			}
 		})
 	})
@@ -791,27 +722,19 @@ func observedBlockedToolFixture(t *testing.T, store harness.Storage) (*publicFac
 func assertRunningToolStarted(t *testing.T, h *harness.Harness, sink *publicFactSink, session, operation string) {
 	t.Helper()
 	rec, err := h.ReadOperation(context.Background(), session, operation)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != harness.OperationRunning || rec.State.Terminal != nil {
-		t.Fatalf("operation state = %+v, want still running", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == harness.OperationRunning && rec.State.Terminal == nil, "operation state = %+v, want still running", rec.State)
 	var started, finished int
 	for _, fact := range sink.snapshot() {
 		switch fact.Kind {
 		case harness.FactToolStarted:
 			started++
-			if fact.SessionID != session || fact.OperationID != operation || fact.CallID != "call-1" || fact.Ordinal != 0 || fact.Name != "echo" {
-				t.Fatalf("tool started fact = %+v", fact)
-			}
+			testassert.Require(t, fact.SessionID == session && fact.OperationID == operation && fact.CallID == "call-1" && fact.Ordinal == 0 && fact.Name == "echo", "tool started fact = %+v", fact)
 		case harness.FactToolFinished:
 			finished++
 		}
 	}
-	if started != 1 || finished != 0 {
-		t.Fatalf("tool progress while blocked = started %d finished %d, want one started and none finished", started, finished)
-	}
+	testassert.Require(t, started == 1 && finished == 0, "tool progress while blocked = started %d finished %d, want one started and none finished", started, finished)
 }
 
 // assertOneToolFinished asserts exactly one finished fact with the expected
@@ -824,13 +747,9 @@ func assertOneToolFinished(t *testing.T, sink *publicFactSink, session, operatio
 			continue
 		}
 		finished++
-		if fact.SessionID != session || fact.OperationID != operation || fact.CallID != "call-1" || fact.Status != model.ResultSuccess {
-			t.Fatalf("tool finished fact = %+v", fact)
-		}
+		testassert.Require(t, fact.SessionID == session && fact.OperationID == operation && fact.CallID == "call-1" && fact.Status == model.ResultSuccess, "tool finished fact = %+v", fact)
 	}
-	if finished != 1 {
-		t.Fatalf("tool finished facts = %d, want one", finished)
-	}
+	testassert.Equal(t, finished, 1)
 }
 
 // TestObservePublicToolProgressRootAndChild proves one tool_started fact while
@@ -846,14 +765,16 @@ func TestObservePublicToolProgressRootAndChild(t *testing.T) {
 				_ = h.Wait(context.Background())
 			}()
 			session := createSession(t, h)
-			if _, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-				t.Fatalf("submit: %v", err)
+			{
+				_, err := submit(t, h, session, "op-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
 			}
 			<-execStarted
 			assertRunningToolStarted(t, h, sink, session, "op-1")
 			release()
-			if rec := awaitTerminal(t, h, session, "op-1"); rec.State.Status != harness.OperationSuccess {
-				t.Fatalf("operation status = %s, want success", rec.State.Status)
+			{
+				rec := awaitTerminal(t, h, session, "op-1")
+				testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 			}
 			assertOneToolFinished(t, sink, session, "op-1")
 		})
@@ -866,14 +787,13 @@ func TestObservePublicToolProgressRootAndChild(t *testing.T) {
 			}()
 			root := createSession(t, h)
 			res, err := h.LaunchChildSession(context.Background(), publicChildLaunch(root))
-			if err != nil {
-				t.Fatalf("LaunchChildSession: %v", err)
-			}
+			testassert.NoError(t, err)
 			<-execStarted
 			assertRunningToolStarted(t, h, sink, res.ChildSessionID, "child-op-1")
 			release()
-			if rec := awaitTerminal(t, h, res.ChildSessionID, "child-op-1"); rec.State.Status != harness.OperationSuccess {
-				t.Fatalf("child operation status = %s, want success", rec.State.Status)
+			{
+				rec := awaitTerminal(t, h, res.ChildSessionID, "child-op-1")
+				testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 			}
 			assertOneToolFinished(t, sink, res.ChildSessionID, "child-op-1")
 		})

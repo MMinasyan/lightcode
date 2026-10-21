@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestPublicSweepSessionSkipsBusyCandidate proves the one per-Session sweep
@@ -25,35 +26,33 @@ func TestPublicSweepSessionSkipsBusyCandidate(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		first, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil {
-			t.Fatalf("read created session: %v", err)
-		}
+		testassert.NoError(t, err)
 
-		if _, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello"); err != nil {
-			t.Fatalf("submit: %v", err)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
 		}
 		<-script.arrived // parked at the model boundary: the Session is running
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		deleted, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
-		if err != nil || deleted {
-			t.Fatalf("SweepSession of a running candidate = (%v, %v), want the no-transition outcome", deleted, err)
-		}
+		testassert.Require(t, err == nil && !deleted, "SweepSession of a running candidate = (%v, %v), want the no-transition outcome", deleted, err)
 		still, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil || still.Lifecycle != harness.LifecycleOpen || still.CurrentOperationID != "op-1" {
-			t.Fatalf("SweepSession touched the running candidate: %+v err %v", still, err)
-		}
+		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.CurrentOperationID == "op-1", "SweepSession touched the running candidate: %+v err %v", still, err)
 
-		if _, err := f.h.SweepSession(ctx, "0123456789abcdef0123456789abcdef", policy, first.LastActivity.Add(100*time.Hour)); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("SweepSession of an unknown identity = %v, want harness.ErrNotFound", err)
+		{
+			_, err := f.h.SweepSession(ctx, "0123456789abcdef0123456789abcdef", policy, first.LastActivity.Add(100*time.Hour))
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "SweepSession of an unknown identity = %v, want harness.ErrNotFound", err)
 		}
-		if _, err := f.h.SweepSession(ctx, session, policy, time.Time{}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("SweepSession with a zero time = %v, want harness.ErrInvalid", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, time.Time{})
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "SweepSession with a zero time = %v, want harness.ErrInvalid", err)
 		}
 
 		script.releaseGate()
-		if err := converge(t, f); err != nil {
-			t.Fatalf("Wait: %v", err)
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -70,20 +69,18 @@ func TestPublicSweepSessionDeletesEligibleCandidate(t *testing.T) {
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		first, err := f.h.ReadSessionHeader(ctx, session)
-		if err != nil {
-			t.Fatalf("read created session: %v", err)
-		}
+		testassert.NoError(t, err)
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		if _, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour)); err != nil {
-			t.Fatalf("archive SweepSession: %v", err)
+		{
+			_, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
+			testassert.NoError(t, err)
 		}
 
 		deleted, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(200*time.Hour))
-		if err != nil || !deleted {
-			t.Fatalf("delete SweepSession = (%v, %v), want the committed deletion", deleted, err)
-		}
-		if _, err := f.h.ReadSessionHeader(ctx, session); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("read after SweepSession deletion = %v, want harness.ErrNotFound", err)
+		testassert.Require(t, err == nil && deleted, "delete SweepSession = (%v, %v), want the committed deletion", deleted, err)
+		{
+			_, err := f.h.ReadSessionHeader(ctx, session)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after SweepSession deletion = %v, want harness.ErrNotFound", err)
 		}
 	})
 }
