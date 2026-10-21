@@ -52,64 +52,30 @@ func chainAgentsDocument(body string) string {
 // configured provider pointed at the scenario's server, the hook tag the
 // hookPlugin requires, and no sessions section.
 func chainPlainConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
-      "discovery": false,
-      "models": {"gpt-5.5": {"name": "G", "context_window": 262144}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "T1"}}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY", false,
+		`{"gpt-5.5":{"name":"G","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
 }
 
 // chainCommandConfigDocument is the readonly-git row's provider document: no
 // plugins section, since its composition declares no configured plugin.
 func chainCommandConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 262144}}
-    }
-  }
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY", false,
+		`{"m":{"name":"M","context_window":262144}}`) + `}}`
 }
 
 // chainSweepConfigDocument adds the explicit sweep thresholds and the hook
 // tag to one provider document for the public-Open initial-sweep row.
 func chainSweepConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 4096}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "T1"}},
-  "sessions": {"archive_after_days": 1, "delete_after_archive_days": 1}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"m":{"name":"M","context_window":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":{"archive_after_days":1,"delete_after_archive_days":1}}`
 }
 
 // chainModelsConfigDocument declares the two models the capability-ID row
 // composes: one matching the bundled GPT-family adaptation pattern, one
 // matching nothing.
 func chainModelsConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
-      "discovery": false,
-      "models": {
-        "gpt-5.5": {"name": "G", "context_window": 262144},
-        "vanilla": {"name": "V", "context_window": 262144}
-      }
-    }
-  }
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"gpt-5.5":{"name":"G","context_window":262144},"vanilla":{"name":"V","context_window":262144}}`) + `}}`
 }
 
 // rewriteWriteHook is the combined scenario's ToolArgumentsHook: it replaces

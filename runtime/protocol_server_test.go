@@ -1100,7 +1100,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		before, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && before.JSON200 != nil, "read before reload: %v", err)
 		configPath := filepath.Join(r.dataDir, "config.json")
-		writeServiceFile(t, configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}}}}`)
+		writeServiceFile(t, configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "", false, `{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(configPath), `{"solo":{"model":"prov/m2","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
 		reload, err := client.ReloadConfigurationWithResponse(ctx)
 		testassert.NoError(t, err)

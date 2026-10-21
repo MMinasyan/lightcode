@@ -34,7 +34,8 @@ import (
 // server's keyless local endpoint with discovery disabled and a generous
 // window so ordinary rows never accidentally test compaction.
 func ownerConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}}}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `}}`
 }
 
 func ownerGatedConfigDocument(endpoint string) string {

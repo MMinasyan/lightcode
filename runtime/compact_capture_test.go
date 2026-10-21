@@ -45,27 +45,17 @@ Be specific — include file paths, function names, error messages, line numbers
 // from one revision, with the compact selection falling back to the
 // conversation model when the compact type's model does not resolve.
 
-const compactPrepConfigTemplate = `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "ENDPOINT", "api_key_env": "PREP_COMPACT_KEY"},
-      "discovery": false,
-      "models": {
-        "m": {"name": "M", "context_window": 4096},
-        "m2": {"name": "M2", "context_window": 2048, "max_output_tokens": 1000},
-        "mzero": {"name": "MZ", "context_window": 0, "max_output_tokens": 500}
-      }
-    },
-    "p2": {
-      "transport": {"base_url": "ENDPOINT", "api_key_env": "PREP_COMPACT_ABSENT_KEY"},
-      "discovery": false,
-      "models": {
-        "m3": {"name": "M3", "context_window": 1024, "max_output_tokens": 200}
-      }
-    }
-  },
-  "sessions": {}
-}`
+// compactPrepConfigDocument is the compaction-capture fixture document: the
+// referenced keyed provider beside one provider whose credential stays
+// absent, both pointed at the given endpoint.
+func compactPrepConfigDocument(endpoint string) string {
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY", false,
+		`{"m":{"name":"M","context_window":4096},`+
+			`"m2":{"name":"M2","context_window":2048,"max_output_tokens":1000},`+
+			`"mzero":{"name":"MZ","context_window":0,"max_output_tokens":500}}`) +
+		`,"p2":` + nominalProvMember(endpoint, "PREP_COMPACT_ABSENT_KEY", false,
+		`{"m3":{"name":"M3","context_window":1024,"max_output_tokens":200}}`) + `},"sessions":{}}`
+}
 
 // agentsWithCompact appends one compact builtin overlay to the retained
 // preparation agents document.
@@ -80,7 +70,7 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture
 	t.Helper()
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
-	writeServiceFile(t, sh.configPath, strings.Replace(compactPrepConfigTemplate, "ENDPOINT", endpoint, -1))
+	writeServiceFile(t, sh.configPath, compactPrepConfigDocument(endpoint))
 	writeServiceFile(t, agents.PathForConfig(sh.configPath), agentsDoc)
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

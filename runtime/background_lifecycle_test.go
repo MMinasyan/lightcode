@@ -33,7 +33,8 @@ const lifecycleAgentsDocument = `{
 // test server's keyless local endpoint and carries the hooks plugin section
 // the selected preparation hook validates.
 func backgroundLifecycleConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}},"plugins":{"hooks":{"tag":"T1"}}}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
 }
 
 // newLifecycleID mints one fresh 32-lowercase-hex identity.

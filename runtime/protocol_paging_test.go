@@ -1028,7 +1028,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		// distinct from the fixtures' shared generous default. The row admits
 		// no work, so the placeholder endpoint is never contacted.
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "", false, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), usageWindowAgents)
 		r, err := e.open(context.Background(), e.storagePlugin(store))
 		testassert.NoError(t, err)
@@ -1097,7 +1097,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		// Agent type: the idle reads report the new selection while the
 		// busy read keeps its capture, and every read names the captured
 		// generation.
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":8192}}}}}`)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "", false, `{"m":{"name":"M","context_window":8192}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), usageWindowAgents)
 		{
 			_, err := r.Reload(ctx)
@@ -1139,7 +1139,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":{"transport":{"base_url":"`+e.server.URL+`","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":1024},"m2":{"name":"M2","context_window":8192,"max_output_tokens":1024}}}}}`)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "", false, `{"m":{"name":"M","context_window":4096,"max_output_tokens":1024},"m2":{"name":"M2","context_window":8192,"max_output_tokens":1024}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"alternate":{"model":"prov/m2","system_prompt":"simple"},"modelless":{"system_prompt":"simple"},"gone":{"model":"prov/gone","system_prompt":"simple"}}`)
 		r, err := e.open(context.Background(), e.storagePlugin(store))
 		testassert.NoError(t, err)

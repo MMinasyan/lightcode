@@ -29,16 +29,8 @@ import (
 // parked execution, and restart repair on the same store.
 
 func assembledConfigDocument(endpoint, tag, label string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "ASSEMBLED_TEST_KEY"},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 262144}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "` + tag + `"}, "depper": {"label": "` + label + `"}}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY", false,
+		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
 }
 
 // The "leaky" definition selects the Core storage export by ID: raw storage

@@ -155,11 +155,30 @@ const connectionAgentsDocument = `{"primary": {"model": "usablep/m"}}`
 // store, with the embedded bundled catalog and the isolated HOME giving the
 // Runtime its own real managed env and discovery cache. The startup refresh
 // carries no credential yet and fails harmlessly on the gated endpoint.
-func openConnectionRuntime(t *testing.T, store harness.Storage, endpoint string, extra ...Plugin) (*Runtime, *ownerEnv) {
+func openConnectionRuntime(t *testing.T, store harness.Storage, endpoint string) (*Runtime, *ownerEnv) {
 	t.Helper()
 	reserveEnvKey(t, "CONNECTION_DISC_KEY")
 	reserveEnvKey(t, "CONNECTION_USABLE_KEY")
-	return openConfigurationRuntimeWithEnv(t, store, newOwnerEnv(t), connectionProvidersDocument(endpoint), connectionAgentsDocument, extra...)
+	return openConfigurationRuntimeWithEnv(t, store, newOwnerEnv(t), connectionProvidersDocument(endpoint), connectionAgentsDocument)
+}
+
+// openConnectionSubscription opens the connection fixture's Runtime and
+// subscribes with the given capacity. The returned close runs inside the
+// store-runner callback — subscription first, then Runtime, then SQLite — so
+// callers defer it there rather than with t.Cleanup. A failed subscription
+// closes the opened Runtime before failing the test.
+func openConnectionSubscription(t *testing.T, store harness.Storage, endpoint string, capacity int) (*Runtime, *ownerEnv, *Subscription, func()) {
+	t.Helper()
+	r, e := openConnectionRuntime(t, store, endpoint)
+	sub, err := r.Subscribe(capacity)
+	if err != nil {
+		closeProjectionRuntime(r)
+		t.Fatalf("Subscribe: %v", err)
+	}
+	return r, e, sub, func() {
+		sub.Close()
+		closeProjectionRuntime(r)
+	}
 }
 
 // reserveEnvKey starts one env name unset and restores its exact prior
@@ -283,12 +302,9 @@ func assertDotenvUnchanged(t *testing.T, r *Runtime, before []byte, what string)
 func TestConnectProviderDiscoveryBackedManagedKey(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
@@ -350,12 +366,9 @@ func TestConnectProviderDiscoveryBackedManagedKey(t *testing.T) {
 func TestConnectProviderRepeatStillPublishes(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		t.Setenv("CONNECTION_USABLE_KEY", "usable-key-value")
 
 		// A repeat connection of an already-connected usable provider is a
@@ -381,12 +394,9 @@ func TestConnectProviderRepeatStillPublishes(t *testing.T) {
 func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_STATIC_KEY")
 
 		// The external hand edit removes staticp's only model window: the
@@ -400,7 +410,7 @@ func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 		fetches := server.requests()
 
 		key := connectionKey
-		_, err = r.connectProvider(ctx, "staticp", &key)
+		_, err := r.connectProvider(ctx, "staticp", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		{
 			got := server.requests()
@@ -413,12 +423,9 @@ func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 func TestConnectProviderUsableSkipsFetch(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_STATIC_KEY")
 		fetchesAtOpen := server.requests()
 
@@ -509,12 +516,9 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 
 		doc := connectionProvidersDocument(server.URL)
 		oldGroq := `"groq": {"transport": {"base_url": "` + server.URL + `", "api_key_env": "CONNECTION_DISC_KEY"}, "discovery": true, "models": {"ghost": {"name": "Ghost"}}}`
@@ -552,12 +556,9 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		server.retarget(func(string) string { return connectionEmptyDiscovery })
 
 		doc := connectionProvidersDocument(server.URL)
@@ -575,7 +576,7 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		fetches := server.requests()
-		_, err = r.connectProvider(ctx, "moonshot", nil)
+		_, err := r.connectProvider(ctx, "moonshot", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		{
 			got := server.requests()
@@ -590,16 +591,13 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 func TestConnectProviderKeyResolutionRefusals(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		// Unset env, no supplied key: the required credential is missing.
-		_, err = r.connectProvider(ctx, "discp", nil)
+		_, err := r.connectProvider(ctx, "discp", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 
 		// A set-but-empty external value fails uniformly.
@@ -614,8 +612,7 @@ func TestConnectProviderKeyResolutionRefusals(t *testing.T) {
 
 		// An unknown provider keeps the read path's typed error.
 		_, err = r.connectProvider(ctx, "ghost-provider", nil)
-		testassert.Require(t, errors.Is(err, catalog.ErrUnknownProvider), "unknown provider connect = %v, want ErrUnknownProvider", err)
-		assertNoConnectionPublication(t, r, sub, generation, warnRev)
+		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, catalog.ErrUnknownProvider)
 	})
 }
 
@@ -628,12 +625,9 @@ func TestConnectProviderKeyResolutionRefusals(t *testing.T) {
 func TestConnectProviderKeylessSuppliedKeyRefuses(t *testing.T) {
 	store := storage.NewMemory()
 	server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-	r, _ := openConnectionRuntime(t, store, server.URL)
-	defer closeProjectionRuntime(r)
+	r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+	defer closeRuntime()
 	ctx := context.Background()
-	sub, err := r.Subscribe(8)
-	testassert.NoError(t, err)
-	defer sub.Close()
 	envBefore, err := os.ReadFile(r.managedEnv.Path())
 	testassert.NoError(t, err)
 	before, generation, warnRev := runtimeMutationBaseline(t, r)
@@ -651,10 +645,9 @@ func TestConnectProviderKeylessSuppliedKeyRefuses(t *testing.T) {
 	// refusal: no discovery record is written for it.
 	{
 		_, err := r.connectProvider(ctx, "keylessp", &key)
-		testassert.Require(t, errors.Is(err, ErrConfiguration), "unusable keyless connect = %v, want the configuration failure", err)
+		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 	}
 	assertDiscoveryCacheLacks(t, r, "keylessp", "ghost")
-	assertNoConnectionPublication(t, r, sub, generation, warnRev)
 
 	// Without a supplied key the keyless connect is the retained
 	// no-credential connection: no key action, one publication.
@@ -675,12 +668,9 @@ func TestConnectProviderKeylessSuppliedKeyRefuses(t *testing.T) {
 func TestConnectProviderUnusableDiscoveryDisabledRefusals(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_STATIC_KEY")
 		t.Setenv("CONNECTION_STATIC_KEY", "valid-external-key")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
@@ -749,11 +739,11 @@ type connectRaceFixture struct {
 	warnRev     uint64
 }
 
-func newConnectRaceFixture(t *testing.T, store harness.Storage) *connectRaceFixture {
+func newConnectRaceFixture(t *testing.T, store harness.Storage) (*connectRaceFixture, *Subscription, func()) {
 	server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-	r, _ := openConnectionRuntime(t, store, server.URL)
+	r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
 	arrive, release := server.park()
-	return &connectRaceFixture{r: r, endpoint: server.URL, arrive: arrive, release: release}
+	return &connectRaceFixture{r: r, endpoint: server.URL, arrive: arrive, release: release}, sub, closeRuntime
 }
 
 // start launches one parked connect whose outcome lands in the fixture.
@@ -803,12 +793,9 @@ func (f *connectRaceFixture) assertRefused(t *testing.T, sub *Subscription) {
 
 func TestConnectProviderRaceRemovedRefusesBeforeWrites(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		f := newConnectRaceFixture(t, store)
-		defer closeProjectionRuntime(f.r)
+		f, sub, closeRuntime := newConnectRaceFixture(t, store)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := f.r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 
 		key := connectionKey
 		f.start("discp", &key)
@@ -833,12 +820,9 @@ func TestConnectProviderRaceRemovedRefusesBeforeWrites(t *testing.T) {
 
 func TestConnectProviderRaceTransportChangedRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		f := newConnectRaceFixture(t, store)
-		defer closeProjectionRuntime(f.r)
+		f, sub, closeRuntime := newConnectRaceFixture(t, store)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := f.r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 
 		key := connectionKey
 		f.start("discp", &key)
@@ -866,11 +850,8 @@ func TestConnectProviderRaceTransportChangedRefuses(t *testing.T) {
 // — the candidate build drops it, so the connect refuses before any write.
 func TestConnectProviderRaceInvalidLatestTransportRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		f := newConnectRaceFixture(t, store)
-		defer closeProjectionRuntime(f.r)
-		sub, err := f.r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
+		f, sub, closeRuntime := newConnectRaceFixture(t, store)
+		defer closeRuntime()
 
 		key := connectionKey
 		f.start("discp", &key)
@@ -895,12 +876,9 @@ func TestConnectProviderRaceInvalidLatestTransportRefuses(t *testing.T) {
 func TestConnectProviderRaceConcurrentModelsSkipsCacheWrite(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, _, _ := runtimeMutationBaseline(t, r)
 		arrive, release := server.park()
 
@@ -952,16 +930,13 @@ func TestConnectProviderDiscoveryFilteredRefuses(t *testing.T) {
 		// The fetch succeeds but never fills the declared windowless model:
 		// no usable effective candidate, no publication, no cache write.
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery) // the fetched model id never fills the declared ghost
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
-		_, err = r.connectProvider(ctx, "discp", &key)
+		_, err := r.connectProvider(ctx, "discp", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDiscoveryCacheLacks(t, r, "discp", "ghost")
 	})
@@ -970,12 +945,9 @@ func TestConnectProviderDiscoveryFilteredRefuses(t *testing.T) {
 func TestConnectProviderCacheContentionRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
@@ -1010,12 +982,9 @@ func TestConnectProviderCacheContentionRefuses(t *testing.T) {
 func TestConnectProviderCacheWrittenKeyWriteFails(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
@@ -1044,12 +1013,9 @@ func TestConnectProviderCacheWrittenKeyWriteFails(t *testing.T) {
 func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_BAD_KEY")
 
 		// A provider identity the catalog's own rules accept — the separate
@@ -1067,7 +1033,7 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
-		_, err = r.connectProvider(ctx, `bad\id`, &key)
+		_, err := r.connectProvider(ctx, `bad\id`, &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDiscoveryCacheLacks(t, r, `bad\id`, "fresh")
 	})
@@ -1076,12 +1042,9 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 func TestConnectProviderNULKeyRefusedWithoutFileEffect(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
@@ -1100,11 +1063,8 @@ func TestConnectProviderNULKeyRefusedWithoutFileEffect(t *testing.T) {
 func TestConnectProviderFetchCancellationBeforePersistence(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		_, generation, warnRev := runtimeMutationBaseline(t, r)
 		arrive, release := server.park()
 
@@ -1118,7 +1078,7 @@ func TestConnectProviderFetchCancellationBeforePersistence(t *testing.T) {
 		<-arrive
 		cancel()
 		close(release)
-		err = <-done
+		err := <-done
 		testassert.Require(t, errors.Is(err, context.Canceled), "canceled fetch = %v, want the unwrapped context error", err)
 		assertNoConnectionPublication(t, r, sub, generation, warnRev)
 		assertDiscoveryCacheLacks(t, r, "discp", "ghost")
@@ -1128,11 +1088,8 @@ func TestConnectProviderFetchCancellationBeforePersistence(t *testing.T) {
 func TestConnectProviderPublicationSurvivesLateCancellation(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 
 		// Park the discovery-cache write's temp sync: the caller cancels
 		// after the final cancellation check, once persistence has begun.
@@ -1252,12 +1209,9 @@ func TestDisconnectProviderManagedKeyTable(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 				server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-				r, _ := openConnectionRuntime(t, store, server.URL)
-				defer closeProjectionRuntime(r)
+				r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+				defer closeRuntime()
 				ctx := context.Background()
-				sub, err := r.Subscribe(8)
-				testassert.NoError(t, err)
-				defer sub.Close()
 				testassert.NoError(t, r.managedEnv.TrySet(row.envName, row.seed))
 				before, _, _ := runtimeMutationBaseline(t, r)
 
@@ -1345,12 +1299,9 @@ drain:
 func TestConnectProviderOverlappingReadSeesPublishedPair(t *testing.T) {
 	store := storage.NewMemory()
 	server := newConnectionDiscoveryServer(t, connectionGhostDiscovery)
-	r, _ := openConnectionRuntime(t, store, server.URL)
-	defer closeProjectionRuntime(r)
+	r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 16)
+	defer closeRuntime()
 	ctx := context.Background()
-	sub, err := r.Subscribe(16)
-	testassert.NoError(t, err)
-	defer sub.Close()
 	reserveEnvKey(t, "CONNECTION_USABLE_KEY")
 	probe := installOwningSyncProbe(t, r.managedEnv.Path())
 	defer probe.restore()
@@ -1401,12 +1352,9 @@ func TestConnectProviderOverlappingReadSeesPublishedPair(t *testing.T) {
 func TestDisconnectProviderOverlappingReadStaysCoherent(t *testing.T) {
 	store := storage.NewMemory()
 	server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-	r, _ := openConnectionRuntime(t, store, server.URL)
-	defer closeProjectionRuntime(r)
+	r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 16)
+	defer closeRuntime()
 	ctx := context.Background()
-	sub, err := r.Subscribe(16)
-	testassert.NoError(t, err)
-	defer sub.Close()
 	testassert.NoError(t, r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 	before, err := r.getProvider(ctx, "usablep")
 	testassert.Require(t, err == nil && before.Provider.KeySource == protocol.Managed && before.Provider.Connected, "initial provider = (%v, %+v), want the managed connected state", err, before.Provider)
@@ -1518,26 +1466,21 @@ func TestMutationResultStaysFrozenAfterNextPublication(t *testing.T) {
 func TestDisconnectProviderRefusals(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		// A keyless provider is removed, not disconnected: the nearest
 		// forbidden sibling of the successful disconnect.
-		_, err = r.disconnectProvider(ctx, "keylessp")
-		testassert.Require(t, err != nil && errors.Is(err, harness.ErrInvalid), "keyless disconnect = %v, want the invalid refusal", err)
+		_, err := r.disconnectProvider(ctx, "keylessp")
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, harness.ErrInvalid)
 
 		// An external set key refuses, naming the env variable alone — no
 		// value exists in a Lightcode store, and none is invented.
 		t.Setenv("CONNECTION_STATIC_KEY", "shell-exported-value")
 		_, err = r.disconnectProvider(ctx, "staticp")
-		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "external disconnect = %v, want the typed refusal", err)
-		testassert.Require(t, strings.Contains(err.Error(), "CONNECTION_STATIC_KEY") && !strings.Contains(err.Error(), "shell-exported-value"), "external disconnect error %q, want the env name without any value", err)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "CONNECTION_STATIC_KEY") && !strings.Contains(err.Error(), "shell-exported-value"), "external disconnect error %q, want the env name without any value", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 	})
 }
@@ -1545,12 +1488,9 @@ func TestDisconnectProviderRefusals(t *testing.T) {
 func TestDisconnectProviderAbsentUnmanagedSucceeds(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		// The env name is set nowhere: the disconnect publishes the ready
@@ -1566,12 +1506,9 @@ func TestDisconnectProviderAbsentUnmanagedSucceeds(t *testing.T) {
 func TestDisconnectProviderRepeatStillPublishes(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		testassert.NoError(t, r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 
 		{
@@ -1594,12 +1531,9 @@ func TestDisconnectProviderRepeatStillPublishes(t *testing.T) {
 func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		testassert.NoError(t, r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 
 		moved := "https://moved.test/v1"
@@ -1628,12 +1562,9 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 func TestDisconnectProviderLatestRawEnvRebindKeepsExternalSibling(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		testassert.NoError(t, r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 		reserveEnvKey(t, "CONNECTION_REBOUND_KEY")
 		t.Setenv("CONNECTION_REBOUND_KEY", "external-rebound-value")
@@ -1668,12 +1599,9 @@ func TestDisconnectProviderLatestRawEnvRebindKeepsExternalSibling(t *testing.T) 
 func TestDisconnectProviderLatestCandidateRemovedRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		testassert.NoError(t, r.managedEnv.TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
@@ -1697,12 +1625,9 @@ func TestDisconnectProviderLatestCandidateRemovedRefuses(t *testing.T) {
 func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "LIGHTCODE_NEWP_API_KEY")
 
 		key := "sk-live-add-1"
@@ -1737,12 +1662,9 @@ func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 func TestCreateProviderExplicitEmptyEnvKeylessRefuses(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
@@ -1776,12 +1698,9 @@ func TestCreateProviderExplicitEmptyEnvKeylessRefuses(t *testing.T) {
 func TestCreateProviderExternalBindingWithKeyRefusesBeforeWrites(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_SHELL_KEY")
 		t.Setenv("CONNECTION_SHELL_KEY", "shell-exported-value")
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
@@ -1901,17 +1820,15 @@ func TestCreateProviderKeySourceTable(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 				server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-				r, _ := openConnectionRuntime(t, store, server.URL)
-				defer closeProjectionRuntime(r)
+				r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+				defer closeRuntime()
 				ctx := context.Background()
-				sub, err := r.Subscribe(8)
-				testassert.NoError(t, err)
-				defer sub.Close()
 				row.arrange(t, r)
 
 				// Only the creates without a supplied key promise silence: the
 				// supplied-key rows write a value by design.
 				var envBefore []byte
+				var err error
 				if row.key == nil {
 					envBefore, err = os.ReadFile(r.managedEnv.Path())
 					testassert.NoError(t, err)
@@ -1942,12 +1859,9 @@ func TestCreateProviderKeySourceTable(t *testing.T) {
 func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		window := 4096
 		baseURL := "https://new.test/v1"
 
@@ -2031,12 +1945,9 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 func TestCreateProviderInvalidCandidateNoWrites(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_RESTORE_KEY")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
@@ -2061,12 +1972,9 @@ func TestCreateProviderInvalidCandidateNoWrites(t *testing.T) {
 func TestCreateProviderKeyFailureRestoresExactBytes(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_RESTORE_KEY")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
@@ -2095,12 +2003,9 @@ func TestCreateProviderKeyFailureRestoresExactBytes(t *testing.T) {
 func TestCreateProviderKeyFailureRestoresPriorAbsence(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_RESTORE_KEY")
 		_, generation, warnRev := runtimeMutationBaseline(t, r)
 		testassert.NoError(t, os.Remove(r.config.configPath))
@@ -2111,7 +2016,7 @@ func TestCreateProviderKeyFailureRestoresPriorAbsence(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		restoreEnv := "CONNECTION_RESTORE_KEY"
-		_, err = r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+		_, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "create with a failing key write = %v, want the typed failure", err)
 		{
@@ -2125,12 +2030,9 @@ func TestCreateProviderKeyFailureRestoresPriorAbsence(t *testing.T) {
 func TestCreateProviderKeyFailureJoinedRestoreError(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		reserveEnvKey(t, "CONNECTION_RESTORE_KEY")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
@@ -2155,7 +2057,7 @@ func TestCreateProviderKeyFailureJoinedRestoreError(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		restoreEnv := "CONNECTION_RESTORE_KEY"
-		_, err = r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+		_, err := r.addProvider(ctx, "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "create with a failing restore = %v, want the typed failure", err)
 		testassert.Require(t, strings.Contains(err.Error(), "persist API key") && strings.Contains(err.Error(), "restore"), "joined failure = %v, want the key failure and the restore failure joined", err)
@@ -2170,11 +2072,8 @@ func TestCreateProviderKeyFailureJoinedRestoreError(t *testing.T) {
 func TestCreateProviderRestoreDespiteCancellation(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		// Park the create write's own temp sync and cancel the caller: the
@@ -2201,7 +2100,7 @@ func TestCreateProviderRestoreDespiteCancellation(t *testing.T) {
 		cancel()
 		probe.park = false
 		probe.release <- struct{}{}
-		err = <-done
+		err := <-done
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "canceled create = %v, want the typed failure", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		after, rerr := os.ReadFile(r.config.configPath)
@@ -2214,12 +2113,9 @@ func TestCreateProviderRestoreDespiteCancellation(t *testing.T) {
 func TestDiscoverCustomProviderPureRead(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		_, generation, warnRev := runtimeMutationBaseline(t, r)
 		t.Setenv("CONNECTION_DISC_REQ_KEY", "request-key-value")
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
@@ -2302,12 +2198,9 @@ func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
 			}
 			return connectionEmptyDiscovery
 		})
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnv.Path())
 		testassert.NoError(t, err)
@@ -2411,12 +2304,9 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 			}
 			return `{"data":[{"id":"m","name":"Included","context_window":4096},{"id":"a","name":"A","context_window":0},{"id":"b","name":"B","context_window":8192,"cost":{"input":0.5}}]}`
 		})
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		t.Setenv("CONNECTION_USABLE_KEY", "usable-key-value")
 		_, generation, warnRev := runtimeMutationBaseline(t, r)
 		records, _ := catalog.ReadDiscoveryCache(r.config.loader.Home())
@@ -2501,18 +2391,16 @@ func TestCreateProviderNilManagedEnvTypedFailure(t *testing.T) {
 	sub, err := svc.obs.subscribe(32)
 	testassert.NoError(t, err)
 	defer sub.Close()
+	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 
 	key := "sk-live-nil-manager"
 	window := 4096
 	baseURL := "https://nil.test/v1"
 	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate("np", protocol.ProviderEdit{BaseUrl: &baseURL},
 		map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key))
-	testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration) && strings.Contains(err.Error(), "managed env is not initialized"), "nil-manager create = (%v, %+v), want the manager's typed failure", err, candidate)
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "managed env is not initialized"), "nil-manager create = (%v, %+v), want the manager's typed failure", err, candidate)
 	// The exact prior bytes were restored and nothing was published.
-	data, rerr := os.ReadFile(h.configPath)
-	testassert.Require(t, rerr == nil && strings.Contains(string(data), `"prov"`) && !strings.Contains(string(data), `"np"`), "nil-manager create left the file = (%q, %v)", data, rerr)
-	testassert.Equal(t, svc.current().generation, 1)
-	assertNoEvent(t, sub)
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 
 	// resolveConnectKey without a manager or key: the absent path decides.
 	{
@@ -2530,13 +2418,8 @@ func TestCreateProviderNilManagedEnvTypedFailure(t *testing.T) {
 		keyEnv:     "CONNECTION_NIL_MGR_KEY",
 		keyValue:   "sk-nil-manager-connect",
 	}))
-	testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration) && strings.Contains(err.Error(), "managed env is not initialized"), "nil-manager connect = %v, want the manager's typed failure", err)
-	testassert.Equal(t, svc.current().generation, 1)
-	{
-		data, rerr = os.ReadFile(h.configPath)
-		testassert.Require(t, rerr == nil && strings.Contains(string(data), `"prov"`), "nil-manager connect changed the file = (%q, %v)", data, rerr)
-	}
-	assertNoEvent(t, sub)
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "managed env is not initialized"), "nil-manager connect = %v, want the manager's typed failure", err)
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 }
 
 // --- full chain ---
@@ -2609,12 +2492,9 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 		)
 		t.Setenv("CONNECT_CHAIN_EXTERNAL", "sibling-value")
 		reserveEnvKey(t, "CONNECT_CHAIN_MANAGED")
-		writeServiceFile(t, e.configPath, `{
-  "providers": {
-    "prov": {"transport": {"base_url": "`+server.URL+`", "api_key_env": "PRODUCTION_TEST_KEY"}, "discovery": false, "models": {"m": {"name": "M", "context_window": 262144}}},
-    "discp": {"transport": {"base_url": "https://disc.test/v1", "api_key_env": "CONNECT_CHAIN_MANAGED"}, "discovery": false, "models": {"m": {"name": "M", "context_window": 4096}}}
-  }
-}`)
+		writeServiceFile(t, e.configPath, `{"providers":{`+
+			`"prov":`+nominalProvMember(server.URL, "PRODUCTION_TEST_KEY", false, `{"m":{"name":"M","context_window":262144}}`)+`,`+
+			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", false, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
 
 		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
@@ -2651,12 +2531,9 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		server := newConnectionDiscoveryServer(t, connectionFullDiscovery)
-		r, _ := openConnectionRuntime(t, store, server.URL)
-		defer closeProjectionRuntime(r)
+		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
+		defer closeRuntime()
 		ctx := context.Background()
-		sub, err := r.Subscribe(8)
-		testassert.NoError(t, err)
-		defer sub.Close()
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		// The keyless usable provider: no credential exists, none is needed,

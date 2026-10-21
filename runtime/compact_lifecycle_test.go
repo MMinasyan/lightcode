@@ -31,9 +31,9 @@ import (
 // and the compact model as a distinct catalog identity, so the wire
 // distinguishes the transports by model ID.
 func compactObservationConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{` +
-		`"m":{"name":"M","context_window":8192,"max_output_tokens":4096},` +
-		`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}}}}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"m":{"name":"M","context_window":8192,"max_output_tokens":4096},`+
+			`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}`) + `}}`
 }
 
 // compactObservationAgentsDocument selects the conversation model for the

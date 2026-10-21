@@ -33,7 +33,8 @@ import (
 // stays: the sweep rows that admit no model work never reach it, and the two
 // startup-probe rows below build their own local-endpoint document.
 func ownerSweepDocument(sessions string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"sessions":` + sessions + `}`
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false,
+		`{"m":{"name":"M","context_window":4096}}`) + `},"sessions":` + sessions + `}`
 }
 
 // ownerSweepProbedDocument builds the sweep fixture's local-endpoint document
@@ -41,7 +42,8 @@ func ownerSweepDocument(sessions string) string {
 // admission reaches the selected preparation hook and the local model server
 // instead of failing for absent metadata.
 func ownerSweepProbedDocument(endpoint, sessions string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
 }
 
 // ownerSweepAgentsDocument selects the local model and the preparation hook

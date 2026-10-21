@@ -189,9 +189,8 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	agentsPath := filepath.Join(h.dataDir, "agents.json")
-	writeServiceFile(t, agentsPath, `{"worker":{"system_prompt":"simple"}}`)
-	agentsBefore, err := os.ReadFile(agentsPath)
-	testassert.NoError(t, err)
+	writeServiceFile(t, agentsPath, workerAgentsDocument)
+	agentsBefore := mustRead(t, agentsPath)
 	svc, sub := metadataService(t, h)
 	unsetenv(t, "NEW_KEY")
 	// The fixture is a genuine credential consumer: the referenced env
@@ -199,22 +198,22 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	// result, or any read — the create stores the env NAME only.
 	t.Setenv("NEW_KEY", "sk-real-credential-98765")
 	window := 4096
-	cost := protocol.Cost{Input: &[]float64{1.5}[0]}
-	meta := protocol.ProtocolMetadata{Family: &[]string{"testfam"}[0]}
+	cost := protocol.Cost{Input: ptrTo(1.5)}
+	meta := protocol.ProtocolMetadata{Family: ptrTo("testfam")}
 	models := map[string]protocol.ModelEdit{
-		"m":          {Name: &[]string{"One"}[0], ContextWindow: &window, Cost: &cost},
-		"incomplete": {Name: &[]string{"I"}[0]},
+		"m":          {Name: ptrTo("One"), ContextWindow: &window, Cost: &cost},
+		"incomplete": {Name: ptrTo("I")},
 		"a/b":        {ContextWindow: &window},
 	}
 	patch := protocol.ProviderEdit{
-		Name:             &[]string{"Created"}[0],
-		BaseUrl:          &[]string{"https://new.test/v1"}[0],
-		ApiKeyEnv:        &[]string{"NEW_KEY"}[0],
+		Name:             ptrTo("Created"),
+		BaseUrl:          ptrTo("https://new.test/v1"),
+		ApiKeyEnv:        ptrTo("NEW_KEY"),
 		Headers:          &map[string]string{"X-Custom": "c"},
-		SystemRole:       &[]protocol.SystemRole{"user"}[0],
-		UsageInStream:    &[]bool{false}[0],
+		SystemRole:       ptrTo(protocol.SystemRole("user")),
+		UsageInStream:    ptrTo(false),
 		ExtraBody:        &map[string]any{"side": json.Number("9007199254740993")},
-		Discovery:        &[]bool{false}[0],
+		Discovery:        ptrTo(false),
 		ProtocolMetadata: &meta,
 	}
 	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(" new ", patch, models, nil))
@@ -232,8 +231,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 
 	// The raw file: the written members, an untouched unowned member, the
 	// untouched sibling's exact numeric lexeme, and no secret value anywhere.
-	data, err := os.ReadFile(h.configPath)
-	testassert.NoError(t, err)
+	data := mustRead(t, h.configPath)
 	var root map[string]json.RawMessage
 	testassert.NoError(t, json.Unmarshal(data, &root))
 	testassert.Equal(t, bigLexeme(t, data, "providers.other.models.o.context_window"), "9007199254740993")
@@ -248,8 +246,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(string(mutationBytes), "NEW_KEY") && !strings.Contains(string(mutationBytes), "sk-real-credential-98765"), "mutation result carries the wrong credential bytes: %s", mutationBytes)
 	testassert.Equal(t, bigLexeme(t, data, "providers.new.extra_body.side"), "9007199254740993")
-	agentsAfter, err := os.ReadFile(agentsPath)
-	testassert.Require(t, err == nil && string(agentsBefore) == string(agentsAfter), "the metadata edit changed the agents file (%v)", err)
+	testassert.Require(t, string(mustRead(t, agentsPath)) == string(agentsBefore), "the metadata edit changed the agents file")
 
 	// The provided empty headers map goes through the same wholesale writer
 	// as the update: the raw headers member stays absent, not an empty
@@ -258,7 +255,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	window2 := 1
 	{
 		_, err := svc.mutate(context.Background(), svc.editProviderCreate("noheaders",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://nh.test/v1"}[0], Headers: &emptyHeaders},
+			protocol.ProviderEdit{BaseUrl: ptrTo("https://nh.test/v1"), Headers: &emptyHeaders},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window2}}, nil))
 		testassert.NoError(t, err)
 	}
@@ -345,8 +342,8 @@ func TestMetadataEditCreateRegistersIncompleteMetadata(t *testing.T) {
 	}{
 		{"zero-window model", "incomplete", protocol.ProviderEdit{BaseUrl: &base}, zeroWindow},
 		{"empty models map", "nomodels", protocol.ProviderEdit{BaseUrl: &base}, empty},
-		{"occupied binding", "occupiedp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: &[]string{"OTHER_TEST_KEY"}[0]}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
-		{"absent binding", "missingp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: &[]string{"MISSING_PROBE_KEY"}[0]}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
+		{"occupied binding", "occupiedp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: ptrTo("OTHER_TEST_KEY")}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
+		{"absent binding", "missingp", protocol.ProviderEdit{BaseUrl: &base, ApiKeyEnv: ptrTo("MISSING_PROBE_KEY")}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
 		{"no binding member", "nobinding", protocol.ProviderEdit{BaseUrl: &base}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
@@ -393,8 +390,7 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 
 	// Pointer absence: an empty patch still publishes (identical bytes
 	// included) but changes no raw member.
-	unchanged, err := os.ReadFile(h.configPath)
-	testassert.NoError(t, err)
+	unchanged := mustRead(t, h.configPath)
 	candidate, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{}))
 	testassert.Require(t, err == nil && candidate.snapshot.generation == 2, "empty patch = (%v, generation %d), want a published edit at 2", err, candidate.snapshot.generation)
 	var beforeRoot, afterRoot map[string]json.RawMessage
@@ -422,16 +418,14 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	drainMutationEvent(t, sub, "3")
-	var prov struct {
-		Transport struct {
-			Headers map[string]string `json:"headers"`
-		} `json:"transport"`
-		ExtraBody *map[string]any `json:"extra_body"`
+	rawProvider := metadataRawProvider(t, h.configPath, "prov")
+	var headerProbe struct {
+		Headers map[string]string `json:"headers"`
 	}
-	var providersRoot map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(fileRoot(t, h.configPath)["providers"], &providersRoot))
-	testassert.NoError(t, json.Unmarshal(providersRoot["prov"], &prov))
-	testassert.Require(t, prov.ExtraBody != nil && len(*prov.ExtraBody) == 0 && prov.Transport.Headers["X-Trace"] == "t1", "extra_body = %v, want the provided empty object; headers = %v, want the absent member untouched", prov.ExtraBody, prov.Transport.Headers)
+	testassert.NoError(t, json.Unmarshal(rawProvider["transport"], &headerProbe))
+	var extraBody map[string]any
+	testassert.NoError(t, json.Unmarshal(rawProvider["extra_body"], &extraBody))
+	testassert.Require(t, extraBody != nil && len(extraBody) == 0 && headerProbe.Headers["X-Trace"] == "t1", "extra_body = %v, want the provided empty object; headers = %v, want the absent member untouched", extraBody, headerProbe.Headers)
 
 	// The headers exception: an empty provided object deletes the raw user
 	// headers member — the file, not merely the filtered GET.
@@ -441,7 +435,7 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	drainMutationEvent(t, sub, "4")
-	rawProvider := metadataRawProvider(t, h.configPath, "prov")
+	rawProvider = metadataRawProvider(t, h.configPath, "prov")
 	var transport map[string]json.RawMessage
 	testassert.NoError(t, json.Unmarshal(rawProvider["transport"], &transport))
 	{
@@ -563,19 +557,19 @@ func TestMetadataEditUpdateBuiltinProvider(t *testing.T) {
 		patch protocol.ProviderEdit
 		check func(*catalog.Provider)
 	}{
-		{"name", protocol.ProviderEdit{Name: &[]string{"Renamed"}[0]}, func(p *catalog.Provider) {
+		{"name", protocol.ProviderEdit{Name: ptrTo("Renamed")}, func(p *catalog.Provider) {
 			testassert.Equal(t, p.Name, "Renamed")
 		}},
-		{"base_url", protocol.ProviderEdit{BaseUrl: &[]string{"https://override.test/v1"}[0]}, func(p *catalog.Provider) {
+		{"base_url", protocol.ProviderEdit{BaseUrl: ptrTo("https://override.test/v1")}, func(p *catalog.Provider) {
 			testassert.Equal(t, p.Transport.BaseURL, "https://override.test/v1")
 		}},
-		{"system_role", protocol.ProviderEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(p *catalog.Provider) {
+		{"system_role", protocol.ProviderEdit{SystemRole: ptrTo(protocol.SystemRole("user"))}, func(p *catalog.Provider) {
 			testassert.Require(t, p.SystemRole == catalog.SystemRole("user"), "builtin system_role = %q, want the override", p.SystemRole)
 		}},
-		{"usage_in_stream", protocol.ProviderEdit{UsageInStream: &[]bool{false}[0]}, func(p *catalog.Provider) {
+		{"usage_in_stream", protocol.ProviderEdit{UsageInStream: ptrTo(false)}, func(p *catalog.Provider) {
 			testassert.Require(t, !p.UsageInStream, "builtin usage_in_stream = true, want the override")
 		}},
-		{"protocol_metadata", protocol.ProviderEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(p *catalog.Provider) {
+		{"protocol_metadata", protocol.ProviderEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: ptrTo("fam")}}, func(p *catalog.Provider) {
 			testassert.Require(t, p.ProtocolMetadata != nil && p.ProtocolMetadata.Family == "fam", "builtin protocol_metadata = %+v, want the override", p.ProtocolMetadata)
 		}},
 	} {
@@ -703,11 +697,11 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 	{
 		_, err := svc.mutate(context.Background(), svc.editProviderCreate("temp",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://temp.test/v1"}[0]}, valid, nil))
+			protocol.ProviderEdit{BaseUrl: ptrTo("https://temp.test/v1")}, valid, nil))
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, svc.warnings, sub, "5")
-	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"custom_flag":true}`
+	external := `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "META_TEST_KEY", false, `{"m":{"name":"M","context_window":4096}}`) + `},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
 	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("temp"))
 	testassert.Require(t, err == nil && candidate.snapshot.generation == 6, "externally-removed delete = (%v, generation %d), want a publication at 6", err, candidate.snapshot.generation)
@@ -742,7 +736,7 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 	extra := map[string]any{"x": 1}
 	stream := false
 	role := protocol.SystemRole("developer")
-	meta := protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}
+	meta := protocol.ProtocolMetadata{Family: ptrTo("fam")}
 	discovery := false
 	hidden := true
 	{
@@ -911,19 +905,19 @@ func TestMetadataEditModelUpsert(t *testing.T) {
 		patch protocol.ModelEdit
 		check func(*catalog.Model)
 	}{
-		{"name", protocol.ModelEdit{Name: &[]string{"Renamed"}[0]}, func(m *catalog.Model) {
+		{"name", protocol.ModelEdit{Name: ptrTo("Renamed")}, func(m *catalog.Model) {
 			testassert.Equal(t, m.Name, "Renamed")
 		}},
-		{"system_role", protocol.ModelEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(m *catalog.Model) {
+		{"system_role", protocol.ModelEdit{SystemRole: ptrTo(protocol.SystemRole("user"))}, func(m *catalog.Model) {
 			testassert.Require(t, m.SystemRole == catalog.SystemRole("user"), "bundled model system_role = %q, want the override", m.SystemRole)
 		}},
-		{"usage_in_stream", protocol.ModelEdit{UsageInStream: &[]bool{false}[0]}, func(m *catalog.Model) {
+		{"usage_in_stream", protocol.ModelEdit{UsageInStream: ptrTo(false)}, func(m *catalog.Model) {
 			testassert.Require(t, !m.UsageInStream, "bundled model usage_in_stream = true, want the override")
 		}},
 		{"input_modalities", protocol.ModelEdit{InputModalities: &[]protocol.InputModality{"text"}}, func(m *catalog.Model) {
 			testassert.Require(t, len(m.InputModalities) == 1 && m.InputModalities[0] == catalog.Modality("text"), "bundled model modalities = %v, want the override", m.InputModalities)
 		}},
-		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(m *catalog.Model) {
+		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: ptrTo("fam")}}, func(m *catalog.Model) {
 			testassert.Require(t, m.ProtocolMetadata != nil && m.ProtocolMetadata.Family == "fam", "bundled model protocol_metadata = %+v, want the override", m.ProtocolMetadata)
 		}},
 	} {
@@ -1057,19 +1051,19 @@ func TestMetadataEditModelDelete(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, svc.warnings, sub, "4")
-	root := fileRoot(t, h.configPath)
-	var rawProviders map[string]map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(root["providers"], &rawProviders))
+	rawProv := metadataRawProvider(t, h.configPath, "prov")
 	var models map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(rawProviders["prov"]["models"], &models))
+	testassert.NoError(t, json.Unmarshal(rawProv["models"], &models))
 	{
 		_, present := models["wide"]
-		testassert.Require(t, !present, "raw models = %s, want the deleted entry gone", rawProviders["prov"]["models"])
+		testassert.Require(t, !present, "raw models = %s, want the deleted entry gone", rawProv["models"])
 	}
 	{
 		_, present := models["m"]
 		testassert.Require(t, present, "the delete touched an unrelated model")
 	}
+	var rawProviders map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(fileRoot(t, h.configPath)["providers"], &rawProviders))
 	{
 		_, present := rawProviders["other"]
 		testassert.Require(t, present, "the delete touched an unrelated provider")
@@ -1114,10 +1108,10 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 	maxOut := 55
 	stream := true
 	extra := map[string]any{"x": 1}
-	cost := protocol.Cost{Input: &[]float64{2.5}[0]}
+	cost := protocol.Cost{Input: ptrTo(2.5)}
 	role := protocol.SystemRole("user")
 	modalities := []protocol.InputModality{"text", "image"}
-	meta := protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}
+	meta := protocol.ProtocolMetadata{Family: ptrTo("fam")}
 	{
 		_, err := svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{
 			Name: &name, MaxOutputTokens: &maxOut, UsageInStream: &stream, ExtraBody: &extra,
@@ -1242,19 +1236,19 @@ func TestMetadataEditDiscoveredModelSource(t *testing.T) {
 		patch protocol.ModelEdit
 		check func(*catalog.Model)
 	}{
-		{"name", protocol.ModelEdit{Name: &[]string{"Renamed"}[0]}, func(m *catalog.Model) {
+		{"name", protocol.ModelEdit{Name: ptrTo("Renamed")}, func(m *catalog.Model) {
 			testassert.Equal(t, m.Name, "Renamed")
 		}},
-		{"system_role", protocol.ModelEdit{SystemRole: &[]protocol.SystemRole{"user"}[0]}, func(m *catalog.Model) {
+		{"system_role", protocol.ModelEdit{SystemRole: ptrTo(protocol.SystemRole("user"))}, func(m *catalog.Model) {
 			testassert.Require(t, m.SystemRole == catalog.SystemRole("user"), "discovered model system_role = %q, want the override", m.SystemRole)
 		}},
-		{"usage_in_stream", protocol.ModelEdit{UsageInStream: &[]bool{false}[0]}, func(m *catalog.Model) {
+		{"usage_in_stream", protocol.ModelEdit{UsageInStream: ptrTo(false)}, func(m *catalog.Model) {
 			testassert.Require(t, !m.UsageInStream, "discovered model usage_in_stream = true, want the override")
 		}},
 		{"input_modalities", protocol.ModelEdit{InputModalities: &[]protocol.InputModality{"text"}}, func(m *catalog.Model) {
 			testassert.Require(t, len(m.InputModalities) == 1 && m.InputModalities[0] == catalog.Modality("text"), "discovered model modalities = %v, want the override", m.InputModalities)
 		}},
-		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}}, func(m *catalog.Model) {
+		{"protocol_metadata", protocol.ModelEdit{ProtocolMetadata: &protocol.ProtocolMetadata{Family: ptrTo("fam")}}, func(m *catalog.Model) {
 			testassert.Require(t, m.ProtocolMetadata != nil && m.ProtocolMetadata.Family == "fam", "discovered model protocol_metadata = %+v, want the override", m.ProtocolMetadata)
 		}},
 	} {
@@ -1309,7 +1303,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 
 		// The create: the projected result is the new provider view.
 		mutation, err := r.addProvider(ctx, "newp",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://new.test/v1"}[0]}, models, nil)
+			protocol.ProviderEdit{BaseUrl: ptrTo("https://new.test/v1")}, models, nil)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		testassert.Require(t, mutation.Result.Id == "newp" && !mutation.Result.Builtin && len(mutation.Result.Models) == 1 && mutation.Result.Models[0].Source == protocol.ModelSource("user"), "created result = %+v, want the newp provider view with its user model", mutation.Result)
 		drainMutationEventWithWarning(t, sub, "2", r.warnings)
@@ -1333,7 +1327,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 
 		// The hidden reset removes its own override.
 		{
-			_, err := r.updateProvider(ctx, "prov", protocol.ProviderEdit{Hidden: &[]bool{true}[0]})
+			_, err := r.updateProvider(ctx, "prov", protocol.ProviderEdit{Hidden: ptrTo(true)})
 			testassert.NoError(t, err)
 		}
 		drainMutationEvent(t, sub, "6")
@@ -1349,7 +1343,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 			want error
 		}{
 			{"duplicate create", func() error {
-				_, err := r.addProvider(ctx, "prov", protocol.ProviderEdit{BaseUrl: &[]string{"https://x.test/v1"}[0]}, models, nil)
+				_, err := r.addProvider(ctx, "prov", protocol.ProviderEdit{BaseUrl: ptrTo("https://x.test/v1")}, models, nil)
 				return err
 			}, harness.ErrInvalid},
 			{"unknown delete", func() error {
@@ -1509,14 +1503,14 @@ func TestMetadataEditModelPatchPreservesUnsuppliedValues(t *testing.T) {
 
 	// Seed the user model with every meaningful writable member.
 	name := "M2"
-	cost := protocol.Cost{Input: &[]float64{2.5}[0]}
+	cost := protocol.Cost{Input: ptrTo(2.5)}
 	extra := map[string]any{"x": 1}
-	meta := protocol.ProtocolMetadata{Family: &[]string{"fam"}[0]}
+	meta := protocol.ProtocolMetadata{Family: ptrTo("fam")}
 	stream := true
 	hidden := true
 	{
 		_, err := svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{
-			Name: &name, ContextWindow: &[]int{4096}[0], MaxOutputTokens: &[]int{100}[0],
+			Name: &name, ContextWindow: ptrTo(4096), MaxOutputTokens: ptrTo(100),
 			Cost: &cost, ExtraBody: &extra, ProtocolMetadata: &meta, UsageInStream: &stream, Hidden: &hidden,
 		}))
 		testassert.NoError(t, err)
@@ -1557,13 +1551,13 @@ func TestMetadataEditModelPatchPreservesUnsuppliedValues(t *testing.T) {
 	// override members and the bundled defaults of the unsupplied ones.
 	{
 		_, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{
-			ContextWindow: &[]int{2000}[0], MaxOutputTokens: &[]int{50}[0], Cost: &cost, ExtraBody: &extra, Hidden: &hidden,
+			ContextWindow: ptrTo(2000), MaxOutputTokens: ptrTo(50), Cost: &cost, ExtraBody: &extra, Hidden: &hidden,
 		}))
 		testassert.NoError(t, err)
 	}
 	drainMutationEvent(t, sub, "5")
 	{
-		_, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{MaxOutputTokens: &[]int{60}[0]}))
+		_, err := svc.mutate(context.Background(), svc.editModelSave("bstatic", "bm", protocol.ModelEdit{MaxOutputTokens: ptrTo(60)}))
 		testassert.NoError(t, err)
 	}
 	drainMutationEvent(t, sub, "6")
@@ -1575,13 +1569,13 @@ func TestMetadataEditModelPatchPreservesUnsuppliedValues(t *testing.T) {
 	seedDiscoveredModel(t, h)
 	{
 		_, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{
-			MaxOutputTokens: &[]int{100}[0], Cost: &cost, ExtraBody: &extra, Hidden: &hidden,
+			MaxOutputTokens: ptrTo(100), Cost: &cost, ExtraBody: &extra, Hidden: &hidden,
 		}))
 		testassert.NoError(t, err)
 	}
 	drainMutationEvent(t, sub, "7")
 	{
-		_, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{Cost: &protocol.Cost{Output: &[]float64{3}[0]}}))
+		_, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{Cost: &protocol.Cost{Output: ptrTo(3.0)}}))
 		testassert.NoError(t, err)
 	}
 	entry = svc.current().catalog.Providers["disco"].Models["disc-model"]
@@ -1664,7 +1658,7 @@ func TestMetadataEditHiddenVisibility(t *testing.T) {
 	// An absent hidden member leaves the written value untouched (the patch
 	// rule, not a visibility setter).
 	{
-		_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{Name: &[]string{"Renamed"}[0]}))
+		_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{Name: ptrTo("Renamed")}))
 		testassert.NoError(t, err)
 	}
 	generation++
@@ -1703,7 +1697,7 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 
 		// The connected keyless custom provider: its model is visible.
 		mutation, err := r.addProvider(ctx, "keyless2",
-			protocol.ProviderEdit{BaseUrl: &[]string{"https://k2.test/v1"}[0]}, models, nil)
+			protocol.ProviderEdit{BaseUrl: ptrTo("https://k2.test/v1")}, models, nil)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		visible, err := r.listModels(ctx, protocol.ListModelsParams{})
 		testassert.Require(t, err == nil && modelListHas(visible, "keyless2", "m"), "visible picker = %+v (%v), want the connected keyless model", visible, err)
@@ -1781,7 +1775,7 @@ func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 				window := 1
 				models := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 
-				mutation, err := r.addProvider(ctx, id, protocol.ProviderEdit{BaseUrl: &[]string{"https://id.test/v1"}[0]}, models, nil)
+				mutation, err := r.addProvider(ctx, id, protocol.ProviderEdit{BaseUrl: ptrTo("https://id.test/v1")}, models, nil)
 				testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Id == id, "addProvider(%q) = (%v, %+v), want the exact ID at generation 2", id, err, mutation.Result)
 				{
 					_, present := metadataRawProvider(t, e.configPath, id)["transport"]
@@ -2142,11 +2136,11 @@ func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 		fileDoc  func(doc string) string
 		rawProbe string
 	}{
-		{"padded api_key_env", protocol.ProviderEdit{ApiKeyEnv: &[]string{"  NEW_TEST_KEY  "}[0]},
+		{"padded api_key_env", protocol.ProviderEdit{ApiKeyEnv: ptrTo("  NEW_TEST_KEY  ")},
 			func(doc string) string {
 				return strings.Replace(doc, `"api_key_env": "META_TEST_KEY"`, `"api_key_env": "  NEW_TEST_KEY  "`, 1)
 			}, `"api_key_env": "  NEW_TEST_KEY  "`},
-		{"padded system_role", protocol.ProviderEdit{SystemRole: &[]protocol.SystemRole{"  developer  "}[0]},
+		{"padded system_role", protocol.ProviderEdit{SystemRole: ptrTo(protocol.SystemRole("  developer  "))},
 			func(doc string) string {
 				return strings.Replace(doc, `"prov": {`, `"prov": {"system_role": "  developer  ",`, 1)
 			}, `"system_role": "  developer  "`},
@@ -2174,8 +2168,8 @@ func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 			testassert.NoError(t, err)
 			testassert.Require(t, viaFile.snapshot.catalog.Providers["prov"] == nil, "the padded %s became effective through the file path", row.name)
 			{
-				data, rerr := os.ReadFile(h.configPath)
-				testassert.Require(t, rerr == nil && strings.Contains(string(data), row.rawProbe), "the raw file = (%q, %v), want the padded value retained", data, rerr)
+				data := mustRead(t, h.configPath)
+				testassert.Require(t, strings.Contains(string(data), row.rawProbe), "the raw file = %q, want the padded value retained", data)
 			}
 		})
 	}
@@ -2208,8 +2202,8 @@ func TestMetadataEditRetiredProviderControlsFollowUnknownFieldPolicy(t *testing.
 			warnings := viaFile.snapshot.catalogWarnings
 			testassert.Require(t, len(warnings) != 0 && warnings[0].Kind == "user_config_skip" && warnings[0].Provider == "prov", "catalog warnings = %#v, want the shared user_config_skip drop", warnings)
 			{
-				data, rerr := os.ReadFile(h.configPath)
-				testassert.Require(t, rerr == nil && strings.Contains(string(data), row.rawProbe), "the raw file = (%q, %v), want the retired member retained", data, rerr)
+				data := mustRead(t, h.configPath)
+				testassert.Require(t, strings.Contains(string(data), row.rawProbe), "the raw file = %q, want the retired member retained", data)
 			}
 		})
 	}
@@ -2388,7 +2382,7 @@ func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
 			patch protocol.ProviderEdit
 			check func(protocol.ProviderMutation)
 		}{
-			{"disconnected api_key_env", protocol.ProviderEdit{ApiKeyEnv: &[]string{"NEW_BUILTIN_TEST_KEY"}[0]},
+			{"disconnected api_key_env", protocol.ProviderEdit{ApiKeyEnv: ptrTo("NEW_BUILTIN_TEST_KEY")},
 				func(m protocol.ProviderMutation) {
 					testassert.Require(t, m.Result.ApiKeyEnv == "NEW_BUILTIN_TEST_KEY" && !m.Result.Connected, "builtin env patch result = %+v, want the new name while disconnected", m.Result)
 					if !strings.Contains(string(metadataRawProvider(t, e.configPath, "openrouter")["transport"]), `"NEW_BUILTIN_TEST_KEY"`) {
@@ -2402,11 +2396,11 @@ func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
 						testassert.Require(t, got["provider_hint"] == "x", "builtin extra_body result = %v, want the written member", got)
 					}
 				}},
-			{"discovery false", protocol.ProviderEdit{Discovery: &[]bool{false}[0]},
+			{"discovery false", protocol.ProviderEdit{Discovery: ptrTo(false)},
 				func(m protocol.ProviderMutation) {
 					testassert.Require(t, !m.Result.Discovery, "builtin discovery result = true, want false")
 				}},
-			{"discovery true", protocol.ProviderEdit{Discovery: &[]bool{true}[0]},
+			{"discovery true", protocol.ProviderEdit{Discovery: ptrTo(true)},
 				func(m protocol.ProviderMutation) {
 					testassert.Require(t, m.Result.Discovery, "builtin discovery result = false, want true")
 				}},
