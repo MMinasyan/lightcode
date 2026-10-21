@@ -27,10 +27,15 @@ const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 // and client.
 const oapiRuntimePkg = "github.com/oapi-codegen/runtime"
 
-// kinOpenAPIPkg is the one third-party dependency the private protocol build
-// command permits: the pinned schema loader that derives the native operation
-// bindings and their invocation contract from the committed schema.
-const kinOpenAPIPkg = "github.com/getkin/kin-openapi/openapi3"
+// The private protocol build command's third-party dependencies: the pinned
+// schema loader and SDK generator, plus the configuration loader for the
+// generator's YAML configuration. No other package of those modules is
+// permitted.
+const (
+	kinOpenAPIPkg = "github.com/getkin/kin-openapi/openapi3"
+	codegenPkg    = "github.com/oapi-codegen/oapi-codegen/v2/pkg/codegen"
+	yamlConfigPkg = "gopkg.in/yaml.v3"
+)
 
 // retiredPackageRoots is the one uniform rejection rule for the retired legacy
 // package roots selected by this modernization: no tracked production file may
@@ -303,8 +308,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/clientops imports "+imp+"; the shared typed invocation helper may import only the standard library, "+clientPkg+", and "+protocolPkg)
 			}
 		case "internal/protocolgen":
-			if imp != kinOpenAPIPkg && !std[imp] {
-				problems = append(problems, rel+": internal/protocolgen imports "+imp+"; the private protocol build command may import only the standard library and "+kinOpenAPIPkg)
+			if imp != kinOpenAPIPkg && imp != codegenPkg && imp != yamlConfigPkg && !std[imp] {
+				problems = append(problems, rel+": internal/protocolgen imports "+imp+"; the private protocol build command may import only the standard library, "+kinOpenAPIPkg+", "+codegenPkg+", and "+yamlConfigPkg)
 			}
 		case "internal/acpclient":
 			if imp != clientPkg && imp != protocolPkg && imp != clienthostPkg && imp != clientopsPkg && imp != versionPkg && !std[imp] {
@@ -837,16 +842,17 @@ func TestDependencyRulesClientViewIsolation(t *testing.T) {
 }
 
 // TestDependencyRulesProtocolGenIsolation enforces the private protocol build
-// command's exact allowlist: the standard library and the pinned schema loader
-// only. The foundation, the Runtime, the target clients and the generated
-// contracts are its nearest forbidden siblings, and another subpackage of the
-// same loader module is not an allowed edge either.
+// command's exact allowlist: the standard library, the pinned schema loader,
+// the pinned SDK generator and the generator's YAML configuration loader. The
+// foundation, the Runtime, the target clients and the generated contracts are
+// its nearest forbidden siblings, and another subpackage of either schema
+// module is not an allowed edge either.
 func TestDependencyRulesProtocolGenIsolation(t *testing.T) {
 	std := standardLibraryImports(t)
 	{
 		problems := checkTrackedGoFile("internal/protocolgen/x.go", []string{
-			"context", "encoding/json", "flag", "fmt", "go/format", "os", "sort", "strconv", "strings", "text/template",
-			kinOpenAPIPkg,
+			"bytes", "context", "encoding/json", "flag", "fmt", "go/format", "go/token", "os", "sort", "strconv", "strings", "text/template",
+			kinOpenAPIPkg, codegenPkg, yamlConfigPkg,
 		}, std)
 		testassert.Check(t, len(problems) == 0, "allowed internal/protocolgen imports flagged: %v", problems)
 	}
@@ -860,6 +866,7 @@ func TestDependencyRulesProtocolGenIsolation(t *testing.T) {
 		publicModule + "/internal/acpclient", publicModule + "/internal/cliclient",
 		publicModule + "/client", publicModule + "/protocol",
 		oapiRuntimePkg, "github.com/getkin/kin-openapi/openapi3filter",
+		"github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen",
 	} {
 		{
 			problems := checkTrackedGoFile("internal/protocolgen/x.go", []string{imp}, std)
