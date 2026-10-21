@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,59 +23,13 @@ import (
 
 var compactModelRef = model.ModelRef{Provider: "cprov", Model: "compact-x"}
 
-// compactManualFixture wires one Harness whose conversation and compact
-// transports are separate scripted models over the same prepared capture,
-// with the fixture's preparation hook available for gating.
-type compactManualFixture struct {
-	h           *harness.Harness
-	store       harness.Storage
-	cancel      context.CancelFunc
-	prepMu      sync.Mutex
-	preps       []harness.PreparationRequest
-	prepareHook func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error)
-	defaultPrep harness.PreparedExecution
-}
-
+// compactManualCapture is the manual compaction fixture's capture: the
+// conversation capture with the compact model identity.
 func compactManualCapture() harness.ExecutionCapture {
 	capture := publicCapture()
 	capture.Compact.Model = compactModelRef
 	return capture
 }
-
-func newCompactManualFixture(t *testing.T, store harness.Storage, conversation, compact *scriptModel) *compactManualFixture {
-	t.Helper()
-	f := &compactManualFixture{store: store, cancel: func() {}}
-	f.defaultPrep = harness.PreparedExecution{
-		Capture: compactManualCapture(),
-		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return publicExecution(conversation.effect, compact.effect), nil
-		},
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	f.cancel = cancel
-	h, err := harness.New(ctx, harness.Dependencies{Storage: store, Prepare: func(_ context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
-		f.prepMu.Lock()
-		call := len(f.preps)
-		f.preps = append(f.preps, req)
-		hook := f.prepareHook
-		f.prepMu.Unlock()
-		if hook != nil {
-			return hook(call, req)
-		}
-		return f.defaultPrep, nil
-	}})
-	testassert.NoError(t, err)
-	f.h = h
-	return f
-}
-
-func (f *compactManualFixture) preparationCalls() []harness.PreparationRequest {
-	f.prepMu.Lock()
-	defer f.prepMu.Unlock()
-	return append([]harness.PreparationRequest(nil), f.preps...)
-}
-
-func (f *compactManualFixture) close() { f.cancel() }
 
 // summaryTurnStream assembles to one completed output carrying the given
 // summary text and reported usage.
@@ -106,18 +59,19 @@ func compactionEntryIDs(t *testing.T, store harness.Storage, sessionID string) [
 	return ids
 }
 
-// entryKindsByOperation returns the entry kinds owned by one Operation.
+// entryKindsByOperation returns the entry kinds owned by one Operation
+// through the shared entry-kind selection.
 func entryKindsByOperation(t *testing.T, store harness.Storage, sessionID, operationID string) []harness.EntryKind {
 	t.Helper()
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
 	testassert.NoError(t, err)
-	var kinds []harness.EntryKind
+	owned := make([]harness.Entry, 0, len(entries))
 	for _, entry := range entries {
 		if entry.OperationID == operationID {
-			kinds = append(kinds, entry.Kind)
+			owned = append(owned, entry)
 		}
 	}
-	return kinds
+	return kindsOf(owned)
 }
 
 // settlementPayloadOf returns the one settlement entry payload of the given
@@ -139,7 +93,7 @@ func settlementPayloadOf(t *testing.T, store harness.Storage, sessionID, operati
 
 // idleHistory runs one completed conversation turn so the Session carries
 // compactable history and is idle again.
-func idleHistory(t *testing.T, f *compactManualFixture, session string) {
+func idleHistory(t *testing.T, f *publicFixture, session string) {
 	t.Helper()
 	res, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
 	testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted, "submit = %+v err %v, want admitted", res, err)
@@ -258,7 +212,8 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
 		gated := &compactCommitGateStore{Storage: store, started: make(chan struct{}, 1), release: make(chan struct{})}
-		f := newCompactManualFixture(t, gated, conversation, compact)
+		f := newPublicFixtureWithJobs(t, gated, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -352,13 +307,8 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		// The summary usage landed keyed by the compact model.
 		view, err := f.h.ReadSessionView(context.Background(), session)
 		testassert.NoError(t, err)
-		found := false
-		for _, mu := range view.TotalUsage.ByModel {
-			if mu.Model == compactModelRef {
-				found = mu.Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5})
-			}
-		}
-		testassert.Require(t, found, "session usage = %+v, want the summary counts keyed by the compact model", view.TotalUsage)
+		pieces := usageByModel(view.TotalUsage, compactModelRef)
+		testassert.Require(t, len(pieces.ByModel) == 1 && pieces.ByModel[0].Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "session usage = %+v, want the summary counts keyed by the compact model", view.TotalUsage)
 		// The compact preparation carried the compact request kind while the
 		// conversation turn's preparation carried the message kind.
 		preps := f.preparationCalls()
@@ -413,7 +363,8 @@ func TestPublicManualCompactRejectsNonIdle(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 
@@ -488,7 +439,8 @@ func TestPublicManualCompactSnapshotShape(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"), summaryAttempt("S2"), summaryAttempt("S3"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -534,7 +486,8 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 
@@ -598,7 +551,8 @@ func TestPublicManualCompactFailedSummaryMarkerSurvivesReload(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(publicAttempt{stream: publicPartialTurnStream()})
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -613,7 +567,8 @@ func TestPublicManualCompactFailedSummaryMarkerSurvivesReload(t *testing.T) {
 		// The cold reload first: a fresh Harness over the same store
 		// cold-loads the Session graph from storage; the same value the warm
 		// live graph returns must survive the durable round-trip.
-		cold := newCompactManualFixture(t, store, newScriptModel(publicTurn()), newScriptModel(publicTurn()))
+		cold := newPublicFixtureWithJobs(t, store, nil, newScriptModel(publicTurn()), nil, newScriptModel(publicTurn()).effect)
+		cold.defaultPrep.Capture = compactManualCapture()
 		defer cold.close()
 		view, err := cold.h.ReadSessionView(context.Background(), session)
 		testassert.NoError(t, err)
@@ -637,7 +592,8 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -702,7 +658,8 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 		ctx := context.Background()
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("S1"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)

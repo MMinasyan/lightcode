@@ -497,7 +497,8 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		ctx := context.Background()
 		conversation := newScriptModel(publicTurn())
 		compact := newScriptModel(summaryAttempt("Summary."))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		session := createSession(t, f.h)
 		{
@@ -919,7 +920,7 @@ func backgroundPrepared(gate, arrived chan struct{}) harness.PreparedExecution {
 // on the later gate; every model invocation signals arrived.
 func gatedBackgroundFixture(t *testing.T, store harness.Storage, stopper harness.JobStopper, script *scriptModel, first, later, arrived chan struct{}) *publicFixture {
 	t.Helper()
-	f := newPublicFixtureWithJobs(t, store, stopper, script, nil)
+	f := newPublicFixtureWithJobs(t, store, stopper, script, nil, nil)
 	calls := 0
 	f.prepareHook = func(_ int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 		calls++
@@ -1329,7 +1330,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		)
 		parkEntered := make(chan struct{})
 		parkRelease := make(chan struct{})
-		f := newPublicFixtureWithJobs(t, store, snapshotJobStopper{}, script, nil)
+		f := newPublicFixtureWithJobs(t, store, snapshotJobStopper{}, script, nil, nil)
 		f.prepareHook = func(call int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 			capture := publicCapture()
 			capture.Capabilities = []string{"cap.a", "cap.b"}

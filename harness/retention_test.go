@@ -30,6 +30,20 @@ import (
 // across the release window; a lease a fixture does hold is explicit and is
 // released by the fixture itself.
 
+// assertMemberCount reports one coordinator's live member count: the count is
+// read under the coordinator's own mutex and reported after the mutex is
+// released, and the helper neither acquires a graph use nor reads storage.
+func assertMemberCount(t *testing.T, c *coordinator, want int) {
+	t.Helper()
+	c.mu.Lock()
+	members := 0
+	if c.group != nil {
+		members = len(c.group.members)
+	}
+	c.mu.Unlock()
+	testassert.Equal(t, members, want)
+}
+
 // TestFinalReleaseLeavesNoIdleGraph proves the rule and the survival of every
 // local fact: a released graph is gone while its cell, local revisions,
 // groups, and buffers stay, and the graphless cell remains fully usable
@@ -150,13 +164,7 @@ func TestFinalReleaseLeavesNoIdleGraph(t *testing.T) {
 		got := runtimeInputTextRaw(t, store, subject)
 		testassert.Equal(t, got, "job done")
 	}
-	subjectC.mu.Lock()
-	remaining := 0
-	if subjectC.group != nil {
-		remaining = len(subjectC.group.members)
-	}
-	subjectC.mu.Unlock()
-	testassert.Equal(t, remaining, 0)
+	assertMemberCount(t, subjectC, 0)
 	deadline := time.Now().Add(10 * time.Second) // the delivered execution's own pin ends asynchronously
 	for {
 		subjectC.mu.Lock()
@@ -328,14 +336,7 @@ func TestStopAllExcludesNeverLoadedLatchedCells(t *testing.T) {
 	survived := h.sessions[testSessionID] == latchedCell && latchedCell.corru != nil
 	h.mu.Unlock()
 	testassert.Require(t, survived, "StopAll dropped the latched never-loaded cell")
-	rootCell := cachedCoordinator(t, h, root)
-	rootCell.mu.Lock()
-	members := 0
-	if rootCell.group != nil {
-		members = len(rootCell.group.members)
-	}
-	rootCell.mu.Unlock()
-	testassert.Equal(t, members, 0)
+	assertMemberCount(t, cachedCoordinator(t, h, root), 0)
 }
 
 // cancelledReadStore makes the private fake storage honor a canceled context
@@ -455,13 +456,7 @@ func TestCancelledMemberFinishSettlesTheChildCompletion(t *testing.T) {
 			childSignals := storedSignals(t, store, completionChildID)
 			testassert.Require(t, len(childSignals) == 1 && childSignals[0].Content == "job done", "child signals = %+v, want the job's own completion record", childSignals)
 		}
-		f.parent.mu.Lock()
-		remaining := 0
-		if f.parent.group != nil {
-			remaining = len(f.parent.group.members)
-		}
-		f.parent.mu.Unlock()
-		testassert.Equal(t, remaining, 0)
+		assertMemberCount(t, f.parent, 0)
 		f.child.mu.Lock()
 		pending := f.child.pendingCompletion
 		f.child.mu.Unlock()
@@ -856,11 +851,5 @@ func TestChildCompletionRendersThroughAGraphlessChild(t *testing.T) {
 		got := runtimeInputTextRaw(t, store, completionParentID)
 		testassert.Equal(t, got, "child text")
 	}
-	parent.mu.Lock()
-	remaining := 0
-	if parent.group != nil {
-		remaining = len(parent.group.members)
-	}
-	parent.mu.Unlock()
-	testassert.Equal(t, remaining, 0)
+	assertMemberCount(t, parent, 0)
 }

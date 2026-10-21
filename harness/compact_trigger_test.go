@@ -57,15 +57,6 @@ func triggerUsageCapture(threshold int64) ExecutionCapture {
 	return capture
 }
 
-// invokeTriggerEffect drives one model effect with the given request through
-// the real Agent assembly.
-func invokeTriggerEffect(t *testing.T, me agent.ModelEffect, req model.Request) (agent.ModelSettlement, error) {
-	t.Helper()
-	return me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-		return agent.Assemble(context.Background(), source, stream)
-	})
-}
-
 // seedConversationUsage runs one ordinary conversation model effect whose
 // completed output reports the given usage: the committed assistant entry is
 // the provider measurement the trigger consumes. The seed effect runs over the
@@ -81,7 +72,7 @@ func seedConversationUsage(t *testing.T, h *Harness, c *coordinator, capture Exe
 	}
 	exec := Execution{Model: modelFn, CompactModel: forbiddenConversationModel(t), NormalizeTool: objectNormalize}
 	{
-		set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c), nil)
 		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "seed turn settlement = %+v, err %v, want ready", set, err)
 	}
 }
@@ -111,7 +102,7 @@ func TestModelEffectCompactTriggerReportedUsageCompacts(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	req := projectedTriggerRequest(t, h, c)
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Equal(t, compactCalls, 1)
@@ -142,7 +133,7 @@ func TestModelEffectCompactTriggerNoReportNeverCompacts(t *testing.T) {
 		},
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Equal(t, compactCalls, 0)
@@ -175,7 +166,7 @@ func TestModelEffectCompactTriggerFittingRequestUntouched(t *testing.T) {
 				CompactModel:  forbiddenConversationModel(t),
 				NormalizeTool: objectNormalize,
 			}
-			set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+			set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 			testassert.NoError(t, err)
 			testassert.Equal(t, set.Disposition, agent.DispoReady)
 			testassert.Equal(t, len(sent), 1)
@@ -214,7 +205,7 @@ func TestModelEffectCompactTriggerPresentZeroWithReserveOverWindowCompacts(t *te
 		},
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Require(t, compactCalls == 1 && conversationCalls == 1, "compact/conversation transport calls = %d/%d, want 1/1 for the overflowing zero report", compactCalls, conversationCalls)
@@ -242,7 +233,7 @@ func TestModelEffectCompactTriggerWideUsageSumCompacts(t *testing.T) {
 		},
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c))
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), projectedTriggerRequest(t, h, c), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Equal(t, compactCalls, 1)
@@ -351,9 +342,7 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 		}
 	}()
 	go func() {
-		set, err := h.modelEffect(c, testOpID, exec, capture)(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 		done <- effectResult{set, err}
 		close(done)
 	}()
@@ -394,20 +383,10 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	}
 	testassert.Require(t, parkedEntry.BoundaryEntryID == boundary && (parkedEntry.Summary == "summary one" && parkedEntry.Usage != nil && *parkedEntry.Usage == summaryUsage), "got %v, want %v; parked compaction summary/usage = %+v", parkedEntry.BoundaryEntryID, boundary, parkedEntry)
 	testassert.Equal(t, parked.session.State.CompactionEntryID, parkedEntry.EntryID)
-	parkedSessionUsage := UsageTotals{}
-	for _, mu := range parked.session.State.Usage.ByModel {
-		if mu.Model == compactRef {
-			parkedSessionUsage.ByModel = append(parkedSessionUsage.ByModel, mu)
-		}
-	}
+	parkedSessionUsage := usageByModel(parked.session.State.Usage, compactRef)
 	testassert.Require(t, len(parkedSessionUsage.ByModel) == 1 && parkedSessionUsage.ByModel[0].Usage == summaryUsage, "parked session usage = %+v, want the summary's counts", parked.session.State.Usage)
 	testassert.Require(t, parked.operation.State.Status == OperationRunning && parked.operation.State.Terminal == nil, "parked operation status = %q, want the enclosing Operation still running", parked.operation.State.Status)
-	parkedOperationUsage := UsageTotals{}
-	for _, mu := range parked.operation.State.Usage.ByModel {
-		if mu.Model == compactRef {
-			parkedOperationUsage.ByModel = append(parkedOperationUsage.ByModel, mu)
-		}
-	}
+	parkedOperationUsage := usageByModel(parked.operation.State.Usage, compactRef)
 	testassert.Require(t, len(parkedOperationUsage.ByModel) == 1 && parkedOperationUsage.ByModel[0].Usage == summaryUsage, "parked operation usage = %+v, want the summary's counts", parked.operation.State.Usage)
 	select {
 	case result := <-done:
@@ -438,12 +417,7 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
 	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
 	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
-	compactionUsage := UsageTotals{}
-	for _, mu := range graph.Session.State.Usage.ByModel {
-		if mu.Model == compactRef {
-			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
-		}
-	}
+	compactionUsage := usageByModel(graph.Session.State.Usage, compactRef)
 	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session usage = %+v, want the summary's counts keyed by the compact model", graph.Session.State.Usage)
 	assistants := 0
 	for i := range graph.Entries {
@@ -478,7 +452,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	{
-		result, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, priorExec, priorCapture), priorRequest)
+		result, err := invokeModelEffect(t, h.modelEffect(c, testOpID, priorExec, priorCapture), priorRequest, nil)
 		testassert.Require(t, err == nil && result.Disposition == agent.DispoReady, "prior automatic checkpoint = %+v, %v", result, err)
 	}
 	{
@@ -535,7 +509,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		Retry:         (&retrySpy{limit: 0}).retry,
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, failingOperation, exec, capture), req)
+	set, err := invokeModelEffect(t, h.modelEffect(c, failingOperation, exec, capture), req, nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, set.Disposition == agent.DispoFailure && set.Output == nil && strings.Contains(set.Detail, "provider failure"), "settlement = %+v, want the outputless failure carrying the summary failure detail", set)
 	testassert.Require(t, summaryCalls == 1 && conversationCalls == 0, "later compact/conversation calls = %d/%d, want 1/0", summaryCalls, conversationCalls)
@@ -557,12 +531,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		state := operationStateOf(t, graph, failingOperation)
 		testassert.Require(t, state.Status == OperationFailure && usageTotalsEqual(state.Usage, wantTotals), "operation usage = %+v, want the reported summary counts keyed by the compact model", state.Usage)
 	}
-	compactSessionTotals := UsageTotals{}
-	for _, contribution := range graph.Session.State.Usage.ByModel {
-		if contribution.Model == compactRef {
-			compactSessionTotals.ByModel = append(compactSessionTotals.ByModel, contribution)
-		}
-	}
+	compactSessionTotals := usageByModel(graph.Session.State.Usage, compactRef)
 	wantSessionTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 11, OutputTokens: 5}}}}
 	testassert.Require(t, usageTotalsEqual(compactSessionTotals, wantSessionTotals), "session compact usage = %+v, want prior plus failed summary counts", compactSessionTotals)
 	testassert.Equal(t, graph.Session.State.CompactionEntryID, prior.EntryID)
@@ -614,7 +583,7 @@ func TestModelEffectCompactTriggerSteeringStaysBuffered(t *testing.T) {
 		},
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 	testassert.NoError(t, err)
 	// The completed turn settles ready: waiting steering never keeps the
 	// Operation running inside the model effect, and no compact summary
@@ -696,12 +665,12 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 	}
 	me := h.modelEffect(c, testOpID, exec, capture)
 	{
-		set, err := invokeTriggerEffect(t, me, req1)
+		set, err := invokeModelEffect(t, me, req1, nil)
 		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "first request: settlement %+v err %v, want ready", set, err)
 	}
 	req2 := projectedTriggerRequest(t, h, c)
 	{
-		set, err := invokeTriggerEffect(t, me, req2)
+		set, err := invokeModelEffect(t, me, req2, nil)
 		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "second request: settlement %+v err %v, want ready", set, err)
 	}
 	testassert.Equal(t, compactCalls, 2)
@@ -751,11 +720,11 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 	}
 	me := h.modelEffect(c, testOpID, exec, capture)
 	{
-		set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c))
+		set, err := invokeModelEffect(t, me, projectedTriggerRequest(t, h, c), nil)
 		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "overflow checkpoint: settlement %+v err %v, want ready", set, err)
 	}
 	{
-		set, err := invokeTriggerEffect(t, me, projectedTriggerRequest(t, h, c))
+		set, err := invokeModelEffect(t, me, projectedTriggerRequest(t, h, c), nil)
 		testassert.Require(t, err == nil && set.Disposition == agent.DispoReady, "fitting checkpoint: settlement %+v err %v, want ready", set, err)
 	}
 	testassert.Equal(t, compactCalls, 1)
@@ -764,12 +733,7 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph) // exactly one compaction entry
 	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
-	compactionUsage := UsageTotals{}
-	for _, mu := range graph.Session.State.Usage.ByModel {
-		if mu.Model == testCompactCapture().Model {
-			compactionUsage.ByModel = append(compactionUsage.ByModel, mu)
-		}
-	}
+	compactionUsage := usageByModel(graph.Session.State.Usage, testCompactCapture().Model)
 	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session compact usage = %+v, want the summary's counts billed exactly once", graph.Session.State.Usage)
 }
 
@@ -796,7 +760,7 @@ func TestModelEffectCompactRequestNeverTriggers(t *testing.T) {
 		NormalizeTool: objectNormalize,
 	}
 	req := projectedTriggerRequest(t, h, c)
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Equal(t, compactCalls, 1)
@@ -837,7 +801,7 @@ func TestModelEffectCompactTriggerStorageFailurePropagatesUnsettled(t *testing.T
 		},
 		NormalizeTool: objectNormalize,
 	}
-	set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 	testassert.Require(t, errors.Is(err, injected), "model effect = %v, want the raw storage error returned unsettled", err)
 	testassert.Require(t, reflect.DeepEqual(set, agent.ModelSettlement{}), "settlement = %+v, want no settlement shape behind the raw error", set)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1017,7 +981,7 @@ func TestModelEffectCompactBoundaryExcludesPostFreezeAppends(t *testing.T) {
 	}
 	done := make(chan invocation, 1)
 	go func() { // a synchronous call would deadlock on the park
-		set, err := invokeTriggerEffect(t, h.modelEffect(c, testOpID, exec, capture), req)
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, capture), req, nil)
 		done <- invocation{set: set, err: err}
 	}()
 	<-arrived

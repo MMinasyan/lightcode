@@ -12,34 +12,21 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
-// TestPublicSweepSessionSkipsBusyCandidate proves the one per-Session sweep
-// transition: a running candidate takes the no-transition outcome without
-// waiting on the Session's work; an unknown
-// identity reports the not-found class; a zero time is invalid input; and an
-// eligible archived candidate transitions inside the call.
-func TestPublicSweepSessionSkipsBusyCandidate(t *testing.T) {
+// TestPublicSweepSessionRejectsUnknownOrZeroTime proves the per-Session sweep
+// transition's remaining rejection rows: an unknown identity reports the
+// not-found class and a zero time is invalid input. The busy candidate's
+// no-transition outcome is observed with its stronger register and buffer
+// evidence by TestPublicSweepRunningLeftUnchanged.
+func TestPublicSweepSessionRejectsUnknownOrZeroTime(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
-		script := newScriptModel()
-		script.gate = make(chan struct{})
-		f := newPublicFixture(t, store, script, nil)
+		f := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f.close()
 		ctx := context.Background()
 		session := createSession(t, f.h)
 		first, err := f.h.ReadSessionHeader(ctx, session)
 		testassert.NoError(t, err)
 
-		{
-			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
-			testassert.NoError(t, err)
-		}
-		<-script.arrived // parked at the model boundary: the Session is running
-
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
-		deleted, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
-		testassert.Require(t, err == nil && !deleted, "SweepSession of a running candidate = (%v, %v), want the no-transition outcome", deleted, err)
-		still, err := f.h.ReadSessionHeader(ctx, session)
-		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.CurrentOperationID == "op-1", "SweepSession touched the running candidate: %+v err %v", still, err)
-
 		{
 			_, err := f.h.SweepSession(ctx, "0123456789abcdef0123456789abcdef", policy, first.LastActivity.Add(100*time.Hour))
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "SweepSession of an unknown identity = %v, want harness.ErrNotFound", err)
@@ -47,12 +34,6 @@ func TestPublicSweepSessionSkipsBusyCandidate(t *testing.T) {
 		{
 			_, err := f.h.SweepSession(ctx, session, policy, time.Time{})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "SweepSession with a zero time = %v, want harness.ErrInvalid", err)
-		}
-
-		script.releaseGate()
-		{
-			err := converge(t, f)
-			testassert.NoError(t, err)
 		}
 	})
 }

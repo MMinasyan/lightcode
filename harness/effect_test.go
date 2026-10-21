@@ -54,21 +54,24 @@ func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request)
 	return newAdmittedHarness(t, context.Background(), modelPrepared(modelFn))
 }
 
-// invokeModelEffect drives one model effect with a validated request; a nil
-// assemble callback runs the real Agent assembly.
-func invokeModelEffect(t *testing.T, me agent.ModelEffect, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+// defaultModelRequest builds the fixture conversation request the default
+// invocation callers drive.
+func defaultModelRequest(t *testing.T) model.Request {
 	t.Helper()
 	req, err := model.NewRequest(model.Request{
 		Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("hello")}},
 		Tools:    []model.ToolDefinition{testToolDefinition()},
 	})
 	testassert.NoError(t, err)
-	if assemble == nil {
-		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		}
-	}
-	return me(context.Background(), req, assemble)
+	return req
+}
+
+// invokeModelEffect drives one model effect with the given validated request
+// under a background context; a nil assemble callback runs the real Agent
+// assembly.
+func invokeModelEffect(t *testing.T, me agent.ModelEffect, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	t.Helper()
+	return invokeModelEffectCtx(t, me, context.Background(), req, assemble)
 }
 
 func testToolCall(id string) model.ToolCall {
@@ -215,7 +218,7 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 
 	calls := 0
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffect(t, me, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
+	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		calls++
 		return agent.Assemble(context.Background(), source, stream)
 	})
@@ -271,7 +274,7 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoContinue)
 	graph, err := validateFixture(t, store, sessionID)
@@ -321,7 +324,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, nil)
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, set.Disposition, agent.DispoInterruption)
 		graph, err := validateFixture(t, store, sessionID)
@@ -351,7 +354,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail == "model failure", "settlement = %+v, want the committed failure with its diagnostic", set)
 		graph, err := validateFixture(t, store, sessionID)
@@ -372,7 +375,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // the execution context dies before any attempt could start
 		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-		set, err := invokeModelEffectCtx(t, me, ctx, nil)
+		set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
 		testassert.Equal(t, attempts, 0)
@@ -414,10 +417,10 @@ func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
 	{
-		_, err := invokeModelEffect(t, me, nil)
+		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
-	_, err := invokeModelEffect(t, me, nil)
+	_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 	testassert.Require(t, err != nil, "second effect settled, want the repeated-call protocol violation")
 	wantErr := err
 	graph, err := validateFixture(t, store, sessionID)
@@ -444,7 +447,7 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -521,7 +524,7 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 				return nil
 			}
 			{
-				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 				testassert.Require(t, err != nil, "model effect succeeded past an injected %s failure", fail.step)
 			}
 			graph, err := validateFixture(t, store, sessionID)
@@ -602,7 +605,7 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 		t.Helper()
 		exec := effectExecution(modelFn, plan)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
@@ -729,7 +732,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -749,7 +752,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "result over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -803,7 +806,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		}
 		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
 		{
-			_, err := invokeModelEffect(t, me, nil)
+			_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "intent over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -819,7 +822,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "result over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -871,15 +874,11 @@ func newExecutionHarness(t *testing.T, modelFn func(context.Context, model.Reque
 	})
 }
 
-// invokeModelEffectCtx drives one model effect with an explicit context; a nil
-// assemble callback runs the real Agent assembly.
-func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+// invokeModelEffectCtx drives one model effect with the given validated
+// request and an explicit context; a nil assemble callback runs the real Agent
+// assembly under that context.
+func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 	t.Helper()
-	req, err := model.NewRequest(model.Request{
-		Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("hello")}},
-		Tools:    []model.ToolDefinition{testToolDefinition()},
-	})
-	testassert.NoError(t, err)
 	if assemble == nil {
 		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 			return agent.Assemble(ctx, source, stream)
@@ -907,7 +906,7 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 		return nil
 	}
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffectCtx(t, me, ctx, nil)
+	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, invoked, 0)
 	testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
@@ -1131,7 +1130,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			return completedTurnStream(testToolCall("call-1")), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1331,6 +1330,11 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 	filePlan := func(permissions ...PermissionRequest) func(_ context.Context, call model.ToolCall) PreparedTool {
 		return filePlanRoots("/w", "/w/sub", permissions...)
 	}
+	captureWith := func(writeDir string, readonly bool) ExecutionCapture {
+		capture := testCapture()
+		capture.WriteDir, capture.Readonly = writeDir, readonly
+		return capture
+	}
 	cases := []struct {
 		name         string
 		capture      ExecutionCapture
@@ -1400,46 +1404,46 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "a relative canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir denies file.write",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     captureWith("", true),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir still allows file.read",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     captureWith("", true),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir confines file.write inside it",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir denies file.write outside it even when policy allows",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/other.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:    "configured write_dir without a canonical prepared write root is denied",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture: captureWith("/w/sub", false),
 			policy:  allowAllWrites,
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
@@ -1454,20 +1458,20 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "readonly with write_dir allows confined writes",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", true),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir does not lift the built-in sensitive-basename denial",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "an explicit user rule overrides the sensitive denial inside write_dir",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: "ran", wantExecuted: true,
@@ -1526,7 +1530,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:    "immediate success denied by the boundary carries no result content",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture: captureWith("", true),
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
 					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/a.txt"}},
@@ -1655,7 +1659,7 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 		), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 1)
@@ -1694,7 +1698,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return completedTurnStream(calls...), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1833,7 +1837,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return streamOf(d, usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
@@ -2267,7 +2271,7 @@ func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, ca
 		return completedTurnStream(calls...), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 }
@@ -2665,7 +2669,7 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 3)

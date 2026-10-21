@@ -358,12 +358,8 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		}
 		testassert.Equal(t, compactions, 1)
 		pieceCount := func(totals harness.UsageTotals) bool {
-			for _, usage := range totals.ByModel {
-				if usage.Model == compactRef {
-					return usage.Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1})
-				}
-			}
-			return false
+			pieces := usageByModel(totals, compactRef)
+			return len(pieces.ByModel) == 1 && pieces.ByModel[0].Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1})
 		}
 		testassert.Require(t, pieceCount(secondOperation.State.Usage) && pieceCount(childQuiet.TotalUsage), "child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.TotalUsage)
 		testassert.Require(t, len(observedPrepares) == 4 && observedPrepares[0].Session.Identity.SessionID == child && observedPrepares[1].Session.Identity.SessionID == root && observedPrepares[2].Session.Identity.SessionID == child && observedPrepares[3].Session.Identity.SessionID == child, "shared preparation lineage = %+v", observedPrepares)

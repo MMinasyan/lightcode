@@ -78,7 +78,7 @@ func publishHookCalls(t *testing.T, h *Harness, c *coordinator, exec Execution, 
 		return completedTurnStream(calls...), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 }

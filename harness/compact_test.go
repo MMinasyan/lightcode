@@ -216,9 +216,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
+		set, err := invokeModelEffect(t, me, req, nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, set.Disposition, agent.DispoReady)
 		testassert.Equal(t, calls, 2)
@@ -242,9 +240,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
+		set, err := invokeModelEffect(t, me, req, nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "" && strings.Contains(set.Detail, "provider failure") && (set.Output != nil && set.Output.Status == model.OutputErrored), "settlement = %+v, want the failure carrying the summary failure detail; settlement output = %+v, want the errored assembly carried on the failure row", set, set.Output)
 		graph, err := validateFixture(t, store, sessionID)
@@ -275,9 +271,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		set, err := me(ctx, req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
+		set, err := invokeModelEffectCtx(t, me, ctx, req, nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail && set.Output == nil, "settlement = %+v, want the fixed interruption settlement; settlement output = %+v, want none on the pre-assembly cancellation", set, set.Output)
 		graph, err := validateFixture(t, store, sessionID)
@@ -308,9 +302,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
+		set, err := invokeModelEffect(t, me, req, nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoReady && set.Output != nil && set.Output.Status == model.OutputCompleted, "settlement = %+v, want the ready settlement carrying the completed output", set)
 		testassert.Equal(t, calls, 1)
@@ -678,6 +670,18 @@ func TestCompactionBoundaryRows(t *testing.T) {
 			testassert.Equal(t, got, compaction.Envelope.ID)
 		}
 	})
+}
+
+// usageByModel returns the totals' pieces keyed by ref: the shared
+// usage-by-model selection; each caller keeps its own expected counts.
+func usageByModel(totals UsageTotals, ref model.ModelRef) UsageTotals {
+	var out UsageTotals
+	for _, mu := range totals.ByModel {
+		if mu.Model == ref {
+			out.ByModel = append(out.ByModel, mu)
+		}
+	}
+	return out
 }
 
 // compactedEntryOf returns the one compaction entry of the validated graph.

@@ -127,29 +127,6 @@ func factFixtureGraph() *testGraph {
 	}
 }
 
-// onlyMember asserts exactly one payload member of one fact is present and
-// returns the EntryKind that member's presence implies.
-func onlyMember(t *testing.T, fact HistoryFact) EntryKind {
-	t.Helper()
-	present := 0
-	var kind EntryKind
-	for member, isKind := range map[EntryKind]bool{
-		EntryInput:               fact.Input != nil,
-		EntryAssistant:           fact.Assistant != nil,
-		EntryToolResult:          fact.ToolResult != nil,
-		EntrySignal:              fact.Signal != nil,
-		EntryCompaction:          fact.Compaction != nil,
-		EntryOperationSettlement: fact.Settlement != nil,
-	} {
-		if isKind {
-			present++
-			kind = member
-		}
-	}
-	testassert.Require(t, present == 1, "fact %s carries %d payload members, want exactly one", fact.EntryID, present)
-	return kind
-}
-
 // FactIdentity is one expected committed fact's envelope identity.
 type FactIdentity struct {
 	EntryID     string
@@ -387,7 +364,22 @@ func TestHistoryViewFactUnionAndOwnership(t *testing.T) {
 		for i, fact := range facts {
 			testassert.Require(t, fact.Kind == wantKinds[i], "fact[%d].Kind = %q, want %q", i, fact.Kind, wantKinds[i])
 			{
-				kind := onlyMember(t, fact)
+				present := 0
+				var kind EntryKind
+				for member, isKind := range map[EntryKind]bool{
+					EntryInput:               fact.Input != nil,
+					EntryAssistant:           fact.Assistant != nil,
+					EntryToolResult:          fact.ToolResult != nil,
+					EntrySignal:              fact.Signal != nil,
+					EntryCompaction:          fact.Compaction != nil,
+					EntryOperationSettlement: fact.Settlement != nil,
+				} {
+					if isKind {
+						present++
+						kind = member
+					}
+				}
+				testassert.Require(t, present == 1, "fact %s carries %d payload members, want exactly one", fact.EntryID, present)
 				testassert.Require(t, kind == fact.Kind, "fact[%d]'s single payload member implies kind %q, want its Kind %q", i, kind, fact.Kind)
 			}
 			testassert.Require(t, fact.EntryID != "" && fact.Sequence != 0 && !fact.CommittedAt.IsZero(), "fact[%d] loses its envelope identity: %+v", i, fact)

@@ -80,16 +80,17 @@ func benchValidatorFixture(n int) *testGraph {
 	return fixture
 }
 
-// BenchmarkGraphValidatorOperationShapes measures the invariant traversal at
-// 250, 1,000 and 4,000 Operations. It is scaling evidence only: no threshold
-// and no CI gate. Each size is decoded once through the real storage path, and
-// the loop measures validateGraphInvariants, the pass whose per-Operation
-// scans read each Operation's entry group instead of rescanning the whole
-// history.
-func BenchmarkGraphValidatorOperationShapes(b *testing.B) {
+// benchmarkGraphValidator runs the invariant traversal at 250, 1,000 and
+// 4,000 Operations over the given fixture builder. Each size is built and
+// decoded once through the real storage path before timing, and the timed loop
+// calls validateGraphInvariants directly, the pass whose per-Operation scans
+// read each Operation's entry group instead of rescanning the whole history.
+// These are scaling evidence only: no threshold and no CI gate.
+func benchmarkGraphValidator(b *testing.B, fixtureBuilder func(int) *testGraph) {
+	b.Helper()
 	for _, n := range []int{250, 1000, 4000} {
 		b.Run(fmt.Sprintf("%d_operations", n), func(b *testing.B) {
-			fixture := benchValidatorFixture(n)
+			fixture := fixtureBuilder(n)
 			graph, err := validateSessionGraph(context.Background(), fixture.storage(b), testSessionID)
 			if err != nil {
 				b.Fatalf("benchmark fixture rejected: %v", err)
@@ -103,6 +104,12 @@ func BenchmarkGraphValidatorOperationShapes(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkGraphValidatorOperationShapes measures the invariant traversal at
+// the runner's sizes over interleaved Operation shapes.
+func BenchmarkGraphValidatorOperationShapes(b *testing.B) {
+	benchmarkGraphValidator(b, benchValidatorFixture)
 }
 
 // benchValidatorUsageFixture extends benchValidatorFixture so every terminal
@@ -127,26 +134,9 @@ func benchValidatorUsageFixture(n int) *testGraph {
 	return fixture
 }
 
-// BenchmarkGraphValidatorUsageShapes measures the same invariant traversal at
-// 250, 1,000 and 4,000 Operations with per-Operation settlement usage under a
-// distinct model identity per Operation, so the Session-total accumulation
-// walks n distinct models. Scaling evidence only: no threshold and no CI
-// gate.
+// BenchmarkGraphValidatorUsageShapes measures the same invariant traversal
+// with per-Operation settlement usage under a distinct model identity per
+// Operation, so the Session-total accumulation walks n distinct models.
 func BenchmarkGraphValidatorUsageShapes(b *testing.B) {
-	for _, n := range []int{250, 1000, 4000} {
-		b.Run(fmt.Sprintf("%d_operations", n), func(b *testing.B) {
-			fixture := benchValidatorUsageFixture(n)
-			graph, err := validateSessionGraph(context.Background(), fixture.storage(b), testSessionID)
-			if err != nil {
-				b.Fatalf("benchmark fixture rejected: %v", err)
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if err := validateGraphInvariants(testSessionID, graph); err != nil {
-					b.Fatalf("benchmark graph rejected: %v", err)
-				}
-			}
-		})
-	}
+	benchmarkGraphValidator(b, benchValidatorUsageFixture)
 }

@@ -239,7 +239,8 @@ func (s *scriptModel) releaseGate() {
 // publicFixture wires one Harness over the given store with a scripted
 // preparation callback: every admission receives the fixture's prepared
 // execution (or the per-call prepare hook's result) and signals the
-// preparation arrival. The model effect defaults to the script's own effect.
+// preparation arrival. The conversation effect defaults to the script's own
+// effect and the compact callback to the resolved conversation callback.
 type publicFixture struct {
 	h       *harness.Harness
 	store   harness.Storage
@@ -258,24 +259,33 @@ type publicFixture struct {
 	// prepareHook, when non-nil, answers one preparation call with its own
 	// result or error; the call index counts from zero.
 	prepareHook func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error)
+
+	// defaultPrep answers a preparation call when no hook is installed: the
+	// fixture's capture over the resolved conversation and compact callbacks.
+	// Consumers with a different capture set it before any admission.
+	defaultPrep harness.PreparedExecution
 }
 
 func newPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
-	return newPublicFixtureWithJobs(t, store, nil, script, modelFn)
+	return newPublicFixtureWithJobs(t, store, nil, script, modelFn, nil)
 }
 
 // newPublicFixtureWithJobs is the fixture's core builder: the same scripted
-// preparation over a Harness whose optional Jobs seam is installed.
-func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harness.JobStopper, script *scriptModel, modelFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
+// preparation over a Harness whose optional Jobs seam is installed. A nil
+// compact callback resolves to the conversation callback.
+func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harness.JobStopper, script *scriptModel, modelFn, compactFn func(context.Context, model.Request) (model.Stream, error)) *publicFixture {
 	t.Helper()
 	if modelFn == nil {
 		modelFn = script.effect
 	}
+	if compactFn == nil {
+		compactFn = modelFn
+	}
 	f := &publicFixture{store: store, cancel: func() {}, prepare: make(chan struct{}, 16), model: script}
-	prepared := harness.PreparedExecution{
+	f.defaultPrep = harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return publicExecution(modelFn, modelFn), nil
+			return publicExecution(modelFn, compactFn), nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -290,7 +300,7 @@ func newPublicFixtureWithJobs(t *testing.T, store harness.Storage, stopper harne
 		if hook != nil {
 			return hook(call, req)
 		}
-		return prepared, nil
+		return f.defaultPrep, nil
 	}, Jobs: stopper})
 	testassert.NoError(t, err)
 	f.h = h
@@ -2339,8 +2349,8 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		{
-			_, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
-			testassert.NoError(t, err)
+			deleted, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
+			testassert.Require(t, err == nil && !deleted, "sweep of the running session = (%v, %v), want the no-transition outcome", deleted, err)
 		}
 		still, err := f.h.ReadSessionHeader(ctx, session)
 		testassert.Require(t, err == nil && still.Lifecycle == harness.LifecycleOpen && still.Revision == active.Revision, "sweep touched the running session: %+v err %v, want it unchanged", still, err)
@@ -2376,22 +2386,9 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 		// corrupt the register directly through the storage contract: syntactically
 		// valid JSON whose state section violates the closed lifecycle enum
 		reg := sessionRegister(t, store, corrupt)
-		var obj map[string]json.RawMessage
-		{
-			err := json.Unmarshal(reg.Payload, &obj)
-			testassert.NoError(t, err)
-		}
-		var state map[string]json.RawMessage
-		{
-			err := json.Unmarshal(obj["state"], &state)
-			testassert.NoError(t, err)
-		}
-		state["lifecycle"] = json.RawMessage(`"bogus"`)
-		newState, err := json.Marshal(state)
-		testassert.NoError(t, err)
-		obj["state"] = newState
-		bad, err := json.Marshal(obj)
-		testassert.NoError(t, err)
+		bad := editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+			state["lifecycle"] = json.RawMessage(`"bogus"`)
+		})
 		key := harness.RegisterKey{SessionID: corrupt, Kind: harness.RegisterSession}
 		{
 			err := store.Transact(ctx, func(tx harness.Transaction) error {
@@ -2756,176 +2753,188 @@ func TestPublicLifecycleRollbackOnTransactionFailure(t *testing.T) {
 			return store
 		}},
 	}
-	cases := []struct {
-		name string
-		run  func(t *testing.T, store harness.Storage)
-	}{
-		{"reopen", rollbackReopenCase},
-		{"archive", rollbackArchiveCase},
-		{"delete", rollbackDeleteCase},
-		{"sweep archive", rollbackSweepArchiveCase},
-		{"sweep delete", rollbackSweepDeleteCase},
-	}
 	for _, variant := range variants {
 		variant := variant
-		for _, c := range cases {
+		for _, c := range rollbackCases {
 			c := c
-			t.Run(variant.name+"/"+c.name, func(t *testing.T) { c.run(t, variant.open(t)) })
+			t.Run(variant.name+"/"+c.name, func(t *testing.T) { runRollbackCase(t, variant.open(t), c) })
 		}
 	}
 }
 
-// rollbackReopenCase proves Reopen's post-mutation rollback on one isolated store.
-func rollbackReopenCase(t *testing.T, store harness.Storage) {
-	probe := &rollbackProbeStore{Storage: store}
-	f := newPublicFixture(t, probe, newScriptModel(), nil)
-	defer f.close()
-	ctx := context.Background()
-	session := createSession(t, f.h)
-	{
-		_, err := f.h.ArchiveSession(ctx, session)
-		testassert.NoError(t, err)
-	}
-	archived, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.NoError(t, err)
-	before := sessionRegister(t, store, session)
-
-	probe.failReplace = true
-	{
-		_, err := f.h.ReopenSession(ctx, session)
-		testassert.Require(t, errors.Is(err, errInjectedRollback), "reopen with injected post-mutation failure = err %v, want the injected rollback", err)
-	}
-	assertRollback(t, store, f.h, session, before, archived)
-
-	reopened, err := f.h.ReopenSession(ctx, session)
-	testassert.Require(t, err == nil && reopened.State.Lifecycle == harness.LifecycleOpen && reopened.State.ArchivedAt == nil && reopened.Revision == before.Revision+1, "reopen after rollback = %+v err %v, want open at the next revision", reopened, err)
+// rollbackCase is one lifecycle transition's rollback row: prepare seeds the
+// transition's precondition and returns the pre-attempt cached view, arm
+// selects the injected post-mutation failure point, run performs the
+// transition, afterFailure observes the rolled-back state before the retry,
+// and retry performs the same transition again and asserts its post-retry
+// outcome. The shared runner owns the snapshot/failure/rollback/retry
+// construction; the rows carry only their operation and their own expected
+// values.
+type rollbackCase struct {
+	name         string
+	prepare      func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader
+	arm          func(probe *rollbackProbeStore)
+	run          func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error
+	afterFailure func(t *testing.T, store harness.Storage, session string)
+	retry        func(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.SessionHeader)
 }
 
-// rollbackArchiveCase proves Archive's post-mutation rollback on one isolated store.
-func rollbackArchiveCase(t *testing.T, store harness.Storage) {
-	probe := &rollbackProbeStore{Storage: store}
-	f := newPublicFixture(t, probe, newScriptModel(), nil)
-	defer f.close()
-	ctx := context.Background()
-	session := createSession(t, f.h)
-	first, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.NoError(t, err)
-	before := sessionRegister(t, store, session)
-
-	probe.failReplace = true
+var rollbackCases = []rollbackCase{
 	{
-		_, err := f.h.ArchiveSession(ctx, session)
-		testassert.Require(t, errors.Is(err, errInjectedRollback), "archive with injected post-mutation failure = err %v, want the injected rollback", err)
-	}
-	assertRollback(t, store, f.h, session, before, first)
-
-	archived, err := f.h.ArchiveSession(ctx, session)
-	testassert.Require(t, err == nil && archived.State.Lifecycle == harness.LifecycleArchived && archived.State.ArchivedAt != nil && archived.Revision == before.Revision+1, "archive after rollback = %+v err %v, want archived at the next revision", archived, err)
+		name: "reopen",
+		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
+			{
+				_, err := h.ArchiveSession(context.Background(), session)
+				testassert.NoError(t, err)
+			}
+			archived, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
+			return archived
+		},
+		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
+			_, err := h.ReopenSession(context.Background(), session)
+			return err
+		},
+		retry: func(t *testing.T, _ harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
+			reopened, err := h.ReopenSession(context.Background(), session)
+			testassert.Require(t, err == nil && reopened.State.Lifecycle == harness.LifecycleOpen && reopened.State.ArchivedAt == nil && reopened.Revision == before.Revision.DurableRevision+1, "reopen after rollback = %+v err %v, want open at the next revision", reopened, err)
+		},
+	},
+	{
+		name: "archive",
+		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
+			first, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
+			return first
+		},
+		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
+			_, err := h.ArchiveSession(context.Background(), session)
+			return err
+		},
+		retry: func(t *testing.T, _ harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
+			archived, err := h.ArchiveSession(context.Background(), session)
+			testassert.Require(t, err == nil && archived.State.Lifecycle == harness.LifecycleArchived && archived.State.ArchivedAt != nil && archived.Revision == before.Revision.DurableRevision+1, "archive after rollback = %+v err %v, want archived at the next revision", archived, err)
+		},
+	},
+	{
+		name: "delete",
+		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
+			{
+				_, err := h.ArchiveSession(context.Background(), session)
+				testassert.NoError(t, err)
+			}
+			archived, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
+			return archived
+		},
+		arm: func(probe *rollbackProbeStore) { probe.failDelete = true },
+		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
+			return h.DeleteSession(context.Background(), session)
+		},
+		afterFailure: func(t *testing.T, store harness.Storage, session string) {
+			ids, err := store.ListSessionIDs(context.Background())
+			testassert.NoError(t, err)
+			found := false
+			for _, id := range ids { // the rolled-back deletion is absence-free: the Session is still listed
+				if id == session {
+					found = true
+				}
+			}
+			testassert.Require(t, found, "rolled-back delete removed the session from the listing")
+		},
+		retry: func(t *testing.T, store harness.Storage, h *harness.Harness, session string, _ harness.SessionHeader) {
+			{
+				err := h.DeleteSession(context.Background(), session)
+				testassert.NoError(t, err)
+			}
+			key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
+			{
+				_, err := store.ReadRegister(context.Background(), key)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after delete = err %v, want ErrNotFound", err)
+			}
+		},
+	},
+	{
+		name: "sweep archive",
+		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
+			first, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
+			return first
+		},
+		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
+			policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
+			now := before.LastActivity.Add(100 * time.Hour)
+			_, err := h.SweepSession(context.Background(), session, policy, now)
+			return err
+		},
+		retry: func(t *testing.T, _ harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
+			policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
+			now := before.LastActivity.Add(100 * time.Hour)
+			{
+				_, err := h.SweepSession(context.Background(), session, policy, now)
+				testassert.NoError(t, err)
+			}
+			archived, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.Require(t, err == nil && archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == before.Revision.DurableRevision+1 && archived.ArchivedAt != nil && archived.ArchivedAt.Equal(now), "sweep after rollback = %+v err %v, want archived at the sweep time", archived, err)
+		},
+	},
+	{
+		name: "sweep delete",
+		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
+			archived, err := h.ArchiveSession(context.Background(), session)
+			testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "seed archive = %+v err %v", archived, err)
+			header, err := h.ReadSessionHeader(context.Background(), session)
+			testassert.NoError(t, err)
+			return header
+		},
+		arm: func(probe *rollbackProbeStore) { probe.failDelete = true },
+		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
+			policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
+			now := before.ArchivedAt.Add(100 * time.Hour)
+			_, err := h.SweepSession(context.Background(), session, policy, now)
+			return err
+		},
+		retry: func(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
+			policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
+			now := before.ArchivedAt.Add(100 * time.Hour)
+			{
+				_, err := h.SweepSession(context.Background(), session, policy, now)
+				testassert.NoError(t, err)
+			}
+			key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
+			{
+				_, err := store.ReadRegister(context.Background(), key)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after swept delete = err %v, want ErrNotFound", err)
+			}
+		},
+	},
 }
 
-// rollbackDeleteCase proves Delete's post-mutation rollback on one isolated store.
-func rollbackDeleteCase(t *testing.T, store harness.Storage) {
+// runRollbackCase owns the shared rollback construction: one isolated store,
+// the real transition, its injected post-mutation failure, the durable and
+// cached rollback assertions, the row's own rolled-back observation, and the
+// retry of the same transition with its post-retry observation.
+func runRollbackCase(t *testing.T, store harness.Storage, row rollbackCase) {
+	t.Helper()
 	probe := &rollbackProbeStore{Storage: store}
 	f := newPublicFixture(t, probe, newScriptModel(), nil)
 	defer f.close()
-	ctx := context.Background()
 	session := createSession(t, f.h)
-	{
-		_, err := f.h.ArchiveSession(ctx, session)
-		testassert.NoError(t, err)
-	}
-	archived, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.NoError(t, err)
+	beforeHeader := row.prepare(t, f.h, session)
 	before := sessionRegister(t, store, session)
-
-	probe.failDelete = true
+	row.arm(probe)
 	{
-		err := f.h.DeleteSession(ctx, session)
-		testassert.Require(t, errors.Is(err, errInjectedRollback), "delete with injected post-mutation failure = err %v, want the injected rollback", err)
+		err := row.run(t, f.h, session, beforeHeader)
+		testassert.Require(t, errors.Is(err, errInjectedRollback), "%s with injected post-mutation failure = err %v, want the injected rollback", row.name, err)
 	}
-	assertRollback(t, store, f.h, session, before, archived)
-	ids, err := store.ListSessionIDs(ctx)
-	testassert.NoError(t, err)
-	found := false
-	for _, id := range ids { // the rolled-back deletion is absence-free: the Session is still listed
-		if id == session {
-			found = true
-		}
+	assertRollback(t, store, f.h, session, before, beforeHeader)
+	if row.afterFailure != nil {
+		row.afterFailure(t, store, session)
 	}
-	testassert.Require(t, found, "rolled-back delete removed the session from the listing")
-
-	{
-		err := f.h.DeleteSession(ctx, session)
-		testassert.NoError(t, err)
-	}
-	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-	{
-		_, err := store.ReadRegister(ctx, key)
-		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after delete = err %v, want ErrNotFound", err)
-	}
-}
-
-// rollbackSweepArchiveCase proves the sweep archive transition's post-mutation
-// rollback on one isolated store.
-func rollbackSweepArchiveCase(t *testing.T, store harness.Storage) {
-	probe := &rollbackProbeStore{Storage: store}
-	f := newPublicFixture(t, probe, newScriptModel(), nil)
-	defer f.close()
-	ctx := context.Background()
-	session := createSession(t, f.h)
-	first, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.NoError(t, err)
-	before := sessionRegister(t, store, session)
-
-	policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
-	now := first.LastActivity.Add(100 * time.Hour)
-	probe.failReplace = true
-	{
-		_, err := f.h.SweepSession(ctx, session, policy, now)
-		testassert.Require(t, errors.Is(err, errInjectedRollback), "sweep with injected post-mutation failure = err %v, want the transition to return it", err)
-	}
-	assertRollback(t, store, f.h, session, before, first)
-
-	{
-		_, err := f.h.SweepSession(ctx, session, policy, now)
-		testassert.NoError(t, err)
-	}
-	archived, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.Require(t, err == nil && archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == before.Revision+1 && archived.ArchivedAt != nil && archived.ArchivedAt.Equal(now), "sweep after rollback = %+v err %v, want archived at the sweep time", archived, err)
-}
-
-// rollbackSweepDeleteCase proves the sweep delete transition's post-mutation
-// rollback on one isolated store.
-func rollbackSweepDeleteCase(t *testing.T, store harness.Storage) {
-	probe := &rollbackProbeStore{Storage: store}
-	f := newPublicFixture(t, probe, newScriptModel(), nil)
-	defer f.close()
-	ctx := context.Background()
-	session := createSession(t, f.h)
-	archived, err := f.h.ArchiveSession(ctx, session)
-	testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "seed archive = %+v err %v", archived, err)
-	before := sessionRegister(t, store, session)
-
-	policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
-	now := archived.State.ArchivedAt.Add(100 * time.Hour)
-	archivedHeader, err := f.h.ReadSessionHeader(ctx, session)
-	testassert.NoError(t, err)
-	probe.failDelete = true
-	{
-		_, err := f.h.SweepSession(ctx, session, policy, now)
-		testassert.Require(t, errors.Is(err, errInjectedRollback), "sweep with injected post-mutation failure = err %v, want the transition to return it", err)
-	}
-	assertRollback(t, store, f.h, session, before, archivedHeader)
-
-	{
-		_, err := f.h.SweepSession(ctx, session, policy, now)
-		testassert.NoError(t, err)
-	}
-	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
-	{
-		_, err := store.ReadRegister(ctx, key)
-		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after swept delete = err %v, want ErrNotFound", err)
-	}
+	row.retry(t, store, f.h, session, beforeHeader)
 }
 
 // TestPublicWaitConvergesWithCorruptingTransition proves the Wait and
@@ -2945,22 +2954,9 @@ func TestPublicWaitConvergesWithCorruptingTransition(t *testing.T) {
 		// corrupt the register directly through storage after materialization:
 		// the transition discovers it in-transaction under c.mu
 		reg := sessionRegister(t, store, session)
-		var obj map[string]json.RawMessage
-		{
-			err := json.Unmarshal(reg.Payload, &obj)
-			testassert.NoError(t, err)
-		}
-		var state map[string]json.RawMessage
-		{
-			err := json.Unmarshal(obj["state"], &state)
-			testassert.NoError(t, err)
-		}
-		state["lifecycle"] = json.RawMessage(`"bogus"`)
-		newState, err := json.Marshal(state)
-		testassert.NoError(t, err)
-		obj["state"] = newState
-		bad, err := json.Marshal(obj)
-		testassert.NoError(t, err)
+		bad := editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+			state["lifecycle"] = json.RawMessage(`"bogus"`)
+		})
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
 		{
 			err := store.Transact(ctx, func(tx harness.Transaction) error {
@@ -5272,22 +5268,9 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			}
 			// corrupt the destination register directly through storage
 			reg := sessionRegister(t, store, res.Session.Identity.SessionID)
-			var obj map[string]json.RawMessage
-			{
-				err := json.Unmarshal(reg.Payload, &obj)
-				testassert.NoError(t, err)
-			}
-			var state map[string]json.RawMessage
-			{
-				err := json.Unmarshal(obj["state"], &state)
-				testassert.NoError(t, err)
-			}
-			state["lifecycle"] = json.RawMessage(`"bogus"`)
-			newState, err := json.Marshal(state)
-			testassert.NoError(t, err)
-			obj["state"] = newState
-			bad, err := json.Marshal(obj)
-			testassert.NoError(t, err)
+			bad := editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+				state["lifecycle"] = json.RawMessage(`"bogus"`)
+			})
 			key := harness.RegisterKey{SessionID: res.Session.Identity.SessionID, Kind: harness.RegisterSession}
 			f8 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f8.close()
@@ -5863,7 +5846,8 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		ctx := context.Background()
 		conversation := newScriptModel(publicTurn(), publicTurn(), publicTurn()) // op-1, op-2, fork-1
 		compact := newScriptModel(summaryAttempt("summary one"))
-		f := newCompactManualFixture(t, store, conversation, compact)
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
 		defer f.close()
 		source := createSession(t, f.h)
 
@@ -5983,9 +5967,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		testassert.Equal(t, destState.State.CompactionEntryID, copied.ID)
 		destView, err := f.h.ReadSessionView(ctx, dest)
 		testassert.NoError(t, err)
-		for _, mu := range destView.TotalUsage.ByModel {
-			testassert.Require(t, mu.Model != compactModelRef, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
-		}
+		testassert.Require(t, len(usageByModel(destView.TotalUsage, compactModelRef).ByModel) == 0, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
 		// The fork's own turn projected at the copied summary.
 		reqs := conversation.seen()
 		testassert.Require(t, len(reqs) != 0, "the fork execution never reached its model boundary")
@@ -6001,6 +5983,18 @@ func kindsOf(entries []harness.Entry) []harness.EntryKind {
 	out := make([]harness.EntryKind, 0, len(entries))
 	for _, entry := range entries {
 		out = append(out, entry.Kind)
+	}
+	return out
+}
+
+// usageByModel returns the totals' pieces keyed by ref: the shared
+// usage-by-model selection; each caller keeps its own expected counts.
+func usageByModel(totals harness.UsageTotals, ref model.ModelRef) harness.UsageTotals {
+	var out harness.UsageTotals
+	for _, mu := range totals.ByModel {
+		if mu.Model == ref {
+			out.ByModel = append(out.ByModel, mu)
+		}
 	}
 	return out
 }
