@@ -24,6 +24,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -59,9 +60,7 @@ func assertNoOperationRegisters(t *testing.T, store harness.Storage, sessionID s
 		t.Fatalf("ReadRegisters(%s): %v", sessionID, err)
 	}
 	for _, reg := range regs {
-		if reg.Key.Kind == harness.RegisterOperation {
-			t.Fatalf("session %s carries the Operation register %q, want no admission", sessionID, reg.Key.OperationID)
-		}
+		testassert.Require(t, reg.Key.Kind != harness.RegisterOperation, "session %s carries the Operation register %q, want no admission", sessionID, reg.Key.OperationID)
 	}
 }
 
@@ -71,9 +70,7 @@ func captureSweepStderr(t *testing.T) func() string {
 	t.Helper()
 	old := os.Stderr
 	f, err := os.CreateTemp(t.TempDir(), "sweep-stderr-*")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	os.Stderr = f
 	t.Cleanup(func() {
 		os.Stderr = old
@@ -333,9 +330,7 @@ func readSweptSession(t *testing.T, r *Runtime, sessionID string) (harness.Sessi
 func readSweepRegister(t *testing.T, store harness.Storage, sessionID string) harness.Register {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
-	if err != nil {
-		t.Fatalf("read session register %q: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "read session register %q: %v", sessionID, err)
 	return reg
 }
 
@@ -346,38 +341,26 @@ func rewriteSessionRegister(t *testing.T, store harness.Storage, sessionID strin
 	ctx := context.Background()
 	key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}
 	reg, err := store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("read register to rewrite: %v", err)
-	}
+	testassert.NoError(t, err)
 	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(reg.Payload, &obj); err != nil {
-		t.Fatalf("unmarshal session payload: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(reg.Payload, &obj))
 	var state map[string]json.RawMessage
-	if err := json.Unmarshal(obj["state"], &state); err != nil {
-		t.Fatalf("unmarshal state section: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(obj["state"], &state))
 	mutate(state)
 	obj["state"] = mustSweepJSON(t, state)
-	if err := store.Transact(ctx, func(tx harness.Transaction) error {
+	testassert.NoError(t, store.Transact(ctx, func(tx harness.Transaction) error {
 		_, err := tx.ReplaceRegister(key, reg.Revision, mustSweepJSON(t, obj))
 		return err
-	}); err != nil {
-		t.Fatalf("replace register: %v", err)
-	}
+	}))
 	out, err := store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("reread rewritten register: %v", err)
-	}
+	testassert.NoError(t, err)
 	return out
 }
 
 func mustSweepJSON(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	testassert.NoError(t, err)
 	return data
 }
 
@@ -394,18 +377,12 @@ func seedStaleSession(t *testing.T, store harness.Storage, workspace string, sta
 			return harness.PreparedExecution{}, errors.New("seed harness prepares nothing")
 		},
 	})
-	if err != nil {
-		t.Fatalf("seed harness.New: %v", err)
-	}
+	testassert.NoError(t, err)
 	rec, err := h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
-	if err != nil {
-		t.Fatalf("seed CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	rewriteSessionRegister(t, store, rec.Identity.SessionID, func(state map[string]json.RawMessage) {
 		var last time.Time
-		if err := json.Unmarshal(state["last_activity"], &last); err != nil {
-			t.Fatalf("decode last_activity: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(state["last_activity"], &last))
 		state["last_activity"] = mustSweepJSON(t, last.Add(-stale))
 	})
 	return rec.Identity.SessionID
@@ -430,29 +407,18 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 			hookPlugin(hook),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		rec, err := readSweptSession(t, r, seeded)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if rec.Lifecycle != harness.LifecycleArchived || rec.ArchivedAt == nil {
-			t.Fatalf("seeded Session after startup = %+v, want the initial pass to have archived it", rec)
-		}
-		if got := e.server.requests(); got != 0 {
-			t.Fatalf("HTTP requests during startup = %d, want the sweep to admit no model work", got)
-		}
-		if calls := len(hook.calls()); calls != 0 {
-			t.Fatalf("preparation hook calls during startup = %d, want the sweep to admit no model work", calls)
-		}
-		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
-			t.Fatalf("short-scope factory opens during startup = %d/%d, want the sweep to admit no model work", ops, ags)
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived && rec.ArchivedAt != nil, "seeded Session after startup = %+v, want the initial pass to have archived it", rec)
+		testassert.Equal(t, e.server.requests(), 0)
+		testassert.Equal(t, len(hook.calls()), 0)
+		{
+			ops, ags := opOpens.Load(), agOpens.Load()
+			testassert.Require(t, ops == 0 && ags == 0, "short-scope factory opens during startup = %d/%d, want the sweep to admit no model work", ops, ags)
 		}
 		assertNoOperationRegisters(t, store, seeded)
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -478,24 +444,19 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		if got := wrapped.listCount(); got != 1 {
-			t.Fatalf("storage lists after construction with auto_archive=false = %d, want recovery's single list only: false must disable the whole sweep", got)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, wrapped.listCount(), 1)
 		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		id := created.Identity.SessionID
 		stderr := captureSweepStderr(t)
 
 		archiveBoundary := created.State.LastActivity.Add(24 * time.Hour)
 		archivedAt := archiveBoundary.Add(time.Nanosecond)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 
 		// Each send's rendezvous proves the previous pass fully converged, so
@@ -504,39 +465,27 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		sendTick(t, ticks, archivedAt)      // one nanosecond past: archive, stamped with the tick time
 		waitWritten(t, wrapped)             // the archive committed; the boundary pass converged at the previous rendezvous
 		archived, err := readSweptSession(t, r, id)
-		if err != nil {
-			t.Fatalf("ReadSession after the archive ticks: %v", err)
-		}
-		if archived.Lifecycle != harness.LifecycleArchived || archived.Revision.DurableRevision != created.Revision+1 {
-			t.Fatalf("Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d", archived, archived.Revision.DurableRevision, created.Revision+1)
-		}
-		if archived.ArchivedAt == nil || !archived.ArchivedAt.Equal(archivedAt) {
-			t.Fatalf("sweep stamped %v, want the archive tick's explicit time %v", archived.ArchivedAt, archivedAt)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, archived.Lifecycle == harness.LifecycleArchived && archived.Revision.DurableRevision == created.Revision+1 && archived.ArchivedAt != nil && archived.ArchivedAt.Equal(archivedAt), "Session after the two archive-boundary ticks = %+v rev %d, want exactly one archive at revision %d; sweep stamped %v, want the archive tick's explicit time %v", archived, archived.Revision.DurableRevision, created.Revision+1, archived.ArchivedAt, archivedAt)
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour))                 // exact delete boundary
 		sendTick(t, ticks, archivedAt.Add(24*time.Hour+time.Nanosecond)) // one nanosecond past: delete
 		waitWritten(t, wrapped)
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
+		testassert.NoError(t, r.Close(context.Background()))
+		{
+			_, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "Session register after the delete-boundary pair = err %v, want it past the boundary deleted", err)
 		}
-		if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("Session register after the delete-boundary pair = err %v, want it past the boundary deleted", err)
-		}
-		if got := wrapped.listCount(); got != 5 {
-			t.Fatalf("storage lists = %d, want recovery plus exactly the four controlled passes", got)
-		}
-		if got := e.server.requests(); got != 0 {
-			t.Fatalf("HTTP requests = %d, want none: the sweep admits no model work", got)
-		}
-		if calls := len(hook.calls()); calls != 0 {
-			t.Fatalf("preparation hook calls = %d, want none: the sweep admits no model work", calls)
-		}
-		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
-			t.Fatalf("short-scope factory opens = %d/%d, want none: the sweep admits no model work", ops, ags)
+		testassert.Equal(t, wrapped.listCount(), 5)
+		testassert.Equal(t, e.server.requests(), 0)
+		testassert.Equal(t, len(hook.calls()), 0)
+		{
+			ops, ags := opOpens.Load(), agOpens.Load()
+			testassert.Require(t, ops == 0 && ags == 0, "short-scope factory opens = %d/%d, want none: the sweep admits no model work", ops, ags)
 		}
 		assertNoOperationRegisters(t, wrapped, id)
-		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-			t.Fatalf("boundary passes reported diagnostics: %q", out)
+		{
+			out := stderr()
+			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "boundary passes reported diagnostics: %q", out)
 		}
 	})
 }
@@ -562,32 +511,26 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				opts := e.options(e.storagePlugin(wrapped))
 				opts.sweepTicks = ticks
 				r, err := open(context.Background(), opts)
-				if err != nil {
-					t.Fatalf("open: %v", err)
-				}
+				testassert.NoError(t, err)
 				created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-				if err != nil {
-					t.Fatalf("createSession: %v", err)
-				}
+				testassert.NoError(t, err)
 				stderr := captureSweepStderr(t)
 				wrapped.armFailOnce(tc.failure)
 				tick := created.State.LastActivity.Add(100 * time.Hour)
 				sendTick(t, ticks, tick) // this pass lists, fails, and reports
 				sendTick(t, ticks, tick) // the rendezvous proves the failed pass converged; this pass sweeps again
 				waitWritten(t, wrapped)  // the later tick committed the archive
-				if rec, err := readSweptSession(t, r, created.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
-					t.Fatalf("Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
+				{
+					rec, err := readSweptSession(t, r, created.Identity.SessionID)
+					testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "Session after the later tick = %+v err %v, want the failed pass to leave no lasting damage", rec, err)
 				}
-				if err := r.Close(context.Background()); err != nil {
-					t.Fatalf("Close: %v", err)
-				}
+				testassert.NoError(t, r.Close(context.Background()))
 				out := stderr()
-				if n := strings.Count(out, "lightcode: sweep: "+tc.failure.Error()); n != 1 {
-					t.Fatalf("stderr sweep diagnostics = %d in %q, want the failed pass reported exactly once", n, out)
+				{
+					n := strings.Count(out, "lightcode: sweep: "+tc.failure.Error())
+					testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want the failed pass reported exactly once", n, out)
 				}
-				if got := wrapped.listCount(); got != 4 {
-					t.Fatalf("storage lists = %d, want recovery, the initial pass, one failing pass, and one later pass: no immediate retry", got)
-				}
+				testassert.Equal(t, wrapped.listCount(), 4)
 			})
 		})
 	}
@@ -609,13 +552,9 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			opts := e.options(e.storagePlugin(wrapped))
 			opts.sweepTicks = ticks
 			r, err := open(context.Background(), opts)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-			if err != nil {
-				t.Fatalf("createSession: %v", err)
-			}
+			testassert.NoError(t, err)
 			stderr := captureSweepStderr(t)
 			wrapped.armBlock()
 			sendTick(t, ticks, created.State.LastActivity.Add(100*time.Hour))
@@ -630,8 +569,9 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 				t.Fatal("shutdown converged while a sweep pass was blocked inside a storage transaction")
 			case <-time.After(200 * time.Millisecond):
 			}
-			if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
-				t.Fatal("the Core storage closed while a sweep pass was still admitted")
+			{
+				events := eventNames(e.events.all())
+				testassert.Require(t, !slices.Contains(events, "close:core"), "the Core storage closed while a sweep pass was still admitted")
 			}
 			wrapped.releaseBlock()
 			select {
@@ -639,11 +579,10 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			case <-time.After(10 * time.Second):
 				t.Fatal("the shutdown never joined the released sweep pass")
 			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("Close = %v, want the joined shutdown to succeed with the pass error kept out of the owner result", err)
-			}
-			if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-				t.Fatalf("the canceled pass reported to stderr: %q, want cancellation joined silently", out)
+			testassert.NoError(t, r.Close(context.Background()))
+			{
+				out := stderr()
+				testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the canceled pass reported to stderr: %q, want cancellation joined silently", out)
 			}
 			e.assertLockReleased(t)
 		}
@@ -669,13 +608,9 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			opts.sweepTicks = ticks
 			ctx := newDeadlineContext()
 			r, err := open(ctx, opts)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-			if err != nil {
-				t.Fatalf("createSession: %v", err)
-			}
+			testassert.NoError(t, err)
 			stderr := captureSweepStderr(t)
 			wrapped.armBlock()
 			sendTick(t, ticks, created.State.LastActivity.Add(100*time.Hour))
@@ -698,11 +633,10 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			case <-time.After(10 * time.Second):
 				t.Fatal("the deadline-started shutdown never joined the released sweep pass")
 			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("Close = %v, want the joined deadline cancellation to succeed with the pass error kept out of the owner result", err)
-			}
-			if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-				t.Fatalf("the deadline-canceled pass reported to stderr: %q, want deadline expiry silent like cancellation", out)
+			testassert.NoError(t, r.Close(context.Background()))
+			{
+				out := stderr()
+				testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the deadline-canceled pass reported to stderr: %q, want deadline expiry silent like cancellation", out)
 			}
 			e.assertLockReleased(t)
 		})
@@ -724,13 +658,9 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 		opts := e.options(e.storagePlugin(wrapped))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		stderr := captureSweepStderr(t)
 		unrelated := errors.New("test unrelated store failure")
 		wrapped.armFailAfterRelease(unrelated)
@@ -752,11 +682,10 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 		case <-time.After(10 * time.Second):
 			t.Fatal("the shutdown never joined the released sweep pass")
 		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close = %v, want the joined shutdown to succeed with the pass error kept out of the owner result", err)
-		}
-		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-			t.Fatalf("the shutdown-observed unrelated failure reported to stderr: %q, want silence once shutdown is observed", out)
+		testassert.NoError(t, r.Close(context.Background()))
+		{
+			out := stderr()
+			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the shutdown-observed unrelated failure reported to stderr: %q, want silence once shutdown is observed", out)
 		}
 		e.assertLockReleased(t)
 	})
@@ -772,20 +701,15 @@ func TestMaintenanceGateRejectionIsQuiet(t *testing.T) {
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
 		r, err := e.open(context.Background(), e.storagePlugin(wrapped))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(context.Background()))
 		stderr := captureSweepStderr(t)
 		before := wrapped.listCount()
 		r.runSweepPass(context.Background(), time.Now())
-		if got := wrapped.listCount(); got != before {
-			t.Fatalf("storage lists = %d, want the gate rejection to leave the store untouched (was %d)", got, before)
-		}
-		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-			t.Fatalf("the gate-rejected pass reported to stderr: %q, want ErrClosed quiet", out)
+		testassert.Equal(t, wrapped.listCount(), before)
+		{
+			out := stderr()
+			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the gate-rejected pass reported to stderr: %q, want ErrClosed quiet", out)
 		}
 	})
 }
@@ -803,17 +727,11 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		opts := e.options(e.storagePlugin(wrapped), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		busy, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "busy"), "solo")
-		if err != nil {
-			t.Fatalf("createSession busy: %v", err)
-		}
+		testassert.NoError(t, err)
 		idle, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "idle"), "solo")
-		if err != nil {
-			t.Fatalf("createSession idle: %v", err)
-		}
+		testassert.NoError(t, err)
 		gate := make(chan struct{})
 		e.server.setHold(gate)
 		submitThroughRuntime(t, r, busy.Identity.SessionID, "op-busy", "work")
@@ -827,22 +745,18 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		sendTick(t, ticks, tick)
 		sendTick(t, ticks, tick) // returns once the first pass fully converged
 		after := readSweepRegister(t, wrapped, busy.Identity.SessionID)
-		if after.Revision != before.Revision || !bytes.Equal(after.Payload, before.Payload) {
-			t.Fatalf("the sweep changed the running Session's register (%d -> %d), want it left unchanged", before.Revision, after.Revision)
+		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "the sweep changed the running Session's register (%d -> %d), want it left unchanged", before.Revision, after.Revision)
+		{
+			rec, err := readSweptSession(t, r, idle.Identity.SessionID)
+			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "idle sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
-		if rec, err := readSweptSession(t, r, idle.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("idle sibling after the sweep = %+v err %v, want it archived", rec, err)
-		}
-		if got := e.server.requests(); got != 1 {
-			t.Fatalf("HTTP requests = %d, want only the explicit submit: the sweep admitted no model work", got)
-		}
+		testassert.Equal(t, e.server.requests(), 1)
 		close(gate)
-		if op := awaitOperation(t, r, busy.Identity.SessionID, "op-busy", harness.OperationSuccess); op.State.Status != harness.OperationSuccess {
-			t.Fatalf("Operation during the sweep = %+v, want the untouched success terminal", op.State)
+		{
+			op := awaitOperation(t, r, busy.Identity.SessionID, "op-busy", harness.OperationSuccess)
+			testassert.Require(t, op.State.Status == harness.OperationSuccess, "Operation during the sweep = %+v, want the untouched success terminal", op.State)
 		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -861,17 +775,11 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		opts := e.options(e.storagePlugin(wrapped))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		corrupted, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "bad"), "solo")
-		if err != nil {
-			t.Fatalf("createSession bad: %v", err)
-		}
+		testassert.NoError(t, err)
 		valid, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "good"), "solo")
-		if err != nil {
-			t.Fatalf("createSession good: %v", err)
-		}
+		testassert.NoError(t, err)
 		bad := rewriteSessionRegister(t, wrapped, corrupted.Identity.SessionID, func(state map[string]json.RawMessage) {
 			state["lifecycle"] = json.RawMessage(`"bogus"`)
 		})
@@ -884,47 +792,46 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		const malformed = "corrupt-id"                        // non-empty, not the durable 32-hex shape
 		const preCorrupt = "fedcba9876543210fedcba9876543210" // valid hex, corrupt register
 		for _, row := range []string{malformed, preCorrupt} {
-			if err := wrapped.Transact(context.Background(), func(tx harness.Transaction) error {
-				_, err := tx.InsertRegister(harness.RegisterDraft{
-					Key:     harness.RegisterKey{SessionID: row, Kind: harness.RegisterSession},
-					Payload: json.RawMessage(`{}`),
+			{
+				err := wrapped.Transact(context.Background(), func(tx harness.Transaction) error {
+					_, err := tx.InsertRegister(harness.RegisterDraft{
+						Key:     harness.RegisterKey{SessionID: row, Kind: harness.RegisterSession},
+						Payload: json.RawMessage(`{}`),
+					})
+					return err
 				})
-				return err
-			}); err != nil {
-				t.Fatalf("plant row %q: %v", row, err)
+				testassert.Require(t, err == nil, "plant row %q: %v", row, err)
 			}
 		}
 		stderr := captureSweepStderr(t)
 		tick := valid.State.LastActivity.Add(100 * time.Hour)
 		sendTick(t, ticks, tick)
 		sendTick(t, ticks, tick)
-		if rec, err := readSweptSession(t, r, valid.Identity.SessionID); err != nil || rec.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("valid sibling after the sweep = %+v err %v, want it archived", rec, err)
+		{
+			rec, err := readSweptSession(t, r, valid.Identity.SessionID)
+			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "valid sibling after the sweep = %+v err %v, want it archived", rec, err)
 		}
 		// Shutdown still converges — Close returns, joining the latched
 		// corruption of the planted corrupt Session as reporting, not as a
 		// failure to converge.
 		err = r.Close(context.Background())
-		if err == nil {
-			t.Fatal("Close = nil, want the joined corruption error for the planted corrupt Session")
-		}
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("Close error = %v, want the corruption-class error", err)
-		}
+		testassert.Require(t, err != nil, "Close = nil, want the joined corruption error for the planted corrupt Session")
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "Close error = %v, want the corruption-class error", err)
 		var corrupt *harness.CorruptionError
-		if !errors.As(err, &corrupt) || corrupt.SessionID != corrupted.Identity.SessionID {
-			t.Fatalf("Close error = %v, want CorruptionError for session %s", err, corrupted.Identity.SessionID)
-		}
-		if after := readSweepRegister(t, wrapped, corrupted.Identity.SessionID); after.Revision != bad.Revision || !bytes.Equal(after.Payload, bad.Payload) {
-			t.Fatalf("the sweep changed the corrupt register (%d -> %d), want it left in place", bad.Revision, after.Revision)
+		testassert.Require(t, errors.As(err, &corrupt) && corrupt.SessionID == corrupted.Identity.SessionID, "Close error = %v, want CorruptionError for session %s", err, corrupted.Identity.SessionID)
+		{
+			after := readSweepRegister(t, wrapped, corrupted.Identity.SessionID)
+			testassert.Require(t, after.Revision == bad.Revision && bytes.Equal(after.Payload, bad.Payload), "the sweep changed the corrupt register (%d -> %d), want it left in place", bad.Revision, after.Revision)
 		}
 		for _, id := range []string{malformed, preCorrupt} {
-			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); err != nil {
-				t.Fatalf("omitted row %s after the pass = err %v, want it left in place", id, err)
+			{
+				_, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+				testassert.Require(t, err == nil, "omitted row %s after the pass = err %v, want it left in place", id, err)
 			}
 		}
-		if out := stderr(); strings.Contains(out, "lightcode: sweep:") {
-			t.Fatalf("the corrupt sibling was reported as a pass failure: %q", out)
+		{
+			out := stderr()
+			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the corrupt sibling was reported as a pass failure: %q", out)
 		}
 	})
 }
@@ -939,30 +846,18 @@ func TestMaintenanceNonpositiveThresholdsDisableTheirTransitions(t *testing.T) {
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
 		wrapped := newSweepStore(store)
 		r, err := e.open(context.Background(), e.storagePlugin(wrapped))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		if got := wrapped.listCount(); got != 2 {
-			t.Fatalf("storage lists after startup = %d, want recovery plus exactly one initial pass: zero thresholds still schedule the sweep", got)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, wrapped.listCount(), 2)
 		var payload struct {
 			State struct {
 				Lifecycle string `json:"lifecycle"`
 			} `json:"state"`
 		}
 		reg := readSweepRegister(t, wrapped, seeded)
-		if err := json.Unmarshal(reg.Payload, &payload); err != nil {
-			t.Fatalf("unmarshal seeded payload: %v", err)
-		}
-		if payload.State.Lifecycle != string(harness.LifecycleOpen) {
-			t.Fatalf("stale Session lifecycle after a zero-threshold pass = %q, want it unchanged open", payload.State.Lifecycle)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if got := wrapped.listCount(); got != 2 {
-			t.Fatalf("storage lists after Close = %d, want no pass beyond the initial one", got)
-		}
+		testassert.NoError(t, json.Unmarshal(reg.Payload, &payload))
+		testassert.Require(t, payload.State.Lifecycle == string(harness.LifecycleOpen), "stale Session lifecycle after a zero-threshold pass = %q, want it unchanged open", payload.State.Lifecycle)
+		testassert.NoError(t, r.Close(context.Background()))
+		testassert.Equal(t, wrapped.listCount(), 2)
 	})
 }
 
@@ -1050,34 +945,28 @@ func seedStaleArchivedSession(t *testing.T, store harness.Storage, workspace str
 func plantSessionCode(t *testing.T, dataDir, sessionID string) string {
 	t.Helper()
 	root := filepath.Join(dataDir, "code", sessionID)
-	if err := os.MkdirAll(filepath.Join(root, "snapshots", "op-1"), 0o755); err != nil {
-		t.Fatalf("plant snapshot group: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "snapshots", "op-1", "snapshot.txt"), []byte("snapshot"), 0o644); err != nil {
-		t.Fatalf("plant snapshot: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, "output"), 0o755); err != nil {
-		t.Fatalf("plant output directory: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "output", "spill.txt"), []byte("spill"), 0o644); err != nil {
-		t.Fatalf("plant spill: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", "op-1"), 0o755))
+	testassert.NoError(t, os.WriteFile(filepath.Join(root, "snapshots", "op-1", "snapshot.txt"), []byte("snapshot"), 0o644))
+	testassert.NoError(t, os.MkdirAll(filepath.Join(root, "output"), 0o755))
+	testassert.NoError(t, os.WriteFile(filepath.Join(root, "output", "spill.txt"), []byte("spill"), 0o644))
 	return root
 }
 
 // mustNotExist asserts one filesystem path is absent.
 func mustNotExist(t *testing.T, path, what string) {
 	t.Helper()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("%s = err %v, want it removed", what, err)
+	{
+		_, err := os.Stat(path)
+		testassert.Require(t, os.IsNotExist(err), "%s = err %v, want it removed", what, err)
 	}
 }
 
 // mustExist asserts one filesystem path is present.
 func mustExist(t *testing.T, path, what string) {
 	t.Helper()
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("%s = err %v, want it present", what, err)
+	{
+		_, err := os.Stat(path)
+		testassert.Require(t, err == nil, "%s = err %v, want it present", what, err)
 	}
 }
 
@@ -1091,91 +980,73 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		e := newOwnerEnv(t)
 		ctx := context.Background()
 		r, err := e.open(ctx, e.storagePlugin(store))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		archive := func(sessionID string) {
 			t.Helper()
-			if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ArchiveSession(ctx, sessionID)
-				return err
-			}); err != nil {
-				t.Fatalf("archive %s: %v", sessionID, err)
+			{
+				err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+					_, err := h.ArchiveSession(ctx, sessionID)
+					return err
+				})
+				testassert.Require(t, err == nil, "archive %s: %v", sessionID, err)
 			}
 		}
 
 		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		archivedID := archived.Identity.SessionID
 		archive(archivedID)
 		archivedCode := plantSessionCode(t, e.dataDir, archivedID)
 
 		sibling, err := r.createSession(ctx, filepath.Join(e.dataDir, "sibling"), "solo")
-		if err != nil {
-			t.Fatalf("create sibling: %v", err)
-		}
+		testassert.NoError(t, err)
 		siblingCode := plantSessionCode(t, e.dataDir, sibling.Identity.SessionID)
 		unrelated := filepath.Join(e.dataDir, "unrelated.txt")
-		if err := os.WriteFile(unrelated, []byte("keep"), 0o644); err != nil {
-			t.Fatalf("plant unrelated content: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(unrelated, []byte("keep"), 0o644))
 
-		if err := r.deleteSession(ctx, archivedID); err != nil {
-			t.Fatalf("deleteSession of an archived session: %v", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, archivedID))
 		mustNotExist(t, archivedCode, "the deleted session's artifact tree")
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.ReadSessionHeader(ctx, archivedID)
-			return err
-		}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("read after delete = err %v, want ErrNotFound", err)
+		{
+			err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				_, err := h.ReadSessionHeader(ctx, archivedID)
+				return err
+			})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after delete = err %v, want ErrNotFound", err)
 		}
 
 		// the repeated delete is the same idempotent result with no artifacts left to clean
-		if err := r.deleteSession(ctx, archivedID); err != nil {
-			t.Fatalf("repeated deleteSession = err %v, want the idempotent cleanup success", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, archivedID))
 
 		// canonical deletion with no artifact directory at all is already clean
 		bare, err := r.createSession(ctx, filepath.Join(e.dataDir, "bare"), "solo")
-		if err != nil {
-			t.Fatalf("create for the missing-artifacts row: %v", err)
-		}
+		testassert.NoError(t, err)
 		archive(bare.Identity.SessionID)
-		if err := r.deleteSession(ctx, bare.Identity.SessionID); err != nil {
-			t.Fatalf("deleteSession with no artifact directory = err %v, want nil", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
 
 		// an unknown valid identity with planted artifacts still cleans them
 		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
 		ghostCode := plantSessionCode(t, e.dataDir, ghost)
-		if err := r.deleteSession(ctx, ghost); err != nil {
-			t.Fatalf("deleteSession of an unknown valid identity = err %v, want the cleanup success", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, ghost))
 		mustNotExist(t, ghostCode, "the unknown identity's artifacts")
 
 		// invalid and uncommitted deletions remove nothing
 		open, err := r.createSession(ctx, filepath.Join(e.dataDir, "open"), "solo")
-		if err != nil {
-			t.Fatalf("create open: %v", err)
-		}
+		testassert.NoError(t, err)
 		openCode := plantSessionCode(t, e.dataDir, open.Identity.SessionID)
-		if err := r.deleteSession(ctx, open.Identity.SessionID); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("deleteSession of an open session = err %v, want ErrInvalid", err)
+		{
+			err := r.deleteSession(ctx, open.Identity.SessionID)
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of an open session = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, openCode, "the open session's artifacts after the rejected delete")
-		if err := r.deleteSession(ctx, "not-a-session-id"); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("deleteSession of a malformed identity = err %v, want ErrInvalid", err)
+		{
+			err := r.deleteSession(ctx, "not-a-session-id")
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of a malformed identity = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, siblingCode, "the sibling session's artifacts after the malformed delete")
 
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -1190,20 +1061,14 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 		ctx := context.Background()
 		blocked := newTargetedBlockStore(store)
 		r, err := open(ctx, e.options(e.storagePlugin(blocked)))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		id := archived.Identity.SessionID
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			_, err := h.ArchiveSession(ctx, id)
 			return err
-		}); err != nil {
-			t.Fatalf("archive: %v", err)
-		}
+		}))
 		code := plantSessionCode(t, e.dataDir, id)
 
 		blocked.block(id)
@@ -1223,22 +1088,20 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 			t.Fatal("shutdown converged while the direct deletion's admission was still held")
 		case <-time.After(200 * time.Millisecond):
 		}
-		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
-			t.Fatal("the Core storage closed while the direct deletion was still admitted")
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, !slices.Contains(events, "close:core"), "the Core storage closed while the direct deletion was still admitted")
 		}
 
 		blocked.releaseBlock()
-		if err := <-done; err != nil {
-			t.Fatalf("deleteSession after the release: %v", err)
-		}
+		testassert.NoError(t, <-done)
 		<-closeDone
 		mustNotExist(t, code, "the artifact tree after the joined deletion")
-		if _, err := blocked.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("deleted session register = err %v, want ErrNotFound", err)
+		{
+			_, err := blocked.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted session register = err %v, want ErrNotFound", err)
 		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -1251,41 +1114,31 @@ func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 		e := newOwnerEnv(t)
 		ctx := context.Background()
 		r, err := e.open(ctx, e.storagePlugin(store))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		id := archived.Identity.SessionID
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			_, err := h.ArchiveSession(ctx, id)
 			return err
-		}); err != nil {
-			t.Fatalf("archive: %v", err)
-		}
+		}))
 		code := plantSessionCode(t, e.dataDir, id)
 		codeRoot := filepath.Join(e.dataDir, "code")
 		if os.Geteuid() == 0 {
 			t.Skip("directory permissions do not block writes as root")
 		}
-		if err := os.Chmod(codeRoot, 0o555); err != nil { // denies the removal of the Session's tree: the cleanup fails
-			t.Fatalf("chmod the code root: %v", err)
-		}
+		// denies the removal of the Session's tree: the cleanup fails
+		testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
 		delErr := r.deleteSession(ctx, id)
-		if delErr == nil || !strings.Contains(delErr.Error(), code) {
-			t.Fatalf("deleteSession with a failing cleanup = err %v, want the removal error naming the blocked tree", delErr)
-		}
-		if _, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("register after the failed cleanup = err %v, want it gone: the deletion stays committed", err)
+		testassert.Require(t, delErr != nil && strings.Contains(delErr.Error(), code), "deleteSession with a failing cleanup = err %v, want the removal error naming the blocked tree", delErr)
+		{
+			_, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after the failed cleanup = err %v, want it gone: the deletion stays committed", err)
 		}
 
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -1307,33 +1160,29 @@ func TestMaintenanceSweepCleansCommittedSessions(t *testing.T) {
 		firstCode := plantSessionCode(t, e.dataDir, first)
 		secondCode := plantSessionCode(t, e.dataDir, second)
 		codeKeep := filepath.Join(e.dataDir, "code", "keep.txt")
-		if err := os.WriteFile(codeKeep, []byte("keep"), 0o644); err != nil {
-			t.Fatalf("plant code-root content: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(codeKeep, []byte("keep"), 0o644))
 
 		wrapped := newSweepStore(store)
 		wrapped.armDeleteTarget(second)
 		stderr := captureSweepStderr(t)
 		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		mustNotExist(t, firstCode, "the committed deletion's artifacts despite the stopping pass error")
 		mustExist(t, secondCode, "the rolled-back deletion's artifacts")
 		mustExist(t, codeKeep, "unrelated code-root content")
-		if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: first, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("committed deletion's register = err %v, want ErrNotFound", err)
+		{
+			_, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: first, Kind: harness.RegisterSession})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "committed deletion's register = err %v, want ErrNotFound", err)
 		}
 		readSweepRegister(t, wrapped, second) // the rolled-back deletion left the Session present
 
 		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep: "+errSweepRollback.Error()); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line reporting the stopping pass error", n, out)
+		{
+			n := strings.Count(out, "lightcode: sweep: "+errSweepRollback.Error())
+			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line reporting the stopping pass error", n, out)
 		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1357,29 +1206,23 @@ func TestMaintenanceSweepJoinsPassAndCleanupErrorsInOneDiagnostic(t *testing.T) 
 			t.Skip("directory permissions do not block writes as root")
 		}
 		codeRoot := filepath.Join(e.dataDir, "code")
-		if err := os.Chmod(codeRoot, 0o555); err != nil { // denies the committed deletion's cleanup
-			t.Fatalf("chmod the code root: %v", err)
-		}
+		// denies the committed deletion's cleanup
+		testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
 		wrapped := newSweepStore(store)
 		wrapped.armDeleteTarget(second)
 		stderr := captureSweepStderr(t)
 		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want exactly one line for the whole pass", n, out)
+		{
+			n := strings.Count(out, "lightcode: sweep:")
+			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want exactly one line for the whole pass", n, out)
 		}
-		if !strings.Contains(out, errSweepRollback.Error()) || !strings.Contains(out, firstCode) {
-			t.Fatalf("stderr sweep diagnostic %q, want it to carry both the stopping pass error and the failing cleanup", out)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, strings.Contains(out, errSweepRollback.Error()) && strings.Contains(out, firstCode), "stderr sweep diagnostic %q, want it to carry both the stopping pass error and the failing cleanup", out)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1399,35 +1242,29 @@ func TestMaintenanceSweepReportsCleanupErrorsAndAttemptsEveryID(t *testing.T) {
 			t.Skip("directory permissions do not block writes as root")
 		}
 		blocked := filepath.Join(aCode, "snapshots") // denies the removal of its contents: the cleanup of a fails
-		if err := os.Chmod(blocked, 0o555); err != nil {
-			t.Fatalf("chmod the blocked directory: %v", err)
-		}
+		testassert.NoError(t, os.Chmod(blocked, 0o555))
 		t.Cleanup(func() { os.Chmod(blocked, 0o755) })
 
 		stderr := captureSweepStderr(t)
 		r, err := open(context.Background(), e.options(e.storagePlugin(store)))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		for _, id := range []string{a, b} { // committed deletions are never rolled back
-			if _, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("committed deletion of %s = err %v, want the register gone despite the cleanup failure", id, err)
+			{
+				_, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "committed deletion of %s = err %v, want the register gone despite the cleanup failure", id, err)
 			}
 		}
 		mustExist(t, filepath.Join(aCode, "snapshots", "op-1"), "the failing cleanup's blocked directory")
 		mustNotExist(t, bCode, "the succeeding cleanup's artifact tree")
 
 		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
+		{
+			n := strings.Count(out, "lightcode: sweep:")
+			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
 		}
-		if !strings.Contains(out, filepath.Join(aCode, "snapshots")) {
-			t.Fatalf("stderr sweep diagnostic %q, want it to report the failing cleanup's path", out)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, strings.Contains(out, filepath.Join(aCode, "snapshots")), "stderr sweep diagnostic %q, want it to report the failing cleanup's path", out)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1455,12 +1292,11 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		opts := e.options(e.storagePlugin(blocked))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 
 		blocked.block(second)
@@ -1479,8 +1315,9 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 			t.Fatal("shutdown converged while the pass's cleanup admission was still held")
 		case <-time.After(200 * time.Millisecond):
 		}
-		if events := eventNames(e.events.all()); slices.Contains(events, "close:core") {
-			t.Fatal("the Core storage closed while the sweep cleanup was still admitted")
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, !slices.Contains(events, "close:core"), "the Core storage closed while the sweep cleanup was still admitted")
 		}
 
 		blocked.releaseBlock()
@@ -1490,9 +1327,7 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 			t.Fatal("the shutdown never joined the released pass")
 		}
 		mustNotExist(t, firstCode, "the committed deletion's artifacts after the joined pass")
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1518,19 +1353,16 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		opts := e.options(e.storagePlugin(wrapped))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := r.Close(context.Background()); err != nil {
-				t.Errorf("Close: %v", err)
+			{
+				err := r.Close(context.Background())
+				testassert.Check(t, err == nil, "Close: %v", err)
 			}
 		}()
 
 		keeper, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "keeper"), "solo")
-		if err != nil {
-			t.Fatalf("createSession(keeper): %v", err)
-		}
+		testassert.NoError(t, err)
 		keeperID := keeper.Identity.SessionID
 		seed := func(sessionID, kind string) {
 			id := sessionID
@@ -1542,15 +1374,14 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		seed(keeperID, "keeper")
 
 		sub, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(sub.Close)
 		baseRevision, _ := r.warnings.snapshot()
 
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		wrapped.armDeleteTarget(third)
 		stderr := captureSweepStderr(t)
@@ -1563,40 +1394,36 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		var hint *protocol.WarningChangedEvent
 		for hint == nil {
 			event, ok := nextEvent(t, sub)
-			if !ok {
-				t.Fatal("the subscription closed before the sweep's warning hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the sweep's warning hint")
 			if eventKind(t, event) != "warning_changed" {
 				continue
 			}
 			body, err := event.AsWarningChangedEvent()
-			if err != nil {
-				t.Fatalf("warning event body: %v", err)
-			}
-			if scopeKind(t, body.Scope) != "runtime" {
-				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, scopeKind(t, body.Scope) == "runtime", "sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
 			hint = &body
 		}
-		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
-			t.Fatalf("sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
-		}
+		testassert.Require(t, hint.WarningsRevision.Revision == strconv.FormatUint(baseRevision+1, 10), "sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
 		assertNoEvent(t, sub)
 
 		for _, id := range []string{first, second} {
-			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("committed deletion of %s = err %v, want the register gone", id, err)
+			{
+				_, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "committed deletion of %s = err %v, want the register gone", id, err)
 			}
-			if _, warnings := r.warnings.snapshot(); sessionWarningPresent(warnings, id) {
-				t.Fatalf("committed deletion of %s kept its warning group: %+v", id, warnings)
+			{
+				_, warnings := r.warnings.snapshot()
+				testassert.Require(t, !sessionWarningPresent(warnings, id), "committed deletion of %s kept its warning group: %+v", id, warnings)
 			}
 		}
 		readSweepRegister(t, wrapped, third)
-		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, third) {
-			t.Fatalf("the rolled-back deletion dropped its warning group")
+		{
+			_, warnings := r.warnings.snapshot()
+			testassert.Require(t, sessionWarningPresent(warnings, third), "the rolled-back deletion dropped its warning group")
 		}
-		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, keeperID) {
-			t.Fatalf("the unrelated Session's warning group was removed")
+		{
+			_, warnings := r.warnings.snapshot()
+			testassert.Require(t, sessionWarningPresent(warnings, keeperID), "the unrelated Session's warning group was removed")
 		}
 
 		// The pass error's one retained diagnostic may land just after the
@@ -1606,8 +1433,9 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 			time.Sleep(5 * time.Millisecond)
 		}
 		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep:"); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
+		{
+			n := strings.Count(out, "lightcode: sweep:")
+			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
 		}
 	})
 }
@@ -1637,19 +1465,16 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		opts := e.options(e.storagePlugin(wrapped))
 		opts.sweepTicks = ticks
 		r, err := open(context.Background(), opts)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := r.Close(context.Background()); err != nil {
-				t.Errorf("Close: %v", err)
+			{
+				err := r.Close(context.Background())
+				testassert.Check(t, err == nil, "Close: %v", err)
 			}
 		}()
 
 		keeper, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "keeper"), "solo")
-		if err != nil {
-			t.Fatalf("createSession(keeper): %v", err)
-		}
+		testassert.NoError(t, err)
 		keeperID := keeper.Identity.SessionID
 		seed := func(sessionID, kind string) {
 			id := sessionID
@@ -1661,15 +1486,14 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		seed(keeperID, "keeper")
 
 		sub, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(sub.Close)
 		baseRevision, _ := r.warnings.snapshot()
 
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		readFailure := errors.New("test sweep register read failure")
 		wrapped.armReadFailure(third, readFailure)
@@ -1682,47 +1506,44 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		var hint *protocol.WarningChangedEvent
 		for hint == nil {
 			event, ok := nextEvent(t, sub)
-			if !ok {
-				t.Fatal("the subscription closed before the sweep's warning hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the sweep's warning hint")
 			if eventKind(t, event) != "warning_changed" {
 				continue
 			}
 			body, err := event.AsWarningChangedEvent()
-			if err != nil {
-				t.Fatalf("warning event body: %v", err)
-			}
-			if scopeKind(t, body.Scope) != "runtime" {
-				t.Fatalf("sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, scopeKind(t, body.Scope) == "runtime", "sweep warning hint scope = %+v, want one runtime-scoped hint for the batch", body.Scope)
 			hint = &body
 		}
-		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
-			t.Fatalf("sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
-		}
+		testassert.Require(t, hint.WarningsRevision.Revision == strconv.FormatUint(baseRevision+1, 10), "sweep warning hint revision = %q, want one advance from %d", hint.WarningsRevision.Revision, baseRevision)
 		assertNoEvent(t, sub)
 
 		mustNotExist(t, firstCode, "the first committed deletion's artifacts despite the stopping read failure")
 		mustNotExist(t, secondCode, "the second committed deletion's artifacts despite the stopping read failure")
 		mustExist(t, thirdCode, "the unreadable candidate's artifacts")
 		for _, id := range []string{first, second} {
-			if _, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession}); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("committed deletion of %s = err %v, want the register gone", id, err)
+			{
+				_, err := wrapped.ReadRegister(context.Background(), harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "committed deletion of %s = err %v, want the register gone", id, err)
 			}
-			if _, warnings := r.warnings.snapshot(); sessionWarningPresent(warnings, id) {
-				t.Fatalf("committed deletion of %s kept its warning group: %+v", id, warnings)
+			{
+				_, warnings := r.warnings.snapshot()
+				testassert.Require(t, !sessionWarningPresent(warnings, id), "committed deletion of %s kept its warning group: %+v", id, warnings)
 			}
 		}
 		readSweepRegister(t, wrapped, third) // the unreadable candidate stays present for the next pass
-		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, third) {
-			t.Fatalf("the unreadable candidate dropped its warning group")
+		{
+			_, warnings := r.warnings.snapshot()
+			testassert.Require(t, sessionWarningPresent(warnings, third), "the unreadable candidate dropped its warning group")
 		}
-		if _, warnings := r.warnings.snapshot(); !sessionWarningPresent(warnings, keeperID) {
-			t.Fatalf("the unrelated Session's warning group was removed")
+		{
+			_, warnings := r.warnings.snapshot()
+			testassert.Require(t, sessionWarningPresent(warnings, keeperID), "the unrelated Session's warning group was removed")
 		}
 		wrapped.disarmReadFailure(third) // the transient read failure is retryable, never latched
-		if rec, err := readSweptSession(t, r, third); err != nil || rec.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("the unreadable candidate after the pass = %+v err %v, want it left readable and archived", rec, err)
+		{
+			rec, err := readSweptSession(t, r, third)
+			testassert.Require(t, err == nil && rec.Lifecycle == harness.LifecycleArchived, "the unreadable candidate after the pass = %+v err %v, want it left readable and archived", rec, err)
 		}
 
 		// The pass error's one retained diagnostic may land just after the
@@ -1732,8 +1553,9 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		out := stderr()
-		if n := strings.Count(out, "lightcode: sweep: "+readFailure.Error()); n != 1 {
-			t.Fatalf("stderr sweep diagnostics = %d in %q, want one line reporting the stopping read failure", n, out)
+		{
+			n := strings.Count(out, "lightcode: sweep: "+readFailure.Error())
+			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line reporting the stopping read failure", n, out)
 		}
 	})
 }
@@ -1749,28 +1571,24 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		ctx := context.Background()
 		r, err := e.open(ctx, e.storagePlugin(store), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		heldWorkspace := filepath.Join(e.dataDir, "held-ws")
-		if err := os.MkdirAll(heldWorkspace, 0o700); err != nil {
-			t.Fatalf("mkdir held workspace: %v", err)
-		}
+		testassert.NoError(t, os.MkdirAll(heldWorkspace, 0o700))
 		held := projectionSession(t, r, heldWorkspace, "solo").Identity.SessionID
 		op := submitCodeOperation(t, r, held, "op-1", "held")
 		file := filepath.Join(heldWorkspace, "held.txt")
-		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
-			t.Fatalf("write v1: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
 		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, held, op.Admission.AdmittedEntry.EntryID), file, "v1")
-		if _, err := r.archiveSession(ctx, held); err != nil {
-			t.Fatalf("archive the held session: %v", err)
+		{
+			_, err := r.archiveSession(ctx, held)
+			testassert.NoError(t, err)
 		}
 		heldCode := filepath.Join(e.dataDir, "code", held)
 
 		sibling := projectionSession(t, r, filepath.Join(e.dataDir, "swept-ws"), "solo").Identity.SessionID
-		if _, err := r.archiveSession(ctx, sibling); err != nil {
-			t.Fatalf("archive the sibling session: %v", err)
+		{
+			_, err := r.archiveSession(ctx, sibling)
+			testassert.NoError(t, err)
 		}
 		siblingCode := plantSessionCode(t, e.dataDir, sibling)
 
@@ -1780,17 +1598,21 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 
 		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
 
-		if _, err := os.Stat(siblingCode); !os.IsNotExist(err) {
-			t.Fatalf("sibling artifacts = %v, want them swept by the pass", err)
+		{
+			_, err := os.Stat(siblingCode)
+			testassert.Require(t, os.IsNotExist(err), "sibling artifacts = %v, want them swept by the pass", err)
 		}
-		if err := headerErrorThroughRuntime(ctx, r, sibling); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("sibling after the pass = %v, want the committed deletion", err)
+		{
+			err := headerErrorThroughRuntime(ctx, r, sibling)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "sibling after the pass = %v, want the committed deletion", err)
 		}
-		if _, err := os.Stat(heldCode); err != nil {
-			t.Fatalf("held artifacts after the pass = %v, want them intact", err)
+		{
+			_, err := os.Stat(heldCode)
+			testassert.NoError(t, err)
 		}
-		if header := headerThroughRuntime(t, r, held); header.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("held candidate lifecycle = %v, want it left archived", header.Lifecycle)
+		{
+			header := headerThroughRuntime(t, r, held)
+			testassert.Equal(t, header.Lifecycle, harness.LifecycleArchived)
 		}
 
 		park.release("restored")
@@ -1800,23 +1622,18 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the parked restore never returned after its FIFO completed")
 		}
-		if parked.err != nil {
-			t.Fatalf("parked restore = %v", parked.err)
-		}
-		if len(parked.result.Restored) != 1 || parked.result.Restored[0] != file {
-			t.Fatalf("restored = %v, want the parked group's restore", parked.result.Restored)
-		}
+		testassert.Require(t, parked.err == nil && len(parked.result.Restored) == 1 && parked.result.Restored[0] == file, "parked restore = %v; restored = %v, want the parked group's restore", parked.err, parked.result.Restored)
 
 		// A later pass owns the interval and completes the deletion.
 		r.runSweepPass(ctx, time.Now().Add(200*time.Hour))
-		if _, err := os.Stat(heldCode); !os.IsNotExist(err) {
-			t.Fatalf("held artifacts after the later pass = %v, want them removed", err)
+		{
+			_, err := os.Stat(heldCode)
+			testassert.Require(t, os.IsNotExist(err), "held artifacts after the later pass = %v, want them removed", err)
 		}
-		if err := headerErrorThroughRuntime(ctx, r, held); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("held candidate after the later pass = %v, want the committed deletion", err)
+		{
+			err := headerErrorThroughRuntime(ctx, r, held)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "held candidate after the later pass = %v, want the committed deletion", err)
 		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	})
 }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -46,9 +47,7 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		}}
 		ws := &workspaceOpens{}
 		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: assembledPlugins(e, store, hook, ws)})
-		if err != nil {
-			t.Fatalf("successor Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		ps := openProtocolServer(t, r)
 		client := protocolClient(t, ps)
 		// The stream opens before the recovered Sessions are ever touched, so
@@ -66,39 +65,27 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		// exact-match on the recorded trace, so the fixture's probe tool's
 		// real trace is spelled out: one invocation during recovery fails this
 		// oracle even while the model counter still reads zero.
-		if got := server.requests(); got != 0 {
-			t.Fatalf("model requests during recovery = %d, want none", got)
-		}
-		if n := countEvents(e.events.all(), "work:L1:base"); n != 0 {
-			t.Fatalf("probe-tool invocations during recovery = %d, want none", n)
-		}
+		testassert.Equal(t, server.requests(), 0)
+		testassert.Equal(t, countEvents(e.events.all(), "work:L1:base"), 0)
 
 		// Durable interruption through the mounted read: the seeded running
 		// root settled as the runtime-loss interruption with no live member.
 		rootHydration := composedLossHydration(t, client, runningRoot)
-		if op := composedLossOperation(t, rootHydration, runningOp); op.Status != protocol.OperationStatusInterruption {
-			t.Fatalf("seeded running root operation = %q, want the interruption repair", op.Status)
+		{
+			op := composedLossOperation(t, rootHydration, runningOp)
+			testassert.Equal(t, op.Status, protocol.OperationStatusInterruption)
 		}
-		if rootHydration.ActiveOperation != nil || len(rootHydration.Background) != 0 {
-			t.Fatalf("seeded root hydration = active %+v background %+v, want no active work and no member", rootHydration.ActiveOperation, rootHydration.Background)
-		}
-		if rootHydration.SessionRevision.InstanceId != ps.instance {
-			t.Fatalf("seeded root revision instance = %q, want the successor's %q", rootHydration.SessionRevision.InstanceId, ps.instance)
-		}
+		testassert.Require(t, rootHydration.ActiveOperation == nil && len(rootHydration.Background) == 0 && rootHydration.SessionRevision.InstanceId == ps.instance, "seeded root hydration = active %+v background %+v, want no active work and no member; got %v, want %v", rootHydration.ActiveOperation, rootHydration.Background, rootHydration.SessionRevision.InstanceId, ps.instance)
 
 		// The child hydrates as one ordinary Session with its own interrupted
 		// Operation and its committed input visible.
 		childHydration := composedLossHydration(t, client, child)
-		if op := composedLossOperation(t, childHydration, childOp); op.Status != protocol.OperationStatusInterruption {
-			t.Fatalf("seeded child operation = %q, want the interruption repair", op.Status)
+		{
+			op := composedLossOperation(t, childHydration, childOp)
+			testassert.Equal(t, op.Status, protocol.OperationStatusInterruption)
 		}
-		if childHydration.Session.SessionId != child || childHydration.Session.Lifecycle != protocol.Open ||
-			childHydration.ActiveOperation != nil || len(childHydration.Background) != 0 {
-			t.Fatalf("seeded child hydration = %+v, want one ordinary open session", childHydration.Session)
-		}
-		if len(childHydration.Conversation.Items) == 0 {
-			t.Fatal("the seeded child's committed input vanished from its hydration")
-		}
+		testassert.Require(t, childHydration.Session.SessionId == child && childHydration.Session.Lifecycle == protocol.Open && childHydration.ActiveOperation == nil && len(childHydration.Background) == 0, "seeded child hydration = %+v, want one ordinary open session", childHydration.Session)
+		testassert.Require(t, len(childHydration.Conversation.Items) != 0, "the seeded child's committed input vanished from its hydration")
 
 		// No replayed facts reach the fresh stream: fresh work — created and
 		// submitted through the generated operations — is read until its own
@@ -106,56 +93,41 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		// witness carries only the fresh Session and Workspace identities.
 		freshWorkspace := filepath.Join(e.home, "loss-next")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: freshWorkspace, AgentType: "integrated"})
-		if err != nil {
-			t.Fatalf("CreateSession(fresh): %v", err)
-		}
-		if created.JSON201 == nil {
-			t.Fatalf("CreateSession(fresh) = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, created.JSON201 != nil, "CreateSession(fresh) = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		fresh := created.JSON201.SessionId
 		var freshPart protocol.ContentPart
-		if err := freshPart.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: "continue"}); err != nil {
-			t.Fatalf("build text part: %v", err)
-		}
+		testassert.NoError(t, freshPart.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: "continue"}))
 		submitted, err := client.SubmitSessionWithResponse(ctx, fresh, protocol.SubmitRequest{
 			OperationId: "op-after-loss",
 			Mode:        protocol.SubmitRequestModeRegular,
 			Content:     []protocol.ContentPart{freshPart},
 		})
-		if err != nil {
-			t.Fatalf("SubmitSession(fresh): %v", err)
-		}
-		if submitted.JSON200 == nil {
-			t.Fatalf("SubmitSession(fresh) = status %d: %s", submitted.HTTPResponse.StatusCode, submitted.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, submitted.JSON200 != nil, "SubmitSession(fresh) = status %d: %s", submitted.HTTPResponse.StatusCode, submitted.Body)
 		for {
 			frame, ok, err := stream.readSSEFrame()
-			if err != nil {
-				t.Fatalf("fresh stream read: %v", err)
-			}
-			if !ok {
-				t.Fatal("the fresh stream closed before the fresh work's witness")
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, ok, "the fresh stream closed before the fresh work's witness")
 			var event protocol.Event
-			if err := json.Unmarshal(frame, &event); err != nil {
-				t.Fatalf("decode fresh stream frame %s: %v", frame, err)
+			{
+				err := json.Unmarshal(frame, &event)
+				testassert.Require(t, err == nil, "decode fresh stream frame %s: %v", frame, err)
 			}
 			scope, err := composedLossEventScope(t, event)
-			if err != nil {
-				t.Fatalf("fresh stream frame scope: %v", err)
+			testassert.NoError(t, err)
+			{
+				stale, ok := scopeSessionIdentity(t, scope)
+				testassert.Require(t, !ok || stale == fresh, "replayed frame for session %s reached the fresh stream: %s", stale, frame)
 			}
-			if stale, ok := scopeSessionIdentity(t, scope); ok && stale != fresh {
-				t.Fatalf("replayed frame for session %s reached the fresh stream: %s", stale, frame)
-			}
-			if stale, ok := scopeWorkspaceAttribution(t, scope); ok && stale != freshWorkspace {
-				t.Fatalf("replayed frame for workspace %s reached the fresh stream: %s", stale, frame)
+			{
+				stale, ok := scopeWorkspaceAttribution(t, scope)
+				testassert.Require(t, !ok || stale == freshWorkspace, "replayed frame for workspace %s reached the fresh stream: %s", stale, frame)
 			}
 			if body, err := event.AsSessionChangedEvent(); err == nil &&
 				scopeKind(t, body.Scope) == "session" {
 				freshScope, err := body.Scope.AsSessionScope()
-				if err != nil {
-					t.Fatalf("fresh invalidation scope: %v", err)
-				}
+				testassert.NoError(t, err)
 				if freshScope.SessionId == fresh {
 					break // the fresh work's own invalidation is the witness
 				}
@@ -165,21 +137,22 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		// Ordinary work proceeds on the repaired state through the mounted
 		// route: the successor's first model requests belong to fresh work.
 		composedLossAwaitSettled(t, client, fresh, "op-after-loss")
-		if got := server.requests(); got < 1 {
-			t.Fatalf("the fresh turn's model requests = %d, want the real execution", got)
+		{
+			got := server.requests()
+			testassert.Require(t, got >= 1, "the fresh turn's model requests = %d, want the real execution", got)
 		}
 		settled := composedLossHydration(t, client, fresh)
-		if op := composedLossOperation(t, settled, "op-after-loss"); op.Status != protocol.OperationStatusSuccess {
-			t.Fatalf("the fresh mounted operation = %q, want success", op.Status)
+		{
+			op := composedLossOperation(t, settled, "op-after-loss")
+			testassert.Equal(t, op.Status, protocol.OperationStatusSuccess)
 		}
 
 		// The closed owner: the listener refuses connections.
 		stream.close()
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if _, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://")); err == nil {
-			t.Fatal("the protocol listener still accepts after the successor closed")
+		testassert.NoError(t, r.Close(ctx))
+		{
+			_, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://"))
+			testassert.Require(t, err != nil, "the protocol listener still accepts after the successor closed")
 		}
 	})
 }
@@ -187,12 +160,8 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 func composedLossHydration(t *testing.T, client *protocol.ClientWithResponses, sessionID string) *protocol.Hydration {
 	t.Helper()
 	resp, err := client.GetSessionHydrationWithResponse(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("GetSessionHydration(%s): %v", sessionID, err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("GetSessionHydration(%s) = status %d", sessionID, resp.HTTPResponse.StatusCode)
-	}
+	testassert.Require(t, err == nil, "GetSessionHydration(%s): %v", sessionID, err)
+	testassert.Require(t, resp.JSON200 != nil, "GetSessionHydration(%s) = status %d", sessionID, resp.HTTPResponse.StatusCode)
 	return resp.JSON200
 }
 
@@ -208,9 +177,7 @@ func composedLossAwaitSettled(t *testing.T, client *protocol.ClientWithResponses
 				return
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("operation %q never settled to success (operations %+v)", operationID, h.Operations)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "operation %q never settled to success (operations %+v)", operationID, h.Operations)
 		time.Sleep(10 * time.Millisecond)
 	}
 }

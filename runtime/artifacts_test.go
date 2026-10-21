@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // assertRegistryState asserts the entry's settled state directly: waiting is
@@ -44,9 +45,7 @@ func awaitRegistryState(t *testing.T, a *artifactIntervals, key string, wantRefs
 		if held && refs == wantRefs {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the held entry for %q never reached %d references", key, wantRefs)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "the held entry for %q never reached %d references", key, wantRefs)
 		time.Sleep(5 * time.Millisecond)
 	}
 }
@@ -59,9 +58,7 @@ func TestArtifactIntervalRegistrySingleHolderAndSharedEntry(t *testing.T) {
 	a := newArtifactIntervals()
 	key := "code/session"
 	releaseHolder, err := a.acquireExecution(context.Background(), key)
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
+	testassert.NoError(t, err)
 	assertRegistryState(t, a, key, 1, 1, true)
 
 	type waiterResult struct {
@@ -79,16 +76,16 @@ func TestArtifactIntervalRegistrySingleHolderAndSharedEntry(t *testing.T) {
 	var releaseWaiter func()
 	select {
 	case res := <-done:
-		if res.err != nil { // an unexpected waiter failure is asserted, never ignored
-			t.Fatalf("waiter acquire failed: %v", res.err)
-		}
+		// an unexpected waiter failure is asserted, never ignored
+		testassert.Require(t, res.err == nil, "waiter acquire failed: %v", res.err)
 		releaseWaiter = res.release
 	case <-time.After(10 * time.Second):
 		t.Fatal("the waiter never won the released interval")
 	}
 
-	if _, err := a.acquireTry(key); !errors.Is(err, harness.ErrConflict) {
-		t.Fatalf("contender acquireTry = %v, want the conflict class", err)
+	{
+		_, err := a.acquireTry(key)
+		testassert.Require(t, errors.Is(err, harness.ErrConflict), "contender acquireTry = %v, want the conflict class", err)
 	}
 	assertRegistryState(t, a, key, 1, 1, true) // the contender's failed attempt dropped its one reference
 
@@ -103,15 +100,14 @@ func TestArtifactIntervalRegistryCanceledWaiterDropsReference(t *testing.T) {
 	a := newArtifactIntervals()
 	key := "code/session"
 	releaseHolder, err := a.acquireExecution(context.Background(), key)
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
+	testassert.NoError(t, err)
 	assertRegistryState(t, a, key, 1, 1, true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := a.acquireExecution(ctx, key); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled acquire = %v, want context.Canceled", err)
+	{
+		_, err := a.acquireExecution(ctx, key)
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled acquire = %v, want context.Canceled", err)
 	}
 	assertRegistryState(t, a, key, 1, 1, true) // the canceled attempt dropped its one reference
 	releaseHolder()
@@ -124,11 +120,10 @@ func TestArtifactIntervalRegistryNonblockingContenderDropsReference(t *testing.T
 	a := newArtifactIntervals()
 	key := "code/session"
 	releaseHolder, err := a.acquireExecution(context.Background(), key)
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
-	if _, err := a.acquireTry(key); !errors.Is(err, harness.ErrConflict) {
-		t.Fatalf("contender acquireTry = %v, want the conflict class", err)
+	testassert.NoError(t, err)
+	{
+		_, err := a.acquireTry(key)
+		testassert.Require(t, errors.Is(err, harness.ErrConflict), "contender acquireTry = %v, want the conflict class", err)
 	}
 	assertRegistryState(t, a, key, 1, 1, true) // only the holder's reference remains
 	releaseHolder()
@@ -142,16 +137,12 @@ func TestArtifactIntervalRegistryReclaimsAtZeroReferences(t *testing.T) {
 	a := newArtifactIntervals()
 	key := "code/session"
 	release, err := a.acquireExecution(context.Background(), key)
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
+	testassert.NoError(t, err)
 	release()
 	assertRegistryState(t, a, key, 0, 0, false)
 
 	again, err := a.acquireExecution(context.Background(), key)
-	if err != nil {
-		t.Fatalf("second acquire: %v", err)
-	}
+	testassert.NoError(t, err)
 	assertRegistryState(t, a, key, 1, 1, true) // the fresh entry's own held/reference state
 	again()
 }
@@ -167,11 +158,10 @@ func TestArtifactIntervalRegistryCanceledWinnerDropsReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	release, err := a.acquireExecution(ctx, key)
-	if release != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled winner returned a lease (%t) with err %v, want no lease and the typed cancellation", release != nil, err)
-	}
+	testassert.Require(t, release == nil && errors.Is(err, context.Canceled), "canceled winner returned a lease (%t) with err %v, want no lease and the typed cancellation", release != nil, err)
 	assertRegistryState(t, a, key, 0, 0, false)
-	if _, err := a.acquireExecution(context.Background(), key); err != nil {
-		t.Fatalf("later acquire: %v", err)
+	{
+		_, err := a.acquireExecution(context.Background(), key)
+		testassert.NoError(t, err)
 	}
 }

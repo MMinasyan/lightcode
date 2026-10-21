@@ -13,6 +13,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/prompt"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -47,9 +48,7 @@ func adaptationPlugin(id, exportID string, scope ScopeKind) Plugin {
 func TestCompositionRejectsMisplacedModelAdaptationScope(t *testing.T) {
 	for _, scope := range []ScopeKind{ScopeWorkspace, ScopeOperation, ScopeAgent} {
 		_, err := newComposition([]Plugin{adaptationPlugin("adapt", "model_adaptation", scope)})
-		if err == nil || !errors.Is(err, ErrComposition) || !strings.Contains(err.Error(), "requires Runtime scope") {
-			t.Errorf("newComposition with a %s-scoped ModelAdaptation = %v, want a Runtime-scope composition failure", scope, err)
-		}
+		testassert.Check(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), "requires Runtime scope"), "newComposition with a %s-scoped ModelAdaptation = %v, want a Runtime-scope composition failure", scope, err)
 	}
 }
 
@@ -58,21 +57,15 @@ func TestCompositionRejectsAmbiguousModelAdaptation(t *testing.T) {
 		adaptationPlugin("adapt-a", "model_adaptation_a", ScopeRuntime),
 		adaptationPlugin("adapt-b", "model_adaptation_b", ScopeRuntime),
 	})
-	if err == nil || !errors.Is(err, ErrComposition) || !strings.Contains(err.Error(), "declared as runtime.ModelAdaptation") {
-		t.Fatalf("newComposition with two ModelAdaptation exports = %v, want an ambiguity composition failure", err)
-	}
+	testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), "declared as runtime.ModelAdaptation"), "newComposition with two ModelAdaptation exports = %v, want an ambiguity composition failure", err)
 }
 
 func TestCompositionSelectsSingleModelAdaptationAndLeavesOtherExportsUnselected(t *testing.T) {
 	c, err := newComposition([]Plugin{
 		adaptationPlugin("adapt", "model_adaptation", ScopeRuntime),
 	})
-	if err != nil {
-		t.Fatalf("newComposition: %v", err)
-	}
-	if c.modelAdaptation != "model_adaptation" {
-		t.Fatalf("composition adaptation export = %q, want model_adaptation", c.modelAdaptation)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, c.modelAdaptation, "model_adaptation")
 	// A plugin exporting ModelAdaptation plus another capability: both exports
 	// stay in the ordinary capability universe for explicit selection, but
 	// only the ModelAdaptation ID becomes the composition's default.
@@ -87,17 +80,11 @@ func TestCompositionSelectsSingleModelAdaptationAndLeavesOtherExportsUnselected(
 			return Instance{Values: map[string]any{"model_adaptation": &fakeAdaptation{}, "extra": "extra"}}, nil
 		},
 	}})
-	if err != nil {
-		t.Fatalf("newComposition(mixed): %v", err)
-	}
-	if mixed.modelAdaptation != "model_adaptation" {
-		t.Fatalf("mixed composition adaptation export = %q, want model_adaptation", mixed.modelAdaptation)
-	}
-	if !reflect.DeepEqual(mixed.capabilityIDs, []string{"model_adaptation", "extra"}) {
-		t.Fatalf("capability universe = %q, want both exports selectable", mixed.capabilityIDs)
-	}
-	if got := defaultCapabilityIDsFor(t, mixed); !reflect.DeepEqual(got, []string{"model_adaptation"}) {
-		t.Fatalf("default capability list for the mixed plugin = %q, want [model_adaptation] only", got)
+	testassert.NoError(t, err)
+	testassert.Require(t, mixed.modelAdaptation == "model_adaptation" && reflect.DeepEqual(mixed.capabilityIDs, []string{"model_adaptation", "extra"}), "got %v, want %v; capability universe = %q, want both exports selectable", mixed.modelAdaptation, "model_adaptation", mixed.capabilityIDs)
+	{
+		got := defaultCapabilityIDsFor(t, mixed)
+		testassert.Require(t, reflect.DeepEqual(got, []string{"model_adaptation"}), "default capability list for the mixed plugin = %q, want [model_adaptation] only", got)
 	}
 }
 
@@ -112,13 +99,15 @@ func defaultCapabilityIDsFor(t *testing.T, c *composition) []string {
 func TestCompositionAdaptationDefaultProjection(t *testing.T) {
 	// One provider: the default list is exactly the single export ID.
 	c := mustComposition(t, adaptationPlugin("adapt", "model_adaptation", ScopeRuntime))
-	if got := defaultCapabilityIDsFor(t, c); !reflect.DeepEqual(got, []string{"model_adaptation"}) {
-		t.Fatalf("default capability list = %q, want [model_adaptation]", got)
+	{
+		got := defaultCapabilityIDsFor(t, c)
+		testassert.Require(t, reflect.DeepEqual(got, []string{"model_adaptation"}), "default capability list = %q, want [model_adaptation]", got)
 	}
 	// No provider: empty defaults, so every definition keeps its baseline.
 	plain := mustComposition(t, servicePlugin("alpha", nil, nil))
-	if got := defaultCapabilityIDsFor(t, plain); got != nil {
-		t.Fatalf("default capability list without adaptation = %q, want empty", got)
+	{
+		got := defaultCapabilityIDsFor(t, plain)
+		testassert.Require(t, got == nil, "default capability list without adaptation = %q, want empty", got)
 	}
 }
 
@@ -132,20 +121,14 @@ func TestConfigurationServiceProjectsDefaultCapabilities(t *testing.T) {
 	}`)
 	svc := h.service(context.Background(), adaptationPlugin("adaptation", "model_adaptation", ScopeRuntime))
 	snapshot, err := svc.publish(context.Background())
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
+	testassert.NoError(t, err)
 	want := []string{"model_adaptation"}
 	for _, def := range snapshot.snapshot.definitions {
 		switch def.Name {
 		case "clear":
-			if def.Capabilities != nil {
-				t.Fatalf("%s capabilities = %q, want the explicit empty clear", def.Name, def.Capabilities)
-			}
+			testassert.Require(t, def.Capabilities == nil, "%s capabilities = %q, want the explicit empty clear", def.Name, def.Capabilities)
 		default:
-			if !reflect.DeepEqual(def.Capabilities, want) {
-				t.Fatalf("%s capabilities = %q, want the projected default %q", def.Name, def.Capabilities, want)
-			}
+			testassert.Require(t, reflect.DeepEqual(def.Capabilities, want), "%s capabilities = %q, want the projected default %q", def.Name, def.Capabilities, want)
 		}
 	}
 }
@@ -215,19 +198,13 @@ func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 		r := req
 		r.promptSize = size
 		result, _, err := composeSurface(r)
-		if err != nil {
-			t.Fatalf("composeSurface(%s): %v", size, err)
-		}
+		testassert.Require(t, err == nil, "composeSurface(%s): %v", size, err)
 		direct := prompt.NewService(req.home).Assemble(req.workspace, req.sessionStart, prompt.Spec{Size: size})
-		if result.Prompt != direct.Prompt {
-			t.Fatalf("composeSurface(%s) prompt diverged from the direct assembly", size)
-		}
+		testassert.Require(t, result.Prompt == direct.Prompt, "composeSurface(%s) prompt diverged from the direct assembly", size)
 		if size == prompt.SizeNone {
 			// None skips the rules reads: no warnings even though no rules
 			// file exists under the isolated home.
-			if len(result.Warnings) != 0 {
-				t.Fatalf("none-size warnings = %#v, want none", result.Warnings)
-			}
+			testassert.Require(t, len(result.Warnings) == 0, "none-size warnings = %#v, want none", result.Warnings)
 		} else if len(result.Warnings) != 1 || result.Warnings[0].Kind != prompt.WarnRulesNotFound {
 			t.Fatalf("%s-size warnings = %#v, want the rules_not_found warning", size, result.Warnings)
 		}
@@ -236,43 +213,23 @@ func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 
 func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
 	home := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".lightcode", "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
+	testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600))
 	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("PROJECT CONTENT"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("PROJECT CONTENT"), 0o600))
 	req := baseSurfaceRequest(t)
 	req.home, req.workspace = home, workspace
 	result, _, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if !strings.Contains(result.Prompt, "GLOBAL CONTENT") || !strings.Contains(result.Prompt, "PROJECT CONTENT") {
-		t.Fatal("the composed prompt lost a rules layer")
-	}
-	if strings.Index(result.Prompt, "GLOBAL CONTENT") >= strings.Index(result.Prompt, "PROJECT CONTENT") {
-		t.Fatal("project rules did not render after global rules")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result.Prompt, "GLOBAL CONTENT") && strings.Contains(result.Prompt, "PROJECT CONTENT"), "the composed prompt lost a rules layer")
+	testassert.Require(t, strings.Index(result.Prompt, "GLOBAL CONTENT") < strings.Index(result.Prompt, "PROJECT CONTENT"), "project rules did not render after global rules")
 	// A user heading overrides the built-in section while the rest of the
 	// assembly is unchanged.
-	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("## Tone\n\nProject tone rule."), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("## Tone\n\nProject tone rule."), 0o600))
 	result, _, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if strings.Contains(result.Prompt, "Be direct and concise") {
-		t.Fatal("the built-in tone section survived a user tone heading override")
-	}
-	if !strings.Contains(result.Prompt, "Project tone rule.") {
-		t.Fatal("the overriding project tone rule is missing")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(result.Prompt, "Be direct and concise"), "the built-in tone section survived a user tone heading override")
+	testassert.Require(t, strings.Contains(result.Prompt, "Project tone rule."), "the overriding project tone rule is missing")
 }
 
 func TestComposeSurfaceBlocksAndAdditionsRender(t *testing.T) {
@@ -283,15 +240,9 @@ func TestComposeSurfaceBlocksAndAdditionsRender(t *testing.T) {
 		Additions: map[string]string{"safety": "ADDITION SAFETY"},
 	}}
 	result, _, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if !strings.Contains(result.Prompt, "COACHING BLOCK") || !strings.Contains(result.Prompt, "ADDITION SAFETY") {
-		t.Fatal("the adaptation blocks or additions did not render")
-	}
-	if strings.Index(result.Prompt, "COACHING BLOCK") >= strings.Index(result.Prompt, "## Your Role and Instructions") {
-		t.Fatal("coaching blocks did not render before the agent body and rules")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result.Prompt, "COACHING BLOCK") && strings.Contains(result.Prompt, "ADDITION SAFETY"), "the adaptation blocks or additions did not render")
+	testassert.Require(t, strings.Index(result.Prompt, "COACHING BLOCK") < strings.Index(result.Prompt, "## Your Role and Instructions"), "coaching blocks did not render before the agent body and rules")
 }
 
 func TestComposeSurfaceDescriptionReplacements(t *testing.T) {
@@ -301,24 +252,16 @@ func TestComposeSurfaceDescriptionReplacements(t *testing.T) {
 
 	// No adaptation: the bundled default replacement applies.
 	_, advertised, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if advertised[0].Description != "Edit edit_file or write_file via one call." {
-		t.Fatalf("baseline description = %q, want the bundled default replacement", advertised[0].Description)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, advertised[0].Description, "Edit edit_file or write_file via one call.")
 
 	// The shipped GPT row's entry override applies instead.
 	req.adaptation = &fakeAdaptation{value: Adaptation{
 		ToolDescriptionReplacements: map[string]string{"<EDIT FILE OR WRITE FILE>": "apply_patch"},
 	}}
 	_, advertised, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if advertised[0].Description != "Edit apply_patch via one call." {
-		t.Fatalf("adapted description = %q, want the entry override replacement", advertised[0].Description)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, advertised[0].Description, "Edit apply_patch via one call.")
 }
 
 func TestComposeSurfaceAdvertisement(t *testing.T) {
@@ -326,21 +269,19 @@ func TestComposeSurfaceAdvertisement(t *testing.T) {
 
 	// Unselected: only the available, non-hidden tool is advertised.
 	_, advertised, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"read_file"}) {
-		t.Fatalf("baseline advertisement = %q, want [read_file]", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "baseline advertisement = %q, want [read_file]", names)
 	}
 
 	// The hidden tool appears only through the include list.
 	req.adaptation = &fakeAdaptation{value: Adaptation{IncludeTools: []string{"apply_patch"}}}
 	_, advertised, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"read_file", "apply_patch"}) {
-		t.Fatalf("included advertisement = %q, want the declaration order", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "included advertisement = %q, want the declaration order", names)
 	}
 
 	// Exclusion always wins over inclusion.
@@ -349,11 +290,10 @@ func TestComposeSurfaceAdvertisement(t *testing.T) {
 		IncludeTools: []string{"read_file", "apply_patch"},
 	}}
 	_, advertised, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"apply_patch"}) {
-		t.Fatalf("exclusion-wins advertisement = %q, want [apply_patch]", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"apply_patch"}), "exclusion-wins advertisement = %q, want [apply_patch]", names)
 	}
 }
 
@@ -370,21 +310,19 @@ func TestComposeSurfaceReadonlyCannotRegainMutationTools(t *testing.T) {
 		IncludeTools: []string{"write_file", "edit_file", "apply_patch"},
 	}}
 	_, advertised, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"read_file"}) {
-		t.Fatalf("readonly advertisement = %q, want only the eligible read_file", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "readonly advertisement = %q, want only the eligible read_file", names)
 	}
 	// The nearest sibling: with a write dir the tools are eligible and the
 	// include surfaces the hidden one.
 	req.constraints = ToolConstraints{Readonly: true, WriteDir: "/tmp/plan"}
 	_, advertised, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"read_file", "write_file", "edit_file", "apply_patch"}) {
-		t.Fatalf("write-dir advertisement = %q, want every eligible tool in declaration order", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "write_file", "edit_file", "apply_patch"}), "write-dir advertisement = %q, want every eligible tool in declaration order", names)
 	}
 }
 
@@ -392,24 +330,19 @@ func TestComposeSurfaceDescribeFailureAborts(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	req.toolSpecs = []CapabilitySpec{failingToolSpec("broken")}
 	_, advertised, err := composeSurface(req)
-	if err == nil || !strings.Contains(err.Error(), "broken describe failure") {
-		t.Fatalf("composeSurface = (%#v, %v), want the describe error", advertised, err)
-	}
-	if advertised != nil {
-		t.Fatalf("a failed description still advertised %d tools", len(advertised))
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "broken describe failure"), "composeSurface = (%#v, %v), want the describe error", advertised, err)
+	testassert.Require(t, advertised == nil, "a failed description still advertised %d tools", len(advertised))
 }
 
 func TestComposeSurfaceResolvesExactlyOnce(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	fake := &fakeAdaptation{}
 	req.adaptation = fake
-	if _, _, err := composeSurface(req); err != nil {
-		t.Fatalf("composeSurface: %v", err)
+	{
+		_, _, err := composeSurface(req)
+		testassert.NoError(t, err)
 	}
-	if fake.calls != 1 {
-		t.Fatalf("Resolve calls = %d, want exactly 1", fake.calls)
-	}
+	testassert.Equal(t, fake.calls, 1)
 	if fake.ref != req.modelRef {
 		t.Fatalf("Resolve received %s, want %s", fake.ref.String(), req.modelRef.String())
 	}
@@ -419,12 +352,8 @@ func TestComposeSurfaceResolveErrorPropagates(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	req.adaptation = &fakeAdaptation{err: errors.New("adaptation unavailable")}
 	result, advertised, err := composeSurface(req)
-	if err == nil || !strings.Contains(err.Error(), "adaptation unavailable") {
-		t.Fatalf("composeSurface = (%+v, %v), want the Resolve error", result, err)
-	}
-	if advertised != nil {
-		t.Fatalf("a failed Resolve still advertised %d tools", len(advertised))
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "adaptation unavailable"), "composeSurface = (%+v, %v), want the Resolve error", result, err)
+	testassert.Require(t, advertised == nil, "a failed Resolve still advertised %d tools", len(advertised))
 }
 
 func TestComposeSurfaceUnselectedAdaptationKeepsBaselinePrompt(t *testing.T) {
@@ -432,15 +361,12 @@ func TestComposeSurfaceUnselectedAdaptationKeepsBaselinePrompt(t *testing.T) {
 	start := time.Now().Add(-time.Hour)
 	req.sessionStart = start
 	result, advertised, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
+	testassert.NoError(t, err)
 	direct := prompt.NewService(req.home).Assemble(req.workspace, start, prompt.Spec{Size: prompt.SizeFull})
-	if result.Prompt != direct.Prompt {
-		t.Fatal("the unselected adaptation changed the baseline prompt")
-	}
-	if names := advertisedNames(advertised); !reflect.DeepEqual(names, []string{"read_file"}) {
-		t.Fatalf("baseline advertisement = %q, want the full eligible surface", names)
+	testassert.Require(t, result.Prompt == direct.Prompt, "the unselected adaptation changed the baseline prompt")
+	{
+		names := advertisedNames(advertised)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "baseline advertisement = %q, want the full eligible surface", names)
 	}
 }
 
@@ -449,34 +375,22 @@ func TestComposeSurfaceZeroSessionStartSamplesComposeTime(t *testing.T) {
 	before := time.Now().Add(-time.Second)
 	result, _, err := composeSurface(req)
 	after := time.Now().Add(time.Second)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
+	testassert.NoError(t, err)
 	const marker = "Session started: "
 	i := strings.Index(result.Prompt, marker)
-	if i < 0 {
-		t.Fatalf("the composed prompt lost the session start: %q", result.Prompt)
-	}
+	testassert.Require(t, i >= 0, "the composed prompt lost the session start: %q", result.Prompt)
 	line := result.Prompt[i+len(marker):]
 	if j := strings.IndexByte(line, '\n'); j >= 0 {
 		line = line[:j]
 	}
 	sampled, err := time.ParseInLocation("2006-01-02 15:04:05 MST", line, time.Local)
-	if err != nil {
-		t.Fatalf("parsing the sampled session start %q: %v", line, err)
-	}
-	if sampled.Before(before) || sampled.After(after) {
-		t.Fatalf("sampled session start = %s, want a compose-time value within [%s, %s]", sampled, before, after)
-	}
+	testassert.Require(t, err == nil, "parsing the sampled session start %q: %v", line, err)
+	testassert.Require(t, !sampled.Before(before) && !sampled.After(after), "sampled session start = %s, want a compose-time value within [%s, %s]", sampled, before, after)
 	// An explicit session start is used verbatim.
 	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	result, _, err = composeSurface(req)
-	if err != nil {
-		t.Fatalf("composeSurface: %v", err)
-	}
-	if !strings.Contains(result.Prompt, "Session started: 2026-01-02 03:04:05 UTC") {
-		t.Fatalf("the explicit session start did not render verbatim: %q", result.Prompt)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result.Prompt, "Session started: 2026-01-02 03:04:05 UTC"), "the explicit session start did not render verbatim: %q", result.Prompt)
 }
 
 // TestComposeSurfaceExcludesLineageUnavailableTools proves the lineage
@@ -490,21 +404,19 @@ func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
 	req.toolSpecs = append(req.toolSpecs, lineageToolSpec("task"))
 
 	_, root, err := composeSurface(req)
-	if err != nil {
-		t.Fatalf("root composeSurface: %v", err)
-	}
-	if names := advertisedNames(root); !reflect.DeepEqual(names, []string{"read_file", "task"}) {
-		t.Fatalf("root advertisement = %q, want the lineage-gated tool present alongside its sibling", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(root)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "task"}), "root advertisement = %q, want the lineage-gated tool present alongside its sibling", names)
 	}
 
 	childReq := req
 	childReq.identity = harness.SessionIdentity{SessionID: "child-session", ParentSessionID: "root-session"}
 	_, child, err := composeSurface(childReq)
-	if err != nil {
-		t.Fatalf("child composeSurface: %v", err)
-	}
-	if names := advertisedNames(child); !reflect.DeepEqual(names, []string{"read_file"}) {
-		t.Fatalf("child advertisement = %q, want the lineage-gated tool excluded", names)
+	testassert.NoError(t, err)
+	{
+		names := advertisedNames(child)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "child advertisement = %q, want the lineage-gated tool excluded", names)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -58,9 +59,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
 		r, err := e.open(context.Background(), e.storagePlugin(store))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		ctx := context.Background()
 
 		e.server.setScript(func(_ context.Context, body string) []string {
@@ -84,26 +83,18 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		})
 
 		sub, err := r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(ctx, e.dataDir, "tight")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
 		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess) // the seed turn commits the report
 		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
 		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
-		if op2.State.Status != harness.OperationSuccess {
-			t.Fatalf("overflowing operation = %+v, want the compacted success", op2.State)
-		}
+		testassert.Require(t, op2.State.Status == harness.OperationSuccess, "overflowing operation = %+v, want the compacted success", op2.State)
 		submitConvergedThroughRuntime(t, r, sessionID, "op-3", "second question", harness.OperationSuccess)
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 
 		// The wire: the seed conversation request, one compact summary on
 		// the compact model, then the two conversation requests against the
@@ -117,57 +108,44 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				compactSummary = body
 				continue
 			}
-			if doc.Model != "m" {
-				t.Fatalf("wire request %d names model %q, want one of the configured identities", i, doc.Model)
-			}
+			testassert.Require(t, doc.Model == "m", "wire request %d names model %q, want one of the configured identities", i, doc.Model)
 			conversation = append(conversation, body)
 		}
-		if compactSummary == "" {
-			t.Fatal("the compaction never reached the compact model's transport")
-		}
-		if len(conversation) != 3 {
-			t.Fatalf("conversation requests = %d, want the seed turn plus the compacted turn plus the later one", len(conversation))
-		}
+		testassert.Require(t, compactSummary != "", "the compaction never reached the compact model's transport")
+		testassert.Equal(t, len(conversation), 3)
 		seed := decodeWireChatBody(t, conversation[0])
-		if roles := wireRoles(seed); !slices.Equal(roles, []string{"system", "user"}) {
-			t.Fatalf("seed request roles = %v, want the prompt and the first message", roles)
+		{
+			roles := wireRoles(seed)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "user"}), "seed request roles = %v, want the prompt and the first message", roles)
 		}
 		summary := decodeWireChatBody(t, compactSummary)
-		if len(summary.Tools) != 0 {
-			t.Fatalf("compact summary request advertised %d tools, want none", len(summary.Tools))
-		}
-		if len(summary.Messages) == 0 || summary.Messages[0].Role != "system" {
-			t.Fatalf("compact summary request = %+v, want the leading compact system prompt", summary.Messages)
-		}
+		testassert.Require(t, len(summary.Tools) == 0 && len(summary.Messages) != 0 && summary.Messages[0].Role == "system", "got %v, want %v; compact summary request = %+v, want the leading compact system prompt", len(summary.Tools), 0, summary.Messages)
 		var systemText string
-		if err := json.Unmarshal(summary.Messages[0].Content, &systemText); err != nil || systemText != op2.Admission.Execution.Compact.SystemPrompt {
-			t.Fatalf("compact summary system = %q (err %v), want the captured compact prompt %q", systemText, err, op2.Admission.Execution.Compact.SystemPrompt)
+		{
+			err := json.Unmarshal(summary.Messages[0].Content, &systemText)
+			testassert.Require(t, err == nil && systemText == op2.Admission.Execution.Compact.SystemPrompt, "compact summary system = %q (err %v), want the captured compact prompt %q", systemText, err, op2.Admission.Execution.Compact.SystemPrompt)
 		}
-		if op2.Admission.Execution.Compact.Model != (model.ModelRef{Provider: "prov", Model: "k"}) {
-			t.Fatalf("captured compact model = %+v, want the overlaid prov/k", op2.Admission.Execution.Compact.Model)
-		}
+		testassert.Require(t, op2.Admission.Execution.Compact.Model == (model.ModelRef{Provider: "prov", Model: "k"}), "captured compact model = %+v, want the overlaid prov/k", op2.Admission.Execution.Compact.Model)
 		first := decodeWireChatBody(t, conversation[1])
-		if roles := wireRoles(first); !slices.Equal(roles, []string{"system", "assistant"}) {
-			t.Fatalf("post-compaction request roles = %v, want the prompt and the summary alone", roles)
+		{
+			roles := wireRoles(first)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "assistant"}), "post-compaction request roles = %v, want the prompt and the summary alone", roles)
 		}
 		var summaryText string
 		if len(first.Messages) > 1 {
 			_ = json.Unmarshal(first.Messages[1].Content, &summaryText)
 		}
-		if !strings.Contains(summaryText, "native summary one") {
-			t.Fatalf("post-compaction assistant = %q, want the committed summary", summaryText)
-		}
+		testassert.Require(t, strings.Contains(summaryText, "native summary one"), "post-compaction assistant = %q, want the committed summary", summaryText)
 		second := decodeWireChatBody(t, conversation[2])
-		if roles := wireRoles(second); !slices.Equal(roles, []string{"system", "assistant", "assistant", "user"}) {
-			t.Fatalf("second request roles = %v, want the prompt, the summary, the first closing turn and the new message", roles)
+		{
+			roles := wireRoles(second)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "assistant", "assistant", "user"}), "second request roles = %v, want the prompt, the summary, the first closing turn and the new message", roles)
 		}
 
 		// The durable state: exactly one committed compaction entry owned by
 		// the overflowing Operation.
 		entries, err := store.ReadEntries(ctx, sessionID, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		compactions := 0
 		for _, entry := range entries {
 			if entry.Kind != harness.EntryCompaction {
@@ -178,16 +156,10 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				OperationID string `json:"operation_id"`
 				Summary     string `json:"summary"`
 			}
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode compaction entry: %v", err)
-			}
-			if wire.OperationID != "op-2" || wire.Summary != "native summary one" {
-				t.Fatalf("compaction entry = %+v, want op-2's committed summary", wire)
-			}
+			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
+			testassert.Require(t, wire.OperationID == "op-2" && wire.Summary == "native summary one", "compaction entry = %+v, want op-2's committed summary", wire)
 		}
-		if compactions != 1 {
-			t.Fatalf("compaction entries = %d, want exactly the overflowing Operation's one", compactions)
-		}
+		testassert.Equal(t, compactions, 1)
 
 		// The observation set: every session invalidation names the real
 		// Session, every text progress the real running Operation, and no
@@ -197,21 +169,13 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			switch eventKind(t, event) {
 			case "session_changed":
 				body, err := event.AsSessionChangedEvent()
-				if err != nil {
-					t.Fatalf("session event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				scope, err := body.Scope.AsSessionScope()
-				if err != nil {
-					t.Fatalf("session invalidation scope: %v", err)
-				}
-				if scope.SessionId != sessionID {
-					t.Fatalf("session invalidation for %q, want the real session", scope.SessionId)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, scope.SessionId, sessionID)
 				sawInvalidation = true
 			case "text_delta":
-				if err := assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2", "op-3"); err != nil {
-					t.Fatalf("text progress: %v", err)
-				}
+				testassert.NoError(t, assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2", "op-3"))
 				sawDelta = true
 			case "scope_opened", "scope_closed", "warning_changed", "configuration_changed":
 				// scope lifecycle and publication facts stay allowed beside the passive set
@@ -219,9 +183,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				t.Fatalf("unexpected event %s", eventJSON(t, event))
 			}
 		}
-		if !sawInvalidation || !sawDelta {
-			t.Fatalf("observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
-		}
+		testassert.Require(t, sawInvalidation && sawDelta, "observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
 	})
 }
 
@@ -243,9 +205,7 @@ func assertProgressScopedToOperations(t *testing.T, event Event, sessionID strin
 		return errors.New("progress carries a non-operation scope")
 	}
 	body, err := scope.AsOperationScope()
-	if err != nil {
-		t.Fatalf("operation scope: %v", err)
-	}
+	testassert.NoError(t, err)
 	if body.SessionId != sessionID {
 		return errors.New("progress carries a foreign session identity")
 	}
@@ -353,14 +313,10 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		freedHook := &recordHook{name: "hook.freed", events: &traceLog{}}
 		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsWithFreedHook())
 		r, err := e.openWithPlugins(ctx, hook, &parkingHook{}, freedHookPlugin(freedHook))
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("compact-capture"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
 		// The capture carries the compact configuration from one revision.
@@ -368,29 +324,21 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
 		var durable harness.ExecutionCapture
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			rec, err := h.ReadOperation(ctx, sessionID, "op-1")
 			if err != nil {
 				return err
 			}
 			durable = rec.Admission.Execution
 			return nil
-		}); err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
+		}))
 		seenMu.Lock()
 		seen := seenCompact
 		revision := seenRevision
 		seenMu.Unlock()
-		if seen != durable.Compact {
-			t.Fatalf("hook-saw compact capture %+v differs from the durable %+v", seen, durable.Compact)
-		}
-		if revision != durable.ConfigurationRevision {
-			t.Fatalf("hook-saw revision %q differs from the durable %q", revision, durable.ConfigurationRevision)
-		}
-		if seen.Model.Provider == "" || seen.Model.Model == "" || seen.SystemPrompt == "" {
-			t.Fatalf("captured compact configuration incomplete: %+v", seen)
-		}
+		testassert.Equal(t, seen, durable.Compact)
+		testassert.Equal(t, revision, durable.ConfigurationRevision)
+		testassert.Require(t, seen.Model.Provider != "" && seen.Model.Model != "" && seen.SystemPrompt != "", "captured compact configuration incomplete: %+v", seen)
 
 		// A hook attempting to change a compact member is rejected. The
 		// mutation stays installed on this session for the phase's whole
@@ -420,11 +368,10 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 			})
 			return serr
 		})
-		if err == nil && rejected.Disposition == harness.DispositionAdmitted {
-			t.Fatalf("a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
-		}
-		if _, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"}); !errors.Is(rerr, harness.ErrNotFound) {
-			t.Fatalf("the rejected admission left a register (%v), want none", rerr)
+		testassert.Require(t, err != nil || rejected.Disposition != harness.DispositionAdmitted, "a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
+		{
+			_, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"})
+			testassert.Require(t, errors.Is(rerr, harness.ErrNotFound), "the rejected admission left a register (%v), want none", rerr)
 		}
 
 		// The prompt and tool-definition replacement freedoms hold on a
@@ -443,12 +390,10 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 			return c
 		})
 		freedSession, err := r.createSession(ctx, e.workspace("compact-freed"), "freedworker")
-		if err != nil {
-			t.Fatalf("createSession(freed): %v", err)
-		}
+		testassert.NoError(t, err)
 		freedID := freedSession.Identity.SessionID
 		var freed harness.SubmitResult
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			var serr error
 			freed, serr = h.Submit(ctx, harness.SubmitRequest{
 				SessionID:   freedID,
@@ -458,30 +403,20 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 				Mode:        harness.MessageModeRegular,
 			})
 			return serr
-		}); err != nil {
-			t.Fatalf("submit op-3: %v", err)
-		}
-		if freed.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("submit op-3 disposition = %q, want admission on the fresh session", freed.Disposition)
-		}
+		}))
+		testassert.Equal(t, freed.Disposition, harness.DispositionAdmitted)
 		awaitOperation(t, r, freedID, "op-3", harness.OperationSuccess)
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			rec, err := h.ReadOperation(ctx, freedID, "op-3")
 			if err != nil {
 				return err
 			}
-			if !strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed") {
-				t.Fatalf("capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
-			}
+			testassert.Require(t, strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed"), "capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
 			for _, tool := range rec.Admission.Execution.Tools {
-				if tool.Description != "freed description" {
-					t.Fatalf("tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
-				}
+				testassert.Require(t, tool.Description == "freed description", "tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
 			}
 			return nil
-		}); err != nil {
-			t.Fatalf("ReadOperation(op-3): %v", err)
-		}
+		}))
 	})
 }
 
@@ -570,18 +505,14 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("glob package sources: %v", err)
-	}
+	testassert.NoError(t, err)
 	got := map[string]string{}
 	for _, file := range files {
 		if strings.HasSuffix(file, "_test.go") {
 			continue
 		}
 		parsed, err := parser.ParseFile(fset, file, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", file, err)
-		}
+		testassert.Require(t, err == nil, "parse %s: %v", file, err)
 		for _, decl := range parsed.Decls {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
@@ -624,17 +555,16 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 			}
 		}
 	}
-	if len(files) == 0 {
-		t.Fatal("the package source scan found no production files")
-	}
+	testassert.Require(t, len(files) != 0, "the package source scan found no production files")
 	for name := range got {
 		if !want[name] {
 			t.Fatalf("exported declaration %q (%s) is outside the fixed pre-compaction surface", name, got[name])
 		}
 	}
 	for name := range want {
-		if _, ok := got[name]; !ok {
-			t.Fatalf("pinned exported declaration %q missing from the package source scan", name)
+		{
+			_, ok := got[name]
+			testassert.Require(t, ok, "pinned exported declaration %q missing from the package source scan", name)
 		}
 	}
 }

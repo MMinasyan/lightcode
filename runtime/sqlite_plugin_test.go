@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -45,9 +46,7 @@ func newComposeEnv(t *testing.T) *composeEnv {
 	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	configPath := filepath.Join(configDir, "config.json")
-	if err := os.WriteFile(configPath, []byte(composedConfigDocument), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(configPath, []byte(composedConfigDocument), 0o600))
 	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath}
 }
 
@@ -56,9 +55,7 @@ func newComposeEnv(t *testing.T) *composeEnv {
 func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -109,18 +106,14 @@ func treeFiles(t *testing.T, root string) map[string]string {
 		files[filepath.ToSlash(rel)] = string(data)
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("walk %s: %v", root, err)
-	}
+	testassert.Require(t, err == nil, "walk %s: %v", root, err)
 	return files
 }
 
 func sortedNames(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read dir %s: %v", dir, err)
-	}
+	testassert.Require(t, err == nil, "read dir %s: %v", dir, err)
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		names = append(names, entry.Name())
@@ -136,12 +129,8 @@ func assertSameTree(t *testing.T, before, after map[string]string, what string) 
 	}
 	for name, want := range before {
 		got, ok := after[name]
-		if !ok {
-			t.Fatalf("%s: file %q vanished", what, name)
-		}
-		if got != want {
-			t.Fatalf("%s: file %q was modified", what, name)
-		}
+		testassert.Require(t, ok, "%s: file %q vanished", what, name)
+		testassert.Require(t, got == want, "%s: file %q was modified", what, name)
 	}
 }
 
@@ -159,61 +148,31 @@ func keys(m map[string]string) []string {
 // implements.
 func TestSQLitePluginDeclaration(t *testing.T) {
 	p := sqlite.Plugin()
-	if p.ID != "sqlite" {
-		t.Fatalf("plugin ID = %q, want %q", p.ID, "sqlite")
-	}
-	if p.Scope != runtime.ScopeRuntime {
-		t.Fatalf("plugin scope = %q, want the Runtime scope", p.Scope)
-	}
-	if len(p.Provides) != 1 {
-		t.Fatalf("plugin declares %d exports, want exactly one harness.Storage export", len(p.Provides))
-	}
-	if len(p.Requires) != 0 {
-		t.Fatalf("plugin requires %d capabilities, want none", len(p.Requires))
-	}
-	if p.ValidateConfig != nil {
-		t.Fatal("plugin declares a settings validator, want none")
-	}
-	if p.Open == nil {
-		t.Fatal("plugin declares no Open")
-	}
+	testassert.Require(t, p.ID == "sqlite" && p.Scope == runtime.ScopeRuntime && len(p.Provides) == 1 && len(p.Requires) == 0, "got %v, want %v; got %v, want %v; got %v, want %v; got %v, want %v", p.ID, "sqlite", p.Scope, runtime.ScopeRuntime, len(p.Provides), 1, len(p.Requires), 0)
+	testassert.Require(t, p.ValidateConfig == nil, "plugin declares a settings validator, want none")
+	testassert.Require(t, p.Open != nil, "plugin declares no Open")
 
 	t.Run("open derives the exact database path and returns the declared store with its Close", func(t *testing.T) {
 		dir := t.TempDir()
 		inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dir}, runtime.Bindings{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		if len(inst.Values) != 1 {
-			t.Fatalf("instance values = %d exports, want exactly one declared export", len(inst.Values))
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, len(inst.Values), 1)
 		var store harness.Storage
 		for _, value := range inst.Values {
 			storageValue, ok := value.(harness.Storage)
-			if !ok {
-				t.Fatalf("instance export supplies %T, not harness.Storage", value)
-			}
+			testassert.Require(t, ok, "instance export supplies %T, not harness.Storage", value)
 			store = storageValue
 		}
-		if store == nil {
-			t.Fatal("instance export supplies a nil harness.Storage")
+		testassert.Require(t, store != nil, "instance export supplies a nil harness.Storage")
+		testassert.Require(t, inst.Close != nil, "instance declares no Close for the opened store")
+		{
+			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
+			testassert.NoError(t, err)
 		}
-		if inst.Close == nil {
-			t.Fatal("instance declares no Close for the opened store")
-		}
-		if _, err := os.Stat(filepath.Join(dir, "lightcode.db")); err != nil {
-			t.Fatalf("the store was not opened at the exact derived path: %v", err)
-		}
-		if err := inst.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, inst.Close())
 		reopened, err := storage.OpenSQLite(filepath.Join(dir, "lightcode.db"))
-		if err != nil {
-			t.Fatalf("the closed database did not remain a valid canonical store: %v", err)
-		}
-		if err := reopened.Close(); err != nil {
-			t.Fatalf("Close of the reopened store: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, reopened.Close())
 	})
 
 	t.Run("open checks the context before touching the filesystem", func(t *testing.T) {
@@ -221,14 +180,11 @@ func TestSQLitePluginDeclaration(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		inst, err := p.Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dir}, runtime.Bindings{})
-		if inst.Values != nil || inst.Close != nil {
-			t.Fatalf("canceled Open returned the instance %+v", inst)
-		}
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled Open error = %v, want the context error", err)
-		}
-		if _, err := os.Stat(filepath.Join(dir, "lightcode.db")); !os.IsNotExist(err) {
-			t.Fatalf("a canceled Open touched the filesystem: stat err = %v", err)
+		testassert.Require(t, inst.Values == nil && inst.Close == nil, "canceled Open returned the instance %+v", inst)
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled Open error = %v, want the context error", err)
+		{
+			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
+			testassert.Require(t, os.IsNotExist(err), "a canceled Open touched the filesystem: stat err = %v", err)
 		}
 	})
 }
@@ -240,29 +196,18 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 
 	t.Run("composes the selected backend at the exact data root and preserves unrelated files", func(t *testing.T) {
 		e := newComposeEnv(t)
-		if err := os.MkdirAll(filepath.Join(e.home, ".lightcode"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(e.home, ".lightcode", ".env"), []byte("ISOLATED=1\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(e.home, ".lightcode", "unrelated.txt"), []byte("keep\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(filepath.Join(e.home, "project"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(e.home, "project", "notes.txt"), []byte("keep\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, ".lightcode"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", ".env"), []byte("ISOLATED=1\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", "unrelated.txt"), []byte("keep\n"), 0o600))
+		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, "project"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, "project", "notes.txt"), []byte("keep\n"), 0o600))
 		homeBefore := treeFiles(t, e.home)
 
 		r, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("OpenForTest: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db")); err != nil {
-			t.Fatalf("the composed backend did not open lightcode.db under the data root: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			testassert.NoError(t, err)
 		}
 		for _, name := range sortedNames(t, e.dataDir) {
 			switch name {
@@ -271,11 +216,10 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 				t.Fatalf("unexpected file %q in the data root while open; it is the sole data-root input", name)
 			}
 		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
-			t.Fatalf("data root after Close = %v, want exactly the ownership lock and the composed database", got)
+		testassert.NoError(t, r.Close(ctx))
+		{
+			got := sortedNames(t, e.dataDir)
+			testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after Close = %v, want exactly the ownership lock and the composed database", got)
 		}
 		assertSameTree(t, homeBefore, treeFiles(t, e.home), "the isolated home")
 	})
@@ -283,9 +227,7 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 	t.Run("lock contention yields one owner and reacquisition follows release", func(t *testing.T) {
 		e := newComposeEnv(t)
 		r, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("OpenForTest: %v", err)
-		}
+		testassert.NoError(t, err)
 		contender := newComposeEnv(t)
 		rivalData := e.dataDir
 		contender.dataDir = rivalData
@@ -293,65 +235,42 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 			_ = r.Close(ctx)
 			t.Fatalf("contender open = (%v, %v), want (nil, ErrOwned)", got, err)
 		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("owner Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 		again, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("reopen after release: %v", err)
-		}
-		if err := again.Close(ctx); err != nil {
-			t.Fatalf("Close after reacquire: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, again.Close(ctx))
 	})
 
 	t.Run("close and reopen compose the same database", func(t *testing.T) {
 		e := newComposeEnv(t)
 		first, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("first open: %v", err)
-		}
-		if err := first.Close(ctx); err != nil {
-			t.Fatalf("first Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, first.Close(ctx))
 		second, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("reopen: %v", err)
-		}
-		if err := second.Close(ctx); err != nil {
-			t.Fatalf("second Close: %v", err)
-		}
-		if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
-			t.Fatalf("data root after the second Close = %v, want exactly the lock and the database", got)
+		testassert.NoError(t, err)
+		testassert.NoError(t, second.Close(ctx))
+		{
+			got := sortedNames(t, e.dataDir)
+			testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after the second Close = %v, want exactly the lock and the database", got)
 		}
 	})
 
 	t.Run("failed assembly releases ownership and creates no second owner", func(t *testing.T) {
 		e := newComposeEnv(t)
-		if err := os.WriteFile(filepath.Join(e.dataDir, "lightcode.db"), []byte("not a database at all"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.dataDir, "lightcode.db"), []byte("not a database at all"), 0o600))
 		r, err := e.openComposed(ctx)
-		if r != nil {
-			t.Fatalf("failed assembly returned a Runtime (%v)", err)
-		}
-		if err == nil || errors.Is(err, runtime.ErrOwned) {
-			t.Fatalf("failed assembly error = %v, want the storage failure, not the ownership identity", err)
-		}
+		testassert.Require(t, r == nil, "failed assembly returned a Runtime (%v)", err)
+		testassert.Require(t, err != nil && !errors.Is(err, runtime.ErrOwned), "failed assembly error = %v, want the storage failure, not the ownership identity", err)
 		// The lock was released: the next attempt fails at storage again rather
 		// than reporting ownership contention, and no partial owner remains.
 		again, err := e.openComposed(ctx)
-		if again != nil || err == nil || errors.Is(err, runtime.ErrOwned) {
-			t.Fatalf("open over the failed assembly = (%v, %v), want (nil, the same storage failure)", again, err)
-		}
+		testassert.Require(t, again == nil && err != nil && !errors.Is(err, runtime.ErrOwned), "open over the failed assembly = (%v, %v), want (nil, the same storage failure)", again, err)
 	})
 
 	t.Run("startup recovery repairs the seeded running state before execution", func(t *testing.T) {
 		e := newComposeEnv(t)
 		store, err := storage.OpenSQLite(filepath.Join(e.dataDir, "lightcode.db"))
-		if err != nil {
-			t.Fatalf("OpenSQLite: %v", err)
-		}
+		testassert.NoError(t, err)
 		// Registered before the seed's own cleanup, so the parked execution is
 		// released before the store closes.
 		t.Cleanup(func() { _ = store.Close() })
@@ -359,50 +278,30 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 
 		key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "seed-op"}
 		reg, err := store.ReadRegister(ctx, key)
-		if err != nil {
-			t.Fatalf("ReadRegister before composition: %v", err)
-		}
-		if status := registerStatus(t, reg.Payload); status != harness.OperationRunning {
-			t.Fatalf("seeded Operation status before composition = %q, want running", status)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, registerStatus(t, reg.Payload), harness.OperationRunning)
 
 		r, err := e.openComposed(ctx)
-		if err != nil {
-			t.Fatalf("OpenForTest: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Repair completed during construction, before any execution: the
 		// register is terminal and no execution callback ever ran again.
 		reg, err = store.ReadRegister(ctx, key)
-		if err != nil {
-			t.Fatalf("ReadRegister after composition: %v", err)
-		}
-		if status := registerStatus(t, reg.Payload); status != harness.OperationInterruption {
-			t.Fatalf("recovered Operation status = %q, want the terminal interruption settlement", status)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, registerStatus(t, reg.Payload), harness.OperationInterruption)
 		entries, err := store.ReadEntries(ctx, sessionID, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		var kinds []string
 		for _, entry := range entries {
 			kinds = append(kinds, string(entry.Kind))
 		}
 		sort.Strings(kinds)
-		if !slices.Equal(kinds, []string{string(harness.EntryInput), string(harness.EntryOperationSettlement), string(harness.EntrySignal)}) {
-			t.Fatalf("repaired Session entries = %v, want the admitted input, the interruption signal, and the settlement", kinds)
-		}
+		testassert.Require(t, slices.Equal(kinds, []string{string(harness.EntryInput), string(harness.EntryOperationSettlement), string(harness.EntrySignal)}), "repaired Session entries = %v, want the admitted input, the interruption signal, and the settlement", kinds)
 		session := readSessionRegister(t, store, sessionID)
-		if session != "" {
-			t.Fatalf("repaired Session still names current Operation %q, want the cleared current Operation", session)
-		}
-		if n := executions.Load(); n != 1 {
-			t.Fatalf("seeded model executions = %d, want only the original seeded one: recovery started no execution", n)
-		}
+		testassert.Equal(t, session, "")
+		testassert.Equal(t, executions.Load(), 1)
 
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -459,18 +358,15 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 			}, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("seed harness.New: %v", err)
-	}
+	testassert.NoError(t, err)
 	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
-	if err != nil {
-		t.Fatalf("seed CreateSession: %v", err)
-	}
-	if _, err := h.Submit(context.Background(), harness.SubmitRequest{
-		SessionID: rec.Identity.SessionID, OperationID: "seed-op", Origin: harness.InputOriginUser,
-		Content: []model.ContentPart{{Kind: model.PartText, Text: "running"}}, Mode: harness.MessageModeRegular,
-	}); err != nil {
-		t.Fatalf("seed Submit: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := h.Submit(context.Background(), harness.SubmitRequest{
+			SessionID: rec.Identity.SessionID, OperationID: "seed-op", Origin: harness.InputOriginUser,
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "running"}}, Mode: harness.MessageModeRegular,
+		})
+		testassert.NoError(t, err)
 	}
 	select {
 	case <-arrived:
@@ -488,9 +384,7 @@ func registerStatus(t *testing.T, payload json.RawMessage) harness.OperationStat
 			Status harness.OperationState `json:"status"`
 		} `json:"state"`
 	}
-	if err := json.Unmarshal(payload, &wire); err != nil {
-		t.Fatalf("decode operation register payload: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(payload, &wire))
 	return wire.State.Status
 }
 
@@ -499,17 +393,13 @@ func registerStatus(t *testing.T, payload json.RawMessage) harness.OperationStat
 func readSessionRegister(t *testing.T, store harness.Storage, sessionID string) string {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession})
-	if err != nil {
-		t.Fatalf("ReadRegister(session): %v", err)
-	}
+	testassert.NoError(t, err)
 	var wire struct {
 		State struct {
 			CurrentOperationID string `json:"current_operation_id"`
 		} `json:"state"`
 	}
-	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-		t.Fatalf("decode session register payload: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(reg.Payload, &wire))
 	return wire.State.CurrentOperationID
 }
 
@@ -529,9 +419,7 @@ func nextComposedEvent(t *testing.T, sub *runtime.Subscription) (runtime.Event, 
 func composedEventKind(t *testing.T, event runtime.Event) string {
 	t.Helper()
 	kind, err := event.Discriminator()
-	if err != nil {
-		t.Fatalf("event discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -540,9 +428,7 @@ func composedEventKind(t *testing.T, event runtime.Event) string {
 func composedEventGeneration(t *testing.T, event runtime.Event) string {
 	t.Helper()
 	body, err := event.AsConfigurationChangedEvent()
-	if err != nil {
-		t.Fatalf("configuration event body: %v", err)
-	}
+	testassert.NoError(t, err)
 	return body.ConfigurationRevision.Generation
 }
 
@@ -578,28 +464,24 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 	ctx := context.Background()
 	e := newComposeEnv(t)
 	r, err := e.openComposed(ctx)
-	if err != nil {
-		t.Fatalf("OpenForTest: %v", err)
-	}
+	testassert.NoError(t, err)
 	sat, err := r.Subscribe(1)
-	if err != nil {
-		t.Fatalf("Subscribe(saturated): %v", err)
-	}
+	testassert.NoError(t, err)
 	healthy, err := r.Subscribe(8)
-	if err != nil {
-		t.Fatalf("Subscribe(healthy): %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3"} {
-		if revision, err := r.Reload(ctx); err != nil || revision != want {
-			t.Fatalf("Reload = (%q, %v), want %s", revision, err, want)
+		{
+			revision, err := r.Reload(ctx)
+			testassert.Require(t, err == nil && revision == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}
 	first, ok := nextComposedEvent(t, sat)
 	if !ok || composedEventGeneration(t, first) != "2" {
 		t.Fatalf("saturated subscriber first event = %s (ok=%v), want revision 2", composedEventJSON(first), ok)
 	}
-	if _, ok := nextComposedEvent(t, sat); ok {
-		t.Fatal("saturated subscriber still open at the second publication, want it removed and closed")
+	{
+		_, ok := nextComposedEvent(t, sat)
+		testassert.Require(t, !ok, "saturated subscriber still open at the second publication, want it removed and closed")
 	}
 	sat.Close()
 	var observed []runtime.Event
@@ -610,11 +492,10 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		}
 		observed = append(observed, event)
 	}
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
-		t.Fatalf("data root after Close = %v, want exactly the ownership lock and the composed database", got)
+	testassert.NoError(t, r.Close(ctx))
+	{
+		got := sortedNames(t, e.dataDir)
+		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after Close = %v, want exactly the ownership lock and the composed database", got)
 	}
 	for {
 		event, ok := nextComposedEvent(t, healthy)
@@ -628,16 +509,10 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		composedConfigurationEvent(3),
 		composedRuntimeScopeClosed(),
 	}
-	if !slices.EqualFunc(observed, want, runtime.EqualEventForTest) {
-		t.Fatalf("healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
-	}
+	testassert.Require(t, slices.EqualFunc(observed, want, runtime.EqualEventForTest), "healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
 	again, err := e.openComposed(ctx)
-	if err != nil {
-		t.Fatalf("reopen after the shutdown released ownership: %v", err)
-	}
-	if err := again.Close(ctx); err != nil {
-		t.Fatalf("Close after reacquire: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, again.Close(ctx))
 }
 
 // TestBuiltinRegistrationComposes proves the shipped registration set — the
@@ -650,17 +525,15 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 	ctx := context.Background()
 	e := newComposeEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
-	if err != nil {
-		t.Fatalf("OpenForTest: %v", err)
+	testassert.NoError(t, err)
+	{
+		revision, err := r.Reload(ctx)
+		testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 	}
-	if revision, err := r.Reload(ctx); err != nil || revision != "2" {
-		t.Fatalf("Reload = (%q, %v), want 2", revision, err)
-	}
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if got := sortedNames(t, e.dataDir); !slices.Equal(got, []string{"lightcode.db", "runtime.lock"}) {
-		t.Fatalf("data root after shutdown = %v, want exactly the real SQLite plugin's files", got)
+	testassert.NoError(t, r.Close(ctx))
+	{
+		got := sortedNames(t, e.dataDir)
+		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the real SQLite plugin's files", got)
 	}
 }
 

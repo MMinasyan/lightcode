@@ -19,6 +19,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -99,12 +100,8 @@ func openConfigurationRuntime(t *testing.T, store harness.Storage, configDoc, ag
 func writeDotEnv(t *testing.T, home, content string) {
 	t.Helper()
 	dir := filepath.Join(home, ".lightcode")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile(.env): %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(dir, 0o700))
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600))
 }
 
 // unsetenv cleans one process-environment key before and after the test:
@@ -153,26 +150,16 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 		defer closeProjectionRuntime(r)
 
 		view, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
-		if view.ConfigurationRevision.Generation != "1" || view.ConfigurationRevision.InstanceId != "" {
-			t.Fatalf("configuration revision = %+v, want generation 1 with the empty pre-server instance", view.ConfigurationRevision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, view.ConfigurationRevision.Generation == "1" && view.ConfigurationRevision.InstanceId == "", "configuration revision = %+v, want generation 1 with the empty pre-server instance", view.ConfigurationRevision)
 
 		// Source labels through the projection: the custom provider's models
 		// are user, and every bundled provider's shipped models are bundled.
 		prov := findProvider(view.Providers, "prov")
-		if prov.Id != "prov" {
-			t.Fatalf("prov view missing: %+v", prov)
-		}
+		testassert.Require(t, prov.Id == "prov", "prov view missing: %+v", prov)
 		openrouter := findProvider(view.Providers, "openrouter")
-		if !openrouter.Builtin {
-			t.Fatalf("openrouter builtin = false, want the bundled identity")
-		}
-		if len(openrouter.Models) == 0 || openrouter.Models[0].Source != protocol.ModelSource("bundled") {
-			t.Fatalf("openrouter model sources = %+v, want bundled labels", openrouter.Models)
-		}
+		testassert.Require(t, openrouter.Builtin, "openrouter builtin = false, want the bundled identity")
+		testassert.Require(t, len(openrouter.Models) != 0 && openrouter.Models[0].Source == protocol.ModelSource("bundled"), "openrouter model sources = %+v, want bundled labels", openrouter.Models)
 
 		// Key-source labels over the capture's own credential sample; the
 		// wire view carries no mutability flags or suggested names — source
@@ -188,47 +175,36 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 			{"keyless", "keyless", true},
 		} {
 			view := findProvider(view.Providers, row.id)
-			if view.KeySource != protocol.ProviderKeySource(row.keySource) || view.Connected != row.connected {
-				t.Fatalf("%s labels = key_source %q connected %v, want %q/%v",
-					row.id, view.KeySource, view.Connected, row.keySource, row.connected)
-			}
+			testassert.Require(t, view.KeySource == protocol.ProviderKeySource(row.keySource) && view.Connected == row.connected, "%s labels = key_source %q connected %v, want %q/%v", row.id, view.KeySource, view.Connected, row.keySource, row.connected)
 		}
 
 		// The no-authorization response contract: no casing or padding of the
 		// credential header names survives into either map.
-		if _, present := prov.Headers["Authorization"]; present {
-			t.Fatal("effective headers returned Authorization")
+		{
+			_, present := prov.Headers["Authorization"]
+			testassert.Require(t, !present, "effective headers returned Authorization")
 		}
 		for name := range prov.Headers {
 			trimmed := strings.TrimSpace(name)
-			if strings.EqualFold(trimmed, "Authorization") || strings.EqualFold(trimmed, "Proxy-Authorization") {
-				t.Fatalf("effective headers returned credential header %q", name)
-			}
+			testassert.Require(t, !strings.EqualFold(trimmed, "Authorization") && !strings.EqualFold(trimmed, "Proxy-Authorization"), "effective headers returned credential header %q", name)
 		}
-		if prov.Headers["X-Trace"] != "t1" {
-			t.Fatalf("effective headers = %v, want the retained transport header", prov.Headers)
-		}
+		testassert.Require(t, prov.Headers["X-Trace"] == "t1", "effective headers = %v, want the retained transport header", prov.Headers)
 
 		// The user headers projection carries the user layer's own headers
 		// exactly — no source-based stripping — so a user-layer collision
 		// with a bundled header name is visible and editable; the user file
 		// is never edited.
-		if got := openrouter.UserHeaders; len(got) != 2 || got["x-title"] != "user-title" || got["X-Custom"] != "keep" {
-			t.Fatalf("openrouter user_headers = %v, want the user layer's own headers", got)
+		{
+			got := openrouter.UserHeaders
+			testassert.Require(t, len(got) == 2 && got["x-title"] == "user-title" && got["X-Custom"] == "keep", "openrouter user_headers = %v, want the user layer's own headers", got)
 		}
-		if len(openrouter.Headers["X-Title"]) == 0 || openrouter.Headers["HTTP-Referer"] == "" {
-			t.Fatalf("openrouter effective headers = %v, want the bundled headers present", openrouter.Headers)
-		}
+		testassert.Require(t, len(openrouter.Headers["X-Title"]) != 0 && openrouter.Headers["HTTP-Referer"] != "", "openrouter effective headers = %v, want the bundled headers present", openrouter.Headers)
 
 		// No secret value leaves through any response: labels only.
 		data, err := json.Marshal(view)
-		if err != nil {
-			t.Fatalf("marshal view: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, secret := range []string{"managed-secret-value", "shell-secret-value", "Bearer forged", "forged2", "forged3"} {
-			if strings.Contains(string(data), secret) {
-				t.Fatalf("configuration view carries secret bytes %q: %s", secret, data)
-			}
+			testassert.Require(t, !strings.Contains(string(data), secret), "configuration view carries secret bytes %q: %s", secret, data)
 		}
 	})
 }
@@ -253,27 +229,25 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	defer closeProjectionRuntime(r)
 	ctx := context.Background()
 	sub, err := r.Subscribe(8)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer sub.Close()
 
 	// Every sibling resolves the one shared credential.
 	for _, id := range []string{"shalpha", "shbeta", "shgamma"} {
 		detail, err := r.getProvider(ctx, id)
-		if err != nil || !detail.Provider.Connected || detail.Provider.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
-			t.Fatalf("%s = (%v, %+v), want the shared managed connection", id, err, detail.Provider)
-		}
+		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.KeySource == protocol.ProviderKeySource(config.KeySourceManaged), "%s = (%v, %+v), want the shared managed connection", id, err, detail.Provider)
 	}
 
 	// The sibling's update keeps the shared reference and the variable.
 	name := "Renamed Alpha"
-	if _, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{Name: &name}); err != nil {
-		t.Fatalf("sibling update: %v", err)
+	{
+		_, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{Name: &name})
+		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, r.warnings, sub, "2")
-	if detail, err := r.getProvider(ctx, "shbeta"); err != nil || !detail.Provider.Connected || detail.Provider.ApiKeyEnv != "SHARED_CRED_TEST_KEY" {
-		t.Fatalf("shbeta after the sibling update = (%v, %+v), want the shared reference untouched", err, detail.Provider)
+	{
+		detail, err := r.getProvider(ctx, "shbeta")
+		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.ApiKeyEnv == "SHARED_CRED_TEST_KEY", "shbeta after the sibling update = (%v, %+v), want the shared reference untouched", err, detail.Provider)
 	}
 	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
 		t.Fatalf("shared variable after the sibling update = (%q, %v), want the exact value and ownership", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
@@ -283,15 +257,17 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	// the credential: the variable keeps its value and the sibling keeps
 	// resolving it.
 	fresh := "RESHARED_TEST_KEY"
-	if _, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{ApiKeyEnv: &fresh}); err != nil {
-		t.Fatalf("connected rebinding: %v", err)
+	{
+		_, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{ApiKeyEnv: &fresh})
+		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, r.warnings, sub, "3")
 	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" {
 		t.Fatalf("the rebinding unset the shared credential: %q", os.Getenv("SHARED_CRED_TEST_KEY"))
 	}
-	if detail, err := r.getProvider(ctx, "shbeta"); err != nil || !detail.Provider.Connected {
-		t.Fatalf("shbeta after the rebinding = (%v, %+v), want the connection through the shared variable", err, detail.Provider)
+	{
+		detail, err := r.getProvider(ctx, "shbeta")
+		testassert.Require(t, err == nil && detail.Provider.Connected, "shbeta after the rebinding = (%v, %+v), want the connection through the shared variable", err, detail.Provider)
 	}
 
 	// The deletion is the strongest form: removing a provider that
@@ -299,15 +275,14 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	// surviving sibling's connection intact — the variable is not a
 	// per-provider lease.
 	mutation, err := r.deleteProvider(ctx, "shbeta")
-	if err != nil || mutation.Result != nil {
-		t.Fatalf("shared-reference delete = (%v, %+v), want the null post-state", err, mutation)
-	}
+	testassert.Require(t, err == nil && mutation.Result == nil, "shared-reference delete = (%v, %+v), want the null post-state", err, mutation)
 	drainConnectionEvent(t, r.warnings, sub, "4")
 	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
 		t.Fatalf("the deletion removed the shared variable = (%q, %v)", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
 	}
-	if detail, err := r.getProvider(ctx, "shgamma"); err != nil || !detail.Provider.Connected || detail.Provider.KeySource != protocol.ProviderKeySource(config.KeySourceManaged) {
-		t.Fatalf("shgamma after the sibling deletion = (%v, %+v), want the surviving shared connection", err, detail.Provider)
+	{
+		detail, err := r.getProvider(ctx, "shgamma")
+		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.KeySource == protocol.ProviderKeySource(config.KeySourceManaged), "shgamma after the sibling deletion = (%v, %+v), want the surviving shared connection", err, detail.Provider)
 	}
 }
 
@@ -318,9 +293,7 @@ func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *own
 	writeServiceFile(t, e.configPath, configDoc)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), agentsDoc)
 	r, err := e.open(context.Background(), append([]Plugin{e.storagePlugin(store)}, extra...)...)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	return r, e
 }
 
@@ -335,28 +308,21 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		view, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessions := view.Settings.Sessions
-		if sessions.AutoArchive || sessions.ArchiveAfterDays != 3 || sessions.DeleteAfterArchiveDays != 7 {
-			t.Fatalf("sessions settings = %+v, want the supplied values with the 7-day delete default", sessions)
-		}
+		testassert.Require(t, !sessions.AutoArchive && sessions.ArchiveAfterDays == 3 && sessions.DeleteAfterArchiveDays == 7, "sessions settings = %+v, want the supplied values with the 7-day delete default", sessions)
 		wantDocs := map[string]string{
 			"tools": `{"max_output_bytes":42}`,
 			"jobs":  `{"max_background_processes":20}`,
 			"tasks": `{}`,
 		}
-		if len(view.Settings.Plugins) != len(wantDocs) {
-			t.Fatalf("plugins = %v, want exactly the owned sections %v", view.Settings.Plugins, wantDocs)
-		}
+		testassert.Require(t, len(view.Settings.Plugins) == len(wantDocs), "plugins = %v, want exactly the owned sections %v", view.Settings.Plugins, wantDocs)
 		for id, wantDoc := range wantDocs {
 			got, ok := view.Settings.Plugins[id]
-			if !ok {
-				t.Fatalf("plugins.%s missing, want the owned document %s", id, wantDoc)
-			}
-			if got := compactJSON(t, []byte(got)); got != wantDoc {
-				t.Fatalf("plugins.%s = %s, want the exact owned document %s (no decoder defaults)", id, got, wantDoc)
+			testassert.Require(t, ok, "plugins.%s missing, want the owned document %s", id, wantDoc)
+			{
+				got := compactJSON(t, []byte(got))
+				testassert.Require(t, got == wantDoc, "plugins.%s = %s, want the exact owned document %s (no decoder defaults)", id, got, wantDoc)
 			}
 		}
 
@@ -365,12 +331,8 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		absent, _ := openConfigurationRuntime(t, store, `{"providers":{}}`, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(absent)
 		absentView, err := absent.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration absent: %v", err)
-		}
-		if len(absentView.Settings.Plugins) != 0 {
-			t.Fatalf("absent plugin sections projected = %+v, want none", absentView.Settings.Plugins)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(absentView.Settings.Plugins) == 0, "absent plugin sections projected = %+v, want none", absentView.Settings.Plugins)
 
 		// The Agent roster: the primary model selection and the worker's
 		// public fields with the trimmed write dir.
@@ -383,12 +345,8 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 				worker = &view.Agents[i]
 			}
 		}
-		if primary == nil || primary.Model != "prov/m" {
-			t.Fatalf("primary roster entry = %+v, want the configured model", primary)
-		}
-		if worker == nil || !worker.Subagent || !worker.Readonly || worker.Description != "w" || worker.WriteDir != "/ws" {
-			t.Fatalf("worker roster entry = %+v, want the public definition fields with the trimmed write dir", worker)
-		}
+		testassert.Require(t, primary != nil && primary.Model == "prov/m", "primary roster entry = %+v, want the configured model", primary)
+		testassert.Require(t, worker != nil && worker.Subagent && worker.Readonly && worker.Description == "w" && worker.WriteDir == "/ws", "worker roster entry = %+v, want the public definition fields with the trimmed write dir", worker)
 	})
 }
 
@@ -434,20 +392,12 @@ func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
 	}
 
 	view, err := r.getConfiguration(context.Background())
-	if err != nil {
-		t.Fatalf("read during a parked build: %v", err)
-	}
-	if view.ConfigurationRevision.Generation != "1" {
-		t.Fatalf("read during a parked build = generation %s, want the ready generation 1", view.ConfigurationRevision.Generation)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, view.ConfigurationRevision.Generation, "1")
 	releaseGate()
-	if err := <-reloadDone; err != nil {
-		t.Fatalf("reload: %v", err)
-	}
+	testassert.NoError(t, <-reloadDone)
 	after, err := r.getConfiguration(context.Background())
-	if err != nil || after.ConfigurationRevision.Generation != "2" {
-		t.Fatalf("read after the reload = (%v, generation %s), want generation 2", err, after.ConfigurationRevision.Generation)
-	}
+	testassert.Require(t, err == nil && after.ConfigurationRevision.Generation == "2", "read after the reload = (%v, generation %s), want generation 2", err, after.ConfigurationRevision.Generation)
 }
 
 // definedEmptyProvidersDocument is the classifier fixture: a defined-but-empty
@@ -477,9 +427,7 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 	ctx := context.Background()
 
 	view, err := r.getConfiguration(ctx)
-	if err != nil {
-		t.Fatalf("getConfiguration: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, row := range []struct {
 		id        string
 		source    string
@@ -491,29 +439,16 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 		{"live", "keyless", true},
 	} {
 		prov := findProvider(view.Providers, row.id)
-		if prov.Id != row.id {
-			t.Fatalf("%s view missing: %+v", row.id, prov)
-		}
-		if string(prov.KeySource) != row.source || prov.Connected != row.connected {
-			t.Fatalf("%s = key_source %q connected %v, want %q/%v",
-				row.id, prov.KeySource, prov.Connected, row.source, row.connected)
-		}
+		testassert.Require(t, prov.Id == row.id && string(prov.KeySource) == row.source && prov.Connected == row.connected, "%s view missing: %+v; %s = key_source %q connected %v, want %q/%v", row.id, prov, row.id, prov.KeySource, prov.Connected, row.source, row.connected)
 	}
 
 	models, err := r.listModels(ctx, protocol.ListModelsParams{All: true})
-	if err != nil {
-		t.Fatalf("listModels: %v", err)
-	}
+	testassert.NoError(t, err)
 	included := map[string]bool{}
 	for _, entry := range models.Models {
 		included[entry.Provider] = true
 	}
-	if included["emptyext"] || included["absent"] || included["managedempty"] {
-		t.Fatalf("the picker includes disconnected providers: %v", included)
-	}
-	if !included["live"] {
-		t.Fatalf("the picker excludes the connected keyless provider: %v", included)
-	}
+	testassert.Require(t, !included["emptyext"] && !included["absent"] && !included["managedempty"] && included["live"], "the picker includes disconnected providers: %v; the picker excludes the connected keyless provider: %v", included, included)
 }
 
 // TestConfigurationModelPickerConnectedRules pins the flat picker: both the
@@ -528,13 +463,9 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		visible, err := r.listModels(context.Background(), protocol.ListModelsParams{All: false})
-		if err != nil {
-			t.Fatalf("listModels(visible): %v", err)
-		}
+		testassert.NoError(t, err)
 		full, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
-		if err != nil {
-			t.Fatalf("listModels(full): %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Connected providers only: unsetp's model is in neither list;
 		// openrouter's isolated key keeps it disconnected in both.
@@ -543,24 +474,11 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 			entries []protocol.ModelListEntry
 		}{{"visible", visible.Models}, {"full", full.Models}} {
 			for _, entry := range list.entries {
-				if entry.Provider == "unsetp" || entry.Provider == "openrouter" {
-					t.Fatalf("%s list contains entry from a disconnected provider: %+v", list.name, entry)
-				}
-				if entry.Ref != entry.Provider+"/"+entry.Model {
-					t.Fatalf("%s list ref = %q, want the provider/model spelling", list.name, entry.Ref)
-				}
-				if entry.Source == "" {
-					t.Fatalf("%s list entry %s carries no source label", list.name, entry.Ref)
-				}
+				testassert.Require(t, entry.Provider != "unsetp" && entry.Provider != "openrouter" && entry.Ref == entry.Provider+"/"+entry.Model && entry.Source != "", "%s list contains entry from a disconnected provider: %+v; %s list ref = %q, want the provider/model spelling; %s list entry %s carries no source label", list.name, entry, list.name, entry.Ref, list.name, entry.Ref)
 			}
 		}
 		for _, entry := range visible.Models {
-			if entry.Hidden || entry.ProviderHidden {
-				t.Fatalf("visible list contains hidden entry %+v", entry)
-			}
-			if entry.Provider == "prov" && entry.Model == "m" && (entry.DisplayName != "M" || entry.ProviderName != "prov") {
-				t.Fatalf("prov/m entry display names = (%q, %q), want the effective model and provider names", entry.DisplayName, entry.ProviderName)
-			}
+			testassert.Require(t, !entry.Hidden && !entry.ProviderHidden && (entry.Provider != "prov" || entry.Model != "m" || entry.DisplayName == "M" && entry.ProviderName == "prov"), "visible list contains hidden entry %+v; prov/m entry display names = (%q, %q), want the effective model and provider names", entry, entry.DisplayName, entry.ProviderName)
 		}
 		var hiddenOne, incompleteOne bool
 		for _, entry := range full.Models {
@@ -571,46 +489,34 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 				incompleteOne = entry.Provider == "prov" && entry.Incomplete
 			}
 		}
-		if !hiddenOne || !incompleteOne {
-			t.Fatalf("full list misses the hidden (%v) or incomplete (%v) entry with its flag", hiddenOne, incompleteOne)
-		}
+		testassert.Require(t, hiddenOne && incompleteOne, "full list misses the hidden (%v) or incomplete (%v) entry with its flag", hiddenOne, incompleteOne)
 
 		// The per-provider model read: every model view of one provider,
 		// including the incomplete and hidden entries with usable flags.
 		models, err := r.listProviderModels(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("listProviderModels: %v", err)
-		}
-		if len(models.Models) != 3 {
-			t.Fatalf("provider models = %d, want all three effective entries", len(models.Models))
-		}
-		if models.ConfigurationRevision.Generation != "1" {
-			t.Fatalf("provider models revision = %+v, want generation 1", models.ConfigurationRevision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(models.Models) == 3 && models.ConfigurationRevision.Generation == "1", "got %v, want %v; provider models revision = %+v, want generation 1", len(models.Models), 3, models.ConfigurationRevision)
 		for _, model := range models.Models {
-			if model.Usable != (model.ContextWindow > 0) {
-				t.Fatalf("model %s usable = %v with window %d", model.Id, model.Usable, model.ContextWindow)
-			}
+			testassert.Require(t, model.Usable == (model.ContextWindow > 0), "model %s usable = %v with window %d", model.Id, model.Usable, model.ContextWindow)
 		}
 
 		// Identity rules: an unknown valid provider is the typed unknown
 		// error; an empty identity wraps the shared invalid sentinel.
-		if _, err := r.getProvider(context.Background(), "absent"); err == nil || !strings.Contains(err.Error(), "unknown provider") {
-			t.Fatalf("getProvider(absent) = %v, want the typed unknown-provider error", err)
+		{
+			_, err := r.getProvider(context.Background(), "absent")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "unknown provider"), "getProvider(absent) = %v, want the typed unknown-provider error", err)
 		}
-		if _, err := r.getProvider(context.Background(), ""); !strings.Contains(err.Error(), "provider id must be non-empty") {
-			t.Fatalf("getProvider(empty) = %v, want the shared invalid sentinel", err)
+		{
+			_, err := r.getProvider(context.Background(), "")
+			testassert.Require(t, strings.Contains(err.Error(), "provider id must be non-empty"), "getProvider(empty) = %v, want the shared invalid sentinel", err)
 		}
-		if _, err := r.listProviderModels(context.Background(), ""); !strings.Contains(err.Error(), "provider id must be non-empty") {
-			t.Fatalf("listProviderModels(empty) = %v, want the shared invalid sentinel", err)
+		{
+			_, err := r.listProviderModels(context.Background(), "")
+			testassert.Require(t, strings.Contains(err.Error(), "provider id must be non-empty"), "listProviderModels(empty) = %v, want the shared invalid sentinel", err)
 		}
 		detail, err := r.getProvider(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("getProvider(prov): %v", err)
-		}
-		if detail.Provider.Id != "prov" || detail.ConfigurationRevision.Generation != "1" {
-			t.Fatalf("provider detail = %+v, want the projected view at generation 1", detail.Provider)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, detail.Provider.Id == "prov" && detail.ConfigurationRevision.Generation == "1", "provider detail = %+v, want the projected view at generation 1", detail.Provider)
 	})
 }
 
@@ -625,13 +531,9 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		baseline, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		expected, err := json.Marshal(baseline)
-		if err != nil {
-			t.Fatalf("marshal baseline: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Mutate everything reachable through the returned view.
 		prov := findProvider(baseline.Providers, "prov")
@@ -643,9 +545,7 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 				model = &prov.Models[i]
 			}
 		}
-		if model == nil || model.Cost == nil || model.Cost.Input == nil || model.ExtraBody == nil || len(model.InputModalities) == 0 {
-			t.Fatalf("prov/m view missing expected references: %+v", model)
-		}
+		testassert.Require(t, model != nil && model.Cost != nil && model.Cost.Input != nil && model.ExtraBody != nil && len(model.InputModalities) != 0, "prov/m view missing expected references: %+v", model)
 		*model.Cost.Input = 999
 		(*model.ExtraBody)["side"] = "mutated"
 		model.InputModalities[0] = "mutated"
@@ -658,63 +558,37 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		}
 
 		fresh, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration again: %v", err)
-		}
+		testassert.NoError(t, err)
 		got, err := json.Marshal(fresh)
-		if err != nil {
-			t.Fatalf("marshal fresh: %v", err)
-		}
-		if string(got) != string(expected) {
-			t.Fatalf("a mutation of the returned view reached the captured configuration:\n%s\nwant\n%s", got, expected)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(got) == string(expected), "a mutation of the returned view reached the captured configuration:\n%s\nwant\n%s", got, expected)
 
 		// The model list and provider detail own their values the same way.
 		list, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
-		if err != nil {
-			t.Fatalf("listModels: %v", err)
-		}
+		testassert.NoError(t, err)
 		listExpected, err := json.Marshal(list)
-		if err != nil {
-			t.Fatalf("marshal list: %v", err)
-		}
+		testassert.NoError(t, err)
 		if len(list.Models) > 0 {
 			list.Models[0].DisplayName = "mutated"
 			list.Models = nil
 		}
 		detail, err := r.getProvider(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("getProvider: %v", err)
-		}
+		testassert.NoError(t, err)
 		detailExpected, err := json.Marshal(detail)
-		if err != nil {
-			t.Fatalf("marshal detail: %v", err)
-		}
+		testassert.NoError(t, err)
 		detail.Provider.Models[0].Name = "mutated"
 		detail.Provider.Headers["X-Trace"] = "mutated"
 
 		freshList, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
-		if err != nil {
-			t.Fatalf("listModels again: %v", err)
-		}
+		testassert.NoError(t, err)
 		gotList, err := json.Marshal(freshList)
-		if err != nil {
-			t.Fatalf("marshal fresh list: %v", err)
-		}
-		if string(gotList) != string(listExpected) {
-			t.Fatalf("a mutation of the returned list reached the captured configuration")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(gotList) == string(listExpected), "a mutation of the returned list reached the captured configuration")
 		freshDetail, err := r.getProvider(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("getProvider again: %v", err)
-		}
+		testassert.NoError(t, err)
 		gotDetail, err := json.Marshal(freshDetail)
-		if err != nil {
-			t.Fatalf("marshal fresh detail: %v", err)
-		}
-		if string(gotDetail) != string(detailExpected) {
-			t.Fatalf("a mutation of the returned detail reached the captured configuration")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(gotDetail) == string(detailExpected), "a mutation of the returned detail reached the captured configuration")
 	})
 }
 
@@ -728,33 +602,22 @@ func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		before, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		warningsBefore, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		writeServiceFile(t, e.configPath, "{not json")
-		if _, err := r.Reload(context.Background()); err == nil {
-			t.Fatal("Reload over a malformed configuration succeeded, want failure")
+		{
+			_, err := r.Reload(context.Background())
+			testassert.Require(t, err != nil, "Reload over a malformed configuration succeeded, want failure")
 		}
 
 		after, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration after failed reload: %v", err)
-		}
-		if after.ConfigurationRevision.Generation != before.ConfigurationRevision.Generation {
-			t.Fatalf("configuration generation advanced on a failed reload: %s → %s", before.ConfigurationRevision.Generation, after.ConfigurationRevision.Generation)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, after.ConfigurationRevision.Generation, before.ConfigurationRevision.Generation)
 		warningsAfter, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings after failed reload: %v", err)
-		}
-		if warningsAfter.WarningsRevision.Revision != warningsBefore.WarningsRevision.Revision {
-			t.Fatalf("warning revision advanced on a failed reload: %s → %s", warningsBefore.WarningsRevision.Revision, warningsAfter.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, warningsAfter.WarningsRevision.Revision, warningsBefore.WarningsRevision.Revision)
 	})
 }
 
@@ -771,35 +634,28 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		r, _ := openConfigurationRuntimeWithEnv(t, store, e, disconnectedDoc, configurationAgentsDocument)
 		defer closeProjectionRuntime(r)
 		setupSub, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(setupSub.Close)
 
 		// Disconnected: no_provider plus the primary model's unavailability.
 		snap, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
+		testassert.NoError(t, err)
 		var setupKinds []string
 		for _, warning := range snap.Warnings {
 			if warning.Source == "runtime:setup" {
 				setupKinds = append(setupKinds, warning.Kind)
 			}
 		}
-		if len(setupKinds) != 2 || setupKinds[0] != "setup_no_provider" || setupKinds[1] != "setup_model_unavailable" {
-			t.Fatalf("setup warnings = %v, want no_provider then model_unavailable", setupKinds)
-		}
+		testassert.Require(t, len(setupKinds) == 2 && setupKinds[0] == "setup_no_provider" && setupKinds[1] == "setup_model_unavailable", "setup warnings = %v, want no_provider then model_unavailable", setupKinds)
 
 		// Connect (the managed key writes through the retained path) and
 		// reload: the setup warnings clear and the publication carries its
 		// warning hint — one configuration event then one runtime-scoped
 		// warning event with the advanced revision.
-		if err := r.managedEnv.Set("UNSET_SETUP_KEY", "setup-secret"); err != nil {
-			t.Fatalf("managed set: %v", err)
-		}
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		testassert.NoError(t, r.managedEnv.Set("UNSET_SETUP_KEY", "setup-secret"))
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		clearingConfig, ok := nextEvent(t, setupSub)
 		if !ok || eventKind(t, clearingConfig) != "configuration_changed" {
@@ -810,34 +666,23 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 			t.Fatalf("clearing reload's warning event = %s (ok=%v), want the required warning hint after the configuration event", eventJSON(t, clearingWarning), ok)
 		}
 		clearingBody, err := clearingWarning.AsWarningChangedEvent()
-		if err != nil {
-			t.Fatalf("warning event body: %v", err)
-		}
-		if scopeKind(t, clearingBody.Scope) != "runtime" {
-			t.Fatalf("clearing reload's warning scope = %+v, want the runtime scope", clearingBody.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, scopeKind(t, clearingBody.Scope) == "runtime", "clearing reload's warning scope = %+v, want the runtime scope", clearingBody.Scope)
 		clear, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings after connect: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, warning := range clear.Warnings {
-			if warning.Source == "runtime:setup" {
-				t.Fatalf("setup warning survived the connected reload: %+v", warning)
-			}
+			testassert.Require(t, warning.Source != "runtime:setup", "setup warning survived the connected reload: %+v", warning)
 		}
 		revision, err := strconv.ParseUint(clear.WarningsRevision.Revision, 10, 64)
-		if err != nil || revision == 0 {
-			t.Fatalf("warning revision after the clearing reload = %v, want an advanced nonzero counter", clear.WarningsRevision.Revision)
-		}
+		testassert.Require(t, err == nil && revision != 0, "warning revision after the clearing reload = %v, want an advanced nonzero counter", clear.WarningsRevision.Revision)
 
-		if clearingBody.WarningsRevision.Revision != clear.WarningsRevision.Revision {
-			t.Fatalf("clearing reload's warning hint revision = %q, want the store's current value %q", clearingBody.WarningsRevision.Revision, clear.WarningsRevision.Revision)
-		}
+		testassert.Equal(t, clearingBody.WarningsRevision.Revision, clear.WarningsRevision.Revision)
 
 		// Idempotent reports advance nothing: reload again with no change —
 		// exactly one configuration event and NO warning hint.
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload again: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		idempotentConfig, ok := nextEvent(t, setupSub)
 		if !ok || eventKind(t, idempotentConfig) != "configuration_changed" {
@@ -845,12 +690,8 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		}
 		assertNoEvent(t, setupSub)
 		idempotent, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings after idempotent reload: %v", err)
-		}
-		if idempotent.WarningsRevision.Revision != clear.WarningsRevision.Revision {
-			t.Fatalf("warning revision advanced on an unchanged publication: %s → %s", clear.WarningsRevision.Revision, idempotent.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, idempotent.WarningsRevision.Revision, clear.WarningsRevision.Revision)
 
 		// A catalog warning rides the published candidate; reads enumerate
 		// the actual stored groups deterministically — global groups ordered
@@ -858,13 +699,12 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		// provider also restores the setup group.
 		brokenDoc := strings.Replace(disconnectedDoc, `"base_url":"https://prov.test/v1"`, `"base_url":""`, 1)
 		writeServiceFile(t, e.configPath, brokenDoc)
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload broken: %v", err)
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		broken, err := r.getWarnings(context.Background())
-		if err != nil {
-			t.Fatalf("getWarnings broken: %v", err)
-		}
+		testassert.NoError(t, err)
 		var sources []string
 		var catalogSeen, setupSeen bool
 		for _, warning := range broken.Warnings {
@@ -876,12 +716,8 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 				setupSeen = true
 			}
 		}
-		if !slices.IsSorted(sources) || len(sources) < 2 || sources[0] != "runtime:agents" {
-			t.Fatalf("broken-reload warning order = %v, want the lexical global groups with the agents group first", sources)
-		}
-		if !catalogSeen || !setupSeen {
-			t.Fatalf("broken-reload warnings = %+v, want both the catalog and setup groups", broken.Warnings)
-		}
+		testassert.Require(t, slices.IsSorted(sources) && len(sources) >= 2 && sources[0] == "runtime:agents", "broken-reload warning order = %v, want the lexical global groups with the agents group first", sources)
+		testassert.Require(t, catalogSeen && setupSeen, "broken-reload warnings = %+v, want both the catalog and setup groups", broken.Warnings)
 	})
 }
 
@@ -898,9 +734,7 @@ func TestConfigurationRosterRequiredArrays(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		view, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		type rosterProbe struct {
 			Name         string          `json:"name"`
 			Model        string          `json:"model"`
@@ -912,22 +746,16 @@ func TestConfigurationRosterRequiredArrays(t *testing.T) {
 			Readonly     bool            `json:"readonly"`
 		}
 		data, err := json.Marshal(view.Agents)
-		if err != nil {
-			t.Fatalf("marshal roster: %v", err)
-		}
+		testassert.NoError(t, err)
 		var probes []rosterProbe
-		if err := json.Unmarshal(data, &probes); err != nil {
-			t.Fatalf("unmarshal roster: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(data, &probes))
 		byName := make(map[string]rosterProbe, len(probes))
 		for _, probe := range probes {
 			for _, field := range []struct {
 				name  string
 				value json.RawMessage
 			}{{"tools", probe.Tools}, {"capabilities", probe.Capabilities}} {
-				if field.value == nil || string(field.value) == "null" {
-					t.Fatalf("agent %q's required %s member = %q, want a present array", probe.Name, field.name, field.value)
-				}
+				testassert.Require(t, field.value != nil && string(field.value) != "null", "agent %q's required %s member = %q, want a present array", probe.Name, field.name, field.value)
 			}
 			byName[probe.Name] = probe
 		}
@@ -935,27 +763,16 @@ func TestConfigurationRosterRequiredArrays(t *testing.T) {
 		if !ok {
 			t.Fatalf("roster misses the compact builtin: %v", probeNames(probes, func(p rosterProbe) string { return p.Name }))
 		}
-		if string(compact.Tools) != "[]" || string(compact.Capabilities) != "[]" {
-			t.Fatalf("compact arrays = tools %s capabilities %s, want the required empty []", compact.Tools, compact.Capabilities)
-		}
+		testassert.Require(t, string(compact.Tools) == "[]" && string(compact.Capabilities) == "[]", "compact arrays = tools %s capabilities %s, want the required empty []", compact.Tools, compact.Capabilities)
 		// The retained resolution chain: compact inherits the primary's model
 		// through secondary; the projection shows the resolved selection.
-		if compact.Model != "prov/m" {
-			t.Fatalf("compact model = %q, want the retained inherited selection", compact.Model)
-		}
+		testassert.Equal(t, compact.Model, "prov/m")
 		worker, ok := byName["worker"]
 		if !ok {
 			t.Fatalf("roster misses the custom sibling: %v", probeNames(probes, func(p rosterProbe) string { return p.Name }))
 		}
-		if string(worker.Tools) != `["prod_read"]` || string(worker.Capabilities) != "[]" {
-			t.Fatalf("worker arrays = tools %s capabilities %s, want the nonempty tools and empty [] capabilities", worker.Tools, worker.Capabilities)
-		}
-		if worker.WriteDir != "/ws" || !worker.Subagent || !worker.Readonly || worker.Description != "w" {
-			t.Fatalf("worker public fields = %+v, want the normalized definition values", worker)
-		}
-		if strings.Contains(string(data), "system_prompt") || strings.Contains(string(data), "lsp") || strings.Contains(string(data), "prompt\":") {
-			t.Fatalf("roster exposes private definition fields: %s", data)
-		}
+		testassert.Require(t, string(worker.Tools) == `["prod_read"]` && string(worker.Capabilities) == "[]" && worker.WriteDir == "/ws" && worker.Subagent && worker.Readonly && worker.Description == "w", "worker arrays = tools %s capabilities %s, want the nonempty tools and empty [] capabilities; worker public fields = %+v, want the normalized definition values", worker.Tools, worker.Capabilities, worker)
+		testassert.Require(t, !strings.Contains(string(data), "system_prompt") && !strings.Contains(string(data), "lsp") && !strings.Contains(string(data), "prompt\":"), "roster exposes private definition fields: %s", data)
 	})
 }
 
@@ -985,88 +802,54 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 		exactJSONMember := func(where, field string, value any, want string) {
 			t.Helper()
 			raw, err := json.Marshal(value)
-			if err != nil {
-				t.Fatalf("%s: marshal %s: %v", where, field, err)
-			}
-			if string(raw) != want {
-				t.Fatalf("%s: %s = %s, want the exact lexeme %s", where, field, raw, want)
-			}
+			testassert.Require(t, err == nil, "%s: marshal %s: %v", where, field, err)
+			testassert.Require(t, string(raw) == want, "%s: %s = %s, want the exact lexeme %s", where, field, raw, want)
 		}
 		checkExtras := func(where string, view protocol.Provider) {
 			t.Helper()
-			if view.ExtraBody == nil {
-				t.Fatalf("%s: prov extra_body missing, want the captured sidecar layer", where)
-			}
-			if got := (*view.ExtraBody)["side"]; got != "value" {
-				t.Fatalf("%s: prov extra_body side = %v, want the captured value", where, got)
+			testassert.Require(t, view.ExtraBody != nil, "%s: prov extra_body missing, want the captured sidecar layer", where)
+			{
+				got := (*view.ExtraBody)["side"]
+				testassert.Require(t, got == "value", "%s: prov extra_body side = %v, want the captured value", where, got)
 			}
 			exactJSONMember(where, "extra_body.big", (*view.ExtraBody)["big"], "9007199254740993")
-			if view.ProtocolMetadata == nil || view.ProtocolMetadata.Family == nil || *view.ProtocolMetadata.Family != "testfam" {
-				t.Fatalf("%s: prov protocol metadata family = %+v, want testfam", where, view.ProtocolMetadata)
-			}
-			if view.ProtocolMetadata.MustPreserve == nil || !slices.Equal(*view.ProtocolMetadata.MustPreserve, []string{"x_keep"}) {
-				t.Fatalf("%s: prov must_preserve = %v, want [x_keep]", where, view.ProtocolMetadata.MustPreserve)
-			}
-			if view.ProtocolMetadata.Drop == nil || !slices.Equal(*view.ProtocolMetadata.Drop, []string{"x_drop"}) {
-				t.Fatalf("%s: prov drop = %v, want [x_drop]", where, view.ProtocolMetadata.Drop)
-			}
+			testassert.Require(t, view.ProtocolMetadata != nil && view.ProtocolMetadata.Family != nil && *view.ProtocolMetadata.Family == "testfam", "%s: prov protocol metadata family = %+v, want testfam", where, view.ProtocolMetadata)
+			testassert.Require(t, view.ProtocolMetadata.MustPreserve != nil && slices.Equal(*view.ProtocolMetadata.MustPreserve, []string{"x_keep"}) && view.ProtocolMetadata.Drop != nil && slices.Equal(*view.ProtocolMetadata.Drop, []string{"x_drop"}), "%s: prov must_preserve = %v, want [x_keep]; %s: prov drop = %v, want [x_drop]", where, view.ProtocolMetadata.MustPreserve, where, view.ProtocolMetadata.Drop)
 		}
 
 		configView, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		prov := findProvider(configView.Providers, "prov")
 		checkExtras("getConfiguration", prov)
 		// The remaining provider/model fields the sidecar fixture carries:
 		// the effective system role and the streamed-usage flag.
-		if prov.SystemRole != protocol.SystemRole("system") || !prov.UsageInStream {
-			t.Fatalf("prov system_role = %q usage_in_stream = %v, want the effective defaults", prov.SystemRole, prov.UsageInStream)
-		}
+		testassert.Require(t, prov.SystemRole == protocol.SystemRole("system") && prov.UsageInStream, "prov system_role = %q usage_in_stream = %v, want the effective defaults", prov.SystemRole, prov.UsageInStream)
 		for _, model := range prov.Models {
-			if model.SystemRole != protocol.SystemRole("system") || !model.UsageInStream {
-				t.Fatalf("prov/%s system_role = %q usage_in_stream = %v, want the effective defaults", model.Id, model.SystemRole, model.UsageInStream)
-			}
+			testassert.Require(t, model.SystemRole == protocol.SystemRole("system") && model.UsageInStream, "prov/%s system_role = %q usage_in_stream = %v, want the effective defaults", model.Id, model.SystemRole, model.UsageInStream)
 		}
 		list, err := r.listProviders(context.Background())
-		if err != nil {
-			t.Fatalf("listProviders: %v", err)
-		}
+		testassert.NoError(t, err)
 		checkExtras("listProviders", findProvider(list.Providers, "prov"))
 		detail, err := r.getProvider(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("getProvider: %v", err)
-		}
+		testassert.NoError(t, err)
 		checkExtras("getProvider", detail.Provider)
-		if configView.ConfigurationRevision.Generation != list.ConfigurationRevision.Generation ||
-			list.ConfigurationRevision.Generation != detail.ConfigurationRevision.Generation {
-			t.Fatalf("the three read paths disagree on the generation: %q/%q/%q",
-				configView.ConfigurationRevision.Generation, list.ConfigurationRevision.Generation, detail.ConfigurationRevision.Generation)
-		}
+		testassert.Require(t, configView.ConfigurationRevision.Generation == list.ConfigurationRevision.Generation && list.ConfigurationRevision.Generation == detail.ConfigurationRevision.Generation, "the three read paths disagree on the generation: %q/%q/%q", configView.ConfigurationRevision.Generation, list.ConfigurationRevision.Generation, detail.ConfigurationRevision.Generation)
 
 		// Ownership: the sidecar members are owned against an independent
 		// serialized baseline — nested member mutations never reach the
 		// captured configuration.
 		baseline, err := json.Marshal(detail.Provider)
-		if err != nil {
-			t.Fatalf("marshal baseline: %v", err)
-		}
+		testassert.NoError(t, err)
 		(*detail.Provider.ExtraBody)["side"] = "mutated"
 		(*detail.Provider.ExtraBody)["big"] = nil
 		*detail.Provider.ProtocolMetadata.Family = "mutated"
 		(*detail.Provider.ProtocolMetadata.MustPreserve)[0] = "mutated"
 		(*detail.Provider.ProtocolMetadata.Drop)[0] = "mutated"
 		fresh, err := r.getProvider(context.Background(), "prov")
-		if err != nil {
-			t.Fatalf("getProvider again: %v", err)
-		}
+		testassert.NoError(t, err)
 		got, err := json.Marshal(fresh.Provider)
-		if err != nil {
-			t.Fatalf("marshal fresh: %v", err)
-		}
-		if string(got) != string(baseline) {
-			t.Fatalf("a mutation of the returned provider's sidecar members reached the captured configuration:\n%s\nwant\n%s", got, baseline)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(got) == string(baseline), "a mutation of the returned provider's sidecar members reached the captured configuration:\n%s\nwant\n%s", got, baseline)
 
 		// The model rows keep their own owned cost/extra/modality values with
 		// raw number lexemes.
@@ -1076,18 +859,11 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 				model = &fresh.Provider.Models[i]
 			}
 		}
-		if model == nil || model.Cost == nil || model.Cost.Input == nil || model.ExtraBody == nil {
-			t.Fatalf("prov/m view missing expected sidecar references: %+v", model)
-		}
+		testassert.Require(t, model != nil && model.Cost != nil && model.Cost.Input != nil && model.ExtraBody != nil, "prov/m view missing expected sidecar references: %+v", model)
 		if *model.Cost.Input != 1.5 {
 			t.Fatalf("prov/m cost input = %v, want the captured price", *model.Cost.Input)
 		}
-		if model.MaxOutputTokens != 0 {
-			t.Fatalf("prov/m max_output_tokens = %d, want the unset default", model.MaxOutputTokens)
-		}
-		if model.ProtocolMetadata == nil || model.ProtocolMetadata.Family == nil || *model.ProtocolMetadata.Family != "testfam" {
-			t.Fatalf("prov/m protocol metadata = %+v, want the effective model-over-provider merge", model.ProtocolMetadata)
-		}
+		testassert.Require(t, model.MaxOutputTokens == 0 && model.ProtocolMetadata != nil && model.ProtocolMetadata.Family != nil && *model.ProtocolMetadata.Family == "testfam", "got %v, want %v; prov/m protocol metadata = %+v, want the effective model-over-provider merge", model.MaxOutputTokens, 0, model.ProtocolMetadata)
 		exactJSONMember("getProvider model", "extra_body.mside", (*model.ExtraBody)["mside"], "1")
 	})
 }
@@ -1109,53 +885,40 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 		// Before any cache record: the bundled provider's shipped models are
 		// bundled and the user-layer model is user; nothing is discovered.
 		before, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration: %v", err)
-		}
+		testassert.NoError(t, err)
 		openrouter := findProvider(before.Providers, "openrouter")
-		if !openrouter.Builtin {
-			t.Fatal("openrouter builtin = false, want the bundled identity")
-		}
+		testassert.Require(t, openrouter.Builtin, "openrouter builtin = false, want the bundled identity")
 		wantBefore := map[string]string{"m": "user"}
 		for _, model := range openrouter.Models {
 			want := wantBefore[model.Id]
 			if want == "" {
 				want = "bundled" // every shipped catalog model
 			}
-			if model.Source != protocol.ModelSource(want) {
-				t.Fatalf("openrouter/%s source = %q, want %q", model.Id, model.Source, want)
-			}
+			testassert.Require(t, model.Source == protocol.ModelSource(want), "openrouter/%s source = %q, want %q", model.Id, model.Source, want)
 		}
 
 		// Seed a bound cache record from the effective merged transport the
 		// first build produced, then reload: the rebuild adopts the discovered
 		// model and labels it from the same accepted record.
 		transport := catalog.Transport{BaseURL: openrouter.BaseUrl, APIKeyEnv: openrouter.ApiKeyEnv, Headers: openrouter.Headers}
-		if err := catalog.WriteDiscoveryCache(e.home, "openrouter", transport,
+		testassert.NoError(t, catalog.WriteDiscoveryCache(e.home, "openrouter", transport,
 			catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{"found-via-cache": {Name: "Found Via Cache", ContextWindow: 4096}}},
-			time.Now().UTC()); err != nil {
-			t.Fatalf("WriteDiscoveryCache: %v", err)
-		}
-		if _, err := r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+			time.Now().UTC()))
+		{
+			_, err := r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		after, err := r.getConfiguration(context.Background())
-		if err != nil {
-			t.Fatalf("getConfiguration after reload: %v", err)
-		}
+		testassert.NoError(t, err)
 		reloaded := findProvider(after.Providers, "openrouter")
-		if reloaded.Id != "openrouter" {
-			t.Fatal("reloaded openrouter view missing")
-		}
+		testassert.Require(t, reloaded.Id == "openrouter", "reloaded openrouter view missing")
 		wantAfter := map[string]string{"m": "user", "found-via-cache": "discovered"}
 		for _, model := range reloaded.Models {
 			want := wantAfter[model.Id]
 			if want == "" {
 				want = "bundled"
 			}
-			if model.Source != protocol.ModelSource(want) {
-				t.Fatalf("openrouter/%s source = %q, want %q", model.Id, model.Source, want)
-			}
+			testassert.Require(t, model.Source == protocol.ModelSource(want), "openrouter/%s source = %q, want %q", model.Id, model.Source, want)
 		}
 		discovered := reloaded.Models[0]
 		for i := range reloaded.Models {
@@ -1163,26 +926,18 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 				discovered = reloaded.Models[i]
 			}
 		}
-		if discovered.Name != "Found Via Cache" || discovered.ContextWindow != 4096 || !discovered.Usable {
-			t.Fatalf("discovered model view = %+v, want the record's adopted identity", discovered)
-		}
+		testassert.Require(t, discovered.Name == "Found Via Cache" && discovered.ContextWindow == 4096 && discovered.Usable, "discovered model view = %+v, want the record's adopted identity", discovered)
 
 		// The picker carries the same exact labels from the captured catalog,
 		// still connected-only: the disconnected openrouter appears in neither
 		// list, and the connected custom provider's model is user.
 		list, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
-		if err != nil {
-			t.Fatalf("listModels: %v", err)
-		}
+		testassert.NoError(t, err)
 		pickerLabels := map[string]string{}
 		for _, entry := range list.Models {
-			if entry.Provider == "openrouter" {
-				t.Fatalf("the picker listed a disconnected provider's model: %+v", entry)
-			}
+			testassert.Require(t, entry.Provider != "openrouter", "the picker listed a disconnected provider's model: %+v", entry)
 			pickerLabels[entry.Provider+"/"+entry.Model] = string(entry.Source)
 		}
-		if pickerLabels["prov/m"] != "user" {
-			t.Fatalf("picker labels = %v, want the exact user label for the connected provider's model", pickerLabels)
-		}
+		testassert.Require(t, pickerLabels["prov/m"] == "user", "picker labels = %v, want the exact user label for the connected provider's model", pickerLabels)
 	})
 }

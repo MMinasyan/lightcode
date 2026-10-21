@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -37,36 +38,25 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		ctx := context.Background()
 
 		absent := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), "", "")
-		if absent.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("absent credential = %d, want 401", absent.StatusCode)
-		}
+		testassert.Equal(t, absent.StatusCode, http.StatusUnauthorized)
 		typed := decodeProtocolError(t, absent)
-		if typed.Code != protocol.Unauthorized || strings.Contains(typed.Message, ps.credential) {
-			t.Fatalf("absent credential error = %+v, want unauthorized with no credential echo", typed)
-		}
+		testassert.Require(t, typed.Code == protocol.Unauthorized && !strings.Contains(typed.Message, ps.credential), "absent credential error = %+v, want unauthorized with no credential echo", typed)
 
 		wrong := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), "wrong-token", "")
-		if wrong.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("wrong credential = %d, want 401", wrong.StatusCode)
-		}
+		testassert.Equal(t, wrong.StatusCode, http.StatusUnauthorized)
 		scheme := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), "Basic dXNlcjpwYXNz", "")
-		if scheme.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("foreign scheme = %d, want 401", scheme.StatusCode)
-		}
+		testassert.Equal(t, scheme.StatusCode, http.StatusUnauthorized)
 
 		// Authentication precedes parameter binding: a request missing its
 		// required query member is answered unauthorized while the
 		// credential is absent, and invalid once it is present.
 		bindless := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/providers/detail"), "", "")
-		if bindless.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated missing query = %d, want the 401 gate answer", bindless.StatusCode)
-		}
+		testassert.Equal(t, bindless.StatusCode, http.StatusUnauthorized)
 		binding := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/providers/detail"), ps.credential, "")
-		if binding.StatusCode != http.StatusBadRequest {
-			t.Fatalf("missing query = %d, want the typed binding failure 400", binding.StatusCode)
-		}
-		if typed := decodeProtocolError(t, binding); typed.Code != protocol.Invalid {
-			t.Fatalf("missing query error = %+v, want invalid", typed)
+		testassert.Equal(t, binding.StatusCode, http.StatusBadRequest)
+		{
+			typed := decodeProtocolError(t, binding)
+			testassert.Require(t, typed.Code == protocol.Invalid, "missing query error = %+v, want invalid", typed)
 		}
 
 		// Authentication precedes every producer effect: a creation with a
@@ -74,50 +64,35 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		workspace := filepath.Join(e.home, "auth")
 		creation := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/sessions"), "bad",
 			fmt.Sprintf(`{"workspace":%q,"agent_type":"solo"}`, workspace))
-		if creation.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated creation = %d, want 401", creation.StatusCode)
-		}
+		testassert.Equal(t, creation.StatusCode, http.StatusUnauthorized)
 		sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("list after refused creation: %v", err)
-		}
-		if len(sessions) != 0 {
-			t.Fatalf("refused creation left %d sessions, want none", len(sessions))
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, len(sessions), 0)
 
 		// The root catch-all rides the same gate: an unknown route without a
 		// credential is unauthorized, not a typed route miss.
 		catchAll := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/nope"), "", "")
-		if catchAll.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated unknown route = %d, want the 401 gate answer", catchAll.StatusCode)
-		}
+		testassert.Equal(t, catchAll.StatusCode, http.StatusUnauthorized)
 
 		// The events stream authenticates before it subscribes: an
 		// unauthenticated request answers the typed 401 and creates no
 		// subscription.
 		unauthenticatedEvents := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/events"), "", "")
-		if unauthenticatedEvents.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated events = %d, want the typed 401", unauthenticatedEvents.StatusCode)
+		testassert.Equal(t, unauthenticatedEvents.StatusCode, http.StatusUnauthorized)
+		{
+			typed := decodeProtocolError(t, unauthenticatedEvents)
+			testassert.Require(t, typed.Code == protocol.Unauthorized, "unauthenticated events error = %+v, want unauthorized", typed)
 		}
-		if typed := decodeProtocolError(t, unauthenticatedEvents); typed.Code != protocol.Unauthorized {
-			t.Fatalf("unauthenticated events error = %+v, want unauthorized", typed)
-		}
-		if subscribers := subscriberCount(r); subscribers != 0 {
-			t.Fatalf("the unauthenticated events request created %d subscriptions", subscribers)
-		}
+		testassert.Equal(t, subscriberCount(r), 0)
 
 		// Version compatibility is connection-side: a bogus per-request
 		// version header changes nothing on the authenticated health read.
 		versioned, err := http.NewRequest(http.MethodGet, protocolTarget(ps, "/v1/health"), nil)
-		if err != nil {
-			t.Fatalf("build versioned health request: %v", err)
-		}
+		testassert.NoError(t, err)
 		versioned.Header.Set("Authorization", "Bearer "+ps.credential)
 		versioned.Header.Set("X-Lightcode-Version", "999")
 		versionedResponse, err := (&http.Client{Timeout: 30 * time.Second}).Do(versioned)
-		if err != nil {
-			t.Fatalf("versioned health: %v", err)
-		}
+		testassert.NoError(t, err)
 		if versionedResponse.StatusCode != http.StatusOK {
 			versionedResponse.Body.Close()
 			t.Fatalf("versioned health = %d, want 200", versionedResponse.StatusCode)
@@ -128,9 +103,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		if health.ProtocolVersion != protocol.N2 {
-			t.Fatalf("versioned health protocol = %q, want %q", health.ProtocolVersion, protocol.N2)
-		}
+		testassert.Equal(t, health.ProtocolVersion, protocol.N2)
 	})
 }
 
@@ -155,19 +128,14 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			t.Helper()
 			response := create(body)
 			defer response.Body.Close()
-			if response.StatusCode != http.StatusBadRequest {
-				t.Fatalf("%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
-			}
-			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
-				t.Fatalf("%s error = %+v, want invalid", name, typed)
+			testassert.Require(t, response.StatusCode == http.StatusBadRequest, "%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
+			{
+				typed := decodeProtocolError(t, response)
+				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", name, typed)
 			}
 			sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
-			if err != nil {
-				t.Fatalf("list after %s: %v", name, err)
-			}
-			if len(sessions) != 0 {
-				t.Fatalf("%s created a session, want no mutation before validation", name)
-			}
+			testassert.Require(t, err == nil, "list after %s: %v", name, err)
+			testassert.Require(t, len(sessions) == 0, "%s created a session, want no mutation before validation", name)
 		}
 		reject("unknown top member", fmt.Sprintf(`{"workspace":%q,"agent_type":"solo","note":"x"}`, workspace))
 		reject("missing required member", fmt.Sprintf(`{"workspace":%q}`, workspace))
@@ -184,18 +152,17 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		// validator. A valid session exists for these rows.
 		client := protocolClient(t, ps)
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
-		if err != nil || created.JSON201 == nil {
-			t.Fatalf("create: %v", err)
-		}
+		testassert.Require(t, err == nil && created.JSON201 != nil, "create: %v", err)
 		session := created.JSON201.SessionId
 		gate := make(chan struct{})
 		e.server.setHold(gate)
 		defer close(gate)
-		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
-			OperationId: "op-1", Mode: "regular",
-			Content: []protocol.ContentPart{textContentPart(t, "first", nil)},
-		}); err != nil {
-			t.Fatalf("gated submit: %v", err)
+		{
+			_, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
+				OperationId: "op-1", Mode: "regular",
+				Content: []protocol.ContentPart{textContentPart(t, "first", nil)},
+			})
+			testassert.NoError(t, err)
 		}
 		awaitModelArrival(t, e)
 
@@ -214,13 +181,12 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 				response.Body.Close()
 				t.Fatalf("%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
 			}
-			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
-				t.Fatalf("%s error = %+v, want the typed invalid body", name, typed)
+			{
+				typed := decodeProtocolError(t, response)
+				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want the typed invalid body", name, typed)
 			}
 			after := sessionViewThroughRuntime(t, r, session)
-			if !reflect.DeepEqual(before, after) {
-				t.Fatalf("%s changed the Session snapshot (pending queues, facts, or revisions)", name)
-			}
+			testassert.Require(t, reflect.DeepEqual(before, after), "%s changed the Session snapshot (pending queues, facts, or revisions)", name)
 		}
 		rejectSubmit("unknown union member", `{"operation_id":"op-2","mode":"queued","content":[{"kind":"text","text":"x","forged":1}]}`)
 		rejectSubmit("unknown union discriminator", `{"operation_id":"op-2","mode":"queued","content":[{"kind":"pdf","text":"x"}]}`)
@@ -244,9 +210,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 				opaqueContentPart(t, "vendor_wire"),
 			},
 		})
-		if err != nil {
-			t.Fatalf("valid image_url/opaque submit: %v", err)
-		}
+		testassert.NoError(t, err)
 		if accepted.JSON200 == nil || accepted.JSON200.Disposition != protocol.SubmitResultDispositionQueued {
 			body, _ := json.Marshal(accepted.JSON200)
 			t.Fatalf("valid image_url/opaque submit = %s (status %d), want the buffered disposition", body, accepted.HTTPResponse.StatusCode)
@@ -260,46 +224,40 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		}
 		nested := providerCreate(`{"id":"newp","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096,"bogus":1}}}`)
 		defer nested.Body.Close()
-		if nested.StatusCode != http.StatusBadRequest {
-			t.Fatalf("unknown nested model member = %d, want 400", nested.StatusCode)
-		}
+		testassert.Equal(t, nested.StatusCode, http.StatusBadRequest)
 		nullModel := providerCreate(`{"id":"newp","provider":{"base_url":"https://x.test/v1"},"models":{"m":null}}`)
 		defer nullModel.Body.Close()
-		if nullModel.StatusCode != http.StatusBadRequest {
-			t.Fatalf("null typed map value = %d, want 400", nullModel.StatusCode)
-		}
+		testassert.Equal(t, nullModel.StatusCode, http.StatusBadRequest)
 		// The provider-create typed model map carries otherwise valid
 		// members and an invalid generated SystemRole: the nested enum
 		// validator refuses it before any write.
 		invalidEnum := providerCreate(`{"id":"newp","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096,"system_role":"boss"}}}`)
 		defer invalidEnum.Body.Close()
-		if invalidEnum.StatusCode != http.StatusBadRequest {
-			t.Fatalf("invalid nested SystemRole = %d, want the typed invalid rejection 400", invalidEnum.StatusCode)
-		}
-		if typed := decodeProtocolError(t, invalidEnum); typed.Code != protocol.Invalid {
-			t.Fatalf("invalid nested SystemRole error = %+v, want invalid", typed)
+		testassert.Equal(t, invalidEnum.StatusCode, http.StatusBadRequest)
+		{
+			typed := decodeProtocolError(t, invalidEnum)
+			testassert.Require(t, typed.Code == protocol.Invalid, "invalid nested SystemRole error = %+v, want invalid", typed)
 		}
 		// The same typed map carries an invalid element inside the real
 		// input_modalities slice; its valid sibling slice element is
 		// accepted.
 		invalidModalities := providerCreate(`{"id":"newp","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096,"input_modalities":["text","hologram"]}}}`)
 		defer invalidModalities.Body.Close()
-		if invalidModalities.StatusCode != http.StatusBadRequest {
-			t.Fatalf("invalid input_modalities element = %d, want the typed invalid rejection 400", invalidModalities.StatusCode)
-		}
-		if typed := decodeProtocolError(t, invalidModalities); typed.Code != protocol.Invalid {
-			t.Fatalf("invalid input_modalities element error = %+v, want invalid", typed)
+		testassert.Equal(t, invalidModalities.StatusCode, http.StatusBadRequest)
+		{
+			typed := decodeProtocolError(t, invalidModalities)
+			testassert.Require(t, typed.Code == protocol.Invalid, "invalid input_modalities element error = %+v, want invalid", typed)
 		}
 		validModalities := providerCreate(`{"id":"validmods","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096,"input_modalities":["text"]}}}`)
 		defer validModalities.Body.Close()
-		if validModalities.StatusCode != http.StatusOK {
-			t.Fatalf("valid input_modalities sibling = %d, want 200", validModalities.StatusCode)
+		testassert.Equal(t, validModalities.StatusCode, http.StatusOK)
+		{
+			_, err := r.getProvider(ctx, "validmods")
+			testassert.NoError(t, err)
 		}
-		if _, err := r.getProvider(ctx, "validmods"); err != nil {
-			t.Fatalf("the valid input_modalities sibling was not written: %v", err)
-		}
-		if _, err := r.getProvider(ctx, "newp"); !errors.Is(err, catalog.ErrUnknownProvider) {
-			t.Fatalf("rejected creation wrote a provider: %v", err)
+		{
+			_, err := r.getProvider(ctx, "newp")
+			testassert.Require(t, errors.Is(err, catalog.ErrUnknownProvider), "rejected creation wrote a provider: %v", err)
 		}
 
 		// The retired provider controls follow the shared strict boundary:
@@ -308,46 +266,36 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		// mutation, leaving the addressed provider and its revision
 		// untouched.
 		beforeRetired, err := r.getProvider(ctx, "validmods")
-		if err != nil {
-			t.Fatalf("read provider before the retired-control rows: %v", err)
-		}
+		testassert.NoError(t, err)
 		retiredEdit := func(name, body string) {
 			t.Helper()
 			response := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/providers/detail?provider_id=validmods"), ps.credential, body)
 			defer response.Body.Close()
-			if response.StatusCode != http.StatusBadRequest {
-				t.Fatalf("%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
-			}
-			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
-				t.Fatalf("%s error = %+v, want invalid", name, typed)
+			testassert.Require(t, response.StatusCode == http.StatusBadRequest, "%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
+			{
+				typed := decodeProtocolError(t, response)
+				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", name, typed)
 			}
 		}
 		retiredEdit("retired edit max_tokens_field", `{"provider":{"max_tokens_field":"max_completion_tokens"}}`)
 		retiredEdit("retired edit options", `{"provider":{"options":{"retries":3}}}`)
 		retiredReset := rawProtocol(t, http.MethodDelete, protocolTarget(ps, "/v1/providers/fields/options?provider_id=validmods"), ps.credential, "")
 		defer retiredReset.Body.Close()
-		if retiredReset.StatusCode != http.StatusBadRequest {
-			t.Fatalf("retired reset options = %d, want the typed invalid rejection 400", retiredReset.StatusCode)
-		}
-		if typed := decodeProtocolError(t, retiredReset); typed.Code != protocol.Invalid {
-			t.Fatalf("retired reset options error = %+v, want invalid", typed)
+		testassert.Equal(t, retiredReset.StatusCode, http.StatusBadRequest)
+		{
+			typed := decodeProtocolError(t, retiredReset)
+			testassert.Require(t, typed.Code == protocol.Invalid, "retired reset options error = %+v, want invalid", typed)
 		}
 		afterRetired, err := r.getProvider(ctx, "validmods")
-		if err != nil {
-			t.Fatalf("read provider after the retired-control rows: %v", err)
-		}
-		if !reflect.DeepEqual(beforeRetired, afterRetired) {
-			t.Fatalf("a retired-control refusal changed the provider:\nbefore %+v\nafter  %+v", beforeRetired, afterRetired)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(beforeRetired, afterRetired), "a retired-control refusal changed the provider:\nbefore %+v\nafter  %+v", beforeRetired, afterRetired)
 
 		// A null header value inside a declared typed map is not an opaque
 		// map member: the discovery route rejects it before any fetch.
 		nullHeader := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers/discover"), ps.credential,
 			`{"base_url":"https://x.test/v1","api_key_env":"","headers":{"h":null}}`)
 		defer nullHeader.Body.Close()
-		if nullHeader.StatusCode != http.StatusBadRequest {
-			t.Fatalf("null header value = %d, want 400", nullHeader.StatusCode)
-		}
+		testassert.Equal(t, nullHeader.StatusCode, http.StatusBadRequest)
 
 		// The controls are argument-free POSTs: no request-body schema
 		// exists, so any body is ignored and the addressed Session decides.
@@ -365,15 +313,11 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		} {
 			response := interrupt(session, body)
 			response.Body.Close()
-			if response.StatusCode != http.StatusNoContent {
-				t.Fatalf("%s = %d, want the accepted 204", name, response.StatusCode)
-			}
+			testassert.Require(t, response.StatusCode == http.StatusNoContent, "%s = %d, want the accepted 204", name, response.StatusCode)
 		}
 		unknown := interrupt("0123456789abcdef0123456789abcdef", "")
 		unknown.Body.Close()
-		if unknown.StatusCode != http.StatusNotFound {
-			t.Fatalf("unknown control target = %d, want the typed not-found 404", unknown.StatusCode)
-		}
+		testassert.Equal(t, unknown.StatusCode, http.StatusNotFound)
 	})
 }
 
@@ -392,28 +336,25 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		client := protocolClient(t, ps)
 		ctx := context.Background()
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "unclean"), AgentType: "solo"})
-		if err != nil || created.JSON201 == nil {
-			t.Fatalf("create session for the unclean-path row: %v", err)
-		}
+		testassert.Require(t, err == nil && created.JSON201 != nil, "create session for the unclean-path row: %v", err)
 		session := created.JSON201.SessionId
 
 		unknown := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/nope"), ps.credential, "")
-		if unknown.StatusCode != http.StatusNotFound {
-			t.Fatalf("unknown route = %d, want the typed 404", unknown.StatusCode)
+		testassert.Equal(t, unknown.StatusCode, http.StatusNotFound)
+		{
+			typed := decodeProtocolError(t, unknown)
+			testassert.Require(t, typed.Code == protocol.NotFound, "unknown route error = %+v, want not_found", typed)
 		}
-		if typed := decodeProtocolError(t, unknown); typed.Code != protocol.NotFound {
-			t.Fatalf("unknown route error = %+v, want not_found", typed)
-		}
-		if media := unknown.Header.Get("Content-Type"); !strings.Contains(media, "json") {
-			t.Fatalf("unknown route content type = %q, want the typed JSON body", media)
+		{
+			media := unknown.Header.Get("Content-Type")
+			testassert.Require(t, strings.Contains(media, "json"), "unknown route content type = %q, want the typed JSON body", media)
 		}
 
 		wrongMethod := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/health"), ps.credential, "")
-		if wrongMethod.StatusCode != http.StatusNotFound {
-			t.Fatalf("wrong method = %d, want the typed 404", wrongMethod.StatusCode)
-		}
-		if typed := decodeProtocolError(t, wrongMethod); typed.Code != protocol.NotFound {
-			t.Fatalf("wrong method error = %+v, want not_found", typed)
+		testassert.Equal(t, wrongMethod.StatusCode, http.StatusNotFound)
+		{
+			typed := decodeProtocolError(t, wrongMethod)
+			testassert.Require(t, typed.Code == protocol.NotFound, "wrong method error = %+v, want not_found", typed)
 		}
 
 		// The removed standalone Session reads are unregistered routes: each
@@ -424,11 +365,10 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 			"/v1/sessions/" + session + "/usage",
 		} {
 			response := rawProtocol(t, http.MethodGet, protocolTarget(ps, removed), ps.credential, "")
-			if response.StatusCode != http.StatusNotFound {
-				t.Fatalf("removed route %s = %d, want the typed 404", removed, response.StatusCode)
-			}
-			if typed := decodeProtocolError(t, response); typed.Code != protocol.NotFound {
-				t.Fatalf("removed route %s error = %+v, want not_found", removed, typed)
+			testassert.Require(t, response.StatusCode == http.StatusNotFound, "removed route %s = %d, want the typed 404", removed, response.StatusCode)
+			{
+				typed := decodeProtocolError(t, response)
+				testassert.Require(t, typed.Code == protocol.NotFound, "removed route %s error = %+v, want not_found", removed, typed)
 			}
 		}
 
@@ -439,18 +379,12 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		}
 
 		unclean := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1//health"), ps.credential, "")
-		if unclean.StatusCode != http.StatusTemporaryRedirect {
-			t.Fatalf("unclean path = %d, want the transport-level 307", unclean.StatusCode)
-		}
-		if location := unclean.Header.Get("Location"); location != "/v1/health" {
-			t.Fatalf("unclean redirect location = %q, want the cleaned path", location)
-		}
+		testassert.Equal(t, unclean.StatusCode, http.StatusTemporaryRedirect)
+		testassert.Equal(t, unclean.Header.Get("Location"), "/v1/health")
 		// The clean operation answers with a clean parameter, never an
 		// untyped answer.
 		healthy := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), ps.credential, "")
-		if healthy.StatusCode != http.StatusOK {
-			t.Fatalf("clean health = %d, want 200", healthy.StatusCode)
-		}
+		testassert.Equal(t, healthy.StatusCode, http.StatusOK)
 		healthy.Body.Close()
 
 		// An unclean Session path is transport-redirected to its clean
@@ -458,22 +392,14 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		// hydration handler and reads exactly the addressed Session.
 		uncleanSessionPath := "/v1//sessions/" + session + "/hydration"
 		uncleanSession := rawProtocol(t, http.MethodGet, protocolTarget(ps, uncleanSessionPath), ps.credential, "")
-		if uncleanSession.StatusCode != http.StatusTemporaryRedirect {
-			t.Fatalf("unclean Session path = %d, want the transport-level 307", uncleanSession.StatusCode)
-		}
-		if location := uncleanSession.Header.Get("Location"); location != "/v1/sessions/"+session+"/hydration" {
-			t.Fatalf("unclean Session redirect location = %q, want the cleaned Session path", location)
-		}
+		testassert.Equal(t, uncleanSession.StatusCode, http.StatusTemporaryRedirect)
+		testassert.Equal(t, uncleanSession.Header.Get("Location"), "/v1/sessions/"+session+"/hydration")
 		uncleanSession.Body.Close()
 		redirectRequest, err := http.NewRequest(http.MethodGet, protocolTarget(ps, uncleanSessionPath), nil)
-		if err != nil {
-			t.Fatalf("build unclean Session request: %v", err)
-		}
+		testassert.NoError(t, err)
 		redirectRequest.Header.Set("Authorization", "Bearer "+ps.credential)
 		redirected, err := (&http.Client{Timeout: 30 * time.Second}).Do(redirectRequest)
-		if err != nil {
-			t.Fatalf("follow the unclean Session redirect: %v", err)
-		}
+		testassert.NoError(t, err)
 		if redirected.StatusCode != http.StatusOK {
 			redirected.Body.Close()
 			t.Fatalf("followed unclean Session path = %d, want the clean 200", redirected.StatusCode)
@@ -484,36 +410,28 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 			t.Fatalf("decode the followed Session: %v", err)
 		}
 		redirected.Body.Close()
-		if followedSession.Session.SessionId != session {
-			t.Fatalf("followed Session = %q, want the addressed %q", followedSession.Session.SessionId, session)
-		}
+		testassert.Equal(t, followedSession.Session.SessionId, session)
 
 		// The asterisk-form OPTIONS request is answered by the server layer
 		// before the routing tree, the authentication gate, and every
 		// handler: it produces no typed protocol answer.
 		conn, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://"))
-		if err != nil {
-			t.Fatalf("dial for OPTIONS: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer conn.Close()
-		if _, err := conn.Write([]byte("OPTIONS * HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")); err != nil {
-			t.Fatalf("write OPTIONS: %v", err)
+		{
+			_, err := conn.Write([]byte("OPTIONS * HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"))
+			testassert.NoError(t, err)
 		}
 		buffer := make([]byte, 512)
 		read, err := conn.Read(buffer)
-		if err != nil && read == 0 {
-			t.Fatalf("read OPTIONS answer: %v", err)
-		}
+		testassert.Require(t, err == nil || read != 0, "read OPTIONS answer: %v", err)
 		answer := string(buffer[:read])
 		statusLine, _, _ := strings.Cut(answer, "\r\n")
-		if !strings.Contains(statusLine, "200") {
-			t.Fatalf("OPTIONS * status = %q, want the stdlib transport-level 200", statusLine)
-		}
-		if !strings.Contains(answer, "Content-Length: 0") {
-			t.Fatalf("OPTIONS * headers = %q, want the empty transport answer", answer)
-		}
-		if _, body, terminated := strings.Cut(answer, "\r\n\r\n"); terminated && body != "" {
-			t.Fatalf("OPTIONS * body = %q, want the empty transport answer", body)
+		testassert.Require(t, strings.Contains(statusLine, "200"), "OPTIONS * status = %q, want the stdlib transport-level 200", statusLine)
+		testassert.Require(t, strings.Contains(answer, "Content-Length: 0"), "OPTIONS * headers = %q, want the empty transport answer", answer)
+		{
+			_, body, terminated := strings.Cut(answer, "\r\n\r\n")
+			testassert.Require(t, !terminated || body == "", "OPTIONS * body = %q, want the empty transport answer", body)
 		}
 	})
 }
@@ -532,21 +450,19 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 
 		// A well-formed but absent session identity answers not_found.
 		unused := newLifecycleID(t)
-		if missing, err := client.GetSessionHydrationWithResponse(ctx, unused); err != nil || missing.JSONDefault == nil ||
-			missing.JSONDefault.Code != protocol.NotFound || missing.HTTPResponse.StatusCode != http.StatusNotFound {
-			t.Fatalf("unknown session = (%d, %+v, %v), want the typed 404", missing.HTTPResponse.StatusCode, missing.JSONDefault, err)
+		{
+			missing, err := client.GetSessionHydrationWithResponse(ctx, unused)
+			testassert.Require(t, err == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.NotFound && missing.HTTPResponse.StatusCode == http.StatusNotFound, "unknown session = (%d, %+v, %v), want the typed 404", missing.HTTPResponse.StatusCode, missing.JSONDefault, err)
 		}
 		// A target route never accepts a legacy 8-hex identity.
 		legacy := rawProtocol(t, http.MethodDelete, protocolTarget(ps, "/v1/sessions/decafbad"), ps.credential, "")
-		if legacy.StatusCode != http.StatusBadRequest {
-			t.Fatalf("legacy identity on a target route = %d, want invalid 400", legacy.StatusCode)
-		}
+		testassert.Equal(t, legacy.StatusCode, http.StatusBadRequest)
 		legacy.Body.Close()
 
 		// A valid unknown provider answers the catalog's typed not-found.
-		if unknown, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "ghost"}); err != nil ||
-			unknown.JSONDefault == nil || unknown.JSONDefault.Code != protocol.NotFound {
-			t.Fatalf("unknown provider = (%d, %+v, %v), want the typed 404", unknown.HTTPResponse.StatusCode, unknown.JSONDefault, err)
+		{
+			unknown, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "ghost"})
+			testassert.Require(t, err == nil && unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.NotFound, "unknown provider = (%d, %+v, %v), want the typed 404", unknown.HTTPResponse.StatusCode, unknown.JSONDefault, err)
 		}
 
 		// A slash provider identity is refused at creation by the complete
@@ -557,18 +473,15 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		// refusal helpers; the mounted response's class is checked first
 		// and then re-pinned through the helper with the same class.
 		subscription, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("subscribe for the slash refusal baseline: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer subscription.Close()
 		slashBefore, slashGeneration, slashWarnRev := runtimeMutationBaseline(t, r)
 		slash := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/providers"), ps.credential,
 			`{"id":"has/slash","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096}}}`)
-		if slash.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("slash provider creation = %d, want the typed candidate failure 422", slash.StatusCode)
-		}
-		if typed := decodeProtocolError(t, slash); typed.Code != protocol.Configuration {
-			t.Fatalf("slash provider creation error = %+v, want configuration", typed)
+		testassert.Equal(t, slash.StatusCode, http.StatusUnprocessableEntity)
+		{
+			typed := decodeProtocolError(t, slash)
+			testassert.Require(t, typed.Code == protocol.Configuration, "slash provider creation error = %+v, want configuration", typed)
 		}
 		assertRuntimeMutationRefused(t, r, subscription, slashBefore, slashGeneration, slashWarnRev,
 			fmt.Errorf("mounted slash refusal: %w", ErrConfiguration), ErrConfiguration)
@@ -581,13 +494,8 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: corruptID, Kind: harness.RegisterSession}, `{"not":"a session register"}`)
 		valid := projectionSession(t, r, workspace, "solo").Identity.SessionID
 		corrupt, err := client.GetSessionHydrationWithResponse(ctx, corruptID)
-		if err != nil || corrupt.JSONDefault == nil || corrupt.JSONDefault.Code != protocol.Corrupt ||
-			corrupt.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("corrupt session = (%d, %+v, %v), want the typed corrupt 422", corrupt.HTTPResponse.StatusCode, corrupt.JSONDefault, err)
-		}
-		if corrupt.JSONDefault.SessionId == nil || *corrupt.JSONDefault.SessionId != corruptID {
-			t.Fatalf("corrupt error session id = %v, want the corrupt session's identity", corrupt.JSONDefault.SessionId)
-		}
+		testassert.Require(t, err == nil && corrupt.JSONDefault != nil && corrupt.JSONDefault.Code == protocol.Corrupt && corrupt.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "corrupt session = (%d, %+v, %v), want the typed corrupt 422", corrupt.HTTPResponse.StatusCode, corrupt.JSONDefault, err)
+		testassert.Require(t, corrupt.JSONDefault.SessionId != nil && *corrupt.JSONDefault.SessionId == corruptID, "corrupt error session id = %v, want the corrupt session's identity", corrupt.JSONDefault.SessionId)
 		listed, err := client.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 		if err != nil || listed.JSON200 == nil || len(*listed.JSON200) != 1 || (*listed.JSON200)[0].SessionId != valid {
 			body, _ := json.Marshal(listed.JSON200)
@@ -597,24 +505,17 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		// An invalid settings write fails invalid before any candidate work,
 		// with the previous revision intact.
 		before, err := client.GetConfigurationWithResponse(ctx)
-		if err != nil || before.JSON200 == nil {
-			t.Fatalf("read before invalid settings: %v", err)
-		}
+		testassert.Require(t, err == nil && before.JSON200 != nil, "read before invalid settings: %v", err)
 		invalidSettings := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
 			`{"settings":{"sessions":{"auto_archive":true,"archive_after_days":-5,"delete_after_archive_days":0},"plugins":{"unknown-plugin":{}}}}`)
-		if invalidSettings.StatusCode != http.StatusBadRequest {
-			t.Fatalf("invalid settings = %d, want the typed invalid 400", invalidSettings.StatusCode)
-		}
-		if typed := decodeProtocolError(t, invalidSettings); typed.Code != protocol.Invalid {
-			t.Fatalf("invalid settings error = %+v, want invalid", typed)
+		testassert.Equal(t, invalidSettings.StatusCode, http.StatusBadRequest)
+		{
+			typed := decodeProtocolError(t, invalidSettings)
+			testassert.Require(t, typed.Code == protocol.Invalid, "invalid settings error = %+v, want invalid", typed)
 		}
 		after, err := client.GetConfigurationWithResponse(ctx)
-		if err != nil || after.JSON200 == nil {
-			t.Fatalf("read after invalid settings: %v", err)
-		}
-		if after.JSON200.ConfigurationRevision.Generation != before.JSON200.ConfigurationRevision.Generation {
-			t.Fatal("an invalid candidate changed the published revision")
-		}
+		testassert.Require(t, err == nil && after.JSON200 != nil, "read after invalid settings: %v", err)
+		testassert.Require(t, after.JSON200.ConfigurationRevision.Generation == before.JSON200.ConfigurationRevision.Generation, "an invalid candidate changed the published revision")
 
 		// The settings outer shape stays closed and its plugins member is a
 		// required complete map: a missing or null member, a wrong-typed
@@ -632,17 +533,14 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 				response.Body.Close()
 				t.Fatalf("%s = %d, want the typed invalid 400", row.name, response.StatusCode)
 			}
-			if typed := decodeProtocolError(t, response); typed.Code != protocol.Invalid {
-				t.Fatalf("%s error = %+v, want invalid", row.name, typed)
+			{
+				typed := decodeProtocolError(t, response)
+				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", row.name, typed)
 			}
 		}
 		finalRead, err := client.GetConfigurationWithResponse(ctx)
-		if err != nil || finalRead.JSON200 == nil {
-			t.Fatalf("read after settings shape failures: %v", err)
-		}
-		if finalRead.JSON200.ConfigurationRevision.Generation != before.JSON200.ConfigurationRevision.Generation {
-			t.Fatal("a rejected settings shape changed the published revision")
-		}
+		testassert.Require(t, err == nil && finalRead.JSON200 != nil, "read after settings shape failures: %v", err)
+		testassert.Require(t, finalRead.JSON200.ConfigurationRevision.Generation == before.JSON200.ConfigurationRevision.Generation, "a rejected settings shape changed the published revision")
 
 		// A restore attempt against a busy Session answers the conflict
 		// class from the one idle gate.
@@ -650,20 +548,17 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		gate := make(chan struct{})
 		e.server.setHold(gate)
 		defer close(gate)
-		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
-			OperationId: "op-1", Mode: "regular",
-			Content: []protocol.ContentPart{textContentPart(t, "busy", nil)},
-		}); err != nil {
-			t.Fatalf("busy submit: %v", err)
+		{
+			_, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
+				OperationId: "op-1", Mode: "regular",
+				Content: []protocol.ContentPart{textContentPart(t, "busy", nil)},
+			})
+			testassert.NoError(t, err)
 		}
 		conflict, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "op-1"})
-		if err != nil || conflict.JSONDefault == nil {
-			t.Fatalf("busy revert = (%v, %+v)", err, conflict.JSONDefault)
-		}
+		testassert.Require(t, err == nil && conflict.JSONDefault != nil, "busy revert = (%v, %+v)", err, conflict.JSONDefault)
 		conflictError, err := conflict.JSONDefault.AsError()
-		if err != nil || conflictError.Code != protocol.Conflict || conflict.HTTPResponse.StatusCode != http.StatusConflict {
-			t.Fatalf("busy revert = (%d, %+v, %v), want the typed conflict 409", conflict.HTTPResponse.StatusCode, conflictError, err)
-		}
+		testassert.Require(t, err == nil && conflictError.Code == protocol.Conflict && conflict.HTTPResponse.StatusCode == http.StatusConflict, "busy revert = (%d, %+v, %v), want the typed conflict 409", conflict.HTTPResponse.StatusCode, conflictError, err)
 	})
 
 	// The classifier table for the classes a wire request cannot reach
@@ -683,9 +578,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 	}
 	for _, row := range classes {
 		code, status := classifyProtocolError(row.err)
-		if code != row.code || status != row.status {
-			t.Fatalf("classify(%v) = (%s, %d), want (%s, %d)", row.err, code, status, row.code, row.status)
-		}
+		testassert.Require(t, code == row.code && status == row.status, "classify(%v) = (%s, %d), want (%s, %d)", row.err, code, status, row.code, row.status)
 	}
 }
 
@@ -754,16 +647,10 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 		for _, row := range rows {
 			t.Run(row.name, func(t *testing.T) {
 				err := row.run()
-				if err == nil {
-					t.Fatal("the producer refused nothing, want a typed refusal")
-				}
-				if !errors.Is(err, row.want) {
-					t.Fatalf("producer refusal = %v, want class %v", err, row.want)
-				}
+				testassert.Require(t, err != nil, "the producer refused nothing, want a typed refusal")
+				testassert.Require(t, errors.Is(err, row.want), "producer refusal = %v, want class %v", err, row.want)
 				code, status := classifyProtocolError(fmt.Errorf("wrapped: %w", err))
-				if code != row.code || status != row.status {
-					t.Fatalf("classify(%v) = (%s, %d), want (%s, %d)", err, code, status, row.code, row.status)
-				}
+				testassert.Require(t, code == row.code && status == row.status, "classify(%v) = (%s, %d), want (%s, %d)", err, code, status, row.code, row.status)
 			})
 		}
 	})
@@ -795,31 +682,26 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 		source, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
 			Workspace: filepath.Join(e.home, "marked-src"), AgentType: "solo",
 		})
-		if err != nil || source.JSON201 == nil {
-			t.Fatalf("create source over HTTP: %v (typed %+v)", err, source.JSONDefault)
-		}
+		testassert.Require(t, err == nil && source.JSON201 != nil, "create source over HTTP: %v (typed %+v)", err, source.JSONDefault)
 		sourceID := source.JSON201.SessionId
 		sibling, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
 			Workspace: filepath.Join(e.home, "marked-sibling"), AgentType: "solo",
 		})
-		if err != nil || sibling.JSON201 == nil {
-			t.Fatalf("create sibling over HTTP: %v (typed %+v)", err, sibling.JSONDefault)
-		}
+		testassert.Require(t, err == nil && sibling.JSON201 != nil, "create sibling over HTTP: %v (typed %+v)", err, sibling.JSONDefault)
 		siblingID := sibling.JSON201.SessionId
 
-		if _, err := client.SubmitSessionWithResponse(ctx, sourceID, protocol.SubmitRequest{
-			OperationId: "op-src", Mode: "regular",
-			Content: []protocol.ContentPart{textContentPart(t, "boundary", nil)},
-		}); err != nil {
-			t.Fatalf("source submit over HTTP: %v", err)
+		{
+			_, err := client.SubmitSessionWithResponse(ctx, sourceID, protocol.SubmitRequest{
+				OperationId: "op-src", Mode: "regular",
+				Content: []protocol.ContentPart{textContentPart(t, "boundary", nil)},
+			})
+			testassert.NoError(t, err)
 		}
 		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
 		awaitIdleSession(t, r, sourceID)
 
 		before, err := client.GetSessionHydrationWithResponse(ctx, sourceID)
-		if err != nil || before.JSON200 == nil {
-			t.Fatalf("hydration before the corruption: %v (typed %+v)", err, before.JSONDefault)
-		}
+		testassert.Require(t, err == nil && before.JSON200 != nil, "hydration before the corruption: %v (typed %+v)", err, before.JSONDefault)
 		// The fork boundary is resolved from the mounted response itself: the
 		// committed user-origin input item the server projected.
 		boundaryItem := ""
@@ -830,9 +712,7 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 			}
 			boundaryItem = input.ItemId
 		}
-		if boundaryItem == "" {
-			t.Fatalf("the mounted hydration carries no user-origin input item: %+v", before.JSON200.Conversation.Items)
-		}
+		testassert.Require(t, boundaryItem != "", "the mounted hydration carries no user-origin input item: %+v", before.JSON200.Conversation.Items)
 
 		// The durable register is corrupted while the mounted Runtime holds
 		// the warm source coordinator, so the sticky marker the HTTP fork
@@ -844,29 +724,15 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 			OperationId:    "op-fork-marked",
 			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		})
-		if err != nil || refused.JSONDefault == nil {
-			t.Fatalf("fork over HTTP = (%d, %+v, %v), want the typed corrupt refusal", refused.HTTPResponse.StatusCode, refused.JSONDefault, err)
-		}
-		if refused.JSONDefault.Code != protocol.Corrupt || refused.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("fork over HTTP = (%d, %+v), want the typed corrupt 422", refused.HTTPResponse.StatusCode, refused.JSONDefault)
-		}
-		if refused.JSONDefault.SessionId == nil || *refused.JSONDefault.SessionId != sourceID {
-			t.Fatalf("fork corrupt error session id = %v, want the marked source identity", refused.JSONDefault.SessionId)
-		}
+		testassert.Require(t, err == nil && refused.JSONDefault != nil, "fork over HTTP = (%d, %+v, %v), want the typed corrupt refusal", refused.HTTPResponse.StatusCode, refused.JSONDefault, err)
+		testassert.Require(t, refused.JSONDefault.Code == protocol.Corrupt && refused.HTTPResponse.StatusCode == http.StatusUnprocessableEntity && refused.JSONDefault.SessionId != nil && *refused.JSONDefault.SessionId == sourceID, "fork over HTTP = (%d, %+v), want the typed corrupt 422; fork corrupt error session id = %v, want the marked source identity", refused.HTTPResponse.StatusCode, refused.JSONDefault, refused.JSONDefault.SessionId)
 
 		after, err := client.GetSessionHydrationWithResponse(ctx, sourceID)
-		if err != nil || after.JSONDefault == nil || after.JSONDefault.Code != protocol.Corrupt ||
-			after.HTTPResponse.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("hydration of the marked warm source = (%d, %+v, %v), want the typed corrupt 422", after.HTTPResponse.StatusCode, after.JSONDefault, err)
-		}
-		if after.JSONDefault.SessionId == nil || *after.JSONDefault.SessionId != sourceID {
-			t.Fatalf("hydration corrupt error session id = %v, want the marked source identity", after.JSONDefault.SessionId)
-		}
+		testassert.Require(t, err == nil && after.JSONDefault != nil && after.JSONDefault.Code == protocol.Corrupt && after.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "hydration of the marked warm source = (%d, %+v, %v), want the typed corrupt 422", after.HTTPResponse.StatusCode, after.JSONDefault, err)
+		testassert.Require(t, after.JSONDefault.SessionId != nil && *after.JSONDefault.SessionId == sourceID, "hydration corrupt error session id = %v, want the marked source identity", after.JSONDefault.SessionId)
 
 		siblingHydration, err := client.GetSessionHydrationWithResponse(ctx, siblingID)
-		if err != nil || siblingHydration.JSON200 == nil || siblingHydration.JSON200.Session.SessionId != siblingID {
-			t.Fatalf("sibling hydration = (%d, %+v, %v), want the valid sibling read", siblingHydration.HTTPResponse.StatusCode, siblingHydration.JSON200, err)
-		}
+		testassert.Require(t, err == nil && siblingHydration.JSON200 != nil && siblingHydration.JSON200.Session.SessionId == siblingID, "sibling hydration = (%d, %+v, %v), want the valid sibling read", siblingHydration.HTTPResponse.StatusCode, siblingHydration.JSON200, err)
 		listed, err := client.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{
 			Workspace: filepath.Join(e.home, "marked-sibling"), Lifecycle: "open",
 		})
@@ -892,9 +758,7 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	e := newOwnerEnv(t)
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)
@@ -905,17 +769,13 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	// store directory becomes unreadable so the reverse traversal fails
 	// after the newest group already changed files.
 	workspace := filepath.Join(e.home, "revert")
-	if err := os.MkdirAll(workspace, 0o700); err != nil {
-		t.Fatalf("mkdir workspace: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 	session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 	older := submitCodeOperation(t, r, session, "op-1", "older turn")
 	newest := submitCodeOperation(t, r, session, "op-2", "newest turn")
 	olderTarget := filepath.Join(workspace, "older.txt")
 	newestTarget := filepath.Join(workspace, "newest.txt")
-	if err := os.WriteFile(newestTarget, []byte("v0"), 0o600); err != nil {
-		t.Fatalf("write the newest preimage: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(newestTarget, []byte("v0"), 0o600))
 	captureCodeMutation(t, codeGroupRoot(r, session, older.Admission.AdmittedEntry.EntryID), olderTarget, olderTarget, []byte("older"))
 	captureCodeMutation(t, codeGroupRoot(r, session, newest.Admission.AdmittedEntry.EntryID), newestTarget, newestTarget, []byte("newest"))
 	awaitRestorableSession(t, r, session)
@@ -923,17 +783,11 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	// the newest group restores first, then the older group's turn errors.
 	olderTurn := filepath.Join(codeGroupRoot(r, session, older.Admission.AdmittedEntry.EntryID), "snapshots", "1")
 	entries, err := os.ReadDir(olderTurn)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("older group turn entries = (%d, %v), want one recorded entry", len(entries), err)
-	}
-	if err := os.WriteFile(filepath.Join(olderTurn, entries[0].Name(), "meta.json"), []byte("{"), 0o600); err != nil {
-		t.Fatalf("corrupt the older group's meta: %v", err)
-	}
+	testassert.Require(t, err == nil && len(entries) == 1, "older group turn entries = (%d, %v), want one recorded entry", len(entries), err)
+	testassert.NoError(t, os.WriteFile(filepath.Join(olderTurn, entries[0].Name(), "meta.json"), []byte("{"), 0o600))
 
 	response, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "op-1"})
-	if err != nil {
-		t.Fatalf("revert: %v", err)
-	}
+	testassert.NoError(t, err)
 	if response.HTTPResponse.StatusCode == http.StatusOK {
 		t.Fatalf("partial restore answered 200: %s", string(response.Body))
 	}
@@ -941,32 +795,22 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	if err := json.Unmarshal(response.Body, &result); err != nil {
 		t.Fatalf("decode partial restore body %s: %v", string(response.Body), err)
 	}
-	if result.Error == nil || result.Error.Code != protocol.Internal {
-		t.Fatalf("partial restore error member = %+v, want the accumulated internal error", result.Error)
-	}
-	if !slices.Contains(result.Restored, newestTarget) {
-		t.Fatalf("partial restore restored = %v, want the newest group's file before the failure", result.Restored)
-	}
-	if restored, err := os.ReadFile(newestTarget); err != nil || string(restored) != "v0" {
-		t.Fatalf("the newest group's file = (%q, %v), want its restored pre-turn content", restored, err)
+	testassert.Require(t, result.Error != nil && result.Error.Code == protocol.Internal && slices.Contains(result.Restored, newestTarget), "partial restore error member = %+v, want the accumulated internal error; partial restore restored = %v, want the newest group's file before the failure", result.Error, result.Restored)
+	{
+		restored, err := os.ReadFile(newestTarget)
+		testassert.Require(t, err == nil && string(restored) == "v0", "the newest group's file = (%q, %v), want its restored pre-turn content", restored, err)
 	}
 
 	// A pre-traversal refusal answers the plain typed error with no result
 	// members: an unknown boundary never opens a store.
 	refusal, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "ghost-op"})
-	if err != nil {
-		t.Fatalf("unknown-boundary revert: %v", err)
-	}
+	testassert.NoError(t, err)
 	if refusal.JSONDefault == nil {
 		t.Fatalf("unknown-boundary revert = %s, want the typed error branch", string(refusal.Body))
 	}
 	typed, err := refusal.JSONDefault.AsError()
-	if err != nil {
-		t.Fatalf("decode the refused revert's error branch: %v", err)
-	}
-	if typed.Code != protocol.Invalid || refusal.HTTPResponse.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unknown-boundary revert = (%d, %+v), want the typed invalid 400", refusal.HTTPResponse.StatusCode, typed)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, typed.Code == protocol.Invalid && refusal.HTTPResponse.StatusCode == http.StatusBadRequest, "unknown-boundary revert = (%d, %+v), want the typed invalid 400", refusal.HTTPResponse.StatusCode, typed)
 }
 
 // TestProtocolServerIntervalProtectionAndAvailability proves the artifact
@@ -984,16 +828,12 @@ func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
 		ctx := context.Background()
 
 		workspace := filepath.Join(e.home, "interval-mounted")
-		if err := os.MkdirAll(workspace, 0o700); err != nil {
-			t.Fatalf("mkdir workspace: %v", err)
-		}
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
 		op := submitCodeOperation(t, r, session, "op-1", "only")
 		awaitRestorableSession(t, r, session)
 		file := filepath.Join(workspace, "mounted.txt")
-		if err := os.WriteFile(file, []byte("v1"), 0o600); err != nil {
-			t.Fatalf("write v1: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
 		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, "v1")
 
 		// The mounted restore parks inside its traversal: its HTTP handler is
@@ -1018,8 +858,9 @@ func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
 			body, _ := json.Marshal(del.JSONDefault)
 			t.Fatalf("mounted delete during a parked restore = (%d, %s, %v), want the typed conflict 409", del.HTTPResponse.StatusCode, body, err)
 		}
-		if hydration, err := client.GetSessionHydrationWithResponse(ctx, session); err != nil || hydration.JSON200 == nil {
-			t.Fatalf("hydration after the refused delete = (%v, %+v), want the surviving Session", err, hydration.JSON200)
+		{
+			hydration, err := client.GetSessionHydrationWithResponse(ctx, session)
+			testassert.Require(t, err == nil && hydration.JSON200 != nil, "hydration after the refused delete = (%v, %+v), want the surviving Session", err, hydration.JSON200)
 		}
 
 		// A second mounted rewind conflicts.
@@ -1031,9 +872,7 @@ func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
 
 		// The metadata-only transition stays available inside the interval.
 		changed, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
-		if err != nil || changed.JSON200 == nil || changed.JSON200.AgentType != "worker" {
-			t.Fatalf("mounted agent-type change during a parked restore = (%v, %+v), want the changed selection", err, changed.JSON200)
-		}
+		testassert.Require(t, err == nil && changed.JSON200 != nil && changed.JSON200.AgentType == "worker", "mounted agent-type change during a parked restore = (%v, %+v), want the changed selection", err, changed.JSON200)
 
 		// The parked mounted restore completes with its own result.
 		park.release("restored")
@@ -1043,14 +882,11 @@ func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the parked mounted restore never returned after its FIFO completed")
 		}
-		if out.err != nil || out.response.JSON200 == nil {
-			t.Fatalf("mounted restore = (%+v, %v), want the restored result", out.response, out.err)
-		}
-		if len(out.response.JSON200.Restored) != 1 || out.response.JSON200.Restored[0] != file {
-			t.Fatalf("restored = %v, want the parked group's restore", out.response.JSON200.Restored)
-		}
-		if data, err := os.ReadFile(file); err != nil || string(data) != "restored" {
-			t.Fatalf("file = (%q, %v), want the FIFO content", data, err)
+		testassert.Require(t, out.err == nil && out.response.JSON200 != nil, "mounted restore = (%+v, %v), want the restored result", out.response, out.err)
+		testassert.Require(t, len(out.response.JSON200.Restored) == 1 && out.response.JSON200.Restored[0] == file, "restored = %v, want the parked group's restore", out.response.JSON200.Restored)
+		{
+			data, err := os.ReadFile(file)
+			testassert.Require(t, err == nil && string(data) == "restored", "file = (%q, %v), want the FIFO content", data, err)
 		}
 	})
 }

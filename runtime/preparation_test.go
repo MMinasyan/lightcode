@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -380,9 +381,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 		ConfigPath: e.configPath,
 		Plugins:    append(e.plugins(), e.storagePlugin(store)),
 	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	e.r = r
 	t.Cleanup(func() { _ = e.converge() })
 	return e
@@ -637,9 +636,7 @@ func eachPrepStore(t *testing.T, run func(t *testing.T, store harness.Storage)) 
 	})
 	t.Run("sqlite", func(t *testing.T) {
 		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
-		if err != nil {
-			t.Fatalf("OpenSQLite: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)
 	})
@@ -665,16 +662,12 @@ func TestPreparationHappyPathThroughHarness(t *testing.T) {
 		res := e.admit(session, "op-1", "hello")
 
 		got := res.Operation.Admission.Execution
-		if !slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}) ||
-			!slices.Equal(toolNames(got.Tools), []string{"echo", "read"}) ||
-			got.Model != prepModelRef || got.ConfigurationRevision != "1" ||
-			!strings.HasSuffix(got.SystemPrompt, "|first|second") {
-			t.Fatalf("committed capture = %+v, want the post-hook selection capture", got)
-		}
+		testassert.Require(t, slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}) && slices.Equal(toolNames(got.Tools), []string{"echo", "read"}) && got.Model == prepModelRef && got.ConfigurationRevision == "1" && strings.HasSuffix(got.SystemPrompt, "|first|second"), "committed capture = %+v, want the post-hook selection capture", got)
 		wantCalls := []hookCall{{revision: "1", tag: "A"}}
 		for _, hook := range e.hooks {
-			if calls := hook.calls(); !slices.Equal(calls, wantCalls) {
-				t.Fatalf("hook %s calls = %v, want the captured revision %v", hook.name, calls, wantCalls)
+			{
+				calls := hook.calls()
+				testassert.Require(t, slices.Equal(calls, wantCalls), "hook %s calls = %v, want the captured revision %v", hook.name, calls, wantCalls)
 			}
 		}
 
@@ -683,19 +676,16 @@ func TestPreparationHappyPathThroughHarness(t *testing.T) {
 
 		// The wire request carried the committed capture: the composed system
 		// prompt and the advertised tool set.
-		if n := e.server.requests(); n != 1 {
-			t.Fatalf("HTTP requests = %d, want the one admitted request", n)
-		}
+		testassert.Equal(t, e.server.requests(), 1)
 		doc := decodeWireChatBody(t, e.server.bodyAt(0))
 		if doc.Model != "m" || !slices.Equal(wireToolNames(doc), []string{"echo", "read"}) {
 			t.Fatalf("wire request = model %q tools %v, want the captured model and advertised tools", doc.Model, wireToolNames(doc))
 		}
-		if len(doc.Messages) == 0 || doc.Messages[0].Role != "system" {
-			t.Fatalf("wire messages = %+v, want the leading system prompt", doc.Messages)
-		}
+		testassert.Require(t, len(doc.Messages) != 0 && doc.Messages[0].Role == "system", "wire messages = %+v, want the leading system prompt", doc.Messages)
 		var systemText string
-		if err := json.Unmarshal(doc.Messages[0].Content, &systemText); err != nil || systemText != got.SystemPrompt {
-			t.Fatalf("wire system prompt = %q (err %v), want the committed capture's %q", systemText, err, got.SystemPrompt)
+		{
+			err := json.Unmarshal(doc.Messages[0].Content, &systemText)
+			testassert.Require(t, err == nil && systemText == got.SystemPrompt, "wire system prompt = %q (err %v), want the committed capture's %q", systemText, err, got.SystemPrompt)
 		}
 
 		// Hooks ran in selected order inside the preparation guard; the owner's
@@ -707,18 +697,13 @@ func TestPreparationHappyPathThroughHarness(t *testing.T) {
 			"op-open:op-1", "ag-open",
 			"ag-close", "op-close",
 		}
-		if events := e.events.all(); !slices.Equal(events, wantEvents) {
-			t.Fatalf("events = %v, want %v", events, wantEvents)
+		{
+			events := e.events.all()
+			testassert.Require(t, slices.Equal(events, wantEvents), "events = %v, want %v", events, wantEvents)
 		}
-		if got := e.hookOpens.Load(); got != 1 {
-			t.Fatalf("hook factories ran %d times, want 1", got)
-		}
-		if got := e.opOpens.Load(); got != 1 {
-			t.Fatalf("Operation scope opened %d times, want 1", got)
-		}
-		if err := e.converge(); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		testassert.Equal(t, e.hookOpens.Load(), 1)
+		testassert.Equal(t, e.opOpens.Load(), 1)
+		testassert.NoError(t, e.converge())
 	})
 }
 
@@ -775,8 +760,9 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					e.server.setHold(hold)
 					e.admit(session, "op-1", "one")
 					<-e.server.arrived
-					if res, err := e.submit(context.Background(), session, "op-2", "two", tc.mode); err != nil || res.Disposition != tc.want {
-						t.Fatalf("buffered submit = %+v err %v, want disposition %s", res, err, tc.want)
+					{
+						res, err := e.submit(context.Background(), session, "op-2", "two", tc.mode)
+						testassert.Require(t, err == nil && res.Disposition == tc.want, "buffered submit = %+v err %v, want disposition %s", res, err, tc.want)
 					}
 					e.hooks[0].parkNext(release, arrived)
 					close(hold) // op-1 converges; the post-terminal drain reaches the parked hook
@@ -822,8 +808,9 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
 				writeServiceFile(t, agents.PathForConfig(e.configPath), reloadAgents)
-				if _, err := e.reload(); err != nil {
-					t.Fatalf("reload publish: %v", err)
+				{
+					_, err := e.reload()
+					testassert.NoError(t, err)
 				}
 				close(release)
 				if tc.kind != "drained" {
@@ -833,9 +820,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				mu.Lock()
 				err := submitErr
 				mu.Unlock()
-				if err != nil {
-					t.Fatalf("held admission failed: %v", err)
-				}
+				testassert.NoError(t, err)
 
 				// The in-flight admission committed revision 1 and the
 				// captured constraints.
@@ -848,28 +833,14 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				} else {
 					inFlight = e.awaitTerminal(session, "op-2", harness.OperationSuccess)
 				}
-				if got := inFlight.Admission.Execution.ConfigurationRevision; got != "1" {
-					t.Fatalf("overlapping-reload admission committed revision %q, want the captured 1", got)
-				}
-				if inFlight.Admission.Execution.Readonly || inFlight.Admission.Execution.WriteDir != "" {
-					t.Fatalf("reloaded constraints leaked into the committed capture: readonly=%v write_dir=%q, want the captured false \"\"",
-						inFlight.Admission.Execution.Readonly, inFlight.Admission.Execution.WriteDir)
-				}
+				testassert.Require(t, inFlight.Admission.Execution.ConfigurationRevision == "1" && !inFlight.Admission.Execution.Readonly && inFlight.Admission.Execution.WriteDir == "", "got %v, want %v; reloaded constraints leaked into the committed capture: readonly=%v write_dir=%q, want the captured false \"\"", inFlight.Admission.Execution.ConfigurationRevision, "1", inFlight.Admission.Execution.Readonly, inFlight.Admission.Execution.WriteDir)
 
 				// The next capture uses revision 2 and the reloaded
 				// constraints.
 				e.admitOrBuffer(session, "op-next", "next")
 				next := e.awaitTerminal(session, "op-next", harness.OperationSuccess)
-				if got := next.Admission.Execution.ConfigurationRevision; got != "2" {
-					t.Fatalf("next admission revision = %q, want 2", got)
-				}
-				if !next.Admission.Execution.Readonly || next.Admission.Execution.WriteDir != "/tmp/reload" {
-					t.Fatalf("next admission constraints = readonly %v write_dir %q, want the reloaded true \"/tmp/reload\"",
-						next.Admission.Execution.Readonly, next.Admission.Execution.WriteDir)
-				}
-				if err := e.converge(); err != nil {
-					t.Fatalf("Wait: %v", err)
-				}
+				testassert.Require(t, next.Admission.Execution.ConfigurationRevision == "2" && next.Admission.Execution.Readonly && next.Admission.Execution.WriteDir == "/tmp/reload", "got %v, want %v; next admission constraints = readonly %v write_dir %q, want the reloaded true \"/tmp/reload\"", next.Admission.Execution.ConfigurationRevision, "2", next.Admission.Execution.Readonly, next.Admission.Execution.WriteDir)
+				testassert.NoError(t, e.converge())
 
 				if tc.kind == "drained" {
 					// Buffered messages captured only on delivery, and the
@@ -888,9 +859,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 							}
 						}
 					}
-					if cleanup < 0 || secondHook < 0 || cleanup > secondHook {
-						t.Fatalf("events = %v, want the first scope close before the successor hook", events)
-					}
+					testassert.Require(t, cleanup >= 0 && secondHook >= 0 && cleanup <= secondHook, "events = %v, want the first scope close before the successor hook", events)
 				}
 			})
 		})
@@ -910,36 +879,24 @@ func TestPreparationDeliveryIdentity(t *testing.T) {
 		e.admit(session, "op-1", "one")
 		<-e.server.arrived
 
-		if res, err := e.submit(context.Background(), session, "op-1", "again", harness.MessageModeRegular); err != nil || res.Disposition != harness.DispositionExisting {
-			t.Fatalf("reused id = %+v err %v, want existing without preparation", res, err)
+		{
+			res, err := e.submit(context.Background(), session, "op-1", "again", harness.MessageModeRegular)
+			testassert.Require(t, err == nil && res.Disposition == harness.DispositionExisting, "reused id = %+v err %v, want existing without preparation", res, err)
 		}
-		if res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
-			t.Fatalf("queued = %+v err %v, want queued", res, err)
+		{
+			res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued)
+			testassert.Require(t, err == nil && res.Disposition == harness.DispositionQueued, "queued = %+v err %v, want queued", res, err)
 		}
-		if calls := len(e.hooks[0].calls()); calls != 1 {
-			t.Fatalf("preparation hook calls = %d, want only the admitted execution prepared so far", calls)
-		}
-		if got := e.server.requests(); got != 1 {
-			t.Fatalf("HTTP requests = %d, want only the admitted execution's request so far", got)
-		}
-		if got := e.opOpens.Load() + e.agOpens.Load(); got != 2 {
-			t.Fatalf("short-scope opens = %d, want the one admitted execution's pair", got)
-		}
+		testassert.Equal(t, len(e.hooks[0].calls()), 1)
+		testassert.Equal(t, e.server.requests(), 1)
+		testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 2)
 		close(hold)
 		e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 		e.awaitTerminal(session, "op-2", harness.OperationSuccess)
-		if calls := len(e.hooks[0].calls()); calls != 2 {
-			t.Fatalf("preparation hook calls = %d, want the drained delivery to capture once", calls)
-		}
-		if got := e.server.requests(); got != 2 {
-			t.Fatalf("HTTP requests = %d, want the drained delivery to reach the model once", got)
-		}
-		if got := e.opOpens.Load() + e.agOpens.Load(); got != 4 {
-			t.Fatalf("short-scope opens = %d, want one pair per admitted execution", got)
-		}
-		if err := e.converge(); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		testassert.Equal(t, len(e.hooks[0].calls()), 2)
+		testassert.Equal(t, e.server.requests(), 2)
+		testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 4)
+		testassert.NoError(t, e.converge())
 	})
 }
 
@@ -962,27 +919,16 @@ func TestPreparationRejectsAdmissionAtTheBoundary(t *testing.T) {
 				t.Cleanup(func() { e.converge() })
 				session := e.session(tc.agentType)
 				res, err := e.submit(context.Background(), session, "op-x", "x", harness.MessageModeRegular)
-				if !errors.Is(err, harness.ErrInvalid) {
-					t.Fatalf("submit error = %v, want harness.ErrInvalid", err)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit error = %v, want harness.ErrInvalid", err)
+				testassert.Require(t, res.Disposition != harness.DispositionAdmitted, "rejected preparation admitted an Operation")
+				testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 0)
+				{
+					_, err := e.readOperation(context.Background(), session, "op-x")
+					testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected admission left an Operation: %v", err)
 				}
-				if res.Disposition == harness.DispositionAdmitted {
-					t.Fatalf("rejected preparation admitted an Operation")
-				}
-				if got := e.opOpens.Load() + e.agOpens.Load(); got != 0 {
-					t.Fatalf("short scopes opened %d times without admission", got)
-				}
-				if _, err := e.readOperation(context.Background(), session, "op-x"); !errors.Is(err, harness.ErrNotFound) {
-					t.Fatalf("rejected admission left an Operation: %v", err)
-				}
-				if calls := len(e.hooks[0].calls()) + len(e.hooks[1].calls()); calls != 0 {
-					t.Fatalf("rejected admission ran %d hooks", calls)
-				}
-				if got := e.server.requests(); got != 0 {
-					t.Fatalf("rejected admission made %d HTTP requests", got)
-				}
-				if err := e.converge(); err != nil {
-					t.Fatalf("Wait: %v", err)
-				}
+				testassert.Equal(t, len(e.hooks[0].calls())+len(e.hooks[1].calls()), 0)
+				testassert.Equal(t, e.server.requests(), 0)
+				testassert.NoError(t, e.converge())
 			})
 		})
 	}
@@ -1005,33 +951,28 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 			e.admit(session, "op-1", "one")
 			<-e.server.arrived
 			e.hooks[0].failNext(errHook)
-			if res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
-				t.Fatalf("queued submit = %+v err %v, want queued", res, err)
+			{
+				res, err := e.submit(context.Background(), session, "op-2", "two", harness.MessageModeQueued)
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionQueued, "queued submit = %+v err %v, want queued", res, err)
 			}
-			if res, err := e.submit(context.Background(), session, "op-3", "three", harness.MessageModeQueued); err != nil || res.Disposition != harness.DispositionQueued {
-				t.Fatalf("queued submit = %+v err %v, want queued", res, err)
+			{
+				res, err := e.submit(context.Background(), session, "op-3", "three", harness.MessageModeQueued)
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionQueued, "queued submit = %+v err %v, want queued", res, err)
 			}
 			close(hold)
 			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 			e.awaitTerminal(session, "op-3", harness.OperationSuccess)
-			if _, err := e.readOperation(context.Background(), session, "op-2"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("rejected delivery left an Operation: %v", err)
+			{
+				_, err := e.readOperation(context.Background(), session, "op-2")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected delivery left an Operation: %v", err)
 			}
 			entries, err := store.ReadEntries(context.Background(), session, 0)
-			if err != nil {
-				t.Fatalf("ReadEntries: %v", err)
-			}
+			testassert.NoError(t, err)
 			for _, entry := range entries {
-				if entry.OperationID == "op-2" {
-					t.Fatalf("rejected delivery left entry %s (%s) behind", entry.ID, entry.Kind)
-				}
+				testassert.Require(t, entry.OperationID != "op-2", "rejected delivery left entry %s (%s) behind", entry.ID, entry.Kind)
 			}
-			if opens := countEvents(e.events.all(), "op-open:op-2"); opens != 0 {
-				t.Fatalf("the rejected delivery opened its execution %d times", opens)
-			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.Equal(t, countEvents(e.events.all(), "op-open:op-2"), 0)
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("failed Fork publishes no destination and leaves the source unchanged", func(t *testing.T) {
@@ -1043,17 +984,11 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 			boundary := e.inputEntry(session, "op-1")
 			sessionsBefore, err := store.ListSessionIDs(context.Background())
-			if err != nil {
-				t.Fatalf("ListSessionIDs: %v", err)
-			}
+			testassert.NoError(t, err)
 			entriesBefore, err := store.ReadEntries(context.Background(), session, 0)
-			if err != nil {
-				t.Fatalf("ReadEntries: %v", err)
-			}
+			testassert.NoError(t, err)
 			sourceBeforeView, err := e.sessionView(context.Background(), session)
-			if err != nil {
-				t.Fatalf("ReadSessionView: %v", err)
-			}
+			testassert.NoError(t, err)
 			e.hooks[0].failNext(errHook)
 			res, err := e.fork(context.Background(), harness.ForkRequest{
 				SourceSessionID: session,
@@ -1061,41 +996,23 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 				OperationID:     "fork-1",
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "fork input"}},
 			})
-			if !errors.Is(err, errHook) {
-				t.Fatalf("fork with a failing hook = %+v err %v, want the hook's own error", res, err)
-			}
+			testassert.Require(t, errors.Is(err, errHook), "fork with a failing hook = %+v err %v, want the hook's own error", res, err)
 			sessionsAfter, err := store.ListSessionIDs(context.Background())
-			if err != nil {
-				t.Fatalf("ListSessionIDs: %v", err)
-			}
-			if !slices.Equal(sessionsAfter, sessionsBefore) {
-				t.Fatalf("session listing after the failed fork = %v, want unchanged %v", sessionsAfter, sessionsBefore)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, slices.Equal(sessionsAfter, sessionsBefore), "session listing after the failed fork = %v, want unchanged %v", sessionsAfter, sessionsBefore)
 			entriesAfter, err := store.ReadEntries(context.Background(), session, 0)
-			if err != nil {
-				t.Fatalf("ReadEntries: %v", err)
-			}
-			if len(entriesAfter) != len(entriesBefore) {
-				t.Fatalf("source entries after the failed fork = %d, want unchanged %d", len(entriesAfter), len(entriesBefore))
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, len(entriesAfter), len(entriesBefore))
 			sourceAfterView, err := e.sessionView(context.Background(), session)
-			if err != nil {
-				t.Fatalf("ReadSessionView: %v", err)
-			}
+			testassert.NoError(t, err)
 			// The run's own retirement publications advance the local counter
 			// between the two reads; the durable metadata and the register
 			// totals must stay exactly as they were.
 			afterHeader, beforeHeader := sourceAfterView.Header, sourceBeforeView.Header
 			afterHeader.Revision.LocalRevision, beforeHeader.Revision.LocalRevision = 0, 0
-			if !reflect.DeepEqual(afterHeader, beforeHeader) || !reflect.DeepEqual(sourceAfterView.TotalUsage, sourceBeforeView.TotalUsage) {
-				t.Fatalf("source session after the failed fork changed: %+v vs %+v", sourceAfterView, sourceBeforeView)
-			}
-			if calls := len(e.hooks[0].calls()); calls != 2 {
-				t.Fatalf("hook.first calls = %v, want the source admission plus the failed fork", calls)
-			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.Require(t, reflect.DeepEqual(afterHeader, beforeHeader) && reflect.DeepEqual(sourceAfterView.TotalUsage, sourceBeforeView.TotalUsage), "source session after the failed fork changed: %+v vs %+v", sourceAfterView, sourceBeforeView)
+			testassert.Equal(t, len(e.hooks[0].calls()), 2)
+			testassert.NoError(t, e.converge())
 		})
 	})
 }
@@ -1138,19 +1055,16 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 					e := newPrepEnv(t, store)
 					e.hooks[0].set(nil, v.mutate)
 					session := e.session("wide")
-					if _, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular); !errors.Is(err, harness.ErrInvalid) {
-						t.Fatalf("submit error = %v, want harness.ErrInvalid", err)
+					{
+						_, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular)
+						testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit error = %v, want harness.ErrInvalid", err)
 					}
 					events := strings.Join(e.events.all(), ",")
 					if !strings.Contains(events, "hook:hook.first") || strings.Contains(events, "hook:hook.second") {
 						t.Fatalf("events = %v, want the failing hook to stop the rest", e.events.all())
 					}
-					if got := e.opOpens.Load() + e.agOpens.Load(); got != 0 {
-						t.Fatalf("short scope factories ran after a rejected hook")
-					}
-					if err := e.converge(); err != nil {
-						t.Fatalf("Wait: %v", err)
-					}
+					testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 0)
+					testassert.NoError(t, e.converge())
 				})
 			})
 		}
@@ -1175,15 +1089,15 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 					e := newPrepEnv(t, store)
 					e.hooks[1].set(nil, v.mutate)
 					session := e.session("wide")
-					if _, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular); !errors.Is(err, harness.ErrInvalid) {
-						t.Fatalf("submit error = %v, want harness.ErrInvalid", err)
+					{
+						_, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular)
+						testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit error = %v, want harness.ErrInvalid", err)
 					}
-					if _, err := e.readOperation(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-						t.Fatalf("rejected hook left an Operation: %v", err)
+					{
+						_, err := e.readOperation(context.Background(), session, "op-1")
+						testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected hook left an Operation: %v", err)
 					}
-					if err := e.converge(); err != nil {
-						t.Fatalf("Wait: %v", err)
-					}
+					testassert.NoError(t, e.converge())
 				})
 			})
 		}
@@ -1206,19 +1120,20 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			// chain), and mutating the second hook's own copy cannot
 			// retroactively change the array the first hook received and
 			// retained.
-			if firstTools, firstDesc := e.hooks[0].retainedInputs(); firstDesc != "" || len(firstTools) == 0 || firstTools[0].Description != "hook.first" {
-				t.Fatalf("hook.first input = %+v description %q, want the unaliased pre-hook capture it mutated", firstTools, firstDesc)
+			{
+				firstTools, firstDesc := e.hooks[0].retainedInputs()
+				testassert.Require(t, firstDesc == "" && len(firstTools) != 0 && firstTools[0].Description == "hook.first", "hook.first input = %+v description %q, want the unaliased pre-hook capture it mutated", firstTools, firstDesc)
 			}
-			if _, secondDesc := e.hooks[1].retainedInputs(); secondDesc != "hook.first" {
-				t.Fatalf("hook.second input description at entry = %q, want the previous owned result", secondDesc)
+			{
+				_, secondDesc := e.hooks[1].retainedInputs()
+				testassert.Equal(t, secondDesc, "hook.first")
 			}
 			// The committed capture carries the final owned result.
-			if got := res.Operation.Admission.Execution.Tools; len(got) == 0 || got[0].Description != "hook.second" {
-				t.Fatalf("committed tools = %+v, want the final owned result", got)
+			{
+				got := res.Operation.Admission.Execution.Tools
+				testassert.Require(t, len(got) != 0 && got[0].Description == "hook.second", "committed tools = %+v, want the final owned result", got)
 			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("hook error aborts admission", func(t *testing.T) {
@@ -1226,15 +1141,15 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			e := newPrepEnv(t, store)
 			e.hooks[0].set(errHook, nil)
 			session := e.session("wide")
-			if _, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular); !errors.Is(err, errHook) {
-				t.Fatalf("submit error = %v, want %v", err, errHook)
+			{
+				_, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular)
+				testassert.Require(t, errors.Is(err, errHook), "submit error = %v, want %v", err, errHook)
 			}
-			if _, err := e.readOperation(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("failed hook left an Operation: %v", err)
+			{
+				_, err := e.readOperation(context.Background(), session, "op-1")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "failed hook left an Operation: %v", err)
 			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("cancellation while a hook is parked aborts admission", func(t *testing.T) {
@@ -1251,15 +1166,15 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			}()
 			<-started
 			cancel()
-			if err := <-done; !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled submit error = %v, want context.Canceled", err)
+			{
+				err := <-done
+				testassert.Require(t, errors.Is(err, context.Canceled), "canceled submit error = %v, want context.Canceled", err)
 			}
-			if _, err := e.readOperation(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("canceled preparation left an Operation: %v", err)
+			{
+				_, err := e.readOperation(context.Background(), session, "op-1")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canceled preparation left an Operation: %v", err)
 			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("cancellation between hooks aborts admission", func(t *testing.T) {
@@ -1276,14 +1191,16 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			}()
 			<-started
 			cancel()
-			if err := <-done; !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled submit error = %v, want context.Canceled", err)
+			{
+				err := <-done
+				testassert.Require(t, errors.Is(err, context.Canceled), "canceled submit error = %v, want context.Canceled", err)
 			}
 			if slices.Contains(e.events.all(), "hook:hook.second") {
 				t.Fatalf("later hook ran after cancellation: %v", e.events.all())
 			}
-			if _, err := e.readOperation(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("canceled hook run left an Operation: %v", err)
+			{
+				_, err := e.readOperation(context.Background(), session, "op-1")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canceled hook run left an Operation: %v", err)
 			}
 			_ = e.converge()
 		})
@@ -1301,19 +1218,17 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 				done <- err
 			}()
 			<-arrived
-			if err := e.r.runtimeScope.close(); err != nil {
-				t.Fatalf("runtime scope close: %v", err)
-			}
+			testassert.NoError(t, e.r.runtimeScope.close())
 			close(release)
-			if err := <-done; !errors.Is(err, ErrClosed) {
-				t.Fatalf("submit after closed bindings error = %v, want ErrClosed", err)
+			{
+				err := <-done
+				testassert.Require(t, errors.Is(err, ErrClosed), "submit after closed bindings error = %v, want ErrClosed", err)
 			}
-			if _, err := e.readOperation(context.Background(), session, "op-1"); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("rejected hook admission left an Operation: %v", err)
+			{
+				_, err := e.readOperation(context.Background(), session, "op-1")
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected hook admission left an Operation: %v", err)
 			}
-			if got := e.opOpens.Load() + e.agOpens.Load(); got != 0 {
-				t.Fatalf("short scope factories ran %d times after a closed binding view", got)
-			}
+			testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 0)
 			_ = e.converge()
 		})
 	})
@@ -1338,41 +1253,40 @@ func TestPreparationDistinctSelectionsOverReusedInstances(t *testing.T) {
 		e.admitOrBuffer(solo, "op-3", "three")
 		third := e.awaitTerminal(solo, "op-3", harness.OperationSuccess)
 
-		if first.Admission.AgentType != "dual" {
-			t.Fatalf("first committed agent = %q, want dual", first.Admission.AgentType)
+		testassert.Equal(t, first.Admission.AgentType, "dual")
+		{
+			got := first.Admission.Execution.Capabilities
+			testassert.Require(t, slices.Equal(got, []string{"hook.first", "cap.shared"}), "dual committed capabilities = %v", got)
 		}
-		if got := first.Admission.Execution.Capabilities; !slices.Equal(got, []string{"hook.first", "cap.shared"}) {
-			t.Fatalf("dual committed capabilities = %v", got)
+		{
+			got := toolNames(first.Admission.Execution.Tools)
+			testassert.Require(t, slices.Equal(got, []string{"echo"}), "dual committed tools = %v", got)
 		}
-		if got := toolNames(first.Admission.Execution.Tools); !slices.Equal(got, []string{"echo"}) {
-			t.Fatalf("dual committed tools = %v", got)
+		testassert.Equal(t, second.Admission.AgentType, "dup")
+		{
+			got := second.Admission.Execution.Capabilities
+			testassert.Require(t, slices.Equal(got, []string{"hook.second", "cap.other"}), "dup committed capabilities = %v", got)
 		}
-		if second.Admission.AgentType != "dup" {
-			t.Fatalf("second committed agent = %q, want dup", second.Admission.AgentType)
+		{
+			got := toolNames(second.Admission.Execution.Tools)
+			testassert.Require(t, slices.Equal(got, []string{"echo", "read"}), "dup committed tools = %v, want the first-occurrence unique list", got)
 		}
-		if got := second.Admission.Execution.Capabilities; !slices.Equal(got, []string{"hook.second", "cap.other"}) {
-			t.Fatalf("dup committed capabilities = %v", got)
+		{
+			got := third.Admission.Execution.Capabilities
+			testassert.Require(t, len(got) == 0, "solo committed capabilities = %v, want none", got)
 		}
-		if got := toolNames(second.Admission.Execution.Tools); !slices.Equal(got, []string{"echo", "read"}) {
-			t.Fatalf("dup committed tools = %v, want the first-occurrence unique list", got)
-		}
-		if got := third.Admission.Execution.Capabilities; len(got) != 0 {
-			t.Fatalf("solo committed capabilities = %v, want none", got)
-		}
-		if got := e.hookOpens.Load() + e.capOpens.Load(); got != 2 {
-			t.Fatalf("long-lived factories ran %d times, want exactly one per plugin", got)
-		}
+		testassert.Equal(t, e.hookOpens.Load()+e.capOpens.Load(), 2)
 		// Only the selected hook ran per admission: hook.first on dual, hook.second
 		// on dup, neither on solo.
-		if calls := e.hooks[0].calls(); len(calls) != 1 {
-			t.Fatalf("hook.first calls = %v, want dual only", calls)
+		{
+			calls := e.hooks[0].calls()
+			testassert.Require(t, len(calls) == 1, "hook.first calls = %v, want dual only", calls)
 		}
-		if calls := e.hooks[1].calls(); len(calls) != 1 {
-			t.Fatalf("hook.second calls = %v, want dup only", calls)
+		{
+			calls := e.hooks[1].calls()
+			testassert.Require(t, len(calls) == 1, "hook.second calls = %v, want dup only", calls)
 		}
-		if err := e.converge(); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		testassert.NoError(t, e.converge())
 	})
 }
 
@@ -1393,24 +1307,15 @@ func TestPreparationSelectsShortScopeCapabilitiesAtOpen(t *testing.T) {
 		session := e.session("deep")
 		e.admit(session, "op-1", "one")
 		rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess)
-		if got := hookSawOp.Load(); got != 0 {
-			t.Fatalf("Operation factories opened %d times during the preparation hook, want none", got)
+		testassert.Equal(t, hookSawOp.Load(), 0)
+		testassert.Equal(t, hookSawAg.Load(), 0)
+		{
+			got := rec.Admission.Execution.Capabilities
+			testassert.Require(t, slices.Equal(got, []string{"hook.first", "op.native", "ag.native"}), "committed capabilities = %v, want the Agent's full selected names", got)
 		}
-		if got := hookSawAg.Load(); got != 0 {
-			t.Fatalf("Agent factories opened %d times during the preparation hook, want none", got)
-		}
-		if got := rec.Admission.Execution.Capabilities; !slices.Equal(got, []string{"hook.first", "op.native", "ag.native"}) {
-			t.Fatalf("committed capabilities = %v, want the Agent's full selected names", got)
-		}
-		if got := e.opOpens.Load(); got != 1 {
-			t.Fatalf("Operation scope opened %d times after admission, want one", got)
-		}
-		if got := e.agOpens.Load(); got != 1 {
-			t.Fatalf("Agent scope opened %d times after admission, want one", got)
-		}
-		if err := e.converge(); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		testassert.Equal(t, e.opOpens.Load(), 1)
+		testassert.Equal(t, e.agOpens.Load(), 1)
+		testassert.NoError(t, e.converge())
 	})
 }
 
@@ -1428,19 +1333,17 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 			e.awaitEvent("ag-close", "op-close")
 			events := e.events.all()
-			if closes := countEvents(events, "ag-close"); closes != 1 {
-				t.Fatalf("Agent scope closed %d times, want once: %v", closes, events)
+			{
+				closes := countEvents(events, "ag-close")
+				testassert.Require(t, closes == 1, "Agent scope closed %d times, want once: %v", closes, events)
 			}
-			if closes := countEvents(events, "op-close"); closes != 1 {
-				t.Fatalf("Operation scope closed %d times, want once: %v", closes, events)
+			{
+				closes := countEvents(events, "op-close")
+				testassert.Require(t, closes == 1, "Operation scope closed %d times, want once: %v", closes, events)
 			}
 			agIdx, opIdx := slices.Index(events, "ag-close"), slices.Index(events, "op-close")
-			if agIdx > opIdx {
-				t.Fatalf("events = %v, want the Agent scope closed before the Operation scope", events)
-			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.Require(t, agIdx <= opIdx, "events = %v, want the Agent scope closed before the Operation scope", events)
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("opening failure unwinds owned scopes", func(t *testing.T) {
@@ -1450,25 +1353,11 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 			session := e.session("dual")
 			e.admit(session, "op-1", "one")
 			rec := e.awaitTerminal(session, "op-1", harness.OperationFailure)
-			if rec.State.Terminal == nil || !strings.Contains(rec.State.Terminal.Detail, errOpen.Error()) {
-				t.Fatalf("operation state = %+v, want the failure carrying the opening error", rec.State)
-			}
+			testassert.Require(t, rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, errOpen.Error()), "operation state = %+v, want the failure carrying the opening error", rec.State)
 			events := e.events.all()
-			if !slices.Contains(events, "op-open:op-1") {
-				t.Fatalf("events = %v, want the Operation scope constructed before the failure", events)
-			}
-			if slices.Contains(events, "ag-open") || slices.Contains(events, "ag-close") {
-				t.Fatalf("events = %v, want no Agent scope constructed through the failed opening", events)
-			}
-			if !slices.Contains(events, "op-close") {
-				t.Fatalf("events = %v, want the owned Operation scope unwound", events)
-			}
-			if got := e.agOpens.Load(); got != 0 {
-				t.Fatalf("Agent factories opened %d times through the failed opening", got)
-			}
-			if err := e.converge(); err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			testassert.Require(t, slices.Contains(events, "op-open:op-1") && !slices.Contains(events, "ag-open") && !slices.Contains(events, "ag-close") && slices.Contains(events, "op-close"), "events = %v, want the Operation scope constructed before the failure; events = %v, want no Agent scope constructed through the failed opening; events = %v, want the owned Operation scope unwound", events, events, events)
+			testassert.Equal(t, e.agOpens.Load(), 0)
+			testassert.NoError(t, e.converge())
 		})
 	})
 	t.Run("cleanup error is retained without rewriting the settlement", func(t *testing.T) {
@@ -1478,11 +1367,10 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 			session := e.session("dual")
 			e.admit(session, "op-1", "one")
 			rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess)
-			if rec.State.Status != harness.OperationSuccess {
-				t.Fatalf("cleanup failure rewrote the settlement: status %q", rec.State.Status)
-			}
-			if err := e.converge(); !errors.Is(err, errExecClose) {
-				t.Fatalf("Wait error = %v, want the retained cleanup failure %v", err, errExecClose)
+			testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
+			{
+				err := e.converge()
+				testassert.Require(t, errors.Is(err, errExecClose), "Wait error = %v, want the retained cleanup failure %v", err, errExecClose)
 			}
 		})
 	})
@@ -1510,18 +1398,14 @@ func TestPreparationInterruptBeforeAgentScopeEntrySettlesInterruption(t *testing
 		case <-time.After(10 * time.Second):
 			t.Fatal("the Agent-scope opening never parked")
 		}
-		if err := e.r.interruptSession(context.Background(), session); err != nil {
-			t.Fatalf("interruptSession: %v", err)
-		}
+		testassert.NoError(t, e.r.interruptSession(context.Background(), session))
 		releaseGate()
 		rec := e.awaitTerminal(session, "op-int", harness.OperationInterruption)
 		if rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, ErrClosed.Error()) {
 			t.Fatalf("terminal detail = %q, want the interruption identity, not the closed-scope failure", rec.State.Terminal.Detail)
 		}
 		e.awaitEvent("ag-close", "op-close") // the parked opening still disposed both scopes
-		if err := e.converge(); err != nil {
-			t.Fatalf("Wait: %v", err)
-		}
+		testassert.NoError(t, e.converge())
 	})
 }
 
@@ -1537,10 +1421,7 @@ func TestPreparationCapturesPermissionConstraints(t *testing.T) {
 		session := e.session("locked")
 		e.admit(session, "op-1", "one")
 		rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess)
-		if !rec.Admission.Execution.Readonly || rec.Admission.Execution.WriteDir != "/tmp/pad" {
-			t.Fatalf("committed constraints = %v %q, want the definition's readonly true and once-trimmed %q",
-				rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir, "/tmp/pad")
-		}
+		testassert.Require(t, rec.Admission.Execution.Readonly && rec.Admission.Execution.WriteDir == "/tmp/pad", "committed constraints = %v %q, want the definition's readonly true and once-trimmed %q", rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir, "/tmp/pad")
 	})
 }
 
@@ -1557,8 +1438,9 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		e := newPrepEnv(t, store)
 		t.Cleanup(func() { e.converge() })
 		writeServiceFile(t, e.configPath, prepPolicyConfigDocument(e.server.URL, "A"))
-		if _, err := e.reload(); err != nil {
-			t.Fatalf("policy publish: %v", err)
+		{
+			_, err := e.reload()
+			testassert.NoError(t, err)
 		}
 		e.server.setScript(func(_ context.Context, body string) []string {
 			if lastMessageRole(body) == "tool" {
@@ -1568,20 +1450,15 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		})
 		session := e.session("solo")
 		e.admit(session, "op-1", "one")
-		if rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("operation = %+v, want terminal success after the denial settled its call", rec.State)
+		{
+			rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess)
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "operation = %+v, want terminal success after the denial settled its call", rec.State)
 		}
 		normalized, executed, _ := e.echo.counters()
-		if executed != 0 {
-			t.Fatalf("concrete effects started = %d, want none for the denied call", executed)
-		}
-		if normalized != 1 {
-			t.Fatalf("normalizations = %d, want the committed value consumed without a second pass", normalized)
-		}
+		testassert.Equal(t, executed, 0)
+		testassert.Equal(t, normalized, 1)
 		entries, err := store.ReadEntries(context.Background(), session, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		var denial bool
 		published := 0
 		for _, entry := range entries {
@@ -1589,8 +1466,9 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 				continue
 			}
 			var obj map[string]json.RawMessage
-			if err := json.Unmarshal(entry.Payload, &obj); err != nil {
-				t.Fatalf("decode %s payload: %v", entry.ID, err)
+			{
+				err := json.Unmarshal(entry.Payload, &obj)
+				testassert.Require(t, err == nil, "decode %s payload: %v", entry.ID, err)
 			}
 			switch entry.Kind {
 			case harness.EntryAssistant:
@@ -1598,35 +1476,24 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 					ID                  string          `json:"id"`
 					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
 				}
-				if err := json.Unmarshal(obj["tool_calls"], &calls); err != nil {
-					t.Fatalf("assistant tool calls: %v", err)
-				}
+				testassert.NoError(t, json.Unmarshal(obj["tool_calls"], &calls))
 				if len(calls) == 0 {
 					continue // the continuation turn's text-only assistant
 				}
 				published++
-				if len(calls) != 1 || calls[0].ID != "call-1" {
-					t.Fatalf("assistant tool calls = %s, want the one published call", obj["tool_calls"])
-				}
-				if string(calls[0].NormalizedArguments) != `{"x":1}` {
-					t.Fatalf("committed normalized_arguments = %s, want the producer's compacted object", calls[0].NormalizedArguments)
-				}
+				testassert.Require(t, len(calls) == 1 && calls[0].ID == "call-1", "assistant tool calls = %s, want the one published call", obj["tool_calls"])
+				testassert.Require(t, string(calls[0].NormalizedArguments) == `{"x":1}`, "committed normalized_arguments = %s, want the producer's compacted object", calls[0].NormalizedArguments)
 			case harness.EntryToolResult:
-				if string(obj["status"]) != `"denied"` || string(obj["content"]) != `"Permission denied."` {
-					t.Fatalf("tool result = %s, want the fixed denial", entry.Payload)
-				}
-				if _, present := obj["metadata"]; present {
-					t.Fatalf("denied result carries a metadata member")
+				testassert.Require(t, string(obj["status"]) == `"denied"` && string(obj["content"]) == `"Permission denied."`, "tool result = %s, want the fixed denial", entry.Payload)
+				{
+					_, present := obj["metadata"]
+					testassert.Require(t, !present, "denied result carries a metadata member")
 				}
 				denial = true
 			}
 		}
-		if published != 1 || !denial {
-			t.Fatalf("committed entries: %d publishing assistants and denial=%v, want 1 and true", published, denial)
-		}
-		if got := e.server.requests(); got != 2 {
-			t.Fatalf("%d model requests, want the continuation after the settled call", got)
-		}
+		testassert.Require(t, published == 1 && denial, "committed entries: %d publishing assistants and denial=%v, want 1 and true", published, denial)
+		testassert.Equal(t, e.server.requests(), 2)
 		var projected string
 		doc := decodeWireChatBody(t, e.server.bodyAt(1))
 		for _, msg := range doc.Messages {
@@ -1637,9 +1504,7 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 				}
 			}
 		}
-		if projected != "Permission denied." {
-			t.Fatalf("second projection carried tool message %q, want the committed denial", projected)
-		}
+		testassert.Equal(t, projected, "Permission denied.")
 	})
 }
 
@@ -1665,22 +1530,19 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		})
 		session := e.session("hooky")
 		e.admit(session, "op-1", "one")
-		if rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("operation = %+v, want terminal success after the hook chain", rec.State)
+		{
+			rec := e.awaitTerminal(session, "op-1", harness.OperationSuccess)
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "operation = %+v, want terminal success after the hook chain", rec.State)
 		}
 
 		_, executed, toolInput := e.echo.counters()
-		if executed != 1 || len(toolInput) != 1 || toolInput[0] != `{"repaired":"arg.agent"}` {
-			t.Fatalf("concrete tool ran %d times on %q, want once with the final committed replacement", executed, toolInput)
-		}
+		testassert.Require(t, executed == 1 && len(toolInput) == 1 && toolInput[0] == `{"repaired":"arg.agent"}`, "concrete tool ran %d times on %q, want once with the final committed replacement", executed, toolInput)
 
 		// The committed hook evidence: one success hook_result per argument
 		// hook in configured order, under the capability IDs, each repairing
 		// from its received bytes.
 		entries, err := store.ReadEntries(context.Background(), session, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		type hookWire struct {
 			HookID     string          `json:"hook_id"`
 			ToolCallID string          `json:"tool_call_id"`
@@ -1693,53 +1555,38 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 				continue
 			}
 			var wire hookWire
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode hook result: %v", err)
-			}
+			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 			hookResults = append(hookResults, wire)
 		}
 		wantIDs := []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"}
-		if len(hookResults) != len(wantIDs) {
-			t.Fatalf("committed hook results = %+v, want one per argument hook", hookResults)
-		}
+		testassert.Require(t, len(hookResults) == len(wantIDs), "committed hook results = %+v, want one per argument hook", hookResults)
 		for i, want := range wantIDs {
 			got := hookResults[i]
-			if got.HookID != want || got.ToolCallID != "call-1" || got.Status != "success" {
-				t.Fatalf("hook result %d = %+v, want hook %q succeeding for call-1", i, got, want)
-			}
+			testassert.Require(t, got.HookID == want && got.ToolCallID == "call-1" && got.Status == "success", "hook result %d = %+v, want hook %q succeeding for call-1", i, got, want)
 		}
-		if string(hookResults[3].Arguments) != `{"repaired":"arg.agent"}` {
-			t.Fatalf("last committed arguments = %s, want the final hook's replacement", hookResults[3].Arguments)
-		}
+		testassert.Require(t, string(hookResults[3].Arguments) == `{"repaired":"arg.agent"}`, "last committed arguments = %s, want the final hook's replacement", hookResults[3].Arguments)
 
 		// The chain: the first hook received the invalid raw arguments, every
 		// later one the preceding hook's committed replacement; the captured
 		// Invocation revision reached every hook.
 		for i, hook := range e.argHooks {
 			seen, revs := hook.received()
-			if len(seen) != 1 {
-				t.Fatalf("hook %d ran %d times, want once", i, len(seen))
-			}
+			testassert.Require(t, len(seen) == 1, "hook %d ran %d times, want once", i, len(seen))
 			if i > 0 && seen[0] != string(hookResults[i-1].Arguments) {
 				t.Fatalf("hook %d received %q, want the preceding committed replacement %q", i, seen[0], hookResults[i-1].Arguments)
 			}
-			if revs[0] == "" {
-				t.Fatalf("hook %d received an empty Invocation revision", i)
-			}
+			testassert.Require(t, revs[0] != "", "hook %d received an empty Invocation revision", i)
 		}
-		if first, _ := e.argHooks[0].received(); first[0] != ` [not json ` {
-			t.Fatalf("first hook received %q, want the invalid raw arguments", first)
+		{
+			first, _ := e.argHooks[0].received()
+			testassert.Require(t, first[0] == ` [not json `, "first hook received %q, want the invalid raw arguments", first)
 		}
 
 		// The pure preparation hook in the same capability list ran at
 		// preparation and never bound as an argument hook.
-		if len(e.hooks[0].calls()) == 0 {
-			t.Fatalf("preparation hook never ran")
-		}
+		testassert.Require(t, len(e.hooks[0].calls()) != 0, "preparation hook never ran")
 		for _, result := range hookResults {
-			if result.HookID == "hook.first" {
-				t.Fatalf("preparation hook bound as an argument hook")
-			}
+			testassert.Require(t, result.HookID != "hook.first", "preparation hook bound as an argument hook")
 		}
 	})
 }

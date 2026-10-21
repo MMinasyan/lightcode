@@ -20,6 +20,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -81,9 +82,7 @@ func newOwnerEnvIn(t *testing.T, home, dataDir string) *ownerEnv {
 func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -275,35 +274,29 @@ type nilStorage struct{ harness.Storage }
 func wantFailedOpen(t *testing.T, e *ownerEnv, plugins []Plugin, wantIs error) {
 	t.Helper()
 	r, err := e.open(context.Background(), plugins...)
-	if r != nil {
-		t.Fatalf("failed construction returned a non-nil Runtime with error %v", err)
-	}
-	if !errors.Is(err, wantIs) {
-		t.Fatalf("open error = %v, want %v", err, wantIs)
-	}
+	testassert.Require(t, r == nil, "failed construction returned a non-nil Runtime with error %v", err)
+	testassert.Require(t, errors.Is(err, wantIs), "open error = %v, want %v", err, wantIs)
 }
 
 // assertLockReleased proves the failed attempt released the ownership lock.
 func (e *ownerEnv) assertLockReleased(t *testing.T) {
 	t.Helper()
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("reopen after the failed attempt: %v (a resource or the ownership lock was left behind)", err)
-	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, r.Close(context.Background()))
 }
 
 // assertNoOwnershipSideEffects proves a pure declaration rejection touched
 // neither the filesystem nor any factory.
 func (e *ownerEnv) assertNoOwnershipSideEffects(t *testing.T) {
 	t.Helper()
-	if _, err := os.Stat(filepath.Join(e.dataDir, "runtime.lock")); !os.IsNotExist(err) {
-		t.Fatalf("declaration validation reached the filesystem or ownership: stat err = %v", err)
+	{
+		_, err := os.Stat(filepath.Join(e.dataDir, "runtime.lock"))
+		testassert.Require(t, os.IsNotExist(err), "declaration validation reached the filesystem or ownership: stat err = %v", err)
 	}
-	if events := e.events.all(); len(events) != 0 {
-		t.Fatalf("declaration validation invoked factories: %v", events)
+	{
+		events := e.events.all()
+		testassert.Require(t, len(events) == 0, "declaration validation invoked factories: %v", events)
 	}
 }
 
@@ -359,9 +352,7 @@ func submitThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Submit(%q): %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
 }
 
 func readOperation(t *testing.T, r *Runtime, sessionID, operationID string) harness.OperationRecord {
@@ -372,9 +363,7 @@ func readOperation(t *testing.T, r *Runtime, sessionID, operationID string) harn
 		rec, err = h.ReadOperation(ctx, sessionID, operationID)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("ReadOperation(%q): %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "ReadOperation(%q): %v", operationID, err)
 	return rec
 }
 
@@ -422,18 +411,15 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 			}, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("seed harness.New: %v", err)
-	}
+	testassert.NoError(t, err)
 	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
-	if err != nil {
-		t.Fatalf("seed CreateSession: %v", err)
-	}
-	if _, err := h.Submit(context.Background(), harness.SubmitRequest{
-		SessionID: rec.Identity.SessionID, OperationID: "seed-op", Origin: harness.InputOriginUser,
-		Content: []model.ContentPart{{Kind: model.PartText, Text: "running"}}, Mode: harness.MessageModeRegular,
-	}); err != nil {
-		t.Fatalf("seed Submit: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := h.Submit(context.Background(), harness.SubmitRequest{
+			SessionID: rec.Identity.SessionID, OperationID: "seed-op", Origin: harness.InputOriginUser,
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "running"}}, Mode: harness.MessageModeRegular,
+		})
+		testassert.NoError(t, err)
 	}
 	select {
 	case <-arrived:
@@ -457,9 +443,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)
-			if r != nil || err == nil {
-				t.Fatalf("open(%s) = (%v, %v), want a nil Runtime and an error", tc.name, r, err)
-			}
+			testassert.Require(t, r == nil && err != nil, "open(%s) = (%v, %v), want a nil Runtime and an error", tc.name, r, err)
 			e.assertNoOwnershipSideEffects(t)
 		}
 	})
@@ -469,45 +453,36 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()))
-		if r != nil || !errors.Is(err, context.Canceled) {
-			t.Fatalf("open = (%v, %v), want (nil, context.Canceled)", r, err)
-		}
+		testassert.Require(t, r == nil && errors.Is(err, context.Canceled), "open = (%v, %v), want (nil, context.Canceled)", r, err)
 		e.assertNoOwnershipSideEffects(t)
 	})
 
 	t.Run("relative paths normalize through one filepath.Abs pass", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		cwd, err := os.Getwd()
-		if err != nil {
-			t.Fatalf("Getwd: %v", err)
-		}
+		testassert.NoError(t, err)
 		relData, err := filepath.Rel(cwd, e.dataDir)
-		if err != nil {
-			t.Fatalf("Rel: %v", err)
-		}
+		testassert.NoError(t, err)
 		r, err := open(context.Background(), options{
 			DataDir:    relData,
 			ConfigPath: filepath.Join(relData, "config.json"),
 			Plugins:    []Plugin{e.sqliteDerivationPlugin()},
 		})
-		if err != nil {
-			t.Fatalf("open(relative): %v", err)
+		testassert.NoError(t, err)
+		{
+			events := e.events.all()
+			testassert.Require(t, slices.Equal(eventNames(events), []string{"open:db"}), "factory events = %v, want exactly the Core factory", events)
 		}
-		if events := e.events.all(); !slices.Equal(eventNames(events), []string{"open:db"}) {
-			t.Fatalf("factory events = %v, want exactly the Core factory", events)
+		testassert.Equal(t, e.scopeDataDir.Load().(string), e.dataDir)
+		{
+			_, err := os.Stat(filepath.Join(e.dataDir, "runtime.lock"))
+			testassert.NoError(t, err)
 		}
-		if got := e.scopeDataDir.Load().(string); got != e.dataDir {
-			t.Fatalf("ScopeInfo DataDir = %q, want the same normalized owner root %q", got, e.dataDir)
+		{
+			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(filepath.Join(e.dataDir, "runtime.lock")); err != nil {
-			t.Fatalf("lock under the normalized root: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db")); err != nil {
-			t.Fatalf("the storage backend derives its database from the same root: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 
 	t.Run("one data root with an independent config path", func(t *testing.T) {
@@ -518,18 +493,16 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		writeServiceFile(t, agents.PathForConfig(configPath), ownerAgentsDocument)
 		e.configPath = configPath
 		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := os.Stat(filepath.Join(configDir, "agents.json"))
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(filepath.Join(configDir, "agents.json")); err != nil {
-			t.Fatalf("agents.json does not stay beside the config path: %v", err)
+		{
+			_, err := os.Stat(filepath.Join(e.home, ".lightcode", ".env"))
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(filepath.Join(e.home, ".lightcode", ".env")); err != nil {
-			t.Fatalf("the managed dotenv source is not home-based: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -538,9 +511,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 func TestRuntimeOwnershipLockIsExclusive(t *testing.T) {
 	e := newOwnerEnv(t)
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	// A contender with its own configuration override still targets the same
 	// owner root: identity is the normalized data directory.
 	rival := newOwnerEnvIn(t, e.home, e.dataDir)
@@ -552,16 +523,10 @@ func TestRuntimeOwnershipLockIsExclusive(t *testing.T) {
 		_ = r.Close(context.Background())
 		t.Fatalf("contender factory events = %v, want no factory invoked while losing ownership", rival.events.all())
 	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	again, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("reopen after release: %v", err)
-	}
-	if err := again.Close(context.Background()); err != nil {
-		t.Fatalf("Close after reacquire: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, again.Close(context.Background()))
 }
 
 const lockChildEnv = "LIGHTCODE_RUNTIME_LOCK_CHILD"
@@ -576,14 +541,10 @@ func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
 	if dir := os.Getenv(lockChildEnv); dir != "" {
 		e := newOwnerEnvIn(t, os.Getenv("HOME"), dir)
 		r, err := e.open(context.Background(), e.sqliteDerivationPlugin())
-		if err != nil {
-			t.Fatalf("child open: %v", err)
-		}
+		testassert.NoError(t, err)
 		fmt.Println("acquired")
 		_, _ = io.Copy(io.Discard, os.Stdin)
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("child Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 		fmt.Println("closed")
 		return
 	}
@@ -602,16 +563,10 @@ func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
 		cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.timeout=120s")
 		cmd.Env = append(os.Environ(), lockChildEnv+"="+dataDir)
 		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			t.Fatalf("StdinPipe: %v", err)
-		}
+		testassert.NoError(t, err)
 		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			t.Fatalf("StdoutPipe: %v", err)
-		}
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, cmd.Start())
 		c := &contender{cmd: cmd, env: parent, stdin: stdin, stdout: bufio.NewScanner(stdout)}
 		for c.stdout.Scan() {
 			if c.stdout.Text() == "acquired" {
@@ -635,26 +590,19 @@ func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
 			_ = c.cmd.Wait()
 			t.Fatalf("contender factory events = %v, want none while another process owns the state", events)
 		}
-		if err := c.cmd.Process.Kill(); err != nil {
-			t.Fatalf("Kill: %v", err)
-		}
-		if err := c.cmd.Wait(); err == nil {
-			t.Fatal("the killed child reported success")
+		testassert.NoError(t, c.cmd.Process.Kill())
+		{
+			err := c.cmd.Wait()
+			testassert.Require(t, err != nil, "the killed child reported success")
 		}
 		r, err := c.env.open(context.Background(), c.env.sqliteDerivationPlugin())
-		if err != nil {
-			t.Fatalf("open against the durable state left by the killed owner: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 
 	t.Run("managed shutdown in another process releases ownership", func(t *testing.T) {
 		c := start(t)
-		if err := c.stdin.Close(); err != nil {
-			t.Fatalf("close stdin: %v", err)
-		}
+		testassert.NoError(t, c.stdin.Close())
 		closed := false
 		for c.stdout.Scan() {
 			if c.stdout.Text() == "closed" {
@@ -662,16 +610,13 @@ func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
 				break
 			}
 		}
-		if err := c.cmd.Wait(); err != nil || !closed {
-			t.Fatalf("child managed shutdown: scanned-closed=%v wait=%v", closed, err)
+		{
+			err := c.cmd.Wait()
+			testassert.Require(t, err == nil && closed, "child managed shutdown: scanned-closed=%v wait=%v", closed, err)
 		}
 		r, err := c.env.open(context.Background(), c.env.sqliteDerivationPlugin())
-		if err != nil {
-			t.Fatalf("open after the owner exited: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -690,8 +635,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, `{not json`)
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory())}, ErrConfiguration)
-		if events := e.events.all(); len(events) != 0 {
-			t.Fatalf("factory events = %v, want the configuration rejection to precede any factory", events)
+		{
+			events := e.events.all()
+			testassert.Require(t, len(events) == 0, "factory events = %v, want the configuration rejection to precede any factory", events)
 		}
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
@@ -706,17 +652,16 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		}
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), e.ordinaryPlugin("first", ScopeRuntime, "first.cap"), failing}, errFactory)
 		events := eventNames(e.events.all())
-		if !orderedSubset(events, "close:first") || slices.Contains(events, "close:failing") {
-			t.Fatalf("factory events = %v, want only the constructed prefix disposed", events)
-		}
+		testassert.Require(t, orderedSubset(events, "close:first") && !slices.Contains(events, "close:failing"), "factory events = %v, want only the constructed prefix disposed", events)
 		e.assertLockReleased(t)
 	})
 
 	t.Run("untyped-nil Core storage rolls back through its closer", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(nil)}, ErrComposition)
-		if events := eventNames(e.events.all()); !slices.Contains(events, "close:core") {
-			t.Fatalf("factory events = %v, want the invalid instance disposed", events)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the invalid instance disposed", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -724,8 +669,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 	t.Run("typed-nil Core storage rolls back through its closer", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin((*nilStorage)(nil))}, ErrComposition)
-		if events := eventNames(e.events.all()); !slices.Contains(events, "close:core") {
-			t.Fatalf("factory events = %v, want the invalid instance disposed", events)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the invalid instance disposed", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -735,8 +681,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		errRecover := errors.New("test recovery failure")
 		store := &failingListStore{Storage: storage.NewMemory(), err: errRecover}
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(store)}, errRecover)
-		if events := eventNames(e.events.all()); !slices.Contains(events, "close:core") {
-			t.Fatalf("factory events = %v, want the constructed Runtime scope disposed", events)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the constructed Runtime scope disposed", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -774,8 +721,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 			cancel()
 			t.Fatalf("canceled construction error = %v, want the context error", err)
 		}
-		if events := eventNames(e.events.all()); !orderedSubset(events, "close:signalled") {
-			t.Fatalf("factory events = %v, want the constructed prefix disposed on cancellation", events)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, orderedSubset(events, "close:signalled"), "factory events = %v, want the constructed prefix disposed on cancellation", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -807,14 +755,10 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("canceled construction never returned")
 		}
-		if got.r != nil {
-			t.Fatalf("construction completed after cancellation (Runtime %v, error %v)", got.r, got.err)
-		}
-		if !errors.Is(got.err, context.Canceled) {
-			t.Fatalf("open error = %v, want the constructor context's own error, not the owner-lifecycle identity", got.err)
-		}
-		if events := e.events.all(); len(events) != 0 {
-			t.Fatalf("factory events = %v, want the publication rejection to precede any factory", events)
+		testassert.Require(t, got.r == nil && errors.Is(got.err, context.Canceled), "construction completed after cancellation (Runtime %v, error %v); open error = %v, want the constructor context's own error, not the owner-lifecycle identity", got.r, got.err, got.err)
+		{
+			events := e.events.all()
+			testassert.Require(t, len(events) == 0, "factory events = %v, want the publication rejection to precede any factory", events)
 		}
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
@@ -826,8 +770,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 		gate.ValidateConfig = func(json.RawMessage) error { return ErrClosed }
 		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), gate}, ErrClosed)
-		if events := e.events.all(); len(events) != 0 {
-			t.Fatalf("factory events = %v, want the validator rejection preserved before any factory", events)
+		{
+			events := e.events.all()
+			testassert.Require(t, len(events) == 0, "factory events = %v, want the validator rejection preserved before any factory", events)
 		}
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
@@ -861,15 +806,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("canceled construction never returned")
 		}
-		if got.r != nil {
-			t.Fatalf("construction completed after the validator rejection (Runtime %v, error %v)", got.r, got.err)
-		}
-		if !errors.Is(got.err, errValidator) || !errors.Is(got.err, ErrConfiguration) {
-			t.Fatalf("open error = %v, want the wrapped validator and ErrConfiguration identities preserved, not replaced by the context error", got.err)
-		}
-		if errors.Is(got.err, context.Canceled) {
-			t.Fatalf("open error = %v, want the source identity rather than the constructor context error", got.err)
-		}
+		testassert.Require(t, got.r == nil && errors.Is(got.err, errValidator) && errors.Is(got.err, ErrConfiguration) && !errors.Is(got.err, context.Canceled), "construction completed after the validator rejection (Runtime %v, error %v); open error = %v, want the wrapped validator and ErrConfiguration identities preserved, not replaced by the context error; open error = %v, want the source identity rather than the constructor context error", got.r, got.err, got.err, got.err)
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
@@ -908,14 +845,14 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		w := e.ordinaryPlugin("w", ScopeWorkspace, "w.cap")
 
 		r, err := e.open(context.Background(), storagePlugin, y, x, w)
-		if err != nil {
-			t.Fatalf("open: %v", err)
+		testassert.NoError(t, err)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, orderedSubset(events, "open:core", "open:x", "open:y"), "factory events = %v, want dependencies constructed before consumers in stable topological order", events)
 		}
-		if events := eventNames(e.events.all()); !orderedSubset(events, "open:core", "open:x", "open:y") {
-			t.Fatalf("factory events = %v, want dependencies constructed before consumers in stable topological order", events)
-		}
-		if _, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"}); err != nil {
-			t.Fatalf("workspace get: %v", err)
+		{
+			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"})
+			testassert.NoError(t, err)
 		}
 
 		firstDone := make(chan error, 1)
@@ -930,8 +867,9 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 
 		canceledCtx, cancelWait := context.WithCancel(context.Background())
 		cancelWait()
-		if err := r.Close(canceledCtx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled Close waiter = %v, want its own context error while the shared cleanup continues", err)
+		{
+			err := r.Close(canceledCtx)
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled Close waiter = %v, want its own context error while the shared cleanup continues", err)
 		}
 		if got, err := e.open(context.Background(), e.corePlugin("contender", "session_store", storage.NewMemory(), nil)); err == nil || !errors.Is(err, ErrOwned) {
 			close(blockClose)
@@ -945,23 +883,18 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("Close never converged after disposal was released")
 		}
-		if !errors.Is(closeErr, errStorageClose) || !errors.Is(closeErr, errXClose) {
-			t.Fatalf("Close error = %v, want every attempted close joined", closeErr)
-		}
+		testassert.Require(t, errors.Is(closeErr, errStorageClose) && errors.Is(closeErr, errXClose), "Close error = %v, want every attempted close joined", closeErr)
 		select {
 		case joined := <-joinedDone:
-			if joined != closeErr {
-				t.Fatalf("concurrent Close = %v, want the same joined shared result %v", joined, closeErr)
-			}
+			testassert.Equal(t, joined, closeErr)
 		case <-time.After(10 * time.Second):
 			t.Fatal("the second Close caller never joined the shared cleanup")
 		}
-		if again := r.Close(context.Background()); again != closeErr {
-			t.Fatalf("repeated Close = %v, want the same joined shared result", again)
-		}
+		testassert.Equal(t, r.Close(context.Background()), closeErr)
 		wantClose := []string{"close:w", "close:y", "close:x", "close:core"}
-		if got := eventsNamedList(e.events.all(), "close"); !slices.Equal(got, wantClose) {
-			t.Fatalf("close events = %v, want Workspace scopes before the Runtime scope and reverse dependency order inside it", got)
+		{
+			got := eventsNamedList(e.events.all(), "close")
+			testassert.Require(t, slices.Equal(got, wantClose), "close events = %v, want Workspace scopes before the Runtime scope and reverse dependency order inside it", got)
 		}
 	})
 }
@@ -984,12 +917,11 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 		t.Run("two reloads publish successive revisions", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			r, err := e.open(context.Background(), e.storagePlugin(store))
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			defer func() {
-				if err := r.Close(context.Background()); err != nil {
-					t.Errorf("Close: %v", err)
+				{
+					err := r.Close(context.Background())
+					testassert.Check(t, err == nil, "Close: %v", err)
 				}
 			}()
 			var revisions [2]string
@@ -1007,9 +939,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				}(i)
 			}
 			wg.Wait()
-			if !((revisions[0] == "2" && revisions[1] == "3") || (revisions[0] == "3" && revisions[1] == "2")) {
-				t.Fatalf("concurrent Reload revisions = %v, want the serialized pair 2 and 3", revisions)
-			}
+			testassert.Require(t, ((revisions[0] == "2" && revisions[1] == "3") || (revisions[0] == "3" && revisions[1] == "2")), "concurrent Reload revisions = %v, want the serialized pair 2 and 3", revisions)
 		})
 
 		t.Run("caller cancellation before publication consumes no revision", func(t *testing.T) {
@@ -1019,12 +949,11 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
 			r, err := e.open(context.Background(), e.storagePlugin(store), gate)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			defer func() {
-				if err := r.Close(context.Background()); err != nil {
-					t.Errorf("Close: %v", err)
+				{
+					err := r.Close(context.Background())
+					testassert.Check(t, err == nil, "Close: %v", err)
 				}
 			}()
 			ctx, cancel := context.WithCancel(context.Background())
@@ -1038,11 +967,13 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			<-arrive
 			cancel()
 			validator.release()
-			if err := <-reloadDone; !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled Reload = %v, want the caller's own context error", err)
+			{
+				err := <-reloadDone
+				testassert.Require(t, errors.Is(err, context.Canceled), "canceled Reload = %v, want the caller's own context error", err)
 			}
-			if revision, err := r.Reload(context.Background()); err != nil || revision != "2" {
-				t.Fatalf("Reload after the canceled build = (%q, %v), want 2: a failed build consumes no generation", revision, err)
+			{
+				revision, err := r.Reload(context.Background())
+				testassert.Require(t, err == nil && revision == "2", "Reload after the canceled build = (%q, %v), want 2: a failed build consumes no generation", revision, err)
 			}
 		})
 
@@ -1053,9 +984,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
 			r, err := e.open(context.Background(), e.storagePlugin(store), gate)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			arrive := validator.arm()
 			reloadDone := make(chan error, 1)
 			go func() {
@@ -1073,17 +1002,13 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			validator.release()
 			select {
 			case err := <-closeDone:
-				if err != nil {
-					t.Fatalf("Close: %v", err)
-				}
+				testassert.NoError(t, err)
 			case <-time.After(10 * time.Second):
 				t.Fatal("Close never converged after the admitted build was released")
 			}
 			select {
 			case err := <-reloadDone:
-				if !errors.Is(err, ErrClosed) {
-					t.Fatalf("admitted Reload under shutdown = %v, want ErrClosed: a live caller on a done owner still reports closure", err)
-				}
+				testassert.Require(t, errors.Is(err, ErrClosed), "admitted Reload under shutdown = %v, want ErrClosed: a live caller on a done owner still reports closure", err)
 			default:
 				t.Fatal("Close returned before the admitted Reload returned")
 			}
@@ -1098,11 +1023,10 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 		t.Run("a canceled request leaves the owner and other work intact", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			r, err := e.open(context.Background(), e.storagePlugin(store))
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
-			if _, err := r.createSession(context.Background(), e.dataDir, "solo"); err != nil {
-				t.Fatalf("createSession: %v", err)
+			testassert.NoError(t, err)
+			{
+				_, err := r.createSession(context.Background(), e.dataDir, "solo")
+				testassert.NoError(t, err)
 			}
 			requestCtx, cancelRequest := context.WithCancel(context.Background())
 			held := make(chan struct{})
@@ -1115,27 +1039,26 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 				})
 			}()
 			<-held
-			if _, err := r.createSession(context.Background(), e.dataDir, "solo"); err != nil {
-				t.Fatalf("createSession while one request was in flight: %v", err)
+			{
+				_, err := r.createSession(context.Background(), e.dataDir, "solo")
+				testassert.NoError(t, err)
 			}
 			cancelRequest()
-			if err := <-callDone; !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled request = %v, want the caller's own error", err)
+			{
+				err := <-callDone
+				testassert.Require(t, errors.Is(err, context.Canceled), "canceled request = %v, want the caller's own error", err)
 			}
-			if revision, err := r.Reload(context.Background()); err != nil || revision != "2" {
-				t.Fatalf("Reload after a canceled request = (%q, %v), want the owner alive at revision 2", revision, err)
+			{
+				revision, err := r.Reload(context.Background())
+				testassert.Require(t, err == nil && revision == "2", "Reload after a canceled request = (%q, %v), want the owner alive at revision 2", revision, err)
 			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
+			testassert.NoError(t, r.Close(context.Background()))
 		})
 
 		t.Run("a canceled Runtime context rejects entry before the cancellation watcher runs", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			r, err := e.open(context.Background(), e.storagePlugin(store))
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			testassert.NoError(t, err)
 			// The exact post-cancellation pre-watcher state: the owned work
 			// context is done while no closure has begun.
 			originalWork, originalCancel := r.work, r.cancelWork
@@ -1150,18 +1073,10 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			})
 			_, sessionErr := r.createSession(context.Background(), e.dataDir, "solo")
 			r.work, r.cancelWork = originalWork, originalCancel
-			if !errors.Is(reloadErr, ErrClosed) {
-				t.Fatalf("Reload after owner cancellation = %v, want ErrClosed", reloadErr)
-			}
-			if ranGuardedCall || !errors.Is(guardedErr, ErrClosed) {
-				t.Fatalf("withHarness after owner cancellation = %v (guarded call ran: %v), want ErrClosed with the call never run", guardedErr, ranGuardedCall)
-			}
-			if !errors.Is(sessionErr, ErrClosed) {
-				t.Fatalf("createSession after owner cancellation = %v, want ErrClosed", sessionErr)
-			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("Close joining the watcher-started shutdown: %v", err)
-			}
+			testassert.Require(t, errors.Is(reloadErr, ErrClosed), "Reload after owner cancellation = %v, want ErrClosed", reloadErr)
+			testassert.Require(t, !ranGuardedCall && errors.Is(guardedErr, ErrClosed), "withHarness after owner cancellation = %v (guarded call ran: %v), want ErrClosed with the call never run", guardedErr, ranGuardedCall)
+			testassert.Require(t, errors.Is(sessionErr, ErrClosed), "createSession after owner cancellation = %v, want ErrClosed", sessionErr)
+			testassert.NoError(t, r.Close(context.Background()))
 			e.assertLockReleased(t)
 		})
 
@@ -1194,43 +1109,37 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 				t.Fatal("the watcher-started shutdown disposed no plugin")
 			}
 			again, err := e.open(context.Background(), e.storagePlugin(store))
-			if err != nil {
-				t.Fatalf("open after the watcher-started shutdown: %v", err)
-			}
-			if err := again.Close(context.Background()); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
+			testassert.NoError(t, err)
+			testassert.NoError(t, again.Close(context.Background()))
 		})
 
 		t.Run("closed access rejects and repeated Close joins the same result", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			r, err := e.open(context.Background(), e.storagePlugin(store))
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("first Close: %v", err)
-			}
-			if _, err := r.Reload(context.Background()); !errors.Is(err, ErrClosed) {
-				t.Fatalf("Reload after Close = %v, want ErrClosed", err)
+			testassert.NoError(t, err)
+			testassert.NoError(t, r.Close(context.Background()))
+			{
+				_, err := r.Reload(context.Background())
+				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close = %v, want ErrClosed", err)
 			}
 			callerCtx, cancelCaller := context.WithCancel(context.Background())
 			cancelCaller()
-			if _, err := r.Reload(callerCtx); !errors.Is(err, ErrClosed) {
-				t.Fatalf("Reload after Close with a canceled caller = %v, want ErrClosed: admission rejects before the caller check", err)
+			{
+				_, err := r.Reload(callerCtx)
+				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close with a canceled caller = %v, want ErrClosed: admission rejects before the caller check", err)
 			}
-			if _, err := r.createSession(context.Background(), e.dataDir, "solo"); !errors.Is(err, ErrClosed) {
-				t.Fatalf("createSession after Close = %v, want ErrClosed", err)
+			{
+				_, err := r.createSession(context.Background(), e.dataDir, "solo")
+				testassert.Require(t, errors.Is(err, ErrClosed), "createSession after Close = %v, want ErrClosed", err)
 			}
-			if err := r.withHarness(context.Background(), func(context.Context, *harness.Harness) error {
-				t.Error("the guarded call ran after Close")
-				return nil
-			}); !errors.Is(err, ErrClosed) {
-				t.Fatalf("withHarness after Close = %v, want ErrClosed", err)
+			{
+				err := r.withHarness(context.Background(), func(context.Context, *harness.Harness) error {
+					t.Error("the guarded call ran after Close")
+					return nil
+				})
+				testassert.Require(t, errors.Is(err, ErrClosed), "withHarness after Close = %v, want ErrClosed", err)
 			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("repeated Close = %v, want the same joined result", err)
-			}
+			testassert.NoError(t, r.Close(context.Background()))
 		})
 	})
 }
@@ -1239,17 +1148,14 @@ func TestRuntimePublishOwnerBarrier(t *testing.T) {
 	t.Run("observed cancellation unwinds and reports the context error", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		got, err := r.publishOwner(ctx)
-		if got != nil || !errors.Is(err, context.Canceled) {
-			t.Fatalf("publishOwner after observed cancellation = (%v, %v), want (nil, context error)", got, err)
-		}
-		if events := eventNames(e.events.all()); !slices.Contains(events, "close:core") {
-			t.Fatalf("factory events = %v, want the completed cleanup before the return", events)
+		testassert.Require(t, got == nil && errors.Is(err, context.Canceled), "publishOwner after observed cancellation = (%v, %v), want (nil, context error)", got, err)
+		{
+			events := eventNames(e.events.all())
+			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the completed cleanup before the return", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -1257,16 +1163,10 @@ func TestRuntimePublishOwnerBarrier(t *testing.T) {
 	t.Run("publication wins while cancellation starts shutdown behind it", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		got, err := r.publishOwner(context.Background())
-		if got != r || err != nil {
-			t.Fatalf("publishOwner = (%v, %v), want the same completed owner", got, err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, got == r && err == nil, "publishOwner = (%v, %v), want the same completed owner", got, err)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1278,98 +1178,61 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 		opens := make(chan int64, 16)
 		ws := e.countedPlugin("ws", ScopeWorkspace, "ws.cap", opens)
 		r, err := e.open(context.Background(), e.storagePlugin(store), ws)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := r.Close(context.Background()); err != nil {
-				t.Errorf("Close: %v", err)
+			{
+				err := r.Close(context.Background())
+				testassert.Check(t, err == nil, "Close: %v", err)
 			}
 		}()
 
-		if _, err := r.createSession(context.Background(), "", "solo"); err == nil {
-			t.Fatal("an empty workspace was accepted")
+		{
+			_, err := r.createSession(context.Background(), "", "solo")
+			testassert.Require(t, err != nil, "an empty workspace was accepted")
 		}
-		if err := r.withHarness(context.Background(), func(context.Context, *harness.Harness) error { return nil }); err != nil {
-			t.Fatalf("withHarness: %v", err)
-		}
+		testassert.NoError(t, r.withHarness(context.Background(), func(context.Context, *harness.Harness) error { return nil }))
 
 		t.Run("unclean and relative paths take one Abs", func(t *testing.T) {
 			target := filepath.Join(e.home, "real", "project")
-			if err := os.MkdirAll(target, 0o700); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, os.MkdirAll(target, 0o700))
 			unclean := filepath.Join(e.home, "real", "other", "..", "project")
 			rec, err := r.createSession(context.Background(), unclean, "solo")
-			if err != nil {
-				t.Fatalf("createSession(unclean): %v", err)
-			}
-			if rec.Identity.Workspace != target {
-				t.Fatalf("workspace = %q, want the lexical %q", rec.Identity.Workspace, target)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, rec.Identity.Workspace, target)
 			cwd, err := os.Getwd()
-			if err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, err)
 			rel, err := filepath.Rel(cwd, target)
-			if err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, err)
 			relative, err := r.createSession(context.Background(), rel, "solo")
-			if err != nil {
-				t.Fatalf("createSession(relative): %v", err)
-			}
-			if relative.Identity.Workspace != target {
-				t.Fatalf("relative workspace = %q, want the same normalized %q", relative.Identity.Workspace, target)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, relative.Identity.Workspace, target)
 		})
 
 		t.Run("symlink siblings keep distinct lexical identities", func(t *testing.T) {
-			if err := os.MkdirAll(filepath.Join(e.home, "real"), 0o700); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, "real"), 0o700))
 			link := filepath.Join(e.home, "link")
-			if err := os.Symlink(filepath.Join(e.home, "real"), link); err != nil {
-				t.Fatalf("Symlink: %v", err)
-			}
+			testassert.NoError(t, os.Symlink(filepath.Join(e.home, "real"), link))
 			byLink, err := r.createSession(context.Background(), filepath.Join(link, "project"), "solo")
-			if err != nil {
-				t.Fatalf("createSession(link): %v", err)
-			}
+			testassert.NoError(t, err)
 			byReal, err := r.createSession(context.Background(), filepath.Join(e.home, "real", "project"), "solo")
-			if err != nil {
-				t.Fatalf("createSession(real): %v", err)
-			}
-			if byLink.Identity.Workspace != filepath.Join(link, "project") {
-				t.Fatalf("link workspace = %q, want the lexical link path, not %q", byLink.Identity.Workspace, byReal.Identity.Workspace)
-			}
-			if byLink.Identity.Workspace == byReal.Identity.Workspace {
-				t.Fatalf("both workspaces normalized to %q, want distinct lexical identities", byLink.Identity.Workspace)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, byLink.Identity.Workspace == filepath.Join(link, "project") && byLink.Identity.Workspace != byReal.Identity.Workspace, "link workspace = %q, want the lexical link path, not %q; both workspaces normalized to %q, want distinct lexical identities", byLink.Identity.Workspace, byReal.Identity.Workspace, byLink.Identity.Workspace)
 		})
 
 		t.Run("scope lookup and Fork inheritance use the normalized identity", func(t *testing.T) {
 			shared := filepath.Join(e.home, "shared")
 			left, err := r.createSession(context.Background(), filepath.Join(shared, "x", ".."), "solo")
-			if err != nil {
-				t.Fatalf("createSession(left): %v", err)
-			}
+			testassert.NoError(t, err)
 			submitThroughRuntime(t, r, left.Identity.SessionID, "op-left", "first")
 			right, err := r.createSession(context.Background(), shared, "solo")
-			if err != nil {
-				t.Fatalf("createSession(right): %v", err)
-			}
+			testassert.NoError(t, err)
 			submitThroughRuntime(t, r, right.Identity.SessionID, "op-right", "first")
 			awaitOperation(t, r, left.Identity.SessionID, "op-left", harness.OperationSuccess)
 			awaitOperation(t, r, right.Identity.SessionID, "op-right", harness.OperationSuccess)
-			if n := <-opens; n != 1 {
-				t.Fatalf("Workspace scope constructions = %d, want one shared scope for the same normalized identity", n)
-			}
+			testassert.Equal(t, <-opens, 1)
 
 			entries, err := store.ReadEntries(context.Background(), left.Identity.SessionID, 0)
-			if err != nil {
-				t.Fatalf("ReadEntries: %v", err)
-			}
+			testassert.NoError(t, err)
 			var boundary string
 			for _, entry := range entries {
 				if entry.Kind == harness.EntryInput && entry.OperationID == "op-left" {
@@ -1377,9 +1240,7 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 					break
 				}
 			}
-			if boundary == "" {
-				t.Fatal("no admitted input entry was found")
-			}
+			testassert.Require(t, boundary != "", "no admitted input entry was found")
 			var forked harness.SessionRecord
 			err = r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 				res, err := h.Fork(ctx, harness.ForkRequest{
@@ -1394,19 +1255,13 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 				forked = res.Session
 				return nil
 			})
-			if err != nil {
-				t.Fatalf("Fork: %v", err)
-			}
-			if forked.Identity.Workspace != shared {
-				t.Fatalf("Fork workspace = %q, want the inherited normalized %q", forked.Identity.Workspace, shared)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, forked.Identity.Workspace, shared)
 			if e.scopeWorkspace.Load().(string) != shared {
 				t.Fatalf("Workspace scope identity = %q, want the normalized %q", e.scopeWorkspace.Load().(string), shared)
 			}
 			awaitOperation(t, r, forked.Identity.SessionID, "op-fork", harness.OperationSuccess)
-			if n := eventsNamed(e.events.all(), "open:ws"); n != 1 {
-				t.Fatalf("Workspace scope constructions = %d, want exactly one across both Sessions and the Fork", n)
-			}
+			testassert.Equal(t, eventsNamed(e.events.all(), "open:ws"), 1)
 		})
 	})
 }
@@ -1456,15 +1311,9 @@ func TestRuntimeCoreStorageBindingContract(t *testing.T) {
 			named := e.ordinaryPlugin("storage", ScopeRuntime, "storage")
 			plugin := e.corePlugin("state", "whatever", canonical, func() error { e.events.add("close:state"); return nil })
 			r, err := e.open(context.Background(), plugin, named)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
-			if err := r.Close(context.Background()); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
-			if canonical.listCount() == 0 {
-				t.Fatal("recovery never used the type-identified Core binding")
-			}
+			testassert.NoError(t, err)
+			testassert.NoError(t, r.Close(context.Background()))
+			testassert.Require(t, canonical.listCount() != 0, "recovery never used the type-identified Core binding")
 		})
 	})
 }
@@ -1506,9 +1355,7 @@ func readSessionFacts(t *testing.T, r *Runtime, sessionID string) (harness.Sessi
 		facts = historyFactsOf(view)
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("read session %q facts: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "read session %q facts: %v", sessionID, err)
 	return header, facts
 }
 
@@ -1521,43 +1368,30 @@ func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 			e.storagePlugin(&countingStore{Storage: store}),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		if got := e.server.requests(); got != 0 {
-			t.Fatalf("HTTP requests during startup = %d, want recovery to reach no model request", got)
-		}
-		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
-			t.Fatalf("short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
+		testassert.NoError(t, err)
+		testassert.Equal(t, e.server.requests(), 0)
+		{
+			ops, ags := opOpens.Load(), agOpens.Load()
+			testassert.Require(t, ops == 0 && ags == 0, "short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
 		}
 		rec := readOperation(t, r, sessionID, operationID)
-		if rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
-			rec.State.Terminal.Detail != "Operation interrupted by Runtime loss." {
-			t.Fatalf("recovered Operation state = %+v, want the terminal interruption settlement", rec.State)
-		}
+		testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "Operation interrupted by Runtime loss.", "recovered Operation state = %+v, want the terminal interruption settlement", rec.State)
 		header, facts := readSessionFacts(t, r, sessionID)
-		if header.CurrentOperationID != "" {
-			t.Fatalf("recovered Session current Operation = %q, want it cleared", header.CurrentOperationID)
-		}
+		testassert.Equal(t, header.CurrentOperationID, "")
 		if len(facts) == 0 || facts[0].Kind != harness.EntryInput {
 			t.Fatalf("recovered Session facts = %d, want the retained seeded input", len(facts))
 		}
 		// Repair precedes execution: a later admission enters ordinary
 		// admission on the repaired durable state.
 		next, err := r.createSession(context.Background(), filepath.Join(e.home, "seeded"), "solo")
-		if err != nil {
-			t.Fatalf("createSession after recovery: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-after-repair", "continue")
-		if post := awaitOperation(t, r, next.Identity.SessionID, "op-after-repair", harness.OperationSuccess); post.State.Status != harness.OperationSuccess {
-			t.Fatalf("post-repair Operation = %+v, want success", post.State)
+		{
+			post := awaitOperation(t, r, next.Identity.SessionID, "op-after-repair", harness.OperationSuccess)
+			testassert.Require(t, post.State.Status == harness.OperationSuccess, "post-repair Operation = %+v, want success", post.State)
 		}
-		if got := e.server.requests(); got != 1 {
-			t.Fatalf("HTTP requests after the explicit submit = %d, want exactly the one admitted request", got)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Equal(t, e.server.requests(), 1)
+		testassert.NoError(t, r.Close(context.Background()))
 	})
 }
 
@@ -1589,33 +1423,23 @@ func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *test
 			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Recovery invoked no model transport, opened no execution scope, and
 		// stopped no job.
-		if got := e.server.requests(); got != 0 {
-			t.Fatalf("HTTP requests during startup = %d, want recovery to reach no model request", got)
+		testassert.Equal(t, e.server.requests(), 0)
+		{
+			ops, ags := opOpens.Load(), agOpens.Load()
+			testassert.Require(t, ops == 0 && ags == 0, "short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
 		}
-		if ops, ags := opOpens.Load(), agOpens.Load(); ops != 0 || ags != 0 {
-			t.Fatalf("short-scope factory opens during startup = %d/%d, want recovery to open no execution scope", ops, ags)
-		}
-		if n := eventsNamed(e.events.all(), "stopjob"); n != 0 {
-			t.Fatalf("job-stop invocations during startup = %d, want recovery to stop no job", n)
-		}
+		testassert.Equal(t, eventsNamed(e.events.all(), "stopjob"), 0)
 
 		// The child's running Operation settled as the runtime-loss
 		// interruption with its committed input prefix retained.
 		rec := readOperation(t, r, child, childOp)
-		if rec.State.Status != harness.OperationInterruption || rec.State.Terminal == nil ||
-			rec.State.Terminal.Detail != "Operation interrupted by Runtime loss." {
-			t.Fatalf("recovered child operation state = %+v, want the terminal interruption settlement", rec.State)
-		}
+		testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "Operation interrupted by Runtime loss.", "recovered child operation state = %+v, want the terminal interruption settlement", rec.State)
 		childHeader, childFacts := readSessionFacts(t, r, child)
-		if childHeader.CurrentOperationID != "" {
-			t.Fatalf("recovered child current Operation = %q, want it cleared", childHeader.CurrentOperationID)
-		}
+		testassert.Equal(t, childHeader.CurrentOperationID, "")
 		if len(childFacts) == 0 || childFacts[0].Kind != harness.EntryInput {
 			t.Fatalf("recovered child facts = %d, want the retained seeded input prefix", len(childFacts))
 		}
@@ -1623,64 +1447,48 @@ func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *test
 		// The loss stays parent-independent: the parent keeps no current
 		// Operation and records no fabricated completion entry.
 		parentHeader, parentFacts := readSessionFacts(t, r, parent)
-		if parentHeader.CurrentOperationID != "" {
-			t.Fatalf("recovered parent current Operation = %q, want none", parentHeader.CurrentOperationID)
-		}
-		if len(parentFacts) != 0 {
-			t.Fatalf("recovered parent facts = %+v, want no fabricated completion entry", parentFacts)
-		}
+		testassert.Equal(t, parentHeader.CurrentOperationID, "")
+		testassert.Require(t, len(parentFacts) == 0, "recovered parent facts = %+v, want no fabricated completion entry", parentFacts)
 
 		// Only the subsequent explicit Submit may produce a request; the
 		// parent admits normally and its lifecycle stays unblocked with no
 		// reconstructed member.
 		submitThroughRuntime(t, r, parent, "op-after-loss", "continue")
-		if post := awaitOperation(t, r, parent, "op-after-loss", harness.OperationSuccess); post.State.Status != harness.OperationSuccess {
-			t.Fatalf("post-recovery parent Operation = %+v, want success", post.State)
+		{
+			post := awaitOperation(t, r, parent, "op-after-loss", harness.OperationSuccess)
+			testassert.Require(t, post.State.Status == harness.OperationSuccess, "post-recovery parent Operation = %+v, want success", post.State)
 		}
-		if got := e.server.requests(); got != 1 {
-			t.Fatalf("HTTP requests after the explicit submit = %d, want exactly the one admitted request", got)
-		}
+		testassert.Equal(t, e.server.requests(), 1)
 		err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			_, err := h.ArchiveSession(ctx, parent)
 			return err
 		})
-		if err != nil {
-			t.Fatalf("ArchiveSession on the recovered parent = %v, want no reconstructed member blocking the lifecycle", err)
-		}
+		testassert.NoError(t, err)
 		_, settledChildFacts := readSessionFacts(t, r, child)
 		_, settledParentFacts := readSessionFacts(t, r, parent)
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 
 		// A repeated recovery over the same durable state changes nothing.
 		requestsBefore := e.server.requests()
 		again, err := e.open(ctx,
 			e.storagePlugin(store),
 			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
-		if err != nil {
-			t.Fatalf("reopen for the repeated recovery: %v", err)
+		testassert.NoError(t, err)
+		testassert.Equal(t, e.server.requests(), requestsBefore)
+		testassert.Equal(t, eventsNamed(e.events.all(), "stopjob"), 0)
+		{
+			got := readOperation(t, again, child, childOp)
+			testassert.Require(t, got.State.Status == rec.State.Status && got.State.Terminal != nil && got.State.Terminal.Detail == rec.State.Terminal.Detail, "repeated recovery changed the child settlement: %+v, want the unchanged %+v", got.State, rec.State)
 		}
-		if got := e.server.requests(); got != requestsBefore {
-			t.Fatalf("HTTP requests during the repeated recovery = %d, want none beyond the %d before it", got, requestsBefore)
-		}
-		if n := eventsNamed(e.events.all(), "stopjob"); n != 0 {
-			t.Fatalf("job-stop invocations across both recoveries = %d, want none", n)
-		}
-		if got := readOperation(t, again, child, childOp); got.State.Status != rec.State.Status ||
-			got.State.Terminal == nil || got.State.Terminal.Detail != rec.State.Terminal.Detail {
-			t.Fatalf("repeated recovery changed the child settlement: %+v, want the unchanged %+v", got.State, rec.State)
-		}
-		if _, facts := readSessionFacts(t, again, child); len(facts) != len(settledChildFacts) {
-			t.Fatalf("repeated recovery changed the child facts %d -> %d", len(settledChildFacts), len(facts))
+		{
+			_, facts := readSessionFacts(t, again, child)
+			testassert.Equal(t, len(facts), len(settledChildFacts))
 		}
 		if header, facts := readSessionFacts(t, again, parent); header.Lifecycle != harness.LifecycleArchived ||
 			len(facts) != len(settledParentFacts) {
 			t.Fatalf("repeated recovery changed the parent: lifecycle %q facts %d -> %d, want the archived %d",
 				header.Lifecycle, len(settledParentFacts), len(facts), len(settledParentFacts))
 		}
-		if err := again.Close(ctx); err != nil {
-			t.Fatalf("second Close: %v", err)
-		}
+		testassert.NoError(t, again.Close(ctx))
 	})
 }

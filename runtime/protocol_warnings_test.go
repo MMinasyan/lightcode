@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -60,20 +61,14 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		ctx := context.Background()
 		hook := e.hookedHook()
 		r, err := e.open(ctx, hook, &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 
 		session, err := r.createSession(ctx, e.workspace("prompt-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 		promptSub, err := r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(promptSub.Close)
 
 		// Successful preparation: the assembled prompt warning replaces the
@@ -85,9 +80,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		progressBeforeHint := false
 		for promptHint == nil {
 			event, ok := nextEvent(t, promptSub)
-			if !ok {
-				t.Fatal("the prompt subscription closed before the preparation's warning hint")
-			}
+			testassert.Require(t, ok, "the prompt subscription closed before the preparation's warning hint")
 			switch eventKind(t, event) {
 			case "text_delta", "tool_started", "tool_finished":
 				// The preparation's publication precedes every effect of the
@@ -97,82 +90,56 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 				continue
 			case "warning_changed":
 				body, err := event.AsWarningChangedEvent()
-				if err != nil {
-					t.Fatalf("warning event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				if scopeKind(t, body.Scope) == "session" {
 					promptScope, err := body.Scope.AsSessionScope()
-					if err != nil {
-						t.Fatalf("session scope: %v", err)
-					}
+					testassert.NoError(t, err)
 					if promptScope.SessionId == sessionID {
 						promptHint = &body
 					}
 				}
 			}
 		}
-		if progressBeforeHint {
-			t.Fatal("the Session's first warning hint arrived after the Operation's progress, want the preparation's own publication")
-		}
+		testassert.Require(t, !progressBeforeHint, "the Session's first warning hint arrived after the Operation's progress, want the preparation's own publication")
 		promptScope, err := promptHint.Scope.AsSessionScope()
-		if err != nil {
-			t.Fatalf("prompt warning hint scope: %v", err)
-		}
-		if promptScope.Workspace == nil || *promptScope.Workspace != e.workspace("prompt-ws") {
-			t.Fatalf("prompt warning hint scope = %+v, want the cached workspace identity", promptHint.Scope)
-		}
-		if revision, err := warnRevision(promptHint.WarningsRevision.Revision); err != nil || revision == 0 {
-			t.Fatalf("prompt warning hint revision = %q, want an advanced counter", promptHint.WarningsRevision.Revision)
+		testassert.NoError(t, err)
+		testassert.Require(t, promptScope.Workspace != nil && *promptScope.Workspace == e.workspace("prompt-ws"), "prompt warning hint scope = %+v, want the cached workspace identity", promptHint.Scope)
+		{
+			revision, err := warnRevision(promptHint.WarningsRevision.Revision)
+			testassert.Require(t, err == nil && revision != 0, "prompt warning hint revision = %q, want an advanced counter", promptHint.WarningsRevision.Revision)
 		}
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitSessionNotBusy(t, r, sessionID)
 		first, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
+		testassert.NoError(t, err)
 		found := warningOf(first.Warnings, "runtime:prompt", "rules_not_found", sessionID)
-		if found == nil || found.Message != "No AGENTS.md found" {
-			t.Fatalf("prompt warning after successful preparation = %+v, want the assembled rules warning for the session", found)
-		}
-		if warningOf(first.Warnings, "runtime:setup", "setup_no_model", "") == nil {
-			t.Fatalf("global setup warning missing: %+v", first.Warnings)
-		}
-		if first.WarningsRevision.Revision == "0" {
-			t.Fatalf("warning revision = %q, want the advanced counter", first.WarningsRevision.Revision)
-		}
+		testassert.Require(t, found != nil && found.Message == "No AGENTS.md found", "prompt warning after successful preparation = %+v, want the assembled rules warning for the session", found)
+		testassert.Require(t, warningOf(first.Warnings, "runtime:setup", "setup_no_model", "") != nil && first.WarningsRevision.Revision != "0", "global setup warning missing: %+v; warning revision = %q, want the advanced counter", first.Warnings, first.WarningsRevision.Revision)
 
 		// A warning-free successful preparation replaces the prior group with
 		// nothing: the same Session's next preparation clears it.
-		if err := os.WriteFile(filepath.Join(e.workspace("prompt-ws"), "AGENTS.md"), []byte("# rules"), 0o600); err != nil {
-			t.Fatalf("write AGENTS.md: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.workspace("prompt-ws"), "AGENTS.md"), []byte("# rules"), 0o600))
 		submitThroughRuntime(t, r, sessionID, "op-2", "please write")
 		awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
 		cleared, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings cleared: %v", err)
-		}
-		if warningOf(cleared.Warnings, "runtime:prompt", "rules_not_found", sessionID) != nil {
-			t.Fatalf("the warning-free preparation kept the session's prompt warning: %+v", cleared.Warnings)
-		}
-		if revision, err := warnRevision(cleared.WarningsRevision.Revision); err != nil || revision == 0 {
-			t.Fatalf("warning revision after the clearing preparation = %q (%v), want an advanced counter", cleared.WarningsRevision.Revision, err)
+		testassert.NoError(t, err)
+		testassert.Require(t, warningOf(cleared.Warnings, "runtime:prompt", "rules_not_found", sessionID) == nil, "the warning-free preparation kept the session's prompt warning: %+v", cleared.Warnings)
+		{
+			revision, err := warnRevision(cleared.WarningsRevision.Revision)
+			testassert.Require(t, err == nil && revision != 0, "warning revision after the clearing preparation = %q (%v), want an advanced counter", cleared.WarningsRevision.Revision, err)
 		}
 
 		// A failed preparation changes nothing: the missing credential
 		// rejects admission before any publication.
 		before, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings before failed preparation: %v", err)
-		}
+		testassert.NoError(t, err)
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
 		failedSession, err := r.createSession(ctx, e.workspace("prompt-ws-3"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(failed): %v", err)
-		}
-		if err := submitExpectFailure(r, failedSession.Identity.SessionID, "op-failed"); err == nil {
-			t.Fatal("the missing-credential submit succeeded, want the failed preparation")
+		testassert.NoError(t, err)
+		{
+			err := submitExpectFailure(r, failedSession.Identity.SessionID, "op-failed")
+			testassert.Require(t, err != nil, "the missing-credential submit succeeded, want the failed preparation")
 		}
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 
@@ -182,21 +149,16 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 			return c
 		})
 		hookSession, err := r.createSession(ctx, e.workspace("prompt-ws-4"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(hook): %v", err)
-		}
-		if err := submitExpectFailure(r, hookSession.Identity.SessionID, "op-hooked"); err == nil {
-			t.Fatal("the rejected-hook submit succeeded, want the failed preparation")
+		testassert.NoError(t, err)
+		{
+			err := submitExpectFailure(r, hookSession.Identity.SessionID, "op-hooked")
+			testassert.Require(t, err != nil, "the rejected-hook submit succeeded, want the failed preparation")
 		}
 		hook.set(nil, nil)
 
 		after, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after failures: %v", err)
-		}
-		if after.WarningsRevision.Revision != before.WarningsRevision.Revision {
-			t.Fatalf("warning revision advanced on failed preparations: %s → %s", before.WarningsRevision.Revision, after.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, after.WarningsRevision.Revision, before.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(before.Warnings), warningBodies(after.Warnings)) {
 			t.Fatalf("warnings changed on failed preparations:\n%v\n%v", warningBodies(before.Warnings), warningBodies(after.Warnings))
 		}
@@ -207,16 +169,12 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		for {
 			select {
 			case event, ok := <-promptSub.Events():
-				if !ok {
-					t.Fatal("the prompt subscription closed around the failed preparations")
-				}
+				testassert.Require(t, ok, "the prompt subscription closed around the failed preparations")
 				if eventKind(t, event) != "warning_changed" {
 					continue
 				}
 				body, err := event.AsWarningChangedEvent()
-				if err != nil {
-					t.Fatalf("warning event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				if hintSession, _ := scopeSessionIdentity(t, body.Scope); hintSession == sessionID {
 					continue
 				}
@@ -236,9 +194,7 @@ func awaitSessionNotBusy(t *testing.T, r *Runtime, sessionID string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for sessionViewThroughRuntime(t, r, sessionID).History.ExecutionBusy {
-		if time.Now().After(deadline) {
-			t.Fatalf("session %q never left its busy state", sessionID)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "session %q never left its busy state", sessionID)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -285,134 +241,61 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		writeServiceFile(t, e.configPath, strings.Replace(
 			productionConfigDocument(e.server.URL, "T1"), `"models": {`, `"models": {"inc": {"name": "I"},`, 1))
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 
 		// Each Session prepares with a distinct prompt warning: an unreadable
 		// rules file carries the path in its message.
 		first := e.workspace("warn-a")
 		second := e.workspace("warn-b")
-		if err := os.MkdirAll(filepath.Join(second, "AGENTS.md"), 0o700); err != nil {
-			t.Fatalf("mkdir AGENTS.md collision: %v", err)
-		}
+		testassert.NoError(t, os.MkdirAll(filepath.Join(second, "AGENTS.md"), 0o700))
 		sessionA, err := r.createSession(ctx, first, "worker")
-		if err != nil {
-			t.Fatalf("createSession A: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionB, err := r.createSession(ctx, second, "worker")
-		if err != nil {
-			t.Fatalf("createSession B: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a", "please write")
 		awaitOperation(t, r, sessionA.Identity.SessionID, "op-a", harness.OperationSuccess)
 		submitThroughRuntime(t, r, sessionB.Identity.SessionID, "op-b", "please write")
 		awaitOperation(t, r, sessionB.Identity.SessionID, "op-b", harness.OperationSuccess)
 
 		all, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
-		if warningOf(all.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
-			t.Fatalf("unfiltered read misses session A's prompt warning: %+v", all.Warnings)
-		}
-		if warningOf(all.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
-			t.Fatalf("unfiltered read misses session B's prompt warning: %+v", all.Warnings)
-		}
-		if warningOf(all.Warnings, "runtime:setup", "setup_no_model", "") == nil {
-			t.Fatalf("unfiltered read misses the global setup warning: %+v", all.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, warningOf(all.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:setup", "setup_no_model", "") != nil, "unfiltered read misses session A's prompt warning: %+v; unfiltered read misses session B's prompt warning: %+v; unfiltered read misses the global setup warning: %+v", all.Warnings, all.Warnings, all.Warnings)
 		catalogWarning := warningOf(all.Warnings, "runtime:catalog", "incomplete_model", "")
-		if catalogWarning == nil || !strings.Contains(catalogWarning.Message, "prov/inc") {
-			t.Fatalf("unfiltered read misses the real catalog warning: %+v", all.Warnings)
-		}
-		if warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
-			t.Fatalf("unfiltered read misses the global agents warning: %+v", all.Warnings)
-		}
+		testassert.Require(t, catalogWarning != nil && strings.Contains(catalogWarning.Message, "prov/inc"), "unfiltered read misses the real catalog warning: %+v", all.Warnings)
+		testassert.Require(t, warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") != nil, "unfiltered read misses the global agents warning: %+v", all.Warnings)
 
 		hydrationA, err := r.buildHydration(ctx, sessionA.Identity.SessionID)
-		if err != nil {
-			t.Fatalf("hydration A: %v", err)
-		}
+		testassert.NoError(t, err)
 		hydrationB, err := r.buildHydration(ctx, sessionB.Identity.SessionID)
-		if err != nil {
-			t.Fatalf("hydration B: %v", err)
-		}
-		if warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil {
-			t.Fatalf("hydration A misses its own prompt warning: %+v", hydrationA.Warnings)
-		}
-		if warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil {
-			t.Fatalf("hydration A contains the sibling's prompt warning: %+v", hydrationA.Warnings)
-		}
-		if warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
-			t.Fatalf("hydration A misses the global agents warning: %+v", hydrationA.Warnings)
-		}
-		if warningOf(hydrationB.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil {
-			t.Fatalf("hydration B misses its own prompt warning: %+v", hydrationB.Warnings)
-		}
-		if warningOf(hydrationB.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil {
-			t.Fatalf("hydration B contains the sibling's prompt warning: %+v", hydrationB.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil && warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") != nil, "hydration A misses its own prompt warning: %+v; hydration A contains the sibling's prompt warning: %+v; hydration A misses the global agents warning: %+v", hydrationA.Warnings, hydrationA.Warnings, hydrationA.Warnings)
+		testassert.Require(t, warningOf(hydrationB.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(hydrationB.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil, "hydration B misses its own prompt warning: %+v; hydration B contains the sibling's prompt warning: %+v", hydrationB.Warnings, hydrationB.Warnings)
 		for _, hydration := range []protocol.Hydration{hydrationA, hydrationB} {
-			if warningOf(hydration.Warnings, "runtime:setup", "setup_no_model", "") == nil {
-				t.Fatalf("hydration misses the global setup warning: %+v", hydration.Warnings)
-			}
-			if warningOf(hydration.Warnings, "runtime:catalog", "incomplete_model", "") == nil {
-				t.Fatalf("hydration misses the global catalog warning: %+v", hydration.Warnings)
-			}
-			if warningOf(hydration.Warnings, "runtime:agents", "invalid_agent_type", "") == nil {
-				t.Fatalf("hydration misses the global agents warning: %+v", hydration.Warnings)
-			}
-			if hydration.WarningsRevision.Revision != all.WarningsRevision.Revision {
-				t.Fatalf("hydration warning revision %q != captured %q", hydration.WarningsRevision.Revision, all.WarningsRevision.Revision)
-			}
-			if hydration.ConfigurationRevision.Generation != "1" {
-				t.Fatalf("hydration configuration revision = %q, want the captured generation", hydration.ConfigurationRevision.Generation)
-			}
+			testassert.Require(t, warningOf(hydration.Warnings, "runtime:setup", "setup_no_model", "") != nil && warningOf(hydration.Warnings, "runtime:catalog", "incomplete_model", "") != nil && warningOf(hydration.Warnings, "runtime:agents", "invalid_agent_type", "") != nil && hydration.WarningsRevision.Revision == all.WarningsRevision.Revision && hydration.ConfigurationRevision.Generation == "1", "hydration misses the global setup warning: %+v; hydration misses the global catalog warning: %+v; hydration misses the global agents warning: %+v; got %v, want %v; got %v, want %v", hydration.Warnings, hydration.Warnings, hydration.Warnings, hydration.WarningsRevision.Revision, all.WarningsRevision.Revision, hydration.ConfigurationRevision.Generation, "1")
 		}
 		// The warning clock is independent of the Session and configuration
 		// clocks: a later report from the OTHER Session advances this
 		// Session's hydration warning revision while its session revision and
 		// the configuration generation stay unchanged.
 		next, err := r.createSession(ctx, e.workspace("warn-c"), "worker")
-		if err != nil {
-			t.Fatalf("createSession C: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-c", "please write")
 		awaitOperation(t, r, next.Identity.SessionID, "op-c", harness.OperationSuccess)
 		later, err := r.buildHydration(ctx, sessionA.Identity.SessionID)
-		if err != nil {
-			t.Fatalf("hydration A later: %v", err)
-		}
+		testassert.NoError(t, err)
 		beforeRevision, revErr := warnRevision(hydrationA.WarningsRevision.Revision)
 		afterRevision, afterErr := warnRevision(later.WarningsRevision.Revision)
-		if revErr != nil || afterErr != nil || afterRevision <= beforeRevision {
-			t.Fatalf("the sibling report did not advance the store-wide warning revision: %q → %q (%v, %v)", hydrationA.WarningsRevision.Revision, later.WarningsRevision.Revision, revErr, afterErr)
-		}
-		if later.SessionRevision.DurableRevision != hydrationA.SessionRevision.DurableRevision || later.SessionRevision.LocalRevision != hydrationA.SessionRevision.LocalRevision {
-			t.Fatalf("a warning advance changed the session revision: %+v → %+v", hydrationA.SessionRevision, later.SessionRevision)
-		}
-		if later.ConfigurationRevision.Generation != hydrationA.ConfigurationRevision.Generation {
-			t.Fatalf("a warning advance changed the configuration generation: %q → %q", hydrationA.ConfigurationRevision.Generation, later.ConfigurationRevision.Generation)
-		}
+		testassert.Require(t, revErr == nil && afterErr == nil && afterRevision > beforeRevision, "the sibling report did not advance the store-wide warning revision: %q → %q (%v, %v)", hydrationA.WarningsRevision.Revision, later.WarningsRevision.Revision, revErr, afterErr)
+		testassert.Require(t, later.SessionRevision.DurableRevision == hydrationA.SessionRevision.DurableRevision && later.SessionRevision.LocalRevision == hydrationA.SessionRevision.LocalRevision && later.ConfigurationRevision.Generation == hydrationA.ConfigurationRevision.Generation, "a warning advance changed the session revision: %+v → %+v; got %v, want %v", hydrationA.SessionRevision, later.SessionRevision, later.ConfigurationRevision.Generation, hydrationA.ConfigurationRevision.Generation)
 
 		// The captured revision is coherent: repeated unfiltered reads with no
 		// store change report the same revision and list.
 		again, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings again: %v", err)
-		}
+		testassert.NoError(t, err)
 		stable, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings stable: %v", err)
-		}
-		if stable.WarningsRevision.Revision != again.WarningsRevision.Revision || !slices.Equal(warningBodies(stable.Warnings), warningBodies(again.Warnings)) {
-			t.Fatalf("an unchanged store changed its read: %+v vs %+v", stable, again)
-		}
-		if stable.WarningsRevision.Revision != later.WarningsRevision.Revision {
-			t.Fatalf("the full read's revision %q diverged from the captured hydration's %q", stable.WarningsRevision.Revision, later.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, stable.WarningsRevision.Revision == again.WarningsRevision.Revision && slices.Equal(warningBodies(stable.Warnings), warningBodies(again.Warnings)) && stable.WarningsRevision.Revision == later.WarningsRevision.Revision, "an unchanged store changed its read: %+v vs %+v; got %v, want %v", stable, again, stable.WarningsRevision.Revision, later.WarningsRevision.Revision)
 	})
 }
 
@@ -426,19 +309,13 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		session, err := r.createSession(ctx, e.workspace("protocol-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 		protocolSub, err := r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(protocolSub.Close)
 
 		// Turn 1: the tool call turn succeeds; the follow-up re-encodes the
@@ -450,56 +327,38 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		var protocolHint *protocol.WarningChangedEvent
 		for protocolHint == nil {
 			event, ok := nextEvent(t, protocolSub)
-			if !ok {
-				t.Fatal("the protocol subscription closed before the diagnostic hint")
-			}
+			testassert.Require(t, ok, "the protocol subscription closed before the diagnostic hint")
 			if eventKind(t, event) != "warning_changed" {
 				continue
 			}
 			body, err := event.AsWarningChangedEvent()
-			if err != nil {
-				t.Fatalf("warning event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			if scopeKind(t, body.Scope) == "session" {
 				protocolScope, err := body.Scope.AsSessionScope()
-				if err != nil {
-					t.Fatalf("session scope: %v", err)
-				}
+				testassert.NoError(t, err)
 				if protocolScope.SessionId == sessionID {
 					protocolHint = &body
 				}
 			}
 		}
 		protocolScope, err := protocolHint.Scope.AsSessionScope()
-		if err != nil {
-			t.Fatalf("protocol diagnostic hint scope: %v", err)
-		}
-		if protocolScope.Workspace == nil || *protocolScope.Workspace != e.workspace("protocol-ws") {
-			t.Fatalf("protocol diagnostic hint scope = %+v, want the cached workspace identity", protocolHint.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, protocolScope.Workspace != nil && *protocolScope.Workspace == e.workspace("protocol-ws"), "protocol diagnostic hint scope = %+v, want the cached workspace identity", protocolHint.Scope)
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		first, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
+		testassert.NoError(t, err)
 		found := warningOf(first.Warnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID)
-		if found == nil || found.Message == "" {
-			t.Fatalf("protocol warning after the tool turn = %+v, want the MustPreserve diagnostic for the session", found)
-		}
+		testassert.Require(t, found != nil && found.Message != "", "protocol warning after the tool turn = %+v, want the MustPreserve diagnostic for the session", found)
 		revision := first.WarningsRevision.Revision
 
 		// An identical re-report dedupes: a second identical turn advances
 		// nothing.
 		next, err := r.createSession(ctx, e.workspace("protocol-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(next): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-2", "please write")
 		awaitOperation(t, r, next.Identity.SessionID, "op-2", harness.OperationSuccess)
 		second, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings second: %v", err)
-		}
+		testassert.NoError(t, err)
 		// The second turn's follow-up request has one more message, so its
 		// diagnostic text differs and DOES advance; the identical first
 		// warning's (kind,message) is retained exactly once.
@@ -509,13 +368,9 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 				firstReports++
 			}
 		}
-		if firstReports != 1 {
-			t.Fatalf("session's identical protocol diagnostics = %d, want one deduped value", firstReports)
-		}
+		testassert.Equal(t, firstReports, 1)
 		revisionAfterSecond := second.WarningsRevision.Revision
-		if revisionAfterSecond == revision {
-			t.Fatalf("warning revision unchanged after a distinct report: %q", revision)
-		}
+		testassert.Require(t, revisionAfterSecond != revision, "warning revision unchanged after a distinct report: %q", revision)
 
 		// Post-encode transport failure: reload the published configuration
 		// onto a counting endpoint whose first request serves the tool-call
@@ -526,25 +381,17 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		failingServer := httptest.NewServer(http.HandlerFunc(attempts.serve))
 		defer failingServer.Close()
 		writeServiceFile(t, e.configPath, productionConfigDocument(failingServer.URL, "T2"))
-		if _, err := r.Reload(ctx); err != nil {
-			t.Fatalf("Reload to the failing endpoint: %v", err)
+		{
+			_, err := r.Reload(ctx)
+			testassert.NoError(t, err)
 		}
 		failing, err := r.createSession(ctx, e.workspace("protocol-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(failing): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, failing.Identity.SessionID, "op-3", "please write")
 		awaitOperation(t, r, failing.Identity.SessionID, "op-3", harness.OperationFailure)
 		third, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after failure: %v", err)
-		}
-		if warningOf(third.Warnings, "runtime:protocol", "protocol_must_preserve_missing", failing.Identity.SessionID) == nil {
-			t.Fatalf("the post-encode transport failure dropped its diagnostics: %+v", third.Warnings)
-		}
-		if third.WarningsRevision.Revision == revisionAfterSecond {
-			t.Fatalf("warning revision unchanged after the failed attempt's report: %q", third.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, warningOf(third.Warnings, "runtime:protocol", "protocol_must_preserve_missing", failing.Identity.SessionID) != nil && third.WarningsRevision.Revision != revisionAfterSecond, "the post-encode transport failure dropped its diagnostics: %+v; warning revision unchanged after the failed attempt's report: %q", third.Warnings, third.WarningsRevision.Revision)
 	})
 }
 
@@ -575,18 +422,14 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 
 		// One real existing subject: the direct compact opener records under
 		// this admitted Session identity, and the new
 		// existence-before-publication rule observes the same Harness.
 		session, err := r.createSession(ctx, e.workspace("compact-warn"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
 		sh := newServiceHarness(t)
@@ -603,8 +446,9 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
 		svc.attachWarnings(r.warnings)
-		if _, err := svc.publish(context.Background()); err != nil {
-			t.Fatalf("publish: %v", err)
+		{
+			_, err := svc.publish(context.Background())
+			testassert.NoError(t, err)
 		}
 		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, r.obs)
 		adapter := newObservationAdapter(r.obs, r.warnings)
@@ -614,21 +458,18 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		request := compactPrepRequest()
 		request.Session.Identity.SessionID = sessionID
 		prepared, err := p.bind()(context.Background(), request)
-		if err != nil {
-			t.Fatalf("bind: %v", err)
-		}
+		testassert.NoError(t, err)
 		execution, err := prepared.Open(context.Background(), harness.OperationAdmission{
 			SessionID:   sessionID,
 			OperationID: "op-compact",
 			RequestKind: harness.RequestKindMessage,
 			AdmittedAt:  time.Now(),
 		})
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := execution.Close(); err != nil {
-				t.Errorf("execution close: %v", err)
+			{
+				err := execution.Close()
+				testassert.Check(t, err == nil, "execution close: %v", err)
 			}
 		}()
 
@@ -640,62 +481,49 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "prov", Model: "m2"},
 				ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}},
 		}}
-		if _, err := execution.CompactModel(context.Background(), diagnostic); err == nil {
-			t.Fatal("compact transport request over the failing endpoint succeeded, want the transport failure")
+		{
+			_, err := execution.CompactModel(context.Background(), diagnostic)
+			testassert.Require(t, err != nil, "compact transport request over the failing endpoint succeeded, want the transport failure")
 		}
 		revision, storeWarnings := r.warnings.hydrate(sessionID)
-		if warningOf(storeWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) == nil {
-			t.Fatalf("the compact closure dropped its post-encode diagnostics: %+v", storeWarnings)
-		}
+		testassert.Require(t, warningOf(storeWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil, "the compact closure dropped its post-encode diagnostics: %+v", storeWarnings)
 
 		// An identical attempt replaces with the same list: no advance.
 		_, _ = execution.CompactModel(context.Background(), diagnostic)
 		deduped, dedupedWarnings := r.warnings.hydrate(sessionID)
-		if deduped != revision || !slices.Equal(warningBodies(dedupedWarnings), warningBodies(storeWarnings)) {
-			t.Fatalf("an identical attempt advanced the store: revision %d → %d", revision, deduped)
-		}
+		testassert.Require(t, deduped == revision && slices.Equal(warningBodies(dedupedWarnings), warningBodies(storeWarnings)), "an identical attempt advanced the store: revision %d → %d", revision, deduped)
 
 		// A diagnostic-free attempt is a complete computation: it replaces
 		// the group with nothing and clears the obsolete value.
 		clean := model.Request{Messages: []model.Message{
 			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
 		}}
-		if _, err := execution.CompactModel(context.Background(), clean); err == nil {
-			t.Fatal("diagnostic-free compact request over the failing endpoint succeeded, want the transport failure")
+		{
+			_, err := execution.CompactModel(context.Background(), clean)
+			testassert.Require(t, err != nil, "diagnostic-free compact request over the failing endpoint succeeded, want the transport failure")
 		}
 		cleared, clearedWarnings := r.warnings.hydrate(sessionID)
-		if warningOf(clearedWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil {
-			t.Fatalf("the diagnostic-free attempt kept the obsolete diagnostics: %+v", clearedWarnings)
-		}
-		if cleared == deduped {
-			t.Fatalf("clearing the group advanced nothing: revision %d", cleared)
-		}
+		testassert.Require(t, warningOf(clearedWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) == nil, "the diagnostic-free attempt kept the obsolete diagnostics: %+v", clearedWarnings)
+		testassert.Require(t, cleared != deduped, "clearing the group advanced nothing: revision %d", cleared)
 
 		// The committed deletion removes the subject's groups; a late attempt
 		// for the deleted subject cannot reintroduce them.
-		if _, err := r.archiveSession(ctx, sessionID); err != nil {
-			t.Fatalf("archive: %v", err)
+		{
+			_, err := r.archiveSession(ctx, sessionID)
+			testassert.NoError(t, err)
 		}
-		if err := r.deleteSession(ctx, sessionID); err != nil {
-			t.Fatalf("delete: %v", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, sessionID))
 		beforeLate, _ := r.warnings.snapshot()
 		_, _ = execution.CompactModel(context.Background(), diagnostic)
 		afterLate, lateWarnings := r.warnings.snapshot()
-		if afterLate != beforeLate {
-			t.Fatalf("a late attempt for the deleted subject advanced the store: %d → %d", beforeLate, afterLate)
-		}
-		if warningOf(lateWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil {
-			t.Fatalf("a late attempt resurrected the deleted subject's diagnostics: %+v", lateWarnings)
-		}
+		testassert.Equal(t, afterLate, beforeLate)
+		testassert.Require(t, warningOf(lateWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) == nil, "a late attempt resurrected the deleted subject's diagnostics: %+v", lateWarnings)
 
 		// Reports after the owner's warning-store closure are ignored.
 		r.warnings.close()
 		_, _ = execution.CompactModel(context.Background(), diagnostic)
 		closed, closedWarnings := r.warnings.snapshot()
-		if closed != afterLate || !slices.Equal(warningBodies(closedWarnings), warningBodies(lateWarnings)) {
-			t.Fatalf("a report after closure changed the store")
-		}
+		testassert.Require(t, closed == afterLate && slices.Equal(warningBodies(closedWarnings), warningBodies(lateWarnings)), "a report after closure changed the store")
 	})
 }
 
@@ -731,22 +559,14 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	// The immutable serialized baseline, taken before any mutation.
 	revision, warnings := store.snapshot()
 	expected, err := json.Marshal(warnings)
-	if err != nil {
-		t.Fatalf("marshal baseline: %v", err)
-	}
-	if len(warnings) != 3 {
-		t.Fatalf("baseline warnings = %d (%+v), want the three seeded groups' members", len(warnings), warnings)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(warnings) == 3, "baseline warnings = %d (%+v), want the three seeded groups' members", len(warnings), warnings)
 	for _, warning := range warnings {
 		switch warning.Source {
 		case "runtime:setup":
-			if warning.SessionId != nil {
-				t.Fatalf("global warning carries an identity: %+v", warning)
-			}
+			testassert.Require(t, warning.SessionId == nil, "global warning carries an identity: %+v", warning)
 		default:
-			if warning.SessionId == nil || *warning.SessionId != managedID {
-				t.Fatalf("%s warning identity = %v, want the owning session", warning.Source, warning.SessionId)
-			}
+			testassert.Require(t, warning.SessionId != nil && *warning.SessionId == managedID, "%s warning identity = %v, want the owning session", warning.Source, warning.SessionId)
 		}
 	}
 
@@ -762,16 +582,10 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 
 	// The re-read is unchanged, byte-for-byte, and the revision stayed.
 	again, againWarnings := store.snapshot()
-	if again != revision {
-		t.Fatalf("warning revision advanced without a report: %d → %d", revision, again)
-	}
+	testassert.Equal(t, again, revision)
 	got, err := json.Marshal(againWarnings)
-	if err != nil {
-		t.Fatalf("marshal again: %v", err)
-	}
-	if string(got) != string(expected) {
-		t.Fatalf("a mutation of the returned warnings reached the store:\n%s\nwant\n%s", got, expected)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(got) == string(expected), "a mutation of the returned warnings reached the store:\n%s\nwant\n%s", got, expected)
 
 	// The filtered hydration read is owned the same way.
 	_, hydrated := store.hydrate(managedID)
@@ -782,9 +596,7 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	}
 	_, stable := store.hydrate(managedID)
 	for _, warning := range stable {
-		if warning.SessionId != nil && *warning.SessionId != managedID {
-			t.Fatalf("a mutation of a returned hydration identity reached the store: %+v", warning)
-		}
+		testassert.Require(t, warning.SessionId == nil || *warning.SessionId == managedID, "a mutation of a returned hydration identity reached the store: %+v", warning)
 	}
 
 	// A next identical report still dedupes correctly against the untouched
@@ -792,16 +604,10 @@ func TestWarningStoreReadOwnsReturnedWarnings(t *testing.T) {
 	sameID := managedID
 	store.setSessionPrompt(managedID, []protocol.Warning{{Source: "runtime:prompt", Kind: "prompt_k", Message: "prompt_m", SessionId: &sameID}})
 	final, finalWarnings := store.snapshot()
-	if final != revision {
-		t.Fatalf("an identical report advanced the revision: %d → %d", revision, final)
-	}
+	testassert.Equal(t, final, revision)
 	finalGot, err := json.Marshal(finalWarnings)
-	if err != nil {
-		t.Fatalf("marshal final: %v", err)
-	}
-	if string(finalGot) != string(expected) {
-		t.Fatalf("the identical report changed the store's read:\n%s\nwant\n%s", finalGot, expected)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(finalGot) == string(expected), "the identical report changed the store's read:\n%s\nwant\n%s", finalGot, expected)
 }
 
 // TestWarningStoreReadsDynamicDeterministicGroups pins the shared read
@@ -820,17 +626,16 @@ func TestWarningStoreReadsDynamicDeterministicGroups(t *testing.T) {
 	store.setGlobal("runtime:setup", []protocol.Warning{{Source: "runtime:setup", Kind: "s", Message: "s"}})
 
 	revision, warnings := store.snapshot()
-	if revision != 4 {
-		t.Fatalf("revision after four distinct groups = %d, want 4", revision)
-	}
+	testassert.Equal(t, revision, 4)
 	want := []string{
 		"plugin:zeta/z/z/",
 		"runtime:setup/s/s/",
 		"runtime:prompt/a/a/" + sessionA,
 		"runtime:prompt/b/b/" + sessionB,
 	}
-	if got := warningBodies(warnings); !slices.Equal(got, want) {
-		t.Fatalf("dynamic read order = %v, want %v", got, want)
+	{
+		got := warningBodies(warnings)
+		testassert.Require(t, slices.Equal(got, want), "dynamic read order = %v, want %v", got, want)
 	}
 
 	// The Session filter carries every global group plus only that Session's
@@ -841,16 +646,18 @@ func TestWarningStoreReadsDynamicDeterministicGroups(t *testing.T) {
 		"runtime:setup/s/s/",
 		"runtime:prompt/a/a/" + sessionA,
 	}
-	if got := warningBodies(hydrated); !slices.Equal(got, wantHydrated) {
-		t.Fatalf("filtered read = %v, want %v", got, wantHydrated)
+	{
+		got := warningBodies(hydrated)
+		testassert.Require(t, slices.Equal(got, wantHydrated), "filtered read = %v, want %v", got, wantHydrated)
 	}
 
 	// Replacing with the identical list and clearing an absent group advance
 	// nothing.
 	store.setGlobal("runtime:setup", []protocol.Warning{{Source: "runtime:setup", Kind: "s", Message: "s"}})
 	store.setGlobal("plugin:absent", nil)
-	if after, _ := store.snapshot(); after != revision {
-		t.Fatalf("an identical or absent-clear report advanced the revision: %d → %d", revision, after)
+	{
+		after, _ := store.snapshot()
+		testassert.Equal(t, after, revision)
 	}
 }
 
@@ -865,42 +672,28 @@ func TestWarningStoreReplacementAlgebra(t *testing.T) {
 	store.setSessionProtocol(id, []protocol.Warning{{Source: "runtime:protocol", Kind: "k1", Message: "m1", SessionId: &id}})
 	store.setSessionProtocol(id, []protocol.Warning{{Source: "runtime:protocol", Kind: "k2", Message: "m2", SessionId: &id}})
 	_, warnings := store.snapshot()
-	if warningOf(warnings, "runtime:protocol", "k1", id) != nil {
-		t.Fatalf("a new attempt kept the previous attempt's diagnostics: %+v", warnings)
-	}
-	if warningOf(warnings, "runtime:protocol", "k2", id) == nil {
-		t.Fatalf("the new attempt's diagnostics are missing: %+v", warnings)
-	}
+	testassert.Require(t, warningOf(warnings, "runtime:protocol", "k1", id) == nil && warningOf(warnings, "runtime:protocol", "k2", id) != nil, "a new attempt kept the previous attempt's diagnostics: %+v; the new attempt's diagnostics are missing: %+v", warnings, warnings)
 	store.setSessionProtocol(id, nil)
 	_, cleared := store.snapshot()
-	if warningOf(cleared, "runtime:protocol", "k2", id) != nil {
-		t.Fatalf("an empty attempt kept the obsolete diagnostics: %+v", cleared)
-	}
+	testassert.Require(t, warningOf(cleared, "runtime:protocol", "k2", id) == nil, "an empty attempt kept the obsolete diagnostics: %+v", cleared)
 
 	store.appendPlugin("lsp", "notice", "one")
 	store.appendPlugin("lsp", "notice", "one")
 	store.appendPlugin("lsp", "other", "two")
 	_, plugins := store.snapshot()
-	if warningOf(plugins, "plugin:lsp", "notice", "") == nil || warningOf(plugins, "plugin:lsp", "other", "") == nil {
-		t.Fatalf("plugin reports are missing from their own global group: %+v", plugins)
-	}
+	testassert.Require(t, warningOf(plugins, "plugin:lsp", "notice", "") != nil && warningOf(plugins, "plugin:lsp", "other", "") != nil, "plugin reports are missing from their own global group: %+v", plugins)
 	count := 0
 	for _, warning := range plugins {
 		if string(warning.Source) == "plugin:lsp" {
 			count++
 		}
 	}
-	if count != 2 {
-		t.Fatalf("plugin group members after the identical report = %d, want the deduped pair", count)
-	}
+	testassert.Equal(t, count, 2)
 
 	// A nil store is inert for every mutation: the shared core's nil guard
 	// covers the append path too.
 	var absent *warningStore
-	if absent.appendPlugin("lsp", "k", "m") || absent.setGlobal("runtime:setup", nil) ||
-		absent.setSessionProtocol(id, nil) || absent.removeSessions([]string{id}) {
-		t.Fatal("a nil store mutated")
-	}
+	testassert.Require(t, !absent.appendPlugin("lsp", "k", "m") && !absent.setGlobal("runtime:setup", nil) && !absent.setSessionProtocol(id, nil) && !absent.removeSessions([]string{id}), "a nil store mutated")
 }
 
 // TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup proves prompt
@@ -914,17 +707,13 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		wrapped := newSweepStore(e.store)
 		e.store = wrapped
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 
 		// A real committed source with a valid boundary: the source's own
 		// successful preparation already published its prompt group.
 		source, err := r.createSession(ctx, e.workspace("orphan-src"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sourceID := source.Identity.SessionID
 		submitThroughRuntime(t, r, sourceID, "op-src", "boundary")
 		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
@@ -933,9 +722,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		boundaryItem := projectItemID(sourceID, commandUserInputEntry(t, snap, "op-src"))
 
 		beforeFork, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings before fork: %v", err)
-		}
+		testassert.NoError(t, err)
 		forkFailure := errors.New("test fork transaction failure")
 		wrapped.armFailAfterRelease(forkFailure)
 		forkDone := make(chan error, 1)
@@ -953,16 +740,13 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			t.Fatal("the failed fork never reached its transaction")
 		}
 		wrapped.releaseBlock()
-		if err := <-forkDone; !errors.Is(err, forkFailure) {
-			t.Fatalf("failed fork = %v, want the injected transaction failure", err)
+		{
+			err := <-forkDone
+			testassert.Require(t, errors.Is(err, forkFailure), "failed fork = %v, want the injected transaction failure", err)
 		}
 		afterFork, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after fork: %v", err)
-		}
-		if afterFork.WarningsRevision.Revision != beforeFork.WarningsRevision.Revision {
-			t.Fatalf("failed fork advanced the warning revision: %s → %s", beforeFork.WarningsRevision.Revision, afterFork.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, afterFork.WarningsRevision.Revision, beforeFork.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(beforeFork.Warnings), warningBodies(afterFork.Warnings)) {
 			t.Fatalf("failed fork changed the warning store:\n%v\n%v", warningBodies(beforeFork.Warnings), warningBodies(afterFork.Warnings))
 		}
@@ -971,13 +755,9 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		// transaction fails, and the preparation's prompt values stay
 		// unpublished.
 		victim, err := r.createSession(ctx, e.workspace("orphan-admit"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(victim): %v", err)
-		}
+		testassert.NoError(t, err)
 		beforeAdmit, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings before admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		admissionFailure := errors.New("test admission transaction failure")
 		wrapped.armFailAfterRelease(admissionFailure)
 		admitDone := make(chan error, 1)
@@ -990,16 +770,13 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			t.Fatal("the failed admission never reached its transaction")
 		}
 		wrapped.releaseBlock()
-		if err := <-admitDone; !errors.Is(err, admissionFailure) {
-			t.Fatalf("failed admission = %v, want the injected transaction failure", err)
+		{
+			err := <-admitDone
+			testassert.Require(t, errors.Is(err, admissionFailure), "failed admission = %v, want the injected transaction failure", err)
 		}
 		afterAdmit, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after admission: %v", err)
-		}
-		if afterAdmit.WarningsRevision.Revision != beforeAdmit.WarningsRevision.Revision {
-			t.Fatalf("failed admission advanced the warning revision: %s → %s", beforeAdmit.WarningsRevision.Revision, afterAdmit.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, afterAdmit.WarningsRevision.Revision, beforeAdmit.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(beforeAdmit.Warnings), warningBodies(afterAdmit.Warnings)) {
 			t.Fatalf("failed admission changed the warning store:\n%v\n%v", warningBodies(beforeAdmit.Warnings), warningBodies(afterAdmit.Warnings))
 		}
@@ -1007,21 +784,12 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		// The oracle flips: an unarmed successful admission publishes its own
 		// Session's prompt group and advances the revision.
 		good, err := r.createSession(ctx, e.workspace("orphan-ok"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(good): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, good.Identity.SessionID, "op-good", "please write")
 		awaitOperation(t, r, good.Identity.SessionID, "op-good", harness.OperationSuccess)
 		afterSuccess, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after success: %v", err)
-		}
-		if afterSuccess.WarningsRevision.Revision == afterAdmit.WarningsRevision.Revision {
-			t.Fatalf("a successful admission did not publish its prompt group: revision stayed %s", afterSuccess.WarningsRevision.Revision)
-		}
-		if warningOf(afterSuccess.Warnings, "runtime:prompt", "rules_not_found", good.Identity.SessionID) == nil {
-			t.Fatalf("the successful admission's prompt group is missing: %+v", afterSuccess.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, afterSuccess.WarningsRevision.Revision != afterAdmit.WarningsRevision.Revision && warningOf(afterSuccess.Warnings, "runtime:prompt", "rules_not_found", good.Identity.SessionID) != nil, "a successful admission did not publish its prompt group: revision stayed %s; the successful admission's prompt group is missing: %+v", afterSuccess.WarningsRevision.Revision, afterSuccess.Warnings)
 	})
 }
 
@@ -1034,19 +802,13 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 
 		victim, err := r.createSession(ctx, e.workspace("warn-delete"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(victim): %v", err)
-		}
+		testassert.NoError(t, err)
 		sibling, err := r.createSession(ctx, e.workspace("warn-keep"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(sibling): %v", err)
-		}
+		testassert.NoError(t, err)
 		victimID, siblingID := victim.Identity.SessionID, sibling.Identity.SessionID
 		submitThroughRuntime(t, r, victimID, "op-victim", "please write")
 		awaitOperation(t, r, victimID, "op-victim", harness.OperationSuccess)
@@ -1055,71 +817,46 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 
 		// Archive retains the group; hydration of the archived subject still
 		// carries it.
-		if _, err := r.archiveSession(ctx, victimID); err != nil {
-			t.Fatalf("archive: %v", err)
+		{
+			_, err := r.archiveSession(ctx, victimID)
+			testassert.NoError(t, err)
 		}
 		archived, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after archive: %v", err)
-		}
-		if !sessionWarningPresent(archived.Warnings, victimID) {
-			t.Fatalf("archive dropped the Session's warning group: %+v", archived.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, sessionWarningPresent(archived.Warnings, victimID), "archive dropped the Session's warning group: %+v", archived.Warnings)
 		hydration, err := r.buildHydration(ctx, victimID)
-		if err != nil {
-			t.Fatalf("hydration of the archived subject: %v", err)
-		}
-		if !sessionWarningPresent(hydration.Warnings, victimID) {
-			t.Fatalf("the archived subject's hydration dropped its group: %+v", hydration.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, sessionWarningPresent(hydration.Warnings, victimID), "the archived subject's hydration dropped its group: %+v", hydration.Warnings)
 
 		sub, err := r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		t.Cleanup(sub.Close)
 		baseRevision, _ := r.warnings.snapshot()
 
 		// The committed deletion removes the group in one observation section
 		// and publishes exactly one runtime-scoped hint.
-		if err := r.deleteSession(ctx, victimID); err != nil {
-			t.Fatalf("delete: %v", err)
-		}
+		testassert.NoError(t, r.deleteSession(ctx, victimID))
 		afterDelete, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after delete: %v", err)
-		}
-		if sessionWarningPresent(afterDelete.Warnings, victimID) {
-			t.Fatalf("the committed deletion kept the Session's group: %+v", afterDelete.Warnings)
-		}
-		if warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) == nil {
-			t.Fatalf("the deletion removed the sibling's group: %+v", afterDelete.Warnings)
-		}
-		if _, err := r.buildHydration(ctx, victimID); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("hydration of the deleted subject = %v, want the typed absence", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, !sessionWarningPresent(afterDelete.Warnings, victimID) && warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) != nil, "the committed deletion kept the Session's group: %+v; the deletion removed the sibling's group: %+v", afterDelete.Warnings, afterDelete.Warnings)
+		{
+			_, err := r.buildHydration(ctx, victimID)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "hydration of the deleted subject = %v, want the typed absence", err)
 		}
 
 		var hint *protocol.WarningChangedEvent
 		for hint == nil {
 			event, ok := nextEvent(t, sub)
-			if !ok {
-				t.Fatal("the subscription closed before the deletion's warning hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the deletion's warning hint")
 			if eventKind(t, event) != "warning_changed" {
 				continue
 			}
 			body, err := event.AsWarningChangedEvent()
-			if err != nil {
-				t.Fatalf("warning event body: %v", err)
-			}
-			if scopeKind(t, body.Scope) != "runtime" {
-				t.Fatalf("deletion warning hint scope = %+v, want the runtime scope", body.Scope)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, scopeKind(t, body.Scope) == "runtime", "deletion warning hint scope = %+v, want the runtime scope", body.Scope)
 			hint = &body
 		}
-		if hint.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
-			t.Fatalf("deletion warning hint revision = %q, want the single advance from %d", hint.WarningsRevision.Revision, baseRevision)
-		}
+		testassert.Require(t, hint.WarningsRevision.Revision == strconv.FormatUint(baseRevision+1, 10), "deletion warning hint revision = %q, want the single advance from %d", hint.WarningsRevision.Revision, baseRevision)
 		assertNoEvent(t, sub)
 
 		// Late reports for the deleted subject through a real adapter bound to
@@ -1132,12 +869,8 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		late.replaceProtocolWarnings(lateID, []protocol.Warning{{Source: "runtime:protocol", Kind: "late_protocol", Message: "late", SessionId: &lateID}})
 		assertNoEvent(t, sub)
 		lateRead, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings after late reports: %v", err)
-		}
-		if lateRead.WarningsRevision.Revision != afterDelete.WarningsRevision.Revision {
-			t.Fatalf("a late report advanced the warning revision: %s → %s", afterDelete.WarningsRevision.Revision, lateRead.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, lateRead.WarningsRevision.Revision, afterDelete.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(afterDelete.Warnings), warningBodies(lateRead.Warnings)) {
 			t.Fatalf("a late report changed the store:\n%v\n%v", warningBodies(afterDelete.Warnings), warningBodies(lateRead.Warnings))
 		}
@@ -1145,28 +878,22 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		// A committed deletion with no owned groups is a store no-op: no
 		// revision advance and no warning hint.
 		bare, err := r.createSession(ctx, e.workspace("warn-bare"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(bare): %v", err)
-		}
-		if _, err := r.archiveSession(ctx, bare.Identity.SessionID); err != nil {
-			t.Fatalf("archive(bare): %v", err)
+		testassert.NoError(t, err)
+		{
+			_, err := r.archiveSession(ctx, bare.Identity.SessionID)
+			testassert.NoError(t, err)
 		}
 		beforeBare, _ := r.warnings.snapshot()
-		if err := r.deleteSession(ctx, bare.Identity.SessionID); err != nil {
-			t.Fatalf("delete(bare): %v", err)
-		}
-		if afterBare, _ := r.warnings.snapshot(); afterBare != beforeBare {
-			t.Fatalf("a no-op deletion advanced the warning revision: %d → %d", beforeBare, afterBare)
+		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
+		{
+			afterBare, _ := r.warnings.snapshot()
+			testassert.Equal(t, afterBare, beforeBare)
 		}
 		for {
 			select {
 			case event, ok := <-sub.Events():
-				if !ok {
-					t.Fatal("the subscription closed around the no-op deletion")
-				}
-				if eventKind(t, event) == "warning_changed" {
-					t.Fatalf("a no-op deletion published a warning hint: %+v", event)
-				}
+				testassert.Require(t, ok, "the subscription closed around the no-op deletion")
+				testassert.Require(t, eventKind(t, event) != "warning_changed", "a no-op deletion published a warning hint: %+v", event)
 				continue
 			default:
 			}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -39,8 +40,9 @@ func backgroundLifecycleConfigDocument(endpoint string) string {
 func newLifecycleID(t *testing.T) string {
 	t.Helper()
 	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		t.Fatalf("random id: %v", err)
+	{
+		_, err := rand.Read(buf[:])
+		testassert.NoError(t, err)
 	}
 	return hex.EncodeToString(buf[:])
 }
@@ -257,16 +259,12 @@ func corruptSessionRegister(t *testing.T, store harness.Storage, sessionID strin
 	t.Helper()
 	key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}
 	reg, err := store.ReadRegister(context.Background(), key)
-	if err != nil {
-		t.Fatalf("ReadRegister(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadRegister(%s): %v", sessionID, err)
 	err = store.Transact(context.Background(), func(tx harness.Transaction) error {
 		_, err := tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"not":"a session register"}`))
 		return err
 	})
-	if err != nil {
-		t.Fatalf("corrupt register: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // --- raw durable-state seeders ---
@@ -277,11 +275,12 @@ const lifecycleSeedToolDefinition = `{"name":"echo","description":"echoes","para
 // storage contract.
 func lifecycleInsertRegister(t *testing.T, store harness.Storage, key harness.RegisterKey, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert register %v: %v", key, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert register %v: %v", key, err)
 	}
 }
 
@@ -289,11 +288,12 @@ func lifecycleInsertRegister(t *testing.T, store harness.Storage, key harness.Re
 // storage contract. The addressed Session must already exist.
 func lifecycleInsertEntry(t *testing.T, store harness.Storage, sessionID, id, operationID string, kind harness.EntryKind, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert entry %s: %v", id, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert entry %s: %v", id, err)
 	}
 }
 
@@ -413,9 +413,7 @@ func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper harness.
 		jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
 		hookPlugin(hook),
 		lifecycleToolsPlugin(tools))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	if s, ok := stopper.(*lifecycleStopper); ok {
 		s.arm(r.harness)
 	}

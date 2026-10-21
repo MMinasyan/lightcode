@@ -11,6 +11,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // The job-stop seam fixtures: one stub records stop invocations and, when
@@ -68,19 +69,16 @@ func startLiveJobRuntime(t *testing.T, store harness.Storage, content string) (*
 	e := newOwnerEnv(t)
 	stopper := &stubStopper{events: e.events, content: content}
 	r, err := e.open(ctx, e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	session, err := r.createSession(ctx, filepath.Join(e.home, "live-job-ws"), "solo")
-	if err != nil {
-		t.Fatalf("createSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	var completionID string
-	if err := startJobThrough(r, session.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
-		completionID = id // the job stays live: terminal delivery is still owed
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
+	{
+		err := startJobThrough(r, session.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
+			completionID = id // the job stays live: terminal delivery is still owed
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 	stopper.h = r.harness
 	stopper.completionID = completionID
@@ -99,9 +97,7 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 	startFor := func(t *testing.T, e *ownerEnv, r *Runtime, spawned *bool) error {
 		t.Helper()
 		session, err := r.createSession(ctx, filepath.Join(e.home, "wiring-ws"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		return startJobThrough(r, session.Identity.SessionID, "0a1b2c3d", func(context.Context, string) error {
 			*spawned = true
 			return nil
@@ -109,26 +105,18 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 	}
 	assertUnbound := func(t *testing.T, err error, spawned bool) {
 		t.Helper()
-		if !errors.Is(err, harness.ErrInvalid) || !strings.Contains(err.Error(), "no job stopper configured") {
-			t.Fatalf("StartJob = %v, want the unbound-seam rejection", err)
-		}
-		if spawned {
-			t.Fatal("spawn ran without a bound seam")
-		}
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "no job stopper configured"), "StartJob = %v, want the unbound-seam rejection", err)
+		testassert.Require(t, !spawned, "spawn ran without a bound seam")
 	}
 	closeOK := func(t *testing.T, r *Runtime) {
 		t.Helper()
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	}
 
 	t.Run("absent export leaves the seam nil", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeOK(t, r)
 		spawned := false
 		assertUnbound(t, startFor(t, e, r, &spawned), spawned)
@@ -138,14 +126,10 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 		e := newOwnerEnv(t)
 		stopper := &stubStopper{events: e.events}
 		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeOK(t, r)
 		session, err := r.createSession(ctx, filepath.Join(e.home, "wiring-ws"), "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		var completionID string
 		err = startJobThrough(r, session.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
 			completionID = id
@@ -154,12 +138,8 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 		// The bound seam admitted the call: spawn received the reserved
 		// completion identity and its error returns unchanged (the
 		// spawn-failure path finishes the member, so shutdown stops nothing).
-		if !errors.Is(err, errSpawn) {
-			t.Fatalf("StartJob = %v, want the spawn error through the bound seam", err)
-		}
-		if completionID == "" {
-			t.Fatal("spawn received no completion identity")
-		}
+		testassert.Require(t, errors.Is(err, errSpawn), "StartJob = %v, want the spawn error through the bound seam", err)
+		testassert.Require(t, completionID != "", "spawn received no completion identity")
 	})
 
 	t.Run("a narrower declared type leaves the seam nil", func(t *testing.T) {
@@ -173,9 +153,7 @@ func TestRuntimeJobsCapabilityWiring(t *testing.T) {
 			},
 		}
 		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()), narrow)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer closeOK(t, r)
 		spawned := false
 		assertUnbound(t, startFor(t, e, r, &spawned), spawned)
@@ -220,17 +198,11 @@ func TestRuntimeShutdownDeliversLiveJobCompletion(t *testing.T) {
 	ctx := context.Background()
 	_, r, store, stopper, sessionID := startLiveJobRuntime(t, storage.NewMemory(), "job stopped")
 
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if stopper.deliverErr != nil {
-		t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
-	}
+	testassert.NoError(t, r.Close(ctx))
+	testassert.Require(t, stopper.deliverErr == nil, "stopped job delivery: %v", stopper.deliverErr)
 
 	entries, err := store.ReadEntries(ctx, sessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	found := false
 	for _, entry := range entries {
 		if entry.Kind != harness.EntrySignal {
@@ -244,23 +216,14 @@ func TestRuntimeShutdownDeliversLiveJobCompletion(t *testing.T) {
 				ID   string `json:"id"`
 			} `json:"related_member"`
 		}
-		if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-			t.Fatalf("decode signal payload: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 		if wire.Signal != "background_completion" {
 			continue
 		}
 		found = true
-		if wire.Content != "job stopped" {
-			t.Fatalf("completion signal content = %q, want the delivered %q", wire.Content, "job stopped")
-		}
-		if wire.RelatedMember == nil || wire.RelatedMember.Kind != "job" || wire.RelatedMember.ID != "0a1b2c3d" {
-			t.Fatalf("completion signal member = %+v, want the job member 0a1b2c3d", wire.RelatedMember)
-		}
+		testassert.Require(t, wire.Content == "job stopped" && wire.RelatedMember != nil && wire.RelatedMember.Kind == "job" && wire.RelatedMember.ID == "0a1b2c3d", "got %v, want %v; completion signal member = %+v, want the job member 0a1b2c3d", wire.Content, "job stopped", wire.RelatedMember)
 	}
-	if !found {
-		t.Fatal("shutdown with a live job recorded no background_completion signal entry")
-	}
+	testassert.Require(t, found, "shutdown with a live job recorded no background_completion signal entry")
 }
 
 // TestRuntimeJobStopperDisposesBeforeStorage pins the disposal order of one
@@ -278,16 +241,10 @@ func TestRuntimeJobStopperDisposesBeforeStorage(t *testing.T) {
 	t.Run("the stop runs while the scopes are open", func(t *testing.T) {
 		e, r, _, stopper, _ := startLiveJobRuntime(t, storage.NewMemory(), "job stopped")
 
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if stopper.deliverErr != nil {
-			t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
-		}
+		testassert.NoError(t, r.Close(ctx))
+		testassert.Require(t, stopper.deliverErr == nil, "stopped job delivery: %v", stopper.deliverErr)
 		events := e.events.all()
-		if !orderedSubset(events, "stopjob", "close:jobs", "close:core") {
-			t.Fatalf("shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
-		}
+		testassert.Require(t, orderedSubset(events, "stopjob", "close:jobs", "close:core"), "shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
 	})
 
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
@@ -313,10 +270,7 @@ func TestRuntimeJobStopperDisposesBeforeStorage(t *testing.T) {
 			// The committed completion is durable at the frozen return
 			// boundary, while shutdown is still joined behind it.
 			completions := completionsOf(gated, sessionID)
-			if len(completions) != 1 || completions[0].memberKind != "job" ||
-				completions[0].memberID != "0a1b2c3d" || completions[0].content != "job stopped" {
-				t.Fatalf("committed completion while held = %+v, want the job 0a1b2c3d with its report", completions)
-			}
+			testassert.Require(t, len(completions) == 1 && completions[0].memberKind == "job" && completions[0].memberID == "0a1b2c3d" && completions[0].content == "job stopped", "committed completion while held = %+v, want the job 0a1b2c3d with its report", completions)
 			select {
 			case err := <-closeDone:
 				t.Fatalf("Close returned while the terminal completion transaction was still held (%v)", err)
@@ -324,29 +278,22 @@ func TestRuntimeJobStopperDisposesBeforeStorage(t *testing.T) {
 			}
 			// The stop already ran, and no plugin scope Close has started
 			// before the held terminal commit returns.
-			if n := eventsNamed(e.events.all(), "stopjob"); n != 1 {
-				t.Fatalf("stopjob events while held = %d, want exactly the one stop", n)
-			}
-			if closes := eventsNamedList(e.events.all(), "close"); len(closes) != 0 {
-				t.Fatalf("scope closes before the held terminal commit = %v, want none", closes)
+			testassert.Equal(t, eventsNamed(e.events.all(), "stopjob"), 1)
+			{
+				closes := eventsNamedList(e.events.all(), "close")
+				testassert.Require(t, len(closes) == 0, "scope closes before the held terminal commit = %v, want none", closes)
 			}
 
 			gated.releaseGate()
 			select {
 			case err := <-closeDone:
-				if err != nil {
-					t.Fatalf("Close: %v", err)
-				}
+				testassert.NoError(t, err)
 			case <-time.After(10 * time.Second):
 				t.Fatal("Close never converged after the terminal commit was released")
 			}
-			if stopper.deliverErr != nil {
-				t.Fatalf("stopped job delivery: %v", stopper.deliverErr)
-			}
+			testassert.Require(t, stopper.deliverErr == nil, "stopped job delivery: %v", stopper.deliverErr)
 			events := e.events.all()
-			if !orderedSubset(events, "stopjob", "close:jobs", "close:core") {
-				t.Fatalf("shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
-			}
+			testassert.Require(t, orderedSubset(events, "stopjob", "close:jobs", "close:core"), "shutdown events = %v, want the stop, then the jobs capability close, then the storage close", events)
 		})
 	})
 }

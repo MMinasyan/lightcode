@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -28,22 +29,17 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 		ctx := context.Background()
 		e := newOwnerEnv(t)
 		r, err := e.open(ctx, e.storagePlugin(store))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := r.Close(context.Background()); err != nil {
-				t.Errorf("Close: %v", err)
+			{
+				err := r.Close(context.Background())
+				testassert.Check(t, err == nil, "Close: %v", err)
 			}
 		}()
 		sub, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(ctx, e.dataDir, "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
 		// The creation's own invalidation is consumed first: everything after
@@ -67,9 +63,7 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 			t.Helper()
 			deadline := time.Now().Add(10 * time.Second)
 			for sessionViewThroughRuntime(t, r, sessionID).Header.Lifecycle != want {
-				if time.Now().After(deadline) {
-					t.Fatalf("the session never reached lifecycle %q while its publication was paused", want)
-				}
+				testassert.Require(t, !time.Now().After(deadline), "the session never reached lifecycle %q while its publication was paused", want)
 				time.Sleep(5 * time.Millisecond)
 			}
 		}
@@ -83,12 +77,8 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 		}()
 		awaitLifecycle(harness.LifecycleOpen)
 		release()
-		if err := <-archiveDone; err != nil {
-			t.Fatalf("archive: %v", err)
-		}
-		if err := <-reopenDone; err != nil {
-			t.Fatalf("reopen: %v", err)
-		}
+		testassert.NoError(t, <-archiveDone)
+		testassert.NoError(t, <-reopenDone)
 
 		pausedEvent, ok := nextEvent(t, sub)
 		if !ok || !equalEvent(pausedEvent, scopeEvent(protocol.ScopeOpened, ScopeInfo{Kind: ScopeWorkspace, Workspace: "/ws-paused-synthetic"})) {
@@ -103,19 +93,11 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 				t.Fatalf("queued invalidation = %s (ok=%v), want the session invalidation", eventJSON(t, event), ok)
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("session event body: %v", err)
-			}
-			if body.SessionRevision != final {
-				t.Fatalf("delayed invalidation revision = %+v, want the current final pair %+v (never the stale intermediate pair)", body.SessionRevision, final)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, body.SessionRevision, final)
 			invalidation, err := body.Scope.AsSessionScope()
-			if err != nil {
-				t.Fatalf("invalidation scope: %v", err)
-			}
-			if invalidation.SessionId != sessionID {
-				t.Fatalf("delayed invalidation session = %q, want the real session", invalidation.SessionId)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, invalidation.SessionId, sessionID)
 		}
 		assertNoEvent(t, sub)
 	})
@@ -133,14 +115,13 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 			}
 		}()
 		sub, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		root := bg.session("root-ws")
 		child := bg.launchChild(root, "child work", "child-op-1", 1)
 		bg.submitMode(root, "root-op-1", "hello", harness.MessageModeRegular)
-		if rec := awaitOperation(t, bg.r, root, "root-op-1", harness.OperationSuccess); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("root op settled %q", rec.State.Status)
+		{
+			rec := awaitOperation(t, bg.r, root, "root-op-1", harness.OperationSuccess)
+			testassert.Equal(t, rec.State.Status, harness.OperationSuccess)
 		}
 		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, bg.r, root)
@@ -153,15 +134,11 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 		for {
 			select {
 			case event, ok := <-sub.Events():
-				if !ok {
-					t.Fatal("the subscription closed before the drain finished")
-				}
+				testassert.Require(t, ok, "the subscription closed before the drain finished")
 				switch eventKind(t, event) {
 				case "session_changed":
 					body, err := event.AsSessionChangedEvent()
-					if err != nil {
-						t.Fatalf("session event body: %v", err)
-					}
+					testassert.NoError(t, err)
 					invalidationSession, _ := scopeSessionIdentity(t, body.Scope)
 					switch invalidationSession {
 					case root:
@@ -171,29 +148,17 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 					default:
 						t.Fatalf("invalidation for a foreign session %+v", body.Scope)
 					}
-					if scopeKind(t, body.Scope) != "session" {
-						t.Fatalf("invalidation scope = %+v, want the session granularity", body.Scope)
-					}
+					testassert.Require(t, scopeKind(t, body.Scope) == "session", "invalidation scope = %+v, want the session granularity", body.Scope)
 					invalidation, err := body.Scope.AsSessionScope()
-					if err != nil {
-						t.Fatalf("invalidation scope: %v", err)
-					}
-					if deref(invalidation.Workspace) != workspace {
-						t.Fatalf("invalidation scope = %+v, want the shared workspace", body.Scope)
-					}
+					testassert.NoError(t, err)
+					testassert.Require(t, deref(invalidation.Workspace) == workspace, "invalidation scope = %+v, want the shared workspace", body.Scope)
 				case "text_delta":
 					body, err := event.AsTextDeltaEvent()
-					if err != nil {
-						t.Fatalf("delta event body: %v", err)
-					}
+					testassert.NoError(t, err)
 					progress, err := body.Scope.AsOperationScope()
-					if err != nil {
-						t.Fatalf("progress scope: %v", err)
-					}
+					testassert.NoError(t, err)
 					if progress.SessionId == child {
-						if progress.OperationId != "child-op-1" {
-							t.Fatalf("child progress scope = %+v, want the child's real operation", body.Scope)
-						}
+						testassert.Require(t, progress.OperationId == "child-op-1", "child progress scope = %+v, want the child's real operation", body.Scope)
 						childProgress++
 						continue
 					}
@@ -201,22 +166,16 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 					// delivery's own follow-up turn: its operation is real
 					// but caller-generated, so only the session identity is
 					// pinned here.
-					if progress.SessionId != root || progress.OperationId == "" {
-						t.Fatalf("progress scope = %+v, want the root session's real operation", body.Scope)
-					}
+					testassert.Require(t, progress.SessionId == root && progress.OperationId != "", "progress scope = %+v, want the root session's real operation", body.Scope)
 					rootProgress++
 				case "tool_started", "tool_finished":
 					t.Fatalf("unexpected tool progress without a tool call: %s", eventJSON(t, event))
 				case "scope_opened", "scope_closed":
 					body, err := event.AsScopeEvent()
-					if err != nil {
-						t.Fatalf("scope event body: %v", err)
-					}
+					testassert.NoError(t, err)
 					if kind := scopeKind(t, body.Scope); kind == "operation" || kind == "agent" {
 						shortSession, _ := scopeSessionIdentity(t, body.Scope)
-						if shortSession != root && shortSession != child {
-							t.Fatalf("short scope event for a foreign session: %+v", body.Scope)
-						}
+						testassert.Require(t, shortSession == root || shortSession == child, "short scope event for a foreign session: %+v", body.Scope)
 					}
 				default:
 					// configuration and warning events carry no session attribution.
@@ -226,12 +185,8 @@ func TestObservationRootChildScopeTagging(t *testing.T) {
 			}
 			break
 		}
-		if rootInvalidations == 0 || childInvalidations == 0 {
-			t.Fatalf("root/child invalidations = %d/%d, want real committed hints for both sessions", rootInvalidations, childInvalidations)
-		}
-		if rootProgress == 0 || childProgress == 0 {
-			t.Fatalf("root/child progress = %d/%d, want the real progress truth for both sessions", rootProgress, childProgress)
-		}
+		testassert.Require(t, rootInvalidations != 0 && childInvalidations != 0, "root/child invalidations = %d/%d, want real committed hints for both sessions", rootInvalidations, childInvalidations)
+		testassert.Require(t, rootProgress != 0 && childProgress != 0, "root/child progress = %d/%d, want the real progress truth for both sessions", rootProgress, childProgress)
 	})
 }
 
@@ -249,40 +204,35 @@ func TestObservationTwoHealthyOrderOneSaturatedNoReplay(t *testing.T) {
 			}
 		}()
 		first, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe(first): %v", err)
-		}
+		testassert.NoError(t, err)
 		second, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe(second): %v", err)
-		}
+		testassert.NoError(t, err)
 		saturated, err := bg.r.Subscribe(1)
-		if err != nil {
-			t.Fatalf("Subscribe(saturated): %v", err)
-		}
+		testassert.NoError(t, err)
 
 		session := bg.session("order-ws")
 		bg.submitMode(session, "op-1", "hello", harness.MessageModeRegular)
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, bg.r, session)
-		if _, err := bg.r.Reload(ctx); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := bg.r.Reload(ctx)
+			testassert.NoError(t, err)
 		}
 
 		// The saturated subscriber is removed on its second publication.
-		if _, ok := nextEvent(t, saturated); !ok {
-			t.Fatal("the saturated subscriber never received its first buffered event")
+		{
+			_, ok := nextEvent(t, saturated)
+			testassert.Require(t, ok, "the saturated subscriber never received its first buffered event")
 		}
-		if _, ok := nextEvent(t, saturated); ok {
-			t.Fatal("the saturated subscriber stayed open past its capacity, want it removed and closed")
+		{
+			_, ok := nextEvent(t, saturated)
+			testassert.Require(t, !ok, "the saturated subscriber stayed open past its capacity, want it removed and closed")
 		}
 		saturated.Close()
 
 		// A late subscriber receives no replay of the past work.
 		late, err := bg.r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe(late): %v", err)
-		}
+		testassert.NoError(t, err)
 		assertNoEvent(t, late)
 		late.Close()
 
@@ -309,9 +259,7 @@ func TestObservationTwoHealthyOrderOneSaturatedNoReplay(t *testing.T) {
 		}
 		firstSeq := drain(first)
 		secondSeq := drain(second)
-		if len(firstSeq) == 0 || !slices.EqualFunc(firstSeq, secondSeq, equalEvent) {
-			t.Fatalf("the two healthy subscribers observed different orders: %d events vs %d", len(firstSeq), len(secondSeq))
-		}
+		testassert.Require(t, len(firstSeq) != 0 && slices.EqualFunc(firstSeq, secondSeq, equalEvent), "the two healthy subscribers observed different orders: %d events vs %d", len(firstSeq), len(secondSeq))
 	})
 }
 
@@ -331,9 +279,7 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 			}
 		}()
 		sub, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		session := bg.session("job-ws")
 		workspace := sessionViewThroughRuntime(t, bg.r, session).Header.Identity.Workspace
 
@@ -390,19 +336,11 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 			t.Fatalf("creation event = %s (ok=%v), want the session's first invalidation", eventJSON(t, creation), ok)
 		}
 		creationBody, err := creation.AsSessionChangedEvent()
-		if err != nil {
-			t.Fatalf("session event body: %v", err)
-		}
-		if scopeKind(t, creationBody.Scope) != "session" {
-			t.Fatalf("creation event scope = %+v, want the plain session granularity", creationBody.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, scopeKind(t, creationBody.Scope) == "session", "creation event scope = %+v, want the plain session granularity", creationBody.Scope)
 		creationScope, err := creationBody.Scope.AsSessionScope()
-		if err != nil {
-			t.Fatalf("creation event scope: %v", err)
-		}
-		if creationScope.JobId != nil {
-			t.Fatalf("creation event scope = %+v, want the plain session granularity", creationBody.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, creationScope.JobId == nil, "creation event scope = %+v, want the plain session granularity", creationBody.Scope)
 
 		// The admission's job-scoped hint with the CURRENT pair: after the
 		// admission nothing else runs on the Session, so the pair equals the
@@ -412,30 +350,20 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 			t.Fatalf("job admission event = %s (ok=%v), want the job-scoped invalidation", eventJSON(t, hint), ok)
 		}
 		body, err := hint.AsSessionChangedEvent()
-		if err != nil {
-			t.Fatalf("session event body: %v", err)
-		}
-		if scopeKind(t, body.Scope) != "job" {
-			t.Fatalf("job admission scope = %+v, want the job scope with the owning session", body.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, scopeKind(t, body.Scope) == "job", "job admission scope = %+v, want the job scope with the owning session", body.Scope)
 		jobScope, err := body.Scope.AsJobScope()
-		if err != nil {
-			t.Fatalf("job admission scope: %v", err)
-		}
-		if jobScope.JobId != "11111111" ||
-			jobScope.SessionId != session || deref(jobScope.Workspace) != workspace {
-			t.Fatalf("job admission scope = %+v, want the job scope with the owning session", body.Scope)
-		}
-		if admitPair := snapshotPairOf(t, bg.r, session); body.SessionRevision != admitPair {
-			t.Fatalf("job admission pair = %+v, want the current pair %+v", body.SessionRevision, admitPair)
+		testassert.NoError(t, err)
+		testassert.Require(t, jobScope.JobId == "11111111" && jobScope.SessionId == session && deref(jobScope.Workspace) == workspace, "job admission scope = %+v, want the job scope with the owning session", body.Scope)
+		{
+			admitPair := snapshotPairOf(t, bg.r, session)
+			testassert.Equal(t, body.SessionRevision, admitPair)
 		}
 
 		// The parked internal start: membership unchanged, no duplicate
 		// revisioned hint, no revision advance.
 		assertNoEvent(t, sub)
-		if parkedPair := snapshotPairOf(t, bg.r, session); parkedPair != body.SessionRevision {
-			t.Fatalf("the parked internal start advanced the revision: %+v → %+v", body.SessionRevision, parkedPair)
-		}
+		testassert.Equal(t, snapshotPairOf(t, bg.r, session), body.SessionRevision)
 
 		// Release the internal start and deliver the completion: the real
 		// session-scoped hints of the delivery's commits arrive, then the
@@ -444,53 +372,37 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 		completionMu.Lock()
 		deliverID := completionID
 		completionMu.Unlock()
-		if err := bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, bg.r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			return h.DeliverBackgroundCompletion(ctx, session, deliverID, "job output")
-		}); err != nil {
-			t.Fatalf("DeliverBackgroundCompletion: %v", err)
-		}
+		}))
 		deadline := time.Now().Add(10 * time.Second)
 		finishPair := protocol.SessionRevision{}
 		for {
 			event, ok := nextEvent(t, sub)
-			if !ok {
-				t.Fatal("the subscription closed before the job finish hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the job finish hint")
 			if eventKind(t, event) != "session_changed" {
 				continue
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("session event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			if scopeKind(t, body.Scope) == "job" {
 				finishHint, err := body.Scope.AsJobScope()
-				if err != nil {
-					t.Fatalf("job finish hint scope: %v", err)
-				}
+				testassert.NoError(t, err)
 				if finishHint.JobId == "11111111" {
 					finishPair = body.SessionRevision
 					break
 				}
 			}
-			if scopeKind(t, body.Scope) != "session" {
-				t.Fatalf("completion-delivery hint scope = %+v, want the session granularity", body.Scope)
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the job finish hint never arrived")
-			}
+			testassert.Require(t, scopeKind(t, body.Scope) == "session", "completion-delivery hint scope = %+v, want the session granularity", body.Scope)
+			testassert.Require(t, !time.Now().After(deadline), "the job finish hint never arrived")
 		}
 		// The completion's own turn may still be settling when the hint is
 		// observed, so the finish pair is pinned to the two invariants that
 		// hold deterministically: it advanced past the admission pair, and
 		// it never lies beyond the Session's current state.
 		afterPair := snapshotPairOf(t, bg.r, session)
-		if !lessPair(t, finishPair, afterPair) && finishPair != afterPair {
-			t.Fatalf("job finish pair = %+v, beyond the Session's current state %+v", finishPair, afterPair)
-		}
-		if lessPair(t, finishPair, body.SessionRevision) {
-			t.Fatalf("job finish pair = %+v, not advanced past the admission pair %+v", finishPair, body.SessionRevision)
-		}
+		testassert.Require(t, lessPair(t, finishPair, afterPair) || finishPair == afterPair, "job finish pair = %+v, beyond the Session's current state %+v", finishPair, afterPair)
+		testassert.Require(t, !lessPair(t, finishPair, body.SessionRevision), "job finish pair = %+v, not advanced past the admission pair %+v", finishPair, body.SessionRevision)
 	})
 }
 
@@ -519,29 +431,20 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 			}
 		}
 		r, err := e.open(ctx, e.storagePlugin(store), reporterPlugin("alpha"), reporterPlugin("beta"))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() {
-			if err := r.Close(context.Background()); err != nil {
-				t.Errorf("Close: %v", err)
+			{
+				err := r.Close(context.Background())
+				testassert.Check(t, err == nil, "Close: %v", err)
 			}
 		}()
-		if reports["alpha"] == nil || reports["beta"] == nil {
-			t.Fatal("the Runtime scope carried no per-plugin ReportWarning closure")
-		}
+		testassert.Require(t, reports["alpha"] != nil && reports["beta"] != nil, "the Runtime scope carried no per-plugin ReportWarning closure")
 		session, err := r.createSession(ctx, e.dataDir, "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		other, err := r.createSession(ctx, e.dataDir, "solo")
-		if err != nil {
-			t.Fatalf("createSession(other): %v", err)
-		}
+		testassert.NoError(t, err)
 		sub, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// One report: the reporting plugin's own global group gains the entry
 		// with the runtime-scoped warning event. The initial configuration
@@ -554,15 +457,11 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 			t.Fatalf("report event = %s (ok=%v), want the warning_changed hint", eventJSON(t, event), ok)
 		}
 		body, err := event.AsWarningChangedEvent()
-		if err != nil {
-			t.Fatalf("warning event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		if scopeKind(t, body.Scope) != "runtime" {
 			t.Fatalf("report event scope kind = %q, want the runtime scope", scopeKind(t, body.Scope))
 		}
-		if body.WarningsRevision.Revision != strconv.FormatUint(baseRevision+1, 10) {
-			t.Fatalf("report event revision = %q, want the first advance", body.WarningsRevision.Revision)
-		}
+		testassert.Require(t, body.WarningsRevision.Revision == strconv.FormatUint(baseRevision+1, 10), "report event revision = %q, want the first advance", body.WarningsRevision.Revision)
 		assertNoEvent(t, sub)
 
 		// The second factory's report is attributed to its own registration
@@ -573,12 +472,8 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 			t.Fatalf("second report event = %s (ok=%v), want the warning_changed hint", eventJSON(t, event), ok)
 		}
 		body, err = event.AsWarningChangedEvent()
-		if err != nil {
-			t.Fatalf("warning event body: %v", err)
-		}
-		if body.WarningsRevision.Revision != strconv.FormatUint(baseRevision+2, 10) {
-			t.Fatalf("second report event revision = %q, want the second advance", body.WarningsRevision.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, body.WarningsRevision.Revision == strconv.FormatUint(baseRevision+2, 10), "second report event revision = %q, want the second advance", body.WarningsRevision.Revision)
 
 		// An identical report dedupes: no second entry, no second event.
 		reports["alpha"]("install_failed", "alpha must be installed")
@@ -586,37 +481,26 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 
 		for _, sessionID := range []string{session.Identity.SessionID, other.Identity.SessionID} {
 			hydration, err := r.buildHydration(ctx, sessionID)
-			if err != nil {
-				t.Fatalf("buildHydration(%s): %v", sessionID, err)
-			}
-			if warningOf(hydration.Warnings, "plugin:alpha", "install_failed", "") == nil ||
-				warningOf(hydration.Warnings, "plugin:beta", "server_unavailable", "") == nil {
-				t.Fatalf("hydration of %s misses a plugin group: %+v", sessionID, hydration.Warnings)
-			}
+			testassert.Require(t, err == nil, "buildHydration(%s): %v", sessionID, err)
+			testassert.Require(t, warningOf(hydration.Warnings, "plugin:alpha", "install_failed", "") != nil && warningOf(hydration.Warnings, "plugin:beta", "server_unavailable", "") != nil, "hydration of %s misses a plugin group: %+v", sessionID, hydration.Warnings)
 		}
 		all, err := r.getWarnings(ctx)
-		if err != nil {
-			t.Fatalf("getWarnings: %v", err)
-		}
-		if warningOf(all.Warnings, "plugin:alpha", "install_failed", "") == nil ||
-			warningOf(all.Warnings, "plugin:beta", "server_unavailable", "") == nil {
-			t.Fatalf("the unfiltered read misses a plugin group: %+v", all.Warnings)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, warningOf(all.Warnings, "plugin:alpha", "install_failed", "") != nil && warningOf(all.Warnings, "plugin:beta", "server_unavailable", "") != nil, "the unfiltered read misses a plugin group: %+v", all.Warnings)
 		counts := map[string]int{}
 		for _, warning := range all.Warnings {
 			counts[string(warning.Source)]++
 		}
-		if counts["plugin:alpha"] != 1 || counts["plugin:beta"] != 1 {
-			t.Fatalf("plugin entries after the identical re-report = %v, want one deduped value per factory", counts)
-		}
+		testassert.Require(t, counts["plugin:alpha"] == 1 && counts["plugin:beta"] == 1, "plugin entries after the identical re-report = %v, want one deduped value per factory", counts)
 
 		// Reports after the warning store's closure are ignored.
 		revision, _ := r.warnings.snapshot()
 		r.warnings.close()
 		reports["alpha"]("install_failed", "a late report")
 		assertNoEvent(t, sub)
-		if after, _ := r.warnings.snapshot(); after != revision {
-			t.Fatalf("a late report advanced the store: %d → %d", revision, after)
+		{
+			after, _ := r.warnings.snapshot()
+			testassert.Equal(t, after, revision)
 		}
 	})
 }
@@ -638,9 +522,7 @@ func TestObservationStopAllJobFinishHints(t *testing.T) {
 			}
 		}()
 		sub, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		jobSession := bg.session("stopall-job")
 		workspace := sessionViewThroughRuntime(t, bg.r, jobSession).Header.Identity.Workspace
 		completionID := bg.startJob(jobSession, "0a1b2c3d")
@@ -659,9 +541,7 @@ func TestObservationStopAllJobFinishHints(t *testing.T) {
 			for {
 				select {
 				case event, ok := <-sub.Events():
-					if !ok {
-						t.Fatal("the subscription closed before the drain finished")
-					}
+					testassert.Require(t, ok, "the subscription closed before the drain finished")
 					out = append(out, event)
 					continue
 				default:
@@ -698,28 +578,20 @@ func TestObservationStopAllJobFinishHints(t *testing.T) {
 				continue
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("session event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			sessionID, ok := scopeSessionIdentity(t, body.Scope)
 			if !ok || sessionID != jobSession {
 				continue
 			}
-			if scopeKind(t, body.Scope) != "session" {
-				t.Fatalf("stopping invalidation scope = %+v, want the session granularity", body.Scope)
-			}
+			testassert.Require(t, scopeKind(t, body.Scope) == "session", "stopping invalidation scope = %+v, want the session granularity", body.Scope)
 			stopping = body.SessionRevision
 		}
-		if stopping.DurableRevision == "" {
-			t.Fatal("the owning Session's stopping invalidation was not queued when the stopper was entered")
-		}
+		testassert.Require(t, stopping.DurableRevision != "", "the owning Session's stopping invalidation was not queued when the stopper was entered")
 
 		releaseGate() // the delivery runs: the member finishes and StopAll converges
 		select {
 		case err := <-stopDone:
-			if err != nil {
-				t.Fatalf("StopAll: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("StopAll never converged")
 		}
@@ -729,47 +601,31 @@ func TestObservationStopAllJobFinishHints(t *testing.T) {
 		finishPair := protocol.SessionRevision{}
 		for {
 			event, ok := nextEvent(t, sub)
-			if !ok {
-				t.Fatal("the subscription closed before the job finish hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the job finish hint")
 			if eventKind(t, event) != "session_changed" {
 				continue
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("session event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			if scopeKind(t, body.Scope) != "job" {
 				continue
 			}
 			jobScope, err := body.Scope.AsJobScope()
-			if err != nil {
-				t.Fatalf("job finish hint scope: %v", err)
-			}
+			testassert.NoError(t, err)
 			if jobScope.JobId != "0a1b2c3d" {
 				continue
 			}
-			if jobScope.SessionId != jobSession || deref(jobScope.Workspace) != workspace {
-				t.Fatalf("job finish hint scope = %+v, want the owning session %q", body.Scope, jobSession)
-			}
+			testassert.Require(t, jobScope.SessionId == jobSession && deref(jobScope.Workspace) == workspace, "job finish hint scope = %+v, want the owning session %q", body.Scope, jobSession)
 			finishPair = body.SessionRevision
 			break
 		}
-		if !lessPair(t, stopping, finishPair) {
-			t.Fatalf("job finish pair = %+v, want it advanced past the stopping pair %+v", finishPair, stopping)
-		}
+		testassert.Require(t, lessPair(t, stopping, finishPair), "job finish pair = %+v, want it advanced past the stopping pair %+v", finishPair, stopping)
 
 		// Authoritative hydration agrees: no member and a revision not older
 		// than the hint.
 		hydration, err := bg.r.buildHydration(ctx, jobSession)
-		if err != nil {
-			t.Fatalf("buildHydration: %v", err)
-		}
-		if len(hydration.Background) != 0 {
-			t.Fatalf("hydration background = %+v, want no member after the stop", hydration.Background)
-		}
-		if lessPair(t, hydration.SessionRevision, finishPair) {
-			t.Fatalf("hydration revision %+v is older than the job finish hint %+v", hydration.SessionRevision, finishPair)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(hydration.Background) == 0, "hydration background = %+v, want no member after the stop", hydration.Background)
+		testassert.Require(t, !lessPair(t, hydration.SessionRevision, finishPair), "hydration revision %+v is older than the job finish hint %+v", hydration.SessionRevision, finishPair)
 	})
 }

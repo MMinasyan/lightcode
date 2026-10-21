@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -40,9 +41,7 @@ func TestComposedJobsPluginPublication(t *testing.T) {
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, accept)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
-	if err != nil {
-		t.Fatalf("OpenForTest over the shipped five with a valid jobs section: %v", err)
-	}
+	testassert.NoError(t, err)
 	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
 		_ = r.Close(ctx)
 		t.Fatalf("first Reload = (%q, %v), want revision 2", rev, err)
@@ -78,7 +77,5 @@ func TestComposedJobsPluginPublication(t *testing.T) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload after the failures = (%q, %v), want generation 3: failed publications published nothing", rev, err)
 	}
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(ctx))
 }

@@ -35,6 +35,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/plugins/tools"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/plugins/jobs"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -308,11 +309,10 @@ func (s *composedStream) count(match func(protocol.Event) bool) int {
 // composedWriteFile writes one configuration file with its owning directory.
 func composedWriteFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create config directory: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
 }
 
@@ -320,9 +320,7 @@ func composedWriteFile(t *testing.T, path, content string) {
 func composedDiscriminator(t *testing.T, event protocol.Event) string {
 	t.Helper()
 	kind, err := event.Discriminator()
-	if err != nil {
-		t.Fatalf("event discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -355,12 +353,8 @@ func composedIsJobHintFor(t *testing.T, jobID string) func(protocol.Event) bool 
 func composedHydrate(t *testing.T, c *client.Client, sessionID string) *protocol.Hydration {
 	t.Helper()
 	resp, err := c.GetSessionHydrationWithResponse(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("GetSessionHydration(%s): %v", sessionID, err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("GetSessionHydration(%s) = status %d: %s", sessionID, resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.Require(t, err == nil, "GetSessionHydration(%s): %v", sessionID, err)
+	testassert.Require(t, resp.JSON200 != nil, "GetSessionHydration(%s) = status %d: %s", sessionID, resp.HTTPResponse.StatusCode, resp.Body)
 	return resp.JSON200
 }
 
@@ -390,9 +384,7 @@ func composedAwaitOp(t *testing.T, c *client.Client, sessionID, operationID stri
 				return h
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("operation %q never settled to %q (operations %+v)", operationID, want, h.Operations)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "operation %q never settled to %q (operations %+v)", operationID, want, h.Operations)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -414,9 +406,7 @@ func composedAwaitQuiet(t *testing.T, c *client.Client, sessionID string, backgr
 		if quiet {
 			return h
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("session %q never went quiet (active %+v, background %+v, operations %+v)", sessionID, h.ActiveOperation, h.Background, h.Operations)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "session %q never went quiet (active %+v, background %+v, operations %+v)", sessionID, h.ActiveOperation, h.Background, h.Operations)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -424,13 +414,9 @@ func composedAwaitQuiet(t *testing.T, c *client.Client, sessionID string, backgr
 // composedItemText returns an input item's first text part.
 func composedItemText(t *testing.T, item protocol.InputItem) string {
 	t.Helper()
-	if len(item.Content) == 0 {
-		t.Fatalf("input item %s carries no content", item.ItemId)
-	}
+	testassert.Require(t, len(item.Content) != 0, "input item %s carries no content", item.ItemId)
 	part, err := item.Content[0].AsTextPart()
-	if err != nil {
-		t.Fatalf("input item text part: %v", err)
-	}
+	testassert.NoError(t, err)
 	return part.Text
 }
 
@@ -442,9 +428,7 @@ func composedAssistantOf(t *testing.T, items []protocol.ConversationItem, operat
 			continue
 		}
 		assistant, err := item.AsAssistantItem()
-		if err != nil {
-			t.Fatalf("assistant item: %v", err)
-		}
+		testassert.NoError(t, err)
 		if assistant.OperationId != nil && *assistant.OperationId == operationID {
 			return assistant
 		}
@@ -456,9 +440,7 @@ func composedAssistantOf(t *testing.T, items []protocol.ConversationItem, operat
 func composedItemKind(t *testing.T, item protocol.ConversationItem) string {
 	t.Helper()
 	kind, err := item.Discriminator()
-	if err != nil {
-		t.Fatalf("item discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -467,20 +449,14 @@ func composedItemKind(t *testing.T, item protocol.ConversationItem) string {
 func composedSubmit(t *testing.T, c *client.Client, sessionID, operationID, text string) {
 	t.Helper()
 	var part protocol.ContentPart
-	if err := part.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: text}); err != nil {
-		t.Fatalf("build text part: %v", err)
-	}
+	testassert.NoError(t, part.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: text}))
 	resp, err := c.SubmitSessionWithResponse(context.Background(), sessionID, protocol.SubmitRequest{
 		OperationId: operationID,
 		Mode:        protocol.SubmitRequestModeRegular,
 		Content:     []protocol.ContentPart{part},
 	})
-	if err != nil {
-		t.Fatalf("SubmitSession(%s): %v", operationID, err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("SubmitSession(%s) = status %d: %s", operationID, resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.Require(t, err == nil, "SubmitSession(%s): %v", operationID, err)
+	testassert.Require(t, resp.JSON200 != nil, "SubmitSession(%s) = status %d: %s", operationID, resp.HTTPResponse.StatusCode, resp.Body)
 }
 
 // composedReserveEnv starts one environment name unset and restores its
@@ -518,21 +494,13 @@ func TestProtocolComposedFlow(t *testing.T) {
 		composedWriteFile(t, agents.PathForConfig(configPath), composedFlowAgentsDocument)
 
 		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
-		if err != nil {
-			t.Fatalf("runtime.Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		ps, err := r.OpenProtocol(ctx)
-		if err != nil {
-			t.Fatalf("OpenProtocol: %v", err)
-		}
+		testassert.NoError(t, err)
 		record := filepath.Join(t.TempDir(), "discovery.json")
-		if err := ps.PublishDiscovery(record); err != nil {
-			t.Fatalf("PublishDiscovery: %v", err)
-		}
+		testassert.NoError(t, ps.PublishDiscovery(record))
 		c, err := client.Connect(ctx, record)
-		if err != nil {
-			t.Fatalf("client.Connect: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() { _ = r.Close(ctx) }()
 
 		// The unauthorized-transport sibling: a strict record carrying a
@@ -541,8 +509,9 @@ func TestProtocolComposedFlow(t *testing.T) {
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
 		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N2, wrongCredential))
-		if _, err := client.Connect(ctx, foreign); !errors.Is(err, client.ErrNoRuntime) {
-			t.Fatalf("wrong-credential connect = %v, want ErrNoRuntime", err)
+		{
+			_, err := client.Connect(ctx, foreign)
+			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
 		}
 
 		streamCtx, cancelStream := context.WithCancel(ctx)
@@ -552,12 +521,8 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// 1. Create and the real model/tool turn with a captured code group.
 		wsMain := filepath.Join(home, "main-ws")
 		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsMain, AgentType: "main"})
-		if err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
-		if created.JSON201 == nil {
-			t.Fatalf("CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		main := created.JSON201.SessionId
 		if created.JSON201.SessionRevision.InstanceId != c.InstanceID() {
 			t.Fatalf("created revision instance = %q, want %q", created.JSON201.SessionRevision.InstanceId, c.InstanceID())
@@ -566,18 +531,12 @@ func TestProtocolComposedFlow(t *testing.T) {
 		composedSubmit(t, c, main, "op-write-1", "write v1")
 		h := composedAwaitOp(t, c, main, "op-write-1", protocol.OperationStatusSuccess)
 		data, err := os.ReadFile(filepath.Join(wsMain, "composed.txt"))
-		if err != nil || string(data) != "v1" {
-			t.Fatalf("composed.txt = (%q, %v), want the real tool effect v1", data, err)
-		}
+		testassert.Require(t, err == nil && string(data) == "v1", "composed.txt = (%q, %v), want the real tool effect v1", data, err)
 		assistant := composedAssistantOf(t, h.Conversation.Items, "op-write-1")
 		// The assistant is indivisible with its published call: a terminal
 		// success status and present nonempty content, without pinning the
 		// exact result wording.
-		if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Name != "write_file" ||
-			assistant.ToolCalls[0].Status == nil || *assistant.ToolCalls[0].Status != protocol.ToolCallStatusSuccess ||
-			assistant.ToolCalls[0].Content == nil || *assistant.ToolCalls[0].Content == "" {
-			t.Fatalf("op-write-1 assistant tool calls = %+v, want one successful write_file call with nonempty terminal content", assistant.ToolCalls)
-		}
+		testassert.Require(t, len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Name == "write_file" && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusSuccess && assistant.ToolCalls[0].Content != nil && *assistant.ToolCalls[0].Content != "", "op-write-1 assistant tool calls = %+v, want one successful write_file call with nonempty terminal content", assistant.ToolCalls)
 		opWriteInput := protocol.InputItem{}
 		found := false
 		for _, item := range h.Conversation.Items {
@@ -585,21 +544,15 @@ func TestProtocolComposedFlow(t *testing.T) {
 				continue
 			}
 			input, err := item.AsInputItem()
-			if err != nil {
-				t.Fatalf("input item: %v", err)
-			}
+			testassert.NoError(t, err)
 			if input.OperationId != nil && *input.OperationId == "op-write-1" {
-				if text := composedItemText(t, input); text != "write v1" {
-					t.Fatalf("op-write-1 input text = %q, want the exact submitted text", text)
-				}
+				testassert.Equal(t, composedItemText(t, input), "write v1")
 				opWriteInput = input
 				found = true
 				break
 			}
 		}
-		if !found {
-			t.Fatal("no input item owned by op-write-1")
-		}
+		testassert.Require(t, found, "no input item owned by op-write-1")
 
 		// The SSE stream observed the real progress and invalidation of the
 		// same operation.
@@ -611,16 +564,10 @@ func TestProtocolComposedFlow(t *testing.T) {
 			return err == nil && body.Name == "write_file"
 		}, "write_file tool_started")
 		startedBody, err := started.AsToolStartedEvent()
-		if err != nil {
-			t.Fatalf("tool_started body: %v", err)
-		}
-		if composedScopeKind(startedBody.Scope) != "operation" {
-			t.Fatalf("write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, composedScopeKind(startedBody.Scope) == "operation", "write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
 		startedScope, err := startedBody.Scope.AsOperationScope()
-		if err != nil || startedScope.SessionId != main {
-			t.Fatalf("write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
-		}
+		testassert.Require(t, err == nil && startedScope.SessionId == main, "write_file tool_started scope = %+v, want the operation scope of the real session", startedBody.Scope)
 		stream.wait(func(event protocol.Event) bool {
 			if composedDiscriminator(t, event) != "tool_finished" {
 				return false
@@ -640,21 +587,15 @@ func TestProtocolComposedFlow(t *testing.T) {
 			return err == nil && session.SessionId == main
 		}, "the settled operation's session invalidation")
 		sessionHint, err := invalidation.AsSessionChangedEvent()
-		if err != nil {
-			t.Fatalf("session_changed body: %v", err)
-		}
+		testassert.NoError(t, err)
 		if sessionHint.SessionRevision.InstanceId != c.InstanceID() {
 			t.Fatalf("session invalidation revision instance = %q, want %q", sessionHint.SessionRevision.InstanceId, c.InstanceID())
 		}
 
 		// The recorded code group is listed with the projected input item.
 		groups, err := c.GetSessionCodeSnapshotsWithResponse(ctx, main)
-		if err != nil {
-			t.Fatalf("GetSessionCodeSnapshots: %v", err)
-		}
-		if groups.JSON200 == nil {
-			t.Fatalf("GetSessionCodeSnapshots = status %d: %s", groups.HTTPResponse.StatusCode, groups.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, groups.JSON200 != nil, "GetSessionCodeSnapshots = status %d: %s", groups.HTTPResponse.StatusCode, groups.Body)
 		var writeGroup *protocol.CodeSnapshotGroup
 		for i, group := range *groups.JSON200 {
 			if group.OperationId == "op-write-1" {
@@ -662,52 +603,43 @@ func TestProtocolComposedFlow(t *testing.T) {
 			}
 		}
 		composedDisplay := filepath.Join(wsMain, "composed.txt")
-		if writeGroup == nil || len(writeGroup.Files) != 1 || writeGroup.Files[0].Path != composedDisplay || writeGroup.Files[0].Existed {
-			t.Fatalf("op-write-1 code group = %+v, want the created %s file", writeGroup, composedDisplay)
-		}
+		testassert.Require(t, writeGroup != nil && len(writeGroup.Files) == 1 && writeGroup.Files[0].Path == composedDisplay && !writeGroup.Files[0].Existed, "op-write-1 code group = %+v, want the created %s file", writeGroup, composedDisplay)
 		// The group's boundary is the projected admitted input item, never a
 		// raw entry identity.
-		if writeGroup.GroupItemId != opWriteInput.ItemId {
-			t.Fatalf("group item id = %q, want the projected admitted input item %q", writeGroup.GroupItemId, opWriteInput.ItemId)
-		}
+		testassert.Equal(t, writeGroup.GroupItemId, opWriteInput.ItemId)
 
 		composedSubmit(t, c, main, "op-write-2", "write v2")
 		composedAwaitOp(t, c, main, "op-write-2", protocol.OperationStatusSuccess)
-		if data, _ := os.ReadFile(filepath.Join(wsMain, "composed.txt")); string(data) != "v2" {
-			t.Fatalf("composed.txt after the second write = %q, want v2", data)
+		{
+			data, _ := os.ReadFile(filepath.Join(wsMain, "composed.txt"))
+			testassert.Require(t, string(data) == "v2", "composed.txt after the second write = %q, want v2", data)
 		}
 
 		// 2. Identity-safe rewind: the external change is skipped with its
 		// reason and never overwritten; the recorded state restores.
 		edited := composedDisplay
-		if err := os.WriteFile(edited, []byte("external"), 0o600); err != nil {
-			t.Fatalf("external edit: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(edited, []byte("external"), 0o600))
 		skippedRevert, err := c.RevertSessionCodeWithResponse(ctx, main, protocol.RevertCodeRequest{BoundaryOperationId: "op-write-2"})
-		if err != nil {
-			t.Fatalf("RevertSessionCode(external): %v", err)
-		}
+		testassert.NoError(t, err)
 		if skippedRevert.JSON200 == nil || len(skippedRevert.JSON200.Restored) != 0 || len(skippedRevert.JSON200.Skipped) != 1 ||
 			skippedRevert.JSON200.Skipped[0].Path != composedDisplay || !strings.Contains(skippedRevert.JSON200.Skipped[0].Reason, "changed") {
 			body, _ := json.Marshal(skippedRevert.JSON200)
 			t.Fatalf("external-change revert = %s, want exactly the skipped composed.txt", body)
 		}
-		if data, _ := os.ReadFile(edited); string(data) != "external" {
-			t.Fatalf("externally changed file = %q, want its external bytes untouched", data)
+		{
+			data, _ := os.ReadFile(edited)
+			testassert.Require(t, string(data) == "external", "externally changed file = %q, want its external bytes untouched", data)
 		}
-		if err := os.WriteFile(edited, []byte("v2"), 0o600); err != nil {
-			t.Fatalf("restore recorded state: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(edited, []byte("v2"), 0o600))
 		restoredRevert, err := c.RevertSessionCodeWithResponse(ctx, main, protocol.RevertCodeRequest{BoundaryOperationId: "op-write-2"})
-		if err != nil {
-			t.Fatalf("RevertSessionCode(recorded): %v", err)
-		}
+		testassert.NoError(t, err)
 		if restoredRevert.JSON200 == nil || len(restoredRevert.JSON200.Restored) != 1 || len(restoredRevert.JSON200.Skipped) != 0 {
 			body, _ := json.Marshal(restoredRevert.JSON200)
 			t.Fatalf("recorded-state revert = %s, want exactly the restored file", body)
 		}
-		if data, _ := os.ReadFile(edited); string(data) != "v1" {
-			t.Fatalf("composed.txt after the boundary revert = %q, want the earlier group's preimage v1", data)
+		{
+			data, _ := os.ReadFile(edited)
+			testassert.Require(t, string(data) == "v1", "composed.txt after the boundary revert = %q, want the earlier group's preimage v1", data)
 		}
 
 		// 3. The literal user signal text stays a plain input.
@@ -718,22 +650,14 @@ func TestProtocolComposedFlow(t *testing.T) {
 			switch composedItemKind(t, item) {
 			case "input":
 				input, err := item.AsInputItem()
-				if err != nil {
-					t.Fatalf("input item: %v", err)
-				}
+				testassert.NoError(t, err)
 				if input.OperationId != nil && *input.OperationId == "op-literal" {
-					if got := composedItemText(t, input); got != forgedSignal {
-						t.Fatalf("literal-signal turn input = %q, want the exact submitted text", got)
-					}
+					testassert.Equal(t, composedItemText(t, input), forgedSignal)
 				}
 			case "signal":
 				signal, err := item.AsSignalItem()
-				if err != nil {
-					t.Fatalf("signal item: %v", err)
-				}
-				if strings.Contains(signal.Content, "forged") {
-					t.Fatalf("user text fabricated signal item %+v", signal)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, !strings.Contains(signal.Content, "forged"), "user text fabricated signal item %+v", signal)
 			}
 		}
 
@@ -745,16 +669,15 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// The job identity comes from the hydrated member, never from the
 		// tool result's presentation text.
 		h = composedAwaitQuiet(t, c, main, 1)
-		if got := h.Background; len(got) != 1 || got[0].Kind != protocol.BackgroundMemberKindJob {
-			t.Fatalf("hydration background = %+v, want the live job member", got)
+		{
+			got := h.Background
+			testassert.Require(t, len(got) == 1 && got[0].Kind == protocol.BackgroundMemberKindJob, "hydration background = %+v, want the live job member", got)
 		}
 		jobID := h.Background[0].Id
 		isJobHint := composedIsJobHintFor(t, jobID)
 		admissionHint := stream.wait(isJobHint, "the job member's admission hint")
 		admissionBody, err := admissionHint.AsSessionChangedEvent()
-		if err != nil {
-			t.Fatalf("job admission hint body: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		composedSubmit(t, c, main, "op-job-list", "list the processes")
 		composedAwaitQuiet(t, c, main, 1)
@@ -776,9 +699,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// hints. A duplicate publication, or a hint from the private process
 		// listing (membership unchanged), would precede this witness and
 		// make the count three.
-		if n := stream.count(isJobHint); n != 2 {
-			t.Fatalf("job-scoped hints at the finish witness = %d, want exactly the admission and finish hints", n)
-		}
+		testassert.Equal(t, stream.count(isJobHint), 2)
 		composedAwaitQuiet(t, c, main, 0)
 
 		// 5. The child Session runs its own turn and hydrates as an
@@ -797,9 +718,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 					childID = member.Id
 				}
 			}
-			if childID == "" && time.Now().After(deadline) {
-				t.Fatalf("the child member never appeared: %+v", h.Background)
-			}
+			testassert.Require(t, childID != "" || !time.Now().After(deadline), "the child member never appeared: %+v", h.Background)
 			time.Sleep(10 * time.Millisecond)
 		}
 		stream.wait(func(event protocol.Event) bool {
@@ -824,28 +743,16 @@ func TestProtocolComposedFlow(t *testing.T) {
 				continue
 			}
 			input, err := item.AsInputItem()
-			if err != nil {
-				t.Fatalf("input item: %v", err)
-			}
+			testassert.NoError(t, err)
 			if input.Origin == protocol.InputOriginRuntime && composedItemText(t, input) == "child finished" {
 				completionInput = true
 			}
 		}
-		if !completionInput {
-			t.Fatal("no runtime-origin completion input carrying the child's final text")
-		}
+		testassert.Require(t, completionInput, "no runtime-origin completion input carrying the child's final text")
 		childHydration := composedHydrate(t, c, childID)
-		if childHydration.Session.SessionId != childID || childHydration.Session.Lifecycle != protocol.Open ||
-			childHydration.ActiveOperation != nil || len(childHydration.Background) != 0 || len(childHydration.Operations) == 0 {
-			t.Fatalf("child hydration = %+v, want one ordinary open session with its own settled operations", childHydration.Session)
-		}
-		if len(childHydration.Conversation.Items) < 2 {
-			t.Fatalf("child conversation items = %+v, want its own input and assistant items", childHydration.Conversation.Items)
-		}
+		testassert.Require(t, childHydration.Session.SessionId == childID && childHydration.Session.Lifecycle == protocol.Open && childHydration.ActiveOperation == nil && len(childHydration.Background) == 0 && len(childHydration.Operations) != 0 && len(childHydration.Conversation.Items) >= 2, "child hydration = %+v, want one ordinary open session with its own settled operations; child conversation items = %+v, want its own input and assistant items", childHydration.Session, childHydration.Conversation.Items)
 		for _, operation := range childHydration.Operations {
-			if operation.Status != protocol.OperationStatusSuccess {
-				t.Fatalf("child operation %s = %q, want success", operation.OperationId, operation.Status)
-			}
+			testassert.Require(t, operation.Status == protocol.OperationStatusSuccess, "child operation %s = %q, want success", operation.OperationId, operation.Status)
 		}
 		// The child's GET/history matches its hydration: both mounted reads
 		// answer from the child's own one snapshot, with the same item
@@ -853,19 +760,13 @@ func TestProtocolComposedFlow(t *testing.T) {
 		childHistory := composedHistory(t, c, childID, nil)
 		historyIDs := composedPageIDs(t, childHistory.Items)
 		hydrationIDs := composedPageIDs(t, childHydration.Conversation.Items)
-		if strings.Join(historyIDs, ",") != strings.Join(hydrationIDs, ",") {
-			t.Fatalf("child history items %v, want its hydration's conversation %v", historyIDs, hydrationIDs)
-		}
-		if childHistory.SessionRevision != childHydration.SessionRevision {
-			t.Fatalf("child history revision = %+v, want the hydration's %+v", childHistory.SessionRevision, childHydration.SessionRevision)
-		}
+		testassert.Require(t, strings.Join(historyIDs, ",") == strings.Join(hydrationIDs, ","), "child history items %v, want its hydration's conversation %v", historyIDs, hydrationIDs)
+		testassert.Equal(t, childHistory.SessionRevision, childHydration.SessionRevision)
 
 		// 6. Older pages: fill past the 50-item boundary, then the anchored
 		// mechanics and the cross-Session cursor refusal.
 		for i := 0; ; i++ {
-			if i > 40 {
-				t.Fatal("the history never crossed the 50-item page boundary")
-			}
+			testassert.Require(t, i <= 40, "the history never crossed the 50-item page boundary")
 			page := composedHistory(t, c, main, nil)
 			if len(page.Items) == 50 && page.OlderCursor != nil {
 				break
@@ -876,42 +777,29 @@ func TestProtocolComposedFlow(t *testing.T) {
 			composedAwaitQuiet(t, c, main, 0)
 		}
 		first := composedHistory(t, c, main, nil)
-		if len(first.Items) != 50 || first.OlderCursor == nil {
-			t.Fatalf("initial page = %d items (cursor %v), want exactly 50 with an older cursor", len(first.Items), first.OlderCursor)
-		}
+		testassert.Require(t, len(first.Items) == 50 && first.OlderCursor != nil, "initial page = %d items (cursor %v), want exactly 50 with an older cursor", len(first.Items), first.OlderCursor)
 		older := composedHistory(t, c, main, first.OlderCursor)
-		if len(older.Items) == 0 || older.OlderCursor != nil {
-			t.Fatalf("older page = %d items (cursor %v), want the remaining prefix", len(older.Items), older.OlderCursor)
-		}
+		testassert.Require(t, len(older.Items) != 0 && older.OlderCursor == nil, "older page = %d items (cursor %v), want the remaining prefix", len(older.Items), older.OlderCursor)
 		olderIDs := composedPageIDs(t, older.Items)
 		composedSubmit(t, c, main, "op-after-anchor", "after the anchor")
 		composedAwaitOp(t, c, main, "op-after-anchor", protocol.OperationStatusSuccess)
 		newest := composedHistory(t, c, main, nil)
-		if newest.SessionRevision == first.SessionRevision {
-			t.Fatalf("newest page revision = %+v, want the advanced current revision", newest.SessionRevision)
-		}
+		testassert.Require(t, newest.SessionRevision != first.SessionRevision, "newest page revision = %+v, want the advanced current revision", newest.SessionRevision)
 		olderAfter := composedHistory(t, c, main, first.OlderCursor)
-		if got := composedPageIDs(t, olderAfter.Items); strings.Join(got, ",") != strings.Join(olderIDs, ",") {
-			t.Fatalf("older page after the append = %v, want the anchored %v", got, olderIDs)
+		{
+			got := composedPageIDs(t, olderAfter.Items)
+			testassert.Require(t, strings.Join(got, ",") == strings.Join(olderIDs, ","), "older page after the append = %v, want the anchored %v", got, olderIDs)
 		}
 		wsB := filepath.Join(home, "b-ws")
 		createdB, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsB, AgentType: "main"})
-		if err != nil {
-			t.Fatalf("CreateSession(B): %v", err)
-		}
-		if createdB.JSON201 == nil {
-			t.Fatalf("CreateSession(B) = status %d: %s", createdB.HTTPResponse.StatusCode, createdB.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, createdB.JSON201 != nil, "CreateSession(B) = status %d: %s", createdB.HTTPResponse.StatusCode, createdB.Body)
 		sessionB := createdB.JSON201.SessionId
 		composedSubmit(t, c, sessionB, "op-b", "hello b")
 		composedAwaitOp(t, c, sessionB, "op-b", protocol.OperationStatusSuccess)
 		foreignCursor, err := c.GetSessionHistoryWithResponse(ctx, sessionB, &protocol.GetSessionHistoryParams{Cursor: first.OlderCursor})
-		if err != nil {
-			t.Fatalf("cross-session history: %v", err)
-		}
-		if foreignCursor.JSONDefault == nil || foreignCursor.JSONDefault.Code != protocol.Invalid {
-			t.Fatalf("cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, foreignCursor.JSONDefault != nil && foreignCursor.JSONDefault.Code == protocol.Invalid, "cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
 
 		// 7. Settings: the stale whole-section save succeeds under
 		// last-writer-wins; each compiled plugin's own document string
@@ -928,70 +816,37 @@ func TestProtocolComposedFlow(t *testing.T) {
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
 			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: settings})
-			if err != nil {
-				t.Fatalf("UpdateConfigurationSettings: %v", err)
-			}
+			testassert.NoError(t, err)
 			return resp
 		}
 		firstPut := put(settingsA)
-		if firstPut.JSON200 == nil || !firstPut.JSON200.Result.Sessions.AutoArchive || firstPut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
-			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
-			compactComposed(t, []byte(firstPut.JSON200.Result.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
-			t.Fatalf("settings write A = %+v, want the published A section with every plugin's exact document", firstPut.JSON200)
-		}
+		testassert.Require(t, firstPut.JSON200 != nil && firstPut.JSON200.Result.Sessions.AutoArchive && firstPut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && compactComposed(t, []byte(firstPut.JSON200.Result.Plugins["tools"])) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(firstPut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "settings write A = %+v, want the published A section with every plugin's exact document", firstPut.JSON200)
 		secondPut := put(settingsB)
-		if secondPut.JSON200 == nil || secondPut.JSON200.Result.Sessions.AutoArchive || len(secondPut.JSON200.Result.Plugins) != 0 {
-			t.Fatalf("settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
-		}
+		testassert.Require(t, secondPut.JSON200 != nil && !secondPut.JSON200.Result.Sessions.AutoArchive && len(secondPut.JSON200.Result.Plugins) == 0, "settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
 		stalePut := put(settingsA)
-		if stalePut.JSON200 == nil || !stalePut.JSON200.Result.Sessions.AutoArchive || stalePut.JSON200.Result.Sessions.ArchiveAfterDays != 3 ||
-			stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays != 0 ||
-			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
-			compactComposed(t, []byte(stalePut.JSON200.Result.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
-			t.Fatalf("stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
-		}
+		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, []byte(stalePut.JSON200.Result.Plugins["tools"])) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
 		invalid := protocol.Settings{Sessions: settingsA.Sessions, Plugins: protocol.PluginsSettings{"tasks": `{"max_concurrent":99,"max_output_bytes":4096}`}}
 		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: invalid})
-		if err != nil {
-			t.Fatalf("invalid settings write: %v", err)
-		}
-		if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.Configuration {
-			t.Fatalf("invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.Configuration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		// The selected custom plugin's own validator refuses its invalid
 		// document with the same configuration class.
 		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Plugins: protocol.PluginsSettings{composedCustomPluginID: `{"threshold":0}`}}
 		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: customInvalid})
-		if err != nil {
-			t.Fatalf("invalid custom settings write: %v", err)
-		}
-		if customRefused.JSONDefault == nil || customRefused.JSONDefault.Code != protocol.Configuration {
-			t.Fatalf("invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.Configuration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
 		view, err := c.GetConfigurationWithResponse(ctx)
-		if err != nil {
-			t.Fatalf("GetConfiguration: %v", err)
-		}
-		if view.JSON200 == nil {
-			t.Fatalf("GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
-		}
-		if view.JSON200.ConfigurationRevision.Generation != publishedGeneration || !view.JSON200.Settings.Sessions.AutoArchive || view.JSON200.Settings.Sessions.ArchiveAfterDays != 3 ||
-			compactComposed(t, []byte(view.JSON200.Settings.Plugins["tools"])) != compactComposed(t, []byte(settingsADocument)) ||
-			compactComposed(t, []byte(view.JSON200.Settings.Plugins[composedCustomPluginID])) != compactComposed(t, []byte(composedCustomSettingsDocument)) {
-			t.Fatalf("configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, view.JSON200 != nil, "GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
+		testassert.Require(t, view.JSON200.ConfigurationRevision.Generation == publishedGeneration && view.JSON200.Settings.Sessions.AutoArchive && view.JSON200.Settings.Sessions.ArchiveAfterDays == 3 && compactComposed(t, []byte(view.JSON200.Settings.Plugins["tools"])) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(view.JSON200.Settings.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
 
 		// The custom plugin's neutral warning: the Runtime-scoped factory's
 		// report carries its own registered source through the mounted
 		// unfiltered read and every Session's hydration.
 		allWarnings, err := c.GetWarningsWithResponse(ctx)
-		if err != nil {
-			t.Fatalf("GetWarnings: %v", err)
-		}
-		if allWarnings.JSON200 == nil {
-			t.Fatalf("GetWarnings = status %d: %s", allWarnings.HTTPResponse.StatusCode, allWarnings.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, allWarnings.JSON200 != nil, "GetWarnings = status %d: %s", allWarnings.HTTPResponse.StatusCode, allWarnings.Body)
 		composedAssertPluginWarning(t, allWarnings.JSON200.Warnings)
 		hydratedWarnings := composedHydrate(t, c, main)
 		composedAssertPluginWarning(t, hydratedWarnings.Warnings)
@@ -1002,31 +857,19 @@ func TestProtocolComposedFlow(t *testing.T) {
 		connectGeneration := view.JSON200.ConfigurationRevision.Generation
 		connectKey := composedFlowConnectKey
 		connected, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "connprov"}, protocol.ConnectRequest{ApiKey: &connectKey})
-		if err != nil {
-			t.Fatalf("ConnectProvider: %v", err)
-		}
-		if connected.JSON200 == nil || !connected.JSON200.Result.Connected || connected.JSON200.Result.KeySource != protocol.Managed {
-			t.Fatalf("connected provider view = %+v, want connected with the managed key source", connected.JSON200)
-		}
-		if !composedGenerationAfter(t, connected.JSON200.ConfigurationRevision.Generation, connectGeneration) {
-			t.Fatalf("connect generation = %s, want an advance over %s", connected.JSON200.ConfigurationRevision.Generation, connectGeneration)
-		}
-		if bytes, _ := json.Marshal(connected.JSON200); strings.Contains(string(bytes), composedFlowConnectKey) {
-			t.Fatal("the connect response body carries the credential value")
+		testassert.NoError(t, err)
+		testassert.Require(t, connected.JSON200 != nil && connected.JSON200.Result.Connected && connected.JSON200.Result.KeySource == protocol.Managed, "connected provider view = %+v, want connected with the managed key source", connected.JSON200)
+		testassert.Require(t, composedGenerationAfter(t, connected.JSON200.ConfigurationRevision.Generation, connectGeneration), "connect generation = %s, want an advance over %s", connected.JSON200.ConfigurationRevision.Generation, connectGeneration)
+		{
+			bytes, _ := json.Marshal(connected.JSON200)
+			testassert.Require(t, !strings.Contains(string(bytes), composedFlowConnectKey), "the connect response body carries the credential value")
 		}
 		composedSubmit(t, c, main, "op-env", "print the environment")
 		h = composedAwaitOp(t, c, main, "op-env", protocol.OperationStatusSuccess)
 		envAssistant := composedAssistantOf(t, h.Conversation.Items, "op-env")
-		if len(envAssistant.ToolCalls) != 1 || envAssistant.ToolCalls[0].Content == nil {
-			t.Fatalf("environment turn tool calls = %+v, want the command result", envAssistant.ToolCalls)
-		}
+		testassert.Require(t, len(envAssistant.ToolCalls) == 1 && envAssistant.ToolCalls[0].Content != nil, "environment turn tool calls = %+v, want the command result", envAssistant.ToolCalls)
 		envOutput := *envAssistant.ToolCalls[0].Content
-		if !strings.Contains(envOutput, "composed-shell-value|") {
-			t.Fatalf("environment command output = %q, want the shell-exported sibling visible", envOutput)
-		}
-		if strings.Contains(envOutput, composedFlowConnectKey) {
-			t.Fatalf("environment command output = %q, want the late-managed connect key scrubbed", envOutput)
-		}
+		testassert.Require(t, strings.Contains(envOutput, "composed-shell-value|") && !strings.Contains(envOutput, composedFlowConnectKey), "environment command output = %q, want the shell-exported sibling visible; environment command output = %q, want the late-managed connect key scrubbed", envOutput, envOutput)
 
 		// The disconnect refusal: the credential state the disconnect
 		// published governs the next admission. The selected model is
@@ -1034,135 +877,82 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// the managed key, and the following admission refuses with no
 		// published Operation.
 		selected, err := c.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "main"}, protocol.SetAgentTypeModelRequest{Model: "connprov/cm"})
-		if err != nil {
-			t.Fatalf("SetAgentTypeModel(connprov/cm): %v", err)
-		}
-		if selected.JSON200 == nil || selected.JSON200.Result.Model != "connprov/cm" {
-			t.Fatalf("selected model edit = %+v, want the main roster entry's connected-provider model", selected.JSON200)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, selected.JSON200 != nil && selected.JSON200.Result.Model == "connprov/cm", "selected model edit = %+v, want the main roster entry's connected-provider model", selected.JSON200)
 		disconnected, err := c.DisconnectProviderWithResponse(ctx, &protocol.DisconnectProviderParams{ProviderId: "connprov"})
-		if err != nil {
-			t.Fatalf("DisconnectProvider: %v", err)
-		}
-		if disconnected.JSON200 == nil || disconnected.JSON200.Result == nil || disconnected.JSON200.Result.Connected {
-			t.Fatalf("disconnect response = %+v, want the disconnected provider view", disconnected.JSON200)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, disconnected.JSON200 != nil && disconnected.JSON200.Result != nil && !disconnected.JSON200.Result.Connected, "disconnect response = %+v, want the disconnected provider view", disconnected.JSON200)
 		var refusedPart protocol.ContentPart
-		if err := refusedPart.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: "refused turn"}); err != nil {
-			t.Fatalf("build refused part: %v", err)
-		}
+		testassert.NoError(t, refusedPart.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: "refused turn"}))
 		refusedSubmit, err := c.SubmitSessionWithResponse(ctx, main, protocol.SubmitRequest{
 			OperationId: "op-refused",
 			Mode:        protocol.SubmitRequestModeRegular,
 			Content:     []protocol.ContentPart{refusedPart},
 		})
-		if err != nil {
-			t.Fatalf("refused submit: %v", err)
-		}
-		if refusedSubmit.JSONDefault == nil || refusedSubmit.JSONDefault.Code != protocol.Invalid ||
-			refusedSubmit.HTTPResponse.StatusCode != http.StatusBadRequest {
-			t.Fatalf("refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, refusedSubmit.JSONDefault != nil && refusedSubmit.JSONDefault.Code == protocol.Invalid && refusedSubmit.HTTPResponse.StatusCode == http.StatusBadRequest, "refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
 		afterRefusal := composedHydrate(t, c, main)
 		for _, operation := range afterRefusal.Operations {
-			if operation.OperationId == "op-refused" {
-				t.Fatalf("the refused admission published operation %+v, want no Operation", operation)
-			}
+			testassert.Require(t, operation.OperationId != "op-refused", "the refused admission published operation %+v, want no Operation", operation)
 		}
 		for _, item := range afterRefusal.Conversation.Items {
 			if composedItemKind(t, item) != "input" {
 				continue
 			}
 			input, err := item.AsInputItem()
-			if err != nil {
-				t.Fatalf("input item: %v", err)
-			}
-			if input.OperationId != nil && *input.OperationId == "op-refused" {
-				t.Fatalf("the refused admission published input %+v, want no published input", input)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, input.OperationId == nil || *input.OperationId != "op-refused", "the refused admission published input %+v, want no published input", input)
 		}
 
 		// 9. Archive keeps history readable; reopen; delete removes every
 		// read; the surviving workspace list is intact.
 		archivedChild, err := c.ArchiveSessionWithResponse(ctx, childID)
-		if err != nil {
-			t.Fatalf("archive child: %v", err)
-		}
-		if archivedChild.JSON200 == nil {
-			t.Fatalf("archive child = status %d: %s", archivedChild.HTTPResponse.StatusCode, archivedChild.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, archivedChild.JSON200 != nil, "archive child = status %d: %s", archivedChild.HTTPResponse.StatusCode, archivedChild.Body)
 		deletedChild, err := c.DeleteSessionWithResponse(ctx, childID)
-		if err != nil {
-			t.Fatalf("delete child: %v", err)
-		}
-		if deletedChild.HTTPResponse.StatusCode != http.StatusNoContent {
-			t.Fatalf("delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, deletedChild.HTTPResponse.StatusCode == http.StatusNoContent, "delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
 		archived, err := c.ArchiveSessionWithResponse(ctx, main)
-		if err != nil {
-			t.Fatalf("archive main: %v", err)
-		}
-		if archived.JSON200 == nil || archived.JSON200.Lifecycle != protocol.Archived {
-			t.Fatalf("archive main = %+v (status %d)", archived.JSON200, archived.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, archived.JSON200 != nil && archived.JSON200.Lifecycle == protocol.Archived, "archive main = %+v (status %d)", archived.JSON200, archived.HTTPResponse.StatusCode)
 		archivedHistory := composedHistory(t, c, main, nil)
-		if len(archivedHistory.Items) == 0 {
-			t.Fatal("the archived session's history is hidden, want the fully readable history")
-		}
+		testassert.Require(t, len(archivedHistory.Items) != 0, "the archived session's history is hidden, want the fully readable history")
 		reopened, err := c.ReopenSessionWithResponse(ctx, main)
-		if err != nil {
-			t.Fatalf("reopen main: %v", err)
-		}
-		if reopened.JSON200 == nil || reopened.JSON200.Lifecycle != protocol.Open {
-			t.Fatalf("reopen main = %+v (status %d)", reopened.JSON200, reopened.HTTPResponse.StatusCode)
-		}
-		if _, err := c.ArchiveSessionWithResponse(ctx, main); err != nil {
-			t.Fatalf("re-archive main: %v", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, reopened.JSON200 != nil && reopened.JSON200.Lifecycle == protocol.Open, "reopen main = %+v (status %d)", reopened.JSON200, reopened.HTTPResponse.StatusCode)
+		{
+			_, err := c.ArchiveSessionWithResponse(ctx, main)
+			testassert.NoError(t, err)
 		}
 		deleted, err := c.DeleteSessionWithResponse(ctx, main)
-		if err != nil {
-			t.Fatalf("delete main: %v", err)
-		}
-		if deleted.HTTPResponse.StatusCode != http.StatusNoContent {
-			t.Fatalf("delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, deleted.HTTPResponse.StatusCode == http.StatusNoContent, "delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
 		missing, err := c.GetSessionHydrationWithResponse(ctx, main)
-		if err != nil {
-			t.Fatalf("deleted session read: %v", err)
-		}
-		if missing.JSON200 != nil || missing.JSONDefault == nil || missing.JSONDefault.Code != protocol.NotFound {
-			t.Fatalf("deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, missing.JSON200 == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.NotFound, "deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
 		mainList, err := c.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: wsMain, Lifecycle: protocol.Open})
-		if err != nil {
-			t.Fatalf("deleted workspace list: %v", err)
-		}
-		if mainList.JSON200 == nil || len(*mainList.JSON200) != 0 {
-			t.Fatalf("deleted workspace list = %+v (status %d), want the empty array", mainList.JSON200, mainList.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, mainList.JSON200 != nil && len(*mainList.JSON200) == 0, "deleted workspace list = %+v (status %d), want the empty array", mainList.JSON200, mainList.HTTPResponse.StatusCode)
 		bList, err := c.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: wsB, Lifecycle: protocol.Open})
-		if err != nil {
-			t.Fatalf("surviving workspace list: %v", err)
-		}
-		if bList.JSON200 == nil || len(*bList.JSON200) != 1 || (*bList.JSON200)[0].SessionId != sessionB {
-			t.Fatalf("surviving workspace list = %+v (status %d), want exactly session B", bList.JSON200, bList.HTTPResponse.StatusCode)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, bList.JSON200 != nil && len(*bList.JSON200) == 1 && (*bList.JSON200)[0].SessionId == sessionB, "surviving workspace list = %+v (status %d), want exactly session B", bList.JSON200, bList.HTTPResponse.StatusCode)
 
 		// 10. The closed owner: the stream closes by caller cancellation,
 		// the managed shutdown withdraws the record, refuses the listener,
 		// and the withdrawn record is no usable owner.
 		cancelStream()
-		if err := <-errs; !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+		{
+			err := <-errs
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
 		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
+		testassert.NoError(t, r.Close(ctx))
+		{
+			_, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://"))
+			testassert.Require(t, err != nil, "the protocol listener still accepts after shutdown")
 		}
-		if _, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://")); err == nil {
-			t.Fatal("the protocol listener still accepts after shutdown")
-		}
-		if _, err := client.Connect(ctx, record); !errors.Is(err, client.ErrNoRuntime) {
-			t.Fatalf("connect after the managed close = %v, want ErrNoRuntime over the withdrawn record", err)
+		{
+			_, err := client.Connect(ctx, record)
+			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "connect after the managed close = %v, want ErrNoRuntime over the withdrawn record", err)
 		}
 	}
 
@@ -1181,12 +971,8 @@ func TestProtocolComposedFlow(t *testing.T) {
 func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *string) *protocol.HistoryPage {
 	t.Helper()
 	resp, err := c.GetSessionHistoryWithResponse(context.Background(), sessionID, &protocol.GetSessionHistoryParams{Cursor: cursor})
-	if err != nil {
-		t.Fatalf("GetSessionHistory: %v", err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("GetSessionHistory = status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON200 != nil, "GetSessionHistory = status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 	return resp.JSON200
 }
 
@@ -1195,39 +981,27 @@ func composedPageIDs(t *testing.T, items []protocol.ConversationItem) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
 		kind, err := item.Discriminator()
-		if err != nil {
-			t.Fatalf("item discriminator: %v", err)
-		}
+		testassert.NoError(t, err)
 		switch kind {
 		case "input":
 			input, err := item.AsInputItem()
-			if err != nil {
-				t.Fatalf("input item: %v", err)
-			}
+			testassert.NoError(t, err)
 			ids = append(ids, input.ItemId)
 		case "assistant":
 			assistant, err := item.AsAssistantItem()
-			if err != nil {
-				t.Fatalf("assistant item: %v", err)
-			}
+			testassert.NoError(t, err)
 			ids = append(ids, assistant.ItemId)
 		case "signal":
 			signal, err := item.AsSignalItem()
-			if err != nil {
-				t.Fatalf("signal item: %v", err)
-			}
+			testassert.NoError(t, err)
 			ids = append(ids, signal.ItemId)
 		case "compaction":
 			compaction, err := item.AsCompactionItem()
-			if err != nil {
-				t.Fatalf("compaction item: %v", err)
-			}
+			testassert.NoError(t, err)
 			ids = append(ids, compaction.ItemId)
 		case "operation_end":
 			end, err := item.AsOperationEndItem()
-			if err != nil {
-				t.Fatalf("operation_end item: %v", err)
-			}
+			testassert.NoError(t, err)
 			ids = append(ids, end.ItemId)
 		}
 	}
@@ -1249,13 +1023,9 @@ func composedParseRevision(value string) uint64 {
 func composedGenerationAfter(t *testing.T, got, before string) bool {
 	t.Helper()
 	g, err := strconv.ParseUint(got, 10, 64)
-	if err != nil {
-		t.Fatalf("generation %q: %v", got, err)
-	}
+	testassert.Require(t, err == nil, "generation %q: %v", got, err)
 	b, err := strconv.ParseUint(before, 10, 64)
-	if err != nil {
-		t.Fatalf("generation %q: %v", before, err)
-	}
+	testassert.Require(t, err == nil, "generation %q: %v", before, err)
 	return g > b
 }
 
@@ -1427,20 +1197,14 @@ func heldOperationExecution(t *testing.T, store harness.Storage, sessionID, oper
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{
 		SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID,
 	})
-	if err != nil {
-		t.Fatalf("ReadRegister(%s, %s): %v", sessionID, operationID, err)
-	}
+	testassert.Require(t, err == nil, "ReadRegister(%s, %s): %v", sessionID, operationID, err)
 	var payload struct {
 		Admission struct {
 			Execution json.RawMessage `json:"execution"`
 		} `json:"admission"`
 	}
-	if err := json.Unmarshal(reg.Payload, &payload); err != nil {
-		t.Fatalf("decode operation register: %v", err)
-	}
-	if len(payload.Admission.Execution) == 0 {
-		t.Fatalf("operation register %s/%s carries no captured execution", sessionID, operationID)
-	}
+	testassert.NoError(t, json.Unmarshal(reg.Payload, &payload))
+	testassert.Require(t, len(payload.Admission.Execution) != 0, "operation register %s/%s carries no captured execution", sessionID, operationID)
 	return payload.Admission.Execution
 }
 
@@ -1475,35 +1239,21 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []runtime.Plugin{
 			composedMemoryStorage(store), tools.Plugin(), jobs.Plugin(),
 		}})
-		if err != nil {
-			t.Fatalf("runtime.Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer func() { _ = r.Close(ctx) }()
 		ps, err := r.OpenProtocol(ctx)
-		if err != nil {
-			t.Fatalf("OpenProtocol: %v", err)
-		}
+		testassert.NoError(t, err)
 		record := filepath.Join(t.TempDir(), "discovery.json")
-		if err := ps.PublishDiscovery(record); err != nil {
-			t.Fatalf("PublishDiscovery: %v", err)
-		}
+		testassert.NoError(t, ps.PublishDiscovery(record))
 		c, err := client.Connect(ctx, record)
-		if err != nil {
-			t.Fatalf("client.Connect: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		ws := filepath.Join(home, "held-ws")
 		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentType: "main"})
-		if err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
-		if created.JSON201 == nil {
-			t.Fatalf("CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		sessionID := created.JSON201.SessionId
-		if err := os.MkdirAll(ws, 0o700); err != nil {
-			t.Fatalf("mkdir workspace: %v", err)
-		}
+		testassert.NoError(t, os.MkdirAll(ws, 0o700))
 
 		// The held turn admits, its opener captures, and only then does the
 		// model request park at the gate — before any command environment.
@@ -1514,9 +1264,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 			t.Fatal("the held turn's model request never arrived")
 		}
 		preReload, err := c.GetConfigurationWithResponse(ctx)
-		if err != nil || preReload.JSON200 == nil {
-			t.Fatalf("GetConfiguration before the hold = (%v, status %d)", err, preReload.HTTPResponse.StatusCode)
-		}
+		testassert.Require(t, err == nil && preReload.JSON200 != nil, "GetConfiguration before the hold = (%v, status %d)", err, preReload.HTTPResponse.StatusCode)
 		heldBefore := heldOperationExecution(t, store, sessionID, "op-held")
 
 		// While the request is parked: rename the provider binding from the
@@ -1528,27 +1276,17 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		composedWriteFile(t, agentsPath, heldAgentsRetargeted)
 		connectKey := heldManagedValue
 		connected, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "connprov"}, protocol.ConnectRequest{ApiKey: &connectKey})
-		if err != nil {
-			t.Fatalf("ConnectProvider: %v", err)
-		}
-		if connected.JSON200 == nil || connected.JSON200.Result == nil || connected.JSON200.Result.KeySource != protocol.Managed {
-			t.Fatalf("connect response = %+v, want the separately managed key", connected.JSON200)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, connected.JSON200 != nil && connected.JSON200.Result != nil && connected.JSON200.Result.KeySource == protocol.Managed, "connect response = %+v, want the separately managed key", connected.JSON200)
 		reloaded, err := c.ReloadConfigurationWithResponse(ctx)
-		if err != nil {
-			t.Fatalf("ReloadConfiguration: %v", err)
-		}
-		if reloaded.JSON200 == nil {
-			t.Fatalf("ReloadConfiguration = status %d: %s", reloaded.HTTPResponse.StatusCode, reloaded.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reloaded.JSON200 != nil, "ReloadConfiguration = status %d: %s", reloaded.HTTPResponse.StatusCode, reloaded.Body)
 
 		// The admitted capture is still the original one: nothing
 		// recaptured the running Operation from the new configuration, and
 		// its revision stays the pre-reload generation.
 		heldAfter := heldOperationExecution(t, store, sessionID, "op-held")
-		if string(heldAfter) != string(heldBefore) {
-			t.Fatal("the captured execution changed across the configuration reload")
-		}
+		testassert.Require(t, string(heldAfter) == string(heldBefore), "the captured execution changed across the configuration reload")
 		var capture struct {
 			ConfigurationRevision string `json:"configuration_revision"`
 			Model                 struct {
@@ -1556,23 +1294,14 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 				Model    string `json:"model"`
 			} `json:"model"`
 		}
-		if err := json.Unmarshal(heldBefore, &capture); err != nil {
-			t.Fatalf("decode captured execution: %v", err)
-		}
-		if capture.Model.Provider != "prov" || capture.Model.Model != "m" {
-			t.Fatalf("captured model = %q/%q, want the preparation-time selection", capture.Model.Provider, capture.Model.Model)
-		}
-		if capture.ConfigurationRevision != preReload.JSON200.ConfigurationRevision.Generation {
-			t.Fatalf("captured revision = %q, want the pre-reload generation %q", capture.ConfigurationRevision, preReload.JSON200.ConfigurationRevision.Generation)
-		}
+		testassert.NoError(t, json.Unmarshal(heldBefore, &capture))
+		testassert.Require(t, capture.Model.Provider == "prov" && capture.Model.Model == "m" && capture.ConfigurationRevision == preReload.JSON200.ConfigurationRevision.Generation, "captured model = %q/%q, want the preparation-time selection; got %v, want %v", capture.Model.Provider, capture.Model.Model, capture.ConfigurationRevision, preReload.JSON200.ConfigurationRevision.Generation)
 
 		// Release the parked request: the admitted command runs and builds
 		// its child environment from the live exclusion service.
 		model.release()
 		h := composedAwaitOp(t, c, sessionID, "op-held", protocol.OperationStatusSuccess)
-		if string(heldOperationExecution(t, store, sessionID, "op-held")) != string(heldBefore) {
-			t.Fatal("the captured execution changed across the held Operation's run")
-		}
+		testassert.Require(t, string(heldOperationExecution(t, store, sessionID, "op-held")) == string(heldBefore), "the captured execution changed across the held Operation's run")
 
 		// Every request the held input issued followed the preparation-time
 		// model and credential: boolean comparisons only, never a credential
@@ -1588,16 +1317,10 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 				continue
 			}
 			heldRequests++
-			if !rec.oldModel || !rec.oldAuth {
-				t.Fatalf("held-input request %d selection = (model %t, auth %t), want the captured model and the preparation-time credential", i, rec.oldModel, rec.oldAuth)
-			}
+			testassert.Require(t, rec.oldModel && rec.oldAuth, "held-input request %d selection = (model %t, auth %t), want the captured model and the preparation-time credential", i, rec.oldModel, rec.oldAuth)
 		}
-		if heldRequests == 0 {
-			t.Fatal("no recorded model request carried the held input")
-		}
-		if model.wasCanceled() {
-			t.Fatal("the parked model request was canceled during the hold")
-		}
+		testassert.Require(t, heldRequests != 0, "no recorded model request carried the held input")
+		testassert.Require(t, !model.wasCanceled(), "the parked model request was canceled during the hold")
 
 		// The child saw neither the preparation-time external binding, nor
 		// the renamed current one, nor the separately managed key, and still
@@ -1610,25 +1333,17 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 					continue
 				}
 				input, err := item.AsInputItem()
-				if err != nil {
-					t.Fatalf("input item: %v", err)
-				}
+				testassert.NoError(t, err)
 				text := composedItemText(t, input)
 				if input.Origin == protocol.InputOriginRuntime && strings.Contains(text, "old=") {
 					flags = text
 				}
 			}
-			if flags == "" {
-				t.Fatal("no background completion carried the child's presence flags")
-			}
-			if !strings.Contains(flags, heldEnvWant) {
-				t.Fatalf("background child presence flags = %q, want %q", flags, heldEnvWant)
-			}
+			testassert.Require(t, flags != "", "no background completion carried the child's presence flags")
+			testassert.Require(t, strings.Contains(flags, heldEnvWant), "background child presence flags = %q, want %q", flags, heldEnvWant)
 		} else {
 			assistant := composedAssistantOf(t, h.Conversation.Items, "op-held")
-			if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Content == nil {
-				t.Fatalf("held command tool calls = %+v, want one result", assistant.ToolCalls)
-			}
+			testassert.Require(t, len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Content != nil, "held command tool calls = %+v, want one result", assistant.ToolCalls)
 			if *assistant.ToolCalls[0].Content != heldEnvWant {
 				t.Fatalf("foreground child presence flags = %q, want %q", *assistant.ToolCalls[0].Content, heldEnvWant)
 			}
@@ -1639,11 +1354,10 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		composedSubmit(t, c, sessionID, "op-deny", "probe the denial")
 		h = composedAwaitOp(t, c, sessionID, "op-deny", protocol.OperationStatusSuccess)
 		probe := composedAssistantOf(t, h.Conversation.Items, "op-deny")
-		if len(probe.ToolCalls) != 1 || probe.ToolCalls[0].Status == nil || *probe.ToolCalls[0].Status != protocol.ToolCallStatusDenied {
-			t.Fatalf("probe tool calls = %+v, want the denied command under the new permissions", probe.ToolCalls)
-		}
-		if _, err := os.Stat(filepath.Join(ws, "held-deny-marker")); !os.IsNotExist(err) {
-			t.Fatalf("the denied probe started its command (%v)", err)
+		testassert.Require(t, len(probe.ToolCalls) == 1 && probe.ToolCalls[0].Status != nil && *probe.ToolCalls[0].Status == protocol.ToolCallStatusDenied, "probe tool calls = %+v, want the denied command under the new permissions", probe.ToolCalls)
+		{
+			_, err := os.Stat(filepath.Join(ws, "held-deny-marker"))
+			testassert.Require(t, os.IsNotExist(err), "the denied probe started its command (%v)", err)
 		}
 
 		// The parent shell keeps every external value untouched and
@@ -1654,43 +1368,30 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 			{heldNewKeyEnv, heldNewKeyValue},
 			{heldSiblingEnv, heldSiblingValue},
 		} {
-			if got := os.Getenv(row.name); got != row.want {
-				t.Fatalf("parent %s preserved = %t, want the external value untouched", row.name, got == row.want)
+			{
+				got := os.Getenv(row.name)
+				testassert.Require(t, got == row.want, "parent %s preserved = %t, want the external value untouched", row.name, got == row.want)
 			}
 		}
 		supplied := "sk-held-supplied-1"
 		refused, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "prov"}, protocol.ConnectRequest{ApiKey: &supplied})
-		if err != nil {
-			t.Fatalf("ConnectProvider(prov): %v", err)
-		}
-		if refused.JSONDefault == nil {
-			t.Fatalf("supplied-key connect on the external binding = status %d, want the typed refusal", refused.HTTPResponse.StatusCode)
-		}
-		if os.Getenv(heldNewKeyEnv) != heldNewKeyValue {
-			t.Fatal("the refused supplied-key write changed the parent external value")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, refused.JSONDefault != nil, "supplied-key connect on the external binding = status %d, want the typed refusal", refused.HTTPResponse.StatusCode)
+		testassert.Require(t, os.Getenv(heldNewKeyEnv) == heldNewKeyValue, "the refused supplied-key write changed the parent external value")
 		providers, err := c.ListProvidersWithResponse(ctx)
-		if err != nil {
-			t.Fatalf("ListProviders: %v", err)
-		}
-		if providers.JSON200 == nil {
-			t.Fatalf("ListProviders = status %d: %s", providers.HTTPResponse.StatusCode, providers.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, providers.JSON200 != nil, "ListProviders = status %d: %s", providers.HTTPResponse.StatusCode, providers.Body)
 		unmanaged := false
 		for _, provider := range providers.JSON200.Providers {
 			if provider.Id == "prov" && provider.KeySource == protocol.External {
 				unmanaged = true
 			}
 		}
-		if !unmanaged {
-			t.Fatal("the renamed binding left the external classification after the refused write")
-		}
+		testassert.Require(t, unmanaged, "the renamed binding left the external classification after the refused write")
 
 		// Every background member already settled above; the managed
 		// shutdown joins the rest through the existing cleanup path.
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 	}
 
 	t.Run("foreground", func(t *testing.T) { run(t, false) })

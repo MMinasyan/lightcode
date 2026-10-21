@@ -12,6 +12,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -89,9 +90,7 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture
 	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
 	captured, err := svc.publish(context.Background())
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
+	testassert.NoError(t, err)
 	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil)
 }
 
@@ -119,9 +118,7 @@ func compactPrepRequest() harness.PreparationRequest {
 func compactPrepSelection(t *testing.T, captured configurationCapture, agentName string) selection {
 	t.Helper()
 	agent, err := harness.ResolveAgentType(agentName, captured.snapshot.agentTypes())
-	if err != nil {
-		t.Fatalf("ResolveAgentType(%q): %v", agentName, err)
-	}
+	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
 	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
 }
 
@@ -226,27 +223,16 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			captured, prep := compactPrep(t, tc.agentsDoc, "https://prov.test/v1")
 			sel := compactPrepSelection(t, captured, tc.agent)
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
-			if err != nil {
-				t.Fatalf("concretePrepare: %v", err)
-			}
-			if opener == nil {
-				t.Fatalf("concretePrepare returned no opener")
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, opener != nil, "concretePrepare returned no opener")
 			if capture.Model != tc.wantModel {
 				t.Fatalf("capture Model = %s, want %s", capture.Model.String(), tc.wantModel.String())
 			}
-			if capture.ContextWindow != tc.wantWindow {
-				t.Fatalf("capture ContextWindow = %d, want %d", capture.ContextWindow, tc.wantWindow)
-			}
-			if capture.OutputReserve != tc.wantReserve {
-				t.Fatalf("capture OutputReserve = %d, want %d", capture.OutputReserve, tc.wantReserve)
-			}
+			testassert.Require(t, capture.ContextWindow == tc.wantWindow && capture.OutputReserve == tc.wantReserve, "got %v, want %v; got %v, want %v", capture.ContextWindow, tc.wantWindow, capture.OutputReserve, tc.wantReserve)
 			if capture.Compact.Model != tc.wantCompactRef {
 				t.Fatalf("capture Compact.Model = %s, want %s", capture.Compact.Model.String(), tc.wantCompactRef.String())
 			}
-			if capture.Compact.SystemPrompt != retainedSummarizerPrompt {
-				t.Fatalf("capture Compact.SystemPrompt = %q, want the compact type's retained prompt", capture.Compact.SystemPrompt)
-			}
+			testassert.Equal(t, capture.Compact.SystemPrompt, retainedSummarizerPrompt)
 		})
 	}
 }
@@ -296,9 +282,7 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 			captured, prep := compactPrep(t, tc.agentsDoc, server.URL)
 			sel := compactPrepSelection(t, captured, "solo")
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
-			if err != nil {
-				t.Fatalf("concretePrepare: %v", err)
-			}
+			testassert.NoError(t, err)
 			exec, err := opener(context.Background(), harness.OperationAdmission{
 				SessionID:   "000000000000000000000000000000aa",
 				OperationID: "op-1",
@@ -306,46 +290,27 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 				Execution:   capture,
 				AdmittedAt:  time.Now(),
 			}, sel)
-			if err != nil {
-				t.Fatalf("opener: %v", err)
-			}
-			if exec.CompactModel == nil {
-				t.Fatalf("opened execution carries no CompactModel callback")
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, exec.CompactModel != nil, "opened execution carries no CompactModel callback")
 			req, err := model.NewRequest(model.Request{Messages: []model.Message{{
 				Role:    "user",
 				Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}},
 			}}})
-			if err != nil {
-				t.Fatalf("NewRequest: %v", err)
-			}
+			testassert.NoError(t, err)
 			stream, err := exec.CompactModel(context.Background(), req)
-			if err != nil {
-				t.Fatalf("CompactModel: %v", err)
-			}
+			testassert.NoError(t, err)
 			stream.Close()
-			if len(server.models) != 1 || server.models[0] != tc.wantCompactOn {
-				t.Fatalf("CompactModel wire models = %v, want exactly one request on %q", server.models, tc.wantCompactOn)
-			}
-			if len(server.auths) != 1 || server.auths[0] != "Bearer compact-secret" {
-				t.Fatalf("CompactModel authorization = %v, want the compact transport's resolved credential", server.auths)
-			}
+			testassert.Require(t, len(server.models) == 1 && server.models[0] == tc.wantCompactOn && len(server.auths) == 1 && server.auths[0] == "Bearer compact-secret", "CompactModel wire models = %v, want exactly one request on %q; CompactModel authorization = %v, want the compact transport's resolved credential", server.models, tc.wantCompactOn, server.auths)
 
 			// The conversation callback rides its own transport in the same
 			// execution; when the compact model is the conversation model the
 			// two closures are built identically over the one shared
 			// transport, so both hit the same wire model and credential.
 			stream, err = exec.Model(context.Background(), req)
-			if err != nil {
-				t.Fatalf("Model: %v", err)
-			}
+			testassert.NoError(t, err)
 			stream.Close()
-			if len(server.models) != 2 || server.models[1] != "m" {
-				t.Fatalf("Model wire models = %v, want the conversation model second", server.models)
-			}
-			if capture.Compact.Model == conversationRef && server.auths[1] != server.auths[0] {
-				t.Fatalf("conversation authorization = %q differs from the compact one %q on the shared-model case", server.auths[1], server.auths[0])
-			}
+			testassert.Require(t, len(server.models) == 2 && server.models[1] == "m", "Model wire models = %v, want the conversation model second", server.models)
+			testassert.Require(t, capture.Compact.Model != conversationRef || server.auths[1] == server.auths[0], "conversation authorization = %q differs from the compact one %q on the shared-model case", server.auths[1], server.auths[0])
 		})
 	}
 }
@@ -360,17 +325,13 @@ func TestValidateHookedCaptureProtectsCompaction(t *testing.T) {
 	// The prompt freedom still holds.
 	prompted := base
 	prompted.SystemPrompt = "replaced prompt"
-	if err := validateHookedCapture(base, prompted); err != nil {
-		t.Fatalf("prompt replacement rejected: %v", err)
-	}
+	testassert.NoError(t, validateHookedCapture(base, prompted))
 	// The tool-definition replacement freedom still holds: same names, new
 	// description.
 	tooled := base
 	tooled.Tools = append([]model.ToolDefinition(nil), base.Tools...)
 	tooled.Tools[0].Description = "replaced description"
-	if err := validateHookedCapture(base, tooled); err != nil {
-		t.Fatalf("tool definition replacement rejected: %v", err)
-	}
+	testassert.NoError(t, validateHookedCapture(base, tooled))
 
 	for _, mutation := range []struct {
 		name   string
@@ -384,8 +345,9 @@ func TestValidateHookedCaptureProtectsCompaction(t *testing.T) {
 		t.Run(mutation.name, func(t *testing.T) {
 			next := base
 			mutation.mutate(&next)
-			if err := validateHookedCapture(base, next); err == nil {
-				t.Fatalf("hook changing the %s accepted, want rejection", mutation.name)
+			{
+				err := validateHookedCapture(base, next)
+				testassert.Require(t, err != nil, "hook changing the %s accepted, want rejection", mutation.name)
 			}
 		})
 	}

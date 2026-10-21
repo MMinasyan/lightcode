@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -120,18 +121,14 @@ func workspaceScopeInfo(workspace string) ScopeInfo {
 func mustComposition(t *testing.T, plugins ...Plugin) *composition {
 	t.Helper()
 	c, err := newComposition(plugins)
-	if err != nil {
-		t.Fatalf("newComposition: %v", err)
-	}
+	testassert.NoError(t, err)
 	return c
 }
 
 func mustOpenScope(t *testing.T, c *composition, ctx context.Context, info ScopeInfo, ancestors []*scope) *scope {
 	t.Helper()
 	sc, err := c.openScope(ctx, info, ancestors)
-	if err != nil {
-		t.Fatalf("openScope(%s %q): %v", info.Kind, info.Workspace, err)
-	}
+	testassert.Require(t, err == nil, "openScope(%s %q): %v", info.Kind, info.Workspace, err)
 	return sc
 }
 
@@ -217,12 +214,8 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			opened = 0
 			_, err := newComposition(row.plugins)
-			if !errors.Is(err, ErrComposition) {
-				t.Fatalf("newComposition error = %v, want ErrComposition", err)
-			}
-			if opened != 0 {
-				t.Fatalf("%d factories ran for a rejected declaration set; validation must precede every factory", opened)
-			}
+			testassert.Require(t, errors.Is(err, ErrComposition), "newComposition error = %v, want ErrComposition", err)
+			testassert.Equal(t, opened, 0)
 		})
 	}
 }
@@ -246,18 +239,21 @@ func TestCompositionAcceptsLongLivedHookDeclarations(t *testing.T) {
 	}
 	c := mustComposition(t, plugins...)
 	for _, kind := range []ScopeKind{ScopeRuntime, ScopeWorkspace, ScopeOperation, ScopeAgent} {
-		if got := len(c.plan[kind]); got != 1 {
-			t.Fatalf("%s plan holds %d plugins, want 1", kind, got)
+		{
+			got := len(c.plan[kind])
+			testassert.Require(t, got == 1, "%s plan holds %d plugins, want 1", kind, got)
 		}
 	}
 	ids := append([]string(nil), c.capabilityIDs...)
 	slices.Sort(ids)
-	if want := []string{"ag.byvalue", "ag.g", "hook.iface", "hook.ptr", "hook.value", "op.g"}; !slices.Equal(ids, want) {
-		t.Fatalf("capability universe = %v, want every export including the ordinary short-scope ones", ids)
+	{
+		want := []string{"ag.byvalue", "ag.g", "hook.iface", "hook.ptr", "hook.value", "op.g"}
+		testassert.Require(t, slices.Equal(ids, want), "capability universe = %v, want every export including the ordinary short-scope ones", ids)
 	}
 	forbidden := append(append([]Plugin(nil), plugins...), hookPlugin("op-hook", ScopeOperation, Spec[hookValue]("hook.op")))
-	if _, err := newComposition(forbidden); !errors.Is(err, ErrComposition) {
-		t.Fatalf("newComposition with an Operation-scoped hook export = %v, want ErrComposition", err)
+	{
+		_, err := newComposition(forbidden)
+		testassert.Require(t, errors.Is(err, ErrComposition), "newComposition with an Operation-scoped hook export = %v, want ErrComposition", err)
 	}
 }
 
@@ -276,9 +272,7 @@ func TestCompositionAcceptsLongerLivedAndSameScopeDependencies(t *testing.T) {
 			return Instance{Values: map[string]any{"ag.g": loudGreeter{}}}, nil
 		}},
 	)
-	if got := len(c.plan[ScopeWorkspace]); got != 2 {
-		t.Fatalf("workspace plan holds %d plugins, want 2", got)
-	}
+	testassert.Equal(t, len(c.plan[ScopeWorkspace]), 2)
 	if c.plan[ScopeWorkspace][0].ID != "wa" || c.plan[ScopeWorkspace][1].ID != "wb" {
 		t.Fatalf("workspace plan = %s before %s, want the provider first", c.plan[ScopeWorkspace][0].ID, c.plan[ScopeWorkspace][1].ID)
 	}
@@ -304,15 +298,15 @@ func TestCompositionConstructsDependenciesFirstInStableOrder(t *testing.T) {
 	)
 	sc := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
 	want := []string{"open:early", "open:late", "open:ties"}
-	if got := trace.all(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("construction order = %q, want %q", got, want)
+	{
+		got := trace.all()
+		testassert.Require(t, reflect.DeepEqual(got, want), "construction order = %q, want %q", got, want)
 	}
-	if err := sc.close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	testassert.NoError(t, sc.close())
 	want = append(want, "close:ties", "close:late", "close:early")
-	if got := trace.all(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("close order = %q, want reverse of construction %q", got, want)
+	{
+		got := trace.all()
+		testassert.Require(t, reflect.DeepEqual(got, want), "close order = %q, want reverse of construction %q", got, want)
 	}
 }
 
@@ -337,29 +331,34 @@ func TestScopeBindingsCarryOnlyDeclaredDependencies(t *testing.T) {
 	rt := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
 	ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/one"), []*scope{rt})
 
-	if len(captured.entries) != 3 || len(ws.bindings.entries) != 1 {
-		t.Fatalf("consumer received %d entries (want its 3 declared), scope exports %d (want its 1)", len(captured.entries), len(ws.bindings.entries))
+	testassert.Require(t, len(captured.entries) == 3 && len(ws.bindings.entries) == 1, "consumer received %d entries (want its 3 declared), scope exports %d (want its 1)", len(captured.entries), len(ws.bindings.entries))
+	{
+		g, err := Bind[greeter](captured, "rt.g")
+		testassert.Require(t, err == nil && g.Greet() == "HI", "Bind assignable dependency: err = %v, value = %v", err, g)
 	}
-	if g, err := Bind[greeter](captured, "rt.g"); err != nil || g.Greet() != "HI" {
-		t.Fatalf("Bind assignable dependency: err = %v, value = %v", err, g)
+	{
+		n, err := Bind[int](captured, "rt.n")
+		testassert.Require(t, err == nil && n == 0, "Bind zero concrete value: err = %v, value = %d, want the ordinary zero value accepted", err, n)
 	}
-	if n, err := Bind[int](captured, "rt.n"); err != nil || n != 0 {
-		t.Fatalf("Bind zero concrete value: err = %v, value = %d, want the ordinary zero value accepted", err, n)
+	{
+		_, err := Bind[counted](captured, "rt.c")
+		testassert.NoError(t, err)
 	}
-	if _, err := Bind[counted](captured, "rt.c"); err != nil {
-		t.Fatalf("Bind typed nil dependency: %v, want the ordinary type rule to accept it", err)
+	{
+		_, err := Bind[greeter](captured, "rt.hidden")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind undeclared capability: %v, want ErrComposition (no ambient lookup)", err)
 	}
-	if _, err := Bind[greeter](captured, "rt.hidden"); !errors.Is(err, ErrComposition) {
-		t.Errorf("Bind undeclared capability: %v, want ErrComposition (no ambient lookup)", err)
+	{
+		_, err := Bind[greeter](captured, "unneeded.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind another plugin's export: %v, want ErrComposition (binding isolation)", err)
 	}
-	if _, err := Bind[greeter](captured, "unneeded.g"); !errors.Is(err, ErrComposition) {
-		t.Errorf("Bind another plugin's export: %v, want ErrComposition (binding isolation)", err)
+	{
+		_, err := Bind[counted](captured, "rt.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind wrong requested type: %v, want ErrComposition", err)
 	}
-	if _, err := Bind[counted](captured, "rt.g"); !errors.Is(err, ErrComposition) {
-		t.Errorf("Bind wrong requested type: %v, want ErrComposition", err)
-	}
-	if _, err := Bind[greeter](Bindings{}, "rt.g"); !errors.Is(err, ErrComposition) {
-		t.Errorf("Bind on zero Bindings: %v, want ErrComposition", err)
+	{
+		_, err := Bind[greeter](Bindings{}, "rt.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind on zero Bindings: %v, want ErrComposition", err)
 	}
 }
 
@@ -435,23 +434,18 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			c, err := newComposition(row.plugins(trace, cancel))
-			if err != nil {
-				t.Fatalf("newComposition: %v", err)
-			}
+			testassert.NoError(t, err)
 			if row.cancelFirst {
 				cancel()
 			}
 			sc, err := c.openScope(ctx, runtimeScopeInfo(), nil)
-			if sc != nil {
-				t.Fatalf("failed construction returned a scope")
-			}
+			testassert.Require(t, sc == nil, "failed construction returned a scope")
 			for _, want := range row.wantIs {
-				if !errors.Is(err, want) {
-					t.Errorf("error = %v, want identity %v", err, want)
-				}
+				testassert.Check(t, errors.Is(err, want), "error = %v, want identity %v", err, want)
 			}
-			if got := trace.all(); !reflect.DeepEqual(got, append([]string(nil), row.wantEvents...)) {
-				t.Fatalf("disposal trace = %q, want %q", got, row.wantEvents)
+			{
+				got := trace.all()
+				testassert.Require(t, reflect.DeepEqual(got, append([]string(nil), row.wantEvents...)), "disposal trace = %q, want %q", got, row.wantEvents)
 			}
 		})
 	}
@@ -463,36 +457,35 @@ func TestScopeAcceptsZeroTypedAndCoreSeamValues(t *testing.T) {
 			return Instance{Values: map[string]any{"ok.n": 0, "ok.c": (*counterService)(nil), "ok.store": stubCoreStorage{}, "ok.stop": (*stubStopper)(nil)}}, nil
 		}},
 	)
-	if len(c.capabilityIDs) != 2 || c.capabilityIDs[0] != "ok.n" || c.capabilityIDs[1] != "ok.c" {
-		t.Fatalf("capability universe = %q, want the ordinary IDs without the Core seam exports", c.capabilityIDs)
-	}
-	if len(c.coreExports) != 1 || c.coreExports[0].id != "ok.store" || c.coreExports[0].plugin != "ok" || c.coreExports[0].scope != ScopeRuntime {
-		t.Fatalf("Core storage declarations = %+v, want the one Runtime export", c.coreExports)
-	}
-	if len(c.jobStoppers) != 1 || c.jobStoppers[0].id != "ok.stop" || c.jobStoppers[0].plugin != "ok" || c.jobStoppers[0].scope != ScopeRuntime {
-		t.Fatalf("job-stop declarations = %+v, want the one Runtime export", c.jobStoppers)
-	}
+	testassert.Require(t, len(c.capabilityIDs) == 2 && c.capabilityIDs[0] == "ok.n" && c.capabilityIDs[1] == "ok.c" && len(c.coreExports) == 1 && c.coreExports[0].id == "ok.store" && c.coreExports[0].plugin == "ok" && c.coreExports[0].scope == ScopeRuntime && len(c.jobStoppers) == 1 && c.jobStoppers[0].id == "ok.stop" && c.jobStoppers[0].plugin == "ok" && c.jobStoppers[0].scope == ScopeRuntime, "capability universe = %q, want the ordinary IDs without the Core seam exports; Core storage declarations = %+v, want the one Runtime export; job-stop declarations = %+v, want the one Runtime export", c.capabilityIDs, c.coreExports, c.jobStoppers)
 	sc := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
-	if _, ok := sc.storages["ok.store"].(stubCoreStorage); !ok {
-		t.Fatalf("Core storage resolution = %#v, want the supplied stub", sc.storages)
+	{
+		_, ok := sc.storages["ok.store"].(stubCoreStorage)
+		testassert.Require(t, ok, "Core storage resolution = %#v, want the supplied stub", sc.storages)
 	}
-	if _, ok := sc.jobStoppers["ok.stop"]; !ok {
-		t.Fatalf("job-stop resolution = %#v, want the supplied value", sc.jobStoppers)
+	{
+		_, ok := sc.jobStoppers["ok.stop"]
+		testassert.Require(t, ok, "job-stop resolution = %#v, want the supplied value", sc.jobStoppers)
 	}
-	if _, leaked := sc.bindings.entries["ok.store"]; leaked {
-		t.Fatalf("Core storage export leaked into ordinary bindings")
+	{
+		_, leaked := sc.bindings.entries["ok.store"]
+		testassert.Require(t, !leaked, "Core storage export leaked into ordinary bindings")
 	}
-	if _, leaked := sc.bindings.entries["ok.stop"]; leaked {
-		t.Fatalf("job-stop export leaked into ordinary bindings")
+	{
+		_, leaked := sc.bindings.entries["ok.stop"]
+		testassert.Require(t, !leaked, "job-stop export leaked into ordinary bindings")
 	}
-	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.store"}); !errors.Is(err, ErrComposition) {
-		t.Errorf("selecting the Core storage export: %v, want ErrComposition", err)
+	{
+		_, err := selectCapabilities([]*scope{sc}, []string{"ok.store"})
+		testassert.Check(t, errors.Is(err, ErrComposition), "selecting the Core storage export: %v, want ErrComposition", err)
 	}
-	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.stop"}); !errors.Is(err, ErrComposition) {
-		t.Errorf("selecting the job-stop export: %v, want ErrComposition", err)
+	{
+		_, err := selectCapabilities([]*scope{sc}, []string{"ok.stop"})
+		testassert.Check(t, errors.Is(err, ErrComposition), "selecting the job-stop export: %v, want ErrComposition", err)
 	}
-	if _, err := selectCapabilities([]*scope{sc}, []string{"ok.n", "ok.c"}); err != nil {
-		t.Errorf("selecting ordinary exports: %v", err)
+	{
+		_, err := selectCapabilities([]*scope{sc}, []string{"ok.n", "ok.c"})
+		testassert.Check(t, err == nil, "selecting ordinary exports: %v", err)
 	}
 }
 
@@ -521,13 +514,15 @@ func TestCompositionRejectsScopeInfoShapes(t *testing.T) {
 		{"unknown kind", mutate(func(i *ScopeInfo) { i.Kind = ScopeKind("project") })},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			if _, err := c.openScope(context.Background(), row.info, nil); !errors.Is(err, ErrComposition) {
-				t.Fatalf("openScope error = %v, want ErrComposition", err)
+			{
+				_, err := c.openScope(context.Background(), row.info, nil)
+				testassert.Require(t, errors.Is(err, ErrComposition), "openScope error = %v, want ErrComposition", err)
 			}
 		})
 	}
-	if _, err := c.openScope(context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/owner/data", Workspace: "/ws", SessionID: "s", OperationID: "o"}, nil); err != nil {
-		t.Fatalf("fully attributed short scope: %v", err)
+	{
+		_, err := c.openScope(context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/owner/data", Workspace: "/ws", SessionID: "s", OperationID: "o"}, nil)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -560,9 +555,7 @@ func openGuardFixture(t *testing.T, owner context.Context) *guardFixture {
 func startBlockedCall(t *testing.T, f *guardFixture) (gctx context.Context, released, done chan struct{}) {
 	t.Helper()
 	gctx, release, err := f.ws.enter(context.Background())
-	if err != nil {
-		t.Fatalf("guard entry: %v", err)
-	}
+	testassert.NoError(t, err)
 	started := make(chan struct{})
 	released = make(chan struct{})
 	done = make(chan struct{})
@@ -596,38 +589,43 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 			closeResult := make(chan error, 1)
 			go func() { closeResult <- f.ws.close() }()
 			synctest.Wait()
-			if !errors.Is(gctx.Err(), context.Canceled) {
-				t.Fatal("scope closure did not cancel the admitted call context")
-			}
+			testassert.Require(t, errors.Is(gctx.Err(), context.Canceled), "scope closure did not cancel the admitted call context")
 			select {
 			case err := <-closeResult:
 				t.Fatalf("close completed without joining the admitted call: %v", err)
 			default:
 			}
-			if got := f.trace.all(); !slices.Contains(got, "call-start") || slices.Contains(got, "close:cons") {
-				t.Fatalf("state during the blocked call = %q, want the admitted call not yet disposed", got)
+			{
+				got := f.trace.all()
+				testassert.Require(t, slices.Contains(got, "call-start") && !slices.Contains(got, "close:cons"), "state during the blocked call = %q, want the admitted call not yet disposed", got)
 			}
 			close(released)
 			released = nil
 			<-done
-			if err := <-closeResult; !errors.Is(err, errCloser) {
-				t.Fatalf("close = %v, want the cleanup error", err)
+			{
+				err := <-closeResult
+				testassert.Require(t, errors.Is(err, errCloser), "close = %v, want the cleanup error", err)
 			}
 			want := []string{"call-start", "greet:HI", "call-end", "close:cons"}
-			if got := f.trace.all(); !reflect.DeepEqual(got, want) {
-				t.Fatalf("guard trace = %q, want %q", got, want)
+			{
+				got := f.trace.all()
+				testassert.Require(t, reflect.DeepEqual(got, want), "guard trace = %q, want %q", got, want)
 			}
-			if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
-				t.Errorf("enter after closure: %v, want ErrClosed", err)
+			{
+				_, _, err := f.ws.enter(context.Background())
+				testassert.Check(t, errors.Is(err, ErrClosed), "enter after closure: %v, want ErrClosed", err)
 			}
-			if _, err := Bind[int](f.ws.bindings, "cons.out"); !errors.Is(err, ErrClosed) {
-				t.Errorf("binding from the closed supplying scope: %v, want ErrClosed", err)
+			{
+				_, err := Bind[int](f.ws.bindings, "cons.out")
+				testassert.Check(t, errors.Is(err, ErrClosed), "binding from the closed supplying scope: %v, want ErrClosed", err)
 			}
-			if _, err := Bind[greeter](f.rt.bindings, "dep.g"); err != nil {
-				t.Errorf("binding from the still-open supplying scope: %v", err)
+			{
+				_, err := Bind[greeter](f.rt.bindings, "dep.g")
+				testassert.Check(t, err == nil, "binding from the still-open supplying scope: %v", err)
 			}
-			if err := f.rt.close(); err != nil {
-				t.Errorf("runtime close: %v", err)
+			{
+				err := f.rt.close()
+				testassert.Check(t, err == nil, "runtime close: %v", err)
 			}
 		})
 	})
@@ -636,22 +634,27 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		owner, cancelOwner := context.WithCancel(context.Background())
 		f := openGuardFixture(t, owner)
 		cancelOwner()
-		if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
-			t.Errorf("enter on an owner-canceled scope: %v, want ErrClosed", err)
+		{
+			_, _, err := f.ws.enter(context.Background())
+			testassert.Check(t, errors.Is(err, ErrClosed), "enter on an owner-canceled scope: %v, want ErrClosed", err)
 		}
-		if _, _, err := f.rt.enter(context.Background()); !errors.Is(err, ErrClosed) {
-			t.Errorf("enter on an owner-canceled ancestor scope: %v, want ErrClosed", err)
+		{
+			_, _, err := f.rt.enter(context.Background())
+			testassert.Check(t, errors.Is(err, ErrClosed), "enter on an owner-canceled ancestor scope: %v, want ErrClosed", err)
 		}
-		if _, err := Bind[int](f.ws.bindings, "cons.out"); !errors.Is(err, ErrClosed) {
-			t.Errorf("Bind from an owner-canceled supplying scope: %v, want ErrClosed", err)
+		{
+			_, err := Bind[int](f.ws.bindings, "cons.out")
+			testassert.Check(t, errors.Is(err, ErrClosed), "Bind from an owner-canceled supplying scope: %v, want ErrClosed", err)
 		}
-		if _, err := Bind[greeter](f.consDeps, "dep.g"); !errors.Is(err, ErrClosed) {
-			t.Errorf("Bind from an owner-canceled ancestor supplying scope: %v, want ErrClosed", err)
+		{
+			_, err := Bind[greeter](f.consDeps, "dep.g")
+			testassert.Check(t, errors.Is(err, ErrClosed), "Bind from an owner-canceled ancestor supplying scope: %v, want ErrClosed", err)
 		}
 		// Rejected admissions registered no work, so closure joins and
 		// disposes synchronously with no registered call to wait on.
-		if err := f.ws.close(); !errors.Is(err, errCloser) {
-			t.Errorf("close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
+		{
+			err := f.ws.close()
+			testassert.Check(t, errors.Is(err, errCloser), "close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
 		}
 	})
 
@@ -659,16 +662,19 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		f := openGuardFixture(t, context.Background())
 		caller, cancelCaller := context.WithCancel(context.Background())
 		cancelCaller()
-		if _, _, err := f.ws.enter(caller); !errors.Is(err, context.Canceled) {
-			t.Errorf("enter from a canceled caller on a live scope: %v, want context.Canceled", err)
+		{
+			_, _, err := f.ws.enter(caller)
+			testassert.Check(t, errors.Is(err, context.Canceled), "enter from a canceled caller on a live scope: %v, want context.Canceled", err)
 		}
 		// Rejected admissions registered no work, so closure joins and
 		// disposes synchronously with no registered call to wait on.
-		if err := f.ws.close(); !errors.Is(err, errCloser) {
-			t.Errorf("close after rejected admission: %v, want prompt completion with the shared cleanup error", err)
+		{
+			err := f.ws.close()
+			testassert.Check(t, errors.Is(err, errCloser), "close after rejected admission: %v, want prompt completion with the shared cleanup error", err)
 		}
-		if err := f.rt.close(); err != nil {
-			t.Errorf("runtime close: %v", err)
+		{
+			err := f.rt.close()
+			testassert.Check(t, err == nil, "runtime close: %v", err)
 		}
 	})
 
@@ -680,24 +686,29 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 		defer cancelOwner()
 		f := openGuardFixture(t, owner)
 		cancelCaller() // cancels both the caller and the scope derived from it
-		if _, _, err := f.ws.enter(caller); !errors.Is(err, context.Canceled) {
-			t.Errorf("enter from a canceled caller on its canceled derived scope: %v, want context.Canceled", err)
+		{
+			_, _, err := f.ws.enter(caller)
+			testassert.Check(t, errors.Is(err, context.Canceled), "enter from a canceled caller on its canceled derived scope: %v, want context.Canceled", err)
 		}
-		if _, _, err := f.rt.enter(caller); !errors.Is(err, context.Canceled) {
-			t.Errorf("enter from a canceled caller on a canceled derived ancestor scope: %v, want context.Canceled", err)
+		{
+			_, _, err := f.rt.enter(caller)
+			testassert.Check(t, errors.Is(err, context.Canceled), "enter from a canceled caller on a canceled derived ancestor scope: %v, want context.Canceled", err)
 		}
 		// A live caller on the same canceled scope still sees its own closed
 		// identity.
-		if _, _, err := f.ws.enter(context.Background()); !errors.Is(err, ErrClosed) {
-			t.Errorf("enter from a live caller on the canceled derived scope: %v, want ErrClosed", err)
+		{
+			_, _, err := f.ws.enter(context.Background())
+			testassert.Check(t, errors.Is(err, ErrClosed), "enter from a live caller on the canceled derived scope: %v, want ErrClosed", err)
 		}
 		// Rejected admissions registered no work, so closure joins and
 		// disposes synchronously with no registered call to wait on.
-		if err := f.ws.close(); !errors.Is(err, errCloser) {
-			t.Errorf("close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
+		{
+			err := f.ws.close()
+			testassert.Check(t, errors.Is(err, errCloser), "close after rejected admissions: %v, want prompt completion with the shared cleanup error", err)
 		}
-		if err := f.rt.close(); err != nil {
-			t.Errorf("runtime close: %v", err)
+		{
+			err := f.rt.close()
+			testassert.Check(t, err == nil, "runtime close: %v", err)
 		}
 	})
 }
@@ -815,15 +826,8 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 		res2 := f.getAsync(context.Background(), "/ws/x")
 		close(release)
 		r1, r2 := <-res1, <-res2
-		if r1.err != nil || r2.err != nil {
-			t.Fatalf("shared construction errors: %v, %v", r1.err, r2.err)
-		}
-		if r1.sc != r2.sc || r1.sc == nil {
-			t.Fatalf("same-key callers received %p and %p, want one shared scope", r1.sc, r2.sc)
-		}
-		if got := f.openCount("/ws/x"); got != 1 {
-			t.Fatalf("workspace factory ran %d times, want 1", got)
-		}
+		testassert.Require(t, r1.err == nil && r2.err == nil && r1.sc == r2.sc && r1.sc != nil, "shared construction errors: %v, %v; same-key callers received %p and %p, want one shared scope", r1.err, r2.err, r1.sc, r2.sc)
+		testassert.Equal(t, f.openCount("/ws/x"), 1)
 	})
 
 	t.Run("other keys proceed while one is held", func(t *testing.T) {
@@ -832,14 +836,10 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 		resA := f.getAsync(context.Background(), "/ws/a")
 		<-entered
 		scB, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/b"))
-		if err != nil || scB == nil {
-			t.Fatalf("unrelated key: %v", err)
-		}
+		testassert.Require(t, err == nil && scB != nil, "unrelated key: %v", err)
 		close(release)
 		rA := <-resA
-		if rA.err != nil || rA.sc == scB {
-			t.Fatalf("held key: %v %p", rA.err, rA.sc)
-		}
+		testassert.Require(t, rA.err == nil && rA.sc != scB, "held key: %v %p", rA.err, rA.sc)
 	})
 
 	t.Run("initiator cancellation preserves the attempt for surviving waiters", func(t *testing.T) {
@@ -850,21 +850,16 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 		<-entered
 		cancel1()
 		res2 := f.getAsync(context.Background(), "/ws/c")
-		if r := <-res1; !errors.Is(r.err, context.Canceled) || r.sc != nil {
-			t.Fatalf("canceled initiator: %v %p", r.err, r.sc)
+		{
+			r := <-res1
+			testassert.Require(t, errors.Is(r.err, context.Canceled) && r.sc == nil, "canceled initiator: %v %p", r.err, r.sc)
 		}
 		close(release)
 		r2 := <-res2
-		if r2.err != nil || r2.sc == nil {
-			t.Fatalf("surviving waiter: %v", r2.err)
-		}
+		testassert.Require(t, r2.err == nil && r2.sc != nil, "surviving waiter: %v", r2.err)
 		sc3, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/c"))
-		if err != nil || sc3 != r2.sc {
-			t.Fatalf("later same-key request: %v %p vs %p, want the published scope", err, sc3, r2.sc)
-		}
-		if got := f.openCount("/ws/c"); got != 1 {
-			t.Fatalf("workspace factory ran %d times after the shared attempt, want 1", got)
-		}
+		testassert.Require(t, err == nil && sc3 == r2.sc, "later same-key request: %v %p vs %p, want the published scope", err, sc3, r2.sc)
+		testassert.Equal(t, f.openCount("/ws/c"), 1)
 	})
 
 	t.Run("failed attempt shares one result and a later request retries", func(t *testing.T) {
@@ -876,9 +871,7 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 		res2 := f.getAsync(context.Background(), "/ws/d")
 		close(release)
 		r1, r2 := <-res1, <-res2
-		if !errors.Is(r1.err, errFactory) || !errors.Is(r2.err, errFactory) || r1.sc != nil || r2.sc != nil {
-			t.Fatalf("shared failure: %v vs %v", r1.err, r2.err)
-		}
+		testassert.Require(t, errors.Is(r1.err, errFactory) && errors.Is(r2.err, errFactory) && r1.sc == nil && r2.sc == nil, "shared failure: %v vs %v", r1.err, r2.err)
 		f.w.mu.Lock()
 		published := len(f.w.live) > 0 || len(f.w.attempts) > 0
 		f.w.mu.Unlock()
@@ -892,18 +885,15 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 		before := f.openCount("/ws/d")
 		res3 := f.getAsync(context.Background(), "/ws/d")
 		<-entered2
-		if got := f.openCount("/ws/d"); got != before+1 {
-			t.Fatalf("retry started %d constructions, want exactly one", got-before)
+		{
+			got := f.openCount("/ws/d")
+			testassert.Require(t, got == before+1, "retry started %d constructions, want exactly one", got-before)
 		}
 		close(release2)
 		r3 := <-res3
-		if r3.err != nil || r3.sc == nil {
-			t.Fatalf("later independent attempt: %v", r3.err)
-		}
+		testassert.Require(t, r3.err == nil && r3.sc != nil, "later independent attempt: %v", r3.err)
 		sc4, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/d"))
-		if err != nil || sc4 != r3.sc {
-			t.Fatalf("request after the successful retry: %v, want the published retry scope", err)
-		}
+		testassert.Require(t, err == nil && sc4 == r3.sc, "request after the successful retry: %v, want the published retry scope", err)
 	})
 }
 
@@ -927,17 +917,18 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 			default:
 			}
 			f.stopOwner()
-			if r := <-resJ; !errors.Is(r.err, context.Canceled) || r.sc != nil {
-				tt.Fatalf("held construction after owner cancellation: %v %p", r.err, r.sc)
+			{
+				r := <-resJ
+				testassert.Require(tt, errors.Is(r.err, context.Canceled) && r.sc == nil, "held construction after owner cancellation: %v %p", r.err, r.sc)
 			}
-			if err := <-shutdownResult; err != nil {
-				tt.Fatalf("joined shutdown: %v", err)
+			testassert.NoError(tt, <-shutdownResult)
+			{
+				_, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/new"))
+				testassert.Require(tt, errors.Is(err, ErrClosed), "get after shutdown admission closed: %v, want ErrClosed", err)
 			}
-			if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/new")); !errors.Is(err, ErrClosed) {
-				tt.Fatalf("get after shutdown admission closed: %v, want ErrClosed", err)
-			}
-			if got := f.trace.all(); slices.Contains(got, "close:/ws/j") {
-				tt.Fatalf("an unpublished construction was disposed: %q", got)
+			{
+				got := f.trace.all()
+				testassert.Require(tt, !slices.Contains(got, "close:/ws/j"), "an unpublished construction was disposed: %q", got)
 			}
 		})
 	})
@@ -945,21 +936,19 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 	t.Run("live workspaces close in sorted order and errors join", func(t *testing.T) {
 		f := newWorkspaceFixture(t)
 		for _, key := range []string{"/ws/2", "/ws/1"} {
-			if _, err := f.w.get(context.Background(), workspaceScopeInfo(key)); err != nil {
-				t.Fatalf("get %s: %v", key, err)
+			{
+				_, err := f.w.get(context.Background(), workspaceScopeInfo(key))
+				testassert.Require(t, err == nil, "get %s: %v", key, err)
 			}
 		}
 		err := f.w.shutdown()
-		if !errors.Is(err, errWorkspaceClo) {
-			t.Fatalf("shutdown error = %v, want the joined closer failures", err)
-		}
+		testassert.Require(t, errors.Is(err, errWorkspaceClo), "shutdown error = %v, want the joined closer failures", err)
 		got := f.trace.all()
 		first, second := slices.Index(got, "close:/ws/1"), slices.Index(got, "close:/ws/2")
-		if first < 0 || second < 0 || first > second {
-			t.Fatalf("workspace close order = %q, want /ws/1 before /ws/2", got)
-		}
-		if _, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/1")); !errors.Is(err, ErrClosed) {
-			t.Fatalf("get after shutdown: %v, want ErrClosed", err)
+		testassert.Require(t, first >= 0 && second >= 0 && first <= second, "workspace close order = %q, want /ws/1 before /ws/2", got)
+		{
+			_, err := f.w.get(context.Background(), workspaceScopeInfo("/ws/1"))
+			testassert.Require(t, errors.Is(err, ErrClosed), "get after shutdown: %v, want ErrClosed", err)
 		}
 	})
 }
@@ -979,29 +968,21 @@ func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 	)
 	ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/config"), nil)
 	view, err := selectCapabilities([]*scope{ws}, []string{"alpha.work"})
-	if err != nil {
-		t.Fatalf("selectCapabilities: %v", err)
-	}
+	testassert.NoError(t, err)
 	a, err := Bind[worker](view, "alpha.work")
-	if err != nil {
-		t.Fatalf("Bind selected: %v", err)
-	}
+	testassert.NoError(t, err)
 	second, err := selectCapabilities([]*scope{ws}, []string{"alpha.work"})
-	if err != nil {
-		t.Fatalf("second selection: %v", err)
-	}
+	testassert.NoError(t, err)
 	a2, err := Bind[worker](second, "alpha.work")
-	if err != nil {
-		t.Fatalf("second Bind: %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, a, a2)
+	{
+		_, err := Bind[worker](view, "beta.work")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind unselected dependency: %v, want ErrComposition", err)
 	}
-	if a != a2 {
-		t.Fatalf("two selected views supplied different instances, want the reused ones")
-	}
-	if _, err := Bind[worker](view, "beta.work"); !errors.Is(err, ErrComposition) {
-		t.Errorf("Bind unselected dependency: %v, want ErrComposition", err)
-	}
-	if _, err := selectCapabilities([]*scope{ws}, []string{"nope.work"}); !errors.Is(err, ErrComposition) {
-		t.Errorf("select unknown capability: %v, want ErrComposition", err)
+	{
+		_, err := selectCapabilities([]*scope{ws}, []string{"nope.work"})
+		testassert.Check(t, errors.Is(err, ErrComposition), "select unknown capability: %v, want ErrComposition", err)
 	}
 
 	revisionOne := &configuration{generation: 1, plugins: map[string]json.RawMessage{
@@ -1013,11 +994,13 @@ func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 	}}
 	invOne := Invocation{snapshot: revisionOne}
 	invTwo := Invocation{snapshot: revisionTwo}
-	if got, want := a.Work(invOne), `a:1 acfg:{"x":1} | b:1 bcfg:{"y":2}`; got != want {
-		t.Fatalf("revision 1 nested call = %q, want %q", got, want)
+	{
+		got, want := a.Work(invOne), `a:1 acfg:{"x":1} | b:1 bcfg:{"y":2}`
+		testassert.Equal(t, got, want)
 	}
-	if got, want := a.Work(invTwo), `a:2 acfg:{"x":9} | b:2 bcfg:none`; got != want {
-		t.Fatalf("revision 2 on the same instance = %q, want %q", got, want)
+	{
+		got, want := a.Work(invTwo), `a:2 acfg:{"x":9} | b:2 bcfg:none`
+		testassert.Equal(t, got, want)
 	}
 
 	var zero Invocation
@@ -1026,9 +1009,7 @@ func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 	}
 	handed := invOne.Config("alpha")
 	handed[2] = '0'
-	if string(revisionOne.plugins["alpha"]) != `{"x":1}` {
-		t.Fatalf("Config handout aliases the snapshot: %s", revisionOne.plugins["alpha"])
-	}
+	testassert.Require(t, string(revisionOne.plugins["alpha"]) == `{"x":1}`, "Config handout aliases the snapshot: %s", revisionOne.plugins["alpha"])
 	if invOne.Config("missing") != nil {
 		t.Errorf("Config for an unconfigured plugin = %v, want nil", invOne.Config("missing"))
 	}
@@ -1051,12 +1032,8 @@ func TestAcceptSettingsAppliesTheNoSettingsRule(t *testing.T) {
 		{"number", json.RawMessage(`1`), false},
 	} {
 		err := acceptSettings(Plugin{ID: "plain"}, row.raw)
-		if row.ok && err != nil {
-			t.Errorf("%s: %v, want acceptance", row.name, err)
-		}
-		if !row.ok && !errors.Is(err, ErrComposition) {
-			t.Errorf("%s: %v, want ErrComposition", row.name, err)
-		}
+		testassert.Check(t, !row.ok || err == nil, "%s: %v, want acceptance", row.name, err)
+		testassert.Check(t, row.ok || errors.Is(err, ErrComposition), "%s: %v, want ErrComposition", row.name, err)
 	}
 	var seen json.RawMessage
 	validator := func(raw json.RawMessage) error {
@@ -1066,27 +1043,20 @@ func TestAcceptSettingsAppliesTheNoSettingsRule(t *testing.T) {
 		}
 		return errValidator
 	}
-	if err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: validator}, json.RawMessage(`null`)); err != nil {
-		t.Fatalf("validator input: %v", err)
-	}
-	if string(seen) != `null` {
-		t.Fatalf("validator saw %s, want the owned input unchanged", seen)
-	}
-	if err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: validator}, json.RawMessage(`{"a":1}`)); !errors.Is(err, errValidator) {
-		t.Fatalf("validator failure = %v, want the source identity", err)
+	testassert.NoError(t, acceptSettings(Plugin{ID: "cfg", ValidateConfig: validator}, json.RawMessage(`null`)))
+	testassert.Require(t, string(seen) == `null`, "validator saw %s, want the owned input unchanged", seen)
+	{
+		err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: validator}, json.RawMessage(`{"a":1}`))
+		testassert.Require(t, errors.Is(err, errValidator), "validator failure = %v, want the source identity", err)
 	}
 	// A non-nil validator receives an independent clone: in-place scratch
 	// never reaches the caller's bytes.
 	caller := json.RawMessage(`{"a":"12345"}`)
-	if err := acceptSettings(Plugin{ID: "cfg", ValidateConfig: func(got json.RawMessage) error {
+	testassert.NoError(t, acceptSettings(Plugin{ID: "cfg", ValidateConfig: func(got json.RawMessage) error {
 		tamperScratch(got, "12345", "xxxxx")
 		return nil
-	}}, caller); err != nil {
-		t.Fatalf("cloned validator input: %v", err)
-	}
-	if string(caller) != `{"a":"12345"}` {
-		t.Fatalf("caller bytes after validator scratch = %s, want unchanged", caller)
-	}
+	}}, caller))
+	testassert.Require(t, string(caller) == `{"a":"12345"}`, "caller bytes after validator scratch = %s, want unchanged", caller)
 }
 
 // noopTool is a concrete Tool implementation for declaration tests; no
@@ -1131,8 +1101,9 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 		{"ToolSpec with a nil function", []Plugin{{ID: "tools", Scope: ScopeRuntime, Provides: []CapabilitySpec{ToolSpec("tool.x", nil)}, Open: noop}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			if _, err := newComposition(row.plugins); !errors.Is(err, ErrComposition) {
-				t.Fatalf("newComposition error = %v, want ErrComposition", err)
+			{
+				_, err := newComposition(row.plugins)
+				testassert.Require(t, errors.Is(err, ErrComposition), "newComposition error = %v, want ErrComposition", err)
 			}
 		})
 	}
@@ -1149,8 +1120,9 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 		}}
 	provider := Plugin{ID: "tools", Scope: ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("tool.x", staticToolDescription("tool.x"))}, Open: noop}
-	if _, err := newComposition([]Plugin{provider, consumer}); err != nil {
-		t.Fatalf("Requires-side composition error = %v, want the ordinary Requires declaration to compose", err)
+	{
+		_, err := newComposition([]Plugin{provider, consumer})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -1179,19 +1151,16 @@ func TestToolDeclarationsComposeAtAllScopes(t *testing.T) {
 	for kind := range map[ScopeKind]string{
 		ScopeRuntime: "", ScopeWorkspace: "", ScopeOperation: "", ScopeAgent: "",
 	} {
-		if got := len(c.plan[kind]); got != 1 {
-			t.Fatalf("%s plan holds %d plugins, want 1", kind, got)
+		{
+			got := len(c.plan[kind])
+			testassert.Require(t, got == 1, "%s plan holds %d plugins, want 1", kind, got)
 		}
 	}
 	slices.Sort(wantIDs)
 	gotIDs := append([]string(nil), c.toolIDs...)
 	slices.Sort(gotIDs)
-	if !slices.Equal(gotIDs, wantIDs) {
-		t.Fatalf("tool universe = %v, want every declared tool ID %v", gotIDs, wantIDs)
-	}
-	if opened != 0 {
-		t.Fatalf("%d factories ran during declaration validation", opened)
-	}
+	testassert.Require(t, slices.Equal(gotIDs, wantIDs), "tool universe = %v, want every declared tool ID %v", gotIDs, wantIDs)
+	testassert.Equal(t, opened, 0)
 }
 
 // TestToolSpecDescribeValidatesAndCopies proves the recorded description
@@ -1212,42 +1181,37 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 	wantInvocation := Invocation{}
 	wantConstraints := ToolConstraints{Readonly: true, WriteDir: "/w"}
 	description, err := spec.describe(wantInvocation, wantConstraints, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("describe: %v", err)
-	}
+	testassert.NoError(t, err)
 	if gotInvocation.Revision() != wantInvocation.Revision() || gotConstraints != wantConstraints {
 		t.Fatalf("describe inputs = (%q, %+v), want the supplied invocation and constraints echoed", gotInvocation.Revision(), gotConstraints)
 	}
-	if !description.Available || !description.DefaultHidden || description.Definition.Description != "reads" || description.Definition.Name != "tool.x" {
-		t.Fatalf("description = %+v, want the flags and validated definition passed through", description)
-	}
+	testassert.Require(t, description.Available && description.DefaultHidden && description.Definition.Description == "reads" && description.Definition.Name == "tool.x", "description = %+v, want the flags and validated definition passed through", description)
 	// The returned definition is an owned copy in both directions.
 	source.Parameters = json.RawMessage(`{"a":2}`)
-	if string(description.Definition.Parameters) != `{"a":1}` {
-		t.Fatalf("returned parameters = %s, want the copied bytes", description.Definition.Parameters)
-	}
+	testassert.Require(t, string(description.Definition.Parameters) == `{"a":1}`, "returned parameters = %s, want the copied bytes", description.Definition.Parameters)
 	description.Definition.Parameters = json.RawMessage(`{"a":3}`)
-	if string(source.Parameters) != `{"a":2}` {
-		t.Fatalf("source parameters = %s, want the returned copy owned by the caller", source.Parameters)
-	}
+	testassert.Require(t, string(source.Parameters) == `{"a":2}`, "source parameters = %s, want the returned copy owned by the caller", source.Parameters)
 
 	mismatch := ToolSpec("tool.y", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{Definition: model.ToolDefinition{Name: "other", Parameters: json.RawMessage(`{}`)}}, nil
 	})
-	if _, err := mismatch.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); err == nil || !strings.Contains(err.Error(), "tool.y") {
-		t.Fatalf("mismatched describe error = %v, want the ID/name match rejection", err)
+	{
+		_, err := mismatch.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{})
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "tool.y"), "mismatched describe error = %v, want the ID/name match rejection", err)
 	}
 	invalid := ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`[1]`)}}, nil
 	})
-	if _, err := invalid.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); err == nil {
-		t.Fatal("invalid parameters accepted by the recorded description")
+	{
+		_, err := invalid.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{})
+		testassert.Require(t, err != nil, "invalid parameters accepted by the recorded description")
 	}
 	failing := ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, errValidator
 	})
-	if _, err := failing.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{}); !errors.Is(err, errValidator) {
-		t.Fatalf("describe failure = %v, want the source error", err)
+	{
+		_, err := failing.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{})
+		testassert.Require(t, errors.Is(err, errValidator), "describe failure = %v, want the source error", err)
 	}
 }
 
@@ -1277,9 +1241,7 @@ func TestCompositionBindsReportWarningPerRuntimeFactory(t *testing.T) {
 	owner, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	mustOpenScope(t, isolated, owner, runtimeScopeInfo(), nil)
-	if captures["isolated"] != nil {
-		t.Fatal("an isolated composition supplied a ReportWarning callback")
-	}
+	testassert.Require(t, captures["isolated"] == nil, "an isolated composition supplied a ReportWarning callback")
 
 	// The owner's composition binds each Runtime-scoped factory to its own
 	// registered ID; a Workspace-scoped factory never receives the ingress.
@@ -1290,23 +1252,21 @@ func TestCompositionBindsReportWarningPerRuntimeFactory(t *testing.T) {
 	}
 	runtimeScope := mustOpenScope(t, c, owner, runtimeScopeInfo(), nil)
 	mustOpenScope(t, c, owner, workspaceScopeInfo("/ws"), []*scope{runtimeScope})
-	if captures["alpha"] == nil || captures["beta"] == nil {
-		t.Fatal("a Runtime-scoped factory received no ReportWarning callback")
-	}
-	if captures["gamma"] != nil {
-		t.Fatal("a Workspace-scoped factory received the Runtime warning ingress")
-	}
+	testassert.Require(t, captures["alpha"] != nil && captures["beta"] != nil, "a Runtime-scoped factory received no ReportWarning callback")
+	testassert.Require(t, captures["gamma"] == nil, "a Workspace-scoped factory received the Runtime warning ingress")
 	captures["alpha"]("a_kind", "a_message")
 	captures["beta"]("b_kind", "b_message")
-	if want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}; !slices.Equal(reported, want) {
-		t.Fatalf("reported = %v, want each factory's own registered ID", reported)
+	{
+		want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}
+		testassert.Require(t, slices.Equal(reported, want), "reported = %v, want each factory's own registered ID", reported)
 	}
 
 	// The scope's cancellation is the callback's boundary: a canceled scope
 	// drops the report.
 	cancel()
 	captures["alpha"]("late_kind", "late_message")
-	if want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}; !slices.Equal(reported, want) {
-		t.Fatalf("a canceled scope's report reached the sink: %v", reported)
+	{
+		want := []string{"alpha|a_kind|a_message", "beta|b_kind|b_message"}
+		testassert.Require(t, slices.Equal(reported, want), "a canceled scope's report reached the sink: %v", reported)
 	}
 }

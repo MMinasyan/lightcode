@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -103,34 +104,30 @@ func TestProtocolHydrationPendingDuringParkedQueuedDelivery(t *testing.T) {
 		defer release() // LIFO: the gate releases before the owner close joins
 
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "pending-delivery"), AgentType: "solo"})
-		if err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		if created.JSON201 == nil {
-			t.Fatalf("create = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, created.JSON201 != nil, "create = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		session := created.JSON201.SessionId
 
 		// op-1 parks at its model boundary; the queued message buffers behind
 		// the active turn.
-		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
-			OperationId: "op-1", Mode: protocol.SubmitRequestModeRegular,
-			Content: []protocol.ContentPart{textContentPart(t, "running", nil)},
-		}); err != nil {
-			t.Fatalf("op-1 submit: %v", err)
+		{
+			_, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
+				OperationId: "op-1", Mode: protocol.SubmitRequestModeRegular,
+				Content: []protocol.ContentPart{textContentPart(t, "running", nil)},
+			})
+			testassert.NoError(t, err)
 		}
 		awaitModelArrival(t, e)
-		if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
-			OperationId: "op-2", Mode: protocol.SubmitRequestModeQueued,
-			Content: []protocol.ContentPart{textContentPart(t, "queued-1", nil)},
-		}); err != nil {
-			t.Fatalf("queued submit: %v", err)
+		{
+			_, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
+				OperationId: "op-2", Mode: protocol.SubmitRequestModeQueued,
+				Content: []protocol.ContentPart{textContentPart(t, "queued-1", nil)},
+			})
+			testassert.NoError(t, err)
 		}
 
 		buffered := mountedHydration(t, client, session)
-		if len(buffered.Pending.Queued) != 1 || buffered.Pending.Queued[0].OperationId != "op-2" {
-			t.Fatalf("buffered pending = %+v, want the queued op-2", buffered.Pending)
-		}
+		testassert.Require(t, len(buffered.Pending.Queued) == 1 && buffered.Pending.Queued[0].OperationId == "op-2", "buffered pending = %+v, want the queued op-2", buffered.Pending)
 
 		// The queued delivery parks inside its admission's storage lifetime:
 		// the coordinator mutex is free there, so the mounted hydration reads
@@ -145,38 +142,28 @@ func TestProtocolHydrationPendingDuringParkedQueuedDelivery(t *testing.T) {
 		}
 
 		unresolved := mountedHydration(t, client, session)
-		if len(unresolved.Pending.Queued) != 1 || unresolved.Pending.Queued[0].OperationId != "op-2" {
-			t.Fatalf("pending during the parked delivery = %+v, want the selected head still pending", unresolved.Pending)
-		}
+		testassert.Require(t, len(unresolved.Pending.Queued) == 1 && unresolved.Pending.Queued[0].OperationId == "op-2", "pending during the parked delivery = %+v, want the selected head still pending", unresolved.Pending)
 		for _, op := range unresolved.Operations {
-			if op.OperationId == "op-2" {
-				t.Fatalf("the pending item %s committed before its delivery completed", op.OperationId)
-			}
+			testassert.Require(t, op.OperationId != "op-2", "the pending item %s committed before its delivery completed", op.OperationId)
 		}
 
 		parked.releasePark() // the adoption removes the queued head in its own critical section
 		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
 
 		settled := mountedHydration(t, client, session)
-		if len(settled.Pending.Steering) != 0 || len(settled.Pending.Queued) != 0 {
-			t.Fatalf("pending after the adoption = %+v, want both FIFOs empty", settled.Pending)
-		}
+		testassert.Require(t, len(settled.Pending.Steering) == 0 && len(settled.Pending.Queued) == 0, "pending after the adoption = %+v, want both FIFOs empty", settled.Pending)
 		found := false
 		for _, item := range settled.Conversation.Items {
 			if itemKind(t, item) != "input" {
 				continue
 			}
 			input, err := item.AsInputItem()
-			if err != nil {
-				t.Fatalf("input item: %v", err)
-			}
+			testassert.NoError(t, err)
 			if input.OperationId != nil && *input.OperationId == "op-2" {
 				found = true
 			}
 		}
-		if !found {
-			t.Fatal("the adopted queued input is missing from the conversation page")
-		}
+		testassert.Require(t, found, "the adopted queued input is missing from the conversation page")
 	})
 }
 
@@ -186,11 +173,7 @@ func mountedHydration(t *testing.T, client *protocol.ClientWithResponses, sessio
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resp, err := client.GetSessionHydrationWithResponse(ctx, sessionID)
-	if err != nil {
-		t.Fatalf("GetSessionHydration(%s): %v", sessionID, err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("GetSessionHydration(%s) = status %d: %s", sessionID, resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.Require(t, err == nil, "GetSessionHydration(%s): %v", sessionID, err)
+	testassert.Require(t, resp.JSON200 != nil, "GetSessionHydration(%s) = status %d: %s", sessionID, resp.HTTPResponse.StatusCode, resp.Body)
 	return resp.JSON200
 }
