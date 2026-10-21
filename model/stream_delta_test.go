@@ -4,12 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
-// TestNewStreamDeltaDeepCopyAndPositions pins delta construction rules.
+// TestNewStreamDeltaDeepCopyAndPositions pins the StreamDelta accepting rules
+// through both entry points: one inventory of positioned fragments, closed
+// content kinds and Extra scopes with their original expected verdicts, plus
+// the constructor's deep-copy/field-preservation probes and the validator's
+// non-mutation observation.
 func TestNewStreamDeltaDeepCopyAndPositions(t *testing.T) {
 	contentSrc := json.RawMessage(`"x"`)
 	pos0 := 1 // non-nil pointer position for the tool fragment.
@@ -46,30 +51,58 @@ func TestNewStreamDeltaDeepCopyAndPositions(t *testing.T) {
 	out4, _ := NewStreamDelta(StreamDelta{HasChoice: true})
 	testassert.Require(t, out4.Usage == nil, "%v", "absent delta usage must stay absent")
 
-	casesErr := []struct {
-		name string
-		d    StreamDelta
+	neg := -1
+	negTwo := -2
+	rows := []struct {
+		name      string
+		delta     StreamDelta
+		wantErr   bool
+		wantIsAny []error
 	}{
-		{name: "negative content fragment position", d: StreamDelta{ContentFragments: []ContentFragment{{Position: -1, Kind: PartText}}}},
-		{name: "negative tool fragment pointer position", d: func() StreamDelta {
-			p := -2
-			return StreamDelta{ToolFragments: []ToolCallFragment{{ID: "c", Name: "f", Position: &p}}}
-		}()},
+		{"rich choice-bearing", richDeltaFixture(), false, nil},
+		{"empty delta", StreamDelta{HasChoice: true}, false, nil},
+		{"usage only", StreamDelta{HasChoice: true, Usage: &Usage{InputTokens: 1}}, false, nil},
+		{"nil tool pointer position", StreamDelta{ToolFragments: []ToolCallFragment{{ID: "c", Name: "f"}}}, false, nil},
+		{"transient empty text at position zero", StreamDelta{ContentFragments: []ContentFragment{{Position: 0, Kind: PartText}}}, false, nil},
+		{"transient image URL later", StreamDelta{ContentFragments: []ContentFragment{{Position: 1, Kind: PartImageURL}}}, false, nil},
+		{"transient opaque without wire type", StreamDelta{ContentFragments: []ContentFragment{{Position: 2, Kind: PartOpaque}}}, false, nil},
+		{"negative content position", StreamDelta{HasChoice: true, ContentFragments: []ContentFragment{{Position: -1, Kind: PartText, Text: "x"}}}, true, nil},
+		{"negative content fragment position", StreamDelta{ContentFragments: []ContentFragment{{Position: -1, Kind: PartText}}}, true, []error{ErrInvalidPosition}},
+		{"cross-kind fragment", StreamDelta{HasChoice: true, ContentFragments: []ContentFragment{{Position: 0, Kind: PartText, Text: "x", URL: "u"}}}, true, nil},
+		{"unknown kind", StreamDelta{HasChoice: true, ContentFragments: []ContentFragment{{Position: 0, Kind: PartKind("audio"), Text: "x"}}}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"empty content kind", StreamDelta{ContentFragments: []ContentFragment{{Position: 0, Text: "x"}}}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"text fragment carrying a URL", StreamDelta{ContentFragments: []ContentFragment{{Position: 0, Kind: PartText, Text: "a", URL: "b"}}}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"image fragment carrying an opaque wire type", StreamDelta{ContentFragments: []ContentFragment{{Position: 1, Kind: PartImageURL, OpaqueWireType: "thinking"}}}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"negative tool pointer position", StreamDelta{HasChoice: true, ToolFragments: []ToolCallFragment{{ID: "c", Name: "f", Position: &neg}}}, true, nil},
+		{"negative tool fragment pointer position", StreamDelta{ToolFragments: []ToolCallFragment{{ID: "c", Name: "f", Position: &negTwo}}}, true, []error{ErrInvalidPosition}},
+		{"malformed tool extra", StreamDelta{HasChoice: true, ToolFragments: []ToolCallFragment{{ID: "c", Name: "f", Extra: Extra{"k": json.RawMessage(`{oops`)}}}}, true, nil},
+		{"malformed message extra", StreamDelta{HasChoice: true, MessageExtra: Extra{"m": json.RawMessage(`[1`)}}, true, nil},
+		{"valid-looking text with an invalid sibling", StreamDelta{HasChoice: true, RefusalFragment: "no", ContentFragments: []ContentFragment{{Position: -1, Kind: PartText, Text: "x"}}}, true, nil},
 	}
-	for _, tc := range casesErr {
-		t.Run(tc.name, func(t *testing.T) {
-			{
-				_, err := NewStreamDelta(tc.d)
-				testassert.Require(t, errors.Is(err, ErrInvalidPosition), "error = %v, want ErrInvalidPosition", err)
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			got, newErr := NewStreamDelta(row.delta)
+			validateErr := ValidateStreamDelta(row.delta)
+			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			if len(row.wantIsAny) > 0 {
+				testassert.Require(t, matchesAnySentinel(newErr, row.wantIsAny...) && matchesAnySentinel(validateErr, row.wantIsAny...), "fixture %s: errors = %v / %v, want one of %v", row.name, newErr, validateErr, row.wantIsAny)
+			}
+			if !row.wantErr {
+				testassert.Require(t, reflect.DeepEqual(got, row.delta), "delta not preserved: %#v", got)
 			}
 		})
 	}
 
-	nilPos := StreamDelta{ToolFragments: []ToolCallFragment{{ID: "c", Name: "f"}}} // omitted position is optional.
+	// The validator mutates nothing, nested fragments and extras included.
+	validated := richDeltaFixture()
+	before := richDeltaFixture()
 	{
-		_, err := NewStreamDelta(nilPos)
+		err := ValidateStreamDelta(validated)
 		testassert.NoError(t, err)
 	}
+	testassert.Require(t, reflect.DeepEqual(validated, before), "%v", "ValidateStreamDelta mutated its input")
 
 	var fake streamFakeImpl
 	out5, _ := NewStreamDelta(StreamDelta{HasChoice: true})
@@ -150,50 +183,5 @@ func TestNewProtocolWarning(t *testing.T) {
 	}
 	for extra := range got {
 		t.Fatalf("ProtocolWarning has non-contract field %q", extra)
-	}
-}
-
-// TestNewStreamDeltaContentFragmentValidation pins the closed content-kind and field-exclusivity contract at the stream-delta accepting boundary: fragments are validated like content values, while still permitting empty transient text/URL/opaque-type pieces (including a transiently absent opaque wire type — only canonical parts require it).
-func TestNewStreamDeltaContentFragmentValidation(t *testing.T) {
-	rejected := []struct {
-		name string
-		frag ContentFragment
-	}{
-		{name: "unknown content kind rejected", frag: ContentFragment{Position: 0, Kind: PartKind("audio")}},
-		{name: "empty content kind rejected", frag: ContentFragment{Position: 0, Text: "x"}},
-		{name: "text fragment carrying a URL rejected", frag: ContentFragment{Position: 0, Kind: PartText, Text: "a", URL: "b"}},
-		{name: "image_url fragment carrying an opaque wire type rejected", frag: ContentFragment{Position: 1, Kind: PartImageURL, OpaqueWireType: "thinking"}},
-	}
-	for _, tc := range rejected {
-		t.Run(tc.name+" rejects at the delta boundary", func(t *testing.T) {
-			{
-				_, err := NewStreamDelta(StreamDelta{ContentFragments: append([]ContentFragment{}, tc.frag)})
-				testassert.Require(t, errors.Is(err, ErrForbiddenField) || errors.Is(err, ErrMissingField), "fragment %#v error = %v", tc.frag, err)
-			}
-		})
-	}
-
-	transient := []struct {
-		name string
-		frag ContentFragment
-	}{
-		{name: "empty text piece at position zero allowed transitively", frag: ContentFragment{Position: 0, Kind: PartText}},
-		{name: "image URL may arrive in a later delta", frag: ContentFragment{Position: 1, Kind: PartImageURL}},
-	}
-	for _, tc := range transient {
-		t.Run(tc.name+" accepted at the delta boundary", func(t *testing.T) {
-			gotOut, err := NewStreamDelta(StreamDelta{ContentFragments: append([]ContentFragment{}, tc.frag)})
-			testassert.Require(t, err == nil && len(gotOut.ContentFragments) == 1 && gotOut.ContentFragments[0].Kind == tc.frag.Kind && gotOut.ContentFragments[0].Position == tc.frag.Position, "transient fragment %#v = %#v (err %v)", tc.frag, gotOut.ContentFragments, err)
-		})
-	}
-
-	opaqueTransient := ContentFragment{Position: 2, Kind: PartOpaque} // wire type absent for now.
-	gotOpaq, e2 := NewStreamDelta(StreamDelta{ContentFragments: append([]ContentFragment{}, opaqueTransient)})
-	testassert.Require(t, e2 == nil && gotOpaq.ContentFragments[0].Kind == PartOpaque, "transiently empty opaque wire type must be permitted on fragments (err %v): %#v", e2, gotOpaq)
-
-	partLevelStillRequiresWireType := ContentPart{Kind: PartOpaque} // the SAME shape is invalid as a canonical part.
-	{
-		_, pErr := NewContentPart(partLevelStillRequiresWireType)
-		testassert.Require(t, errors.Is(pErr, ErrMissingField), "canonical opaque part without wire type error = %v, want ErrMissingField (fragment allowance does not loosen parts)", pErr)
 	}
 }

@@ -62,7 +62,7 @@ func toolDelta(frags ...model.ToolCallFragment) model.StreamDelta {
 	return model.StreamDelta{HasChoice: true, ToolFragments: frags}
 }
 
-// stopDelta is a trailing choice carrying only finish reason stop; the payload accumulated in earlier deltas of the same stream above it.
+// stopDelta is a trailing choice carrying only finish reason stop; any payload arrived in earlier deltas.
 func stopDelta() model.StreamDelta { return model.StreamDelta{HasChoice: true, FinishReason: "stop"} }
 
 // toolCallsDelta is a trailing choice carrying only finish reason tool_calls; its fragments arrived in earlier deltas of the same stream.
@@ -78,7 +78,7 @@ func msgContent(out model.Output) []model.ContentPart {
 	return out.Message.Content
 }
 
-// msgRefusal returns the refusal string of a present output message, or the marker <nil-message> when no partial content was retained at all by design above it
+// msgRefusal returns the refusal string of a present output message, or the marker <nil-message> when no message was retained.
 func msgRefusal(out model.Output) string {
 	if out.Message == nil {
 		return "<nil-message>"
@@ -86,7 +86,7 @@ func msgRefusal(out model.Output) string {
 	return out.Message.Refusal
 }
 
-// msgCalls returns the ordered tool calls of a present output message, or nil when none were retained
+// msgCalls returns the ordered tool calls of a present output message, or nil when none were retained.
 func msgCalls(out model.Output) []model.ToolCall {
 	if out.Message == nil {
 		return nil
@@ -105,16 +105,11 @@ func usageStep(u model.Usage) func() (model.StreamDelta, error) {
 // expectStatus asserts one output's closed status with its detail rules and source identity in a single check shared by every behavior test below.
 func expectStatus(t *testing.T, out model.Output, want model.OutputStatus) {
 	t.Helper()
-	// wrong closed status is the primary failure mode every assembler test guards against first before any payload-level detail assertion further below it in wire order across all those network hops between us there over on their end of things entirely without any further communication whatsoever after that point forward.
+	// Wrong closed status is the primary failure mode.
 	testassert.Require(t, out.Status == want, "status = %q, want %q (detail=%q)", out.Status, want, out.Detail)
 
-	// completed outputs must carry empty detail by contract — any non-empty diagnostic text on a supposedly-successful shape is itself an invariant violation worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
-	// fail with the offending prose included verbatim so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which unexpected wording leaked through from wherever inside assembly itself produced it in the first place above these lines verbatim without alteration whatsoever at all.
-	// errored and interrupted outputs both mandate non-empty diagnostic detail under contract — absence of any explanatory text on a non-successful shape is equally worth failing loudly about right here in place rather than papering over silently anywhere downstream of this if-block below it further ahead now.
-	// fail with just the offending status name included so whoever reads the failure later upstream/downstream along this particular trajectory forward can see exactly which non-successful shape failed to explain itself properly through its own mandated Detail field above these lines verbatim without alteration whatsoever at all.
+	// Completed outputs carry empty detail; errored/interrupted output requires non-empty detail.
 	testassert.Require(t, (want != model.OutputCompleted || out.Detail == "") && (want == model.OutputCompleted || out.Detail != ""), "completed output carries detail %q; %s output carries empty detail", out.Detail, want)
 
-	// every assembler output in this package's tests must carry back exactly the source identity it was invoked with under contract — any divergence here means either state corruption somewhere upstream inside assembly itself or a wrong ref passed into Assemble from whichever specific calling site above these lines now rather than scattered across multiple files' worth of prose below it further ahead in wire order.
-	testassert.Equal(t, out.Source, testRef) // else: source matched exactly as required — no further action needed on that specific dimension anywhere downstream of this final if-block ends here now under exactly one rule documented inline within its own single-line comment.
-
+	testassert.Equal(t, out.Source, testRef)
 }

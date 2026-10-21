@@ -167,41 +167,61 @@ func TestNewMessageRejectsInvalidEmbeddedPartsAndCalls(t *testing.T) {
 }
 
 func TestNewContentPartKindsAndExclusivity(t *testing.T) {
-	valid := []struct {
-		name string
-		part ContentPart
+	// One inventory for the ContentPart accepting boundary: the cross-kind,
+	// unknown-kind, missing-wire-type and Extra-value shapes, each with its
+	// original expected verdict. Both entry points must match every row.
+	rows := []struct {
+		name      string
+		part      ContentPart
+		wantErr   bool
+		wantIsAny []error
 	}{
-		{name: "text", part: ContentPart{Kind: PartText, Text: "hi"}},
-		{name: "empty text allowed for later finalization omission", part: ContentPart{Kind: PartText}},
-		{name: "image url only", part: ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png"}},
-		{name: "opaque wire type with extras", part: ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"data": json.RawMessage(`"x"`)}}},
-	}
-	for _, tc := range valid {
-		t.Run(tc.name+" accepts", func(t *testing.T) {
-			out, err := NewContentPart(tc.part)
-			testassert.NoError(t, err)
-			testassert.Require(t, out.Kind == tc.part.Kind && out.Text == tc.part.Text && out.URL == tc.part.URL && out.OpaqueWireType == tc.part.OpaqueWireType, "part not preserved: %#v", out)
-		})
+		{"text", ContentPart{Kind: PartText, Text: "hi"}, false, nil},
+		{"rich text", ContentPart{Kind: PartText, Text: "hello", Extra: Extra{"k": json.RawMessage(`"v"`)}}, false, nil},
+		{"empty text allowed for later finalization omission", ContentPart{Kind: PartText}, false, nil},
+		{"image url only", ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png"}, false, nil},
+		{"opaque wire type with extras", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"data": json.RawMessage(`"x"`)}}, false, nil},
+		{"opaque with nested extra", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"t": json.RawMessage(`{"n":1}`)}}, false, nil},
+		{"null extra value", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"n": json.RawMessage(`null`)}}, false, nil},
+		{"unknown kind rejected", ContentPart{Kind: PartKind("image")}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"unknown named kind rejected", ContentPart{Kind: PartKind("audio"), Text: "a"}, true, nil},
+		{"empty kind rejected", ContentPart{Text: "hi"}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"text with url rejected", ContentPart{Kind: PartText, Text: "a", URL: "b"}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"text carrying opaque wire type rejected", ContentPart{Kind: PartText, Text: "a", OpaqueWireType: "thinking"}, true, nil},
+		{"image carrying text rejected", ContentPart{Kind: PartImageURL, URL: "u", Text: "a"}, true, nil},
+		{"image carrying opaque wire type rejected", ContentPart{Kind: PartImageURL, URL: "u", OpaqueWireType: "thinking"}, true, nil},
+		{"url without image kind rejected", ContentPart{URL: "https://x"}, true, []error{ErrForbiddenField, ErrMissingField}},
+		{"opaque carrying text rejected", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", Text: "a"}, true, nil},
+		{"opaque carrying url rejected", ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking", URL: "u"}, true, nil},
+		{"opaque missing wire type rejected", ContentPart{Kind: PartOpaque}, true, []error{ErrMissingField}},
+		{"malformed extra", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"raw": json.RawMessage("not json")}}, true, nil},
+		{"empty extra value", ContentPart{Kind: PartText, Text: "a", Extra: Extra{"e": json.RawMessage{}}}, true, nil},
 	}
 
-	cases := []struct {
-		name string
-		part ContentPart
-	}{
-		{name: "unknown kind rejected", part: ContentPart{Kind: PartKind("image")}},
-		{name: "empty kind rejected", part: ContentPart{Text: "hi"}},
-		{name: "text with url rejected", part: ContentPart{Kind: PartText, Text: "a", URL: "b"}},
-		{name: "url without image kind rejected", part: ContentPart{URL: "https://x"}},
-		{name: "opaque missing wire type rejected", part: ContentPart{Kind: PartOpaque}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name+" rejects", func(t *testing.T) {
-			{
-				_, err := NewContentPart(tc.part)
-				testassert.Require(t, errors.Is(err, ErrForbiddenField) || errors.Is(err, ErrMissingField), "error = %v, want ErrForbiddenField or ErrMissingField", err)
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			out, newErr := NewContentPart(row.part)
+			validateErr := ValidateContentPart(row.part)
+			requireEqualConstructorVerdict(t, row.name, newErr, validateErr)
+			testassert.Require(t, (newErr != nil) == row.wantErr, "fixture %s: error = %v, wantErr = %v", row.name, newErr, row.wantErr)
+			if len(row.wantIsAny) > 0 {
+				testassert.Require(t, matchesAnySentinel(newErr, row.wantIsAny...) && matchesAnySentinel(validateErr, row.wantIsAny...), "fixture %s: errors = %v / %v, want one of %v", row.name, newErr, validateErr, row.wantIsAny)
+			}
+			if !row.wantErr {
+				testassert.Require(t, out.Kind == row.part.Kind && out.Text == row.part.Text && out.URL == row.part.URL && out.OpaqueWireType == row.part.OpaqueWireType, "part not preserved: %#v", out)
 			}
 		})
 	}
+
+	// The validator mutates nothing: a value-equal sibling still compares
+	// equal after the call, extras included.
+	in := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
+	before := ContentPart{Kind: PartImageURL, URL: "https://example.com/a.png", Extra: Extra{"detail": json.RawMessage(`"high"`)}}
+	{
+		err := ValidateContentPart(in)
+		testassert.NoError(t, err)
+	}
+	testassert.Require(t, reflect.DeepEqual(in, before), "%v", "ValidateContentPart mutated its input")
 
 	opaqueIn := ContentPart{Kind: PartOpaque, OpaqueWireType: "thinking"}
 	outOpaq, err := NewContentPart(opaqueIn)

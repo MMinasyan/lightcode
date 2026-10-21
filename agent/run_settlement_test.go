@@ -9,34 +9,17 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// TestRunForgedModelSettlementsRejected pins every malformed settlement shape ending the run with one typed boundary-protocol error naming the "model" boundary and a zero terminal, through the shared validator — no effect after it runs.
+// TestRunForgedModelSettlementsRejected pins every shared malformed settlement
+// shape ending the run with its typed boundary-protocol error and a zero
+// terminal, through the shared validator — no effect after it runs.
 func TestRunForgedModelSettlementsRejected(t *testing.T) {
-	errored := mkOutput(model.OutputErrored, "boom", nil)
-	completed := mkOutput(model.OutputCompleted, "", nil)
-	foreign := mkForeignSettlementOutput(model.OutputCompleted, "", model.ModelRef{Provider: "acme", Model: "other"})
-
-	rows := []struct {
-		name string
-		set  ModelSettlement
-	}{
-		{"ready-nil-output", ModelSettlement{Disposition: DispoReady}},
-		{"ready-errored-output", ModelSettlement{Disposition: DispoReady, Output: errored}},
-		{"continue-nil-output", ModelSettlement{Disposition: DispoContinue}},
-		{"failure-completed-output", ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}},
-		{"failure-empty-detail", ModelSettlement{Disposition: DispoFailure}},
-		{"interruption-errored-output", ModelSettlement{Disposition: DispoInterruption, Output: errored, Detail: "d"}},
-		{"interruption-empty-detail", ModelSettlement{Disposition: DispoInterruption}},
-		{"unknown-disposition", ModelSettlement{Disposition: "bogus"}},
-		{"foreign-source", ModelSettlement{Disposition: DispoReady, Output: foreign}},
-	}
-
-	for _, row := range rows {
+	for _, row := range forgedModelSettlements() {
 		t.Run(row.name, func(t *testing.T) {
 			f := &runFakes{}
 			f.modelSet = setScript(row.set)
 
 			res, err := Run(context.Background(), f.invocation())
-			requireBoundaryViolation(t, err, "model")
+			requireBoundaryViolation(t, err, row.wantBoundary)
 			requireZeroTerminal(t, res)
 			testassert.Require(t, f.modelCalls == 1 && f.toolCalls == 0, "model=%d tool=%d, want the run to stop at the forged settlement", f.modelCalls, f.toolCalls)
 		})
@@ -192,7 +175,7 @@ func isBoundaryViolation(err error, boundary string) bool {
 	return errors.As(err, &pe) && pe.Boundary == boundary && pe.Detail != ""
 }
 
-// TestRunFailureDispositionPassthrough pins the failure row of step 6: the matching terminal keeps the settlement's own detail and its optional errored (or absent) output, and nothing continues.
+// TestRunFailureDispositionPassthrough pins the failure disposition: the matching terminal keeps the settlement's own detail and its optional errored (or absent) output, and nothing continues.
 func TestRunFailureDispositionPassthrough(t *testing.T) {
 	t.Run("with-errored-output", func(t *testing.T) {
 		f := &runFakes{}
@@ -214,7 +197,7 @@ func TestRunFailureDispositionPassthrough(t *testing.T) {
 	})
 }
 
-// TestRunInterruptionDispositionPassthrough pins the interruption row of step 6: the settlement keeps its own detail (never re-labelled), and a retained completed response is never discarded — its not-yet-dispatched calls, all of them here, return in message order.
+// TestRunInterruptionDispositionPassthrough pins the interruption disposition: the settlement keeps its own detail (never re-labelled), and a retained completed response is never discarded — its not-yet-dispatched calls, all of them here, return in message order.
 func TestRunInterruptionDispositionPassthrough(t *testing.T) {
 	t.Run("in-flight-interrupted-output", func(t *testing.T) {
 		f := &runFakes{}
