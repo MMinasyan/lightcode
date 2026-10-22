@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,13 +68,13 @@ func staticBundledFS() fstest.MapFS {
 
 // nominalProvMember builds the header-free nominal prov provider object the
 // configuration fixtures share: a transport carrying only the endpoint and
-// the key-env name (both encoded as JSON strings), the discovery flag, and
+// the key-env name (both encoded as JSON strings), discovery disabled, and
 // the authored raw models object spliced exactly as written — its numeric
 // lexemes are never decoded and re-encoded. Callers keep their own document
 // roots (permissions, plugins, sessions, custom members).
-func nominalProvMember(endpoint, keyEnv string, discovery bool, models string) string {
+func nominalProvMember(endpoint, keyEnv, models string) string {
 	return `{"transport":{"base_url":` + fixtureString(endpoint) + `,"api_key_env":` + fixtureString(keyEnv) +
-		`},"discovery":` + strconv.FormatBool(discovery) + `,"models":` + models + `}`
+		`},"discovery":false,"models":` + models + `}`
 }
 
 // workerAgentsDocument is the shared one-worker agent document the
@@ -90,7 +89,7 @@ func fixtureString(value string) string {
 }
 
 func providerConfigFile(name string) string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false,
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "",
 		`{"m":{"name":`+fixtureString(name)+`,"context_window":9007199254740993}}`) + `},"sessions":{"archive_after_days":3}}`
 }
 
@@ -290,7 +289,7 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 
 // pluginsConfigFile is providerConfigFile with one plugin section verbatim.
 func pluginsConfigFile(alpha string) string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false, `{"m":{"name":"One","context_window":100}}`) + `},"plugins":{"alpha":` + alpha + `}}`
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"One","context_window":100}}`) + `},"plugins":{"alpha":` + alpha + `}}`
 }
 
 // TestConfigurationServiceValidatorScratchCannotChangePublication proves the
@@ -716,7 +715,7 @@ func TestConfigurationServiceRestartsGenerationWithFreshCaptures(t *testing.T) {
 const captureGlobalAllow = `{"rules":[{"permission":"file.write","target":"*","access":"allow"}]}`
 
 func captureConfigDoc() string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false, `{"m":{"name":"One","context_window":100}}`) + `},"permissions":` + captureGlobalAllow + `}`
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"One","context_window":100}}`) + `},"permissions":` + captureGlobalAllow + `}`
 }
 
 // TestConfigurationServiceCapturesWorkspacePermissions proves the

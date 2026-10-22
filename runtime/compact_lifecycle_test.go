@@ -31,7 +31,7 @@ import (
 // and the compact model as a distinct catalog identity, so the wire
 // distinguishes the transports by model ID.
 func compactObservationConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":8192,"max_output_tokens":4096},`+
 			`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}`) + `}}`
 }

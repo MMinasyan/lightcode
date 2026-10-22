@@ -100,7 +100,9 @@ func TestLoadDotEnvShellKeyNotManaged(t *testing.T) {
 // TestManagedEnvOrdinaryRows drives the ordinary Set/Remove outcomes. Each
 // row carries its seed, external environment and initial managed membership,
 // its Set/Remove action, and independently authored post-state predicates for
-// the process environment, the managed set and the real file.
+// the process environment, the managed set and the real file's present and
+// absent substrings. The $KEY placeholder in a seed or fragment is the row's
+// env key.
 func TestManagedEnvOrdinaryRows(t *testing.T) {
 	rows := []struct {
 		name          string
@@ -115,10 +117,8 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 		wantEnv       string
 		wantEnvSet    bool
 		wantManaged   bool
-		keyValue      string
-		noKeyValue    string
-		keyAbsent     bool
 		wantFile      []string
+		absentFile    []string
 		wantMode      os.FileMode
 	}{
 		{
@@ -129,8 +129,7 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			wantEnv:     "hello",
 			wantEnvSet:  true,
 			wantManaged: true,
-			keyValue:    "hello",
-			wantFile:    []string{"# keep me", "UNRELATED=keep"},
+			wantFile:    []string{"$KEY=hello", "# keep me", "UNRELATED=keep"},
 			wantMode:    0o600,
 		},
 		{
@@ -142,9 +141,8 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			wantEnv:     "new",
 			wantEnvSet:  true,
 			wantManaged: true,
-			keyValue:    "new",
-			noKeyValue:  "old",
-			wantFile:    []string{"OTHER=x"},
+			wantFile:    []string{"$KEY=new", "OTHER=x"},
+			absentFile:  []string{"$KEY=old"},
 		},
 		{
 			name:          "SetRefusesExternalKey",
@@ -157,7 +155,7 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			wantEnv:       "external",
 			wantEnvSet:    true,
 			wantManaged:   false,
-			keyAbsent:     true,
+			absentFile:    []string{"$KEY"},
 		},
 		{
 			name:          "RemoveDeletesLineAndUnsets",
@@ -169,8 +167,8 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			remove:        true,
 			wantEnvSet:    false,
 			wantManaged:   false,
-			keyAbsent:     true,
 			wantFile:      []string{"# header", "KEEP=me"},
+			absentFile:    []string{"$KEY"},
 		},
 		{
 			name:          "RemoveNoopForUnmanagedKey",
@@ -183,8 +181,8 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			wantEnv:       "external",
 			wantEnvSet:    true,
 			wantManaged:   false,
-			keyAbsent:     true,
 			wantFile:      []string{"KEEP=me"},
+			absentFile:    []string{"$KEY"},
 		},
 	}
 	for _, row := range rows {
@@ -228,17 +226,13 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 			data, err := os.ReadFile(path)
 			testassert.NoError(t, err)
 			body := string(data)
-			if row.keyValue != "" {
-				testassert.Require(t, strings.Contains(body, key+"="+row.keyValue), "file missing %s=%s: %q", key, row.keyValue, body)
+			for _, frag := range row.wantFile {
+				frag = strings.ReplaceAll(frag, "$KEY", key)
+				testassert.Require(t, strings.Contains(body, frag), "file missing %q: %q", frag, body)
 			}
-			if row.noKeyValue != "" {
-				testassert.Require(t, !strings.Contains(body, key+"="+row.noKeyValue), "old value %s=%s still in file: %q", key, row.noKeyValue, body)
-			}
-			if row.keyAbsent {
-				testassert.Require(t, !strings.Contains(body, key), "file still contains %s: %q", key, body)
-			}
-			for _, want := range row.wantFile {
-				testassert.Require(t, strings.Contains(body, want), "file missing %q: %q", want, body)
+			for _, frag := range row.absentFile {
+				frag = strings.ReplaceAll(frag, "$KEY", key)
+				testassert.Require(t, !strings.Contains(body, frag), "file still contains %q: %q", frag, body)
 			}
 			if row.wantMode != 0 {
 				info, err := os.Stat(path)

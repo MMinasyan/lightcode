@@ -525,7 +525,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 // warnCompactConfigDocument points both the conversation and the compact
 // model at the given failing endpoint with must-preserve metadata.
 func warnCompactConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY",
 		`{"m":{"name":"M","context_window":4096,"protocol_metadata":{"must_preserve":["proto_keep"]}},`+
 			`"m2":{"name":"M2","context_window":2048,"protocol_metadata":{"must_preserve":["proto_keep"]}}}`) + `}}`
 }

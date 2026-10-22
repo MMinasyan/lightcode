@@ -33,7 +33,7 @@ import (
 // unowned providers member with an exact big-integer lexeme, an unowned
 // permissions member, and an unowned unknown top-level member.
 func mutationConfigDocument() string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false,
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "",
 		`{"m":{"name":"One","context_window":9007199254740993}}`) +
 		`},"permissions":{"rules":[{"permission":"file.write","target":"*","access":"allow"}]},"custom_flag":true}`
 }
@@ -69,7 +69,7 @@ func compactJSON(t *testing.T, data []byte) string {
 // int64 lexeme beyond JS number precision, one empty compiled section, and
 // one unowned provider model carrying the same kind of lexeme.
 func opaqueSettingsDocument() string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false,
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "",
 		`{"m":{"name":"One","context_window":9007199254740993}}`) +
 		`},"sessions":{"archive_after_days":3},"plugins":{` +
 		`"alpha":{"kept":1,"exact":9007199254740993},` +
@@ -1182,7 +1182,7 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "", false,
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "",
 			`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},"wide":{"name":"W","context_window":262144,"max_output_tokens":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
 		r, err := e.open(context.Background(), e.storagePlugin(store))

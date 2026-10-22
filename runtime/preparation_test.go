@@ -50,7 +50,7 @@ func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
 // rows never accidentally test compaction. The "zero" model keeps the
 // zero-window rejection row.
 func prepConfigDocument(endpoint, tag string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},`+
 			`"zero":{"name":"Z","context_window":0}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `}}}`
 }

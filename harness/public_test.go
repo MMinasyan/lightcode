@@ -2762,17 +2762,17 @@ func TestPublicLifecycleRollbackOnTransactionFailure(t *testing.T) {
 	}
 }
 
-// rollbackCase is one lifecycle transition's rollback row: prepare seeds the
-// transition's precondition and returns the pre-attempt cached view, arm
-// selects the injected post-mutation failure point, run performs the
-// transition, afterFailure observes the rolled-back state before the retry,
-// and retry performs the same transition again and asserts its post-retry
-// outcome. The shared runner owns the snapshot/failure/rollback/retry
-// construction; the rows carry only their operation and their own expected
-// values.
+// rollbackCase is one lifecycle transition's rollback row: archived seeds the
+// transition's archived precondition (the shared runner archives and reads the
+// pre-attempt cached view itself), arm selects the injected post-mutation
+// failure point, run performs the transition, afterFailure observes the
+// rolled-back state before the retry, and retry performs the same transition
+// again and asserts its post-retry outcome. The shared runner owns the
+// snapshot/failure/rollback/retry construction; the rows carry only their
+// operation and their own expected values.
 type rollbackCase struct {
 	name         string
-	prepare      func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader
+	archived     bool
 	arm          func(probe *rollbackProbeStore)
 	run          func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error
 	afterFailure func(t *testing.T, store harness.Storage, session string)
@@ -2781,17 +2781,9 @@ type rollbackCase struct {
 
 var rollbackCases = []rollbackCase{
 	{
-		name: "reopen",
-		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
-			{
-				_, err := h.ArchiveSession(context.Background(), session)
-				testassert.NoError(t, err)
-			}
-			archived, err := h.ReadSessionHeader(context.Background(), session)
-			testassert.NoError(t, err)
-			return archived
-		},
-		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		name:     "reopen",
+		archived: true,
+		arm:      func(probe *rollbackProbeStore) { probe.failReplace = true },
 		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
 			_, err := h.ReopenSession(context.Background(), session)
 			return err
@@ -2803,12 +2795,7 @@ var rollbackCases = []rollbackCase{
 	},
 	{
 		name: "archive",
-		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
-			first, err := h.ReadSessionHeader(context.Background(), session)
-			testassert.NoError(t, err)
-			return first
-		},
-		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		arm:  func(probe *rollbackProbeStore) { probe.failReplace = true },
 		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
 			_, err := h.ArchiveSession(context.Background(), session)
 			return err
@@ -2819,17 +2806,9 @@ var rollbackCases = []rollbackCase{
 		},
 	},
 	{
-		name: "delete",
-		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
-			{
-				_, err := h.ArchiveSession(context.Background(), session)
-				testassert.NoError(t, err)
-			}
-			archived, err := h.ReadSessionHeader(context.Background(), session)
-			testassert.NoError(t, err)
-			return archived
-		},
-		arm: func(probe *rollbackProbeStore) { probe.failDelete = true },
+		name:     "delete",
+		archived: true,
+		arm:      func(probe *rollbackProbeStore) { probe.failDelete = true },
 		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
 			return h.DeleteSession(context.Background(), session)
 		},
@@ -2858,12 +2837,7 @@ var rollbackCases = []rollbackCase{
 	},
 	{
 		name: "sweep archive",
-		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
-			first, err := h.ReadSessionHeader(context.Background(), session)
-			testassert.NoError(t, err)
-			return first
-		},
-		arm: func(probe *rollbackProbeStore) { probe.failReplace = true },
+		arm:  func(probe *rollbackProbeStore) { probe.failReplace = true },
 		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
 			policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 			now := before.LastActivity.Add(100 * time.Hour)
@@ -2882,15 +2856,9 @@ var rollbackCases = []rollbackCase{
 		},
 	},
 	{
-		name: "sweep delete",
-		prepare: func(t *testing.T, h *harness.Harness, session string) harness.SessionHeader {
-			archived, err := h.ArchiveSession(context.Background(), session)
-			testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "seed archive = %+v err %v", archived, err)
-			header, err := h.ReadSessionHeader(context.Background(), session)
-			testassert.NoError(t, err)
-			return header
-		},
-		arm: func(probe *rollbackProbeStore) { probe.failDelete = true },
+		name:     "sweep delete",
+		archived: true,
+		arm:      func(probe *rollbackProbeStore) { probe.failDelete = true },
 		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
 			policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 			now := before.ArchivedAt.Add(100 * time.Hour)
@@ -2914,16 +2882,26 @@ var rollbackCases = []rollbackCase{
 }
 
 // runRollbackCase owns the shared rollback construction: one isolated store,
-// the real transition, its injected post-mutation failure, the durable and
-// cached rollback assertions, the row's own rolled-back observation, and the
-// retry of the same transition with its post-retry observation.
+// the shared archived precondition and pre-attempt header read, the real
+// transition, its injected post-mutation failure, the durable and cached
+// rollback assertions, the row's own rolled-back observation, and the retry of
+// the same transition with its post-retry observation.
 func runRollbackCase(t *testing.T, store harness.Storage, row rollbackCase) {
 	t.Helper()
 	probe := &rollbackProbeStore{Storage: store}
 	f := newPublicFixture(t, probe, newScriptModel(), nil)
 	defer f.close()
 	session := createSession(t, f.h)
-	beforeHeader := row.prepare(t, f.h, session)
+	var beforeHeader harness.SessionHeader
+	if row.archived { // the shared archived precondition: the transition rows and retries need the Session archived before the attempt.
+		archived, err := f.h.ArchiveSession(context.Background(), session)
+		testassert.Require(t, err == nil && archived.State.ArchivedAt != nil, "seed archive = %+v err %v", archived, err)
+	}
+	{
+		header, err := f.h.ReadSessionHeader(context.Background(), session)
+		testassert.NoError(t, err)
+		beforeHeader = header
+	}
 	before := sessionRegister(t, store, session)
 	row.arm(probe)
 	{

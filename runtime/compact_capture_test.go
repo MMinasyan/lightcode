@@ -49,11 +49,11 @@ Be specific — include file paths, function names, error messages, line numbers
 // referenced keyed provider beside one provider whose credential stays
 // absent, both pointed at the given endpoint.
 func compactPrepConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY",
 		`{"m":{"name":"M","context_window":4096},`+
 			`"m2":{"name":"M2","context_window":2048,"max_output_tokens":1000},`+
 			`"mzero":{"name":"MZ","context_window":0,"max_output_tokens":500}}`) +
-		`,"p2":` + nominalProvMember(endpoint, "PREP_COMPACT_ABSENT_KEY", false,
+		`,"p2":` + nominalProvMember(endpoint, "PREP_COMPACT_ABSENT_KEY",
 		`{"m3":{"name":"M3","context_window":1024,"max_output_tokens":200}}`) + `},"sessions":{}}`
 }
 

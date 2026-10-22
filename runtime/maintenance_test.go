@@ -33,7 +33,7 @@ import (
 // stays: the sweep rows that admit no model work never reach it, and the two
 // startup-probe rows below build their own local-endpoint document.
 func ownerSweepDocument(sessions string) string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", false,
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "",
 		`{"m":{"name":"M","context_window":4096}}`) + `},"sessions":` + sessions + `}`
 }
 
@@ -42,7 +42,7 @@ func ownerSweepDocument(sessions string) string {
 // admission reaches the selected preparation hook and the local model server
 // instead of failing for absent metadata.
 func ownerSweepProbedDocument(endpoint, sessions string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
 }
 

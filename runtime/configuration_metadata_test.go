@@ -701,7 +701,7 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, svc.warnings, sub, "5")
-	external := `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "META_TEST_KEY", false, `{"m":{"name":"M","context_window":4096}}`) + `},"custom_flag":true}`
+	external := `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "META_TEST_KEY", `{"m":{"name":"M","context_window":4096}}`) + `},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
 	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("temp"))
 	testassert.Require(t, err == nil && candidate.snapshot.generation == 6, "externally-removed delete = (%v, generation %d), want a publication at 6", err, candidate.snapshot.generation)

@@ -50,21 +50,21 @@ func chainAgentsDocument(body string) string {
 // configured provider pointed at the scenario's server, the hook tag the
 // hookPlugin requires, and no sessions section.
 func chainPlainConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY",
 		`{"gpt-5.5":{"name":"G","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
 }
 
 // chainCommandConfigDocument is the readonly-git row's provider document: no
 // plugins section, since its composition declares no configured plugin.
 func chainCommandConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY",
 		`{"m":{"name":"M","context_window":262144}}`) + `}}`
 }
 
 // chainSweepConfigDocument adds the explicit sweep thresholds and the hook
 // tag to one provider document for the public-Open initial-sweep row.
 func chainSweepConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":{"archive_after_days":1,"delete_after_archive_days":1}}`
 }
 
@@ -72,7 +72,7 @@ func chainSweepConfigDocument(endpoint string) string {
 // composes: one matching the bundled GPT-family adaptation pattern, one
 // matching nothing.
 func chainModelsConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"gpt-5.5":{"name":"G","context_window":262144},"vanilla":{"name":"V","context_window":262144}}`) + `}}`
 }
 

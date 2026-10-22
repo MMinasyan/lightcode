@@ -29,7 +29,7 @@ import (
 // parked execution, and restart repair on the same store.
 
 func assembledConfigDocument(endpoint, tag, label string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY",
 		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -878,12 +879,25 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		// state stays stable until the subtest's assertions complete: no
 		// terminal commit and no successor drain can publish while reading
 		release2 := make(chan struct{})
-		defer close(release2)
+		release := make(chan struct{})
+		releaseDelivery := sync.OnceFunc(func() { close(release) })
 		script := newModelScript(turn(testToolCall("call-1")), modelAttempt{stream: &parkingStream{release: release2}})
 		script.gate = make(chan struct{})
 		h, cancel := newCancelableHarness(t, store, steeringPrepared(script), nil)
-		defer cancel()
-		defer script.releaseGate()
+		// Cleanup releases the storage publication gate and the script model
+		// gate, loses the Harness, then opens the parked stream read and joins
+		// the execution with a bounded Wait: the stream's gated delta and EOF
+		// let the assembly terminate instead of leaking an executor into
+		// later allocation windows.
+		defer func() {
+			releaseDelivery()
+			script.releaseGate()
+			cancel()
+			close(release2)
+			waitCtx, stopWait := context.WithTimeout(context.Background(), 10*time.Second)
+			defer stopWait()
+			testassert.NoError(t, h.Wait(waitCtx))
+		}()
 		session := createSession(t, h)
 		c := cachedCoordinator(t, h, session)
 
@@ -901,9 +915,6 @@ func TestSnapshotSessionSteeringDeliveryPublications(t *testing.T) {
 		testassert.Require(t, len(buffered.Steering) == 1 && buffered.History.Revision.LocalRevision == baseline.History.Revision.LocalRevision+3, "buffered view = %+v, want one steering item advanced by the Submit's three publications", buffered)
 
 		deliveryStarted := make(chan struct{})
-		release := make(chan struct{})
-		releaseDelivery := sync.OnceFunc(func() { close(release) })
-		defer releaseDelivery()
 		deliverySettled := make(chan struct{})
 		var once sync.Once
 		store.entryHook = func(draft EntryDraft) error {
@@ -1092,7 +1103,8 @@ func steeringPrepared(script *modelScript) PreparedExecution {
 }
 
 // parkingStream is one accepted stream whose first read parks until its
-// release channel closes, then completes one turn.
+// release channel closes, then yields its existing delta once; every later
+// read is EOF, so an assembly consuming it terminates instead of leaking.
 type parkingStream struct {
 	release chan struct{}
 	done    bool
@@ -1102,13 +1114,27 @@ func (s *parkingStream) Recv() (model.StreamDelta, error) {
 	if !s.done {
 		<-s.release
 		s.done = true
+		return model.StreamDelta{
+			HasChoice:        true,
+			Role:             "assistant",
+			ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
+			FinishReason:     "stop",
+		}, nil
 	}
-	return model.StreamDelta{
-		HasChoice:        true,
-		Role:             "assistant",
-		ContentFragments: []model.ContentFragment{{Position: 0, Kind: model.PartText, Text: "done"}},
-		FinishReason:     "stop",
-	}, nil
+	return model.StreamDelta{}, io.EOF
 }
 
 func (s *parkingStream) Close() error { return nil }
+
+// TestParkingStreamGatedDeltaThenEOF pins the parked fixture's own stream
+// contract: after release, the first Recv carries the existing delta and the
+// next Recv is EOF, so an assembly consuming the stream terminates rather than
+// leaking an executor into later allocation windows.
+func TestParkingStreamGatedDeltaThenEOF(t *testing.T) {
+	s := &parkingStream{release: make(chan struct{})}
+	close(s.release)
+	delta, err := s.Recv()
+	testassert.Require(t, err == nil && delta.HasChoice && delta.FinishReason == "stop" && len(delta.ContentFragments) == 1 && delta.ContentFragments[0].Text == "done", "first Recv after release = %+v, %v; want the existing delta", delta, err)
+	_, err = s.Recv()
+	testassert.Require(t, errors.Is(err, io.EOF), "second Recv = %v, want EOF", err)
+}

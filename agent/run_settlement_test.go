@@ -19,7 +19,7 @@ func TestRunForgedModelSettlementsRejected(t *testing.T) {
 			f.modelSet = setScript(row.set)
 
 			res, err := Run(context.Background(), f.invocation())
-			requireBoundaryViolation(t, err, row.wantBoundary)
+			requireBoundaryViolation(t, err, "model")
 			requireZeroTerminal(t, res)
 			testassert.Require(t, f.modelCalls == 1 && f.toolCalls == 0, "model=%d tool=%d, want the run to stop at the forged settlement", f.modelCalls, f.toolCalls)
 		})

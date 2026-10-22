@@ -2493,8 +2493,8 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 		t.Setenv("CONNECT_CHAIN_EXTERNAL", "sibling-value")
 		reserveEnvKey(t, "CONNECT_CHAIN_MANAGED")
 		writeServiceFile(t, e.configPath, `{"providers":{`+
-			`"prov":`+nominalProvMember(server.URL, "PRODUCTION_TEST_KEY", false, `{"m":{"name":"M","context_window":262144}}`)+`,`+
-			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", false, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
+			`"prov":`+nominalProvMember(server.URL, "PRODUCTION_TEST_KEY", `{"m":{"name":"M","context_window":262144}}`)+`,`+
+			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
 
 		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), connectEnvEchoPlugin())

@@ -74,22 +74,19 @@ func TestValidateSettlement(t *testing.T) {
 
 	for _, row := range forgedModelSettlements() {
 		t.Run(row.name, func(t *testing.T) {
-			_, err := validateSettlement(row.set, row.expected, true)
-			requireBoundaryViolation(t, err, row.wantBoundary)
+			_, err := validateSettlement(row.set, testRef, true)
+			requireBoundaryViolation(t, err, "model")
 		})
 	}
 }
 
-// forgedModelSettlement is one shared invalid-settlement input: the expected
-// model identity, the forged settlement, and the boundary its typed protocol
-// error must name. Direct validation and Run propagation each build their own
-// fresh values from forgedModelSettlements so scripted effects and ownership
-// probes cannot share an input.
+// forgedModelSettlement is one shared invalid-settlement input: the name and
+// the forged settlement. Direct validation and Run propagation each build their
+// own fresh values from forgedModelSettlements so scripted effects and
+// ownership probes cannot share an input.
 type forgedModelSettlement struct {
-	name         string
-	expected     model.ModelRef
-	set          ModelSettlement
-	wantBoundary string
+	name string
+	set  ModelSettlement
 }
 
 func forgedModelSettlements() []forgedModelSettlement {
@@ -101,20 +98,20 @@ func forgedModelSettlements() []forgedModelSettlement {
 	foreign := &model.Output{Status: model.OutputCompleted, Source: model.ModelRef{Provider: "acme", Model: "m-other"}, Message: &model.Message{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "acme", Model: "m-other"}, Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}}}
 
 	return []forgedModelSettlement{
-		{"ready-nil-output", testRef, ModelSettlement{Disposition: DispoReady}, "model"},                      // Ready requires its callback output.
-		{"ready-errored-output", testRef, ModelSettlement{Disposition: DispoReady, Output: errored}, "model"}, // Ready requires completed; an errored output is the wrong direction.
-		{"ready-nonempty-detail", testRef, ModelSettlement{Disposition: DispoReady, Output: completed, Detail: "x"}, "model"},
-		{"continue-nil-output", testRef, ModelSettlement{Disposition: DispoContinue}, "model"},
-		{"continue-completed-with-calls", testRef, ModelSettlement{Disposition: DispoContinue, Output: callsOut}, "model"},  // A continue carrying tool calls would strand them: nothing dispatches after continue.
-		{"continue-errored-without-payload", testRef, ModelSettlement{Disposition: DispoContinue, Output: bare}, "model"},   // Nearest forbidden sibling of the errored-payload continue rows: nothing model-visible was retained.
-		{"continue-interrupted-output", testRef, ModelSettlement{Disposition: DispoContinue, Output: interrupted}, "model"}, // Nearest forbidden sibling of the completed continue row: an interrupted payload settles interruption only.
-		{"continue-nonempty-detail", testRef, ModelSettlement{Disposition: DispoContinue, Output: errored, Detail: "y"}, "model"},
-		{"failure-completed-output", testRef, ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}, "model"}, // Failure permits no output or its errored one; completed is the nearest forbidden sibling of valid failure-with-errored.
-		{"failure-empty-detail", testRef, ModelSettlement{Disposition: DispoFailure}, "model"},
-		{"interruption-errored-output", testRef, ModelSettlement{Disposition: DispoInterruption, Output: errored, Detail: "d"}, "model"}, // Interruption admits no/interrupted/completed; errored is the nearest forbidden sibling of valid interruption-in-flight.
-		{"interruption-empty-detail", testRef, ModelSettlement{Disposition: DispoInterruption}, "model"},
-		{"unknown-disposition", testRef, ModelSettlement{Disposition: "bogus"}, "model"},                // Unknown dispositions fail before any other field is consulted.
-		{"foreign-source", testRef, ModelSettlement{Disposition: DispoReady, Output: foreign}, "model"}, // A present output must match the expected identity field-for-field.
+		{"ready-nil-output", ModelSettlement{Disposition: DispoReady}},                      // Ready requires its callback output.
+		{"ready-errored-output", ModelSettlement{Disposition: DispoReady, Output: errored}}, // Ready requires completed; an errored output is the wrong direction.
+		{"ready-nonempty-detail", ModelSettlement{Disposition: DispoReady, Output: completed, Detail: "x"}},
+		{"continue-nil-output", ModelSettlement{Disposition: DispoContinue}},
+		{"continue-completed-with-calls", ModelSettlement{Disposition: DispoContinue, Output: callsOut}},  // A continue carrying tool calls would strand them: nothing dispatches after continue.
+		{"continue-errored-without-payload", ModelSettlement{Disposition: DispoContinue, Output: bare}},   // Nearest forbidden sibling of the errored-payload continue rows: nothing model-visible was retained.
+		{"continue-interrupted-output", ModelSettlement{Disposition: DispoContinue, Output: interrupted}}, // Nearest forbidden sibling of the completed continue row: an interrupted payload settles interruption only.
+		{"continue-nonempty-detail", ModelSettlement{Disposition: DispoContinue, Output: errored, Detail: "y"}},
+		{"failure-completed-output", ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}}, // Failure permits no output or its errored one; completed is the nearest forbidden sibling of valid failure-with-errored.
+		{"failure-empty-detail", ModelSettlement{Disposition: DispoFailure}},
+		{"interruption-errored-output", ModelSettlement{Disposition: DispoInterruption, Output: errored, Detail: "d"}}, // Interruption admits no/interrupted/completed; errored is the nearest forbidden sibling of valid interruption-in-flight.
+		{"interruption-empty-detail", ModelSettlement{Disposition: DispoInterruption}},
+		{"unknown-disposition", ModelSettlement{Disposition: "bogus"}},                // Unknown dispositions fail before any other field is consulted.
+		{"foreign-source", ModelSettlement{Disposition: DispoReady, Output: foreign}}, // A present output must match the expected identity field-for-field.
 	}
 }
 

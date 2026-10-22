@@ -34,7 +34,7 @@ import (
 // server's keyless local endpoint with discovery disabled and a generous
 // window so ordinary rows never accidentally test compaction.
 func ownerConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":` + nominalProvMember(endpoint, "", false,
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `}}`
 }
 
