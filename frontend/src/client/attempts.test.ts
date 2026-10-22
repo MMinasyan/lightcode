@@ -4,36 +4,9 @@
 // ID without resurrection of removed attempts.
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Hydration } from '../generated/protocol/types.gen';
 import { AttemptLedger, mintOperationID } from './attempts';
 import type { RestoreOutcome } from './restore';
-
-const INSTANCE = '0123456789abcdef0123456789abcdef';
-
-function makeHydration(overrides: Partial<Hydration> = {}): Hydration {
-  return {
-    session: {
-      session_id: 's1',
-      workspace: '/ws',
-      lifecycle: 'open',
-      agent_type: 'primary',
-      created_at: '0',
-      last_activity: '0',
-      session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-    },
-    selected_model: null,
-    session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-    configuration_revision: { instance_id: INSTANCE, generation: '1' },
-    warnings_revision: { instance_id: INSTANCE, revision: '1' },
-    operations: [],
-    pending: { steering: [], queued: [] },
-    conversation: { items: [] },
-    usage: { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } },
-    warnings: [],
-    background: [],
-    ...overrides,
-  };
-}
+import { hydration, session } from './test-fixtures';
 
 describe('mintOperationID', () => {
   it('mints exactly 16 crypto-random bytes in lowercase hex', () => {
@@ -75,7 +48,8 @@ describe('AttemptLedger', () => {
     ledger.markUnknown(queued.id);
     ledger.markUnknown(steered.id);
     ledger.markUnknown(unseen.id);
-    const accepted = ledger.adoptHydration('s1', makeHydration({
+    const accepted = ledger.adoptHydration('s1', hydration({
+      session: session('s1', '0'),
       operations: [{ operation_id: admitted.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
       pending: {
         steering: [{ operation_id: steered.id, origin: 'user', content: [] }],
@@ -96,7 +70,8 @@ describe('AttemptLedger', () => {
     const ledger = new AttemptLedger();
     const other = ledger.create('submit', 'regular', [{ kind: 'text', text: 'x' }], 's2', 1);
     ledger.markUnknown(other.id);
-    const accepted = ledger.adoptHydration('s1', makeHydration({
+    const accepted = ledger.adoptHydration('s1', hydration({
+      session: session('s1', '0'),
       operations: [{ operation_id: other.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(accepted).toHaveLength(0);
@@ -138,7 +113,8 @@ describe('AttemptLedger', () => {
     const start = seen.length;
     const attempt = ledger.create('submit', 'regular', [{ kind: 'text', text: 'x' }], 's1', 1);
     ledger.markUnknown(attempt.id);
-    ledger.adoptHydration('s1', makeHydration({
+    ledger.adoptHydration('s1', hydration({
+      session: session('s1', '0'),
       operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(ledger.getAttempts()).toHaveLength(0);
@@ -197,17 +173,8 @@ describe('fork attempts', () => {
     const ledger = new AttemptLedger();
     const attempt = fork(ledger);
     ledger.markUnknown(attempt.id);
-    const accepted = ledger.adoptHydration('dest1', makeHydration({
-      session: {
-        session_id: 'dest1',
-        workspace: '/ws',
-        source_session_id: 's1',
-        lifecycle: 'open',
-        agent_type: 'primary',
-        created_at: '0',
-        last_activity: '0',
-        session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-      },
+    const accepted = ledger.adoptHydration('dest1', hydration({
+      session: { ...session('dest1', '0'), source_session_id: 's1' },
       operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(accepted.map((entry) => entry.id)).toEqual([attempt.id]);
@@ -219,21 +186,13 @@ describe('fork attempts', () => {
     const attempt = fork(ledger);
     ledger.markUnknown(attempt.id);
     // Another destination without the lineage does not accept.
-    const unrelated = ledger.adoptHydration('dest2', makeHydration({
-      session: {
-        session_id: 'dest2',
-        workspace: '/ws',
-        lifecycle: 'open',
-        agent_type: 'primary',
-        created_at: '0',
-        last_activity: '0',
-        session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-      },
+    const unrelated = ledger.adoptHydration('dest2', hydration({
+      session: session('dest2', '0'),
       operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(unrelated).toHaveLength(0);
     // The source Session's own hydration absence proves nothing.
-    const source = ledger.adoptHydration('s1', makeHydration());
+    const source = ledger.adoptHydration('s1', hydration({ session: session('s1', '0') }));
     expect(source).toHaveLength(0);
     expect(ledger.get(attempt.id)?.status).toBe('unknown');
   });
