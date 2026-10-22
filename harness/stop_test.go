@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -151,6 +152,66 @@ func stopResult(t *testing.T, done <-chan error) error {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Stop did not return")
 		return nil
+	}
+}
+
+// awaitStopJoiners waits until count distinct current-test goroutines are
+// parked in the concurrent-join receive: each must be blocked in a channel
+// receive with (*Harness).stopCoordinator as its top application frame and
+// must carry this test's wrapper. The owner parked in its gated StopJob —
+// its stopCoordinator frame sits deeper — and a goroutine merely started by
+// the test do not match, so the wait proves real joining before release.
+func awaitStopJoiners(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		stacks := string(buf[:goruntime.Stack(buf, true)])
+		seen := 0
+		for _, stack := range strings.Split(stacks, "\n\n") {
+			if stopJoinerStack(stack, t.Name()) {
+				seen++
+			}
+		}
+		if seen >= count {
+			return
+		}
+		testassert.Require(t, !time.Now().After(deadline), "%d concurrent Stop callers: only %d parked in the join receive", count, seen)
+		goruntime.Gosched()
+	}
+}
+
+// stopJoinerStack reports whether one goroutine dump is a concurrent joiner
+// of the current test's Stop: parked in a channel receive with
+// stopCoordinator as the top application frame and created by the named test.
+// No source line is consulted; a deeper stopCoordinator frame (the owner
+// under gatedJobStopper) and a caller that has only started never match.
+func stopJoinerStack(stack, testName string) bool {
+	lines := strings.Split(stack, "\n")
+	if len(lines) < 2 {
+		return false
+	}
+	if !strings.Contains(lines[0], "chan receive") { // the join receive itself, not a started caller
+		return false
+	}
+	if !strings.Contains(lines[1], "(*Harness).stopCoordinator") { // the top application frame
+		return false
+	}
+	return strings.Contains(stack, testName) // this test's wrapper, not another Stop stack
+}
+
+// waitStopCallers bounds the cleanup join of every started Stop caller: the
+// fixture gate is released before this runs, so each unblocked caller
+// converges and Done fires; one held past the bound is reported, never hung
+// on, and the owner is never left parked.
+func waitStopCallers(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("a Stop caller did not converge during cleanup")
 	}
 }
 
@@ -750,11 +811,13 @@ func insertMalformedChildSession(t *testing.T, store *graphStorage, sessionID st
 }
 
 // TestStopConcurrentCallersJoinSameError proves the join row: concurrent
-// stops share one interval and every caller receives the same stored error —
-// here the corruption-class child failure that Stop claim-finishes without
-// delivery. The stopper stops the job member exactly once, the corrupt child
-// register stays byte-identical, and the root admits and completes ordinary
-// work after convergence.
+// stops share one interval and every joining caller receives the same stored
+// error — here the corruption-class child failure that Stop claim-finishes
+// without delivery — while a later public Stop after retirement is not a
+// joiner and observes the reopened empty root as a nil no-op. The stopper
+// stops the job member exactly once, the corrupt child register stays
+// byte-identical, and the root admits and completes ordinary work after
+// convergence.
 func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	store := freshSessionStore(t)
 	childID := hexID(9)
@@ -781,26 +844,39 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 
-	// The first stop owns the interval and parks at the gated job. The two
-	// joiners signal entry immediately before their Stop calls while that
-	// interval is provably open; the rendezvous receives both entries, then
-	// the gate releases — the joiners have joined and cannot return before
-	// the owner converges.
+	// The first stop owns the interval and parks at the gated job. Every
+	// concurrent caller below starts while that interval is provably open.
+	// The bounded stack wait then requires the two joiners actually parked
+	// in the join receive — not merely announced — before the gate releases.
+	// A later public Stop runs synchronously after retirement: it is not a
+	// joiner and observes the reopened empty root as a nil no-op —
+	// goroutine start is not a join.
 	ownerDone := make(chan error, 1)
-	go func() { ownerDone <- h.Stop(context.Background(), testSessionID) }()
-	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
-	joinerEntered := make(chan struct{}, 2)
 	joinerDone := make(chan error, 2)
+	var (
+		releaseGate sync.Once
+		stopWG      sync.WaitGroup
+	)
+	stopWG.Add(1)
+	go func() {
+		defer stopWG.Done()
+		ownerDone <- h.Stop(context.Background(), testSessionID)
+	}()
+	defer func() { // a failed phase still releases the fixture gate once and joins the started Stop callers
+		releaseGate.Do(func() { close(gate) })
+		waitStopCallers(t, &stopWG)
+	}()
+	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
 	for i := 0; i < 2; i++ {
+		stopWG.Add(1)
 		go func() {
-			joinerEntered <- struct{}{}
+			defer stopWG.Done()
 			joinerDone <- h.Stop(context.Background(), testSessionID)
 		}()
 	}
-	<-joinerEntered
-	<-joinerEntered
+	awaitStopJoiners(t, 2)
 
-	close(gate) // the job finishes: the owner collects the child error and stores it
+	releaseGate.Do(func() { close(gate) }) // the job finishes: the owner collects the child error and stores it
 	err = stopResult(t, ownerDone)
 	{
 		err2 := stopResult(t, joinerDone)
@@ -809,6 +885,10 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	{
 		err3 := stopResult(t, joinerDone)
 		testassert.Equal(t, err3, err)
+	}
+	{
+		errLate := h.Stop(context.Background(), testSessionID) // a post-retirement public Stop is not a joiner
+		testassert.NoError(t, errLate)                         // the empty reopened root stops as a nil no-op
 	}
 	testassert.Require(t, err != nil, "the joined error = nil, want the stored child error")
 	var corrupt *CorruptionError
