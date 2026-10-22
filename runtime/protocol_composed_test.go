@@ -411,6 +411,43 @@ func composedAwaitQuiet(t *testing.T, c *client.Client, sessionID string, backgr
 	}
 }
 
+// composedAwaitCompletionInput polls until the Session is quiet and one
+// runtime-origin input whose text contains want is delivered, returning the
+// matched input's text. The background completion's successor input is
+// delivery-deferred until the retiring run's drain delivers it after the
+// terminal settlement publishes, so a quiet snapshot alone can land inside
+// the publish→delivery window and miss the input; the wait must include the
+// awaited condition itself.
+func composedAwaitCompletionInput(t *testing.T, c *client.Client, sessionID, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		h := composedHydrate(t, c, sessionID)
+		quiet := h.ActiveOperation == nil && len(h.Background) == 0
+		for _, operation := range h.Operations {
+			if operation.Status == protocol.OperationStatusRunning {
+				quiet = false
+			}
+		}
+		for _, item := range h.Conversation.Items {
+			if composedItemKind(t, item) != "input" {
+				continue
+			}
+			input, err := item.AsInputItem()
+			testassert.NoError(t, err)
+			if input.Origin != protocol.InputOriginRuntime {
+				continue
+			}
+			text := composedItemText(t, input)
+			if quiet && strings.Contains(text, want) {
+				return text
+			}
+		}
+		testassert.Require(t, !time.Now().After(deadline), "session %q never delivered the runtime-origin completion input containing %q (active %+v, background %+v, operations %+v)", sessionID, want, h.ActiveOperation, h.Background, h.Operations)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // composedItemText returns an input item's first text part.
 func composedItemText(t *testing.T, item protocol.InputItem) string {
 	t.Helper()
@@ -736,19 +773,8 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// The parent receives the completion as one runtime-origin input
 		// admitted as its own settled Operation: the child's final assistant
 		// text, never one of the submitted user texts.
-		h = composedAwaitQuiet(t, c, main, 0)
-		completionInput := false
-		for _, item := range h.Conversation.Items {
-			if composedItemKind(t, item) != "input" {
-				continue
-			}
-			input, err := item.AsInputItem()
-			testassert.NoError(t, err)
-			if input.Origin == protocol.InputOriginRuntime && composedItemText(t, input) == "child finished" {
-				completionInput = true
-			}
-		}
-		testassert.Require(t, completionInput, "no runtime-origin completion input carrying the child's final text")
+		completionText := composedAwaitCompletionInput(t, c, main, "child finished")
+		testassert.Require(t, completionText == "child finished", "completion input = %q, want exactly the child's final text", completionText)
 		childHydration := composedHydrate(t, c, childID)
 		testassert.Require(t, childHydration.Session.SessionId == childID && childHydration.Session.Lifecycle == protocol.Open && childHydration.ActiveOperation == nil && len(childHydration.Background) == 0 && len(childHydration.Operations) != 0 && len(childHydration.Conversation.Items) >= 2, "child hydration = %+v, want one ordinary open session with its own settled operations; child conversation items = %+v, want its own input and assistant items", childHydration.Session, childHydration.Conversation.Items)
 		for _, operation := range childHydration.Operations {
@@ -1326,20 +1352,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		// the renamed current one, nor the separately managed key, and still
 		// saw the unrelated external sibling.
 		if background {
-			h = composedAwaitQuiet(t, c, sessionID, 0)
-			flags := ""
-			for _, item := range h.Conversation.Items {
-				if composedItemKind(t, item) != "input" {
-					continue
-				}
-				input, err := item.AsInputItem()
-				testassert.NoError(t, err)
-				text := composedItemText(t, input)
-				if input.Origin == protocol.InputOriginRuntime && strings.Contains(text, "old=") {
-					flags = text
-				}
-			}
-			testassert.Require(t, flags != "", "no background completion carried the child's presence flags")
+			flags := composedAwaitCompletionInput(t, c, sessionID, "old=")
 			testassert.Require(t, strings.Contains(flags, heldEnvWant), "background child presence flags = %q, want %q", flags, heldEnvWant)
 		} else {
 			assistant := composedAssistantOf(t, h.Conversation.Items, "op-held")
