@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -12,9 +14,9 @@ import (
 )
 
 // The fixture schemas are one valid Health/Events baseline with local
-// variations. Each case below composes only the paths it needs, so a supported
-// addition and every unsupported shape are exercised against a schema that
-// would otherwise generate.
+// variations. Each case below composes only the paths it needs, so every
+// unsupported shape is exercised against a schema that would otherwise
+// generate.
 const (
 	fixtureHead = `openapi: "3.0.3"
 info:
@@ -80,472 +82,6 @@ func generateFixture(t *testing.T, text string) (string, string, string) {
 	sdk, source, contract, err := generateFiles(writeFixture(t, text), writeConfig(t))
 	testassert.NoError(t, err)
 	return string(sdk), string(source), string(contract)
-}
-
-// TestSupportedAdditionGenerates proves a supported schema addition generates
-// into the SDK and both native artifacts deterministically: the added
-// operation appears in the SDK client, the descriptor table and the invocation
-// contract, and two runs over the same schema are byte-identical.
-func TestSupportedAdditionGenerates(t *testing.T) {
-	const addition = `  /v1/sessions/{id}/extra:
-    post:
-      operationId: Extra
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-      responses:
-        "201":
-          description: the added operation
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	schema := baselineSchema + addition
-	sdk, source, contract := generateFixture(t, schema)
-	testassert.Check(t, strings.Contains(sdk, "func (c *Client) ExtraWithBody("), "generated SDK has no added operation method:\n%s", sdk)
-	testassert.Check(t, strings.Contains(source, `"Extra": {`), "generated bindings have no descriptor for the added operation:\n%s", source)
-	testassert.Check(t, strings.Contains(source, "session: memberRequired,"), "generated descriptor does not declare the added path member")
-	testassert.Check(t, strings.Contains(source, "body:    memberRequired,"), "generated descriptor does not declare the added body member")
-	testassert.Check(t, strings.Contains(source, "status:  201,"), "generated descriptor does not carry the added operation's declared success status")
-	testassert.Check(t, strings.Contains(source, "var pathValue string"), "generated descriptor does not bind the plain-string path")
-	testassert.Check(t, strings.Contains(source, "c.ExtraWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))"), "generated descriptor does not call the added operation's generated method")
-	testassert.Check(t, strings.Contains(contract, `"Extra": {`), "invocation contract has no entry for the added operation:\n%s", contract)
-	testassert.Check(t, strings.Contains(contract, `"body": "required"`) && strings.Contains(contract, `"session_id": "required"`), "invocation contract does not carry the added operation's declared modes")
-	testassert.Check(t, !strings.Contains(contract, "GetEvents"), "invocation contract carries the event stream:\n%s", contract)
-	againSDK, againSource, againContract := generateFixture(t, schema)
-	testassert.Check(t, sdk == againSDK && source == againSource && contract == againContract, "two runs over the same schema produced different artifacts")
-}
-
-// TestOptionalQueryMembersGenerate proves the optional query envelope modes
-// derive from the SDK's combined parameter records: a query mixing required and
-// optional members binds every member and requires the required ones, and an
-// optional-only query binds only when present through the nil-required guard.
-// The contract publishes both forms and neither operation declares a request
-// body.
-func TestOptionalQueryMembersGenerate(t *testing.T) {
-	const mixedQuery = `  /v1/optional:
-    post:
-      operationId: Optional
-      parameters:
-        - name: cursor
-          in: query
-          required: false
-          schema:
-            type: string
-        - name: all
-          in: query
-          required: true
-          schema:
-            type: boolean
-      responses:
-        "200":
-          description: the mixed query operation
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	const optionalQuery = `  /v1/sessions/{id}/history:
-    get:
-      operationId: GetSessionHistory
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: cursor
-          in: query
-          required: false
-          schema:
-            type: string
-      responses:
-        "200":
-          description: the optional query operation
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	for _, tc := range []struct {
-		name     string
-		path     string
-		source   []string
-		contract []string
-	}{
-		{
-			name: "required and optional query members without a body",
-			path: mixedQuery,
-			source: []string{
-				`"Optional": {`,
-				`query:  memberRequired,`,
-				`var query protocol.OptionalParams`,
-				`bindQuery(env.query, []string{"all"}, &query)`,
-				`c.Optional(ctx, &query)`,
-			},
-			contract: []string{
-				`"Optional": {
-    "session_id": "forbidden",
-    "field": "forbidden",
-    "query": "required",
-    "body": "forbidden"`,
-				`"cursor": {
-        "required": false,
-        "type": "string"
-      }`,
-				`"all": {
-        "required": true,
-        "type": "boolean"
-      }`,
-			},
-		},
-		{
-			name: "an optional-only query binds only when present",
-			path: optionalQuery,
-			source: []string{
-				`"GetSessionHistory": {`,
-				`session: memberRequired,`,
-				`query:   memberOptional,`,
-				`var pathValue string`,
-				`if env.query != nil {`,
-				`bindQuery(env.query, nil, &query)`,
-				`c.GetSessionHistory(ctx, pathValue, &query)`,
-			},
-			contract: []string{
-				`"GetSessionHistory": {
-    "session_id": "required",
-    "field": "forbidden",
-    "query": "optional",
-    "body": "forbidden"`,
-				`"cursor": {
-        "required": false,
-        "type": "string"
-      }`,
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, source, contract := generateFixture(t, baselineSchema+tc.path)
-			for _, want := range tc.source {
-				testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
-			}
-			for _, want := range tc.contract {
-				testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
-			}
-		})
-	}
-}
-
-// TestSupportedShapesGenerate pins the accepted shapes the projection must
-// keep: a referenced string-enum field path emits its SDK-declared protocol
-// type, and a single numeric 2xx — including one with no named standard-library
-// constant — is emitted as the schema's own number, beside the unchanged
-// contentless 204 descriptor.
-func TestSupportedShapesGenerate(t *testing.T) {
-	const fieldsPath = `  /v1/fields/{field}:
-    delete:
-      operationId: ResetField
-      parameters:
-        - name: field
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/ProviderField"
-        - name: provider_id
-          in: query
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: the reset post-state
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	const acceptedPath = `  /v1/accepted:
-    post:
-      operationId: Accepted203
-      responses:
-        "203":
-          description: an unlisted numeric success
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	const extendedPath = `  /v1/extended:
-    get:
-      operationId: Extended210
-      responses:
-        "210":
-          description: another unlisted numeric success
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	const removedPath = `  /v1/removed:
-    delete:
-      operationId: Removed204
-      responses:
-        "204":
-          description: a contentless success
-`
-	const components = `components:
-  schemas:
-    ProviderField:
-      type: string
-      enum:
-        - name
-        - hidden
-`
-	_, source, contract := generateFixture(t, baselineSchema+fieldsPath+acceptedPath+extendedPath+removedPath+components)
-	for _, want := range []string{
-		`"ResetField": {`,
-		`field:  memberRequired,`,
-		`query:  memberRequired,`,
-		`var pathValue protocol.ProviderField`,
-		`bindPath(env.field, &pathValue)`,
-		`bindQuery(env.query, []string{"provider_id"}, &query)`,
-		`c.ResetField(ctx, pathValue, &query)`,
-		`status: 203,`,
-		`status: 210,`,
-		`status: 204,`,
-		`"Accepted203": {`,
-		`"Extended210": {`,
-		`"Removed204": {`,
-		`"ResetField": {`,
-	} {
-		testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
-	}
-	testassert.Check(t, !strings.Contains(source, "http.Status"), "generated bindings carry a named status constant instead of the schema's number:\n%s", source)
-	testassert.Check(t, !strings.Contains(source, "protocol.ProviderField(env.field)"), "generated bindings still cast the field instead of binding its SDK-declared type:\n%s", source)
-	for _, want := range []string{
-		`"ResetField": {`,
-		`"field": "required"`,
-		`"Accepted203": {`,
-		`"Extended210": {`,
-		`"Removed204": {`,
-		`"provider_id": {
-        "required": true,
-        "type": "string"
-      }`,
-	} {
-		testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
-	}
-}
-
-// TestReferencedStringsAndNormalizedNames proves the projection uses the SDK's
-// resolved type and name records: referenced strings bind their declared type
-// with or without an enum, a normalized component name binds the SDK-generated
-// type, a plain inline string binds the builtin type, and a normalized
-// operation ID keeps its original native name while the SDK call uses the
-// normalized generated method.
-func TestReferencedStringsAndNormalizedNames(t *testing.T) {
-	const paths = `  /v1/providers/fields/{field}:
-    delete:
-      operationId: ResetProviderField
-      parameters:
-        - name: field
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/ProviderField"
-      responses:
-        "200":
-          description: provider field reset
-          content:
-            application/json:
-              schema:
-                type: object
-  /v1/providers/models/fields/{field}:
-    delete:
-      operationId: ResetProviderModelField
-      parameters:
-        - name: field
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/ModelField"
-      responses:
-        "200":
-          description: model field reset
-          content:
-            application/json:
-              schema:
-                type: object
-  /v1/plain/fields/{field}:
-    delete:
-      operationId: ResetPlainField
-      parameters:
-        - name: field
-          in: path
-          required: true
-          schema:
-            $ref: "#/components/schemas/plain_field"
-      responses:
-        "200":
-          description: plain field reset
-          content:
-            application/json:
-              schema:
-                type: object
-  /v1/sessions/{id}/plain:
-    post:
-      operationId: PingSession
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: plain session path
-          content:
-            application/json:
-              schema:
-                type: object
-  /v1/normalized:
-    get:
-      operationId: get_extra
-      responses:
-        "200":
-          description: normalized operation ID
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	const components = `components:
-  schemas:
-    ProviderField:
-      type: string
-      enum:
-        - name
-        - hidden
-    ModelField:
-      type: string
-      enum:
-        - name
-        - context_window
-    plain_field:
-      type: string
-`
-	sdk, source, contract := generateFixture(t, baselineSchema+paths+components)
-	for _, want := range []string{
-		`"ResetProviderField": {`,
-		`var pathValue protocol.ProviderField`,
-		`bindPath(env.field, &pathValue)`,
-		`c.ResetProviderField(ctx, pathValue)`,
-		`"ResetProviderModelField": {`,
-		`var pathValue protocol.ModelField`,
-		`c.ResetProviderModelField(ctx, pathValue)`,
-		`"ResetPlainField": {`,
-		`var pathValue protocol.PlainField`,
-		`c.ResetPlainField(ctx, pathValue)`,
-		`"PingSession": {`,
-		`var pathValue string`,
-		`c.PingSession(ctx, pathValue)`,
-		`"get_extra": {`,
-		`c.GetExtra(ctx)`,
-	} {
-		testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
-	}
-	testassert.Check(t, strings.Contains(sdk, "func (c *Client) GetExtra("), "generated SDK has no normalized method for the source operation ID:\n%s", sdk)
-	testassert.Check(t, strings.Contains(sdk, "type PlainField = string"), "generated SDK did not normalize the referenced schema name:\n%s", sdk)
-	for _, want := range []string{`"get_extra": {`, `"ResetPlainField": {`, `"PingSession": {`} {
-		testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
-	}
-	testassert.Check(t, !strings.Contains(contract, `"GetExtra"`), "invocation contract uses the normalized SDK name instead of the source operation ID:\n%s", contract)
-}
-
-// TestLocalParameterOverrides proves operation-level parameters override their
-// path-level declarations with local-wins requiredness, and that both the
-// native contract and the generated SDK Params type carry the resulting
-// requiredness.
-func TestLocalParameterOverrides(t *testing.T) {
-	const paths = `  /v1/overrides:
-    parameters:
-      - name: flag
-        in: query
-        required: false
-        schema:
-          type: boolean
-    get:
-      operationId: QueryOverride
-      parameters:
-        - name: flag
-          in: query
-          required: true
-          schema:
-            type: boolean
-      responses:
-        "200":
-          description: required override
-          content:
-            application/json:
-              schema:
-                type: object
-  /v1/optional-override:
-    parameters:
-      - name: limit
-        in: query
-        required: true
-        schema:
-          type: string
-    get:
-      operationId: OptionalOverride
-      parameters:
-        - name: limit
-          in: query
-          required: false
-          schema:
-            type: string
-      responses:
-        "200":
-          description: optional override
-          content:
-            application/json:
-              schema:
-                type: object
-`
-	sdk, source, contract := generateFixture(t, baselineSchema+paths)
-	testassert.Check(t, strings.Contains(sdk, "type QueryOverrideParams struct"), "generated SDK has no Params type for the overridden query:\n%s", sdk)
-	for _, want := range []string{
-		`"QueryOverride": {`,
-		`query:  memberRequired,`,
-		`bindQuery(env.query, []string{"flag"}, &query)`,
-		`"OptionalOverride": {`,
-		`query:  memberOptional,`,
-		`bindQuery(env.query, nil, &query)`,
-	} {
-		testassert.Check(t, strings.Contains(source, want), "generated bindings are missing %q:\n%s", want, source)
-	}
-	for _, want := range []string{
-		`"flag": {
-        "required": true,
-        "type": "boolean"
-      }`,
-		`"limit": {
-        "required": false,
-        "type": "string"
-      }`,
-	} {
-		testassert.Check(t, strings.Contains(contract, want), "invocation contract is missing %q:\n%s", want, contract)
-	}
 }
 
 // TestStreamCardinality proves stream operations are excluded whole without
@@ -1131,11 +667,14 @@ components:
 	}
 }
 
-// fixtureDispatchSchema exercises the accepted native shapes together: the
-// committed ProviderField/ModelField enum references, an enum-less referenced
-// string whose component name the SDK normalizes, the plain inline string path,
-// an operation ID the SDK normalizes, path-level query parameters overridden at
-// the operation level in both directions, and one required JSON object body.
+// fixtureDispatchSchema is the one compiled owner of every accepted native
+// shape: the committed ProviderField/ModelField enum references, an enum-less
+// referenced string whose component name the SDK normalizes, a named date
+// schema the SDK aliases to a non-string Go representation, inline and
+// component-parameter session paths, an operation ID the SDK normalizes,
+// path-level query parameters overridden at the operation level in both
+// directions, mixed required/optional queries, one required JSON object body,
+// and the unlisted 201/203/210/204 success statuses.
 const fixtureDispatchSchema = `openapi: "3.0.3"
 info:
   title: protocolgen-dispatch-fixture
@@ -1236,6 +775,28 @@ paths:
             application/json:
               schema:
                 type: object
+  /v1/sessions/{id}/extra:
+    post:
+      operationId: Extra
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: the added operation
+          content:
+            application/json:
+              schema:
+                type: object
   /v1/normalized:
     get:
       operationId: get_extra
@@ -1248,6 +809,27 @@ paths:
       responses:
         "200":
           description: normalized operation ID
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/mixed:
+    get:
+      operationId: MixedQuery
+      parameters:
+        - name: all
+          in: query
+          required: true
+          schema:
+            type: boolean
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: a mixed query
           content:
             application/json:
               schema:
@@ -1296,6 +878,48 @@ paths:
             application/json:
               schema:
                 type: object
+  /v1/accepted:
+    post:
+      operationId: Accepted203
+      responses:
+        "203":
+          description: an unlisted numeric success
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/extended:
+    get:
+      operationId: Extended210
+      responses:
+        "210":
+          description: another unlisted numeric success
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/removed:
+    delete:
+      operationId: Removed204
+      responses:
+        "204":
+          description: a contentless success
+  /v1/dated/{day}:
+    get:
+      operationId: GetDated
+      parameters:
+        - name: day
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Day"
+      responses:
+        "200":
+          description: a date path
+          content:
+            application/json:
+              schema:
+                type: object
   /v1/sessions:
     post:
       operationId: CreateSession
@@ -1333,12 +957,17 @@ components:
         - context_window
     plain_field:
       type: string
+    Day:
+      type: string
+      format: date
 `
 
 // fixtureDispatchTest is the generated module's own test. It drives the real
 // generated SDK through the real stateless binder against an httptest route and
-// compares every request's path, query and raw body with independently
-// authored expectations.
+// compares every request's path, query, raw body, declared status and received
+// response bytes with independently authored expectations. The date row proves
+// the SDK's non-string path type stays compiled and parsed, and a direct string
+// cast producer would fail this module's compilation.
 const fixtureDispatchTest = `package clientops
 
 import (
@@ -1373,7 +1002,22 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 		mu.Lock()
 		recorded = append(recorded, recordedCall{method: r.Method, path: r.URL.EscapedPath(), query: r.URL.RawQuery, body: string(body)})
 		mu.Unlock()
+		status := http.StatusOK
+		switch r.URL.Path {
+		case "/v1/sessions/s1/extra":
+			status = http.StatusCreated
+		case "/v1/accepted":
+			status = 203
+		case "/v1/extended":
+			status = 210
+		case "/v1/removed":
+			status = http.StatusNoContent
+		}
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusNoContent {
+			return
+		}
 		_, _ = w.Write([]byte("{\"ok\":true}"))
 	}))
 	defer server.Close()
@@ -1389,16 +1033,25 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 		path      string
 		query     string
 		body      string
+		status    int
+		response  string
 	}{
-		{"enum-backed referenced field", "ResetProviderField", "{\"field\":\"hidden\",\"query\":{\"provider_id\":\"prov\"}}", "DELETE", "/v1/providers/fields/hidden", "provider_id=prov", ""},
-		{"model enum-backed referenced field", "ResetProviderModelField", "{\"field\":\"context_window\",\"query\":{\"provider_id\":\"prov\",\"model_id\":\"m\"}}", "DELETE", "/v1/providers/models/fields/context_window", "provider_id=prov&model_id=m", ""},
-		{"enum-less normalized referenced field", "ResetPlainField", "{\"field\":\"anything\"}", "DELETE", "/v1/plain/fields/anything", "", ""},
-		{"plain string session path", "PingSession", "{\"session_id\":\"s1\"}", "POST", "/v1/sessions/s1/plain", "", ""},
-		{"normalized operation ID", "get_extra", "{\"query\":{\"cursor\":\"abc\"}}", "GET", "/v1/normalized", "cursor=abc", ""},
-		{"operation-level required override", "QueryOverride", "{\"query\":{\"flag\":true}}", "GET", "/v1/overrides", "flag=true", ""},
-		{"operation-level optional override", "OptionalOverride", "{\"query\":{\"limit\":\"x\"}}", "GET", "/v1/optional-override", "limit=x", ""},
-		{"optional override without a query member", "OptionalOverride", "", "GET", "/v1/optional-override", "", ""},
-		{"raw JSON body", "CreateSession", "{\"body\":{\"workspace\":\"/ws\",\"opaque\":9007199254740993}}", "POST", "/v1/sessions", "", "{\"workspace\":\"/ws\",\"opaque\":9007199254740993}"},
+		{"health without an envelope", "GetHealth", "", "GET", "/v1/health", "", "", 200, "{\"ok\":true}"},
+		{"enum-backed referenced field", "ResetProviderField", "{\"field\":\"hidden\",\"query\":{\"provider_id\":\"prov\"}}", "DELETE", "/v1/providers/fields/hidden", "provider_id=prov", "", 200, "{\"ok\":true}"},
+		{"model enum-backed referenced field", "ResetProviderModelField", "{\"field\":\"context_window\",\"query\":{\"provider_id\":\"prov\",\"model_id\":\"m\"}}", "DELETE", "/v1/providers/models/fields/context_window", "provider_id=prov&model_id=m", "", 200, "{\"ok\":true}"},
+		{"enum-less normalized referenced field", "ResetPlainField", "{\"field\":\"anything\"}", "DELETE", "/v1/plain/fields/anything", "", "", 200, "{\"ok\":true}"},
+		{"component-parameter session path", "PingSession", "{\"session_id\":\"s1\"}", "POST", "/v1/sessions/s1/plain", "", "", 200, "{\"ok\":true}"},
+		{"inline string session path with a body", "Extra", "{\"session_id\":\"s1\",\"body\":{\"workspace\":\"/ws\",\"opaque\":9007199254740993}}", "POST", "/v1/sessions/s1/extra", "", "{\"workspace\":\"/ws\",\"opaque\":9007199254740993}", 201, "{\"ok\":true}"},
+		{"normalized operation ID", "get_extra", "{\"query\":{\"cursor\":\"abc\"}}", "GET", "/v1/normalized", "cursor=abc", "", 200, "{\"ok\":true}"},
+		{"mixed required and optional query", "MixedQuery", "{\"query\":{\"all\":true,\"cursor\":\"abc\"}}", "GET", "/v1/mixed", "all=true&cursor=abc", "", 200, "{\"ok\":true}"},
+		{"operation-level required override", "QueryOverride", "{\"query\":{\"flag\":true}}", "GET", "/v1/overrides", "flag=true", "", 200, "{\"ok\":true}"},
+		{"operation-level optional override", "OptionalOverride", "{\"query\":{\"limit\":\"x\"}}", "GET", "/v1/optional-override", "limit=x", "", 200, "{\"ok\":true}"},
+		{"optional override without a query member", "OptionalOverride", "", "GET", "/v1/optional-override", "", "", 200, "{\"ok\":true}"},
+		{"unlisted 203 success", "Accepted203", "", "POST", "/v1/accepted", "", "", 203, "{\"ok\":true}"},
+		{"unlisted 210 success", "Extended210", "", "GET", "/v1/extended", "", "", 210, "{\"ok\":true}"},
+		{"contentless 204 success", "Removed204", "", "DELETE", "/v1/removed", "", "", 204, ""},
+		{"named date path", "GetDated", "{\"field\":\"2024-01-02\"}", "GET", "/v1/dated/2024-01-02", "", "", 200, "{\"ok\":true}"},
+		{"raw JSON body", "CreateSession", "{\"body\":{\"workspace\":\"/ws\",\"opaque\":9007199254740993}}", "POST", "/v1/sessions", "", "{\"workspace\":\"/ws\",\"opaque\":9007199254740993}", 200, "{\"ok\":true}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mu.Lock()
@@ -1408,13 +1061,13 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("invokeGenerated(%s): %v", tc.operation, err)
 			}
-			if status != http.StatusOK {
-				t.Fatalf("%s status = %d, want %d", tc.operation, status, http.StatusOK)
+			if status != tc.status || response.StatusCode != tc.status {
+				t.Fatalf("%s status = declared %d received %d, want %d", tc.operation, status, response.StatusCode, tc.status)
 			}
 			body, err := io.ReadAll(response.Body)
 			_ = response.Body.Close()
-			if err != nil || string(body) != "{\"ok\":true}" {
-				t.Fatalf("%s result = %q, %v, want the exact response bytes", tc.operation, body, err)
+			if err != nil || string(body) != tc.response {
+				t.Fatalf("%s result = %q, %v, want %q", tc.operation, body, err, tc.response)
 			}
 			mu.Lock()
 			call := recorded[before]
@@ -1424,33 +1077,46 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 			}
 		})
 	}
-	{
-		mu.Lock()
-		before := len(recorded)
-		mu.Unlock()
-		_, _, err := invokeGenerated(context.Background(), client, "QueryOverride", nil)
-		if !errors.Is(err, ErrInvalidParams) {
-			t.Fatalf("omitted required override error = %v, want ErrInvalidParams", err)
-		}
-		mu.Lock()
-		reached := len(recorded) != before
-		mu.Unlock()
-		if reached {
-			t.Fatal("a locally rejected query override reached the transport")
-		}
+	for _, tc := range []struct {
+		name      string
+		operation string
+		params    string
+	}{
+		{"omitted required query override", "QueryOverride", ""},
+		{"mixed query missing its required member", "MixedQuery", "{\"query\":{\"cursor\":\"abc\"}}"},
+		{"invalid date path text", "GetDated", "{\"field\":\"not-a-date\"}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			before := len(recorded)
+			mu.Unlock()
+			_, _, err := invokeGenerated(context.Background(), client, tc.operation, json.RawMessage(tc.params))
+			if !errors.Is(err, ErrInvalidParams) {
+				t.Fatalf("%s error = %v, want ErrInvalidParams", tc.operation, err)
+			}
+			mu.Lock()
+			reached := len(recorded) != before
+			mu.Unlock()
+			if reached {
+				t.Fatalf("%s reached the transport after local rejection", tc.operation)
+			}
+		})
 	}
 	names := OperationNames()
-	want := []string{"CreateSession", "GetHealth", "OptionalOverride", "PingSession", "QueryOverride", "ResetPlainField", "ResetProviderField", "ResetProviderModelField", "get_extra"}
+	want := []string{"Accepted203", "CreateSession", "Extended210", "Extra", "GetDated", "GetHealth", "MixedQuery", "OptionalOverride", "PingSession", "QueryOverride", "Removed204", "ResetPlainField", "ResetProviderField", "ResetProviderModelField", "get_extra"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("OperationNames() = %v, want %v", names, want)
 	}
 }
 `
 
-// TestGeneratedFixtureCompilesAndDispatches generates a fixture SDK and its
+// TestGeneratedFixtureCompilesAndDispatches generates the fixture SDK and its
 // native bindings into a disposable module with the product module path, copies
 // the real stateless binder, compiles them, and drives the actual generated
-// client through the binder against httptest routes.
+// client through the binder against httptest routes. The fixture is the one
+// compiled owner of every accepted native shape; the rows carry independently
+// expected paths, queries, raw bodies, declared statuses, response bytes and
+// contract metadata.
 func TestGeneratedFixtureCompilesAndDispatches(t *testing.T) {
 	dir := t.TempDir()
 	schemaPath := filepath.Join(dir, "openapi.yaml")
@@ -1469,10 +1135,38 @@ func TestGeneratedFixtureCompilesAndDispatches(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(nativePath), "bind.go"), binder, 0o644))
 	testassert.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(nativePath), "bind_test.go"), []byte(fixtureDispatchTest), 0o644))
-	contract, err := os.ReadFile(contractPath)
+	contractData, err := os.ReadFile(contractPath)
 	testassert.NoError(t, err)
-	testassert.Check(t, strings.Contains(string(contract), `"get_extra": {`), "fixture contract does not advertise the source operation ID:\n%s", contract)
-	testassert.Check(t, !strings.Contains(string(contract), "GetEvents"), "fixture contract carries the event stream:\n%s", contract)
+	var contract map[string]contractOperation
+	testassert.NoError(t, json.Unmarshal(contractData, &contract))
+	wantContract := map[string]contractOperation{
+		"Accepted203":             {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
+		"CreateSession":           {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeRequired},
+		"Extended210":             {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
+		"Extra":                   {SessionID: modeRequired, Field: modeForbidden, Query: modeForbidden, Body: modeRequired},
+		"GetDated":                {SessionID: modeForbidden, Field: modeRequired, Query: modeForbidden, Body: modeForbidden},
+		"GetHealth":               {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
+		"MixedQuery":              {SessionID: modeForbidden, Field: modeForbidden, Query: modeRequired, Body: modeForbidden, QueryMembers: map[string]contractMember{"all": {Required: true, Type: "boolean"}, "cursor": {Required: false, Type: "string"}}},
+		"OptionalOverride":        {SessionID: modeForbidden, Field: modeForbidden, Query: modeOptional, Body: modeForbidden, QueryMembers: map[string]contractMember{"limit": {Required: false, Type: "string"}}},
+		"PingSession":             {SessionID: modeRequired, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
+		"QueryOverride":           {SessionID: modeForbidden, Field: modeForbidden, Query: modeRequired, Body: modeForbidden, QueryMembers: map[string]contractMember{"flag": {Required: true, Type: "boolean"}}},
+		"Removed204":              {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
+		"ResetPlainField":         {SessionID: modeForbidden, Field: modeRequired, Query: modeForbidden, Body: modeForbidden},
+		"ResetProviderField":      {SessionID: modeForbidden, Field: modeRequired, Query: modeRequired, Body: modeForbidden, QueryMembers: map[string]contractMember{"provider_id": {Required: true, Type: "string"}}},
+		"ResetProviderModelField": {SessionID: modeForbidden, Field: modeRequired, Query: modeRequired, Body: modeForbidden, QueryMembers: map[string]contractMember{"provider_id": {Required: true, Type: "string"}, "model_id": {Required: true, Type: "string"}}},
+		"get_extra":               {SessionID: modeForbidden, Field: modeForbidden, Query: modeOptional, Body: modeForbidden, QueryMembers: map[string]contractMember{"cursor": {Required: false, Type: "string"}}},
+	}
+	testassert.Require(t, len(contract) == len(wantContract), "fixture contract names %d operations, want %d:\n%s", len(contract), len(wantContract), contractData)
+	for name, want := range wantContract {
+		got, ok := contract[name]
+		testassert.Require(t, ok, "fixture contract is missing %q", name)
+		testassert.Require(t, got.SessionID == want.SessionID && got.Field == want.Field && got.Query == want.Query && got.Body == want.Body, "fixture contract %q = %+v, want the declared modes %+v", name, got, want)
+		if want.QueryMembers == nil {
+			testassert.Require(t, len(got.QueryMembers) == 0, "fixture contract %q carries query members %+v, want none", name, got.QueryMembers)
+		} else {
+			testassert.Require(t, reflect.DeepEqual(got.QueryMembers, want.QueryMembers), "fixture contract %q query members = %+v, want %+v", name, got.QueryMembers, want.QueryMembers)
+		}
+	}
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(`module github.com/MMinasyan/lightcode
 
 go 1.26.0
@@ -1487,24 +1181,10 @@ require (
 	sum, err := os.ReadFile(filepath.Join("..", "..", "go.sum"))
 	testassert.NoError(t, err)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "go.sum"), sum, 0o644))
-	cmd := exec.Command("go", "test", "./internal/clientops")
+	cmd := exec.Command("go", "test", "-mod=mod", "./internal/clientops")
 	cmd.Dir = dir
-	cmd.Env = fixtureEnv()
 	{
 		out, err := cmd.CombinedOutput()
 		testassert.Require(t, err == nil, "compiling/dispatching the generated fixture: %v\n%s", err, out)
 	}
-}
-
-// fixtureEnv returns the process environment with the disposable module's build
-// flags pinned: no network, the local module cache and the copied go.sum.
-func fixtureEnv() []string {
-	env := make([]string, 0, len(os.Environ())+3)
-	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "GOFLAGS=") || strings.HasPrefix(entry, "GOPROXY=") || strings.HasPrefix(entry, "GOSUMDB=") {
-			continue
-		}
-		env = append(env, entry)
-	}
-	return append(env, "GOFLAGS=-mod=mod", "GOPROXY=off", "GOSUMDB=off")
 }

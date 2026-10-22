@@ -672,9 +672,9 @@ func TestCompactionBoundaryRows(t *testing.T) {
 	})
 }
 
-// usageByModel returns the totals' pieces keyed by ref: the shared
+// UsageByModelForTest returns the totals' pieces keyed by ref: the shared
 // usage-by-model selection; each caller keeps its own expected counts.
-func usageByModel(totals UsageTotals, ref model.ModelRef) UsageTotals {
+func UsageByModelForTest(totals UsageTotals, ref model.ModelRef) UsageTotals {
 	var out UsageTotals
 	for _, mu := range totals.ByModel {
 		if mu.Model == ref {

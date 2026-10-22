@@ -383,10 +383,10 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	}
 	testassert.Require(t, parkedEntry.BoundaryEntryID == boundary && (parkedEntry.Summary == "summary one" && parkedEntry.Usage != nil && *parkedEntry.Usage == summaryUsage), "got %v, want %v; parked compaction summary/usage = %+v", parkedEntry.BoundaryEntryID, boundary, parkedEntry)
 	testassert.Equal(t, parked.session.State.CompactionEntryID, parkedEntry.EntryID)
-	parkedSessionUsage := usageByModel(parked.session.State.Usage, compactRef)
+	parkedSessionUsage := UsageByModelForTest(parked.session.State.Usage, compactRef)
 	testassert.Require(t, len(parkedSessionUsage.ByModel) == 1 && parkedSessionUsage.ByModel[0].Usage == summaryUsage, "parked session usage = %+v, want the summary's counts", parked.session.State.Usage)
 	testassert.Require(t, parked.operation.State.Status == OperationRunning && parked.operation.State.Terminal == nil, "parked operation status = %q, want the enclosing Operation still running", parked.operation.State.Status)
-	parkedOperationUsage := usageByModel(parked.operation.State.Usage, compactRef)
+	parkedOperationUsage := UsageByModelForTest(parked.operation.State.Usage, compactRef)
 	testassert.Require(t, len(parkedOperationUsage.ByModel) == 1 && parkedOperationUsage.ByModel[0].Usage == summaryUsage, "parked operation usage = %+v, want the summary's counts", parked.operation.State.Usage)
 	select {
 	case result := <-done:
@@ -417,7 +417,7 @@ func TestModelEffectCompactTriggerOverflowCompactsFirst(t *testing.T) {
 	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
 	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
 	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
-	compactionUsage := usageByModel(graph.Session.State.Usage, compactRef)
+	compactionUsage := UsageByModelForTest(graph.Session.State.Usage, compactRef)
 	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session usage = %+v, want the summary's counts keyed by the compact model", graph.Session.State.Usage)
 	assistants := 0
 	for i := range graph.Entries {
@@ -531,7 +531,7 @@ func TestModelEffectCompactTriggerCheckpointFailureUnsent(t *testing.T) {
 		state := operationStateOf(t, graph, failingOperation)
 		testassert.Require(t, state.Status == OperationFailure && usageTotalsEqual(state.Usage, wantTotals), "operation usage = %+v, want the reported summary counts keyed by the compact model", state.Usage)
 	}
-	compactSessionTotals := usageByModel(graph.Session.State.Usage, compactRef)
+	compactSessionTotals := UsageByModelForTest(graph.Session.State.Usage, compactRef)
 	wantSessionTotals := UsageTotals{ByModel: []ModelUsage{{Model: compactRef, Usage: UsageCount{InputTokens: 11, OutputTokens: 5}}}}
 	testassert.Require(t, usageTotalsEqual(compactSessionTotals, wantSessionTotals), "session compact usage = %+v, want prior plus failed summary counts", compactSessionTotals)
 	testassert.Equal(t, graph.Session.State.CompactionEntryID, prior.EntryID)
@@ -733,7 +733,7 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph) // exactly one compaction entry
 	testassert.Require(t, comp.Usage != nil && *comp.Usage == summaryUsage, "compaction entry usage = %+v, want the summary's reported counts", comp.Usage)
-	compactionUsage := usageByModel(graph.Session.State.Usage, testCompactCapture().Model)
+	compactionUsage := UsageByModelForTest(graph.Session.State.Usage, testCompactCapture().Model)
 	testassert.Require(t, len(compactionUsage.ByModel) == 1 && compactionUsage.ByModel[0].Usage == summaryUsage, "session compact usage = %+v, want the summary's counts billed exactly once", graph.Session.State.Usage)
 }
 

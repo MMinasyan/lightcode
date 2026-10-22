@@ -27,8 +27,8 @@ var errSteeringBoundary = errors.New("harness: steering boundary")
 // another request, leaving every head buffered for the ordinary post-terminal
 // drain — otherwise it projects the fresh model.Message history. Selection
 // consumes no head and performs no storage, reservation, cancellation or
-// observation. Physical retries and compact-piece context callbacks never
-// reach this boundary.
+// observation. Physical retries and the compact Agent's own context callback
+// never reach this boundary.
 func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
 	firstRequest := true
 	return func(ctx context.Context) ([]model.Message, error) {

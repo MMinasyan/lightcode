@@ -386,9 +386,10 @@ type operationSettlementEntry struct {
 	CompactionUsage bool            `json:"compaction_usage,omitempty"`
 }
 
-// compactionEntry is one immutable compaction commit: the rolling summary of
-// everything up to its boundary entry, the compact model identity that
-// produced it, the governing configuration revision, and the commit's
+// compactionEntry is one immutable compaction commit: the single-request
+// summary of the frozen conversation up to its boundary entry, the compact
+// model identity that produced it, the governing configuration revision, and
+// the commit's
 // reported usage when present. Independently copied fork-prefix entries omit
 // the owning Operation identity and carry no source usage.
 type compactionEntry struct {

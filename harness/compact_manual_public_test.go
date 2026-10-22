@@ -307,7 +307,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		// The summary usage landed keyed by the compact model.
 		view, err := f.h.ReadSessionView(context.Background(), session)
 		testassert.NoError(t, err)
-		pieces := usageByModel(view.TotalUsage, compactModelRef)
+		pieces := harness.UsageByModelForTest(view.TotalUsage, compactModelRef)
 		testassert.Require(t, len(pieces.ByModel) == 1 && pieces.ByModel[0].Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "session usage = %+v, want the summary counts keyed by the compact model", view.TotalUsage)
 		// The compact preparation carried the compact request kind while the
 		// conversation turn's preparation carried the message kind.

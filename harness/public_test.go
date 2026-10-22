@@ -5967,7 +5967,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		testassert.Equal(t, destState.State.CompactionEntryID, copied.ID)
 		destView, err := f.h.ReadSessionView(ctx, dest)
 		testassert.NoError(t, err)
-		testassert.Require(t, len(usageByModel(destView.TotalUsage, compactModelRef).ByModel) == 0, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
+		testassert.Require(t, len(harness.UsageByModelForTest(destView.TotalUsage, compactModelRef).ByModel) == 0, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
 		// The fork's own turn projected at the copied summary.
 		reqs := conversation.seen()
 		testassert.Require(t, len(reqs) != 0, "the fork execution never reached its model boundary")
@@ -5983,18 +5983,6 @@ func kindsOf(entries []harness.Entry) []harness.EntryKind {
 	out := make([]harness.EntryKind, 0, len(entries))
 	for _, entry := range entries {
 		out = append(out, entry.Kind)
-	}
-	return out
-}
-
-// usageByModel returns the totals' pieces keyed by ref: the shared
-// usage-by-model selection; each caller keeps its own expected counts.
-func usageByModel(totals harness.UsageTotals, ref model.ModelRef) harness.UsageTotals {
-	var out harness.UsageTotals
-	for _, mu := range totals.ByModel {
-		if mu.Model == ref {
-			out.ByModel = append(out.ByModel, mu)
-		}
 	}
 	return out
 }

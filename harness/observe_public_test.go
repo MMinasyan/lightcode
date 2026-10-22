@@ -285,7 +285,8 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 			t.Fatal("the child compact request never arrived")
 		}
 		// a user steering head submitted during the frozen checkpoint stays
-		// pending: no compact piece exits at a boundary and no successor is scoped
+		// pending: the single summary request drains no steering and no
+		// successor is scoped
 		steered, err := submit(t, h, child, "child-op-3", harness.MessageModeRegular, "steered child")
 		testassert.Require(t, err == nil && steered.Disposition == harness.DispositionSteering && steered.Operation == nil, "checkpoint steering submit = %+v, %v", steered, err)
 		frozen, err := h.ReadSessionView(context.Background(), child)
@@ -294,7 +295,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		for _, op := range frozen.Operations {
 			testassert.Require(t, op.OperationID != "child-op-3", "the pending head was scoped as an Operation inside the frozen checkpoint")
 		}
-		close(compactGate) // the pieces complete and the turn settles
+		close(compactGate) // the summary completes and the turn settles
 
 		secondOperation := awaitTerminal(t, h, child, "child-op-2")
 		{
@@ -358,7 +359,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		}
 		testassert.Equal(t, compactions, 1)
 		pieceCount := func(totals harness.UsageTotals) bool {
-			pieces := usageByModel(totals, compactRef)
+			pieces := harness.UsageByModelForTest(totals, compactRef)
 			return len(pieces.ByModel) == 1 && pieces.ByModel[0].Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1})
 		}
 		testassert.Require(t, pieceCount(secondOperation.State.Usage) && pieceCount(childQuiet.TotalUsage), "child compact usage missing: operation=%+v session=%+v", secondOperation.State.Usage, childQuiet.TotalUsage)
