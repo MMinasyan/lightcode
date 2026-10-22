@@ -23,52 +23,9 @@ import { RuntimeConnection } from './connection';
 import { extractSettingsText } from './exactjson';
 import { invokeNative } from './results';
 import { assertNativeInvocations } from './nativecontract';
+import { INSTANCE, NEWER, OLDER, hydration, json, native, session } from './test-fixtures';
 
-const INSTANCE = '0123456789abcdef0123456789abcdef';
-const NEWER = '2026-10-02T10:00:00Z';
-const OLDER = '2026-10-01T05:00:00Z';
 const mounted: Array<ReturnType<typeof mount>> = [];
-
-function session(id: string, lastActivity: string, parent?: string) {
-  return {
-    session_id: id,
-    workspace: '/ws',
-    ...(parent ? { parent_session_id: parent } : {}),
-    lifecycle: 'open',
-    agent_type: 'primary',
-    created_at: '0',
-    last_activity: lastActivity,
-    session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-  };
-}
-
-function hydration(sessionID: string, overrides: Record<string, unknown> = {}) {
-  return {
-    session: session(sessionID, NEWER),
-    selected_model: null,
-    session_revision: { instance_id: INSTANCE, durable_revision: '1', local_revision: '0' },
-    configuration_revision: { instance_id: INSTANCE, generation: '1' },
-    warnings_revision: { instance_id: INSTANCE, revision: '1' },
-    operations: [],
-    pending: { steering: [], queued: [] },
-    conversation: { items: [] },
-    usage: { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } },
-    warnings: [],
-    background: [],
-    ...overrides,
-  };
-}
-
-function json(status: number, value: unknown): desktopclient.HTTPResponse {
-  return native(status, JSON.stringify(value), false);
-}
-
-// native supplies one scripted local result exactly as the native owner
-// returns it, including the explicit invalid-delivery bit; producer
-// validation stays at the Go response owner.
-function native(status: number, body: string, invalid: boolean): desktopclient.HTTPResponse {
-  return { status, body, invalid };
-}
 
 // routeState is the scripted in-memory Runtime behind the byte bridge.
 interface Delayed {
@@ -117,7 +74,7 @@ function bridge(script: Script = {}) {
         const raw = script.hydration.shift()!;
         return native(raw.status, raw.body, raw.invalid);
       }
-      return json(200, hydration(envelope.session_id!));
+      return json(200, hydration({ session: session(envelope.session_id!, NEWER) }));
     }
     if (operation === 'GetConfiguration') {
       const scriptedRead = script.configuration?.shift();
@@ -269,10 +226,6 @@ function configurationView(generation: string, agentName: string) {
   };
 }
 
-function rawJSONResponse(value: unknown) {
-  return { status: 200, body: JSON.stringify(value), invalid: false };
-}
-
 function typeInto(target: HTMLElement, text: string) {
   const textarea = target.querySelector('textarea') as HTMLTextAreaElement;
   textarea.value = text;
@@ -288,6 +241,16 @@ function changeInput(target: HTMLElement, label: string, value: string) {
 async function settle() {
   await new Promise((resolve) => setTimeout(resolve, 0));
   await tick();
+}
+
+// submitOnce types one mounted draft and presses Send through the real
+// composer, leaving each case its own scripted outcome and predicates.
+async function submitOnce(target: HTMLElement, text: string) {
+  typeInto(target, text);
+  await settle();
+  (target.querySelector('.send') as HTMLElement).click();
+  await settle();
+  await settle();
 }
 
 afterEach(async () => {
@@ -325,11 +288,7 @@ describe('real generated stack over the byte bridge', () => {
 
   it('a real native Call rejection is a transport loss, not a server rejection', async () => {
     const { target } = await mountReal({ submit: 'throw' });
-    typeInto(target, 'lost message');
-    await settle();
-    (target.querySelector('.send') as HTMLElement).click();
-    await settle();
-    await settle();
+    await submitOnce(target, 'lost message');
     // The binding rejects; the consumer must show Outcome unknown, never a
     // generated protocol error.
     expect(target.querySelector('.attempt.unknown')?.textContent).toContain('Outcome unknown');
@@ -340,11 +299,7 @@ describe('real generated stack over the byte bridge', () => {
     const { target } = await mountReal({
       submit: () => ({ status: 400, body: { code: 'invalid', message: 'content is not admitted' } }),
     });
-    typeInto(target, 'bad message');
-    await settle();
-    (target.querySelector('.send') as HTMLElement).click();
-    await settle();
-    await settle();
+    await submitOnce(target, 'bad message');
     expect(target.querySelector('.attempt.rejected')?.textContent).toContain('content is not admitted');
     expect((target.querySelector('textarea') as HTMLTextAreaElement).value).toBe('bad message');
     expect(target.querySelector('.attempt.unknown')).toBeNull();
@@ -352,11 +307,7 @@ describe('real generated stack over the byte bridge', () => {
 
   it('a real 200 disposition clears the matching draft and retires the attempt', async () => {
     const { target, calls } = await mountReal();
-    typeInto(target, 'delivered text');
-    await settle();
-    (target.querySelector('.send') as HTMLElement).click();
-    await settle();
-    await settle();
+    await submitOnce(target, 'delivered text');
     const submit = calls.find((call) => call.operation === 'SubmitSession');
     expect(submit).toBeDefined();
     const body = (JSON.parse(submit!.params) as { body: { operation_id: string; mode: string; content: unknown[] } }).body;
@@ -476,7 +427,7 @@ describe('real generated stack over the byte bridge', () => {
     // survives the binding and the actual reader repairs through the fresh
     // Open, while the event pull stays live and no blank projection is ever
     // adopted.
-    const unusable = { status: 200, body: unusableBody, invalid: true };
+    const unusable = native(200, unusableBody, true);
     const newerHint = JSON.stringify({
       kind: 'session_changed',
       scope: { kind: 'session', session_id: 'root1' },
@@ -499,16 +450,16 @@ describe('real generated stack over the byte bridge', () => {
     let releaseRead: () => void = () => {};
     const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
     const retired = variant === 'success'
-      ? rawJSONResponse(configurationView('9', 'stale'))
+      ? json(200, configurationView('9', 'stale'))
       : variant === 'loss'
         ? ('throw' as const)
-        : { status: 200, body: '{not json', invalid: true };
+        : native(200, '{not json', true);
     const { target, calls, connection } = await mountReal({
       openGate,
       configuration: [
-        { wait: Promise.resolve(), outcome: rawJSONResponse(configurationView('1', 'boot')) },
+        { wait: Promise.resolve(), outcome: json(200, configurationView('1', 'boot')) },
         { wait: readGate, outcome: retired },
-        { wait: Promise.resolve(), outcome: rawJSONResponse(configurationView('1', 'successor')) },
+        { wait: Promise.resolve(), outcome: json(200, configurationView('1', 'successor')) },
       ],
       events: [
         JSON.stringify({
@@ -553,7 +504,7 @@ describe('real generated stack over the byte bridge', () => {
     // call→reader path must render every FIFO occurrence on the initial body
     // and again on a replacement body, without deduplicating or minting
     // attempt rows.
-    const firstBody = hydration('root1', {
+    const firstBody = hydration({
       pending: {
         steering: [
           { operation_id: 'dup', origin: 'user', content: [{ kind: 'text', text: 'steer first' }] },
@@ -565,7 +516,7 @@ describe('real generated stack over the byte bridge', () => {
         ],
       },
     });
-    const secondBody = hydration('root1', {
+    const secondBody = hydration({
       session_revision: { instance_id: INSTANCE, durable_revision: '2', local_revision: '0' },
       pending: {
         steering: [
@@ -663,7 +614,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
 
   it('captures the ordered rewind-then-Fork requests from the shared invocation', async () => {
     const { target, calls } = await mountReal({
-      hydration: [json(200, hydration('root1', { conversation: { items: [forkInput] }, operations: [forkOperation] }))],
+      hydration: [json(200, hydration({ conversation: { items: [forkInput] }, operations: [forkOperation] }))],
       rewind: () => ({ status: 200, body: { restored: ['a.ts'], skipped: [] } }),
     });
     await submitRewindFork(target);
@@ -685,7 +636,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
 
   it('never sends Fork after a real transport-unknown rewind', async () => {
     const { target, calls } = await mountReal({
-      hydration: [json(200, hydration('root1', { conversation: { items: [forkInput] }, operations: [forkOperation] }))],
+      hydration: [json(200, hydration({ conversation: { items: [forkInput] }, operations: [forkOperation] }))],
       rewind: 'throw',
     });
     await submitRewindFork(target);
@@ -801,7 +752,7 @@ describe('the shared invocation boundary', () => {
   });
 
   it('treats a null success document as invalid delivery beside its non-null and 204 siblings', async () => {
-    vi.mocked(Call).mockResolvedValue({ status: 200, body: 'null', invalid: false });
+    vi.mocked(Call).mockResolvedValue(native(200, 'null', false));
     const nulled = await invokeNative(() => handle, 'submit', 'SubmitSession', '{"session_id":"root1","body":{}}', JSON.parse);
     expect(nulled.kind).toBe('invalid');
     if (nulled.kind === 'ok') throw new Error('null document accepted as ok');
@@ -809,9 +760,26 @@ describe('the shared invocation boundary', () => {
     const accepted = await invokeNative(() => handle, 'submit', 'SubmitSession', '{"session_id":"root1","body":{}}', JSON.parse);
     expect(accepted.kind).toBe('ok');
     if (accepted.kind === 'ok') expect(accepted.data).toEqual({ disposition: 'admitted' });
-    vi.mocked(Call).mockResolvedValue({ status: 204, body: '', invalid: false });
+    vi.mocked(Call).mockResolvedValue(native(204, '', false));
     const empty = await invokeNative(() => handle, 'interrupt', 'InterruptSession', '{"session_id":"root1"}', JSON.parse);
     expect(empty.kind).toBe('ok');
     if (empty.kind === 'ok') expect(empty.data).toEqual({});
+  });
+
+  it('refuses an otherwise decodable body carrying the invalid bit, unlike its false-bit control', async () => {
+    const params = '{"session_id":"root1","body":{}}';
+    const body = '{"disposition":"admitted"}';
+    vi.mocked(Call).mockResolvedValue(native(200, body, true));
+    const refused = await invokeNative(() => handle, 'submit', 'SubmitSession', params, JSON.parse);
+    expect(refused.kind).toBe('invalid');
+    vi.mocked(Call).mockResolvedValue(native(200, body, false));
+    const accepted = await invokeNative(() => handle, 'submit', 'SubmitSession', params, JSON.parse);
+    expect(accepted.kind).toBe('ok');
+    if (accepted.kind === 'ok') expect(accepted.data).toEqual({ disposition: 'admitted' });
+    // The two calls carried the same exact params; only the invalid bit differs.
+    expect(vi.mocked(Call).mock.calls).toEqual([
+      ['1', 'SubmitSession', params],
+      ['1', 'SubmitSession', params],
+    ]);
   });
 });

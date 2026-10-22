@@ -11,6 +11,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -24,15 +25,11 @@ func TestBackgroundBridgeMethodsForward(t *testing.T) {
 	store := storage.NewMemory()
 	stopper := &stubStopper{events: e.events}
 	r, err := e.open(ctx, e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	bridge := &backgroundBridge{h: r.harness}
 
 	parent, err := r.createSession(ctx, filepath.Join(e.home, "forward-parent"), "solo")
-	if err != nil {
-		t.Fatalf("createSession(parent): %v", err)
-	}
+	testassert.NoError(t, err)
 	res, err := bridge.LaunchChild(ctx, harness.LaunchChildRequest{
 		ParentSessionID: parent.Identity.SessionID,
 		AgentType:       "solo",
@@ -41,45 +38,29 @@ func TestBackgroundBridgeMethodsForward(t *testing.T) {
 		MaxConcurrent:   5,
 		OutputLimit:     4096,
 	})
-	if err != nil {
-		t.Fatalf("LaunchChild: %v", err)
-	}
-	if res.ChildSessionID == "" {
-		t.Fatal("LaunchChild returned no child session id")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.ChildSessionID != "", "LaunchChild returned no child session id")
 
 	jobSession, err := r.createSession(ctx, filepath.Join(e.home, "forward-job"), "solo")
-	if err != nil {
-		t.Fatalf("createSession(job): %v", err)
-	}
+	testassert.NoError(t, err)
 	var completionID string
-	if err := bridge.StartJob(ctx, jobSession.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
+	testassert.NoError(t, bridge.StartJob(ctx, jobSession.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
 		completionID = id
 		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
-	}
+	}))
 
-	if err := bridge.DeliverCompletion(ctx, jobSession.Identity.SessionID, completionID, "job report"); err != nil {
-		t.Fatalf("DeliverCompletion: %v", err)
-	}
+	testassert.NoError(t, bridge.DeliverCompletion(ctx, jobSession.Identity.SessionID, completionID, "job report"))
 	entries, err := store.ReadEntries(ctx, jobSession.Identity.SessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	admitted := false
 	for _, entry := range entries {
 		if entry.Kind == harness.EntryInput && strings.Contains(string(entry.Payload), "job report") {
 			admitted = true
 		}
 	}
-	if !admitted {
-		t.Fatal("the forwarded completion delivery left no admitted input entry")
-	}
+	testassert.Require(t, admitted, "the forwarded completion delivery left no admitted input entry")
 
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(ctx))
 }
 
 // backgroundProbe records the background services bridge of every prepared
@@ -150,45 +131,29 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	writeServiceFile(t, agents.PathForConfig(configPath),
 		`{"prober": {"model": "prov/m", "system_prompt": "simple", "tools": ["bg_probe"]}}`)
 	workspace := filepath.Join(home, "probe-ws")
-	if err := os.MkdirAll(workspace, 0o700); err != nil {
-		t.Fatalf("mkdir workspace: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 
 	probe := &backgroundProbe{}
 	r, err := Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
 		coreStoragePlugin(store), backgroundProbePlugin(probe),
 	}})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	// The unarmed-to-armed window ends before publication: construction
 	// and publication observe nothing.
-	if len(probe.seen) != 0 {
-		t.Fatalf("bridge observations across construction = %d, want none before the first admitted call", len(probe.seen))
-	}
+	testassert.Equal(t, len(probe.seen), 0)
 
 	session, err := r.createSession(ctx, workspace, "prober")
-	if err != nil {
-		t.Fatalf("createSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "probe")
 	awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
-	if len(probe.seen) == 0 {
-		t.Fatal("no prepared call observed the bridge")
-	}
+	testassert.Require(t, len(probe.seen) != 0, "no prepared call observed the bridge")
 	for i, background := range probe.seen {
-		if background == nil {
-			t.Fatalf("prepared call %d carried no background services bridge", i)
-		}
+		testassert.Require(t, background != nil, "prepared call %d carried no background services bridge", i)
 		// Complete after publication: the production-armed instance
 		// reaches the Harness (an unknown completion is not new work).
-		if err := background.DeliverCompletion(ctx, session.Identity.SessionID, "00000000000000000000000000000000", "ignored"); err != nil {
-			t.Fatalf("armed bridge delivery: %v", err)
-		}
+		testassert.NoError(t, background.DeliverCompletion(ctx, session.Identity.SessionID, "00000000000000000000000000000000", "ignored"))
 	}
 
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(ctx))
 }

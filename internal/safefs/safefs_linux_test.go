@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,12 +19,8 @@ func TestOpenExistingRefusesSymlinkLeaf(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
 	link := filepath.Join(root, "link.txt")
-	if err := os.WriteFile(target, []byte("content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(target, []byte("content"), 0o644))
+	testassert.NoError(t, os.Symlink(target, link))
 	f, err := OpenExisting(link, os.O_RDONLY)
 	if err == nil {
 		f.Close()
@@ -34,13 +31,9 @@ func TestOpenExistingRefusesSymlinkLeaf(t *testing.T) {
 func TestOpenForWriteCreatesParentsAndRefusesSymlinkParent(t *testing.T) {
 	root := t.TempDir()
 	realDir := filepath.Join(root, "real")
-	if err := os.Mkdir(realDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Mkdir(realDir, 0o755))
 	linkDir := filepath.Join(root, "link")
-	if err := os.Symlink(realDir, linkDir); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(realDir, linkDir))
 
 	if f, _, err := OpenForWrite(filepath.Join(root, "a", "b", "file.txt"), 0o644); err != nil {
 		t.Fatalf("OpenForWrite create parents: %v", err)
@@ -72,12 +65,8 @@ func TestOpenExistingWriterlessFIFORejectedWithoutBlocking(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("OpenExisting succeeded on writerless FIFO leaf")
-		}
-		if !errors.Is(err, ErrNonRegular) {
-			t.Fatalf("OpenExisting writerless FIFO err = %v, want ErrNonRegular", err)
-		}
+		testassert.Require(t, err != nil, "OpenExisting succeeded on writerless FIFO leaf")
+		testassert.Require(t, errors.Is(err, ErrNonRegular), "OpenExisting writerless FIFO err = %v, want ErrNonRegular", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("OpenExisting blocked on writerless FIFO; want immediate ErrNonRegular")
 	}
@@ -101,13 +90,9 @@ func TestOpenForWriteRefusesFIFOLeaf(t *testing.T) {
 func TestPR11Closure_OpenExistingAndOpenForWriteRefuseHardlinkLeaf(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")
-	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(outside, []byte("outside-content"), 0o644))
 	hardlinked := filepath.Join(root, "hardlinked.txt")
-	if err := os.Link(outside, hardlinked); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Link(outside, hardlinked))
 
 	t.Run("OpenExisting", func(t *testing.T) {
 		f, err := OpenExisting(hardlinked, os.O_RDONLY)
@@ -130,127 +115,97 @@ func TestRemoveLeafUnlinksSymlinkItself(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
 	link := filepath.Join(root, "link.txt")
-	if err := os.WriteFile(target, []byte("content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveLeaf(link); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(link); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("link lstat err = %v, want not exist", err)
+	testassert.NoError(t, os.WriteFile(target, []byte("content"), 0o644))
+	testassert.NoError(t, os.Symlink(target, link))
+	testassert.NoError(t, RemoveLeaf(link))
+	{
+		_, err := os.Lstat(link)
+		testassert.Require(t, errors.Is(err, os.ErrNotExist), "link lstat err = %v, want not exist", err)
 	}
 	data, err := os.ReadFile(target)
-	if err != nil || string(data) != "content" {
-		t.Fatalf("target content = %q, %v; want unchanged", data, err)
-	}
+	testassert.Require(t, err == nil && string(data) == "content", "target content = %q, %v; want unchanged", data, err)
 }
 
 func TestRemoveLeafRefusesHardlinkedRegularLeafAndPreservesLinks(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")
-	if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(outside, []byte("outside-content"), 0o644))
 	hardlinked := filepath.Join(root, "hardlinked.txt")
-	if err := os.Link(outside, hardlinked); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Link(outside, hardlinked))
 
 	err := RemoveLeaf(hardlinked)
-	if err == nil {
-		t.Fatal("RemoveLeaf succeeded on hardlinked regular leaf; want refusal")
-	}
+	testassert.Require(t, err != nil, "RemoveLeaf succeeded on hardlinked regular leaf; want refusal")
 	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
-		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
+	{
+		_, err := os.Lstat(hardlinked)
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Lstat(hardlinked); err != nil {
-		t.Fatalf("hardlinked leaf lstat = %v; want preserved", err)
-	}
-	if got, err := os.ReadFile(outside); err != nil || string(got) != "outside-content" {
-		t.Fatalf("outside file = %q, %v; want unchanged", got, err)
+	{
+		got, err := os.ReadFile(outside)
+		testassert.Require(t, err == nil && string(got) == "outside-content", "outside file = %q, %v; want unchanged", got, err)
 	}
 }
 
 func TestRemoveLeafRefusesHardlinkedSymlinkLeafAndPreservesLinks(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
-	if err := os.WriteFile(target, []byte("target-content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(target, []byte("target-content"), 0o644))
 	link := filepath.Join(root, "link.txt")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(target, link))
 	hardlinkedSymlink := filepath.Join(root, "hardlinked-link.txt")
-	if err := os.Link(link, hardlinkedSymlink); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Link(link, hardlinkedSymlink))
 	assertHardlinkedSymlink(t, link)
 	assertHardlinkedSymlink(t, hardlinkedSymlink)
 
 	err := RemoveLeaf(hardlinkedSymlink)
-	if err == nil {
-		t.Fatal("RemoveLeaf succeeded on hardlinked symlink leaf; want refusal")
-	}
+	testassert.Require(t, err != nil, "RemoveLeaf succeeded on hardlinked symlink leaf; want refusal")
 	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
-		t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
+	testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
+	{
+		_, err := os.Lstat(link)
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Lstat(link); err != nil {
-		t.Fatalf("original symlink lstat = %v; want preserved", err)
+	{
+		_, err := os.Lstat(hardlinkedSymlink)
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Lstat(hardlinkedSymlink); err != nil {
-		t.Fatalf("hardlinked symlink lstat = %v; want preserved", err)
-	}
-	if got, err := os.ReadFile(target); err != nil || string(got) != "target-content" {
-		t.Fatalf("target file = %q, %v; want unchanged", got, err)
+	{
+		got, err := os.ReadFile(target)
+		testassert.Require(t, err == nil && string(got) == "target-content", "target file = %q, %v; want unchanged", got, err)
 	}
 }
 
 func TestRemoveLeafRemovesEmptyDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "empty")
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveLeaf(dir); err != nil {
-		t.Fatalf("RemoveLeaf(empty dir) = %v, want nil", err)
-	}
-	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("empty dir lstat err = %v, want not exist", err)
+	testassert.NoError(t, os.Mkdir(dir, 0o755))
+	testassert.NoError(t, RemoveLeaf(dir))
+	{
+		_, err := os.Lstat(dir)
+		testassert.Require(t, errors.Is(err, os.ErrNotExist), "empty dir lstat err = %v, want not exist", err)
 	}
 }
 
 func TestRemoveLeafRefusesNonEmptyDirectoryAndPreservesChild(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nonempty")
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Mkdir(dir, 0o755))
 	child := filepath.Join(dir, "file.txt")
-	if err := os.WriteFile(child, []byte("content"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveLeaf(dir); err == nil {
-		t.Fatal("RemoveLeaf(non-empty dir) = nil, want refusal")
+	testassert.NoError(t, os.WriteFile(child, []byte("content"), 0o644))
+	{
+		err := RemoveLeaf(dir)
+		testassert.Require(t, err != nil, "RemoveLeaf(non-empty dir) = nil, want refusal")
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		t.Fatalf("non-empty dir stat = %v, isDir = %v; want intact directory", err, err == nil && info.IsDir())
 	}
 	data, err := os.ReadFile(child)
-	if err != nil || string(data) != "content" {
-		t.Fatalf("non-empty dir child content = %q, %v; want unchanged", data, err)
-	}
+	testassert.Require(t, err == nil && string(data) == "content", "non-empty dir child content = %q, %v; want unchanged", data, err)
 }
 
 func assertHardlinkedSymlink(t *testing.T, path string) {
 	t.Helper()
 	info, err := os.Lstat(path)
-	if err != nil {
-		t.Fatalf("lstat %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "lstat %s: %v", path, err)
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("%s mode = %s, want symlink", path, info.Mode())
 	}
@@ -258,7 +213,5 @@ func assertHardlinkedSymlink(t *testing.T, path string) {
 	if !ok {
 		t.Fatalf("%s stat type = %T, want *syscall.Stat_t", path, info.Sys())
 	}
-	if st.Nlink <= 1 {
-		t.Fatalf("%s symlink nlink = %d, want > 1", path, st.Nlink)
-	}
+	testassert.Require(t, st.Nlink > 1, "%s symlink nlink = %d, want > 1", path, st.Nlink)
 }

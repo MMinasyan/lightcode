@@ -24,6 +24,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestSQLiteConformance runs the shared storage conformance suite against the
@@ -37,9 +38,7 @@ func TestSQLiteConformance(t *testing.T) {
 func newSQLiteStore(t *testing.T) *SQLite {
 	t.Helper()
 	store, err := OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
-	if err != nil {
-		t.Fatalf("OpenSQLite: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
 	return store
 }
@@ -55,13 +54,9 @@ func sqliteBackend() conformanceBackend {
 		newStore: func(t *testing.T) harness.Storage { return newSQLiteStore(t) },
 		reopen: func(t *testing.T, store harness.Storage) harness.Storage {
 			s := store.(*SQLite)
-			if err := s.Close(); err != nil {
-				t.Fatalf("close: %v", err)
-			}
+			testassert.NoError(t, s.Close())
 			reopened, err := OpenSQLite(s.path)
-			if err != nil {
-				t.Fatalf("reopen %q: %v", s.path, err)
-			}
+			testassert.Require(t, err == nil, "reopen %q: %v", s.path, err)
 			t.Cleanup(func() { reopened.Close() })
 			return reopened
 		},
@@ -70,9 +65,7 @@ func sqliteBackend() conformanceBackend {
 			conn := sqliteFixtureConn(t, s)
 			defer conn.Close()
 			var highest sql.NullInt64
-			if err := conn.QueryRowContext(context.Background(), `SELECT MAX(sequence) FROM entries WHERE session_id = ?`, sessionID).Scan(&highest); err != nil {
-				t.Fatalf("read highest sequence: %v", err)
-			}
+			testassert.NoError(t, conn.QueryRowContext(context.Background(), `SELECT MAX(sequence) FROM entries WHERE session_id = ?`, sessionID).Scan(&highest))
 			sqliteRawExec(t, conn, `PRAGMA ignore_check_constraints = ON`)
 			defer sqliteRawExec(t, conn, `PRAGMA ignore_check_constraints = OFF`)
 			// Valid in every envelope field except the zero commit time.
@@ -140,16 +133,15 @@ func sqliteBackend() conformanceBackend {
 func sqliteFixtureConn(t *testing.T, store *SQLite) *sql.Conn {
 	t.Helper()
 	conn, err := store.db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("fixture connection: %v", err)
-	}
+	testassert.NoError(t, err)
 	return conn
 }
 
 func sqliteRawExec(t *testing.T, conn *sql.Conn, query string, args ...any) {
 	t.Helper()
-	if _, err := conn.ExecContext(context.Background(), query, args...); err != nil {
-		t.Fatalf("exec %q: %v", query, err)
+	{
+		_, err := conn.ExecContext(context.Background(), query, args...)
+		testassert.Require(t, err == nil, "exec %q: %v", query, err)
 	}
 }
 
@@ -157,9 +149,7 @@ func sqliteRawExec(t *testing.T, conn *sql.Conn, query string, args ...any) {
 func sqliteFileDigest(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %q: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "read %q: %v", path, err)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
@@ -168,8 +158,9 @@ func sqliteFileDigest(t *testing.T, path string) string {
 func sqliteAssertNoSidecars(t *testing.T, path string) {
 	t.Helper()
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Stat(path + suffix); !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("sidecar %q exists: %v", path+suffix, err)
+		{
+			_, err := os.Stat(path + suffix)
+			testassert.Check(t, errors.Is(err, fs.ErrNotExist), "sidecar %q exists: %v", path+suffix, err)
 		}
 	}
 }
@@ -180,22 +171,22 @@ func sqliteAssertNoSidecars(t *testing.T, path string) {
 func sqliteFixtureDatabase(t *testing.T, path string, ddl []string, version int) {
 	t.Helper()
 	db, err := sql.Open(sqliteDriverName, path)
-	if err != nil {
-		t.Fatalf("open fixture database: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer db.Close()
 	for _, stmt := range ddl {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("exec %q: %v", stmt, err)
+		{
+			_, err := db.Exec(stmt)
+			testassert.Require(t, err == nil, "exec %q: %v", stmt, err)
 		}
 	}
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
-		t.Fatalf("set user_version: %v", err)
+	{
+		_, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version))
+		testassert.NoError(t, err)
 	}
 }
 
 // TestSQLiteSchemaInitialization proves a missing path is initialized with the
-// complete canonical schema in one shot: version 6, exactly the two canonical
+// complete canonical schema in one shot: version 7, exactly the two canonical
 // tables and the one explicit index, only the autoindexes implied by those
 // tables, a well-formed image, no sidecars after close, and no partial file
 // when initialization fails.
@@ -203,125 +194,94 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lightcode.db")
 	store, err := OpenSQLite(path)
-	if err != nil {
-		t.Fatalf("OpenSQLite: %v", err)
-	}
+	testassert.NoError(t, err)
 	ctx := context.Background()
 	conn, err := store.db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("connection: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	var version int
-	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
-		t.Fatalf("PRAGMA user_version = %d (error %v), want 6", version, err)
+	{
+		err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version)
+		testassert.Require(t, err == nil && version == 7, "PRAGMA user_version = %d (error %v), want 7", version, err)
 	}
 
 	objects := map[string]string{}
 	rows, err := conn.QueryContext(ctx, `SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL`)
-	if err != nil {
-		t.Fatalf("read schema objects: %v", err)
-	}
+	testassert.NoError(t, err)
 	for rows.Next() {
 		var typ, name, ddl string
-		if err := rows.Scan(&typ, &name, &ddl); err != nil {
-			t.Fatalf("read schema objects: %v", err)
-		}
+		testassert.NoError(t, rows.Scan(&typ, &name, &ddl))
 		objects[typ+" "+name] = ddl
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("read schema objects: %v", err)
-	}
+	testassert.NoError(t, rows.Err())
 	rows.Close()
 	want := map[string]string{
 		"table entries":               sqliteEntriesDDL,
 		"table registers":             sqliteRegistersDDL,
 		"index operation_register_id": sqliteOperationIndexDDL,
 	}
-	if len(objects) != len(want) {
-		t.Errorf("user-defined schema objects = %v, want exactly %v", objects, want)
-	}
+	testassert.Check(t, len(objects) == len(want), "user-defined schema objects = %v, want exactly %v", objects, want)
 	for key, ddl := range want {
-		if objects[key] != ddl {
-			t.Errorf("schema object %q = %q, want the canonical definition", key, ddl)
-		}
+		testassert.Check(t, objects[key] == ddl, "schema object %q = %q, want the canonical definition", key, ddl)
 	}
 
 	autoindexes := map[string]bool{}
 	rows, err = conn.QueryContext(ctx, `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NULL`)
-	if err != nil {
-		t.Fatalf("read autoindexes: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer rows.Close()
 	for rows.Next() {
 		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatalf("read autoindexes: %v", err)
-		}
+		testassert.NoError(t, rows.Scan(&name))
 		autoindexes[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("read autoindexes: %v", err)
-	}
+	testassert.NoError(t, rows.Err())
 	wantAutoindexes := map[string]bool{
 		"sqlite_autoindex_entries_1":   true,
 		"sqlite_autoindex_entries_2":   true,
 		"sqlite_autoindex_registers_1": true,
 	}
-	if len(autoindexes) != len(wantAutoindexes) {
-		t.Errorf("autoindexes = %v, want exactly %v", autoindexes, wantAutoindexes)
-	}
+	testassert.Check(t, len(autoindexes) == len(wantAutoindexes), "autoindexes = %v, want exactly %v", autoindexes, wantAutoindexes)
 	for name := range wantAutoindexes {
-		if !autoindexes[name] {
-			t.Errorf("implied autoindex %q missing", name)
-		}
+		testassert.Check(t, autoindexes[name], "implied autoindex %q missing", name)
 	}
 
 	var integrity string
-	if err := conn.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
-		t.Errorf("PRAGMA integrity_check = %q (error %v), want ok", integrity, err)
+	{
+		err := conn.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity)
+		testassert.Check(t, err == nil && integrity == "ok", "PRAGMA integrity_check = %q (error %v), want ok", integrity, err)
 	}
 	conn.Close()
 
-	if err := store.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	testassert.NoError(t, store.Close())
 	sqliteAssertNoSidecars(t, path)
 
 	// An existing zero-length file is initialized exactly like a missing one.
 	empty := filepath.Join(dir, "empty.db")
-	if err := os.WriteFile(empty, nil, 0o644); err != nil {
-		t.Fatalf("create zero-length file: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(empty, nil, 0o644))
 	emptyStore, err := OpenSQLite(empty)
-	if err != nil {
-		t.Fatalf("OpenSQLite zero-length file: %v", err)
-	}
+	testassert.NoError(t, err)
 	var emptyVersion int
-	if err := emptyStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&emptyVersion); err != nil || emptyVersion != 6 {
-		t.Errorf("zero-length file user_version = %d (error %v), want 6", emptyVersion, err)
+	{
+		err := emptyStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&emptyVersion)
+		testassert.Check(t, err == nil && emptyVersion == 7, "zero-length file user_version = %d (error %v), want 7", emptyVersion, err)
 	}
-	if err := emptyStore.Close(); err != nil {
-		t.Fatalf("close zero-length store: %v", err)
-	}
+	testassert.NoError(t, emptyStore.Close())
 	sqliteAssertNoSidecars(t, empty)
 
 	// A caller path holding reserved URI characters initializes exactly that
 	// file, never a truncated sibling database.
 	reserved := filepath.Join(dir, "weird?name#part.db")
 	reservedStore, err := OpenSQLite(reserved)
-	if err != nil {
-		t.Fatalf("OpenSQLite reserved URI path: %v", err)
-	}
+	testassert.NoError(t, err)
 	var reservedVersion int
-	if err := reservedStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&reservedVersion); err != nil || reservedVersion != 6 {
-		t.Errorf("reserved-path user_version = %d (error %v), want 6", reservedVersion, err)
+	{
+		err := reservedStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&reservedVersion)
+		testassert.Check(t, err == nil && reservedVersion == 7, "reserved-path user_version = %d (error %v), want 7", reservedVersion, err)
 	}
-	if err := reservedStore.Close(); err != nil {
-		t.Fatalf("close reserved-path store: %v", err)
-	}
-	if _, err := os.Stat(reserved); err != nil {
-		t.Fatalf("reserved-path database %q missing: %v", reserved, err)
+	testassert.NoError(t, reservedStore.Close())
+	{
+		_, err := os.Stat(reserved)
+		testassert.Require(t, err == nil, "reserved-path database %q missing: %v", reserved, err)
 	}
 
 	// The relative literal filename `:memory:` is a caller-supplied
@@ -330,37 +290,29 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	// database.
 	t.Chdir(dir)
 	memoryStore, err := OpenSQLite(":memory:")
-	if err != nil {
-		t.Fatalf("OpenSQLite :memory: path: %v", err)
-	}
+	testassert.NoError(t, err)
 	confCreateSession(t, ctx, memoryStore, "s1")
 	confTxn(t, ctx, memoryStore, func(txn harness.Transaction) error {
 		_, err := txn.InsertEntry(confEntry("s1", "e1"))
 		return err
 	})
-	if _, err := os.Stat(filepath.Join(dir, ":memory:")); err != nil {
-		t.Fatalf("durable :memory: file missing: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(dir, ":memory:"))
+		testassert.NoError(t, err)
 	}
-	if err := memoryStore.Close(); err != nil {
-		t.Fatalf("close :memory: store: %v", err)
-	}
+	testassert.NoError(t, memoryStore.Close())
 	reopenedMemory, err := OpenSQLite(":memory:")
-	if err != nil {
-		t.Fatalf("reopen :memory: path: %v", err)
+	testassert.NoError(t, err)
+	{
+		entries, err := reopenedMemory.ReadEntries(ctx, "s1", 0)
+		testassert.Check(t, err == nil && len(entries) == 1 && entries[0].ID == "e1", "durable :memory: entries = %v (error %v), want [e1]", entries, err)
 	}
-	if entries, err := reopenedMemory.ReadEntries(ctx, "s1", 0); err != nil || len(entries) != 1 || entries[0].ID != "e1" {
-		t.Errorf("durable :memory: entries = %v (error %v), want [e1]", entries, err)
-	}
-	if err := reopenedMemory.Close(); err != nil {
-		t.Fatalf("close reopened :memory: store: %v", err)
-	}
+	testassert.NoError(t, reopenedMemory.Close())
 
 	// Every initialized file is the requested one; no sibling or truncated
 	// database was created beside them.
 	dirEntries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read directory: %v", err)
-	}
+	testassert.NoError(t, err)
 	initialized := map[string]bool{}
 	for _, dirEntry := range dirEntries {
 		initialized[dirEntry.Name()] = true
@@ -372,23 +324,21 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 		":memory:":           true,
 	}
 	for name := range wantFiles {
-		if !initialized[name] {
-			t.Errorf("initialized file %q missing", name)
-		}
+		testassert.Check(t, initialized[name], "initialized file %q missing", name)
 	}
 	for name := range initialized {
-		if !wantFiles[name] {
-			t.Errorf("unexpected sibling or truncated database %q was initialized", name)
-		}
+		testassert.Check(t, wantFiles[name], "unexpected sibling or truncated database %q was initialized", name)
 	}
 
 	// A failed initialization must not leave a partial database behind.
 	blocked := filepath.Join(dir, "missing", "lightcode.db")
-	if _, err := OpenSQLite(blocked); err == nil {
-		t.Fatal("OpenSQLite into a missing directory succeeded")
+	{
+		_, err := OpenSQLite(blocked)
+		testassert.Require(t, err != nil, "OpenSQLite into a missing directory succeeded")
 	}
-	if _, err := os.Stat(blocked); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("failed initialization left %q behind: %v", blocked, err)
+	{
+		_, err := os.Stat(blocked)
+		testassert.Check(t, errors.Is(err, fs.ErrNotExist), "failed initialization left %q behind: %v", blocked, err)
 	}
 }
 
@@ -400,9 +350,7 @@ func TestSQLitePhysicalShapes(t *testing.T) {
 	store := newSQLiteStore(t)
 	ctx := context.Background()
 	conn, err := store.db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("connection: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer conn.Close()
 
 	rejected := []struct {
@@ -424,18 +372,15 @@ func TestSQLitePhysicalShapes(t *testing.T) {
 		{"malformed register payload", `INSERT INTO registers (session_id, kind, operation_id, revision, payload) VALUES ('s', 'session', '', 1, '{')`, nil},
 	}
 	for _, tc := range rejected {
-		if _, err := conn.ExecContext(ctx, tc.query, tc.args...); err == nil {
-			t.Errorf("%s: physical constraint not enforced", tc.name)
+		{
+			_, err := conn.ExecContext(ctx, tc.query, tc.args...)
+			testassert.Check(t, err != nil, "%s: physical constraint not enforced", tc.name)
 		}
 	}
 
 	var userObjects int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE sql IS NOT NULL`).Scan(&userObjects); err != nil {
-		t.Fatalf("count user-defined objects: %v", err)
-	}
-	if userObjects != 3 {
-		t.Errorf("user-defined object count = %d, want 3 (two tables, one index)", userObjects)
-	}
+	testassert.NoError(t, conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE sql IS NOT NULL`).Scan(&userObjects))
+	testassert.Check(t, userObjects == 3, "user-defined object count = %d, want 3 (two tables, one index)", userObjects)
 }
 
 // TestSQLiteRejectsNonEmptyVersionZero proves a non-empty version-zero
@@ -447,132 +392,105 @@ func TestSQLiteRejectsNonEmptyVersionZero(t *testing.T) {
 	before := sqliteFileDigest(t, path)
 
 	store, err := OpenSQLite(path)
-	if !errors.Is(err, harness.ErrIncompatible) {
-		t.Fatalf("error = %v, want ErrIncompatible", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &incompatible) {
-		t.Fatalf("error = %T, want *harness.IncompatibleSchemaError", err)
-	}
-	if incompatible.Found != 0 || incompatible.Supported != 6 {
-		t.Errorf("recovered %+v, want found 0 supported 6", incompatible)
-	}
-	if store != nil {
-		t.Error("rejected database returned a store")
-	}
-	if after := sqliteFileDigest(t, path); after != before {
-		t.Error("rejected version-zero database file changed")
+	testassert.Require(t, errors.As(err, &incompatible), "error = %T, want *harness.IncompatibleSchemaError", err)
+	testassert.Check(t, incompatible.Found == 0 && incompatible.Supported == 7, "recovered %+v, want found 0 supported 7", incompatible)
+	testassert.Check(t, store == nil, "rejected database returned a store")
+	{
+		after := sqliteFileDigest(t, path)
+		testassert.Check(t, after == before, "rejected version-zero database file changed")
 	}
 	sqliteAssertNoSidecars(t, path)
 }
 
 // TestSQLiteRejectsPriorVersion proves a database left at the prior schema
-// version 5 — the child-lineage and background-completion payload shape with
+// version 6 — the child-lineage and background-completion payload shape with
 // the unchanged canonical tables — is rejected through the read-only open
 // phase with the incompatible class before recovery ever sees the store,
 // leaving the file byte-identical with no sidecars.
 func TestSQLiteRejectsPriorVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prior.db")
-	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 5)
+	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 6)
 	before := sqliteFileDigest(t, path)
 
 	store, err := OpenSQLite(path)
-	if !errors.Is(err, harness.ErrIncompatible) {
-		t.Fatalf("error = %v, want ErrIncompatible", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &incompatible) || incompatible.Found != 5 || incompatible.Supported != 6 {
-		t.Errorf("recovered %+v, want found 5 supported 6", incompatible)
-	}
-	if store != nil {
-		t.Error("rejected prior-version database returned a store")
-	}
-	if after := sqliteFileDigest(t, path); after != before {
-		t.Error("rejected prior-version database file changed")
+	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 6 && incompatible.Supported == 7, "recovered %+v, want found 6 supported 7", incompatible)
+	testassert.Check(t, store == nil, "rejected prior-version database returned a store")
+	{
+		after := sqliteFileDigest(t, path)
+		testassert.Check(t, after == before, "rejected prior-version database file changed")
 	}
 	sqliteAssertNoSidecars(t, path)
 }
 
 // TestSQLiteRejectsUnsupportedVersion proves a database with a future schema
-// version beyond the accepted 6 is rejected without any file or sidecar
+// version beyond the accepted 7 is rejected without any file or sidecar
 // change.
 func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "future.db")
-	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 7)
+	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 8)
 	before := sqliteFileDigest(t, path)
 
 	_, err := OpenSQLite(path)
-	if !errors.Is(err, harness.ErrIncompatible) {
-		t.Fatalf("error = %v, want ErrIncompatible", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &incompatible) || incompatible.Found != 7 || incompatible.Supported != 6 {
-		t.Errorf("recovered %+v, want found 7 supported 6", incompatible)
-	}
-	if after := sqliteFileDigest(t, path); after != before {
-		t.Error("rejected version-7 database file changed")
+	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 8 && incompatible.Supported == 7, "recovered %+v, want found 8 supported 7", incompatible)
+	{
+		after := sqliteFileDigest(t, path)
+		testassert.Check(t, after == before, "rejected version-8 database file changed")
 	}
 	sqliteAssertNoSidecars(t, path)
 
-	// Unsupported hot-WAL sibling: version 7 lives only in an uncheckpointed
-	// WAL beside a checkpointed version 6 main file, with no SHM file — the
+	// Unsupported hot-WAL sibling: version 8 lives only in an uncheckpointed
+	// WAL beside a checkpointed version 7 main file, with no SHM file — the
 	// crashed-writer state. Read-only validation must see the WAL-carried
 	// version and reject the copy while leaving the database and WAL bytes
 	// unchanged; a SQLite-owned -shm WAL index may appear and remain.
 	source := filepath.Join(t.TempDir(), "wal-source.db")
 	live, err := sql.Open(sqliteDriverName, sqliteDSN(source, "_journal_mode=WAL&_synchronous=FULL"))
-	if err != nil {
-		t.Fatalf("open WAL source: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := live.Exec(`PRAGMA user_version = 7`)
+		testassert.NoError(t, err)
 	}
-	if _, err := live.Exec(`PRAGMA user_version = 6`); err != nil {
-		t.Fatalf("checkpointed version: %v", err)
+	{
+		_, err := live.Exec(`PRAGMA wal_checkpoint(FULL)`)
+		testassert.NoError(t, err)
 	}
-	if _, err := live.Exec(`PRAGMA wal_checkpoint(FULL)`); err != nil {
-		t.Fatalf("checkpoint version 6: %v", err)
-	}
-	if _, err := live.Exec(`PRAGMA user_version = 7`); err != nil {
-		t.Fatalf("hot version: %v", err)
+	{
+		_, err := live.Exec(`PRAGMA user_version = 8`)
+		testassert.NoError(t, err)
 	}
 	mainBytes, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatalf("copy source main file: %v", err)
-	}
+	testassert.NoError(t, err)
 	walBytes, err := os.ReadFile(source + "-wal")
-	if err != nil {
-		t.Fatalf("copy source WAL: %v", err)
-	}
+	testassert.NoError(t, err)
 	target := filepath.Join(t.TempDir(), "wal-crashed.db")
-	if err := os.WriteFile(target, mainBytes, 0o644); err != nil {
-		t.Fatalf("materialize target main file: %v", err)
-	}
-	if err := os.WriteFile(target+"-wal", walBytes, 0o644); err != nil {
-		t.Fatalf("materialize target WAL: %v", err)
-	}
-	if err := live.Close(); err != nil {
-		t.Fatalf("close WAL source: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(target, mainBytes, 0o644))
+	testassert.NoError(t, os.WriteFile(target+"-wal", walBytes, 0o644))
+	testassert.NoError(t, live.Close())
 	beforeMain := sqliteFileDigest(t, target)
 	beforeWAL := sqliteFileDigest(t, target+"-wal")
 
 	crashedStore, err := OpenSQLite(target)
-	if !errors.Is(err, harness.ErrIncompatible) {
-		t.Fatalf("error = %v, want ErrIncompatible", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var walIncompatible *harness.IncompatibleSchemaError
-	if !errors.As(err, &walIncompatible) || walIncompatible.Found != 7 || walIncompatible.Supported != 6 {
-		t.Errorf("recovered %+v, want the WAL-carried version found 7 supported 6", walIncompatible)
+	testassert.Check(t, errors.As(err, &walIncompatible) && walIncompatible.Found == 8 && walIncompatible.Supported == 7, "recovered %+v, want the WAL-carried version found 8 supported 7", walIncompatible)
+	testassert.Check(t, crashedStore == nil, "rejected WAL-mode database returned a store")
+	{
+		after := sqliteFileDigest(t, target)
+		testassert.Check(t, after == beforeMain, "rejected WAL-mode database file changed")
 	}
-	if crashedStore != nil {
-		t.Error("rejected WAL-mode database returned a store")
+	{
+		after := sqliteFileDigest(t, target+"-wal")
+		testassert.Check(t, after == beforeWAL, "rejected WAL-mode database WAL changed")
 	}
-	if after := sqliteFileDigest(t, target); after != beforeMain {
-		t.Error("rejected WAL-mode database file changed")
-	}
-	if after := sqliteFileDigest(t, target+"-wal"); after != beforeWAL {
-		t.Error("rejected WAL-mode database WAL changed")
-	}
-	if _, err := os.Stat(target + "-journal"); !errors.Is(err, fs.ErrNotExist) {
-		t.Error("rejected WAL-mode database created a journal sidecar")
+	{
+		_, err := os.Stat(target + "-journal")
+		testassert.Check(t, errors.Is(err, fs.ErrNotExist), "rejected WAL-mode database created a journal sidecar")
 	}
 }
 
@@ -602,21 +520,13 @@ ON registers(operation_id) WHERE kind = 'operation'`
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "schema.db")
-			sqliteFixtureDatabase(t, path, ddl, 6)
+			sqliteFixtureDatabase(t, path, ddl, 7)
 			store, err := OpenSQLite(path)
-			if !errors.Is(err, harness.ErrIncompatible) {
-				t.Fatalf("error = %v, want ErrIncompatible", err)
-			}
+			testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 			var incompatible *harness.IncompatibleSchemaError
-			if !errors.As(err, &incompatible) {
-				t.Fatalf("error = %T, want *harness.IncompatibleSchemaError", err)
-			}
-			if incompatible.Found != 6 || incompatible.Supported != 6 {
-				t.Errorf("recovered %+v, want found 6 supported 6", incompatible)
-			}
-			if store != nil {
-				t.Error("rejected database returned a store")
-			}
+			testassert.Require(t, errors.As(err, &incompatible), "error = %T, want *harness.IncompatibleSchemaError", err)
+			testassert.Check(t, incompatible.Found == 7 && incompatible.Supported == 7, "recovered %+v, want found 7 supported 7", incompatible)
+			testassert.Check(t, store == nil, "rejected database returned a store")
 		})
 	}
 }
@@ -629,9 +539,7 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 	ctx := context.Background()
 
 	store, err := OpenSQLite(path)
-	if err != nil {
-		t.Fatalf("initial open: %v", err)
-	}
+	testassert.NoError(t, err)
 	confCreateSession(t, ctx, store, "s1")
 	var first harness.Entry
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
@@ -645,39 +553,23 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 		first, err = txn.InsertEntry(harness.EntryDraft{SessionID: "s1", ID: "e1", Kind: harness.EntryToolResult, OperationID: "op1", Payload: rawJSON(`{"entry":"e1"}`)})
 		return err
 	})
-	if err := store.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	testassert.NoError(t, store.Close())
 
 	reopened, err := OpenSQLite(path)
-	if err != nil {
-		t.Fatalf("exact-version reopen: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer reopened.Close()
 
 	ids, err := reopened.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 1 || ids[0] != "s1" {
-		t.Fatalf("ListSessionIDs after reopen = %v (error %v), want [s1]", ids, err)
-	}
+	testassert.Require(t, err == nil && len(ids) == 1 && ids[0] == "s1", "ListSessionIDs after reopen = %v (error %v), want [s1]", ids, err)
 	entries, err := reopened.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("ReadEntries after reopen = %v (error %v), want [e1]", entries, err)
-	}
+	testassert.Require(t, err == nil && len(entries) == 1, "ReadEntries after reopen = %v (error %v), want [e1]", entries, err)
 	entry := entries[0]
-	if entry.ID != "e1" || entry.Sequence != 1 || entry.Kind != harness.EntryToolResult || entry.OperationID != "op1" || string(entry.Payload) != `{"entry":"e1"}` {
-		t.Errorf("reopened entry = %+v, want the committed entry %#v", entry, first)
-	}
-	if !entry.CommittedAt.Equal(first.CommittedAt) || entry.CommittedAt.Location() != time.UTC {
-		t.Errorf("reopened commit time = %v, want the committed %v in UTC", entry.CommittedAt, first.CommittedAt)
-	}
+	testassert.Check(t, entry.ID == "e1" && entry.Sequence == 1 && entry.Kind == harness.EntryToolResult && entry.OperationID == "op1" && string(entry.Payload) == `{"entry":"e1"}`, "reopened entry = %+v, want the committed entry %#v", entry, first)
+	testassert.Check(t, entry.CommittedAt.Equal(first.CommittedAt) && entry.CommittedAt.Location() == time.UTC, "reopened commit time = %v, want the committed %v in UTC", entry.CommittedAt, first.CommittedAt)
 	register, err := reopened.ReadRegister(ctx, confSessionKey("s1"))
-	if err != nil || register.Revision != 2 || string(register.Payload) != `{"state":"replaced"}` {
-		t.Errorf("reopened session register = %+v (error %v), want revision 2", register, err)
-	}
+	testassert.Check(t, err == nil && register.Revision == 2 && string(register.Payload) == `{"state":"replaced"}`, "reopened session register = %+v (error %v), want revision 2", register, err)
 	operation, err := reopened.ReadRegister(ctx, confOpKey("s1", "op1"))
-	if err != nil || operation.Revision != 1 {
-		t.Errorf("reopened operation register = %+v (error %v), want revision 1", operation, err)
-	}
+	testassert.Check(t, err == nil && operation.Revision == 1, "reopened operation register = %+v (error %v), want revision 1", operation, err)
 
 	// Current hot-WAL sibling: the canonical schema, schema version, and
 	// committed data live only in an uncheckpointed WAL. The source database
@@ -688,66 +580,53 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 	// may appear and remain.
 	source := filepath.Join(t.TempDir(), "wal-current-source.db")
 	live, err := sql.Open(sqliteDriverName, sqliteDSN(source, "_journal_mode=WAL&_synchronous=FULL"))
-	if err != nil {
-		t.Fatalf("open hot-WAL source: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, stmt := range []string{
 		sqliteEntriesDDL,
 		sqliteRegistersDDL,
 		sqliteOperationIndexDDL,
-		`PRAGMA user_version = 6`,
+		`PRAGMA user_version = 7`,
 		`INSERT INTO registers (session_id, kind, operation_id, revision, payload) VALUES ('s1', 'session', '', 1, '{"session":"s1"}')`,
 		`INSERT INTO entries (session_id, sequence, entry_id, operation_id, kind, committed_at_ns, payload) VALUES ('s1', 1, 'e1', '', 'input', 1700000000000000000, '{"entry":"e1"}')`,
 	} {
-		if _, err := live.Exec(stmt); err != nil {
-			t.Fatalf("build hot-WAL source: %v", err)
+		{
+			_, err := live.Exec(stmt)
+			testassert.NoError(t, err)
 		}
 	}
 	mainBytes, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatalf("copy source main file: %v", err)
-	}
+	testassert.NoError(t, err)
 	walBytes, err := os.ReadFile(source + "-wal")
-	if err != nil {
-		t.Fatalf("copy source WAL: %v", err)
-	}
-	if err := live.Close(); err != nil {
-		t.Fatalf("close hot-WAL source: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, live.Close())
 
 	crashed := filepath.Join(t.TempDir(), "wal-current.db")
-	if err := os.WriteFile(crashed, mainBytes, 0o644); err != nil {
-		t.Fatalf("materialize crash copy: %v", err)
-	}
-	if err := os.WriteFile(crashed+"-wal", walBytes, 0o644); err != nil {
-		t.Fatalf("materialize crash WAL: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(crashed, mainBytes, 0o644))
+	testassert.NoError(t, os.WriteFile(crashed+"-wal", walBytes, 0o644))
 	beforeMain := sqliteFileDigest(t, crashed)
 	beforeWAL := sqliteFileDigest(t, crashed+"-wal")
 
 	crashStore, err := OpenSQLite(crashed)
-	if err != nil {
-		t.Fatalf("read-only validation of the WAL-carried state: %v", err)
-	}
+	testassert.NoError(t, err)
 	ids, err = crashStore.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 1 || ids[0] != "s1" {
-		t.Errorf("WAL-carried session discovery = %v (error %v), want [s1]", ids, err)
+	testassert.Check(t, err == nil && len(ids) == 1 && ids[0] == "s1", "WAL-carried session discovery = %v (error %v), want [s1]", ids, err)
+	{
+		walEntries, err := crashStore.ReadEntries(ctx, "s1", 0)
+		testassert.Check(t, err == nil && len(walEntries) == 1 && walEntries[0].ID == "e1", "WAL-carried entries = %v (error %v), want [e1]", walEntries, err)
 	}
-	if walEntries, err := crashStore.ReadEntries(ctx, "s1", 0); err != nil || len(walEntries) != 1 || walEntries[0].ID != "e1" {
-		t.Errorf("WAL-carried entries = %v (error %v), want [e1]", walEntries, err)
+	{
+		after := sqliteFileDigest(t, crashed)
+		testassert.Check(t, after == beforeMain, "validated crash-copy database changed")
 	}
-	if after := sqliteFileDigest(t, crashed); after != beforeMain {
-		t.Error("validated crash-copy database changed")
+	{
+		after := sqliteFileDigest(t, crashed+"-wal")
+		testassert.Check(t, after == beforeWAL, "validated crash-copy WAL changed")
 	}
-	if after := sqliteFileDigest(t, crashed+"-wal"); after != beforeWAL {
-		t.Error("validated crash-copy WAL changed")
+	{
+		_, err := os.Stat(crashed + "-journal")
+		testassert.Check(t, errors.Is(err, fs.ErrNotExist), "validated crash copy created a journal sidecar")
 	}
-	if _, err := os.Stat(crashed + "-journal"); !errors.Is(err, fs.ErrNotExist) {
-		t.Error("validated crash copy created a journal sidecar")
-	}
-	if err := crashStore.Close(); err != nil {
-		t.Fatalf("close crash copy: %v", err)
-	}
+	testassert.NoError(t, crashStore.Close())
 }
 
 // TestSQLitePhysicalCorruption proves a database whose schema image is
@@ -756,41 +635,29 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 func TestSQLitePhysicalCorruption(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lightcode.db")
 	store, err := OpenSQLite(path)
-	if err != nil {
-		t.Fatalf("initial open: %v", err)
-	}
+	testassert.NoError(t, err)
 	confCreateSession(t, context.Background(), store, "s1")
-	if err := store.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	testassert.NoError(t, store.Close())
 
 	// Destroy the b-tree page type of the schema root while keeping the
 	// database header intact, so the file is still recognizable as SQLite
 	// but its schema image is unreadable.
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("open for corruption: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := file.WriteAt([]byte{0x00}, 100)
+		testassert.NoError(t, err)
 	}
-	if _, err := file.WriteAt([]byte{0x00}, 100); err != nil {
-		t.Fatalf("corrupt schema page: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("close after corruption: %v", err)
-	}
+	testassert.NoError(t, file.Close())
 	before := sqliteFileDigest(t, path)
 
 	opened, err := OpenSQLite(path)
-	if !errors.Is(err, harness.ErrStorage) {
-		t.Fatalf("error = %v, want ErrStorage", err)
-	}
-	if errors.Is(err, harness.ErrIncompatible) {
-		t.Errorf("physical corruption misclassified as incompatible schema: %v", err)
-	}
-	if opened != nil {
-		t.Error("corrupt database returned a store")
-	}
-	if after := sqliteFileDigest(t, path); after != before {
-		t.Error("rejected corrupt database file changed")
+	testassert.Require(t, errors.Is(err, harness.ErrStorage), "error = %v, want ErrStorage", err)
+	testassert.Check(t, !errors.Is(err, harness.ErrIncompatible), "physical corruption misclassified as incompatible schema: %v", err)
+	testassert.Check(t, opened == nil, "corrupt database returned a store")
+	{
+		after := sqliteFileDigest(t, path)
+		testassert.Check(t, after == before, "rejected corrupt database file changed")
 	}
 }
 
@@ -807,48 +674,38 @@ func TestSQLiteConnectionConfiguration(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		conn, err := store.db.Conn(ctx)
-		if err != nil {
-			t.Fatalf("connection %d: %v", i, err)
-		}
+		testassert.Require(t, err == nil, "connection %d: %v", i, err)
 		for pragma, want := range map[string]string{
 			"PRAGMA journal_mode": "wal",
 			"PRAGMA synchronous":  "2",
 			"PRAGMA busy_timeout": "5000",
 		} {
 			var got string
-			if err := conn.QueryRowContext(ctx, pragma).Scan(&got); err != nil {
-				t.Fatalf("connection %d, %s: %v", i, pragma, err)
+			{
+				err := conn.QueryRowContext(ctx, pragma).Scan(&got)
+				testassert.Require(t, err == nil, "connection %d, %s: %v", i, pragma, err)
 			}
-			if got != want {
-				t.Errorf("connection %d, %s = %q, want %q", i, pragma, got, want)
-			}
+			testassert.Check(t, got == want, "connection %d, %s = %q, want %q", i, pragma, got, want)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("connection %d close: %v", i, err)
+		{
+			err := conn.Close()
+			testassert.Require(t, err == nil, "connection %d close: %v", i, err)
 		}
 	}
 
 	tx, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("BeginTx: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	other, err := sql.Open(sqliteDriverName, sqliteDSN(store.path, "_busy_timeout=10"))
-	if err != nil {
-		t.Fatalf("open competing connection: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer other.Close()
 	if _, err := other.Exec(`BEGIN IMMEDIATE`); err == nil {
 		t.Error("BEGIN IMMEDIATE succeeded while the pool transaction holds the write lock; the pool transaction did not use BEGIN IMMEDIATE")
 	} else {
 		var busy sqlite3.Error
-		if !errors.As(err, &busy) || busy.Code != sqlite3.ErrBusy {
-			t.Errorf("BEGIN IMMEDIATE error = %v, want SQLITE_BUSY", err)
-		}
+		testassert.Check(t, errors.As(err, &busy) && busy.Code == sqlite3.ErrBusy, "BEGIN IMMEDIATE error = %v, want SQLITE_BUSY", err)
 	}
-	if err := tx.Rollback(); err != nil {
-		t.Fatalf("release pool transaction: %v", err)
-	}
+	testassert.NoError(t, tx.Rollback())
 
 	// One public read's statements share one deferred read snapshot on a
 	// single pooled connection: a concurrent writer commits mid-read, and the
@@ -871,15 +728,12 @@ func TestSQLiteConnectionConfiguration(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(before) != 1 || before[0].ID != "e1" || len(after) != 1 || after[0].ID != "e1" {
-			t.Errorf("read snapshot observed a concurrent commit: before %v, after %v, want the same pre-commit state [e1]", before, after)
-		}
+		testassert.Check(t, len(before) == 1 && before[0].ID == "e1" && len(after) == 1 && after[0].ID == "e1", "read snapshot observed a concurrent commit: before %v, after %v, want the same pre-commit state [e1]", before, after)
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("read snapshot: %v", err)
-	}
-	if entries, err := store.ReadEntries(ctx, "s1", 0); err != nil || len(entries) != 2 || entries[1].ID != "e2" {
-		t.Errorf("post-snapshot read = %v (error %v), want the committed transition [e1 e2]", entries, err)
+	testassert.NoError(t, err)
+	{
+		entries, err := store.ReadEntries(ctx, "s1", 0)
+		testassert.Check(t, err == nil && len(entries) == 2 && entries[1].ID == "e2", "post-snapshot read = %v (error %v), want the committed transition [e1 e2]", entries, err)
 	}
 }

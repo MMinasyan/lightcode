@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // conformanceBackend supplies one storage implementation to the shared suite.
@@ -108,9 +109,7 @@ func confOpRegister(sessionID, opID string) harness.RegisterDraft {
 
 func confTxn(t *testing.T, ctx context.Context, store harness.Storage, fn func(txn harness.Transaction) error) {
 	t.Helper()
-	if err := store.Transact(ctx, fn); err != nil {
-		t.Fatalf("Transact: unexpected error: %v", err)
-	}
+	testassert.NoError(t, store.Transact(ctx, fn))
 }
 
 func confCreateSession(t *testing.T, ctx context.Context, store harness.Storage, sessionID string) {
@@ -123,16 +122,12 @@ func confCreateSession(t *testing.T, ctx context.Context, store harness.Storage,
 
 func confPayloadEqual(t *testing.T, got json.RawMessage, want string) {
 	t.Helper()
-	if string(got) != want {
-		t.Fatalf("payload = %s, want %s", got, want)
-	}
+	testassert.Require(t, string(got) == want, "payload = %s, want %s", got, want)
 }
 
 func confWantInvalid(t *testing.T, name string, err error) {
 	t.Helper()
-	if !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("%s: error = %v, want ErrInvalid", name, err)
-	}
+	testassert.Check(t, errors.Is(err, harness.ErrInvalid), "%s: error = %v, want ErrInvalid", name, err)
 }
 
 // confEnvelopeValidity covers the caller-side envelope rules: closed kinds,
@@ -158,8 +153,9 @@ func confEnvelopeValidity(t *testing.T, b conformanceBackend) {
 		})
 		confWantInvalid(t, "InsertEntry "+name, err)
 	}
-	if entries, err := store.ReadEntries(ctx, "s1", 0); err != nil || len(entries) != 0 {
-		t.Fatalf("rejected drafts persisted: %d entries, error %v", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "s1", 0)
+		testassert.Require(t, err == nil && len(entries) == 0, "rejected drafts persisted: %d entries, error %v", len(entries), err)
 	}
 
 	validPayloads := []string{`{}`, `null`, `42`, `"text"`, `[1,2,{"k":"v"}]`}
@@ -171,16 +167,10 @@ func confEnvelopeValidity(t *testing.T, b conformanceBackend) {
 		})
 	}
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
-	if len(entries) != len(validPayloads) {
-		t.Fatalf("ReadEntries returned %d entries, want %d", len(entries), len(validPayloads))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(entries), len(validPayloads))
 	for i, entry := range entries {
-		if entry.Sequence != int64(i+1) {
-			t.Errorf("entry %s sequence = %d, want %d", entry.ID, entry.Sequence, i+1)
-		}
+		testassert.Check(t, entry.Sequence == int64(i+1), "entry %s sequence = %d, want %d", entry.ID, entry.Sequence, i+1)
 		confPayloadEqual(t, entry.Payload, validPayloads[i])
 	}
 
@@ -191,11 +181,10 @@ func confEnvelopeValidity(t *testing.T, b conformanceBackend) {
 		return err
 	})
 	entries, err = store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
-	if got := entries[len(entries)-1]; got.ID != "op-entry" || got.OperationID != "op-1" {
-		t.Errorf("optional operation identity not round-tripped: %+v", got)
+	testassert.NoError(t, err)
+	{
+		got := entries[len(entries)-1]
+		testassert.Check(t, got.ID == "op-entry" && got.OperationID == "op-1", "optional operation identity not round-tripped: %+v", got)
 	}
 
 	invalidRegisters := map[string]harness.RegisterDraft{
@@ -231,8 +220,9 @@ func confEnvelopeValidity(t *testing.T, b conformanceBackend) {
 		_, err := store.ReadRegister(ctx, key)
 		confWantInvalid(t, "ReadRegister "+name, err)
 	}
-	if _, err := store.ReadRegister(ctx, confSessionKey("missing")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("ReadRegister missing session: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, confSessionKey("missing"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "ReadRegister missing session: error = %v, want ErrNotFound", err)
 	}
 
 	for _, revision := range []int64{0, -1} {
@@ -248,14 +238,17 @@ func confEnvelopeValidity(t *testing.T, b conformanceBackend) {
 	})
 	confWantInvalid(t, "ReplaceRegister bad payload", err)
 
-	if _, err := store.ReadEntries(ctx, "s1", -1); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("ReadEntries negative boundary: error = %v, want ErrInvalid", err)
+	{
+		_, err := store.ReadEntries(ctx, "s1", -1)
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "ReadEntries negative boundary: error = %v, want ErrInvalid", err)
 	}
-	if _, err := store.ReadEntries(ctx, "", 0); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("ReadEntries empty session: error = %v, want ErrInvalid", err)
+	{
+		_, err := store.ReadEntries(ctx, "", 0)
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "ReadEntries empty session: error = %v, want ErrInvalid", err)
 	}
-	if _, err := store.ReadRegisters(ctx, ""); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("ReadRegisters empty session: error = %v, want ErrInvalid", err)
+	{
+		_, err := store.ReadRegisters(ctx, "")
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "ReadRegisters empty session: error = %v, want ErrInvalid", err)
 	}
 }
 
@@ -274,9 +267,7 @@ func confPayloadOwnership(t *testing.T, b conformanceBackend) {
 	})
 	draftPayload[5] = '2' // mutating the caller's bytes must not reach the store
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	confPayloadEqual(t, entries[0].Payload, `{"n":1}`)
 
 	registerPayload := rawJSON(`{"v":1}`)
@@ -288,9 +279,7 @@ func confPayloadOwnership(t *testing.T, b conformanceBackend) {
 	})
 	registerPayload[5] = '9'
 	register, err := store.ReadRegister(ctx, confOpKey("s1", "op1"))
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	confPayloadEqual(t, register.Payload, `{"v":1}`)
 
 	replacePayload := rawJSON(`{"rev":2}`)
@@ -300,31 +289,21 @@ func confPayloadOwnership(t *testing.T, b conformanceBackend) {
 	})
 	replacePayload[7] = '9'
 	register, err = store.ReadRegister(ctx, confSessionKey("s1"))
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	confPayloadEqual(t, register.Payload, `{"rev":2}`)
 
 	first, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	first[0].Payload[5] = '7'
 	second, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	confPayloadEqual(t, second[0].Payload, `{"n":1}`)
 
 	g1, err := store.ReadRegister(ctx, confSessionKey("s1"))
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	g1.Payload[7] = '8'
 	g2, err := store.ReadRegister(ctx, confSessionKey("s1"))
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	confPayloadEqual(t, g2.Payload, `{"rev":2}`)
 }
 
@@ -350,9 +329,7 @@ func confEntryIdentityOrder(t *testing.T, b conformanceBackend) {
 		firstSequence, secondSequence = e1.Sequence, e2.Sequence
 		return nil
 	})
-	if firstSequence != 1 || secondSequence != 2 {
-		t.Fatalf("first transaction sequences = %d, %d; want 1, 2", firstSequence, secondSequence)
-	}
+	testassert.Require(t, firstSequence == 1 && secondSequence == 2, "first transaction sequences = %d, %d; want 1, 2", firstSequence, secondSequence)
 
 	var s2Sequence, s1Next int64
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
@@ -367,50 +344,46 @@ func confEntryIdentityOrder(t *testing.T, b conformanceBackend) {
 		s2Sequence, s1Next = e3.Sequence, e4.Sequence
 		return nil
 	})
-	if s2Sequence != 1 {
-		t.Errorf("second session first sequence = %d, want 1 (per-session counters are independent)", s2Sequence)
-	}
-	if s1Next != 3 {
-		t.Errorf("first session next sequence = %d, want 3", s1Next)
-	}
+	testassert.Check(t, s2Sequence == 1, "second session first sequence = %d, want 1 (per-session counters are independent)", s2Sequence)
+	testassert.Check(t, s1Next == 3, "first session next sequence = %d, want 3", s1Next)
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	wantIDs := []string{"e1", "e2", "e4"}
 	for i, entry := range entries {
-		if entry.ID != wantIDs[i] || entry.Sequence != int64(i+1) {
-			t.Errorf("entry %d = {%s, seq %d}, want {%s, seq %d}", i, entry.ID, entry.Sequence, wantIDs[i], i+1)
-		}
-		if entry.CommittedAt.Location() != time.UTC {
-			t.Errorf("entry %s commit time %v is not UTC", entry.ID, entry.CommittedAt)
-		}
+		testassert.Check(t, entry.ID == wantIDs[i] && entry.Sequence == int64(i+1), "entry %d = {%s, seq %d}, want {%s, seq %d}", i, entry.ID, entry.Sequence, wantIDs[i], i+1)
+		testassert.Check(t, entry.CommittedAt.Location() == time.UTC, "entry %s commit time %v is not UTC", entry.ID, entry.CommittedAt)
 	}
-	if tail, err := store.ReadEntries(ctx, "s1", 2); err != nil || len(tail) != 1 || tail[0].ID != "e4" {
-		t.Errorf("ReadEntries after 2 = %v (error %v), want [e4]", tail, err)
+	{
+		tail, err := store.ReadEntries(ctx, "s1", 2)
+		testassert.Check(t, err == nil && len(tail) == 1 && tail[0].ID == "e4", "ReadEntries after 2 = %v (error %v), want [e4]", tail, err)
 	}
-	if rest, err := store.ReadEntries(ctx, "s1", 3); err != nil || len(rest) != 0 {
-		t.Errorf("ReadEntries after last sequence = %v (error %v), want empty", rest, err)
+	{
+		rest, err := store.ReadEntries(ctx, "s1", 3)
+		testassert.Check(t, err == nil && len(rest) == 0, "ReadEntries after last sequence = %v (error %v), want empty", rest, err)
 	}
-	if s2Entries, err := store.ReadEntries(ctx, "s2", 0); err != nil || len(s2Entries) != 1 || s2Entries[0].ID != "e3" {
-		t.Errorf("second session entries = %v (error %v), want [e3]", s2Entries, err)
+	{
+		s2Entries, err := store.ReadEntries(ctx, "s2", 0)
+		testassert.Check(t, err == nil && len(s2Entries) == 1 && s2Entries[0].ID == "e3", "second session entries = %v (error %v), want [e3]", s2Entries, err)
 	}
 
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertEntry(confEntry("s1", "e1"))
-		return err
-	}); !errors.Is(err, harness.ErrConflict) {
-		t.Errorf("duplicate entry id in one session: error = %v, want ErrConflict", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertEntry(confEntry("s1", "e1"))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrConflict), "duplicate entry id in one session: error = %v, want ErrConflict", err)
 	}
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertEntry(confEntry("s2", "e1"))
-		return err
-	}); !errors.Is(err, harness.ErrConflict) {
-		t.Errorf("duplicate entry id across sessions: error = %v, want ErrConflict", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertEntry(confEntry("s2", "e1"))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrConflict), "duplicate entry id across sessions: error = %v, want ErrConflict", err)
 	}
-	if entries, err := store.ReadEntries(ctx, "s1", 0); err != nil || len(entries) != 3 {
-		t.Errorf("conflicted transactions changed entries: %d entries (error %v)", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "s1", 0)
+		testassert.Check(t, err == nil && len(entries) == 3, "conflicted transactions changed entries: %d entries (error %v)", len(entries), err)
 	}
 }
 
@@ -424,12 +397,8 @@ func confRegisterMechanics(t *testing.T, b conformanceBackend) {
 	key := confSessionKey("s1")
 
 	register, err := store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
-	if register.Revision != 1 || register.Key != key {
-		t.Fatalf("fresh session register = revision %d key %+v, want revision 1 key %+v", register.Revision, register.Key, key)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, register.Revision == 1 && register.Key == key, "fresh session register = revision %d key %+v, want revision 1 key %+v", register.Revision, register.Key, key)
 	confPayloadEqual(t, register.Payload, `{"session":"s1"}`)
 
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
@@ -437,45 +406,35 @@ func confRegisterMechanics(t *testing.T, b conformanceBackend) {
 		return err
 	})
 	register, err = store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
-	if register.Revision != 2 {
-		t.Errorf("replacement revision = %d, want 2", register.Revision)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, register.Revision == 2, "replacement revision = %d, want 2", register.Revision)
 	confPayloadEqual(t, register.Payload, `{"state":"replaced","extra":[1,2]}`)
 
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.ReplaceRegister(key, 1, rawJSON(`{"stale":true}`))
-		return err
-	}); !errors.Is(err, harness.ErrConflict) {
-		t.Errorf("stale replacement: error = %v, want ErrConflict", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.ReplaceRegister(key, 1, rawJSON(`{"stale":true}`))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrConflict), "stale replacement: error = %v, want ErrConflict", err)
 	}
 	register, err = store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
-	if register.Revision != 2 || string(register.Payload) != `{"state":"replaced","extra":[1,2]}` {
-		t.Errorf("conflicted replacement changed state: revision %d payload %s", register.Revision, register.Payload)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, register.Revision == 2 && string(register.Payload) == `{"state":"replaced","extra":[1,2]}`, "conflicted replacement changed state: revision %d payload %s", register.Revision, register.Payload)
 
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
 		_, err := txn.ReplaceRegister(key, 2, rawJSON(`{"state":"replaced","extra":[1,2]}`))
 		return err
 	})
 	register, err = store.ReadRegister(ctx, key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
-	if register.Revision != 3 {
-		t.Errorf("unchanged-payload replacement revision = %d, want 3", register.Revision)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, register.Revision == 3, "unchanged-payload replacement revision = %d, want 3", register.Revision)
 
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertRegister(harness.RegisterDraft{Key: key, Payload: confSessionPayload("s1")})
-		return err
-	}); !errors.Is(err, harness.ErrConflict) {
-		t.Errorf("duplicate register insertion: error = %v, want ErrConflict", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertRegister(harness.RegisterDraft{Key: key, Payload: confSessionPayload("s1")})
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrConflict), "duplicate register insertion: error = %v, want ErrConflict", err)
 	}
 
 	confCreateSession(t, ctx, store, "s2")
@@ -483,14 +442,16 @@ func confRegisterMechanics(t *testing.T, b conformanceBackend) {
 		_, err := txn.InsertRegister(confOpRegister("s1", "op1"))
 		return err
 	})
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertRegister(confOpRegister("s2", "op1"))
-		return err
-	}); !errors.Is(err, harness.ErrConflict) {
-		t.Errorf("duplicate operation identity across sessions: error = %v, want ErrConflict", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertRegister(confOpRegister("s2", "op1"))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrConflict), "duplicate operation identity across sessions: error = %v, want ErrConflict", err)
 	}
-	if _, err := store.ReadRegister(ctx, confOpKey("s2", "op1")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("conflicted operation register exists: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("s2", "op1"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "conflicted operation register exists: error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -510,27 +471,32 @@ func confStructuralOwnership(t *testing.T, b conformanceBackend) {
 		_, err := txn.InsertRegister(confOpRegister("fork-origin", "op1"))
 		return err
 	})
-	if entries, err := store.ReadEntries(ctx, "fork-origin", 0); err != nil || len(entries) != 1 {
-		t.Fatalf("same-transaction dependent insertion lost: %d entries (error %v)", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "fork-origin", 0)
+		testassert.Require(t, err == nil && len(entries) == 1, "same-transaction dependent insertion lost: %d entries (error %v)", len(entries), err)
 	}
-	if _, err := store.ReadRegister(ctx, confOpKey("fork-origin", "op1")); err != nil {
-		t.Fatalf("ReadRegister staged in creation transaction: %v", err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("fork-origin", "op1"))
+		testassert.NoError(t, err)
 	}
 
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertEntry(confEntry("ghost", "e1"))
-		return err
-	}); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("entry without session register: error = %v, want ErrNotFound", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertEntry(confEntry("ghost", "e1"))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "entry without session register: error = %v, want ErrNotFound", err)
 	}
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.InsertRegister(confOpRegister("ghost", "op9"))
-		return err
-	}); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("operation register without session register: error = %v, want ErrNotFound", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.InsertRegister(confOpRegister("ghost", "op9"))
+			return err
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "operation register without session register: error = %v, want ErrNotFound", err)
 	}
-	if ids, err := store.ListSessionIDs(ctx); err != nil || len(ids) != 1 || ids[0] != "fork-origin" {
-		t.Errorf("ListSessionIDs = %v (error %v), want [fork-origin]", ids, err)
+	{
+		ids, err := store.ListSessionIDs(ctx)
+		testassert.Check(t, err == nil && len(ids) == 1 && ids[0] == "fork-origin", "ListSessionIDs = %v (error %v), want [fork-origin]", ids, err)
 	}
 }
 
@@ -555,30 +521,20 @@ func confStructuralOrphan(t *testing.T, b conformanceBackend) {
 		"ReadRegisterOp": func() error { _, err := store.ReadRegister(ctx, confOpKey("ghost", "op1")); return err },
 	} {
 		err := read()
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("%s on orphan session: error = %v, want ErrCorrupt", name, err)
-		}
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "%s on orphan session: error = %v, want ErrCorrupt", name, err)
 		var corrupt *harness.CorruptionError
-		if !errors.As(err, &corrupt) || corrupt.SessionID != "ghost" {
-			t.Errorf("%s on orphan session: recovered %+v, want owning session ghost", name, corrupt)
-		}
+		testassert.Check(t, errors.As(err, &corrupt) && corrupt.SessionID == "ghost", "%s on orphan session: recovered %+v, want owning session ghost", name, corrupt)
 	}
 
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 2 || ids[0] != "ghost" || ids[1] != "keeper" {
-		t.Fatalf("ListSessionIDs = %v (error %v), want [ghost keeper]", ids, err)
-	}
+	testassert.Require(t, err == nil && len(ids) == 2 && ids[0] == "ghost" && ids[1] == "keeper", "ListSessionIDs = %v (error %v), want [ghost keeper]", ids, err)
 
 	err = store.Transact(ctx, func(txn harness.Transaction) error {
 		return txn.DeleteSession("ghost")
 	})
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("DeleteSession on orphan session: error = %v, want ErrCorrupt", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "DeleteSession on orphan session: error = %v, want ErrCorrupt", err)
 	var corrupt *harness.CorruptionError
-	if !errors.As(err, &corrupt) || corrupt.SessionID != "ghost" {
-		t.Errorf("DeleteSession orphan corruption recovered %+v, want owning session ghost", corrupt)
-	}
+	testassert.Check(t, errors.As(err, &corrupt) && corrupt.SessionID == "ghost", "DeleteSession orphan corruption recovered %+v, want owning session ghost", corrupt)
 
 	// Every mutation that meets the orphan state reports the same typed
 	// corruption instead of treating the session as absent, and inserting the
@@ -603,29 +559,29 @@ func confStructuralOrphan(t *testing.T, b conformanceBackend) {
 	}
 	for name, mutate := range mutations {
 		err := store.Transact(ctx, func(txn harness.Transaction) error { return mutate(txn) })
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("%s on orphan session: error = %v, want ErrCorrupt", name, err)
-		}
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "%s on orphan session: error = %v, want ErrCorrupt", name, err)
 		var orphanErr *harness.CorruptionError
-		if !errors.As(err, &orphanErr) || orphanErr.SessionID != "ghost" {
-			t.Errorf("%s on orphan session recovered %+v, want owning session ghost", name, orphanErr)
-		}
+		testassert.Check(t, errors.As(err, &orphanErr) && orphanErr.SessionID == "ghost", "%s on orphan session recovered %+v, want owning session ghost", name, orphanErr)
 	}
-	if _, err := store.ReadRegister(ctx, confSessionKey("ghost")); !errors.Is(err, harness.ErrCorrupt) {
-		t.Errorf("orphan session after rejected mutations: error = %v, want ErrCorrupt (the orphan must stay unrepaired)", err)
+	{
+		_, err := store.ReadRegister(ctx, confSessionKey("ghost"))
+		testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "orphan session after rejected mutations: error = %v, want ErrCorrupt (the orphan must stay unrepaired)", err)
 	}
-	if ids, err := store.ListSessionIDs(ctx); err != nil || len(ids) != 2 || ids[0] != "ghost" || ids[1] != "keeper" {
-		t.Errorf("rejected mutations changed discovery: %v (error %v)", ids, err)
+	{
+		ids, err := store.ListSessionIDs(ctx)
+		testassert.Check(t, err == nil && len(ids) == 2 && ids[0] == "ghost" && ids[1] == "keeper", "rejected mutations changed discovery: %v (error %v)", ids, err)
 	}
 
-	if entries, err := store.ReadEntries(ctx, "keeper", 0); err != nil || len(entries) != 1 {
-		t.Errorf("keeper entries = %d (error %v), want 1", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "keeper", 0)
+		testassert.Check(t, err == nil && len(entries) == 1, "keeper entries = %d (error %v), want 1", len(entries), err)
 	}
 
 	if b.reopen != nil {
 		store = b.reopen(t, store)
-		if _, err := store.ReadEntries(ctx, "ghost", 0); !errors.Is(err, harness.ErrCorrupt) {
-			t.Errorf("orphan corruption after reopen: error = %v, want ErrCorrupt", err)
+		{
+			_, err := store.ReadEntries(ctx, "ghost", 0)
+			testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "orphan corruption after reopen: error = %v, want ErrCorrupt", err)
 		}
 	}
 
@@ -633,13 +589,9 @@ func confStructuralOrphan(t *testing.T, b conformanceBackend) {
 	// owning-session corruption on the entries read, not as an absent session.
 	b.orphanOperationRegister(t, store, "ghost-op")
 	_, err = store.ReadEntries(ctx, "ghost-op", 0)
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("orphan operation register: error = %v, want ErrCorrupt", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "orphan operation register: error = %v, want ErrCorrupt", err)
 	var opOrphan *harness.CorruptionError
-	if !errors.As(err, &opOrphan) || opOrphan.SessionID != "ghost-op" {
-		t.Errorf("orphan operation register recovered %+v, want owning session ghost-op", opOrphan)
-	}
+	testassert.Check(t, errors.As(err, &opOrphan) && opOrphan.SessionID == "ghost-op", "orphan operation register recovered %+v, want owning session ghost-op", opOrphan)
 
 	// Replacing that exact extant orphan Operation register is the same typed
 	// owning-session corruption, and the orphan stays unchanged: a second
@@ -649,17 +601,14 @@ func confStructuralOrphan(t *testing.T, b conformanceBackend) {
 		_, err := txn.ReplaceRegister(confOpKey("ghost-op", "orphan-op"), 1, rawJSON(`{"operation":"replaced"}`))
 		return err
 	})
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("ReplaceRegister on an extant orphan Operation register: error = %v, want ErrCorrupt", err)
-	}
-	if !errors.As(err, &opOrphan) || opOrphan.SessionID != "ghost-op" {
-		t.Errorf("ReplaceRegister on an extant orphan Operation register recovered %+v, want owning session ghost-op", opOrphan)
-	}
-	if err = store.Transact(ctx, func(txn harness.Transaction) error {
-		_, err := txn.ReplaceRegister(confOpKey("ghost-op", "orphan-op"), 1, rawJSON(`{"operation":"replaced"}`))
-		return err
-	}); !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("second ReplaceRegister on the unchanged orphan: error = %v, want ErrCorrupt (a consumed revision would be ErrConflict)", err)
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "ReplaceRegister on an extant orphan Operation register: error = %v, want ErrCorrupt", err)
+	testassert.Check(t, errors.As(err, &opOrphan) && opOrphan.SessionID == "ghost-op", "ReplaceRegister on an extant orphan Operation register recovered %+v, want owning session ghost-op", opOrphan)
+	{
+		err = store.Transact(ctx, func(txn harness.Transaction) error {
+			_, err := txn.ReplaceRegister(confOpKey("ghost-op", "orphan-op"), 1, rawJSON(`{"operation":"replaced"}`))
+			return err
+		})
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "second ReplaceRegister on the unchanged orphan: error = %v, want ErrCorrupt (a consumed revision would be ErrConflict)", err)
 	}
 }
 
@@ -681,32 +630,25 @@ func confMalformedSessionRegister(t *testing.T, b conformanceBackend) {
 	}
 	for name, read := range reads {
 		err := read()
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("%s on a malformed session register: error = %v, want ErrCorrupt", name, err)
-		}
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "%s on a malformed session register: error = %v, want ErrCorrupt", name, err)
 		var corrupt *harness.CorruptionError
-		if !errors.As(err, &corrupt) || corrupt.SessionID != "forged" {
-			t.Errorf("%s on a malformed session register recovered %+v, want owning session forged", name, corrupt)
-		}
+		testassert.Check(t, errors.As(err, &corrupt) && corrupt.SessionID == "forged", "%s on a malformed session register recovered %+v, want owning session forged", name, corrupt)
 	}
 
 	err := store.Transact(ctx, func(txn harness.Transaction) error {
 		_, err := txn.InsertEntry(confEntry("forged", "e1"))
 		return err
 	})
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("InsertEntry on a malformed session register: error = %v, want ErrCorrupt", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "InsertEntry on a malformed session register: error = %v, want ErrCorrupt", err)
 
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 1 || ids[0] != "forged" {
-		t.Errorf("ListSessionIDs = %v (error %v), want [forged]", ids, err)
-	}
+	testassert.Check(t, err == nil && len(ids) == 1 && ids[0] == "forged", "ListSessionIDs = %v (error %v), want [forged]", ids, err)
 
 	if b.reopen != nil {
 		store = b.reopen(t, store)
-		if _, err := store.ReadEntries(ctx, "forged", 0); !errors.Is(err, harness.ErrCorrupt) {
-			t.Errorf("malformed session register after reopen: error = %v, want ErrCorrupt", err)
+		{
+			_, err := store.ReadEntries(ctx, "forged", 0)
+			testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "malformed session register after reopen: error = %v, want ErrCorrupt", err)
 		}
 	}
 
@@ -722,18 +664,12 @@ func confMalformedSessionRegister(t *testing.T, b conformanceBackend) {
 		return nil
 	})
 	validRegisters, err := store.ReadRegisters(ctx, "valid-parent")
-	if err != nil || len(validRegisters) != 2 || validRegisters[0].Key.Kind != harness.RegisterSession || validRegisters[1].Key.OperationID != "op1" {
-		t.Fatalf("valid parent ReadRegisters = %v (error %v), want the canonical Session register followed by the Operation register", validRegisters, err)
-	}
+	testassert.Require(t, err == nil && len(validRegisters) == 2 && validRegisters[0].Key.Kind == harness.RegisterSession && validRegisters[1].Key.OperationID == "op1", "valid parent ReadRegisters = %v (error %v), want the canonical Session register followed by the Operation register", validRegisters, err)
 	b.malformedSessionRegister(t, store, "valid-parent")
 	_, err = store.ReadRegisters(ctx, "valid-parent")
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("ReadRegisters beside a valid parent: error = %v, want ErrCorrupt", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "ReadRegisters beside a valid parent: error = %v, want ErrCorrupt", err)
 	var siblingCorrupt *harness.CorruptionError
-	if !errors.As(err, &siblingCorrupt) || siblingCorrupt.SessionID != "valid-parent" {
-		t.Errorf("ReadRegisters beside a valid parent recovered %+v, want owning session valid-parent", siblingCorrupt)
-	}
+	testassert.Check(t, errors.As(err, &siblingCorrupt) && siblingCorrupt.SessionID == "valid-parent", "ReadRegisters beside a valid parent recovered %+v, want owning session valid-parent", siblingCorrupt)
 }
 
 // confTransactionReadYourWrites proves transaction reads observe the committed
@@ -755,9 +691,7 @@ func confTransactionReadYourWrites(t *testing.T, b conformanceBackend) {
 		if err != nil {
 			return err
 		}
-		if len(entries) != 2 || entries[0].ID != "e1" || entries[1].ID != "e2" {
-			t.Errorf("transaction read saw %v, want [e1 e2]", entries)
-		}
+		testassert.Check(t, len(entries) == 2 && entries[0].ID == "e1" && entries[1].ID == "e2", "transaction read saw %v, want [e1 e2]", entries)
 		if _, err := txn.InsertRegister(confOpRegister("s1", "op1")); err != nil {
 			return err
 		}
@@ -765,18 +699,15 @@ func confTransactionReadYourWrites(t *testing.T, b conformanceBackend) {
 		if err != nil {
 			return err
 		}
-		if staged.Revision != 1 {
-			t.Errorf("staged register revision = %d, want 1", staged.Revision)
-		}
+		testassert.Check(t, staged.Revision == 1, "staged register revision = %d, want 1", staged.Revision)
 		return nil
 	})
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 2 {
-		t.Fatalf("committed entries = %d (error %v), want 2", len(entries), err)
-	}
-	if _, err := store.ReadRegister(ctx, confOpKey("s1", "op1")); err != nil {
-		t.Fatalf("committed register read: %v", err)
+	testassert.Require(t, err == nil && len(entries) == 2, "committed entries = %d (error %v), want 2", len(entries), err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("s1", "op1"))
+		testassert.NoError(t, err)
 	}
 }
 
@@ -804,21 +735,16 @@ func confTransactionRollback(t *testing.T, b conformanceBackend) {
 		}
 		return boom
 	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("Transact error = %v, want the callback error", err)
-	}
+	testassert.Require(t, errors.Is(err, boom), "Transact error = %v, want the callback error", err)
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 1 || entries[0].ID != "e1" {
-		t.Fatalf("rollback left %d entries (error %v), want [e1]", len(entries), err)
-	}
+	testassert.Require(t, err == nil && len(entries) == 1 && entries[0].ID == "e1", "rollback left %d entries (error %v), want [e1]", len(entries), err)
 	register, err := store.ReadRegister(ctx, confSessionKey("s1"))
-	if err != nil || register.Revision != 1 {
-		t.Fatalf("rollback left register revision %d (error %v), want 1", register.Revision, err)
-	}
+	testassert.Require(t, err == nil && register.Revision == 1, "rollback left register revision %d (error %v), want 1", register.Revision, err)
 	confPayloadEqual(t, register.Payload, `{"session":"s1"}`)
-	if _, err := store.ReadRegister(ctx, confOpKey("s1", "op1")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("rollback left staged register: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("s1", "op1"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "rollback left staged register: error = %v, want ErrNotFound", err)
 	}
 
 	var retrySequence int64
@@ -827,9 +753,7 @@ func confTransactionRollback(t *testing.T, b conformanceBackend) {
 		retrySequence = entry.Sequence
 		return err
 	})
-	if retrySequence != 2 {
-		t.Errorf("retry sequence = %d, want 2 (rollback must not consume a sequence)", retrySequence)
-	}
+	testassert.Check(t, retrySequence == 2, "retry sequence = %d, want 2 (rollback must not consume a sequence)", retrySequence)
 }
 
 // confTransactionIgnoredConflict proves a mutation conflict latches failure
@@ -851,15 +775,15 @@ func confTransactionIgnoredConflict(t *testing.T, b conformanceBackend) {
 		_ = err
 		return nil
 	})
-	if !errors.Is(err, harness.ErrConflict) {
-		t.Fatalf("ignored mutation conflict: Transact error = %v, want ErrConflict", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrConflict), "ignored mutation conflict: Transact error = %v, want ErrConflict", err)
 
-	if entries, err := store.ReadEntries(ctx, "s1", 0); err != nil || len(entries) != 0 {
-		t.Errorf("latched conflict committed staged entries: %d (error %v)", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "s1", 0)
+		testassert.Check(t, err == nil && len(entries) == 0, "latched conflict committed staged entries: %d (error %v)", len(entries), err)
 	}
-	if _, err := store.ReadRegister(ctx, confOpKey("s1", "dup")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("latched conflict committed staged register: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("s1", "dup"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "latched conflict committed staged register: error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -884,23 +808,17 @@ func confTransactionPanic(t *testing.T, b conformanceBackend) {
 			panic("boom")
 		})
 	}()
-	if panicked != "boom" {
-		t.Fatalf("panic did not propagate, recovered %v", panicked)
-	}
+	testassert.Equal(t, panicked, "boom")
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 1 || entries[0].ID != "e1" {
-		t.Fatalf("panic rollback left %d entries (error %v), want [e1]", len(entries), err)
-	}
+	testassert.Require(t, err == nil && len(entries) == 1 && entries[0].ID == "e1", "panic rollback left %d entries (error %v), want [e1]", len(entries), err)
 	var retrySequence int64
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
 		entry, err := txn.InsertEntry(confEntry("s1", "e3"))
 		retrySequence = entry.Sequence
 		return err
 	})
-	if retrySequence != 2 {
-		t.Errorf("post-panic insert sequence = %d, want 2 (rollback must not consume a sequence)", retrySequence)
-	}
+	testassert.Check(t, retrySequence == 2, "post-panic insert sequence = %d, want 2 (rollback must not consume a sequence)", retrySequence)
 }
 
 // confTransactionContext proves context cancellation rolls back staged writes
@@ -921,12 +839,8 @@ func confTransactionContext(t *testing.T, b conformanceBackend) {
 		called = true
 		return nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("Transact on canceled context: error = %v, want context.Canceled", err)
-	}
-	if called {
-		t.Error("callback invoked on canceled context")
-	}
+	testassert.Check(t, errors.Is(err, context.Canceled), "Transact on canceled context: error = %v, want context.Canceled", err)
+	testassert.Check(t, !called, "callback invoked on canceled context")
 
 	transactionCtx, cancelTransaction := context.WithCancel(context.Background())
 	err = store.Transact(transactionCtx, func(txn harness.Transaction) error {
@@ -936,13 +850,9 @@ func confTransactionContext(t *testing.T, b conformanceBackend) {
 		cancelTransaction()
 		return nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("pre-commit cancellation: error = %v, want context.Canceled", err)
-	}
+	testassert.Check(t, errors.Is(err, context.Canceled), "pre-commit cancellation: error = %v, want context.Canceled", err)
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 1 || entries[0].ID != "e1" {
-		t.Errorf("cancellation committed staged writes: %d entries (error %v)", len(entries), err)
-	}
+	testassert.Check(t, err == nil && len(entries) == 1 && entries[0].ID == "e1", "cancellation committed staged writes: %d entries (error %v)", len(entries), err)
 
 	reads := map[string]func() error{
 		"ReadEntries":    func() error { _, err := store.ReadEntries(canceled, "s1", 0); return err },
@@ -952,15 +862,17 @@ func confTransactionContext(t *testing.T, b conformanceBackend) {
 		"Transact":       func() error { return store.Transact(canceled, func(harness.Transaction) error { return nil }) },
 	}
 	for name, read := range reads {
-		if err := read(); !errors.Is(err, context.Canceled) {
-			t.Errorf("%s on canceled context: error = %v, want context.Canceled", name, err)
+		{
+			err := read()
+			testassert.Check(t, errors.Is(err, context.Canceled), "%s on canceled context: error = %v, want context.Canceled", name, err)
 		}
 	}
 
 	deadlineCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancelDeadline()
-	if _, err := store.ReadEntries(deadlineCtx, "s1", 0); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ReadEntries on expired deadline: error = %v, want context.DeadlineExceeded", err)
+	{
+		_, err := store.ReadEntries(deadlineCtx, "s1", 0)
+		testassert.Check(t, errors.Is(err, context.DeadlineExceeded), "ReadEntries on expired deadline: error = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -1000,15 +912,12 @@ func confTransactionQueuedCancellation(t *testing.T, b conformanceBackend) {
 	<-queuedCtx.Done() // the deadline expires while the queued transaction still waits
 	close(release)
 
-	if err := <-first; err != nil {
-		t.Fatalf("first transaction: %v", err)
+	testassert.NoError(t, <-first)
+	{
+		err := <-queued
+		testassert.Check(t, errors.Is(err, context.DeadlineExceeded), "queued transaction error = %v, want context.DeadlineExceeded", err)
 	}
-	if err := <-queued; !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("queued transaction error = %v, want context.DeadlineExceeded", err)
-	}
-	if queuedCalled {
-		t.Error("queued transaction callback ran after cancellation")
-	}
+	testassert.Check(t, !queuedCalled, "queued transaction callback ran after cancellation")
 }
 
 // confTransactionBarrier proves readers outside a transaction observe either
@@ -1044,21 +953,13 @@ func confTransactionBarrier(t *testing.T, b conformanceBackend) {
 	<-staged
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("outside reader: %v", err)
-	}
+	testassert.NoError(t, err)
 	preCommit := len(entries) == 1 && entries[0].ID == "e1"
 	postCommit := len(entries) == 3 && entries[0].ID == "e1" && entries[1].ID == "e2" && entries[2].ID == "e3"
-	if !preCommit && !postCommit {
-		t.Errorf("outside reader observed a partial transition %v, want exactly [e1] or [e1 e2 e3]", entries)
-	}
-	if err := <-committed; err != nil {
-		t.Fatalf("Transact: %v", err)
-	}
+	testassert.Check(t, preCommit || postCommit, "outside reader observed a partial transition %v, want exactly [e1] or [e1 e2 e3]", entries)
+	testassert.NoError(t, <-committed)
 	entries, err = store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 3 || entries[2].ID != "e3" {
-		t.Errorf("post-commit read = %v (error %v), want the complete committed transition [e1 e2 e3]", entries, err)
-	}
+	testassert.Check(t, err == nil && len(entries) == 3 && entries[2].ID == "e3", "post-commit read = %v (error %v), want the complete committed transition [e1 e2 e3]", entries, err)
 }
 
 // confRetainedTransaction proves using a transaction after its callback
@@ -1073,14 +974,17 @@ func confRetainedTransaction(t *testing.T, b conformanceBackend) {
 		retained = txn
 		return nil
 	})
-	if _, err := retained.ReadEntries("s1", 0); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("retained ReadEntries: error = %v, want ErrInvalid", err)
+	{
+		_, err := retained.ReadEntries("s1", 0)
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "retained ReadEntries: error = %v, want ErrInvalid", err)
 	}
-	if _, err := retained.ReadRegister(confSessionKey("s1")); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("retained ReadRegister: error = %v, want ErrInvalid", err)
+	{
+		_, err := retained.ReadRegister(confSessionKey("s1"))
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "retained ReadRegister: error = %v, want ErrInvalid", err)
 	}
-	if _, err := retained.InsertEntry(confEntry("s1", "e1")); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("retained InsertEntry: error = %v, want ErrInvalid", err)
+	{
+		_, err := retained.InsertEntry(confEntry("s1", "e1"))
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "retained InsertEntry: error = %v, want ErrInvalid", err)
 	}
 }
 
@@ -1104,9 +1008,7 @@ func confMultiSessionTransaction(t *testing.T, b conformanceBackend) {
 		if err != nil {
 			return err
 		}
-		if len(source) != 2 {
-			t.Errorf("transaction read of source session saw %d entries, want 2", len(source))
-		}
+		testassert.Check(t, len(source) == 2, "transaction read of source session saw %d entries, want 2", len(source))
 		if _, err := txn.InsertRegister(harness.RegisterDraft{Key: confSessionKey("dst"), Payload: confSessionPayload("dst")}); err != nil {
 			return err
 		}
@@ -1115,13 +1017,9 @@ func confMultiSessionTransaction(t *testing.T, b conformanceBackend) {
 	})
 
 	dstEntries, err := store.ReadEntries(ctx, "dst", 0)
-	if err != nil || len(dstEntries) != 1 || dstEntries[0].ID != "copy" {
-		t.Fatalf("destination entries = %v (error %v), want [copy]", dstEntries, err)
-	}
+	testassert.Require(t, err == nil && len(dstEntries) == 1 && dstEntries[0].ID == "copy", "destination entries = %v (error %v), want [copy]", dstEntries, err)
 	srcEntries, err := store.ReadEntries(ctx, "src", 0)
-	if err != nil || len(srcEntries) != 2 {
-		t.Fatalf("source entries = %d (error %v), want 2", len(srcEntries), err)
-	}
+	testassert.Require(t, err == nil && len(srcEntries) == 2, "source entries = %d (error %v), want 2", len(srcEntries), err)
 
 	boom := errors.New("multi-session rollback")
 	err = store.Transact(ctx, func(txn harness.Transaction) error {
@@ -1133,14 +1031,14 @@ func confMultiSessionTransaction(t *testing.T, b conformanceBackend) {
 		}
 		return boom
 	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("Transact error = %v, want the callback error", err)
+	testassert.Require(t, errors.Is(err, boom), "Transact error = %v, want the callback error", err)
+	{
+		ids, err := store.ListSessionIDs(ctx)
+		testassert.Check(t, err == nil && len(ids) == 2, "rollback changed the session set: %v (error %v)", ids, err)
 	}
-	if ids, err := store.ListSessionIDs(ctx); err != nil || len(ids) != 2 {
-		t.Errorf("rollback changed the session set: %v (error %v)", ids, err)
-	}
-	if entries, err := store.ReadEntries(ctx, "dst", 0); err != nil || len(entries) != 1 {
-		t.Errorf("rollback changed destination entries: %d (error %v)", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "dst", 0)
+		testassert.Check(t, err == nil && len(entries) == 1, "rollback changed destination entries: %d (error %v)", len(entries), err)
 	}
 }
 
@@ -1163,18 +1061,12 @@ func confRevisionConflict(t *testing.T, b conformanceBackend) {
 		_, err := txn.ReplaceRegister(key, 99, rawJSON(`{"stale":true}`))
 		return err
 	})
-	if !errors.Is(err, harness.ErrConflict) {
-		t.Fatalf("stale preparation: error = %v, want ErrConflict", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrConflict), "stale preparation: error = %v, want ErrConflict", err)
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil || len(entries) != 1 || entries[0].ID != "e1" {
-		t.Errorf("stale replacement consumed a staged sequence: %v (error %v)", entries, err)
-	}
+	testassert.Check(t, err == nil && len(entries) == 1 && entries[0].ID == "e1", "stale replacement consumed a staged sequence: %v (error %v)", entries, err)
 	register, err := store.ReadRegister(ctx, key)
-	if err != nil || register.Revision != 1 {
-		t.Errorf("stale replacement changed the register: revision %d (error %v)", register.Revision, err)
-	}
+	testassert.Check(t, err == nil && register.Revision == 1, "stale replacement changed the register: revision %d (error %v)", register.Revision, err)
 	confPayloadEqual(t, register.Payload, `{"session":"s1"}`)
 
 	confTxn(t, ctx, store, func(txn harness.Transaction) error {
@@ -1182,9 +1074,7 @@ func confRevisionConflict(t *testing.T, b conformanceBackend) {
 		return err
 	})
 	register, err = store.ReadRegister(ctx, key)
-	if err != nil || register.Revision != 2 {
-		t.Errorf("retry at exact revision = revision %d (error %v), want 2", register.Revision, err)
-	}
+	testassert.Check(t, err == nil && register.Revision == 2, "retry at exact revision = revision %d (error %v), want 2", register.Revision, err)
 }
 
 // confRecoveryReads covers sorted session discovery, deterministic register
@@ -1194,9 +1084,7 @@ func confRecoveryReads(t *testing.T, b conformanceBackend) {
 	store := b.newStore(t)
 
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 0 {
-		t.Fatalf("empty store ListSessionIDs = %v (error %v), want empty", ids, err)
-	}
+	testassert.Require(t, err == nil && len(ids) == 0, "empty store ListSessionIDs = %v (error %v), want empty", ids, err)
 
 	confCreateSession(t, ctx, store, "b")
 	confCreateSession(t, ctx, store, "a")
@@ -1212,45 +1100,28 @@ func confRecoveryReads(t *testing.T, b conformanceBackend) {
 	})
 
 	ids, err = store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 2 || ids[0] != "a" || ids[1] != "b" {
-		t.Fatalf("ListSessionIDs = %v (error %v), want [a b]", ids, err)
-	}
+	testassert.Require(t, err == nil && len(ids) == 2 && ids[0] == "a" && ids[1] == "b", "ListSessionIDs = %v (error %v), want [a b]", ids, err)
 
 	registers, err := store.ReadRegisters(ctx, "a")
-	if err != nil {
-		t.Fatalf("ReadRegisters: %v", err)
-	}
-	if len(registers) != 3 {
-		t.Fatalf("ReadRegisters returned %d registers, want 3", len(registers))
-	}
-	if registers[0].Key.Kind != harness.RegisterSession {
-		t.Errorf("first register = %+v, want the session register", registers[0].Key)
-	}
-	if registers[1].Key.OperationID != "op-a" || registers[2].Key.OperationID != "op-b" {
-		t.Errorf("operation register order = %s, %s; want op-a, op-b", registers[1].Key.OperationID, registers[2].Key.OperationID)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(registers), 3)
+	testassert.Check(t, registers[0].Key.Kind == harness.RegisterSession, "first register = %+v, want the session register", registers[0].Key)
+	testassert.Check(t, registers[1].Key.OperationID == "op-a" && registers[2].Key.OperationID == "op-b", "operation register order = %s, %s; want op-a, op-b", registers[1].Key.OperationID, registers[2].Key.OperationID)
 	for _, register := range registers {
-		if register.Revision != 1 {
-			t.Errorf("register %+v revision = %d, want 1", register.Key, register.Revision)
-		}
+		testassert.Check(t, register.Revision == 1, "register %+v revision = %d, want 1", register.Key, register.Revision)
 	}
 
 	onlySession, err := store.ReadRegisters(ctx, "b")
-	if err != nil || len(onlySession) != 1 || onlySession[0].Key.Kind != harness.RegisterSession {
-		t.Fatalf("register-only session ReadRegisters = %v (error %v), want the session register", onlySession, err)
-	}
-	if entries, err := store.ReadEntries(ctx, "b", 0); err != nil || len(entries) != 0 {
-		t.Errorf("register-only session ReadEntries = %v (error %v), want empty", entries, err)
+	testassert.Require(t, err == nil && len(onlySession) == 1 && onlySession[0].Key.Kind == harness.RegisterSession, "register-only session ReadRegisters = %v (error %v), want the session register", onlySession, err)
+	{
+		entries, err := store.ReadEntries(ctx, "b", 0)
+		testassert.Check(t, err == nil && len(entries) == 0, "register-only session ReadEntries = %v (error %v), want empty", entries, err)
 	}
 
 	idsAgain, err := store.ListSessionIDs(ctx)
-	if err != nil || len(idsAgain) != 2 || idsAgain[0] != "a" || idsAgain[1] != "b" {
-		t.Errorf("repeated ListSessionIDs = %v (error %v), want [a b]", idsAgain, err)
-	}
+	testassert.Check(t, err == nil && len(idsAgain) == 2 && idsAgain[0] == "a" && idsAgain[1] == "b", "repeated ListSessionIDs = %v (error %v), want [a b]", idsAgain, err)
 	reread, err := store.ReadRegisters(ctx, "a")
-	if err != nil || len(reread) != 3 || reread[2].Key.OperationID != "op-b" || reread[2].Revision != 1 {
-		t.Errorf("recovery reads mutated state: %v (error %v)", reread, err)
-	}
+	testassert.Check(t, err == nil && len(reread) == 3 && reread[2].Key.OperationID == "op-b" && reread[2].Revision == 1, "recovery reads mutated state: %v (error %v)", reread, err)
 }
 
 // confSequenceExhaustion proves sequence advancement beyond math.MaxInt64
@@ -1270,17 +1141,11 @@ func confSequenceExhaustion(t *testing.T, b conformanceBackend) {
 		_, err := txn.InsertEntry(confEntry("s1", "overflow"))
 		return err
 	})
-	if !errors.Is(err, harness.ErrStorage) {
-		t.Fatalf("sequence exhaustion: error = %v, want ErrStorage", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrStorage), "sequence exhaustion: error = %v, want ErrStorage", err)
 
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
-	if len(entries) != 2 || entries[1].Sequence != math.MaxInt64 {
-		t.Errorf("aborted exhaustion transaction changed entries: %v", entries)
-	}
+	testassert.NoError(t, err)
+	testassert.Check(t, len(entries) == 2 && entries[1].Sequence == math.MaxInt64, "aborted exhaustion transaction changed entries: %v", entries)
 }
 
 // confRevisionExhaustion proves revision advancement beyond math.MaxInt64
@@ -1294,20 +1159,14 @@ func confRevisionExhaustion(t *testing.T, b conformanceBackend) {
 	b.exhaustRevision(t, store, "s1")
 
 	register, err := store.ReadRegister(ctx, key)
-	if err != nil || register.Revision != math.MaxInt64 {
-		t.Fatalf("fixture revision = %d (error %v), want %d", register.Revision, err, int64(math.MaxInt64))
-	}
+	testassert.Require(t, err == nil && register.Revision == math.MaxInt64, "fixture revision = %d (error %v), want %d", register.Revision, err, int64(math.MaxInt64))
 	err = store.Transact(ctx, func(txn harness.Transaction) error {
 		_, err := txn.ReplaceRegister(key, math.MaxInt64, rawJSON(`{"next":true}`))
 		return err
 	})
-	if !errors.Is(err, harness.ErrStorage) {
-		t.Fatalf("revision exhaustion: error = %v, want ErrStorage", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrStorage), "revision exhaustion: error = %v, want ErrStorage", err)
 	register, err = store.ReadRegister(ctx, key)
-	if err != nil || register.Revision != math.MaxInt64 {
-		t.Fatalf("aborted exhaustion transaction changed revision: %d (error %v)", register.Revision, err)
-	}
+	testassert.Require(t, err == nil && register.Revision == math.MaxInt64, "aborted exhaustion transaction changed revision: %d (error %v)", register.Revision, err)
 	confPayloadEqual(t, register.Payload, `{"session":"s1"}`)
 }
 
@@ -1331,21 +1190,13 @@ func confCorruption(t *testing.T, b conformanceBackend) {
 	b.corruptEntry(t, store, "owner")
 
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 2 || ids[0] != "keeper" || ids[1] != "owner" {
-		t.Fatalf("corrupt state disappeared from discovery: %v (error %v)", ids, err)
-	}
+	testassert.Require(t, err == nil && len(ids) == 2 && ids[0] == "keeper" && ids[1] == "owner", "corrupt state disappeared from discovery: %v (error %v)", ids, err)
 	_, err = store.ReadEntries(ctx, "owner", 0)
-	if !errors.Is(err, harness.ErrCorrupt) {
-		t.Fatalf("corrupt entry: error = %v, want ErrCorrupt", err)
-	}
+	testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt entry: error = %v, want ErrCorrupt", err)
 	var corrupt *harness.CorruptionError
-	if !errors.As(err, &corrupt) || corrupt.SessionID != "owner" {
-		t.Errorf("corrupt entry recovered %+v, want owning session owner", corrupt)
-	}
+	testassert.Check(t, errors.As(err, &corrupt) && corrupt.SessionID == "owner", "corrupt entry recovered %+v, want owning session owner", corrupt)
 	keeperEntries, err := store.ReadEntries(ctx, "keeper", 0)
-	if err != nil || len(keeperEntries) != 1 || keeperEntries[0].ID != "k1" {
-		t.Errorf("keeper readable entries = %v (error %v), want [k1]", keeperEntries, err)
-	}
+	testassert.Check(t, err == nil && len(keeperEntries) == 1 && keeperEntries[0].ID == "k1", "keeper readable entries = %v (error %v), want [k1]", keeperEntries, err)
 
 	b.corruptRegister(t, store, "owner")
 
@@ -1354,32 +1205,30 @@ func confCorruption(t *testing.T, b conformanceBackend) {
 		"ReadRegisters": func() error { _, err := store.ReadRegisters(ctx, "owner"); return err },
 	} {
 		err := read()
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Errorf("%s on corrupt register: error = %v, want ErrCorrupt", name, err)
-		}
+		testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "%s on corrupt register: error = %v, want ErrCorrupt", name, err)
 		var corrupt *harness.CorruptionError
-		if !errors.As(err, &corrupt) || corrupt.SessionID != "owner" {
-			t.Errorf("%s on corrupt register recovered %+v, want owning session owner", name, corrupt)
-		}
+		testassert.Check(t, errors.As(err, &corrupt) && corrupt.SessionID == "owner", "%s on corrupt register recovered %+v, want owning session owner", name, corrupt)
 	}
-	if _, err := store.ReadRegister(ctx, confSessionKey("keeper")); err != nil {
-		t.Errorf("keeper register unreadable beside corruption: %v", err)
+	{
+		_, err := store.ReadRegister(ctx, confSessionKey("keeper"))
+		testassert.Check(t, err == nil, "keeper register unreadable beside corruption: %v", err)
 	}
 	ids, err = store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 2 {
-		t.Errorf("register corruption removed discovery: %v (error %v)", ids, err)
-	}
+	testassert.Check(t, err == nil && len(ids) == 2, "register corruption removed discovery: %v (error %v)", ids, err)
 
 	if b.reopen != nil {
 		store = b.reopen(t, store)
-		if _, err := store.ReadEntries(ctx, "owner", 0); !errors.Is(err, harness.ErrCorrupt) {
-			t.Errorf("entry corruption after reopen: error = %v, want ErrCorrupt", err)
+		{
+			_, err := store.ReadEntries(ctx, "owner", 0)
+			testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "entry corruption after reopen: error = %v, want ErrCorrupt", err)
 		}
-		if _, err := store.ReadRegister(ctx, confSessionKey("owner")); !errors.Is(err, harness.ErrCorrupt) {
-			t.Errorf("register corruption after reopen: error = %v, want ErrCorrupt", err)
+		{
+			_, err := store.ReadRegister(ctx, confSessionKey("owner"))
+			testassert.Check(t, errors.Is(err, harness.ErrCorrupt), "register corruption after reopen: error = %v, want ErrCorrupt", err)
 		}
-		if entries, err := store.ReadEntries(ctx, "keeper", 0); err != nil || len(entries) != 1 {
-			t.Errorf("keeper after reopen: %d entries (error %v)", len(entries), err)
+		{
+			entries, err := store.ReadEntries(ctx, "keeper", 0)
+			testassert.Check(t, err == nil && len(entries) == 1, "keeper after reopen: %d entries (error %v)", len(entries), err)
 		}
 	}
 }
@@ -1411,19 +1260,11 @@ func confCompactionPayloadRoundTrip(t *testing.T, b conformanceBackend) {
 		store = b.reopen(t, store)
 	}
 	entries, err := store.ReadEntries(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("ReadEntries returned %d entries, want 2", len(entries))
-	}
-	if entries[0].ID != "c1" || entries[0].Kind != harness.EntryCompaction || entries[0].OperationID != "op-1" {
-		t.Errorf("owned compaction envelope = %+v", entries[0])
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(entries), 2)
+	testassert.Check(t, entries[0].ID == "c1" && entries[0].Kind == harness.EntryCompaction && entries[0].OperationID == "op-1", "owned compaction envelope = %+v", entries[0])
 	confPayloadEqual(t, entries[0].Payload, owned)
-	if entries[1].ID != "c2" || entries[1].Kind != harness.EntryCompaction || entries[1].OperationID != "" {
-		t.Errorf("copied compaction envelope = %+v", entries[1])
-	}
+	testassert.Check(t, entries[1].ID == "c2" && entries[1].Kind == harness.EntryCompaction && entries[1].OperationID == "", "copied compaction envelope = %+v", entries[1])
 	confPayloadEqual(t, entries[1].Payload, copied)
 }
 
@@ -1459,34 +1300,39 @@ func confSessionDeletion(t *testing.T, b conformanceBackend) {
 	})
 
 	ids, err := store.ListSessionIDs(ctx)
-	if err != nil || len(ids) != 1 || ids[0] != "kept" {
-		t.Fatalf("ListSessionIDs after deletion = %v (error %v), want [kept]", ids, err)
+	testassert.Require(t, err == nil && len(ids) == 1 && ids[0] == "kept", "ListSessionIDs after deletion = %v (error %v), want [kept]", ids, err)
+	{
+		_, err := store.ReadRegister(ctx, confSessionKey("gone"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "deleted session register: error = %v, want ErrNotFound", err)
 	}
-	if _, err := store.ReadRegister(ctx, confSessionKey("gone")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("deleted session register: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadEntries(ctx, "gone", 0)
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "deleted session entries: error = %v, want ErrNotFound", err)
 	}
-	if _, err := store.ReadEntries(ctx, "gone", 0); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("deleted session entries: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegisters(ctx, "gone")
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "deleted session registers: error = %v, want ErrNotFound", err)
 	}
-	if _, err := store.ReadRegisters(ctx, "gone"); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("deleted session registers: error = %v, want ErrNotFound", err)
+	{
+		_, err := store.ReadRegister(ctx, confOpKey("gone", "op1"))
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "deleted session operation register: error = %v, want ErrNotFound", err)
 	}
-	if _, err := store.ReadRegister(ctx, confOpKey("gone", "op1")); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("deleted session operation register: error = %v, want ErrNotFound", err)
-	}
-	if entries, err := store.ReadEntries(ctx, "kept", 0); err != nil || len(entries) != 1 {
-		t.Errorf("other session changed by deletion: %d entries (error %v)", len(entries), err)
+	{
+		entries, err := store.ReadEntries(ctx, "kept", 0)
+		testassert.Check(t, err == nil && len(entries) == 1, "other session changed by deletion: %d entries (error %v)", len(entries), err)
 	}
 
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		return txn.DeleteSession("absent")
-	}); !errors.Is(err, harness.ErrNotFound) {
-		t.Errorf("DeleteSession absent: error = %v, want ErrNotFound", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			return txn.DeleteSession("absent")
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrNotFound), "DeleteSession absent: error = %v, want ErrNotFound", err)
 	}
-	if err := store.Transact(ctx, func(txn harness.Transaction) error {
-		return txn.DeleteSession("")
-	}); !errors.Is(err, harness.ErrInvalid) {
-		t.Errorf("DeleteSession empty identity: error = %v, want ErrInvalid", err)
+	{
+		err := store.Transact(ctx, func(txn harness.Transaction) error {
+			return txn.DeleteSession("")
+		})
+		testassert.Check(t, errors.Is(err, harness.ErrInvalid), "DeleteSession empty identity: error = %v, want ErrInvalid", err)
 	}
 
 	boom := errors.New("deletion rollback")
@@ -1496,11 +1342,10 @@ func confSessionDeletion(t *testing.T, b conformanceBackend) {
 		}
 		return boom
 	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("staged deletion Transact error = %v, want the callback error", err)
-	}
-	if ids, err := store.ListSessionIDs(ctx); err != nil || len(ids) != 1 || ids[0] != "kept" {
-		t.Errorf("rolled-back deletion removed the session: %v (error %v)", ids, err)
+	testassert.Require(t, errors.Is(err, boom), "staged deletion Transact error = %v, want the callback error", err)
+	{
+		ids, err := store.ListSessionIDs(ctx)
+		testassert.Check(t, err == nil && len(ids) == 1 && ids[0] == "kept", "rolled-back deletion removed the session: %v (error %v)", ids, err)
 	}
 
 	staged := make(chan struct{})
@@ -1516,16 +1361,11 @@ func confSessionDeletion(t *testing.T, b conformanceBackend) {
 	}()
 	<-staged
 	ids, err = store.ListSessionIDs(ctx) // the complete pre-commit or post-commit set, never partial
-	if err != nil {
-		t.Fatalf("outside reader during deletion: %v", err)
-	}
-	if len(ids) > 1 || (len(ids) == 1 && ids[0] != "kept") {
-		t.Errorf("outside reader observed a partially deleted session set: %v, want exactly [kept] or empty", ids)
-	}
-	if err := <-committed; err != nil {
-		t.Fatalf("deletion Transact: %v", err)
-	}
-	if ids, err = store.ListSessionIDs(ctx); err != nil || len(ids) != 0 {
-		t.Errorf("session set after committed deletion = %v (error %v), want empty", ids, err)
+	testassert.NoError(t, err)
+	testassert.Check(t, len(ids) <= 1 && (len(ids) != 1 || ids[0] == "kept"), "outside reader observed a partially deleted session set: %v, want exactly [kept] or empty", ids)
+	testassert.NoError(t, <-committed)
+	{
+		ids, err = store.ListSessionIDs(ctx)
+		testassert.Check(t, err == nil && len(ids) == 0, "session set after committed deletion = %v (error %v), want empty", ids, err)
 	}
 }

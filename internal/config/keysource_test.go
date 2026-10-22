@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 func TestClassifyKeySourceOrder(t *testing.T) {
 	yes := func(string) bool { return true }
@@ -21,9 +24,7 @@ func TestClassifyKeySourceOrder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ClassifyKeySource(tc.apiKeyEnv, tc.external, tc.managed); got != tc.want {
-				t.Fatalf("ClassifyKeySource = %q, want %q", got, tc.want)
-			}
+			testassert.Equal(t, ClassifyKeySource(tc.apiKeyEnv, tc.external, tc.managed), tc.want)
 		})
 	}
 }
@@ -37,15 +38,9 @@ func TestClassifyKeySourceAgentContext(t *testing.T) {
 	managed := func(name string) bool { return managedSet[name] }
 	external := func(name string) bool { return envSet[name] && !managed(name) }
 
-	if got := ClassifyKeySource("MANAGED_KEY", external, managed); got != KeySourceManaged {
-		t.Fatalf("managed+env key = %q, want %q", got, KeySourceManaged)
-	}
-	if got := ClassifyKeySource("SHELL_KEY", external, managed); got != KeySourceExternal {
-		t.Fatalf("shell key = %q, want %q", got, KeySourceExternal)
-	}
-	if got := ClassifyKeySource("UNSET_KEY", external, managed); got != KeySourceNone {
-		t.Fatalf("unset key = %q, want %q", got, KeySourceNone)
-	}
+	testassert.Equal(t, ClassifyKeySource("MANAGED_KEY", external, managed), KeySourceManaged)
+	testassert.Equal(t, ClassifyKeySource("SHELL_KEY", external, managed), KeySourceExternal)
+	testassert.Equal(t, ClassifyKeySource("UNSET_KEY", external, managed), KeySourceNone)
 }
 
 // Doctor-context adapter: LoadDotEnv never ran, so doctor mirrors its
@@ -65,19 +60,9 @@ func TestClassifyKeySourceDoctorContext(t *testing.T) {
 		return inDotEnv
 	}
 
-	if got := ClassifyKeySource("BOTH_KEY", external, managed); got != KeySourceExternal {
-		t.Fatalf("shell+.env key = %q, want %q", got, KeySourceExternal)
-	}
-	if got := ClassifyKeySource("DOTENV_KEY", external, managed); got != KeySourceManaged {
-		t.Fatalf(".env-only key = %q, want %q", got, KeySourceManaged)
-	}
-	if got := ClassifyKeySource("EMPTY_DOTENV_KEY", external, managed); got != KeySourceManaged {
-		t.Fatalf("empty .env value = %q, want %q (LoadDotEnv marks it managed)", got, KeySourceManaged)
-	}
-	if got := ClassifyKeySource("EMPTY_SHELL_KEY", external, managed); got != KeySourceNone {
-		t.Fatalf("empty shell export = %q, want %q", got, KeySourceNone)
-	}
-	if got := ClassifyKeySource("OTHER_KEY", external, managed); got != KeySourceNone {
-		t.Fatalf("absent key = %q, want %q", got, KeySourceNone)
-	}
+	testassert.Equal(t, ClassifyKeySource("BOTH_KEY", external, managed), KeySourceExternal)
+	testassert.Equal(t, ClassifyKeySource("DOTENV_KEY", external, managed), KeySourceManaged)
+	testassert.Equal(t, ClassifyKeySource("EMPTY_DOTENV_KEY", external, managed), KeySourceManaged)
+	testassert.Equal(t, ClassifyKeySource("EMPTY_SHELL_KEY", external, managed), KeySourceNone)
+	testassert.Equal(t, ClassifyKeySource("OTHER_KEY", external, managed), KeySourceNone)
 }

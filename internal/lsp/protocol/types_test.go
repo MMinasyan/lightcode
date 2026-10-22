@@ -3,19 +3,18 @@ package protocol
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestURIPathRoundTrip(t *testing.T) {
 	path := "/tmp/light code/файл.go"
 	uri := URIFromPath(path)
-	if got := PathFromURI(uri); got != path {
-		t.Fatalf("PathFromURI(URIFromPath(%q)) = %q", path, got)
-	}
-	if got := PathFromURI("file:///tmp/a%20b.go"); got != "/tmp/a b.go" {
-		t.Fatalf("PathFromURI decoded = %q", got)
-	}
-	if got := PathFromURI("not a uri"); got == "" {
-		t.Fatal("PathFromURI invalid URI returned empty path")
+	testassert.Equal(t, PathFromURI(uri), path)
+	testassert.Equal(t, PathFromURI("file:///tmp/a%20b.go"), "/tmp/a b.go")
+	{
+		got := PathFromURI("not a uri")
+		testassert.Require(t, got != "", "PathFromURI invalid URI returned empty path")
 	}
 }
 
@@ -30,12 +29,8 @@ func TestHoverContentsUnmarshalVariants(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var got HoverContents
-			if err := json.Unmarshal([]byte(tt.input), &got); err != nil {
-				t.Fatalf("Unmarshal: %v", err)
-			}
-			if got.Value != tt.want {
-				t.Fatalf("Value = %q, want %q", got.Value, tt.want)
-			}
+			testassert.NoError(t, json.Unmarshal([]byte(tt.input), &got))
+			testassert.Equal(t, got.Value, tt.want)
 		})
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -40,16 +41,14 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 		live.mu.Lock()
 		live.calls = append(live.calls, r.Method+" "+r.URL.RequestURI())
 		live.mu.Unlock()
-		if r.Header.Get("Authorization") != "Bearer "+strings.Repeat("1", 64) {
-			t.Error("unauthenticated generated request")
-		}
+		testassert.Check(t, r.Header.Get("Authorization") == "Bearer "+strings.Repeat("1", 64), "unauthenticated generated request")
 		if live.special != nil && live.special(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/health":
-			health(w)
+			health(w, instance)
 		case r.URL.Path == "/v1/events":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
@@ -94,19 +93,14 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 	}))
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
-	raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
-	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), discoveryRecord(server.URL, instance), 0600))
 	live.opts = clienthost.Options{DataDir: dir}
 	return live
 }
 func pipeInput(t *testing.T) (*os.File, *os.File) {
 	t.Helper()
 	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { read.Close(); write.Close() })
 	return read, write
 }
@@ -120,9 +114,7 @@ func assertNoImplicitControls(t *testing.T, live *liveRuntime) {
 	live.mu.Lock()
 	defer live.mu.Unlock()
 	for _, route := range live.calls {
-		if strings.Contains(route, "shutdown") || strings.Contains(route, "/interrupt") || strings.Contains(route, "/stop") {
-			t.Fatalf("implicit control on exit: %s", route)
-		}
+		testassert.Require(t, !strings.Contains(route, "shutdown") && !strings.Contains(route, "/interrupt") && !strings.Contains(route, "/stop"), "implicit control on exit: %s", route)
 	}
 }
 
@@ -176,22 +168,14 @@ func TestRunEOFSignalReadErrorAndOutputError(t *testing.T) {
 			err := receive(t, done)
 			switch exit {
 			case "EOF":
-				if err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, err)
 			case "signal":
 				var e ExitError
-				if !errors.As(err, &e) || e.Code != 130 {
-					t.Fatal(err)
-				}
+				testassert.Require(t, errors.As(err, &e) && e.Code == 130, "%v", err)
 			case "read-error":
-				if err == nil || errors.Is(err, io.EOF) {
-					t.Fatal("read error hidden")
-				}
+				testassert.Require(t, err != nil && !errors.Is(err, io.EOF), "read error hidden")
 			case "output-error":
-				if !errors.Is(err, io.ErrClosedPipe) {
-					t.Fatal(err)
-				}
+				testassert.Require(t, errors.Is(err, io.ErrClosedPipe), "%v", err)
 			}
 			assertNoImplicitControls(t, live)
 		})
@@ -212,14 +196,13 @@ func TestRunInputPressureBackpressuresAndReleases(t *testing.T) {
 	barrier(t, blocked.entered)
 	// Far more keys than the queue holds: every one past capacity waits, so the
 	// reader never reads past them while the input is closed behind them.
-	if _, err := write.Write([]byte(strings.Repeat("x", 5000))); err != nil {
-		t.Fatal(err)
+	{
+		_, err := write.Write([]byte(strings.Repeat("x", 5000)))
+		testassert.NoError(t, err)
 	}
 	write.Close()
 	close(blocked.release)
-	if err := receive(t, done); err != nil {
-		t.Fatalf("Run after EOF behind blocked keys = %v, want nil", err)
-	}
+	testassert.NoError(t, receive(t, done))
 	assertNoImplicitControls(t, live)
 }
 
@@ -235,16 +218,15 @@ func TestRunInputPressureReleasesOnSignal(t *testing.T) {
 	done := runClient(c, input, blocked)
 	barrier(t, live.streams)
 	barrier(t, blocked.entered)
-	if _, err := write.Write([]byte(strings.Repeat("x", 5000))); err != nil {
-		t.Fatal(err)
+	{
+		_, err := write.Write([]byte(strings.Repeat("x", 5000)))
+		testassert.NoError(t, err)
 	}
 	barrierUntilFull(t, c)
 	c.handleSignal(syscall.SIGTERM, int(input.Fd()))
 	err := receive(t, done)
 	var e ExitError
-	if !errors.As(err, &e) || e.Code != 130 {
-		t.Fatalf("Run = %v, want the signal exit while input pressure persists", err)
-	}
+	testassert.Require(t, errors.As(err, &e) && e.Code == 130, "Run = %v, want the signal exit while input pressure persists", err)
 	assertNoImplicitControls(t, live)
 }
 
@@ -256,9 +238,7 @@ func barrierUntilFull(t *testing.T, c *CLI) {
 	for len(c.keys) != cap(c.keys) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(c.keys) != cap(c.keys) {
-		t.Fatal("the bounded key queue never filled")
-	}
+	testassert.Require(t, len(c.keys) == cap(c.keys), "the bounded key queue never filled")
 }
 
 func TestRunParkedStartupReadStopAndOutputCancel(t *testing.T) {
@@ -294,9 +274,7 @@ func TestRunParkedStartupReadStopAndOutputCancel(t *testing.T) {
 			}
 			barrier(t, entered)
 			write.Close()
-			if err := receive(t, done); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, receive(t, done))
 			if stage != "output" {
 				barrier(t, cancelled)
 			}
@@ -318,15 +296,11 @@ func TestRunSSEBeforeReadsRejectsEstablishmentFailure(t *testing.T) {
 	input, _ := pipeInput(t)
 	c := New(Options{Startup: live.opts, Workspace: "/workspace"})
 	err := receive(t, runClient(c, input, io.Discard))
-	if err == nil || !strings.Contains(err.Error(), "event stream establishment") {
-		t.Fatal(err)
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "event stream establishment"), "%v", err)
 	live.mu.Lock()
 	defer live.mu.Unlock()
 	for _, route := range live.calls {
-		if strings.Contains(route, "configuration") || strings.Contains(route, "hydration") || strings.Contains(route, "sessions?") {
-			t.Fatalf("state read before SSE: %s", route)
-		}
+		testassert.Require(t, !strings.Contains(route, "configuration") && !strings.Contains(route, "hydration") && !strings.Contains(route, "sessions?"), "state read before SSE: %s", route)
 	}
 }
 
@@ -344,14 +318,10 @@ func TestRunBlockedOutputSSEOverflowRepairsBoundedQueue(t *testing.T) {
 	}
 	barrier(t, live.streams) // actual second establishment, not polling a counter
 	c.mu.Lock()
-	if cap(c.events) != 256 || len(c.events) > 256 {
-		t.Fatal("unbounded event sink")
-	}
+	testassert.Require(t, cap(c.events) == 256 && len(c.events) <= 256, "unbounded event sink")
 	c.mu.Unlock()
 	write.Close()
-	if err := receive(t, done); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, receive(t, done))
 	assertNoImplicitControls(t, live)
 }
 
@@ -392,18 +362,15 @@ func TestRunExplicitInterruptStopAndChildCannotSubmit(t *testing.T) {
 	frameContaining(t, screen, `"used_tokens"`)
 	c.handleSignal(syscall.SIGTERM, int(input.Fd()))
 	var exit ExitError
-	if err := receive(t, done); !errors.As(err, &exit) || exit.Code != 130 {
-		t.Fatal(err)
+	{
+		err := receive(t, done)
+		testassert.Require(t, errors.As(err, &exit) && exit.Code == 130, "%v", err)
 	}
 	live.mu.Lock()
 	defer live.mu.Unlock()
 	for _, call := range live.calls {
-		if strings.Contains(call, "/submit") {
-			t.Fatal("child input submitted work")
-		}
-		if strings.Contains(call, "/stop") && !strings.Contains(call, rootA) {
-			t.Fatal("Stop addressed inspector rather than root")
-		}
+		testassert.Require(t, !strings.Contains(call, "/submit"), "child input submitted work")
+		testassert.Require(t, !strings.Contains(call, "/stop") || strings.Contains(call, rootA), "Stop addressed inspector rather than root")
 	}
 }
 
@@ -421,8 +388,9 @@ func TestActualInputRegularQueuedResetAndEOFDoesNotControlOwner(t *testing.T) {
 			return false
 		}
 		var body protocol.SubmitRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
+		{
+			err := json.NewDecoder(r.Body).Decode(&body)
+			testassert.Check(t, err == nil, "%v", err)
 		}
 		submitted <- body
 		ownerMu.Lock()
@@ -451,24 +419,18 @@ func TestActualInputRegularQueuedResetAndEOFDoesNotControlOwner(t *testing.T) {
 		_, _ = write.Write([]byte(text + "\r"))
 		body := receive(t, submitted)
 		barrier(t, reads)
-		if body.Mode != mode || contentText(body.Content) != text || len(body.OperationId) != 32 || seen[body.OperationId] {
-			t.Fatalf("wrong actual input translation: %#v", body)
-		}
+		testassert.Require(t, body.Mode == mode && contentText(body.Content) == text && len(body.OperationId) == 32 && !seen[body.OperationId], "wrong actual input translation: %#v", body)
 		seen[body.OperationId] = true
 	}
 	write.Close()
-	if err := receive(t, done); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, receive(t, done))
 	assertNoImplicitControls(t, live)
 	// The scripted owner retains all three delivered caller identities after
 	// this client leaves. Runtime admission/draining semantics remain at their
 	// existing producer owners, rather than a second terminal backend suite.
 	ownerMu.Lock()
 	defer ownerMu.Unlock()
-	if len(ownerIDs) != 3 {
-		t.Fatal("exit discarded accepted owner work")
-	}
+	testassert.Require(t, len(ownerIDs) == 3, "exit discarded accepted owner work")
 }
 
 func TestIdleKeyboardCtrlCAndCtrlDExitZero(t *testing.T) {
@@ -481,9 +443,7 @@ func TestIdleKeyboardCtrlCAndCtrlDExitZero(t *testing.T) {
 			done := runClient(c, input, screen)
 			frameContaining(t, screen, "canonical clipboard")
 			_, _ = write.Write([]byte{key})
-			if err := receive(t, done); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, receive(t, done))
 			assertNoImplicitControls(t, live)
 		})
 	}

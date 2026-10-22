@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // isBuiltInOnly reports whether a resolved policy carries no user-level state
@@ -121,8 +123,9 @@ func TestResolvePermissionPolicyFallbackChain(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := policy(tc.global, tc.workspe).evaluate(tc.root, tc.req); got != tc.want {
-				t.Errorf("evaluate(%q, %+v) = %v, want %v", tc.root, tc.req, got, tc.want)
+			{
+				got := policy(tc.global, tc.workspe).evaluate(tc.root, tc.req)
+				testassert.Check(t, got == tc.want, "evaluate(%q, %+v) = %v, want %v", tc.root, tc.req, got, tc.want)
 			}
 		})
 	}
@@ -136,9 +139,7 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	for _, path := range inside {
 		t.Run("in-workspace file allowed "+path, func(t *testing.T) {
 			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
-				if !policy.evaluate("/w", PermissionRequest{permission, path}) {
-					t.Errorf("built-in %s of %s denied, want allow", permission, path)
-				}
+				testassert.Check(t, policy.evaluate("/w", PermissionRequest{permission, path}), "built-in %s of %s denied, want allow", permission, path)
 			}
 		})
 	}
@@ -146,16 +147,12 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	for _, path := range outside {
 		t.Run("outside-workspace file denied "+path, func(t *testing.T) {
 			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
-				if policy.evaluate("/w", PermissionRequest{permission, path}) {
-					t.Errorf("built-in %s of %s allowed, want deny", permission, path)
-				}
+				testassert.Check(t, !policy.evaluate("/w", PermissionRequest{permission, path}), "built-in %s of %s allowed, want deny", permission, path)
 			}
 		})
 	}
 	t.Run("workspace root itself is inside", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w"}) {
-			t.Error("built-in file.read of the root denied, want allow")
-		}
+		testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w"}), "%v", "built-in file.read of the root denied, want allow")
 	})
 	t.Run("plan-asserted sensitive versus sensitive-looking pairs", func(t *testing.T) {
 		type pair struct {
@@ -167,12 +164,8 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 				{"/w/.env.cache/README.md", "/w/sub/.env.cache"},
 				{"/w/credentials-cache/data.json", "/w/sub/credentials-cache.json"},
 			} {
-				if !policy.evaluate("/w", PermissionRequest{permission, p.allow}) {
-					t.Errorf("built-in %s of %s denied, want allow", permission, p.allow)
-				}
-				if policy.evaluate("/w", PermissionRequest{permission, p.deny}) {
-					t.Errorf("built-in %s of %s allowed, want deny", permission, p.deny)
-				}
+				testassert.Check(t, policy.evaluate("/w", PermissionRequest{permission, p.allow}), "built-in %s of %s denied, want allow", permission, p.allow)
+				testassert.Check(t, !policy.evaluate("/w", PermissionRequest{permission, p.deny}), "built-in %s of %s allowed, want deny", permission, p.deny)
 			}
 		}
 	})
@@ -223,69 +216,45 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 			dir := strings.ReplaceAll(base, "*", "x")
 			for _, permission := range []string{PermissionFileRead, PermissionFileWrite} {
 				target := "/w/" + dir + "/f"
-				if !policy.evaluate("/w", PermissionRequest{permission, target}) {
-					t.Errorf("built-in %s of %s denied, want allow", permission, target)
-				}
+				testassert.Check(t, policy.evaluate("/w", PermissionRequest{permission, target}), "built-in %s of %s denied, want allow", permission, target)
 				nested := "/w/" + dir + "/sub/" + base
-				if policy.evaluate("/w", PermissionRequest{permission, nested}) {
-					t.Errorf("built-in %s of %s allowed, want deny", permission, nested)
-				}
+				testassert.Check(t, !policy.evaluate("/w", PermissionRequest{permission, nested}), "built-in %s of %s allowed, want deny", permission, nested)
 			}
 		}
 	})
 	t.Run("literal glob characters in a real path are plain data", func(t *testing.T) {
 		for _, base := range []string{"*", "?", "[x]", "a?b", "x[1].txt"} {
-			if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/" + base}) {
-				t.Errorf("built-in file.read of %s denied, want allow", base)
-			}
+			testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/" + base}), "built-in file.read of %s denied, want allow", base)
 		}
 	})
 	t.Run("root path metacharacters stay literal path data", func(t *testing.T) {
 		root := "/w/[x]"
-		if !policy.evaluate(root, PermissionRequest{PermissionFileRead, root + "/a.txt"}) {
-			t.Error("file under a metacharacter root denied, want allow")
-		}
-		if !policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, root}) {
-			t.Error("inspect of the metacharacter root denied, want allow")
-		}
-		if policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, "/w/y"}) {
-			t.Error("inspect of a different root allowed, want deny")
-		}
+		testassert.Check(t, policy.evaluate(root, PermissionRequest{PermissionFileRead, root + "/a.txt"}), "%v", "file under a metacharacter root denied, want allow")
+		testassert.Check(t, policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, root}), "%v", "inspect of the metacharacter root denied, want allow")
+		testassert.Check(t, !policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, "/w/y"}), "%v", "inspect of a different root allowed, want deny")
 	})
 	t.Run("command run allows any canonical command target", func(t *testing.T) {
 		for _, target := range []string{"*", "git push origin main", "rm -rf /tmp/x", "echo\nls"} {
-			if !policy.evaluate("/w", PermissionRequest{PermissionCommandRun, target}) {
-				t.Errorf("built-in command.run of %q denied, want allow", target)
-			}
+			testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionCommandRun, target}), "built-in command.run of %q denied, want allow", target)
 		}
 	})
 	t.Run("workspace inspect allows only the canonical root", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, "/w"}) {
-			t.Error("built-in inspect of the root denied, want allow")
-		}
+		testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, "/w"}), "%v", "built-in inspect of the root denied, want allow")
 		for _, target := range []string{"/w/keys", "/etc", "*", ""} {
-			if policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, target}) {
-				t.Errorf("built-in inspect of %q allowed, want deny", target)
-			}
+			testassert.Check(t, !policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, target}), "built-in inspect of %q allowed, want deny", target)
 		}
 	})
 	t.Run("sleep allows the fixed target only", func(t *testing.T) {
-		if !policy.evaluate("/w", PermissionRequest{PermissionSleep, "*"}) {
-			t.Error("built-in sleep of the fixed target denied, want allow")
-		}
+		testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionSleep, "*"}), "%v", "built-in sleep of the fixed target denied, want allow")
 		for _, target := range []string{"1", ""} {
-			if policy.evaluate("/w", PermissionRequest{PermissionSleep, target}) {
-				t.Errorf("built-in sleep of %q allowed, want deny", target)
-			}
+			testassert.Check(t, !policy.evaluate("/w", PermissionRequest{PermissionSleep, target}), "built-in sleep of %q allowed, want deny", target)
 		}
 	})
 	t.Run("uncovered future permission namespaces deny", func(t *testing.T) {
 		for _, permission := range []string{
 			"process.list", "process.read", "process.stop", "agent.start", "owned.process.list",
 		} {
-			if policy.evaluate("/w", PermissionRequest{permission, "*"}) {
-				t.Errorf("built-in %s allowed, want deny", permission)
-			}
+			testassert.Check(t, !policy.evaluate("/w", PermissionRequest{permission, "*"}), "built-in %s allowed, want deny", permission)
 		}
 	})
 }
@@ -301,9 +270,7 @@ func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
 	}
 	for _, req := range concrete {
 		t.Run("built-in "+req.permission+" of "+req.target, func(t *testing.T) {
-			if !builtIn.evaluate("/w", PermissionRequest{req.permission, req.target}) {
-				t.Errorf("built-in %s of %q denied, want allow", req.permission, req.target)
-			}
+			testassert.Check(t, builtIn.evaluate("/w", PermissionRequest{req.permission, req.target}), "built-in %s of %q denied, want allow", req.permission, req.target)
 		})
 	}
 	denied := ResolvePermissionPolicy(nil, json.RawMessage(levelJSON(rulesJSON(
@@ -312,9 +279,7 @@ func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
 	))))
 	for _, req := range concrete {
 		t.Run("user deny decides "+req.permission+" of "+req.target, func(t *testing.T) {
-			if denied.evaluate("/w", PermissionRequest{req.permission, req.target}) {
-				t.Errorf("user deny did not decide %s of %q: allowed, want deny", req.permission, req.target)
-			}
+			testassert.Check(t, !denied.evaluate("/w", PermissionRequest{req.permission, req.target}), "user deny did not decide %s of %q: allowed, want deny", req.permission, req.target)
 		})
 	}
 }
@@ -351,11 +316,10 @@ func TestPermissionGlobMatcher(t *testing.T) {
 	for _, tc := range globs {
 		t.Run(tc.name, func(t *testing.T) {
 			glob, err := compileGlob(tc.pattern)
-			if err != nil {
-				t.Fatalf("compileGlob(%q): %v", tc.pattern, err)
-			}
-			if got := glob.MatchString(tc.target); got != tc.want {
-				t.Errorf("glob %q match %q = %v, want %v", tc.pattern, tc.target, got, tc.want)
+			testassert.Require(t, err == nil, "compileGlob(%q): %v", tc.pattern, err)
+			{
+				got := glob.MatchString(tc.target)
+				testassert.Check(t, got == tc.want, "glob %q match %q = %v, want %v", tc.pattern, tc.target, got, tc.want)
 			}
 		})
 	}
@@ -364,21 +328,19 @@ func TestPermissionGlobMatcher(t *testing.T) {
 			ruleJSON(PermissionFileRead, "*", permissionAccessAllow),
 			ruleJSON(PermissionFileRead, "/w/docs/*", permissionAccessDeny),
 		))))
-		if policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/docs/a.txt"}) {
-			t.Error("the complete-target deny rule did not match its canonical target")
-		}
-		if !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/etc/docs/a.txt"}) {
-			t.Error("the complete-target deny rule matched outside its pattern")
-		}
+		testassert.Check(t, !policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/w/docs/a.txt"}), "%v", "the complete-target deny rule did not match its canonical target")
+		testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/etc/docs/a.txt"}), "%v", "the complete-target deny rule matched outside its pattern")
 	})
 }
 
 func TestCompileGlobRejectsTrailingBackslash(t *testing.T) {
-	if _, err := compileGlob(`/w/sub\`); err == nil {
-		t.Fatal("compileGlob accepted a trailing backslash")
+	{
+		_, err := compileGlob(`/w/sub\`)
+		testassert.Require(t, err != nil, "%v", "compileGlob accepted a trailing backslash")
 	}
-	if _, err := compileGlob(`\`); err == nil {
-		t.Fatal("compileGlob accepted a lone backslash")
+	{
+		_, err := compileGlob(`\`)
+		testassert.Require(t, err != nil, "%v", "compileGlob accepted a lone backslash")
 	}
 }
 
@@ -432,17 +394,16 @@ func TestResolvePermissionPolicyMalformedDiscardsBothLevels(t *testing.T) {
 				ResolvePermissionPolicy(malformed, valid),
 				ResolvePermissionPolicy(valid, malformed),
 			} {
-				if !isBuiltInOnly(policy) {
-					t.Errorf("malformed %s did not discard both levels: %+v", tc.name, policy)
-				}
+				testassert.Check(t, isBuiltInOnly(policy), "malformed %s did not discard both levels: %+v", tc.name, policy)
 			}
 		})
 	}
 }
 
 func TestResolvePermissionPolicyValidShapes(t *testing.T) {
-	if got := ResolvePermissionPolicy(nil, nil); !isBuiltInOnly(got) {
-		t.Errorf("absent levels resolved to %+v, want the zero built-in policy", got)
+	{
+		got := ResolvePermissionPolicy(nil, nil)
+		testassert.Check(t, isBuiltInOnly(got), "absent levels resolved to %+v, want the zero built-in policy", got)
 	}
 	outsideAllow := json.RawMessage(levelJSON(rulesJSON(
 		ruleJSON(PermissionFileRead, "/elsewhere/*", permissionAccessAllow),
@@ -450,14 +411,8 @@ func TestResolvePermissionPolicyValidShapes(t *testing.T) {
 	workspaceDeny := json.RawMessage(levelJSON(rulesJSON(
 		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessDeny),
 	)))
-	if !ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w",
-		PermissionRequest{PermissionFileRead, "/elsewhere/x"}) {
-		t.Error("valid global level lost when a valid workspace block is present")
-	}
-	if ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w",
-		PermissionRequest{PermissionFileRead, "/w/private/x"}) {
-		t.Error("valid workspace level lost when a valid global block is present")
-	}
+	testassert.Check(t, ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w", PermissionRequest{PermissionFileRead, "/elsewhere/x"}), "%v", "valid global level lost when a valid workspace block is present")
+	testassert.Check(t, !ResolvePermissionPolicy(outsideAllow, workspaceDeny).evaluate("/w", PermissionRequest{PermissionFileRead, "/w/private/x"}), "%v", "valid workspace level lost when a valid global block is present")
 	// A malformed Workspace block affects only resolutions carrying it: the
 	// same global level still decides for a valid Workspace sibling.
 	for _, tc := range []struct {
@@ -470,37 +425,30 @@ func TestResolvePermissionPolicyValidShapes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			policy := ResolvePermissionPolicy(outsideAllow, tc.workspace)
 			want := tc.name != "malformed workspace block"
-			if got := policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/elsewhere/x"}); got != want {
-				t.Errorf("global decision under %s = %v, want %v", tc.name, got, want)
+			{
+				got := policy.evaluate("/w", PermissionRequest{PermissionFileRead, "/elsewhere/x"})
+				testassert.Check(t, got == want, "global decision under %s = %v, want %v", tc.name, got, want)
 			}
 		})
 	}
 	emptyRules := json.RawMessage(levelJSON(rulesJSON()))
-	if got := ResolvePermissionPolicy(emptyRules, nil); !isBuiltInOnly(got) {
-		t.Errorf("empty rules list resolved to %+v, want the zero built-in policy", got)
+	{
+		got := ResolvePermissionPolicy(emptyRules, nil)
+		testassert.Check(t, isBuiltInOnly(got), "empty rules list resolved to %+v, want the zero built-in policy", got)
 	}
 	// Duplicate members resolve by encoding/json's ordinary last-value
 	// decoding, not a second duplicate-key parser.
 	duplicates := json.RawMessage(`{"default":"deny","default":"allow","rules":[],"rules":[]}`)
-	if !ResolvePermissionPolicy(nil, duplicates).evaluate("/w",
-		PermissionRequest{PermissionFileRead, "/elsewhere/x"}) {
-		t.Error("last duplicate default did not win")
-	}
+	testassert.Check(t, ResolvePermissionPolicy(nil, duplicates).evaluate("/w", PermissionRequest{PermissionFileRead, "/elsewhere/x"}), "%v", "last duplicate default did not win")
 	lastRule := json.RawMessage(levelJSON(rulesJSON(
 		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessDeny),
 		ruleJSON(PermissionFileRead, "/w/private/*", permissionAccessAllow),
 	)))
-	if !ResolvePermissionPolicy(nil, lastRule).evaluate("/w",
-		PermissionRequest{PermissionFileRead, "/w/private/x"}) {
-		t.Error("last duplicate rule did not win")
-	}
+	testassert.Check(t, ResolvePermissionPolicy(nil, lastRule).evaluate("/w", PermissionRequest{PermissionFileRead, "/w/private/x"}), "%v", "last duplicate rule did not win")
 	// Whitespace before the top-level value is ordinary JSON, not trailing
 	// garbage.
 	padded := json.RawMessage(" \n\t" + levelJSON(`"default":"allow"`))
-	if !ResolvePermissionPolicy(padded, nil).evaluate("/w",
-		PermissionRequest{PermissionSleep, "1"}) {
-		t.Error("whitespace-padded block did not parse as a valid level")
-	}
+	testassert.Check(t, ResolvePermissionPolicy(padded, nil).evaluate("/w", PermissionRequest{PermissionSleep, "1"}), "%v", "whitespace-padded block did not parse as a valid level")
 }
 
 func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
@@ -533,8 +481,9 @@ func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := policy.callAllowed("/w", tc.requests); got != tc.want {
-				t.Errorf("callAllowed(%+v) = %v, want %v", tc.requests, got, tc.want)
+			{
+				got := policy.callAllowed("/w", tc.requests)
+				testassert.Check(t, got == tc.want, "callAllowed(%+v) = %v, want %v", tc.requests, got, tc.want)
 			}
 		})
 	}
@@ -542,13 +491,15 @@ func TestPermissionPolicyCallAllowedAllPairs(t *testing.T) {
 
 func TestPermissionLevelDecideSemantics(t *testing.T) {
 	level := permissionLevel{}
-	if _, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); decided {
-		t.Error("empty level without a default decided a request")
+	{
+		_, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"})
+		testassert.Check(t, !decided, "%v", "empty level without a default decided a request")
 	}
 	level.defaultAllow = true
 	level.hasDefault = true
-	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); !decided || !allow {
-		t.Errorf("level default did not decide: allow=%v decided=%v", allow, decided)
+	{
+		allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"})
+		testassert.Check(t, decided && allow, "level default did not decide: allow=%v decided=%v", allow, decided)
 	}
 	glob := mustCompileGlob("/w/*")
 	level.rules = []permissionRule{
@@ -556,14 +507,17 @@ func TestPermissionLevelDecideSemantics(t *testing.T) {
 		{permission: PermissionFileWrite, glob: glob, allow: true},
 		{permission: PermissionFileRead, glob: glob, allow: true},
 	}
-	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"}); !decided || !allow {
-		t.Errorf("last matching rule did not decide over the level default: allow=%v decided=%v", allow, decided)
+	{
+		allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/w/a"})
+		testassert.Check(t, decided && allow, "last matching rule did not decide over the level default: allow=%v decided=%v", allow, decided)
 	}
-	if allow, decided := level.decide(PermissionRequest{PermissionCommandRun, "x"}); !decided || !allow {
-		t.Errorf("level default did not decide an unmatched permission: allow=%v decided=%v", allow, decided)
+	{
+		allow, decided := level.decide(PermissionRequest{PermissionCommandRun, "x"})
+		testassert.Check(t, decided && allow, "level default did not decide an unmatched permission: allow=%v decided=%v", allow, decided)
 	}
-	if allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/other/a"}); !decided || !allow {
-		t.Errorf("level default did not decide an unmatched target: allow=%v decided=%v", allow, decided)
+	{
+		allow, decided := level.decide(PermissionRequest{PermissionFileRead, "/other/a"})
+		testassert.Check(t, decided && allow, "level default did not decide an unmatched target: allow=%v decided=%v", allow, decided)
 	}
 }
 
@@ -580,17 +534,12 @@ func TestPermissionNamesKeepPublishedLiterals(t *testing.T) {
 		PermissionChildLaunch:      "child.launch",
 		PermissionProcessOwn:       "process.own",
 	}
-	if len(want) != 7 { // distinct literals: a duplicated value would collapse the map.
-		t.Fatalf("published permission vocabulary carries %d distinct literals, want 7", len(want))
-	}
+	// distinct literals: a duplicated value would collapse the map.
+	testassert.Equal(t, len(want), 7)
 	for name, literal := range want {
-		if name != literal {
-			t.Errorf("permission constant %q = %q, want the published literal", name, literal)
-		}
+		testassert.Check(t, name == literal, "permission constant %q = %q, want the published literal", name, literal)
 	}
-	if PermissionDeniedContent != "Permission denied." {
-		t.Errorf("PermissionDeniedContent = %q, want the published denial content", PermissionDeniedContent)
-	}
+	testassert.Check(t, PermissionDeniedContent == "Permission denied.", "PermissionDeniedContent = %q, want the published denial content", PermissionDeniedContent)
 }
 
 // readmePermissionsDocument extracts the one fenced JSON document in README.md
@@ -598,9 +547,7 @@ func TestPermissionNamesKeepPublishedLiterals(t *testing.T) {
 func readmePermissionsDocument(t *testing.T) []byte {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("..", "README.md"))
-	if err != nil {
-		t.Fatalf("read README.md: %v", err)
-	}
+	testassert.NoError(t, err)
 	lines := strings.Split(string(data), "\n")
 	for i := 0; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) != "```json" {
@@ -634,16 +581,13 @@ func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
 	var doc struct {
 		Permissions json.RawMessage `json:"permissions"`
 	}
-	if err := json.Unmarshal(block, &doc); err != nil {
-		t.Fatalf("README permissions example is not a JSON document: %v", err)
+	{
+		err := json.Unmarshal(block, &doc)
+		testassert.NoError(t, err)
 	}
-	if len(doc.Permissions) == 0 {
-		t.Fatal("README permissions example carries no permissions member")
-	}
+	testassert.Require(t, len(doc.Permissions) != 0, "%v", "README permissions example carries no permissions member")
 	policy := ResolvePermissionPolicy(doc.Permissions, nil)
-	if isBuiltInOnly(policy) {
-		t.Fatal("README permissions example fell back to the built-in policy instead of parsing")
-	}
+	testassert.Require(t, !isBuiltInOnly(policy), "%v", "README permissions example fell back to the built-in policy instead of parsing")
 	for _, tc := range []struct {
 		name string
 		req  PermissionRequest
@@ -655,8 +599,9 @@ func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
 		{"unmatched read falls to the example default deny", PermissionRequest{PermissionFileRead, "/w/plain.txt"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := policy.evaluate("/w", tc.req); got != tc.want {
-				t.Errorf("README example %s = %v, want %v", tc.name, got, tc.want)
+			{
+				got := policy.evaluate("/w", tc.req)
+				testassert.Check(t, got == tc.want, "README example %s = %v, want %v", tc.name, got, tc.want)
 			}
 		})
 	}
@@ -667,12 +612,8 @@ func TestReadmePermissionsExampleAppliesItsRules(t *testing.T) {
 	// extracted rule can deny the target. The full-policy row above stays
 	// masked by the default by design; this observation is not.
 	generatedWrite := PermissionRequest{PermissionFileWrite, "/w/generated/x.go"}
-	if !(PermissionPolicy{}).evaluate("/w", generatedWrite) {
-		t.Fatal("built-in control: a plain workspace write must be allowed without any user level")
-	}
+	testassert.Require(t, (PermissionPolicy{}).evaluate("/w", generatedWrite), "%v", "built-in control: a plain workspace write must be allowed without any user level")
 	ruleOnly := policy
 	ruleOnly.global.hasDefault = false
-	if ruleOnly.evaluate("/w", generatedWrite) {
-		t.Error("extracted generated-file deny rule did not deny its target once the example default was cleared")
-	}
+	testassert.Check(t, !ruleOnly.evaluate("/w", generatedWrite), "%v", "extracted generated-file deny rule did not deny its target once the example default was cleared")
 }

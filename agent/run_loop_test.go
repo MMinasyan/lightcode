@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -32,20 +33,15 @@ func TestRunContinuationUsesFreshSnapshotPerEffect(t *testing.T) {
 	)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
-	}
-	if f.sourceCalls != 3 || f.modelCalls != 3 {
-		t.Fatalf("source=%d model=%d, want 3/3", f.sourceCalls, f.modelCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Require(t, f.sourceCalls == 3 && f.modelCalls == 3, "source=%d model=%d, want 3/3", f.sourceCalls, f.modelCalls)
 	for i, want := range []string{"a", "b", "c"} { // one fresh snapshot per logical effect: after the settled batch and after the continue disposition alike.
-		if got := f.reqs[i].Messages[0].TextContent(); got != want {
-			t.Fatalf("request %d snapshot = %q, want %q", i, got, want)
+		{
+			got := f.reqs[i].Messages[0].TextContent()
+			testassert.Require(t, got == want, "request %d snapshot = %q, want %q", i, got, want)
 		}
 	}
-	if res.LastOutput == nil || res.LastOutput.Status != model.OutputCompleted {
-		t.Fatalf("last output = %#v, want the final completed settlement", res.LastOutput)
-	}
+	testassert.Require(t, res.LastOutput != nil && res.LastOutput.Status == model.OutputCompleted, "last output = %#v, want the final completed settlement", res.LastOutput)
 }
 
 // TestRunRequestToolsAreFreshCopiesPerEffect pins the per-request tool ownership rule: every model effect receives its own deep copy of the entry-validated advertised list — slice and Parameters bytes — so a model-effect callback mutating the handed request's tool slice and bytes in place cannot reach the immutable advertised baseline, any later request, or the invocation input.
@@ -70,33 +66,19 @@ func TestRunRequestToolsAreFreshCopiesPerEffect(t *testing.T) {
 	}
 
 	res, err := Run(context.Background(), inv)
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
-	}
-	if f.modelCalls != 2 {
-		t.Fatalf("model calls = %d, want 2", f.modelCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Equal(t, f.modelCalls, 2)
 	// Every request started from the pristine advertised values.
 	for i, got := range handed {
-		if got.Name != "t" || string(got.Parameters) != `{"type":"object"}` {
-			t.Fatalf("request %d carried a mutated tool: %#v", i+1, got)
-		}
+		testassert.Require(t, got.Name == "t" && string(got.Parameters) == `{"type":"object"}`, "request %d carried a mutated tool: %#v", i+1, got)
 	}
 	// The mutation actually landed in the recorded requests — the check above is not vacuous.
-	if f.reqs[0].Tools[0].Name != "mutated" || f.reqs[1].Tools[0].Name != "mutated" {
-		t.Fatalf("recorded requests show %q/%q, want the callback's in-place mutations", f.reqs[0].Tools[0].Name, f.reqs[1].Tools[0].Name)
-	}
+	testassert.Require(t, f.reqs[0].Tools[0].Name == "mutated" && f.reqs[1].Tools[0].Name == "mutated", "recorded requests show %q/%q, want the callback's in-place mutations", f.reqs[0].Tools[0].Name, f.reqs[1].Tools[0].Name)
 	// The invocation input keeps exactly its own entry values.
-	if advertised[0].Name != "t" || string(advertised[0].Parameters) != `{"type":"object"}` {
-		t.Fatalf("advertised baseline mutated through a request alias: %#v", advertised[0])
-	}
+	testassert.Require(t, advertised[0].Name == "t" && string(advertised[0].Parameters) == `{"type":"object"}`, "advertised baseline mutated through a request alias: %#v", advertised[0])
 	// Each request owns independent storage: no request aliases the advertised bytes, and successive requests share nothing.
-	if &f.reqs[0].Tools[0].Parameters[0] == &advertised[0].Parameters[0] {
-		t.Fatal("a request gained an alias to the advertised baseline bytes")
-	}
-	if &f.reqs[0].Tools[0].Parameters[0] == &f.reqs[1].Tools[0].Parameters[0] {
-		t.Fatal("successive requests share tool Parameters backing")
-	}
+	testassert.Require(t, &f.reqs[0].Tools[0].Parameters[0] != &advertised[0].Parameters[0], "%v", "a request gained an alias to the advertised baseline bytes")
+	testassert.Require(t, &f.reqs[0].Tools[0].Parameters[0] != &f.reqs[1].Tools[0].Parameters[0], "%v", "successive requests share tool Parameters backing")
 }
 
 // TestRunToolBatchSettlesInOrderThenContinues pins sequential in-order dispatch with a settled complete non-interrupted batch feeding the next fresh-context effect, which then ends the run.
@@ -112,18 +94,13 @@ func TestRunToolBatchSettlesInOrderThenContinues(t *testing.T) {
 	)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Require(t, f.modelCalls == 2 && f.sourceCalls == 2 && f.toolCalls == 3, "model=%d source=%d tool=%d, want 2/2/3", f.modelCalls, f.sourceCalls, f.toolCalls)
+	{
+		got := joinedIDs(f.calls)
+		testassert.Equal(t, got, "[a b c]")
 	}
-	if f.modelCalls != 2 || f.sourceCalls != 2 || f.toolCalls != 3 {
-		t.Fatalf("model=%d source=%d tool=%d, want 2/2/3", f.modelCalls, f.sourceCalls, f.toolCalls)
-	}
-	if got := joinedIDs(f.calls); got != "[a b c]" {
-		t.Fatalf("dispatch order = %s, want assembled order", got)
-	}
-	if res.LastOutput != final {
-		t.Fatalf("terminal carries %p, want the second settlement %p", res.LastOutput, final)
-	}
+	testassert.Equal(t, res.LastOutput, final)
 }
 
 // TestRunDeniedAndErrorResultsNeverStopTheBatch pins that per-call settlements other than interrupted settle only their own call: the surrounding batch completes and the run continues.
@@ -133,12 +110,8 @@ func TestRunDeniedAndErrorResultsNeverStopTheBatch(t *testing.T) {
 	f.modelSet = readyOutputs(callsOut, mkOutput(model.OutputCompleted, "", nil))
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success via default all-success tool script", res, err)
-	}
-	if f.toolCalls != 3 || f.modelCalls != 2 {
-		t.Fatalf("tool=%d model=%d, want 3/2", f.toolCalls, f.modelCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success via default all-success tool script", res, err)
+	testassert.Require(t, f.toolCalls == 3 && f.modelCalls == 2, "tool=%d model=%d, want 3/2", f.toolCalls, f.modelCalls)
 }
 
 // TestRunCapExhaustedAfterContinue pins the cap failure shape: after 25 continues, Agent fails with the last errored output and the fixed detail before a 26th request — and before another snapshot fetch.
@@ -151,18 +124,10 @@ func TestRunCapExhaustedAfterContinue(t *testing.T) {
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if res.Status != TerminalFailure || res.Detail != "agent exceeded 25 model effects" {
-		t.Fatalf("terminal = %s/%q, want failure with the cap detail", res.Status, res.Detail)
-	}
-	if res.LastOutput != sets[maxModelEffects-1].Output {
-		t.Fatalf("cap failure carries %p, want the 25th settlement output %p", res.LastOutput, sets[maxModelEffects-1].Output)
-	}
-	if f.modelCalls != maxModelEffects || f.sourceCalls != maxModelEffects {
-		t.Fatalf("model=%d source=%d, want 25/25 — the cap ends the run before a 26th request", f.modelCalls, f.sourceCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == TerminalFailure && res.Detail == "agent exceeded 25 model effects", "terminal = %s/%q, want failure with the cap detail", res.Status, res.Detail)
+	testassert.Equal(t, res.LastOutput, sets[maxModelEffects-1].Output)
+	testassert.Require(t, f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "model=%d source=%d, want 25/25 — the cap ends the run before a 26th request", f.modelCalls, f.sourceCalls)
 }
 
 // TestRunFinalTextFromEffect25Succeeds pins that the 25th logical model effect may still finish the run cleanly: its call-free completed output succeeds instead of tripping the cap.
@@ -176,12 +141,8 @@ func TestRunFinalTextFromEffect25Succeeds(t *testing.T) {
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success from the 25th effect", res, err)
-	}
-	if f.modelCalls != maxModelEffects {
-		t.Fatalf("model=%d, want 25", f.modelCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success from the 25th effect", res, err)
+	testassert.Equal(t, f.modelCalls, maxModelEffects)
 }
 
 // TestRunEffect25SettlesBatchBeforeCapFailure pins that a completed tool batch from the 25th effect fully settles — every call dispatched — and only then fails with that last completed output under the cap detail.
@@ -196,18 +157,9 @@ func TestRunEffect25SettlesBatchBeforeCapFailure(t *testing.T) {
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if res.Status != TerminalFailure || res.Detail != "agent exceeded 25 model effects" {
-		t.Fatalf("terminal = %s/%q, want cap failure", res.Status, res.Detail)
-	}
-	if res.LastOutput != callsOut {
-		t.Fatalf("cap failure carries %p, want the 25th completed output %p", res.LastOutput, callsOut)
-	}
-	if f.toolCalls != 3 || f.modelCalls != maxModelEffects || f.sourceCalls != maxModelEffects {
-		t.Fatalf("tool=%d model=%d source=%d, want 3/25/25 — the batch settles before the cap ends the run", f.toolCalls, f.modelCalls, f.sourceCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == TerminalFailure && res.Detail == "agent exceeded 25 model effects" && res.LastOutput == callsOut, "terminal = %s/%q, want cap failure; got %v, want %v", res.Status, res.Detail, res.LastOutput, callsOut)
+	testassert.Require(t, f.toolCalls == 3 && f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "tool=%d model=%d source=%d, want 3/25/25 — the batch settles before the cap ends the run", f.toolCalls, f.modelCalls, f.sourceCalls)
 }
 
 // TestRunToolEffectsDoNotConsumeModelCap pins that tool calls beyond the numeric model cap are irrelevant to it: one batch of 30 calls followed by a final text response still succeeds.
@@ -217,10 +169,6 @@ func TestRunToolEffectsDoNotConsumeModelCap(t *testing.T) {
 	f.modelSet = readyOutputs(bigOut, mkOutput(model.OutputCompleted, "", nil))
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success", res, err)
-	}
-	if f.toolCalls != maxModelEffects+5 || f.modelCalls != 2 {
-		t.Fatalf("tool=%d model=%d, want 30/2", f.toolCalls, f.modelCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
+	testassert.Require(t, f.toolCalls == maxModelEffects+5 && f.modelCalls == 2, "tool=%d model=%d, want 30/2", f.toolCalls, f.modelCalls)
 }

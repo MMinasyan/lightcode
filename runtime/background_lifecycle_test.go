@@ -13,6 +13,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -32,15 +33,17 @@ const lifecycleAgentsDocument = `{
 // test server's keyless local endpoint and carries the hooks plugin section
 // the selected preparation hook validates.
 func backgroundLifecycleConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}}},"plugins":{"hooks":{"tag":"T1"}}}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
 }
 
 // newLifecycleID mints one fresh 32-lowercase-hex identity.
 func newLifecycleID(t *testing.T) string {
 	t.Helper()
 	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		t.Fatalf("random id: %v", err)
+	{
+		_, err := rand.Read(buf[:])
+		testassert.NoError(t, err)
 	}
 	return hex.EncodeToString(buf[:])
 }
@@ -257,16 +260,12 @@ func corruptSessionRegister(t *testing.T, store harness.Storage, sessionID strin
 	t.Helper()
 	key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}
 	reg, err := store.ReadRegister(context.Background(), key)
-	if err != nil {
-		t.Fatalf("ReadRegister(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadRegister(%s): %v", sessionID, err)
 	err = store.Transact(context.Background(), func(tx harness.Transaction) error {
 		_, err := tx.ReplaceRegister(key, reg.Revision, json.RawMessage(`{"not":"a session register"}`))
 		return err
 	})
-	if err != nil {
-		t.Fatalf("corrupt register: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // --- raw durable-state seeders ---
@@ -277,11 +276,12 @@ const lifecycleSeedToolDefinition = `{"name":"echo","description":"echoes","para
 // storage contract.
 func lifecycleInsertRegister(t *testing.T, store harness.Storage, key harness.RegisterKey, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert register %v: %v", key, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertRegister(harness.RegisterDraft{Key: key, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert register %v: %v", key, err)
 	}
 }
 
@@ -289,11 +289,12 @@ func lifecycleInsertRegister(t *testing.T, store harness.Storage, key harness.Re
 // storage contract. The addressed Session must already exist.
 func lifecycleInsertEntry(t *testing.T, store harness.Storage, sessionID, id, operationID string, kind harness.EntryKind, payload string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx harness.Transaction) error {
-		_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
-		return err
-	}); err != nil {
-		t.Fatalf("insert entry %s: %v", id, err)
+	{
+		err := store.Transact(context.Background(), func(tx harness.Transaction) error {
+			_, err := tx.InsertEntry(harness.EntryDraft{SessionID: sessionID, ID: id, OperationID: operationID, Kind: kind, Payload: json.RawMessage(payload)})
+			return err
+		})
+		testassert.Require(t, err == nil, "insert entry %s: %v", id, err)
 	}
 }
 
@@ -321,22 +322,20 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 			`"state":{"lifecycle":"open","current_agent_type":"worker","current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
 		childID, now, parentID, operationID, now)
 	entryID := newLifecycleID(t)
-	inputPayload := fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"plugin","content":[{"kind":"text","text":"child work"}]}`,
-		childID, entryID, operationID)
-	admission := fmt.Sprintf(
-		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"worker",`+
-			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
-			`"context_window":4096,"output_reserve":2048,`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
-		childID, operationID, childID, entryID, lifecycleSeedToolDefinition, now)
-	operationPayload := fmt.Sprintf(
-		`{"admission":%s,"state":{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
-		admission, now)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterSession}, sessionPayload)
-	lifecycleInsertEntry(t, store, childID, entryID, operationID, harness.EntryInput, inputPayload)
+	lifecycleInsertEntry(t, store, childID, entryID, operationID, harness.EntryInput,
+		compactRawInputEntry(childID, entryID, operationID, "plugin", "child work"))
+	admission := rawMessageAdmission(childID, operationID, entryID, rawAdmissionValues{
+		agentType:     "worker",
+		model:         usageWireRef{Provider: "prov", Model: "gpt-x"},
+		outputReserve: 2048,
+		systemPrompt:  "system",
+		tools:         "[" + lifecycleSeedToolDefinition + "]",
+		compactModel:  usageWireRef{Provider: "cprov", Model: "compact-x"},
+		compactPrompt: "summarize",
+	})
+	operationPayload := compactRawOperationRegister(admission,
+		fmt.Sprintf(`{"status":"running","started_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]}}`, now))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterOperation, OperationID: operationID}, operationPayload)
 }
 
@@ -413,9 +412,7 @@ func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper harness.
 		jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
 		hookPlugin(hook),
 		lifecycleToolsPlugin(tools))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	if s, ok := stopper.(*lifecycleStopper); ok {
 		s.arm(r.harness)
 	}
@@ -476,35 +473,13 @@ func (b *bgRuntime) startJob(sessionID, jobID string) string {
 	return completionID
 }
 
-// stop stops one Session through the Runtime's admitted-call gate.
-func (b *bgRuntime) stop(sessionID string) error {
-	b.t.Helper()
-	return b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		return h.Stop(ctx, sessionID)
-	})
-}
-
 // submitMode submits one message in the given mode and returns its
 // disposition.
 func (b *bgRuntime) submitMode(sessionID, operationID, text string, mode harness.MessageMode) harness.SubmitDisposition {
 	b.t.Helper()
-	var disposition harness.SubmitDisposition
-	err := b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        mode,
-		})
-		if err != nil {
-			return err
-		}
-		disposition = res.Disposition
-		return nil
-	})
+	res, err := submitRawThroughRuntime(context.Background(), b.r, sessionID, operationID, text, mode)
 	if err != nil {
 		b.t.Fatalf("Submit(%s): %v", operationID, err)
 	}
-	return disposition
+	return res.Disposition
 }

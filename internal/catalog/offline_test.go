@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // snapshotTree records every entry under root with its size and mtime, so a
@@ -26,9 +28,7 @@ func snapshotTree(t *testing.T, root string) map[string]string {
 		snap[path] = fmt.Sprintf("%d:%d:%v", info.Size(), info.ModTime().UnixNano(), info.IsDir())
 		return nil
 	})
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("snapshot %s: %v", root, err)
-	}
+	testassert.Require(t, err == nil || os.IsNotExist(err), "snapshot %s: %v", root, err)
 	return snap
 }
 
@@ -36,27 +36,23 @@ func TestBuildOfflineZeroWrites(t *testing.T) {
 	t.Run("absent data dir", func(t *testing.T) {
 		home := t.TempDir()
 		before := snapshotTree(t, home)
-		if _, err := BuildOffline(home, nil); err != nil {
-			t.Fatalf("BuildOffline: %v", err)
+		{
+			_, err := BuildOffline(home, nil)
+			testassert.NoError(t, err)
 		}
 		after := snapshotTree(t, home)
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("filesystem changed:\nbefore: %v\nafter:  %v", before, after)
-		}
-		if _, statErr := os.Stat(filepath.Join(home, ".lightcode")); !os.IsNotExist(statErr) {
-			t.Fatalf(".lightcode was created: stat err = %v", statErr)
+		testassert.Require(t, reflect.DeepEqual(before, after), "filesystem changed:\nbefore: %v\nafter:  %v", before, after)
+		{
+			_, statErr := os.Stat(filepath.Join(home, ".lightcode"))
+			testassert.Require(t, os.IsNotExist(statErr), ".lightcode was created: stat err = %v", statErr)
 		}
 	})
 
 	t.Run("populated cache dir", func(t *testing.T) {
 		home := t.TempDir()
 		dir := filepath.Join(home, ".lightcode", "cache", "discovery")
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "corrupt.json"), []byte("{not json"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.MkdirAll(dir, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "corrupt.json"), []byte("{not json"), 0o600))
 		before := snapshotTree(t, home)
 		userRaw := map[string]any{
 			"local": map[string]any{
@@ -65,42 +61,31 @@ func TestBuildOfflineZeroWrites(t *testing.T) {
 				"models":    map[string]any{"m1": map[string]any{"context_window": float64(8192)}},
 			},
 		}
-		if _, err := BuildOffline(home, userRaw); err != nil {
-			t.Fatalf("BuildOffline: %v", err)
+		{
+			_, err := BuildOffline(home, userRaw)
+			testassert.NoError(t, err)
 		}
 		after := snapshotTree(t, home)
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("filesystem changed:\nbefore: %v\nafter:  %v", before, after)
-		}
+		testassert.Require(t, reflect.DeepEqual(before, after), "filesystem changed:\nbefore: %v\nafter:  %v", before, after)
 	})
 }
 
 func TestBuildOfflineSurfacesCorruptCacheWarning(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, ".lightcode", "cache", "discovery")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "someprovider.json"), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(dir, 0o700))
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "someprovider.json"), []byte("{not json"), 0o600))
 
 	result, err := BuildOffline(home, nil)
-	if err != nil {
-		t.Fatalf("BuildOffline: %v", err)
-	}
+	testassert.NoError(t, err)
 	found := false
 	for _, w := range result.Warnings {
 		if w.Kind == "discovery_failure" && w.Provider == "someprovider" {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatalf("no discovery_failure warning for the corrupt cache file; warnings = %+v", result.Warnings)
-	}
-	if result.Catalog == nil || len(result.Catalog.Providers) == 0 {
-		t.Fatal("bundled providers missing from the offline catalog")
-	}
+	testassert.Require(t, found, "no discovery_failure warning for the corrupt cache file; warnings = %+v", result.Warnings)
+	testassert.Require(t, result.Catalog != nil && len(result.Catalog.Providers) != 0, "bundled providers missing from the offline catalog")
 }
 
 func TestProviderConnected(t *testing.T) {
@@ -150,9 +135,7 @@ func TestProviderConnected(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ProviderConnected(tc.prov, tc.isSet); got != tc.want {
-				t.Fatalf("ProviderConnected = %v, want %v", got, tc.want)
-			}
+			testassert.Equal(t, ProviderConnected(tc.prov, tc.isSet), tc.want)
 		})
 	}
 }
@@ -176,9 +159,7 @@ func TestDiscoveryTransportReadyDoesNotRequireModels(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := DiscoveryTransportReady(tc.prov, tc.set); got != tc.want {
-				t.Fatalf("DiscoveryTransportReady = %v, want %v", got, tc.want)
-			}
+			testassert.Equal(t, DiscoveryTransportReady(tc.prov, tc.set), tc.want)
 		})
 	}
 }
@@ -199,13 +180,10 @@ func TestProviderConnectedDoctorContext(t *testing.T) {
 		Transport: Transport{APIKeyEnv: "DOTENV_ONLY_KEY", BaseURL: "https://x"},
 		Models:    map[string]*Model{"m": {ID: "m", ContextWindow: 8192}},
 	}
-	if _, set := os.LookupEnv("DOTENV_ONLY_KEY"); set {
-		t.Fatal("test precondition: DOTENV_ONLY_KEY must not be in the process env")
+	{
+		_, set := os.LookupEnv("DOTENV_ONLY_KEY")
+		testassert.Require(t, !set, "test precondition: DOTENV_ONLY_KEY must not be in the process env")
 	}
-	if !ProviderConnected(prov, isSet) {
-		t.Fatal("a .env-only key must resolve through the dotenv key set")
-	}
-	if ProviderConnected(prov, func(name string) bool { _, ok := os.LookupEnv(name); return ok }) {
-		t.Fatal("without the dotenv set the key must not resolve (the false-disconnected regression)")
-	}
+	testassert.Require(t, ProviderConnected(prov, isSet), "a .env-only key must resolve through the dotenv key set")
+	testassert.Require(t, !ProviderConnected(prov, func(name string) bool { _, ok := os.LookupEnv(name); return ok }), "without the dotenv set the key must not resolve (the false-disconnected regression)")
 }

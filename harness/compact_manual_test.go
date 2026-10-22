@@ -10,6 +10,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // insertForeignCompactAdmission publishes one complete compact admission of
@@ -51,83 +53,65 @@ func compactOperationRecord(operationID string) OperationRecord {
 func TestCompactAdmissionKindResolution(t *testing.T) {
 	t.Run("compact resolves its own existing identity without new work", func(t *testing.T) {
 		store := freshSessionStore(t)
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
-		}); err != nil {
-			t.Fatalf("foreign compact admission: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
+			})
+			testassert.NoError(t, err)
 		}
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
 		beforeEntries, beforeRegs := storedSessionState(store, testSessionID)
 		rec, err := h.Compact(context.Background(), CompactRequest{SessionID: testSessionID, OperationID: "cx-1"})
-		if err != nil {
-			t.Fatalf("Compact: %v", err)
-		}
-		if rec.Admission.RequestKind != RequestKindCompact || rec.Admission.AdmittedEntry != (EntryRef{}) {
-			t.Fatalf("resolved record = %+v, want the existing compact admission", rec.Admission)
-		}
-		if rec.State.Status != OperationRunning {
-			t.Fatalf("resolved state = %+v, want the running first Operation", rec.State)
-		}
-		if got := stub.callCount(); got != 0 {
-			t.Fatalf("preparation calls = %d, want none on an existing resolution", got)
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.Admission.RequestKind == RequestKindCompact && rec.Admission.AdmittedEntry == (EntryRef{}) && rec.State.Status == OperationRunning, "resolved record = %+v, want the existing compact admission; resolved state = %+v, want the running first Operation", rec.Admission, rec.State)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 0)
 		}
 		afterEntries, afterRegs := storedSessionState(store, testSessionID)
-		if len(afterEntries) != len(beforeEntries) || len(afterRegs) != len(beforeRegs) {
-			t.Fatalf("retry published entries %v registers %v, want the unchanged %v %v", afterEntries, afterRegs, beforeEntries, beforeRegs)
-		}
+		testassert.Require(t, len(afterEntries) == len(beforeEntries) && len(afterRegs) == len(beforeRegs), "retry published entries %v registers %v, want the unchanged %v %v", afterEntries, afterRegs, beforeEntries, beforeRegs)
 	})
 
 	t.Run("compact rejects an existing message identity before the idle check", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		if _, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("x")); disposition != DispositionAdmitted {
-			t.Fatalf("disposition %q, want admitted", disposition)
+		{
+			_, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("x"))
+			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		_, err := h.Compact(context.Background(), CompactRequest{SessionID: testSessionID, OperationID: testOpID})
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("compact reuse of a message identity = %v, want ErrInvalid", err)
-		}
-		if strings.Contains(err.Error(), "is not idle") {
-			t.Fatalf("the resolution kind check must precede the idle guard: %v", err)
-		}
-		if !strings.Contains(err.Error(), "different request kind") {
-			t.Fatalf("error %v, want the request-kind rejection text", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid) && !strings.Contains(err.Error(), "is not idle") && strings.Contains(err.Error(), "different request kind"), "compact reuse of a message identity = %v, want ErrInvalid; the resolution kind check must precede the idle guard: %v; error %v, want the request-kind rejection text", err, err, err)
 	})
 
 	t.Run("message admission rejects a compact identity at the reserved path", func(t *testing.T) {
 		store := freshSessionStore(t)
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
-		}); err != nil {
-			t.Fatalf("foreign compact admission: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
+			})
+			testassert.NoError(t, err)
 		}
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 		c := leaseCoordinator(t, h, testSessionID)
 		release, err := h.reserve(context.Background(), c)
-		if err != nil {
-			t.Fatalf("reserve: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer release()
 		_, _, _, err = h.admitReserved(context.Background(), c, admissionRequest{Kind: RequestKindMessage, SessionID: testSessionID, OperationID: "cx-1", Origin: InputOriginUser, Content: admissionContent("x")})
-		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "different request kind") {
-			t.Fatalf("reserved reuse = %v, want the request-kind rejection", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "different request kind"), "reserved reuse = %v, want the request-kind rejection", err)
 	})
 
 	t.Run("submit rejects a compact identity at its pre-routing check", func(t *testing.T) {
 		store := freshSessionStore(t)
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
-		}); err != nil {
-			t.Fatalf("foreign compact admission: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return insertForeignCompactAdmission(t, tx, testSessionID, "cx-1")
+			})
+			testassert.NoError(t, err)
 		}
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: "cx-1", Origin: InputOriginUser, Content: admissionContent("x"), Mode: MessageModeRegular})
-		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "different request kind") {
-			t.Fatalf("submit reuse = %v, want the request-kind rejection", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "different request kind"), "submit reuse = %v, want the request-kind rejection", err)
 	})
 }
 
@@ -145,9 +129,7 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 		h := newTestHarness(t, store, stub.prepare)
 		c := leaseCoordinator(t, h, testSessionID)
 		release, err := h.reserve(context.Background(), c)
-		if err != nil {
-			t.Fatalf("reserve: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer release()
 		type outcome struct {
 			rec *OperationRecord
@@ -169,15 +151,14 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 			out <- outcome{err: err}
 		}()
 		<-stub.arrived
-		if err := store.Transact(context.Background(), foreign); err != nil {
-			t.Fatalf("foreign admission: %v", err)
+		{
+			err := store.Transact(context.Background(), foreign)
+			testassert.NoError(t, err)
 		}
 		close(gate)
 		res := <-out
 		if wantExisting {
-			if res.err != nil || res.rec == nil {
-				t.Fatalf("raced admission = (%+v, %v), want the foreign winner's record", res.rec, res.err)
-			}
+			testassert.Require(t, res.err == nil && res.rec != nil, "raced admission = (%+v, %v), want the foreign winner's record", res.rec, res.err)
 		} else if !errors.Is(res.err, ErrInvalid) || !strings.Contains(res.err.Error(), "different request kind") {
 			t.Fatalf("raced admission error = %v, want the request-kind rejection", res.err)
 		}
@@ -200,9 +181,7 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 		rec := race(t, RequestKindCompact, func(tx Transaction) error {
 			return insertForeignCompactAdmission(t, tx, testSessionID, testOpID)
 		}, true)
-		if rec.Admission.RequestKind != RequestKindCompact {
-			t.Fatalf("resolved record = %+v, want the compact winner", rec.Admission)
-		}
+		testassert.Require(t, rec.Admission.RequestKind == RequestKindCompact, "resolved record = %+v, want the compact winner", rec.Admission)
 	})
 }
 
@@ -212,31 +191,28 @@ func tamperOperationAdmission(t *testing.T, store *graphStorage, sessionID, oper
 	t.Helper()
 	key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
 	reg, err := store.ReadRegister(context.Background(), key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	payload := map[string]json.RawMessage{}
-	if err := json.Unmarshal(reg.Payload, &payload); err != nil {
-		t.Fatalf("unmarshal register payload: %v", err)
+	{
+		err := json.Unmarshal(reg.Payload, &payload)
+		testassert.NoError(t, err)
 	}
 	admission := map[string]json.RawMessage{}
-	if err := json.Unmarshal(payload["admission"], &admission); err != nil {
-		t.Fatalf("unmarshal admission: %v", err)
+	{
+		err := json.Unmarshal(payload["admission"], &admission)
+		testassert.NoError(t, err)
 	}
 	mutate(admission)
 	mutatedAdmission, err := json.Marshal(admission)
-	if err != nil {
-		t.Fatalf("marshal admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	mutated, err := json.Marshal(map[string]json.RawMessage{"admission": mutatedAdmission, "state": payload["state"]})
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
-	}
-	if err := store.Transact(context.Background(), func(tx Transaction) error {
-		_, err := tx.ReplaceRegister(key, reg.Revision, mutated)
-		return err
-	}); err != nil {
-		t.Fatalf("tamper: %v", err)
+	testassert.NoError(t, err)
+	{
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			_, err := tx.ReplaceRegister(key, reg.Revision, mutated)
+			return err
+		})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -267,23 +243,16 @@ func TestCompactAdmissionForkKindArm(t *testing.T) {
 		OperationID:     "cx-1",
 		Content:         admissionContent("fork input"),
 	})
-	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "different fork lineage or request kind") {
-		t.Fatalf("fork over a compact identity = %v, want the lineage-or-kind rejection", err)
-	}
-	if got := stub.callCount(); got != 0 {
-		t.Fatalf("preparation calls = %d, want none — the kind check precedes preparation", got)
+	testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "different fork lineage or request kind"), "fork over a compact identity = %v, want the lineage-or-kind rejection", err)
+	{
+		got := stub.callCount()
+		testassert.Equal(t, got, 0)
 	}
 	ids, err := store.ListSessionIDs(context.Background())
-	if err != nil {
-		t.Fatalf("ListSessionIDs: %v", err)
-	}
-	if len(ids) != 1 {
-		t.Fatalf("sessions after the rejected fork = %v, want only the seeded one", ids)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(ids) == 1, "sessions after the rejected fork = %v, want only the seeded one", ids)
 	entries, regs := storedSessionState(store, testSessionID)
-	if len(entries) != 0 || len(regs) != 2 {
-		t.Fatalf("rejected fork published entries %v registers %v, want the unchanged fixture", entries, regs)
-	}
+	testassert.Require(t, len(entries) == 0 && len(regs) == 2, "rejected fork published entries %v registers %v, want the unchanged fixture", entries, regs)
 }
 
 // TestCompactOperationGraphInvariant proves the request-kind-specific
@@ -301,8 +270,9 @@ func TestCompactOperationGraphInvariant(t *testing.T) {
 
 	t.Run("compact operation without an admitted input validates", func(t *testing.T) {
 		store := validCompactGraph().storage(t)
-		if _, err := validateFixture(t, store, testSessionID); err != nil {
-			t.Fatalf("compact graph: %v", err)
+		{
+			_, err := validateFixture(t, store, testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -322,8 +292,9 @@ func TestCompactOperationGraphInvariant(t *testing.T) {
 		tamperOperationAdmission(t, store, testSessionID, "cx-1", func(admission map[string]json.RawMessage) {
 			admission["admitted_entry"] = json.RawMessage(`{"session_id":"` + testSessionID + `","entry_id":"` + hexID(1) + `"}`)
 		})
-		if _, err := validateFixture(t, store, testSessionID); !isCorruption(err) {
-			t.Fatalf("compact graph with an admitted entry = %v, want corruption", err)
+		{
+			_, err := validateFixture(t, store, testSessionID)
+			testassert.Require(t, isCorruption(err), "compact graph with an admitted entry = %v, want corruption", err)
 		}
 	})
 
@@ -332,29 +303,26 @@ func TestCompactOperationGraphInvariant(t *testing.T) {
 		tamperOperationAdmission(t, store, testSessionID, testOpID, func(admission map[string]json.RawMessage) {
 			delete(admission, "admitted_entry")
 		})
-		if _, err := validateFixture(t, store, testSessionID); !isCorruption(err) {
-			t.Fatalf("message graph without its admitted input = %v, want corruption", err)
+		{
+			_, err := validateFixture(t, store, testSessionID)
+			testassert.Require(t, isCorruption(err), "message graph without its admitted input = %v, want corruption", err)
 		}
 	})
 
 	t.Run("recovery settles a running compact Operation and preserves the invariant", func(t *testing.T) {
 		store := validCompactGraph().storage(t)
-		if err := Recover(context.Background(), store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		{
+			err := Recover(context.Background(), store)
+			testassert.NoError(t, err)
 		}
 		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: "cx-1"})
-		if err != nil {
-			t.Fatalf("ReadRegister: %v", err)
-		}
+		testassert.NoError(t, err)
 		op, err := decodeOperationRegister(reg)
-		if err != nil {
-			t.Fatalf("decodeOperationRegister: %v", err)
-		}
-		if op.State.Status != OperationInterruption || op.State.Terminal == nil {
-			t.Fatalf("recovered state = %+v, want the interruption terminal", op.State)
-		}
-		if _, err := validateFixture(t, store, testSessionID); err != nil {
-			t.Fatalf("post-recovery graph: %v", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, op.State.Status == OperationInterruption && op.State.Terminal != nil, "recovered state = %+v, want the interruption terminal", op.State)
+		{
+			_, err := validateFixture(t, store, testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -363,11 +331,13 @@ func TestCompactOperationGraphInvariant(t *testing.T) {
 		tamperOperationAdmission(t, store, testSessionID, "cx-1", func(admission map[string]json.RawMessage) {
 			admission["admitted_entry"] = json.RawMessage(`{"session_id":"` + testSessionID + `","entry_id":"` + hexID(1) + `"}`)
 		})
-		if err := Recover(context.Background(), store); err != nil {
-			t.Fatalf("Recover: %v", err)
+		{
+			err := Recover(context.Background(), store)
+			testassert.NoError(t, err)
 		}
-		if _, err := validateFixture(t, store, testSessionID); !isCorruption(err) {
-			t.Fatalf("post-recovery graph = %v, want the preserved corruption", err)
+		{
+			_, err := validateFixture(t, store, testSessionID)
+			testassert.Require(t, isCorruption(err), "post-recovery graph = %v, want the preserved corruption", err)
 		}
 	})
 }
@@ -378,19 +348,11 @@ func TestCompactOperationGraphInvariant(t *testing.T) {
 func TestCompactAdmissionCodecRules(t *testing.T) {
 	compact := compactOperationRecord(testOpID)
 	raw, err := encodeOperationRegister(compact)
-	if err != nil {
-		t.Fatalf("encode compact register: %v", err)
-	}
-	if strings.Contains(string(raw), `"admitted_entry"`) {
-		t.Fatalf("compact admission carries the admitted_entry member: %s", raw)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(string(raw), `"admitted_entry"`), "compact admission carries the admitted_entry member: %s", raw)
 	decoded, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: raw})
-	if err != nil {
-		t.Fatalf("decode compact register: %v", err)
-	}
-	if decoded.Admission.RequestKind != RequestKindCompact || decoded.Admission.AdmittedEntry != (EntryRef{}) {
-		t.Fatalf("decoded admission = %+v, want the compact kind with no admitted entry", decoded.Admission)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, decoded.Admission.RequestKind == RequestKindCompact && decoded.Admission.AdmittedEntry == (EntryRef{}), "decoded admission = %+v, want the compact kind with no admitted entry", decoded.Admission)
 
 	// A compact payload carrying the member rejects.
 	admission := wireObject(t, raw)["admission"]
@@ -399,16 +361,15 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 
 	// A message payload without the member rejects.
 	messageRaw, err := encodeOperationRegister(validOperationRecord())
-	if err != nil {
-		t.Fatalf("encode message register: %v", err)
-	}
+	testassert.NoError(t, err)
 	messageless := setKey(messageRaw, "admission", deleteKey(t, wireObject(t, messageRaw)["admission"], "admitted_entry"))
 
 	// An unknown kind rejects on both directions.
 	unknown := compactOperationRecord(testOpID)
 	unknown.Admission.RequestKind = RequestKind("bogus")
-	if _, err := encodeOperationRegister(unknown); err == nil {
-		t.Fatalf("unknown request kind encoded")
+	{
+		_, err := encodeOperationRegister(unknown)
+		testassert.Require(t, err != nil, "unknown request kind encoded")
 	}
 	unknownWire := setKey(raw, "admission", setKey(admission, "request_kind", json.RawMessage(`"bogus"`)))
 
@@ -426,12 +387,8 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 	for _, tc := range rejections {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: tc.payload})
-			if err == nil {
-				t.Fatalf("%s decoded", tc.name)
-			}
-			if tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText) {
-				t.Fatalf("error %v, want the %s member named", err, tc.wantText)
-			}
+			testassert.Require(t, err != nil, "%s decoded", tc.name)
+			testassert.Require(t, tc.wantText == "" || strings.Contains(err.Error(), tc.wantText), "error %v, want the %s member named", err, tc.wantText)
 		})
 	}
 }
@@ -440,13 +397,12 @@ func TestCompactAdmissionCodecRules(t *testing.T) {
 func deleteKey(t *testing.T, raw json.RawMessage, key string) json.RawMessage {
 	t.Helper()
 	obj := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	{
+		err := json.Unmarshal(raw, &obj)
+		testassert.NoError(t, err)
 	}
 	delete(obj, key)
 	out, err := json.Marshal(obj)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	testassert.NoError(t, err)
 	return out
 }

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestShowMenuDoesNotRedrawAtNavigationBounds(t *testing.T) {
@@ -27,9 +29,7 @@ func TestShowMenuDoesNotRedrawAtNavigationBounds(t *testing.T) {
 	}
 
 	result := ShowMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
-	if result.Selected != -1 {
-		t.Fatalf("selected = %d, want cancel", result.Selected)
-	}
+	testassert.Equal(t, result.Selected, -1)
 	if got := bytes.Count(out.Bytes(), []byte("Revert - pick turn")); got != 1 {
 		t.Fatalf("menu rendered %d times, want 1\n%s", got, out.String())
 	}
@@ -55,11 +55,10 @@ func TestShowMenuRedrawUsesRenderedLineCount(t *testing.T) {
 
 	_ = ShowMenu(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "Revert - pick turn", items, 80)
 	rendered := out.String()
-	if strings.Contains(rendered, "\x1b7") || strings.Contains(rendered, "\x1b8") || strings.Contains(rendered, "\x1b[J") {
-		t.Fatalf("menu redraw should not use cursor save/restore anchors:\n%q", rendered)
-	}
-	if got := strings.Count(rendered, "\x1b[1A"); got != 8 {
-		t.Fatalf("cursor-up clears = %d, want 8 for redraw+exit of 5-row menu frame\n%q", got, rendered)
+	testassert.Require(t, !strings.Contains(rendered, "\x1b7") && !strings.Contains(rendered, "\x1b8") && !strings.Contains(rendered, "\x1b[J"), "menu redraw should not use cursor save/restore anchors:\n%q", rendered)
+	{
+		got := strings.Count(rendered, "\x1b[1A")
+		testassert.Require(t, got == 8, "cursor-up clears = %d, want 8 for redraw+exit of 5-row menu frame\n%q", got, rendered)
 	}
 }
 
@@ -68,12 +67,8 @@ func TestConfirmYNDistinguishesReadErrorFromNo(t *testing.T) {
 		var out bytes.Buffer
 		readKey := func() (KeyMsg, error) { return KeyMsg{Special: KeyEnter}, nil }
 		got, err := ConfirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
-		if err != nil {
-			t.Fatalf("ConfirmYN err = %v, want nil", err)
-		}
-		if !got {
-			t.Fatal("ConfirmYN = false, want true on Enter at Yes")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got, "ConfirmYN = false, want true on Enter at Yes")
 	})
 
 	t.Run("enter_no", func(t *testing.T) {
@@ -86,36 +81,24 @@ func TestConfirmYNDistinguishesReadErrorFromNo(t *testing.T) {
 		}
 		var out bytes.Buffer
 		got, err := ConfirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
-		if err != nil {
-			t.Fatalf("ConfirmYN err = %v, want nil", err)
-		}
-		if got {
-			t.Fatal("ConfirmYN = true, want false on Enter at No")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, !got, "ConfirmYN = true, want false on Enter at No")
 	})
 
 	t.Run("escape_is_no", func(t *testing.T) {
 		var out bytes.Buffer
 		readKey := func() (KeyMsg, error) { return KeyMsg{Special: KeyEscape}, nil }
 		got, err := ConfirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
-		if err != nil {
-			t.Fatalf("ConfirmYN err = %v, want nil", err)
-		}
-		if got {
-			t.Fatal("ConfirmYN = true, want false on Escape")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, !got, "ConfirmYN = true, want false on Escape")
 	})
 
 	t.Run("read_error_reported", func(t *testing.T) {
 		var out bytes.Buffer
 		readKey := func() (KeyMsg, error) { return KeyMsg{}, errors.New("read failed") }
 		got, err := ConfirmYN(&sync.Mutex{}, func(s string) { out.WriteString(s) }, readKey, "also revert code?", 80)
-		if err == nil {
-			t.Fatal("ConfirmYN err = nil, want the read error")
-		}
-		if got {
-			t.Fatal("ConfirmYN = true, want false with the error")
-		}
+		testassert.Require(t, err != nil, "ConfirmYN err = nil, want the read error")
+		testassert.Require(t, !got, "ConfirmYN = true, want false with the error")
 	})
 }
 
@@ -135,8 +118,9 @@ func TestRenderMenuConstrainsLineWidths(t *testing.T) {
 
 	lines := strings.Split(rendered, nl)
 	// 3 items plus the title and footer rows.
-	if got, want := len(lines), 5; got != want {
-		t.Fatalf("rendered rows = %d, want %d\n%s", got, want, rendered)
+	{
+		got, want := len(lines), 5
+		testassert.Require(t, got == want, "rendered rows = %d, want %d\n%s", got, want, rendered)
 	}
 	for _, line := range lines {
 		if got := VisibleWidth(line); got > menuLineWidth(width) {
@@ -156,15 +140,11 @@ func TestRenderMenuNormalizesAndTruncatesMultilineText(t *testing.T) {
 		"footer\nhint",
 	)
 
-	if strings.Contains(rendered, "\nsecond") || strings.Contains(rendered, "\rthird") || strings.Contains(rendered, "\t") {
-		t.Fatalf("menu text was not normalized:\n%q", rendered)
-	}
-	if !strings.Contains(rendered, "first line second") {
-		t.Fatalf("normalized detail missing from menu:\n%q", rendered)
-	}
+	testassert.Require(t, !strings.Contains(rendered, "\nsecond") && !strings.Contains(rendered, "\rthird") && !strings.Contains(rendered, "\t") && strings.Contains(rendered, "first line second"), "menu text was not normalized:\n%q; normalized detail missing from menu:\n%q", rendered, rendered)
 	// 1 item plus the title and footer rows.
-	if got, want := len(strings.Split(rendered, nl)), 3; got != want {
-		t.Fatalf("rendered rows = %d, want %d\n%s", got, want, rendered)
+	{
+		got, want := len(strings.Split(rendered, nl)), 3
+		testassert.Require(t, got == want, "rendered rows = %d, want %d\n%s", got, want, rendered)
 	}
 	for _, line := range strings.Split(rendered, nl) {
 		if got := VisibleWidth(line); got > menuLineWidth(50) {
@@ -174,8 +154,9 @@ func TestRenderMenuNormalizesAndTruncatesMultilineText(t *testing.T) {
 }
 
 func TestMenuLineWidthKeepsWideTerminalsConservative(t *testing.T) {
-	if got, want := menuLineWidth(90), 56; got != want {
-		t.Fatalf("menuLineWidth(90) = %d, want %d", got, want)
+	{
+		got, want := menuLineWidth(90), 56
+		testassert.Equal(t, got, want)
 	}
 	rendered := RenderMenu(
 		"Revert - pick turn",
@@ -187,8 +168,9 @@ func TestMenuLineWidthKeepsWideTerminalsConservative(t *testing.T) {
 		defaultMenuFooter,
 	)
 	for _, line := range strings.Split(rendered, nl) {
-		if got := VisibleWidth(line); got > 56 {
-			t.Fatalf("line width = %d, want <= 56: %q\n%s", got, line, rendered)
+		{
+			got := VisibleWidth(line)
+			testassert.Require(t, got <= 56, "line width = %d, want <= 56: %q\n%s", got, line, rendered)
 		}
 	}
 }
@@ -202,7 +184,5 @@ func TestRenderMenuTitleDoesNotUseFullWidthRule(t *testing.T) {
 		defaultMenuFooter,
 	)
 	firstLine := strings.Split(rendered, nl)[0]
-	if strings.Count(firstLine, "─") > 4 {
-		t.Fatalf("title should not render a full-width rule: %q", firstLine)
-	}
+	testassert.Require(t, strings.Count(firstLine, "─") <= 4, "title should not render a full-width rule: %q", firstLine)
 }

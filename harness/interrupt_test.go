@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -28,21 +29,22 @@ func TestInterruptBlockedModelAttemptSettlesContractInterruption(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-started // parked inside the blocked model attempt
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 	watch.next()
 	rec := settledOperation(t, store, session, "op-1")
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption with the contract detail", rec.State)
-	}
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the contract detail", rec.State)
 	requireSessionCleared(t, h, session)
-	if _, err := validateFixture(t, store, session); err != nil {
-		t.Fatalf("graph after the interrupt: %v", err)
+	{
+		_, err := validateFixture(t, store, session)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -93,59 +95,55 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-started // the foreground tool is parked in its executor
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer"); err != nil {
-		t.Fatalf("steering submit while the tool is blocked: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "steer")
+		testassert.NoError(t, err)
 	}
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 	watch.next()
 	rec := settledOperation(t, store, session, "op-1")
-	if rec.State.Status != OperationInterruption {
-		t.Fatalf("operation status = %s, want interruption", rec.State.Status)
-	}
+	testassert.Equal(t, rec.State.Status, OperationInterruption)
 	mu.Lock()
 	ran := call2Ran
 	mu.Unlock()
-	if ran {
-		t.Fatalf("the later unstarted call began after the interrupt")
-	}
+	testassert.Require(t, !ran, "the later unstarted call began after the interrupt")
 	graph, err := validateFixture(t, store, session)
-	if err != nil {
-		t.Fatalf("graph after the interrupt: %v", err)
-	}
+	testassert.NoError(t, err)
 	var call1 *toolResultEntry
 	for i := range graph.Entries {
 		if tr := graph.Entries[i].ToolResult; tr != nil && tr.ToolCallID == "call-1" {
 			call1 = tr
 		}
 	}
-	if call1 == nil || call1.Status != model.ResultInterrupted || call1.Content != "tool canceled" {
-		t.Fatalf("call-1 result = %+v, want the tool's real interrupted result", call1)
-	}
+	testassert.Require(t, call1 != nil && call1.Status == model.ResultInterrupted && call1.Content == "tool canceled", "call-1 result = %+v, want the tool's real interrupted result", call1)
 
 	// The steering buffered while the tool was blocked drains after the
 	// interrupted Operation's terminal into its own admission, whose own
 	// model request carries it: exactly two model effects in total.
 	watch.next()
-	if rec := settledOperation(t, store, session, "op-2"); rec.State.Status != OperationSuccess {
-		t.Fatalf("op-2 status = %s, want the buffered steering admitted and successful", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-2")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 	mu.Lock()
 	calls, reqs := calls, append([]model.Request(nil), requests...)
 	mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("model effects = %d, want the blocked Operation's turn plus the steering admission's own request", calls)
+	testassert.Equal(t, calls, 2)
+	{
+		got := strings.Join(textsOf(reqs[1]), "|")
+		testassert.Require(t, strings.Contains(got, "steer"), "the steering admission's request = %q, want the steering text at its own model boundary", got)
 	}
-	if got := strings.Join(textsOf(reqs[1]), "|"); !strings.Contains(got, "steer") {
-		t.Fatalf("the steering admission's request = %q, want the steering text at its own model boundary", got)
-	}
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,steer" {
-		t.Fatalf("committed inputs = %q, want the interrupted turn's input and the steering admission's own input", got)
+	{
+		got := strings.Join(entryTexts(t, store, session), ",")
+		testassert.Equal(t, got, "hello,steer")
 	}
 	requireSessionCleared(t, h, session)
 }
@@ -169,31 +167,27 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		opens := 0
 		h, store, c, sessionID, prepared, cancel := newOpenerHarness(t, opener(&opens))
 		defer cancel()
-		if err := h.Interrupt(context.Background(), sessionID); err != nil { // the durable Operation runs; no execution is installed yet
-			t.Fatalf("Interrupt: %v", err)
+		// the durable Operation runs; no execution is installed yet
+		{
+			err := h.Interrupt(context.Background(), sessionID)
+			testassert.NoError(t, err)
 		}
-		if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
-			t.Fatalf("execute = %v, want the entry interruption", err)
+		{
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
+			testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the entry interruption", err)
 		}
-		if opens != 0 {
-			t.Fatalf("opener calls = %d, want the interrupted execution to settle at entry", opens)
-		}
+		testassert.Equal(t, opens, 0)
 		c.mu.Lock()
 		consumed := c.interruptOp == ""
 		c.mu.Unlock()
-		if !consumed {
-			t.Fatalf("the interrupt marker survived its consumption")
-		}
+		testassert.Require(t, consumed, "the interrupt marker survived its consumption")
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-			t.Fatalf("operation state = %+v, want terminal interruption with the contract detail", rec.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the contract detail", rec.State)
 		requireSessionCleared(t, h, sessionID)
-		if _, err := validateFixture(t, store, sessionID); err != nil {
-			t.Fatalf("graph after the entry settlement: %v", err)
+		{
+			_, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -208,30 +202,28 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		c.mu.Lock()
 		c.run = retired
 		c.mu.Unlock()
-		if err := h.Interrupt(context.Background(), sessionID); err != nil { // canceling the retiring predecessor is the harmless no-op
-			t.Fatalf("Interrupt: %v", err)
+		// canceling the retiring predecessor is the harmless no-op
+		{
+			err := h.Interrupt(context.Background(), sessionID)
+			testassert.NoError(t, err)
 		}
 		select {
 		case <-retired.done:
 		default:
 			t.Fatalf("the retiring predecessor's done channel was reopened")
 		}
-		if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
-			t.Fatalf("execute = %v, want the entry interruption", err)
+		{
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
+			testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the entry interruption", err)
 		}
-		if opens != 0 {
-			t.Fatalf("opener calls = %d, want the interrupted execution to settle at entry", opens)
-		}
+		testassert.Equal(t, opens, 0)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-			t.Fatalf("operation state = %+v, want terminal interruption with the contract detail", rec.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the contract detail", rec.State)
 		requireSessionCleared(t, h, sessionID)
-		if _, err := validateFixture(t, store, sessionID); err != nil {
-			t.Fatalf("graph after the entry settlement: %v", err)
+		{
+			_, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -242,27 +234,21 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		c.mu.Lock()
 		c.interruptOp = "op-other"
 		c.mu.Unlock()
-		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-			t.Fatalf("execute: %v", err)
+		{
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
+			testassert.NoError(t, err)
 		}
-		if opens != 1 {
-			t.Fatalf("opener calls = %d, want the execution to run past a foreign marker", opens)
-		}
+		testassert.Equal(t, opens, 1)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationSuccess {
-			t.Fatalf("operation status = %s, want success past a foreign marker", rec.State.Status)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 		c.mu.Lock()
 		marker := c.interruptOp
 		c.mu.Unlock()
-		if marker != "op-other" {
-			t.Fatalf("foreign marker = %q, want it retained", marker)
-		}
-		if _, err := validateFixture(t, store, sessionID); err != nil {
-			t.Fatalf("graph after the run: %v", err)
+		testassert.Equal(t, marker, "op-other")
+		{
+			_, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -313,44 +299,52 @@ func TestInterruptSteeringPreservesBufferOrder(t *testing.T) {
 	session := createSession(t, h)
 	watch := watchSettlements(store)
 
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	receiveBounded(t, toolArrived, "the first tool batch") // op-1 parks inside its tool batch, before any conversation boundary
-	if _, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1"); err != nil {
-		t.Fatalf("steering submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-2", MessageModeRegular, "s1")
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, h, session, "op-4", MessageModeQueued, "q1"); err != nil {
-		t.Fatalf("queued submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-4", MessageModeQueued, "q1")
+		testassert.NoError(t, err)
 	}
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 	close(toolGate)
 
 	receiveBounded(t, watch.seen, "op-1's interrupted terminal") // op-1 settles as the interrupted Operation
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationInterruption ||
-		rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("op-1 state = %+v, want terminal interruption with the contract detail", rec.State)
+	{
+		rec := settledOperation(t, store, session, "op-1")
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "op-1 state = %+v, want terminal interruption with the contract detail", rec.State)
 	}
 	receiveBounded(t, watch.seen, "the steering head's settlement") // the buffered steering drains through ordinary admission
 	if rec := settledOperation(t, store, session, "op-2"); rec.State.Status != OperationSuccess {
 		t.Fatalf("op-2 status = %s (%s), want the preserved steering admitted and successful", rec.State.Status, rec.State.Terminal.Detail)
 	}
 	receiveBounded(t, watch.seen, "the queued head's settlement") // the queued input drains next
-	if rec := settledOperation(t, store, session, "op-4"); rec.State.Status != OperationSuccess {
-		t.Fatalf("op-4 status = %s, want the queued input admitted and successful", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-4")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 	awaitHarnessQuiet(t, h, session) // raw graph readers await Session convergence after the successors' terminals
-	if got := strings.Join(entryTexts(t, store, session), ","); got != "hello,s1,q1" {
-		t.Fatalf("committed inputs = %q, want the buffers drained in FIFO order", got)
+	{
+		got := strings.Join(entryTexts(t, store, session), ",")
+		testassert.Equal(t, got, "hello,s1,q1")
 	}
-	if owner, _ := steeringInputOwner(t, store, session, "s1"); owner != "op-2" {
-		t.Fatalf("steering input s1 owned by %q, want op-2", owner)
+	{
+		owner, _ := steeringInputOwner(t, store, session, "s1")
+		testassert.Equal(t, owner, "op-2")
 	}
 	requireSessionCleared(t, h, session)
-	if _, err := validateFixture(t, store, session); err != nil {
-		t.Fatalf("graph after the drains: %v", err)
+	{
+		_, err := validateFixture(t, store, session)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -373,24 +367,29 @@ func TestInterruptLeavesBackgroundGroupOpen(t *testing.T) {
 	watch := watchSettlements(store)
 
 	var first []string
-	if err := h.StartJob(context.Background(), session, jobFixtureID, spawnRecord(&first, nil)); err != nil {
-		t.Fatalf("first StartJob: %v", err)
+	{
+		err := h.StartJob(context.Background(), session, jobFixtureID, spawnRecord(&first, nil))
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, session, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 	<-started
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt: %v", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
 	watch.next()
-	if rec := settledOperation(t, store, session, "op-1"); rec.State.Status != OperationInterruption {
-		t.Fatalf("op-1 status = %s, want interruption", rec.State.Status)
+	{
+		rec := settledOperation(t, store, session, "op-1")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
 
 	var second []string
-	if err := h.StartJob(context.Background(), session, "feedface", spawnRecord(&second, nil)); err != nil {
-		t.Fatalf("StartJob after the interrupt = %v, want the group still admitting", err)
+	{
+		err := h.StartJob(context.Background(), session, "feedface", spawnRecord(&second, nil))
+		testassert.NoError(t, err)
 	}
 	c := leaseCoordinator(t, h, session)
 	c.mu.Lock()
@@ -398,9 +397,7 @@ func TestInterruptLeavesBackgroundGroupOpen(t *testing.T) {
 	_, firstLive := c.group.members[first[0]]
 	_, secondLive := c.group.members[second[0]]
 	c.mu.Unlock()
-	if members != 2 || !firstLive || !secondLive {
-		t.Fatalf("group members = %d (first %v, second %v), want both members live after the interrupt", members, firstLive, secondLive)
-	}
+	testassert.Require(t, members == 2 && firstLive && secondLive, "group members = %d (first %v, second %v), want both members live after the interrupt", members, firstLive, secondLive)
 }
 
 // TestInterruptIdleAndUnknown proves the idle row: an idle Session returns
@@ -408,10 +405,12 @@ func TestInterruptLeavesBackgroundGroupOpen(t *testing.T) {
 func TestInterruptIdleAndUnknown(t *testing.T) {
 	h := newTestHarness(t, emptyStore(t), nil)
 	session := createSession(t, h)
-	if err := h.Interrupt(context.Background(), session); err != nil {
-		t.Fatalf("Interrupt on an idle Session = %v, want nil", err)
+	{
+		err := h.Interrupt(context.Background(), session)
+		testassert.NoError(t, err)
 	}
-	if err := h.Interrupt(context.Background(), "ffffffffffffffffffffffffffffffff"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Interrupt on an unknown Session = %v, want ErrNotFound", err)
+	{
+		err := h.Interrupt(context.Background(), "ffffffffffffffffffffffffffffffff")
+		testassert.Require(t, errors.Is(err, ErrNotFound), "Interrupt on an unknown Session = %v, want ErrNotFound", err)
 	}
 }

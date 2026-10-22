@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -38,11 +39,10 @@ const clientAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"s
 // writeServiceFile writes one owner configuration file.
 func writeServiceFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create config directory: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
 }
 
@@ -52,9 +52,7 @@ func writeServiceFile(t *testing.T, path, content string) {
 func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -90,12 +88,11 @@ func newRealRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string) {
 	writeServiceFile(t, configPath, fmt.Sprintf(clientConfigDocument, baseURL))
 	writeServiceFile(t, agents.PathForConfig(configPath), clientAgentsDocument)
 	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
-	if err != nil {
-		t.Fatalf("runtime.Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() {
-		if err := r.Close(context.Background()); err != nil {
-			t.Errorf("runtime.Close: %v", err)
+		{
+			err := r.Close(context.Background())
+			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
 	return r, configPath
@@ -106,13 +103,9 @@ func newRealRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string) {
 func openProtocol(t *testing.T, r *runtime.Runtime) (*runtime.ProtocolServer, string) {
 	t.Helper()
 	ps, err := r.OpenProtocol(context.Background())
-	if err != nil {
-		t.Fatalf("OpenProtocol: %v", err)
-	}
+	testassert.NoError(t, err)
 	record := filepath.Join(t.TempDir(), "discovery.json")
-	if err := ps.PublishDiscovery(record); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, ps.PublishDiscovery(record))
 	return ps, record
 }
 
@@ -120,9 +113,7 @@ func openProtocol(t *testing.T, r *runtime.Runtime) (*runtime.ProtocolServer, st
 func textContentPart(t *testing.T, text string) protocol.ContentPart {
 	t.Helper()
 	var part protocol.ContentPart
-	if err := part.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: text}); err != nil {
-		t.Fatalf("build text part: %v", err)
-	}
+	testassert.NoError(t, part.FromTextPart(protocol.TextPart{Kind: protocol.TextPartKindText, Text: text}))
 	return part
 }
 
@@ -130,12 +121,8 @@ func textContentPart(t *testing.T, text string) protocol.ContentPart {
 func createSession(t *testing.T, c *client.Client, workspace string) string {
 	t.Helper()
 	resp, err := c.CreateSessionWithResponse(context.Background(), protocol.CreateSessionRequest{Workspace: workspace, AgentType: "integrated"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if resp.JSON201 == nil {
-		t.Fatalf("CreateSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON201 != nil, "CreateSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 	return resp.JSON201.SessionId
 }
 
@@ -144,12 +131,8 @@ func createSession(t *testing.T, c *client.Client, workspace string) string {
 func hydrateSession(t *testing.T, c *client.Client, sessionID string) *protocol.Hydration {
 	t.Helper()
 	resp, err := c.GetSessionHydrationWithResponse(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("GetSessionHydration: %v", err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("GetSessionHydration status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON200 != nil, "GetSessionHydration status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 	return resp.JSON200
 }
 
@@ -157,23 +140,15 @@ func hydrateSession(t *testing.T, c *client.Client, sessionID string) *protocol.
 func archiveSession(t *testing.T, c *client.Client, sessionID string) {
 	t.Helper()
 	resp, err := c.ArchiveSessionWithResponse(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ArchiveSession: %v", err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("ArchiveSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON200 != nil, "ArchiveSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 }
 
 func reopenSession(t *testing.T, c *client.Client, sessionID string) {
 	t.Helper()
 	resp, err := c.ReopenSessionWithResponse(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReopenSession: %v", err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("ReopenSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON200 != nil, "ReopenSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 }
 
 // submitOperation submits one regular operation through the generated
@@ -185,12 +160,8 @@ func submitOperation(t *testing.T, c *client.Client, sessionID, operationID, tex
 		Mode:        protocol.SubmitRequestModeRegular,
 		Content:     []protocol.ContentPart{textContentPart(t, text)},
 	})
-	if err != nil {
-		t.Fatalf("SubmitSession: %v", err)
-	}
-	if resp.JSON200 == nil {
-		t.Fatalf("SubmitSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.JSON200 != nil, "SubmitSession status %d: %s", resp.HTTPResponse.StatusCode, resp.Body)
 }
 
 // waitEvent consumes the stream until one delivered event matches, failing on
@@ -217,9 +188,7 @@ func waitEvent(t *testing.T, events <-chan protocol.Event, errs <-chan error, ma
 func eventKind(t *testing.T, event protocol.Event) string {
 	t.Helper()
 	kind, err := event.Discriminator()
-	if err != nil {
-		t.Fatalf("event discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -255,21 +224,15 @@ func TestRealRuntimeClient(t *testing.T) {
 		ctx := context.Background()
 		c := connectFixture(t, record)
 		health, err := c.GetHealthWithResponse(ctx)
-		if err != nil || health.JSON200 == nil {
-			t.Fatalf("GetHealth: %v", err)
-		}
+		testassert.Require(t, err == nil && health.JSON200 != nil, "GetHealth: %v", err)
 		if health.JSON200.InstanceId != c.InstanceID() {
 			t.Fatalf("health instance = %q, client instance = %q", health.JSON200.InstanceId, c.InstanceID())
 		}
 		session := createSession(t, c, filepath.Join(t.TempDir(), "workspace"))
 		hydration := hydrateSession(t, c, session)
-		if hydration.Session.SessionId != session || hydration.SessionRevision.InstanceId != c.InstanceID() {
-			t.Fatalf("hydration = %+v", hydration.Session)
-		}
+		testassert.Require(t, hydration.Session.SessionId == session && hydration.SessionRevision.InstanceId == c.InstanceID(), "hydration = %+v", hydration.Session)
 		listed, err := c.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: hydration.Session.Workspace, Lifecycle: protocol.Open})
-		if err != nil || listed.JSON200 == nil || len(*listed.JSON200) != 1 {
-			t.Fatalf("ListSessions = %v (%v)", listed, err)
-		}
+		testassert.Require(t, err == nil && listed.JSON200 != nil && len(*listed.JSON200) == 1, "ListSessions = %v (%v)", listed, err)
 
 		streamCtx, cancelStream := context.WithCancel(ctx)
 		events, errs := c.Events(streamCtx)
@@ -278,8 +241,9 @@ func TestRealRuntimeClient(t *testing.T) {
 		createSession(t, c, filepath.Join(t.TempDir(), "workspace-2"))
 		waitEvent(t, events, errs, func(protocol.Event) bool { return true }, "stream delivery")
 		cancelStream()
-		if err := <-errs; !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+		{
+			err := <-errs
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
 		}
 
 		reconnected := connectFixture(t, record)
@@ -287,9 +251,7 @@ func TestRealRuntimeClient(t *testing.T) {
 			t.Fatalf("reconnect instance = %q, want %q", reconnected.InstanceID(), c.InstanceID())
 		}
 		rehydrated := hydrateSession(t, reconnected, session)
-		if rehydrated.Session.SessionId != session || rehydrated.SessionRevision.InstanceId != reconnected.InstanceID() {
-			t.Fatalf("rehydrated session = %+v", rehydrated.Session)
-		}
+		testassert.Require(t, rehydrated.Session.SessionId == session && rehydrated.SessionRevision.InstanceId == reconnected.InstanceID(), "rehydrated session = %+v", rehydrated.Session)
 	})
 
 	t.Run("authenticated stream carries a configuration change", func(t *testing.T) {
@@ -304,22 +266,19 @@ func TestRealRuntimeClient(t *testing.T) {
 		changed := fmt.Sprintf(`{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"CLIENT_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}}}}`, baseURL)
 		writeServiceFile(t, configPath, changed)
 		reload, err := c.ReloadConfigurationWithResponse(ctx)
-		if err != nil || reload.JSON200 == nil {
-			t.Fatalf("ReloadConfiguration: %v", err)
-		}
+		testassert.Require(t, err == nil && reload.JSON200 != nil, "ReloadConfiguration: %v", err)
 		event := waitEvent(t, events, errs, func(event protocol.Event) bool {
 			return eventKind(t, event) == "configuration_changed"
 		}, "configuration_changed")
 		body, err := event.AsConfigurationChangedEvent()
-		if err != nil {
-			t.Fatalf("configuration_changed decode: %v", err)
-		}
+		testassert.NoError(t, err)
 		if body.ConfigurationRevision.InstanceId != c.InstanceID() {
 			t.Fatalf("configuration revision instance = %q, want %q", body.ConfigurationRevision.InstanceId, c.InstanceID())
 		}
 		cancelStream()
-		if err := <-errs; !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+		{
+			err := <-errs
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
 		}
 	})
 
@@ -437,38 +396,29 @@ func TestRealRuntimeRefusalStream(t *testing.T) {
 			switch eventKind(t, event) {
 			case "text_delta":
 				body, err := event.AsTextDeltaEvent()
-				if err != nil {
-					t.Fatalf("text_delta body: %v", err)
-				}
+				testassert.NoError(t, err)
 				entry = progress{kind: "text_delta", content: body.Content}
 			case "refusal_delta":
 				body, err := event.AsRefusalDeltaEvent()
-				if err != nil {
-					t.Fatalf("refusal_delta body: %v", err)
-				}
+				testassert.NoError(t, err)
 				entry = progress{kind: "refusal_delta", content: body.Content}
 			default:
 				continue
 			}
 			scope, err := progressScope(t, event)
-			if err != nil {
-				t.Fatalf("progress scope: %v", err)
-			}
+			testassert.NoError(t, err)
 			operation, err := scope.AsOperationScope()
-			if err != nil {
-				t.Fatalf("progress operation scope: %v", err)
-			}
-			if operation.SessionId != session || operation.OperationId != "op-refusal" {
-				t.Fatalf("progress scope = %+v, want the real running operation", scope)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, operation.SessionId == session && operation.OperationId == "op-refusal", "progress scope = %+v, want the real running operation", scope)
 			got = append(got, entry)
 		case <-deadline:
 			t.Fatalf("the live progress stalled at %+v", got)
 		}
 	}
 	cancel()
-	if err := <-errs; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+	{
+		err := <-errs
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
 	}
 	want := []progress{
 		{kind: "text_delta", content: "working"},
@@ -476,9 +426,7 @@ func TestRealRuntimeRefusalStream(t *testing.T) {
 		{kind: "refusal_delta", content: " but no"},
 		{kind: "refusal_delta", content: " can do."},
 	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("delivered progress = %+v, want the exact fragment order %+v", got, want)
-	}
+	testassert.Require(t, slices.Equal(got, want), "delivered progress = %+v, want the exact fragment order %+v", got, want)
 
 	// Final refusal retention through the real chain: the settled history's
 	// assistant item keeps the joined refusal beside the content text.
@@ -487,31 +435,18 @@ func TestRealRuntimeRefusalStream(t *testing.T) {
 	var assistant *protocol.AssistantItem
 	for _, item := range hydration.Conversation.Items {
 		kind, err := item.Discriminator()
-		if err != nil {
-			t.Fatalf("conversation item discriminator: %v", err)
-		}
+		testassert.NoError(t, err)
 		if kind != "assistant" {
 			continue
 		}
 		value, err := item.AsAssistantItem()
-		if err != nil {
-			t.Fatalf("assistant item decode: %v", err)
-		}
+		testassert.NoError(t, err)
 		assistant = &value
 	}
-	if assistant == nil {
-		t.Fatal("the settled history carries no assistant item")
-	}
-	if assistant.Refusal == nil || *assistant.Refusal != " but no can do." {
-		t.Fatalf("assistant refusal = %v, want the joined fragments", assistant.Refusal)
-	}
-	if len(assistant.Content) != 1 {
-		t.Fatalf("assistant content = %+v, want the single accumulated text part", assistant.Content)
-	}
+	testassert.Require(t, assistant != nil, "the settled history carries no assistant item")
+	testassert.Require(t, assistant.Refusal != nil && *assistant.Refusal == " but no can do." && len(assistant.Content) == 1, "assistant refusal = %v, want the joined fragments; assistant content = %+v, want the single accumulated text part", assistant.Refusal, assistant.Content)
 	part, err := assistant.Content[0].AsTextPart()
-	if err != nil || part.Text != "working harder" {
-		t.Fatalf("assistant text = (%q, %v), want the accumulated content", part.Text, err)
-	}
+	testassert.Require(t, err == nil && part.Text == "working harder", "assistant text = (%q, %v), want the accumulated content", part.Text, err)
 }
 
 // progressScope extracts the scope one delivered progress event carries.
@@ -548,17 +483,14 @@ func TestStreamCloseDoesNotCancelWork(t *testing.T) {
 		t.Fatal("the parked model request never arrived")
 	}
 	cancelStream()
-	if err := <-errs; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled stream error = %v, want context.Canceled", err)
+	{
+		err := <-errs
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
 	}
-	if model.wasCanceled() {
-		t.Fatal("closing the event stream canceled the parked model work")
-	}
+	testassert.Require(t, !model.wasCanceled(), "closing the event stream canceled the parked model work")
 	model.unblock()
 	awaitOperation(t, c, session, "op-parked", protocol.OperationStatusSuccess)
-	if model.wasCanceled() {
-		t.Fatal("the parked model work was canceled during settlement")
-	}
+	testassert.Require(t, !model.wasCanceled(), "the parked model work was canceled during settlement")
 }
 
 // testProjection is the caller-owned, instance-qualified Session projection:
@@ -620,9 +552,7 @@ func TestCallerProjectionStaleOwner(t *testing.T) {
 	held := hydrateSession(t, oldClient, oldSession)
 	// A real owner closes its active sockets: the held hydration was already
 	// received before the owner goes away.
-	if err := oldRuntime.Close(context.Background()); err != nil {
-		t.Fatalf("close old owner: %v", err)
-	}
+	testassert.NoError(t, oldRuntime.Close(context.Background()))
 
 	newRuntime, _ := newRealRuntime(t, "http://127.0.0.1:1/v1")
 	_, newRecord := openProtocol(t, newRuntime)
@@ -630,34 +560,20 @@ func TestCallerProjectionStaleOwner(t *testing.T) {
 	newSession := createSession(t, newClient, filepath.Join(t.TempDir(), "workspace-new"))
 	accepted := hydrateSession(t, newClient, newSession)
 
-	if !revisionOlder(accepted.SessionRevision, held.SessionRevision) {
-		t.Fatalf("held old revision %+v is not numerically newer than the accepted %+v", held.SessionRevision, accepted.SessionRevision)
-	}
+	testassert.Require(t, revisionOlder(accepted.SessionRevision, held.SessionRevision), "held old revision %+v is not numerically newer than the accepted %+v", held.SessionRevision, accepted.SessionRevision)
 	projection := &testProjection{}
 	projection.switchOwner(held.SessionRevision.InstanceId)
-	if !projection.accept(held.SessionRevision.InstanceId, held.SessionRevision) {
-		t.Fatal("the old owner's held read was not accepted")
-	}
+	testassert.Require(t, projection.accept(held.SessionRevision.InstanceId, held.SessionRevision), "the old owner's held read was not accepted")
 	// The new owner is accepted: the old projection is discarded first.
 	projection.switchOwner(accepted.SessionRevision.InstanceId)
-	if !projection.accept(accepted.SessionRevision.InstanceId, accepted.SessionRevision) {
-		t.Fatal("the new owner's read was not accepted")
-	}
-	if projection.accept(held.SessionRevision.InstanceId, held.SessionRevision) {
-		t.Fatal("a delayed old-owner hydration replaced the accepted projection")
-	}
-	if projection.instance != accepted.SessionRevision.InstanceId {
-		t.Fatalf("projection instance = %q, want the new owner %q", projection.instance, accepted.SessionRevision.InstanceId)
-	}
+	testassert.Require(t, projection.accept(accepted.SessionRevision.InstanceId, accepted.SessionRevision), "the new owner's read was not accepted")
+	testassert.Require(t, !projection.accept(held.SessionRevision.InstanceId, held.SessionRevision), "a delayed old-owner hydration replaced the accepted projection")
+	testassert.Equal(t, projection.instance, accepted.SessionRevision.InstanceId)
 	older := accepted.SessionRevision
 	older.DurableRevision = "0"
 	older.LocalRevision = "0"
-	if projection.accept(older.InstanceId, older) {
-		t.Fatal("an older same-instance revision overwrote the accepted one")
-	}
+	testassert.Require(t, !projection.accept(older.InstanceId, older), "an older same-instance revision overwrote the accepted one")
 	newer := accepted.SessionRevision
 	newer.DurableRevision = strconv.FormatUint(parseRevision(accepted.SessionRevision.DurableRevision)+1, 10)
-	if !projection.accept(newer.InstanceId, newer) {
-		t.Fatal("a newer same-instance revision was rejected")
-	}
+	testassert.Require(t, projection.accept(newer.InstanceId, newer), "a newer same-instance revision was rejected")
 }

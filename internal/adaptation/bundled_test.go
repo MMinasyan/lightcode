@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // loadFixture reads the fixture bundled data into a bundledDoc the tests
@@ -16,13 +18,9 @@ func loadFixture(t *testing.T) bundledDoc {
 	t.Helper()
 	path := filepath.Join("testdata", "bundled.json")
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fixture %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "read fixture %s: %v", path, err)
 	var doc bundledDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("parse fixture: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(raw, &doc))
 	return doc
 }
 
@@ -44,29 +42,19 @@ func fixtureRow(doc bundledDoc, want string) bundledEntry {
 // before they reach the matcher.
 func TestProductionBundledDataIsValid(t *testing.T) {
 	tbl := loadBundledTable()
-	if len(tbl) == 0 {
-		t.Fatal("loadBundledTable returned an empty table")
-	}
+	testassert.Require(t, len(tbl) != 0, "loadBundledTable returned an empty table")
 	// The production data file is the authoritative source of truth.
 	// Compare its loaded form against its parsed JSON form to ensure
 	// the loader and the file agree.
 	doc := loadFixture(t)
-	if len(doc.Entries) != len(tbl) {
-		t.Fatalf("loaded %d rows, fixture has %d", len(tbl), len(doc.Entries))
-	}
+	testassert.Equal(t, len(doc.Entries), len(tbl))
 	for i, e := range doc.Entries {
-		if e.Name == "" {
-			t.Errorf("row %d (%q): fixture row has no authoring name", i, e.Pattern)
-		}
-		if tbl[i].pattern != e.Pattern {
-			t.Errorf("row %d: loader pattern %q != fixture %q", i, tbl[i].pattern, e.Pattern)
-		}
-		if !maps.Equal(tbl[i].adapt.Additions, e.Additions) ||
-			!slices.Equal(tbl[i].adapt.ExcludeTools, e.ExcludeTools) ||
-			!slices.Equal(tbl[i].adapt.IncludeTools, e.IncludeTools) ||
-			!maps.Equal(tbl[i].adapt.ToolDescriptionReplacements, e.ToolDescriptionReplacements) {
-			t.Errorf("row %d (%q): loaded adaptation outputs %+v != fixture row %+v", i, e.Pattern, tbl[i].adapt, e)
-		}
+		testassert.Check(t, e.Name != "", "row %d (%q): fixture row has no authoring name", i, e.Pattern)
+		testassert.Check(t, tbl[i].pattern == e.Pattern, "row %d: loader pattern %q != fixture %q", i, tbl[i].pattern, e.Pattern)
+		testassert.Check(t, maps.Equal(tbl[i].adapt.Additions, e.Additions) &&
+			slices.Equal(tbl[i].adapt.ExcludeTools, e.ExcludeTools) &&
+			slices.Equal(tbl[i].adapt.IncludeTools, e.IncludeTools) &&
+			maps.Equal(tbl[i].adapt.ToolDescriptionReplacements, e.ToolDescriptionReplacements), "row %d (%q): loaded adaptation outputs %+v != fixture row %+v", i, e.Pattern, tbl[i].adapt, e)
 	}
 }
 
@@ -93,9 +81,7 @@ func TestProductionBundledDataHasNoDuplicateRow(t *testing.T) {
 	seen := make(map[string]bool)
 	for _, e := range doc.Entries {
 		key := e.Pattern + "\x00" + e.Name
-		if seen[key] {
-			t.Errorf("duplicate row %q / %q", e.Pattern, e.Name)
-		}
+		testassert.Check(t, !seen[key], "duplicate row %q / %q", e.Pattern, e.Name)
 		seen[key] = true
 	}
 }
@@ -107,21 +93,18 @@ func TestProductionBundledDataAdditionsUseValidSectionIDs(t *testing.T) {
 	doc := loadFixture(t)
 	for _, e := range doc.Entries {
 		for k := range e.Additions {
-			if !validSectionIDs[k] {
-				t.Errorf("entry %q has additions key %q outside {safety, tone, task_execution, language}", e.Pattern, k)
-			}
+			testassert.Check(t, validSectionIDs[k], "entry %q has additions key %q outside {safety, tone, task_execution, language}", e.Pattern, k)
 		}
 	}
 }
 
 func TestProductionBundledDataHasToolDescriptionDefaults(t *testing.T) {
 	doc := loadFixture(t)
-	if len(doc.Defaults.ToolDescriptionReplacements) == 0 {
-		t.Fatal("fixture defaults.tool_description_replacements is empty")
-	}
+	testassert.Require(t, len(doc.Defaults.ToolDescriptionReplacements) != 0, "fixture defaults.tool_description_replacements is empty")
 	for _, key := range []string{"<EDIT FILE OR WRITE FILE>"} {
-		if _, ok := doc.Defaults.ToolDescriptionReplacements[key]; !ok {
-			t.Fatalf("fixture missing default tool description replacement %q", key)
+		{
+			_, ok := doc.Defaults.ToolDescriptionReplacements[key]
+			testassert.Require(t, ok, "fixture missing default tool description replacement %q", key)
 		}
 	}
 }
@@ -136,9 +119,7 @@ func TestBundledEntryRejectsUnknownToolDescriptionReplacement(t *testing.T) {
 	}, bundledDefaults{ToolDescriptionReplacements: map[string]string{
 		"<KNOWN>": "value",
 	}})
-	if err == nil || !strings.Contains(err.Error(), "has no default replacement") {
-		t.Fatalf("validateBundledEntry err = %v, want unknown replacement key error", err)
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "has no default replacement"), "validateBundledEntry err = %v, want unknown replacement key error", err)
 }
 
 func indexOf(doc bundledDoc, want bundledEntry) int {
@@ -172,9 +153,7 @@ var modelFamilyNames = []string{
 // stays intact.
 func TestProductionGoContainsNoModelFamilyNames(t *testing.T) {
 	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package dir: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() {
@@ -199,17 +178,13 @@ func TestProductionGoContainsNoModelFamilyNames(t *testing.T) {
 func scanFileForModelFamilyNames(t *testing.T, path string) {
 	t.Helper()
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "read %s: %v", path, err)
 	// Match Go string literals (double-quoted) and backtick raw strings.
 	// We are intentionally not parsing Go; a token-level scan is good
 	// enough for the audit's purpose.
 	src := string(raw)
 	for _, fam := range modelFamilyNames {
-		if containsStringLiteral(src, fam) {
-			t.Errorf("production Go file %q contains model family name %q as a string literal; production bindings must live in the bundled data file", path, fam)
-		}
+		testassert.Check(t, !containsStringLiteral(src, fam), "production Go file %q contains model family name %q as a string literal; production bindings must live in the bundled data file", path, fam)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // richEquivalenceRequest builds the fixture request through the public constructors, failing the test instead of panicking.
@@ -20,16 +22,12 @@ func richEquivalenceRequest(t *testing.T, assistantSource ModelRef) Request {
 		Content: []ContentPart{{Kind: PartText, Text: "working on it"}},
 		ToolCalls: []ToolCall{func() ToolCall {
 			call, err := NewToolCall(ToolCall{ID: "call_eq_1", Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`), Extra: Extra{"call_meta": json.RawMessage(`1`)}})
-			if err != nil {
-				t.Fatalf("NewToolCall fixture: %v", err)
-			}
+			testassert.NoError(t, err)
 			return call
 		}()},
 		Extra: Extra{"provider_meta": json.RawMessage(`{"v":2}`)},
 	})
-	if err != nil {
-		t.Fatalf("NewMessage assistant fixture: %v", err)
-	}
+	testassert.NoError(t, err)
 	return Request{
 		Messages: []Message{
 			mustMsg(t, Message{Role: RoleSystem, Content: []ContentPart{{Kind: PartText, Text: "system setup"}}}),
@@ -126,26 +124,16 @@ func TestEncodeAndStreamProduceIdenticalBodyAndWarnings(t *testing.T) {
 			rowRt.MustPreserve = []string{"reasoning_details"}
 
 			wantBody, wantWarnings, err := Encode(rowRt, req, tc.runtimeExtras)
-			if err != nil {
-				t.Fatalf("Encode returned error for valid input: %v", err)
-			}
-			if len(wantWarnings) != tc.wantWarnings {
-				t.Fatalf("fixture premise: Encode warnings = %d, want %d (%#v)", len(wantWarnings), tc.wantWarnings, wantWarnings)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(wantWarnings) == tc.wantWarnings, "fixture premise: Encode warnings = %d, want %d (%#v)", len(wantWarnings), tc.wantWarnings, wantWarnings)
 
 			tr := mustTransport(t, rowRt)
 			stream, gotWarnings, err := tr.Stream(context.Background(), req, tc.runtimeExtras)
-			if err != nil {
-				t.Fatalf("Stream returned error for valid input: %v", err)
-			}
+			testassert.NoError(t, err)
 			defer stream.Close()
 
-			if !bytes.Equal(capturedBody, wantBody) {
-				t.Fatalf("posted body differs from Encode output:\ngot  %s\nwant %s", capturedBody, wantBody)
-			}
-			if !reflect.DeepEqual(gotWarnings, wantWarnings) {
-				t.Fatalf("warnings differ: Stream %#v, Encode %#v", gotWarnings, wantWarnings)
-			}
+			testassert.Require(t, bytes.Equal(capturedBody, wantBody), "posted body differs from Encode output:\ngot  %s\nwant %s", capturedBody, wantBody)
+			testassert.Require(t, reflect.DeepEqual(gotWarnings, wantWarnings), "warnings differ: Stream %#v, Encode %#v", gotWarnings, wantWarnings)
 		})
 	}
 }
@@ -174,13 +162,9 @@ func TestCallerMutationAfterConstructionKeepsNextStream(t *testing.T) {
 
 	// Pre-mutation baselines: one direct Encode body and one Stream exchange.
 	wantBody, wantWarnings, err := Encode(rt, req, extras)
-	if err != nil {
-		t.Fatalf("Encode baseline failed: %v", err)
-	}
-	if len(wantWarnings) != 2 || wantWarnings[0].Field != "reasoning_details" || wantWarnings[1].Field != "tool_call_id" ||
-		wantWarnings[0].MessageIndex != 2 || wantWarnings[1].MessageIndex != 2 { // premise: the immutable expectation really is the ordered pair, so the comparison below cannot pass vacuously (the assistant is the third message, index 2).
-		t.Fatalf("fixture premise: Encode ordered warnings = %#v; want reasoning_details then tool_call_id at message index 2", wantWarnings)
-	}
+	testassert.NoError(t, err)
+	// premise: the immutable expectation really is the ordered pair, so the comparison below cannot pass vacuously (the assistant is the third message, index 2).
+	testassert.Require(t, len(wantWarnings) == 2 && wantWarnings[0].Field == "reasoning_details" && wantWarnings[1].Field == "tool_call_id" && wantWarnings[0].MessageIndex == 2 && wantWarnings[1].MessageIndex == 2, "fixture premise: Encode ordered warnings = %#v; want reasoning_details then tool_call_id at message index 2", wantWarnings)
 	baseline := append([]byte(nil), wantBody...) // independent copy as the comparison reference; wantBody itself is mutated below as a returned-value stimulus.
 
 	tr := mustTransport(t, rt)
@@ -214,10 +198,6 @@ func TestCallerMutationAfterConstructionKeepsNextStream(t *testing.T) {
 		t.Fatalf("post-mutation stream Close failed: %v", err)
 	}
 
-	if !bytes.Equal(capturedBody, baseline) {
-		t.Fatalf("post-mutation Stream body changed:\ngot  %s\nwant %s", capturedBody, baseline)
-	}
-	if !reflect.DeepEqual(gotWarnings, wantWarnings) {
-		t.Fatalf("post-mutation Stream warnings changed: got %#v, want %#v", gotWarnings, wantWarnings)
-	}
+	testassert.Require(t, bytes.Equal(capturedBody, baseline), "post-mutation Stream body changed:\ngot  %s\nwant %s", capturedBody, baseline)
+	testassert.Require(t, reflect.DeepEqual(gotWarnings, wantWarnings), "post-mutation Stream warnings changed: got %#v, want %#v", gotWarnings, wantWarnings)
 }

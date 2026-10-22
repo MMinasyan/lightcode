@@ -1,6 +1,9 @@
 package builtin
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 // TestShippedRegistrationHoldsSixInOrder proves the shipped registration set
 // is exactly the six registered plugins in registration order: the durable
@@ -10,16 +13,10 @@ import "testing"
 // integration suite.
 func TestShippedRegistrationHoldsSixInOrder(t *testing.T) {
 	plugins := Plugins()
-	if len(plugins) != 6 {
-		t.Fatalf("Plugins() returned %d plugins, want six", len(plugins))
-	}
+	testassert.Equal(t, len(plugins), 6)
 	want := []string{"sqlite", "tools", "adaptation", "lsp", "jobs", "tasks"}
 	for i, p := range plugins {
-		if p.ID != want[i] {
-			t.Errorf("plugin %d ID = %q, want %q", i, p.ID, want[i])
-		}
-		if p.Open == nil {
-			t.Errorf("plugin %q has no Open factory", p.ID)
-		}
+		testassert.Check(t, p.ID == want[i], "plugin %d ID = %q, want %q", i, p.ID, want[i])
+		testassert.Check(t, p.Open != nil, "plugin %q has no Open factory", p.ID)
 	}
 }

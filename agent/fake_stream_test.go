@@ -35,21 +35,21 @@ func errStep(err error) func() (model.StreamDelta, error) { // one accepted-stre
 
 func (f *fakeStream) Recv() (model.StreamDelta, error) { // one scripted outcome per call in order and io.EOF once the script is exhausted or after Close — mirroring the accepted-stream contract without adding retry, classification, or skip behavior of its own.
 	f.recvCount++
-	if f.closed { // post-close reads are observable through recvsAfterClose; every test pins them at zero because the owner never re-reads a closed stream anywhere downstream along this trajectory forward now under exactly one rule documented inline within its own single-line comment rather than scattered across multiple files' worth of prose below it further ahead in wire order.
+	if f.closed { // post-close reads are observable through recvsAfterClose; every test pins them at zero because the owner never re-reads a closed stream
 		f.recvsAfterClose++
-		return model.StreamDelta{}, io.EOF // report normal termination shape through the standard library's sentinel EOF error value rather than inventing a custom marker type anywhere downstream of this return statement above these lines now under exactly one rule documented inline within its own single-line expression argument list itself over in that other package's scope boundary across the import wire between us two packages right about now today onward.
+		return model.StreamDelta{}, io.EOF
 	}
 
-	idx := f.recvCount - 1   // zero-based position into the script slice corresponding to THIS call specifically (not any previous or future one anywhere upstream/downstream along this particular trajectory forward).
-	if idx < len(f.script) { // still inside scripted territory — serve exactly the outcome recorded at that index verbatim without altering anything about its identity/state/shape in any way whatsoever before returning it back out through this function's own single return path below further ahead now.
+	idx := f.recvCount - 1
+	if idx < len(f.script) {
 		return f.script[idx]()
 	}
 
-	return model.StreamDelta{}, io.EOF // script exhausted — report normal termination through the standard library's sentinel EOF error value exactly like every other clean stream end handled elsewhere in this same test package across all of its files' worth of code together as one cohesive unit rather than scattered pieces lying around haphazardly here and there without any consistent ordering or structure whatsoever above these lines verbatim.
+	return model.StreamDelta{}, io.EOF // exhausted script reports normal termination.
 }
 
 func (f *fakeStream) Close() error {
 	f.closeCount++
-	f.closed = true // flip the observable post-close flag exactly once on whichever call lands first among any subsequent duplicate invocations arriving later upstream/downstream along this particular trajectory forward (idempotent thereafter — repeated flips of an already-true bool carry no additional semantic weight anywhere downstream of this assignment statement above these lines verbatim).
+	f.closed = true // flip the observable post-close flag
 	return f.closeErr
 }

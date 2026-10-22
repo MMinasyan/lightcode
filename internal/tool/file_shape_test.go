@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"golang.org/x/sys/unix"
 )
 
@@ -216,9 +217,7 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			err := tc.run(store, path)
 			release()
 			assertNonRegularRefusal(t, path, err)
-			if len(store.calls) != 0 {
-				t.Fatalf("snapshot calls = %+v, want none", store.calls)
-			}
+			testassert.Require(t, len(store.calls) == 0, "snapshot calls = %+v, want none", store.calls)
 		})
 	}
 }
@@ -229,19 +228,11 @@ func TestMissingWriteFileStillCreatesNewFile(t *testing.T) {
 		"path":    path,
 		"content": "created",
 	})
-	if err != nil {
-		t.Fatalf("WriteFile missing target error = %v", err)
-	}
-	if !strings.Contains(result, "Wrote") {
-		t.Fatalf("result = %q, want write success", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result, "Wrote"), "result = %q, want write success", result)
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "created" {
-		t.Fatalf("content = %q, want created", data)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(data) == "created", "content = %q, want created", data)
 }
 
 type nonRegularSnapshotCall struct {
@@ -270,26 +261,14 @@ func (s *recordingNonRegularSnapshotStore) CurrentTurn() int {
 
 func assertNonRegularRefusal(t *testing.T, path string, err error) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("operation succeeded, want non-regular target refusal")
-	}
+	testassert.Require(t, err != nil, "operation succeeded, want non-regular target refusal")
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "has not been read yet") {
-		t.Fatalf("error = %v, want target-shape refusal before read-required checks", err)
-	}
-	if strings.Contains(msg, "did not fail closed before blocking") {
-		t.Fatalf("error = %v, want target-shape refusal before blocking on target I/O", err)
-	}
-	if !strings.Contains(msg, "non-regular") {
-		t.Fatalf("error = %v, want explicit non-regular target-shape refusal", err)
-	}
+	testassert.Require(t, !strings.Contains(msg, "has not been read yet"), "error = %v, want target-shape refusal before read-required checks", err)
+	testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "error = %v, want target-shape refusal before blocking on target I/O", err)
+	testassert.Require(t, strings.Contains(msg, "non-regular"), "error = %v, want explicit non-regular target-shape refusal", err)
 	info, statErr := os.Lstat(path)
-	if statErr != nil {
-		t.Fatalf("lstat %s = %v, want non-regular target still present", path, statErr)
-	}
-	if info.Mode().IsRegular() {
-		t.Fatalf("%s became a regular file after refused operation", path)
-	}
+	testassert.Require(t, statErr == nil, "lstat %s = %v, want non-regular target still present", path, statErr)
+	testassert.Require(t, !info.Mode().IsRegular(), "%s became a regular file after refused operation", path)
 }
 
 func runNonRegularTargetWithTimeout(fn func() error) error {
@@ -308,9 +287,7 @@ func runNonRegularTargetWithTimeout(fn func() error) error {
 func nonRegularDirectoryTarget(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "target-dir")
-	if err := os.Mkdir(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Mkdir(path, 0o755))
 	return path
 }
 
@@ -375,33 +352,21 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 		project := t.TempDir()
 		outsideDir := t.TempDir()
 		outside = filepath.Join(outsideDir, "outside.txt")
-		if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(outside, []byte("outside-content"), 0o644))
 		hardlinked = filepath.Join(project, "hardlinked.txt")
-		if err := os.Link(outside, hardlinked); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.Link(outside, hardlinked))
 		info, err := os.Stat(hardlinked)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || st.Nlink < 2 {
-			t.Fatalf("setup: hardlinked target nlink = %d, want >= 2", st.Nlink)
-		}
+		testassert.Require(t, ok && st.Nlink >= 2, "setup: hardlinked target nlink = %d, want >= 2", st.Nlink)
 		return hardlinked, outside
 	}
 
 	assertHardlinkRefusal := func(t *testing.T, err error) {
 		t.Helper()
-		if err == nil {
-			t.Fatal("operation succeeded on hardlinked target; want refusal")
-		}
+		testassert.Require(t, err != nil, "operation succeeded on hardlinked target; want refusal")
 		msg := strings.ToLower(err.Error())
-		if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
-			t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
-		}
+		testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
 	}
 
 	t.Run("read_file", func(t *testing.T) {

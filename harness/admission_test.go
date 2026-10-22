@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -88,9 +89,7 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 		}
 	}
 	h, err := New(context.Background(), Dependencies{Storage: store, Prepare: prepare})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 	return h
 }
 
@@ -142,9 +141,7 @@ func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID 
 	t.Helper()
 	c := leaseCoordinator(t, h, sessionID)
 	release, err := h.reserve(context.Background(), c)
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer release()
 	rec, prepared, disposition, err := h.admitReserved(context.Background(), c, admissionRequest{
 		SessionID:   sessionID,
@@ -153,12 +150,8 @@ func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID 
 		Origin:      InputOriginUser,
 		Content:     content,
 	})
-	if err != nil {
-		t.Fatalf("admitReserved: %v", err)
-	}
-	if disposition != DispositionAdmitted || prepared == nil {
-		t.Fatalf("disposition %q (prepared %v), want a new admission", disposition, prepared != nil)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, disposition == DispositionAdmitted && prepared != nil, "disposition %q (prepared %v), want a new admission", disposition, prepared != nil)
 	return rec, disposition
 }
 
@@ -177,12 +170,8 @@ func mustAdmit(t *testing.T, h *Harness, sessionID, operationID string, content 
 		Content:     content,
 		Mode:        MessageModeRegular,
 	})
-	if err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	if res.Operation == nil {
-		t.Fatalf("Submit disposition %q carried no operation record", res.Disposition)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Operation != nil, "Submit disposition %q carried no operation record", res.Disposition)
 	return *res.Operation, res.Disposition
 }
 
@@ -214,20 +203,24 @@ func storedSessionState(s *graphStorage, sessionID string) (entries []Entry, reg
 // performs no storage work.
 func TestNewConstructionContract(t *testing.T) {
 	store := emptyStore(t)
-	if _, err := New(context.Background(), Dependencies{}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("New without dependencies = %v, want ErrInvalid", err)
+	{
+		_, err := New(context.Background(), Dependencies{})
+		testassert.Require(t, errors.Is(err, ErrInvalid), "New without dependencies = %v, want ErrInvalid", err)
 	}
-	if _, err := New(context.Background(), Dependencies{Storage: store}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("New without preparation = %v, want ErrInvalid", err)
+	{
+		_, err := New(context.Background(), Dependencies{Storage: store})
+		testassert.Require(t, errors.Is(err, ErrInvalid), "New without preparation = %v, want ErrInvalid", err)
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	deps := Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) { return PreparedExecution{}, nil }}
-	if _, err := New(canceled, deps); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("New with a dead context = %v, want ErrInvalid", err)
+	{
+		_, err := New(canceled, deps)
+		testassert.Require(t, errors.Is(err, ErrInvalid), "New with a dead context = %v, want ErrInvalid", err)
 	}
-	if _, err := New(context.Background(), deps); err != nil {
-		t.Fatalf("valid construction rejected: %v", err)
+	{
+		_, err := New(context.Background(), deps)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -240,39 +233,21 @@ func TestCreateSessionWorkspaceIdentity(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 
 	rec, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if rec.Identity.Workspace != "/tmp/works" {
-		t.Fatalf("stored workspace = %q, want the caller value unchanged", rec.Identity.Workspace)
-	}
-	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(rec.Identity.SessionID) {
-		t.Fatalf("session id %q is not 32 lowercase hex characters", rec.Identity.SessionID)
-	}
-	if rec.State.Lifecycle != LifecycleOpen || rec.State.CurrentAgentType != "coder" || rec.Revision != 1 {
-		t.Fatalf("created session state = %+v", rec.State)
-	}
-	if rec.Identity.CreatedAt.IsZero() || !rec.State.LastActivity.Equal(rec.Identity.CreatedAt) {
-		t.Fatalf("creation did not sample one time for created_at and last_activity: %+v", rec)
-	}
-	if len(rec.State.Usage.ByModel) != 0 {
-		t.Fatalf("created session carries usage: %+v", rec.State.Usage)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.Identity.Workspace == "/tmp/works" && regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(rec.Identity.SessionID) && (rec.State.Lifecycle == LifecycleOpen && rec.State.CurrentAgentType == "coder" && rec.Revision == 1) && (!rec.Identity.CreatedAt.IsZero() && rec.State.LastActivity.Equal(rec.Identity.CreatedAt)) && len(rec.State.Usage.ByModel) == 0, "got %v, want %v; session id %q is not 32 lowercase hex characters; created session state = %+v; creation did not sample one time for created_at and last_activity: %+v; created session carries usage: %+v", rec.Identity.Workspace, "/tmp/works", rec.Identity.SessionID, rec.State, rec, rec.State.Usage)
 	read, err := h.ReadSessionHeader(context.Background(), rec.Identity.SessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if read.Identity.Workspace != "/tmp/works" || read.Revision.DurableRevision != 1 {
-		t.Fatalf("read session = %+v", read)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, read.Identity.Workspace == "/tmp/works" && read.Revision.DurableRevision == 1, "read session = %+v", read)
 
 	for _, workspace := range []string{"relative/path", "/tmp/works/../works", ""} {
-		if _, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: workspace, AgentType: "coder"}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("CreateSession(%q) = %v, want ErrInvalid", workspace, err)
+		{
+			_, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: workspace, AgentType: "coder"})
+			testassert.Require(t, errors.Is(err, ErrInvalid), "CreateSession(%q) = %v, want ErrInvalid", workspace, err)
 		}
 	}
-	if _, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works"}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("empty agent type = %v, want ErrInvalid", err)
+	{
+		_, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works"})
+		testassert.Require(t, errors.Is(err, ErrInvalid), "empty agent type = %v, want ErrInvalid", err)
 	}
 }
 
@@ -283,28 +258,29 @@ func TestCreateSessionWorkspaceIdentity(t *testing.T) {
 func TestReadsMaterializeValidatedState(t *testing.T) {
 	store := emptyStore(t)
 	h := newTestHarness(t, store, nil)
-	if _, err := h.ReadSessionHeader(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent session = %v, want ErrNotFound", err)
+	{
+		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent session = %v, want ErrNotFound", err)
 	}
-	if _, err := h.ReadHistoryView(context.Background(), testSessionID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent history = %v, want ErrNotFound", err)
+	{
+		_, err := h.ReadHistoryView(context.Background(), testSessionID)
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent history = %v, want ErrNotFound", err)
 	}
-	if _, err := h.ReadSessionHeader(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("malformed session id = %v, want ErrInvalid", err)
+	{
+		_, err := h.ReadSessionHeader(context.Background(), "nope")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "malformed session id = %v, want ErrInvalid", err)
 	}
-	if _, err := h.ReadOperation(context.Background(), testSessionID, testOpID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent operation = %v, want ErrNotFound", err)
+	{
+		_, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent operation = %v, want ErrNotFound", err)
 	}
 	created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	read, err := h.ReadSessionHeader(context.Background(), created.Identity.SessionID)
-	if err != nil || read.Revision.DurableRevision != 1 || read.Identity.SessionID != created.Identity.SessionID {
-		t.Fatalf("ReadSession = %+v, err %v", read, err)
-	}
-	if _, err := h.ReadOperation(context.Background(), created.Identity.SessionID, "op-1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent operation after creation = %v, want ErrNotFound", err)
+	testassert.Require(t, err == nil && read.Revision.DurableRevision == 1 && read.Identity.SessionID == created.Identity.SessionID, "ReadSession = %+v, err %v", read, err)
+	{
+		_, err := h.ReadOperation(context.Background(), created.Identity.SessionID, "op-1")
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent operation after creation = %v, want ErrNotFound", err)
 	}
 }
 
@@ -314,9 +290,7 @@ func TestReadsMaterializeValidatedState(t *testing.T) {
 func TestCorruptSessionIsUnavailable(t *testing.T) {
 	fixture := validTestGraph()
 	raw, err := encodeInputEntry(*fixture.entries[0].input)
-	if err != nil {
-		t.Fatalf("fixture encode: %v", err)
-	}
+	testassert.NoError(t, err)
 	fixture.entries[0].rawOverride = setKey(raw, "bogus", json.RawMessage(`1`))
 	store := fixture.storage(t)
 	h := newTestHarness(t, store, nil)
@@ -339,11 +313,10 @@ func TestCorruptSessionIsUnavailable(t *testing.T) {
 	}())
 
 	sibling, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession on a store with a corrupt sibling: %v", err)
-	}
-	if _, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID); err != nil {
-		t.Fatalf("valid sibling session unreadable: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -355,23 +328,14 @@ func TestChangeAgentType(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 
 	before, err := h.ReadSessionHeader(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("ReadSessionHeader: %v", err)
-	}
+	testassert.NoError(t, err)
 	beforeUsage := readSessionView(t, h, testSessionID).TotalUsage
 	after, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
-	if err != nil {
-		t.Fatalf("ChangeAgentType: %v", err)
-	}
-	if after.State.CurrentAgentType != "reviewer" || after.Revision != before.Revision.DurableRevision+1 {
-		t.Fatalf("changed session = %+v", after.State)
-	}
-	if after.Identity != before.Identity || !after.State.LastActivity.Equal(before.LastActivity) ||
-		!usageTotalsEqual(after.State.Usage, beforeUsage) {
-		t.Fatalf("agent-type change altered identity, activity or usage: %+v", after)
-	}
-	if _, err := h.ChangeAgentType(context.Background(), testSessionID, ""); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("empty agent type = %v, want ErrInvalid", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, after.State.CurrentAgentType == "reviewer" && after.Revision == before.Revision.DurableRevision+1 && (after.Identity == before.Identity && after.State.LastActivity.Equal(before.LastActivity) && usageTotalsEqual(after.State.Usage, beforeUsage)), "changed session = %+v; agent-type change altered identity, activity or usage: %+v", after.State, after)
+	{
+		_, err := h.ChangeAgentType(context.Background(), testSessionID, "")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "empty agent type = %v, want ErrInvalid", err)
 	}
 
 	archived := &testGraph{session: validSessionRecord()}
@@ -379,8 +343,9 @@ func TestChangeAgentType(t *testing.T) {
 	archived.session.State.Lifecycle = LifecycleArchived
 	archived.session.State.ArchivedAt = &stamped
 	archivedHarness := newTestHarness(t, archived.storage(t), nil)
-	if _, err := archivedHarness.ChangeAgentType(context.Background(), testSessionID, "reviewer"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("agent type on an archived session = %v, want ErrInvalid", err)
+	{
+		_, err := archivedHarness.ChangeAgentType(context.Background(), testSessionID, "reviewer")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "agent type on an archived session = %v, want ErrInvalid", err)
 	}
 }
 
@@ -389,16 +354,18 @@ func TestChangeAgentType(t *testing.T) {
 func TestAdmissionSessionPreconditions(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-	if _, err := h.Submit(context.Background(), SubmitRequest{SessionID: otherSession(), OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent session admission = %v, want ErrNotFound", err)
+	{
+		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: otherSession(), OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent session admission = %v, want ErrNotFound", err)
 	}
 	archived := &testGraph{session: validSessionRecord()}
 	stamped := testTime
 	archived.session.State.Lifecycle = LifecycleArchived
 	archived.session.State.ArchivedAt = &stamped
 	archivedHarness := newTestHarness(t, archived.storage(t), newPrepareStub(validPrepared()).prepare)
-	if _, err := archivedHarness.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("archived session admission = %v, want ErrInvalid", err)
+	{
+		_, err := archivedHarness.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
+		testassert.Require(t, errors.Is(err, ErrInvalid), "archived session admission = %v, want ErrInvalid", err)
 	}
 }
 
@@ -419,9 +386,7 @@ func TestAdmissionInputValidation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: tc.operationID, Origin: tc.origin, Content: tc.content, Mode: MessageModeRegular})
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("invalid input = %v, want ErrInvalid", err)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "invalid input = %v, want ErrInvalid", err)
 		})
 	}
 }
@@ -436,34 +401,14 @@ func TestAdmissionPublishesRunningOperation(t *testing.T) {
 	h := newTestHarness(t, store, stub.prepare)
 
 	rec, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("hello"))
-	if disposition != DispositionAdmitted {
-		t.Fatalf("disposition = %q, want admitted", disposition)
-	}
-	if rec.State.Status != OperationRunning || rec.Admission.AgentType != "coder" ||
-		rec.Admission.RequestKind != RequestKindMessage || rec.Admission.SessionID != testSessionID ||
-		rec.Admission.OperationID != testOpID {
-		t.Fatalf("admitted operation = %+v", rec)
-	}
-	if rec.Admission.Execution.ConfigurationRevision != testCapture().ConfigurationRevision ||
-		rec.Admission.Execution.Model != testModelRef() || len(rec.Admission.Execution.Tools) != 1 {
-		t.Fatalf("durable capture = %+v", rec.Admission.Execution)
-	}
-	if rec.Admission.AdmittedEntry.SessionID != testSessionID || rec.Admission.AdmittedEntry.EntryID == "" {
-		t.Fatalf("admitted entry reference = %+v", rec.Admission.AdmittedEntry)
-	}
-	if rec.State.StartedAt.IsZero() || !rec.Admission.AdmittedAt.Equal(rec.State.StartedAt) {
-		t.Fatalf("operation timestamps = %+v", rec.State)
-	}
-	if len(rec.State.PendingToolCalls) != 0 || len(rec.State.Usage.ByModel) != 0 {
-		t.Fatalf("fresh operation state = %+v", rec.State)
-	}
+	testassert.Equal(t, disposition, DispositionAdmitted)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.Admission.AgentType == "coder" && rec.Admission.RequestKind == RequestKindMessage && rec.Admission.SessionID == testSessionID && rec.Admission.OperationID == testOpID && (rec.Admission.Execution.ConfigurationRevision == testCapture().ConfigurationRevision && rec.Admission.Execution.Model == testModelRef() && len(rec.Admission.Execution.Tools) == 1) && (rec.Admission.AdmittedEntry.SessionID == testSessionID && rec.Admission.AdmittedEntry.EntryID != "") && (!rec.State.StartedAt.IsZero() && rec.Admission.AdmittedAt.Equal(rec.State.StartedAt)) && (len(rec.State.PendingToolCalls) == 0 && len(rec.State.Usage.ByModel) == 0), "admitted operation = %+v; durable capture = %+v; admitted entry reference = %+v; operation timestamps = %+v; fresh operation state = %+v", rec, rec.Admission.Execution, rec.Admission.AdmittedEntry, rec.State, rec.State)
 
 	entries, regs := storedSessionState(store, testSessionID)
-	if len(entries) != 1 || entries[0].Kind != EntryInput || entries[0].OperationID != testOpID || entries[0].Sequence != 1 {
-		t.Fatalf("published entries = %+v", entries)
-	}
-	if _, err := decodeInputEntry(entries[0]); err != nil {
-		t.Fatalf("published input entry does not decode: %v", err)
+	testassert.Require(t, len(entries) == 1 && entries[0].Kind == EntryInput && entries[0].OperationID == testOpID && entries[0].Sequence == 1, "published entries = %+v", entries)
+	{
+		_, err := decodeInputEntry(entries[0])
+		testassert.NoError(t, err)
 	}
 	var sessionReg, opReg *Register
 	for i := range regs {
@@ -474,24 +419,15 @@ func TestAdmissionPublishesRunningOperation(t *testing.T) {
 			opReg = &regs[i]
 		}
 	}
-	if sessionReg == nil || opReg == nil {
-		t.Fatalf("published registers = %+v", regs)
-	}
-	if opReg.Key.OperationID != testOpID {
-		t.Fatalf("operation register key = %+v", opReg.Key)
-	}
+	testassert.Require(t, sessionReg != nil && opReg != nil, "published registers = %+v", regs)
+	testassert.Require(t, opReg.Key.OperationID == testOpID, "operation register key = %+v", opReg.Key)
 	session, err := decodeSessionRegister(*sessionReg)
-	if err != nil {
-		t.Fatalf("session register decode: %v", err)
-	}
-	if session.State.CurrentOperationID != testOpID || session.Revision != 2 {
-		t.Fatalf("session register = revision %d, current op %q", session.Revision, session.State.CurrentOperationID)
-	}
-	if !session.State.LastActivity.Equal(entries[0].CommittedAt) {
-		t.Fatalf("last_activity %v did not advance to the input commit time %v", session.State.LastActivity, entries[0].CommittedAt)
-	}
-	if _, err := validateSessionGraph(context.Background(), store, testSessionID); err != nil {
-		t.Fatalf("published graph does not validate: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, session.State.CurrentOperationID == testOpID && session.Revision == 2, "session register = revision %d, current op %q", session.Revision, session.State.CurrentOperationID)
+	testassert.Require(t, session.State.LastActivity.Equal(entries[0].CommittedAt), "last_activity %v did not advance to the input commit time %v", session.State.LastActivity, entries[0].CommittedAt)
+	{
+		_, err := validateSessionGraph(context.Background(), store, testSessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -505,20 +441,16 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		if _, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
-			t.Fatalf("disposition = %q", disposition)
+		{
+			_, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("hello"))
+			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want exactly one", got)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 1)
 		}
 		req := stub.lastCall().req
-		if req.RequestKind != RequestKindMessage {
-			t.Fatalf("request kind = %q", req.RequestKind)
-		}
-		if req.Session.Identity.SessionID != testSessionID || req.Session.Identity.Workspace != "/tmp/works" ||
-			req.Session.Identity.CreatedAt.IsZero() || req.Session.AgentType != "coder" {
-			t.Fatalf("preparation session view = %+v", req.Session)
-		}
+		testassert.Require(t, req.RequestKind == RequestKindMessage && (req.Session.Identity.SessionID == testSessionID && req.Session.Identity.Workspace == "/tmp/works" && !req.Session.Identity.CreatedAt.IsZero() && req.Session.AgentType == "coder"), "got %v, want %v; preparation session view = %+v", req.RequestKind, RequestKindMessage, req.Session)
 	})
 
 	t.Run("invalid prepared execution publishes nothing", func(t *testing.T) {
@@ -536,13 +468,9 @@ func TestAdmissionPreparationContract(t *testing.T) {
 				store := freshSessionStore(t)
 				h := newTestHarness(t, store, newPrepareStub(prepared).prepare)
 				_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x"), Mode: MessageModeRegular})
-				if !errors.Is(err, ErrInvalid) {
-					t.Fatalf("invalid prepared execution = %v, want ErrInvalid", err)
-				}
+				testassert.Require(t, errors.Is(err, ErrInvalid), "invalid prepared execution = %v, want ErrInvalid", err)
 				entries, regs := storedSessionState(store, testSessionID)
-				if len(entries) != 0 || len(regs) != 1 || regs[0].Key.Kind != RegisterSession {
-					t.Fatalf("invalid preparation published entries %v registers %v", entries, regs)
-				}
+				testassert.Require(t, len(entries) == 0 && len(regs) == 1 && regs[0].Key.Kind == RegisterSession, "invalid preparation published entries %v registers %v", entries, regs)
 			})
 		}
 	})
@@ -554,13 +482,9 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, stub.prepare)
 		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
-		if err != prepErr {
-			t.Fatalf("preparation error = %v, want the exact callback error", err)
-		}
+		testassert.Equal(t, err, prepErr)
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 0 || len(regs) != 1 {
-			t.Fatalf("failed preparation published entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 0 && len(regs) == 1, "failed preparation published entries %v registers %v", entries, regs)
 	})
 
 	t.Run("caller cancellation stops preparation", func(t *testing.T) {
@@ -578,16 +502,10 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		<-stub.arrived // the callback is parked
 		cancel()
 		err := <-done
-		if err == nil || !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled admission = %v, want a context error", err)
-		}
-		if stub.lastCall().ctx.Err() == nil {
-			t.Fatalf("preparation context was not canceled with the caller")
-		}
+		testassert.Require(t, err != nil && errors.Is(err, context.Canceled), "canceled admission = %v, want a context error", err)
+		testassert.Require(t, stub.lastCall().ctx.Err() != nil, "preparation context was not canceled with the caller")
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 0 || len(regs) != 1 {
-			t.Fatalf("canceled preparation published entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 0 && len(regs) == 1, "canceled preparation published entries %v registers %v", entries, regs)
 		close(gate)
 	})
 
@@ -600,12 +518,8 @@ func TestAdmissionPreparationContract(t *testing.T) {
 		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
 		tools[0].Parameters = json.RawMessage(`{"type":"string"}`)
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if string(rec.Admission.Execution.Tools[0].Parameters) != `{"type":"object"}` {
-			t.Fatalf("durable capture shares tool bytes with the caller: %q", rec.Admission.Execution.Tools[0].Parameters)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(rec.Admission.Execution.Tools[0].Parameters) == `{"type":"object"}`, "durable capture shares tool bytes with the caller: %q", rec.Admission.Execution.Tools[0].Parameters)
 	})
 }
 
@@ -624,8 +538,9 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		first := make(chan struct{}, 1)
 		go func() {
-			if _, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("first"), Mode: MessageModeRegular}); err != nil {
-				t.Errorf("first admission: %v", err)
+			{
+				_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("first"), Mode: MessageModeRegular})
+				testassert.Check(t, err == nil, "first admission: %v", err)
 			}
 			first <- struct{}{}
 		}()
@@ -633,8 +548,9 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 
 		readDone := make(chan struct{}, 1)
 		go func() {
-			if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil {
-				t.Errorf("ReadSession during preparation: %v", err)
+			{
+				_, err := h.ReadSessionHeader(context.Background(), testSessionID)
+				testassert.Check(t, err == nil, "ReadSession during preparation: %v", err)
 			}
 			readDone <- struct{}{}
 		}()
@@ -647,23 +563,18 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		second := make(chan struct{}, 1)
 		go func() {
 			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("second"), Mode: MessageModeRegular})
-			if err != nil {
-				t.Errorf("second admission: %v", err)
-			}
-			if res.Disposition != DispositionExisting || res.Operation == nil {
-				t.Errorf("second admission disposition = %q, want existing", res.Disposition)
-			}
-			if res.Operation != nil && res.Operation.Admission.AdmittedAt != firstAdmittedAt(t, h, testSessionID, testOpID) {
-				t.Errorf("second admission returned a different operation")
-			}
+			testassert.Check(t, err == nil, "second admission: %v", err)
+			testassert.Check(t, res.Disposition == DispositionExisting && res.Operation != nil, "second admission disposition = %q, want existing", res.Disposition)
+			testassert.Check(t, res.Operation == nil || res.Operation.Admission.AdmittedAt == firstAdmittedAt(t, h, testSessionID, testOpID), "second admission returned a different operation")
 			second <- struct{}{}
 		}()
 
 		close(gate)
 		<-first
 		<-second
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one: the blocked admission must not prepare again", got)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 1)
 		}
 	})
 
@@ -681,20 +592,17 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		}()
 		<-stub.arrived
 
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return foreignAgentTypeChange(tx, testSessionID, "foreign")
-		}); err != nil {
-			t.Fatalf("foreign mutation: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return foreignAgentTypeChange(tx, testSessionID, "foreign")
+			})
+			testassert.NoError(t, err)
 		}
 		close(gate)
 		err := <-done
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("raced admission = %v, want ErrConflict", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrConflict), "raced admission = %v, want ErrConflict", err)
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 2 {
-			t.Fatalf("conflicted admission published entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 0 && len(regs) == 1 && regs[0].Revision == 2, "conflicted admission published entries %v registers %v", entries, regs)
 	})
 
 	t.Run("agent-type change during preparation affects later admission only", func(t *testing.T) {
@@ -707,12 +615,8 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		admitted := make(chan struct{}, 1)
 		go func() {
 			res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
-			if err != nil {
-				t.Errorf("admission: %v", err)
-			}
-			if res.Disposition != DispositionAdmitted || res.Operation == nil || res.Operation.Admission.AgentType != "coder" {
-				t.Errorf("admitted operation = %+v disposition %q", res.Operation, res.Disposition)
-			}
+			testassert.Check(t, err == nil, "admission: %v", err)
+			testassert.Check(t, res.Disposition == DispositionAdmitted && res.Operation != nil && res.Operation.Admission.AgentType == "coder", "admitted operation = %+v disposition %q", res.Operation, res.Disposition)
 			admitted <- struct{}{}
 		}()
 		<-stub.arrived
@@ -720,12 +624,8 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		changed := make(chan struct{}, 1)
 		go func() {
 			rec, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
-			if err != nil {
-				t.Errorf("ChangeAgentType: %v", err)
-			}
-			if rec.State.CurrentAgentType != "reviewer" {
-				t.Errorf("changed session = %+v", rec.State)
-			}
+			testassert.Check(t, err == nil, "ChangeAgentType: %v", err)
+			testassert.Check(t, rec.State.CurrentAgentType == "reviewer", "changed session = %+v", rec.State)
 			changed <- struct{}{}
 		}()
 
@@ -733,25 +633,17 @@ func TestAdmissionReservationAndRaces(t *testing.T) {
 		<-admitted
 		<-changed
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.Admission.AgentType != "coder" {
-			t.Fatalf("admitted operation agent type = %q, want the capture-time value", rec.Admission.AgentType)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, rec.Admission.AgentType, "coder")
 		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil || session.CurrentAgentType != "reviewer" {
-			t.Fatalf("session agent type = %+v err %v", session, err)
-		}
+		testassert.Require(t, err == nil && session.CurrentAgentType == "reviewer", "session agent type = %+v err %v", session, err)
 	})
 }
 
 func firstAdmittedAt(t *testing.T, h *Harness, sessionID, operationID string) time.Time {
 	t.Helper()
 	rec, err := h.ReadOperation(context.Background(), sessionID, operationID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
+	testassert.NoError(t, err)
 	return rec.Admission.AdmittedAt
 }
 
@@ -792,16 +684,13 @@ func TestAdmissionPartialFailurePublishesNothing(t *testing.T) {
 			}
 			h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("x"), Mode: MessageModeRegular})
-			if err != injected {
-				t.Fatalf("admission error = %v, want the injected failure", err)
-			}
+			testassert.Equal(t, err, injected)
 			entries, regs := storedSessionState(store, testSessionID)
-			if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 1 {
-				t.Fatalf("partial failure published entries %v registers %v", entries, regs)
-			}
+			testassert.Require(t, len(entries) == 0 && len(regs) == 1 && regs[0].Revision == 1, "partial failure published entries %v registers %v", entries, regs)
 			store.txHook = nil
-			if _, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("x")); disposition != DispositionAdmitted {
-				t.Fatalf("retry disposition = %q", disposition)
+			{
+				_, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
+				testassert.Equal(t, disposition, DispositionAdmitted)
 			}
 		})
 	}
@@ -819,26 +708,17 @@ func TestAdmissionIdempotency(t *testing.T) {
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
 		first, firstDisp := mustAdmit(t, h, testSessionID, testOpID, admissionContent("first"))
-		if firstDisp != DispositionAdmitted {
-			t.Fatalf("first disposition = %q", firstDisp)
-		}
+		testassert.Equal(t, firstDisp, DispositionAdmitted)
 		retry, retryDisp := mustAdmit(t, h, testSessionID, testOpID, admissionContent("second"))
-		if retryDisp != DispositionExisting {
-			t.Fatalf("retry disposition = %q, want existing", retryDisp)
-		}
-		if retry.Admission.AdmittedEntry != first.Admission.AdmittedEntry || !retry.Admission.AdmittedAt.Equal(first.Admission.AdmittedAt) {
-			t.Fatalf("retry returned a different operation: %+v vs %+v", retry, first)
-		}
+		testassert.Equal(t, retryDisp, DispositionExisting)
+		testassert.Require(t, retry.Admission.AdmittedEntry == first.Admission.AdmittedEntry && retry.Admission.AdmittedAt.Equal(first.Admission.AdmittedAt), "retry returned a different operation: %+v vs %+v", retry, first)
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 1 || len(regs) != 2 {
-			t.Fatalf("retry published entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 1 && len(regs) == 2, "retry published entries %v registers %v", entries, regs)
 		decoded, err := decodeInputEntry(entries[0])
-		if err != nil || decoded.Content[0].Text != "first" {
-			t.Fatalf("retry replaced the first payload: %+v err %v", decoded, err)
-		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one", got)
+		testassert.Require(t, err == nil && decoded.Content[0].Text == "first", "retry replaced the first payload: %+v err %v", decoded, err)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 1)
 		}
 	})
 
@@ -856,30 +736,21 @@ func TestAdmissionIdempotency(t *testing.T) {
 				// A concurrent admission of the same identity wins: it
 				// publishes the full input, operation, and session state
 				// directly into storage.
-				if err := store.Transact(context.Background(), func(tx Transaction) error {
-					return insertForeignAdmission(t, tx, testSessionID, testOpID)
-				}); err != nil {
-					t.Fatalf("foreign admission: %v", err)
+				{
+					err := store.Transact(context.Background(), func(tx Transaction) error {
+						return insertForeignAdmission(t, tx, testSessionID, testOpID)
+					})
+					testassert.NoError(t, err)
 				}
 			},
 			check: func(t *testing.T, store *graphStorage, h *Harness, _ string, _ int64, res SubmitResult, err error) {
-				if err != nil {
-					t.Fatalf("raced admission: %v", err)
-				}
-				if res.Disposition != DispositionExisting {
-					t.Fatalf("raced admission disposition = %q, want existing", res.Disposition)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, res.Disposition, DispositionExisting)
 				entries, regs := storedSessionState(store, testSessionID)
-				if len(entries) != 1 || len(regs) != 2 {
-					t.Fatalf("raced admission published entries %v registers %v", entries, regs)
-				}
+				testassert.Require(t, len(entries) == 1 && len(regs) == 2, "raced admission published entries %v registers %v", entries, regs)
 				rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-				if err != nil {
-					t.Fatalf("ReadOperation: %v", err)
-				}
-				if rec.Admission.Execution.ConfigurationRevision != testCapture().ConfigurationRevision {
-					t.Fatalf("raced admission returned the wrong operation: %+v", rec)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, rec.Admission.Execution.ConfigurationRevision == testCapture().ConfigurationRevision, "raced admission returned the wrong operation: %+v", rec)
 			},
 		},
 		{
@@ -889,51 +760,41 @@ func TestAdmissionIdempotency(t *testing.T) {
 				// caller ID, with its typed settlement and no Session-register
 				// change.
 				settlementID := hexID(60)
-				if err := store.Transact(context.Background(), func(tx Transaction) error {
-					settlement, err := encodeOperationSettlementEntry(operationSettlementEntry{
-						SessionID: testSessionID, EntryID: settlementID, OperationID: testOpID, Status: OperationSuccess,
+				{
+					err := store.Transact(context.Background(), func(tx Transaction) error {
+						settlement, err := encodeOperationSettlementEntry(operationSettlementEntry{
+							SessionID: testSessionID, EntryID: settlementID, OperationID: testOpID, Status: OperationSuccess,
+						})
+						if err != nil {
+							return err
+						}
+						if _, err := tx.InsertEntry(EntryDraft{SessionID: testSessionID, ID: settlementID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: settlement}); err != nil {
+							return err
+						}
+						winner := compactOperationRecord(testOpID)
+						stamped := testTime
+						winner.State.Status = OperationSuccess
+						winner.State.SettledAt = &stamped
+						winner.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: settlementID}}
+						payload, err := encodeOperationRegister(winner)
+						if err != nil {
+							return err
+						}
+						_, err = tx.InsertRegister(RegisterDraft{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: payload})
+						return err
 					})
-					if err != nil {
-						return err
-					}
-					if _, err := tx.InsertEntry(EntryDraft{SessionID: testSessionID, ID: settlementID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: settlement}); err != nil {
-						return err
-					}
-					winner := compactOperationRecord(testOpID)
-					stamped := testTime
-					winner.State.Status = OperationSuccess
-					winner.State.SettledAt = &stamped
-					winner.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: settlementID}}
-					payload, err := encodeOperationRegister(winner)
-					if err != nil {
-						return err
-					}
-					_, err = tx.InsertRegister(RegisterDraft{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: payload})
-					return err
-				}); err != nil {
-					t.Fatalf("compact winner: %v", err)
+					testassert.NoError(t, err)
 				}
 			},
 			check: func(t *testing.T, store *graphStorage, _ *Harness, _ string, _ int64, _ SubmitResult, err error) {
-				if !errors.Is(err, ErrInvalid) {
-					t.Fatalf("raced admission = %v, want the wrong-kind rejection", err)
-				}
+				testassert.Require(t, errors.Is(err, ErrInvalid), "raced admission = %v, want the wrong-kind rejection", err)
 				entries, regs := storedSessionState(store, testSessionID)
-				if len(entries) != 1 || entries[0].ID != hexID(60) {
-					t.Fatalf("raced admission published %v, want no extra input beside the winner's settlement", entries)
-				}
-				if len(regs) != 2 {
-					t.Fatalf("raced admission published %d registers, want only the session and the winner", len(regs))
-				}
+				testassert.Require(t, len(entries) == 1 && entries[0].ID == hexID(60), "raced admission published %v, want no extra input beside the winner's settlement", entries)
+				testassert.Equal(t, len(regs), 2)
 				wire, ok := registerLookup(regs, RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID})
-				if !ok {
-					t.Fatalf("the compact winner's register vanished")
-				}
+				testassert.Require(t, ok, "the compact winner's register vanished")
 				rec, err := decodeOperationRegister(wire)
-				if err != nil || rec.Admission.RequestKind != RequestKindCompact ||
-					rec.State.Terminal == nil || rec.State.Terminal.SettlementEntry.EntryID != hexID(60) {
-					t.Fatalf("winner rewritten = %+v err %v, want the compact terminal untouched", rec, err)
-				}
+				testassert.Require(t, err == nil && rec.Admission.RequestKind == RequestKindCompact && rec.State.Terminal != nil && rec.State.Terminal.SettlementEntry.EntryID == hexID(60), "winner rewritten = %+v err %v, want the compact terminal untouched", rec, err)
 			},
 		},
 		{
@@ -941,37 +802,29 @@ func TestAdmissionIdempotency(t *testing.T) {
 			seed: func(t *testing.T, store *graphStorage, _ *Harness, other string) {
 				// The winner lands in its own Session and changes only that
 				// Session.
-				if err := store.Transact(context.Background(), func(tx Transaction) error {
-					return insertForeignAdmission(t, tx, other, testOpID)
-				}); err != nil {
-					t.Fatalf("foreign admission: %v", err)
+				{
+					err := store.Transact(context.Background(), func(tx Transaction) error {
+						return insertForeignAdmission(t, tx, other, testOpID)
+					})
+					testassert.NoError(t, err)
 				}
 			},
 			check: func(t *testing.T, store *graphStorage, _ *Harness, other string, baseRevision int64, _ SubmitResult, err error) {
-				if !errors.Is(err, ErrInvalid) {
-					t.Fatalf("raced admission = %v, want the foreign-identity rejection", err)
-				}
+				testassert.Require(t, errors.Is(err, ErrInvalid), "raced admission = %v, want the foreign-identity rejection", err)
 				entries, _ := storedSessionState(store, testSessionID)
-				if len(entries) != 0 {
-					t.Fatalf("raced admission published %v, want no extra input", entries)
-				}
+				testassert.Require(t, len(entries) == 0, "raced admission published %v, want no extra input", entries)
 				_, otherRegs := storedSessionState(store, other)
 				otherWire, ok := registerLookup(otherRegs, RegisterKey{SessionID: other, Kind: RegisterOperation, OperationID: testOpID})
-				if !ok {
-					t.Fatalf("the foreign winner is not durable in its own Session")
-				}
-				if otherRec, err := decodeOperationRegister(otherWire); err != nil || otherRec.Admission.SessionID != other {
-					t.Fatalf("foreign winner = %+v err %v, want it owned by its own Session", otherRec, err)
+				testassert.Require(t, ok, "the foreign winner is not durable in its own Session")
+				{
+					otherRec, err := decodeOperationRegister(otherWire)
+					testassert.Require(t, err == nil && otherRec.Admission.SessionID == other, "foreign winner = %+v err %v, want it owned by its own Session", otherRec, err)
 				}
 				_, regs := storedSessionState(store, testSessionID)
 				wire, ok := registerLookup(regs, RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
-				if !ok {
-					t.Fatalf("the session register vanished")
-				}
+				testassert.Require(t, ok, "the session register vanished")
 				current, err := decodeSessionRegister(wire)
-				if err != nil || current.Revision != baseRevision {
-					t.Fatalf("this Session changed = %+v err %v (revision %d, was %d), want the foreign winner confined to its own Session", current, err, current.Revision, baseRevision)
-				}
+				testassert.Require(t, err == nil && current.Revision == baseRevision, "this Session changed = %+v err %v (revision %d, was %d), want the foreign winner confined to its own Session", current, err, current.Revision, baseRevision)
 			},
 		},
 	} {
@@ -982,9 +835,7 @@ func TestAdmissionIdempotency(t *testing.T) {
 			store := freshSessionStore(t)
 			h := newTestHarness(t, store, stub.prepare)
 			created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-			if err != nil {
-				t.Fatalf("CreateSession: %v", err)
-			}
+			testassert.NoError(t, err)
 			other := created.Identity.SessionID
 
 			type outcome struct {
@@ -1003,19 +854,16 @@ func TestAdmissionIdempotency(t *testing.T) {
 
 			_, baseRegs := storedSessionState(store, testSessionID)
 			baseWire, ok := registerLookup(baseRegs, RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
-			if !ok {
-				t.Fatalf("the session register vanished")
-			}
+			testassert.Require(t, ok, "the session register vanished")
 			base, err := decodeSessionRegister(baseWire)
-			if err != nil {
-				t.Fatalf("decode session register: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			tc.seed(t, store, h, other)
 			close(gate)
 			out := <-done
-			if got := stub.callCount(); got != 1 {
-				t.Fatalf("preparation calls = %d, want one", got)
+			{
+				got := stub.callCount()
+				testassert.Equal(t, got, 1)
 			}
 			tc.check(t, store, h, other, base.Revision, out.res, out.err)
 		})
@@ -1026,17 +874,11 @@ func TestAdmissionIdempotency(t *testing.T) {
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 		mustAdmit(t, h, testSessionID, "shared-op", admissionContent("x"))
 		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-		if err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		_, err = h.Submit(context.Background(), SubmitRequest{SessionID: created.Identity.SessionID, OperationID: "shared-op", Origin: InputOriginUser, Content: admissionContent("y"), Mode: MessageModeRegular})
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("cross-session reuse = %v, want ErrInvalid", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid), "cross-session reuse = %v, want ErrInvalid", err)
 		entries, regs := storedSessionState(store, created.Identity.SessionID)
-		if len(entries) != 0 || len(regs) != 1 {
-			t.Fatalf("rejected reuse published entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 0 && len(regs) == 1, "rejected reuse published entries %v registers %v", entries, regs)
 	})
 
 }
@@ -1167,66 +1009,58 @@ func TestAdmissionRechecksPreconditionsAfterReservation(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
-			t.Fatalf("ReadHistoryView: %v", err)
+		leaseCoordinator(t, h, testSessionID) // the controlled warm view the foreign write races
+		// a real history use under the held lease
+		{
+			_, err := h.ReadHistoryView(context.Background(), testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return foreignArchiveChange(tx, testSessionID)
-		}); err != nil {
-			t.Fatalf("foreign archive: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return foreignArchiveChange(tx, testSessionID)
+			})
+			testassert.NoError(t, err)
 		}
 		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("admission over a foreign archive = %v, want ErrInvalid", err)
-		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one: preparation may run against the stale view", got)
+		testassert.Require(t, errors.Is(err, ErrInvalid), "admission over a foreign archive = %v, want ErrInvalid", err)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 1)
 		}
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 2 {
-			t.Fatalf("refused admission left entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 0 && len(regs) == 1 && regs[0].Revision == 2, "refused admission left entries %v registers %v", entries, regs)
 		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if session.Lifecycle != LifecycleArchived {
-			t.Fatalf("read session kept the stale view: %+v", session)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, session.Lifecycle == LifecycleArchived, "read session kept the stale view: %+v", session)
 	})
 
 	t.Run("foreign committed running operation refuses at commit", func(t *testing.T) {
 		store := freshSessionStore(t)
 		stub := newPrepareStub(validPrepared())
 		h := newTestHarness(t, store, stub.prepare)
-		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
-			t.Fatalf("ReadHistoryView: %v", err)
+		leaseCoordinator(t, h, testSessionID) // the controlled warm view the foreign write races
+		// a real history use under the held lease
+		{
+			_, err := h.ReadHistoryView(context.Background(), testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return insertForeignAdmission(t, tx, testSessionID, "foreign-op")
-		}); err != nil {
-			t.Fatalf("foreign admission: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return insertForeignAdmission(t, tx, testSessionID, "foreign-op")
+			})
+			testassert.NoError(t, err)
 		}
 		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("admission over a foreign running operation = %v, want ErrInvalid", err)
-		}
-		if got := stub.callCount(); got != 1 {
-			t.Fatalf("preparation calls = %d, want one: preparation may run against the stale view", got)
+		testassert.Require(t, errors.Is(err, ErrInvalid), "admission over a foreign running operation = %v, want ErrInvalid", err)
+		{
+			got := stub.callCount()
+			testassert.Equal(t, got, 1)
 		}
 		entries, regs := storedSessionState(store, testSessionID)
-		if len(entries) != 1 || len(regs) != 2 {
-			t.Fatalf("refused admission left entries %v registers %v", entries, regs)
-		}
+		testassert.Require(t, len(entries) == 1 && len(regs) == 2, "refused admission left entries %v registers %v", entries, regs)
 		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if session.CurrentOperationID != "foreign-op" {
-			t.Fatalf("read session kept the stale view: %+v", session)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, session.CurrentOperationID == "foreign-op", "read session kept the stale view: %+v", session)
 	})
 }
 
@@ -1247,46 +1081,44 @@ func TestForeignChangeRefreshesTheView(t *testing.T) {
 			done <- err
 		}()
 		<-stub.arrived
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return foreignAgentTypeChange(tx, testSessionID, "foreign")
-		}); err != nil {
-			t.Fatalf("foreign mutation: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return foreignAgentTypeChange(tx, testSessionID, "foreign")
+			})
+			testassert.NoError(t, err)
 		}
 		close(gate)
-		if err := <-done; !errors.Is(err, ErrConflict) {
-			t.Fatalf("raced admission = %v, want ErrConflict", err)
+		{
+			err := <-done
+			testassert.Require(t, errors.Is(err, ErrConflict), "raced admission = %v, want ErrConflict", err)
 		}
 		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if session.CurrentAgentType != "foreign" {
-			t.Fatalf("read session kept the stale view: %+v", session)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, session.CurrentAgentType == "foreign", "read session kept the stale view: %+v", session)
 	})
 
 	t.Run("failed agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		leaseCoordinator(t, h, testSessionID)                                             // the controlled warm view the foreign write races
-		if _, err := h.ReadHistoryView(context.Background(), testSessionID); err != nil { // a real history use under the held lease
-			t.Fatalf("ReadHistoryView: %v", err)
+		leaseCoordinator(t, h, testSessionID) // the controlled warm view the foreign write races
+		// a real history use under the held lease
+		{
+			_, err := h.ReadHistoryView(context.Background(), testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := store.Transact(context.Background(), func(tx Transaction) error {
-			return foreignAgentTypeChange(tx, testSessionID, "foreign")
-		}); err != nil {
-			t.Fatalf("foreign mutation: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error {
+				return foreignAgentTypeChange(tx, testSessionID, "foreign")
+			})
+			testassert.NoError(t, err)
 		}
-		if _, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer"); !errors.Is(err, ErrConflict) {
-			t.Fatalf("raced change = %v, want ErrConflict", err)
+		{
+			_, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
+			testassert.Require(t, errors.Is(err, ErrConflict), "raced change = %v, want ErrConflict", err)
 		}
 		session, err := h.ReadSessionHeader(context.Background(), testSessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if session.CurrentAgentType != "foreign" {
-			t.Fatalf("read session kept the stale view: %+v", session)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, session.CurrentAgentType == "foreign", "read session kept the stale view: %+v", session)
 	})
 }
 
@@ -1311,9 +1143,7 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 	stub.ignoreCtx = true // preparation completes despite the canceled harness context
 	store := freshSessionStore(t)
 	h, err := New(harnessCtx, Dependencies{Storage: store, Prepare: stub.prepare})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	done := make(chan error, 1)
 	go func() {
@@ -1324,16 +1154,10 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 	cancelHarness()
 	close(gate)
 	err = <-done
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("admission over a canceled harness context = %v, want a context error", err)
-	}
-	if opens != 0 {
-		t.Fatalf("opener calls = %d, want a failed publication to discard the prepared values without opening", opens)
-	}
+	testassert.Require(t, errors.Is(err, context.Canceled), "admission over a canceled harness context = %v, want a context error", err)
+	testassert.Equal(t, opens, 0)
 	entries, regs := storedSessionState(store, testSessionID)
-	if len(entries) != 0 || len(regs) != 1 || regs[0].Revision != 1 {
-		t.Fatalf("canceled publication left entries %v registers %v", entries, regs)
-	}
+	testassert.Require(t, len(entries) == 0 && len(regs) == 1 && regs[0].Revision == 1, "canceled publication left entries %v registers %v", entries, regs)
 }
 
 // TestReadOperationReturnsOwnedRecords proves every pointer field of a
@@ -1344,39 +1168,25 @@ func TestReadOperationReturnsOwnedRecords(t *testing.T) {
 		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
 		h := newTestHarness(t, fixture.storage(t), nil)
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
+		testassert.NoError(t, err)
 		rec.State.ActiveEffect.Kind = EffectTool
 		rec.State.ActiveEffect.ResultEntryID = hexID(9)
 		again, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("re-read: %v", err)
-		}
-		if again.State.ActiveEffect == nil || again.State.ActiveEffect.Kind != EffectModel || again.State.ActiveEffect.ResultEntryID != hexID(3) {
-			t.Fatalf("returned record shares the active effect with the coordinator view: %+v", again.State.ActiveEffect)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, again.State.ActiveEffect != nil && again.State.ActiveEffect.Kind == EffectModel && again.State.ActiveEffect.ResultEntryID == hexID(3), "returned record shares the active effect with the coordinator view: %+v", again.State.ActiveEffect)
 	})
 
 	t.Run("terminal pointers", func(t *testing.T) {
 		h := newTestHarness(t, terminalTestGraph().storage(t), nil)
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
+		testassert.NoError(t, err)
 		other := testTime.Add(time.Hour)
 		*rec.State.SettledAt = other
 		rec.State.Terminal.Detail = "tampered"
 		rec.State.Terminal.SettlementEntry.EntryID = hexID(9)
 		again, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("re-read: %v", err)
-		}
-		if again.State.SettledAt == nil || !again.State.SettledAt.Equal(testTime) ||
-			again.State.Terminal == nil || again.State.Terminal.Detail != "" ||
-			again.State.Terminal.SettlementEntry.EntryID != hexID(3) {
-			t.Fatalf("returned record shares terminal pointers with the coordinator view: %+v", again.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, again.State.SettledAt != nil && again.State.SettledAt.Equal(testTime) && again.State.Terminal != nil && again.State.Terminal.Detail == "" && again.State.Terminal.SettlementEntry.EntryID == hexID(3), "returned record shares terminal pointers with the coordinator view: %+v", again.State)
 	})
 }
 
@@ -1386,8 +1196,9 @@ func TestAdmissionOwnsInputContent(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 	content := []model.ContentPart{{Kind: model.PartText, Text: "hello", Extra: model.Extra{"k": json.RawMessage(`"v"`)}}}
-	if _, disposition := mustAdmit(t, h, testSessionID, testOpID, content); disposition != DispositionAdmitted {
-		t.Fatalf("disposition = %q", disposition)
+	{
+		_, disposition := mustAdmit(t, h, testSessionID, testOpID, content)
+		testassert.Equal(t, disposition, DispositionAdmitted)
 	}
 	content[0].Text = "tampered"
 	content[0].Extra["k"] = json.RawMessage(`"tampered"`)
@@ -1397,9 +1208,7 @@ func TestAdmissionOwnsInputContent(t *testing.T) {
 	c.mu.Lock()
 	entry := *c.graph.Entries[0].Input
 	c.mu.Unlock()
-	if entry.Content[0].Text != "hello" || string(entry.Content[0].Extra["k"]) != `"v"` {
-		t.Fatalf("coordinator view shares input content with the caller: %+v", entry.Content)
-	}
+	testassert.Require(t, entry.Content[0].Text == "hello" && string(entry.Content[0].Extra["k"]) == `"v"`, "coordinator view shares input content with the caller: %+v", entry.Content)
 }
 
 // TestReadOperationValidatesIdentity proves an empty operation identity is
@@ -1407,11 +1216,13 @@ func TestAdmissionOwnsInputContent(t *testing.T) {
 func TestReadOperationValidatesIdentity(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
-	if _, err := h.ReadOperation(context.Background(), testSessionID, ""); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("empty operation id = %v, want ErrInvalid", err)
+	{
+		_, err := h.ReadOperation(context.Background(), testSessionID, "")
+		testassert.Require(t, errors.Is(err, ErrInvalid), "empty operation id = %v, want ErrInvalid", err)
 	}
-	if _, err := h.ReadOperation(context.Background(), testSessionID, "op-ghost"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("absent operation id = %v, want ErrNotFound", err)
+	{
+		_, err := h.ReadOperation(context.Background(), testSessionID, "op-ghost")
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent operation id = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1424,8 +1235,9 @@ func TestReadOperationValidatesIdentity(t *testing.T) {
 func TestAdmitExistingBeforeLifecycle(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-	if _, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("first")); disposition != DispositionAdmitted {
-		t.Fatalf("first disposition = %q", disposition)
+	{
+		_, disposition := mustAdmit(t, h, testSessionID, testOpID, admissionContent("first"))
+		testassert.Equal(t, disposition, DispositionAdmitted)
 	}
 	h.mu.Lock()
 	c := h.sessions[testSessionID]
@@ -1437,12 +1249,8 @@ func TestAdmitExistingBeforeLifecycle(t *testing.T) {
 	c.mu.Unlock()
 
 	res, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Content: admissionContent("retry"), Mode: MessageModeRegular})
-	if err != nil {
-		t.Fatalf("retry on an archived session = %v, want the existing Operation", err)
-	}
-	if res.Disposition != DispositionExisting || res.Operation == nil {
-		t.Fatalf("retry disposition = %q, want existing", res.Disposition)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Disposition == DispositionExisting && res.Operation != nil, "retry disposition = %q, want existing", res.Disposition)
 }
 
 // TestAdmitDeadContextSkipsPreparation proves a dead combined context never
@@ -1452,21 +1260,16 @@ func TestAdmitDeadContextSkipsPreparation(t *testing.T) {
 	stub := newPrepareStub(validPrepared())
 	store := freshSessionStore(t)
 	h, err := New(harnessCtx, Dependencies{Storage: store, Prepare: stub.prepare})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 	cancelHarness() // the harness context dies after construction, before admission
 	_, admitErr := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
-	if !errors.Is(admitErr, context.Canceled) {
-		t.Fatalf("admission over a dead harness context = %v, want a context error", admitErr)
-	}
-	if got := stub.callCount(); got != 0 {
-		t.Fatalf("preparation calls = %d, want zero: a dead context must not invoke Prepare", got)
+	testassert.Require(t, errors.Is(admitErr, context.Canceled), "admission over a dead harness context = %v, want a context error", admitErr)
+	{
+		got := stub.callCount()
+		testassert.Equal(t, got, 0)
 	}
 	entries, regs := storedSessionState(store, testSessionID)
-	if len(entries) != 0 || len(regs) != 1 {
-		t.Fatalf("dead-context admission left entries %v registers %v", entries, regs)
-	}
+	testassert.Require(t, len(entries) == 0 && len(regs) == 1, "dead-context admission left entries %v registers %v", entries, regs)
 }
 
 // foreignCorruptRevision bumps one Session register to a new valid revision and
@@ -1501,36 +1304,39 @@ func TestRefreshReturnsDiscoveredCorruption(t *testing.T) {
 	t.Run("admission", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
-			t.Fatalf("ReadSession: %v", err)
+		// materialize revision 1
+		{
+			_, err := h.ReadSessionHeader(context.Background(), testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) }); err != nil {
-			t.Fatalf("foreign corrupt revision: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) })
+			testassert.NoError(t, err)
 		}
 		_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginUser, Mode: MessageModeRegular})
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("admission over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
-		}
-		if _, rerr := h.ReadSessionHeader(context.Background(), testSessionID); !errors.As(rerr, &corrupt) {
-			t.Fatalf("subsequent read = %v, want the marked CorruptionError", rerr)
+		testassert.Require(t, errors.As(err, &corrupt), "admission over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
+		{
+			_, rerr := h.ReadSessionHeader(context.Background(), testSessionID)
+			testassert.Require(t, errors.As(rerr, &corrupt), "subsequent read = %v, want the marked CorruptionError", rerr)
 		}
 	})
 
 	t.Run("agent-type change", func(t *testing.T) {
 		store := freshSessionStore(t)
 		h := newTestHarness(t, store, nil)
-		if _, err := h.ReadSessionHeader(context.Background(), testSessionID); err != nil { // materialize revision 1
-			t.Fatalf("ReadSession: %v", err)
+		// materialize revision 1
+		{
+			_, err := h.ReadSessionHeader(context.Background(), testSessionID)
+			testassert.NoError(t, err)
 		}
-		if err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) }); err != nil {
-			t.Fatalf("foreign corrupt revision: %v", err)
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error { return foreignCorruptRevision(tx, testSessionID) })
+			testassert.NoError(t, err)
 		}
 		_, err := h.ChangeAgentType(context.Background(), testSessionID, "reviewer")
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("agent-type change over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
-		}
+		testassert.Require(t, errors.As(err, &corrupt), "agent-type change over a corrupt foreign revision = %v, want the discovered CorruptionError", err)
 	})
 }
 
@@ -1545,12 +1351,8 @@ func TestOwnCaptureDropsZeroLengthBacking(t *testing.T) {
 	mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
 	_ = append(tools, testToolDefinition()) // the caller reuses its backing after admission
 	rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.Admission.Execution.Tools != nil {
-		t.Fatalf("admitted capture retained the caller's zero-length backing: %+v", rec.Admission.Execution.Tools)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.Admission.Execution.Tools == nil, "admitted capture retained the caller's zero-length backing: %+v", rec.Admission.Execution.Tools)
 }
 
 // TestOwnCaptureOwnsCapabilitySelection proves the admitted capture keeps the
@@ -1568,12 +1370,8 @@ func TestOwnCaptureOwnsCapabilitySelection(t *testing.T) {
 		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
 		_ = append(capabilities, "ghost") // the caller reuses its backing after admission
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.Admission.Execution.Capabilities != nil {
-			t.Fatalf("admitted capture retained the caller's zero-length capability backing: %+v", rec.Admission.Execution.Capabilities)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.Admission.Execution.Capabilities == nil, "admitted capture retained the caller's zero-length capability backing: %+v", rec.Admission.Execution.Capabilities)
 	})
 
 	t.Run("caller mutation after admission", func(t *testing.T) {
@@ -1584,12 +1382,8 @@ func TestOwnCaptureOwnsCapabilitySelection(t *testing.T) {
 		mustAdmit(t, h, testSessionID, testOpID, admissionContent("x"))
 		capabilities[0] = "tampered"
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if len(rec.Admission.Execution.Capabilities) != 1 || rec.Admission.Execution.Capabilities[0] != "cap-a" {
-			t.Fatalf("admitted capture aliases the caller's capability selection: %+v", rec.Admission.Execution.Capabilities)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(rec.Admission.Execution.Capabilities) == 1 && rec.Admission.Execution.Capabilities[0] == "cap-a", "admitted capture aliases the caller's capability selection: %+v", rec.Admission.Execution.Capabilities)
 	})
 }
 
@@ -1601,19 +1395,11 @@ func TestAdmittedOperationCarriesRegisterRevision(t *testing.T) {
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
 
 	rec, disposition := mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
-	if disposition != DispositionAdmitted {
-		t.Fatalf("disposition = %q, want admitted", disposition)
-	}
-	if rec.Revision != 1 {
-		t.Fatalf("admitted operation revision = %d, want the register revision assigned at insert", rec.Revision)
-	}
+	testassert.Equal(t, disposition, DispositionAdmitted)
+	testassert.Equal(t, rec.Revision, 1)
 	viewed, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if viewed.Revision != 1 {
-		t.Fatalf("coordinator-view operation revision = %d, want the register revision assigned at insert", viewed.Revision)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, viewed.Revision, 1)
 }
 
 // corruptGateStore wraps one Storage and parks its first ReadRegisters call
@@ -1669,7 +1455,7 @@ func (s *corruptGateStore) readCount() int {
 func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	store := freshSessionStore(t)
 	validRaw, err := encodeSessionRegister(validSessionRecord())
-	mustEncode(t, err)
+	testassert.NoError(t, err)
 	gate := &corruptGateStore{
 		Storage: store,
 		entered: make(chan struct{}),
@@ -1701,8 +1487,9 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	// The concurrent acquirer never started a second load: it waited on the
 	// stable cell and observed the same load's outcome.
 	wantCorruption(t, <-sharedErr)
-	if got := gate.readCount(); got != 1 {
-		t.Fatalf("register reads for two concurrent first acquisitions = %d, want the one shared load", got)
+	{
+		got := gate.readCount()
+		testassert.Equal(t, got, 1)
 	}
 	wantCorruption(t, func() error {
 		_, err := h.ReadSessionHeader(context.Background(), testSessionID)
@@ -1714,10 +1501,9 @@ func TestConcurrentMaterializationSticksDiscoveredCorruption(t *testing.T) {
 	}())
 
 	sibling, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession with a corrupt sibling: %v", err)
-	}
-	if _, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID); err != nil {
-		t.Fatalf("valid sibling session unreadable: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := h.ReadSessionHeader(context.Background(), sibling.Identity.SessionID)
+		testassert.NoError(t, err)
 	}
 }

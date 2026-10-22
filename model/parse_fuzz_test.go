@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // FuzzParseStreamChunk exercises the fixed parser's invariants over arbitrary bytes: it must never panic, every failure is a protocol error wrapping ErrProtocol with nothing else leaking through untyped, and every successful parse yields a delta that passes its own accepting boundary (NewStreamDelta) — nonnegative positions throughout, closed content kinds, well-formed extras at all scopes. Seeds are the retained legacy fixture payloads ported inline as authoritative real-world wire shapes plus minimal malformed inputs so interesting coverage starts from corpus rather than cold mutation.
@@ -48,34 +50,36 @@ func FuzzParseStreamChunk(f *testing.F) { // fuzzing a pure function needs no se
 		delta, err := parseStreamChunkRaw(json.RawMessage(raw))
 
 		if err != nil {
-			if !errors.Is(err, ErrProtocol) { // every failure path in this function wraps the umbrella sentinel — a raw stdlib error escaping here would break upstream classification for ALL stream-level failures at once... (this single check is what makes "typed protocol errors only" an executable guarantee rather than a code-review promise).
-				t.Fatalf("parseStreamChunkRaw returned non-protocol error: %v", err) // full cause rendered so the exact un-wrapped path that leaked it is visible alongside its input bytes for direct reproduction.
-			}
+			// every failure path in this function wraps the umbrella sentinel — a raw stdlib error escaping here would break upstream classification for ALL stream-level failures at once... (this single check is what makes "typed protocol errors only" an executable guarantee rather than a code-review promise).
+			// full cause rendered so the exact un-wrapped path that leaked it is visible alongside its input bytes for direct reproduction.
+			testassert.Require(t, errors.Is(err, ErrProtocol), "parseStreamChunkRaw returned non-protocol error: %v", err)
 			return // successful-parse invariants below do not apply to failed parses — their contract IS the sentinel above and nothing more at this boundary... (further shape assertions on a zero delta would just re-encode what "error returned" already implies).
 		}
 
-		if _, derr := NewStreamDelta(delta); derr != nil { // THE accepting-boundary invariant: parser output must always be constructible through the public validation path — any drift between internal normalization and external contract (negative positions, open kinds, malformed extras) surfaces here instead of at some later assembly stage where it would be far harder to attribute... (this is what keeps "parser satisfies its own consumer's entry point" continuously proven rather than assumed after each edit).
-			t.Fatalf("successfully-parsed delta fails NewStreamDelta validation: %v", derr) // both the validating error and implicit input bytes via f.Fuzz reproduction make this immediately actionable without additional instrumentation.
+		// THE accepting-boundary invariant: parser output must always be constructible through the public validation path — any drift between internal normalization and external contract (negative positions, open kinds, malformed extras) surfaces here instead of at some later assembly stage where it would be far harder to attribute... (this is what keeps "parser satisfies its own consumer's entry point" continuously proven rather than assumed after each edit).
+		// both the validating error and implicit input bytes via f.Fuzz reproduction make this immediately actionable without additional instrumentation.
+		{
+			_, derr := NewStreamDelta(delta)
+			testassert.NoError(t, derr)
 		}
 
-		if delta.Usage != nil && delta.Usage.InputTokens < 0 { // usage normalization's single floor guarantees nonnegative UNCACHED input only; cached and output pass through as-reported signed ints with no range policy on either — pinning the floored field alone here keeps test space from inventing clamps the retained producer never had.
-			t.Fatalf("normalized uncached input carries a negative value: %+v", delta.Usage) // full struct rendered so any future regression on the one floored field is named directly against its original wire input for comparison.
-		}
+		// usage normalization's single floor guarantees nonnegative UNCACHED input only; cached and output pass through as-reported signed ints with no range policy on either — pinning the floored field alone here keeps test space from inventing clamps the retained producer never had.
+		// full struct rendered so any future regression on the one floored field is named directly against its original wire input for comparison.
+		testassert.Require(t, delta.Usage == nil || delta.Usage.InputTokens >= 0, "normalized uncached input carries a negative value: %+v", delta.Usage)
 
 		for i, frag := range delta.ContentFragments { // content positions are nonnegative by construction (array index / fixed zero); NewStreamDelta above already re-validates this but naming it here keeps THIS target's coverage explicit independent of that helper ever changing... (defense-in-depth across two validation layers is cheap insurance against one being weakened while the other compensates silently).
-			if frag.Position < 0 {
-				t.Fatalf("content fragment[%d] has negative position %d", i, frag.Position) // index included so multi-fragment payloads attribute their failure to its exact wire slot rather than requiring a re-run with verbose output enabled.
-			}
+			// index included so multi-fragment payloads attribute their failure to its exact wire slot rather than requiring a re-run with verbose output enabled.
+			testassert.Require(t, frag.Position >= 0, "content fragment[%d] has negative position %d", i, frag.Position)
 		}
 
 		for i, frag := range delta.ToolFragments { // tool-call positions are ALWAYS concrete non-nil values from parsed output (omission is normalized before any delta leaves the parser) — pinning nil-ness here catches a regression where normalization gets skipped for some mutated input shape table tests don't cover...
-			if frag.Position == nil || *frag.Position < 0 { // grouped as one condition since both halves describe THE SAME contract ("concrete nonnegative position always") from complementary angles: absence-of-normalization vs negative-value-escape.
-				t.Fatalf("tool call fragment[%d] lacks a concrete normalized position (nil or negative)", i) // names the exact invariant violated so future readers find its source rule quickly instead of re-deriving scope containment relationships from scratch during triage.
-			}
+			// grouped as one condition since both halves describe THE SAME contract ("concrete nonnegative position always") from complementary angles: absence-of-normalization vs negative-value-escape.
+			// names the exact invariant violated so future readers find its source rule quickly instead of re-deriving scope containment relationships from scratch during triage.
+			testassert.Require(t, frag.Position != nil && *frag.Position >= 0, "tool call fragment[%d] lacks a concrete normalized position (nil or negative)", i)
 		}
 
-		if len(delta.ToolFragments) > 0 && !delta.HasChoice { // tool fragments only ever accompany a present choice (they parse from inside that single first-choice's delta object) — the checkable direction of this correlation: fragments WITHOUT their enclosing choice marker would mean normalization ran on a scope whose parent was reported absent.
-			t.Fatalf("tool call fragments present without any choice in delta output") // names the exact invariant violated for direct attribution to its source rule during triage.
-		}
+		// tool fragments only ever accompany a present choice (they parse from inside that single first-choice's delta object) — the checkable direction of this correlation: fragments WITHOUT their enclosing choice marker would mean normalization ran on a scope whose parent was reported absent.
+		// names the exact invariant violated for direct attribution to its source rule during triage.
+		testassert.Require(t, len(delta.ToolFragments) <= 0 || delta.HasChoice, "tool call fragments present without any choice in delta output")
 	})
 }

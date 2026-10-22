@@ -21,12 +21,7 @@ import {
   unresolvedAssistantIDs,
   type ReaderOutcome,
 } from './reader';
-
-const INSTANCE = '0123456789abcdef0123456789abcdef';
-
-function revision(durable: string, local = '0', instance = INSTANCE): SessionRevision {
-  return { instance_id: instance, durable_revision: durable, local_revision: local };
-}
+import { INSTANCE, hydration as hydrationFixture, revision } from './test-fixtures';
 
 function inputItem(id: string): ConversationItem {
   return {
@@ -60,8 +55,11 @@ function range(start: number, end: number): ConversationItem[] {
   return items;
 }
 
+// The reader's own adapter: the supplied revision object, its argument-derived
+// Session/configuration instance and optional older cursor stay authoritative;
+// the shared builder supplies the remaining nominal defaults.
 function hydration(revisionValue: SessionRevision, items: ConversationItem[], olderCursor: string | null, extra: Partial<Hydration> = {}): Hydration {
-  return {
+  return hydrationFixture({
     session: {
       session_id: 's1',
       workspace: '/ws',
@@ -71,18 +69,12 @@ function hydration(revisionValue: SessionRevision, items: ConversationItem[], ol
       last_activity: '0',
       session_revision: revisionValue,
     },
-    selected_model: null,
     session_revision: revisionValue,
     configuration_revision: { instance_id: revisionValue.instance_id, generation: '1' },
     warnings_revision: { instance_id: revisionValue.instance_id, revision: '1' },
-    operations: [],
-    pending: { steering: [], queued: [] },
     conversation: olderCursor === null ? { items } : { items, older_cursor: olderCursor },
-    usage: { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } },
-    warnings: [],
-    background: [],
     ...extra,
-  };
+  });
 }
 
 function page(revisionValue: SessionRevision, items: ConversationItem[], olderCursor: string | null): HistoryPage {

@@ -24,6 +24,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -335,12 +336,19 @@ func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkin
 	return e.openWithPlugins(ctx, hook, park)
 }
 
+// openPlugins opens the fixture's exact plugin list over its data and config
+// roots.
+func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
+	e.t.Helper()
+	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins})
+}
+
 // openWithPlugins composes the suite's base plugin set plus extras — the
 // adaptation row adds its custom ModelAdaptation export this way.
 func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, park *parkingHook, extra ...Plugin) (*Runtime, error) {
 	e.t.Helper()
 	plugins := []Plugin{coreStoragePlugin(e.store), productionToolsPlugin(), hookPlugin(hook), parkPlugin(park)}
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: append(plugins, extra...)})
+	return e.openPlugins(ctx, append(plugins, extra...)...)
 }
 
 func (e *productionEnv) hookedHook() *recordHook {
@@ -458,7 +466,7 @@ func (s *productionModelServer) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeToolCallTurn(w, toolName, toolArgs)
+		writeToolCallTurn(w, "call-1", toolName, toolArgs)
 	}
 }
 
@@ -564,9 +572,7 @@ type wireChatBody struct {
 func decodeWireChatBody(t *testing.T, body string) wireChatBody {
 	t.Helper()
 	var doc wireChatBody
-	if err := json.Unmarshal([]byte(body), &doc); err != nil {
-		t.Fatalf("decode wire body: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(body), &doc))
 	return doc
 }
 
@@ -586,9 +592,7 @@ func awaitIdleSession(t *testing.T, r *Runtime, sessionID string) {
 		if err == nil && idle {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("session %q never became idle (read error %v)", sessionID, err)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "session %q never became idle (read error %v)", sessionID, err)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -597,33 +601,23 @@ func TestProductionAdmittedOperation(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
 		workspace := e.workspace("prod-ws")
 		session, err := r.createSession(ctx, workspace, "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
 		// The real file effect happened in the Workspace.
 		data, err := os.ReadFile(filepath.Join(workspace, "out.txt"))
-		if err != nil || string(data) != "written by production" {
-			t.Fatalf("prod_write effect = (%q, %v), want the written content", data, err)
-		}
-		if rec.Admission.Execution.ConfigurationRevision != "1" {
-			t.Fatalf("capture revision = %q, want 1", rec.Admission.Execution.ConfigurationRevision)
-		}
+		testassert.Require(t, err == nil && string(data) == "written by production", "prod_write effect = (%q, %v), want the written content", data, err)
+		testassert.Equal(t, rec.Admission.Execution.ConfigurationRevision, "1")
 		if !slices.Equal(toolNames(rec.Admission.Execution.Tools), []string{"prod_write", "prod_read"}) {
 			t.Fatalf("advertisement = %v, want the agent's composed tools", toolNames(rec.Admission.Execution.Tools))
 		}
-		if !strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked") {
-			t.Fatalf("capture prompt = %q, want the hooked composed prompt", rec.Admission.Execution.SystemPrompt)
-		}
+		testassert.Require(t, strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "capture prompt = %q, want the hooked composed prompt", rec.Admission.Execution.SystemPrompt)
 
 		// The wire: one tool-call turn and one follow-up, both carrying the
 		// resolved credential, the custom headers, the no-max_tokens body,
@@ -632,48 +626,27 @@ func TestProductionAdmittedOperation(t *testing.T) {
 			t.Fatalf("model requests = %d, want the tool-call turn and the follow-up", e.server.requests())
 		}
 		first := decodeWireChatBody(t, e.server.bodyAt(0))
-		if first.Model != "m" || !first.Stream || first.ToolChoice != "auto" {
-			t.Fatalf("wire body base = %+v, want the fixed streaming shape for model m", first)
-		}
-		if first.MaxTokens != nil || first.MaxCompletion != nil {
-			t.Fatalf("wire body carries an output-token field (%v, %v), want none", first.MaxTokens, first.MaxCompletion)
-		}
-		if first.StreamOptions == nil || !first.StreamOptions.IncludeUsage {
-			t.Fatalf("wire stream_options = %+v, want include_usage from the effective streamed-usage flag", first.StreamOptions)
-		}
+		testassert.Require(t, first.Model == "m" && first.Stream && first.ToolChoice == "auto" && first.MaxTokens == nil && first.MaxCompletion == nil && first.StreamOptions != nil && first.StreamOptions.IncludeUsage, "wire body base = %+v, want the fixed streaming shape for model m; wire body carries an output-token field (%v, %v), want none; wire stream_options = %+v, want include_usage from the effective streamed-usage flag", first, first.MaxTokens, first.MaxCompletion, first.StreamOptions)
 		var wireTools []string
 		for _, tool := range first.Tools {
 			wireTools = append(wireTools, tool.Function.Name)
 		}
-		if !slices.Equal(wireTools, []string{"prod_write", "prod_read"}) {
-			t.Fatalf("wire tools = %v, want the advertised order", wireTools)
+		testassert.Require(t, slices.Equal(wireTools, []string{"prod_write", "prod_read"}), "wire tools = %v, want the advertised order", wireTools)
+		testassert.Require(t, len(first.Messages) != 0 && first.Messages[0].Role == "system", "wire messages = %+v, want the captured composed prompt first", first.Messages)
+		{
+			want, err := json.Marshal(rec.Admission.Execution.SystemPrompt)
+			testassert.Require(t, err == nil && string(first.Messages[0].Content) == string(want), "wire system message = %s, want the captured composed prompt %s", first.Messages[0].Content, want)
 		}
-		if len(first.Messages) == 0 || first.Messages[0].Role != "system" {
-			t.Fatalf("wire messages = %+v, want the captured composed prompt first", first.Messages)
-		}
-		if want, err := json.Marshal(rec.Admission.Execution.SystemPrompt); err != nil || string(first.Messages[0].Content) != string(want) {
-			t.Fatalf("wire system message = %s, want the captured composed prompt %s", first.Messages[0].Content, want)
-		}
-		if auth := e.server.authAt(0); auth != "Bearer production-secret-1" {
-			t.Fatalf("wire authorization = %q, want the resolved key's bearer form", auth)
-		}
-		if trace := e.server.traceAt(0); trace != "trace-1" {
-			t.Fatalf("wire X-Provider-Trace = %q, want the captured transport headers", trace)
-		}
+		testassert.Equal(t, e.server.authAt(0), "Bearer production-secret-1")
+		testassert.Equal(t, e.server.traceAt(0), "trace-1")
 		// The merged sidecar layers reach the wire body as decoded members,
 		// not whole-body substrings: the exact-number decode keeps the
 		// provider's number lexeme and both sidecar string values comparable.
 		decoder := json.NewDecoder(strings.NewReader(e.server.bodyAt(0)))
 		decoder.UseNumber()
 		var wire map[string]any
-		if err := decoder.Decode(&wire); err != nil {
-			t.Fatalf("decode wire body with exact numbers: %v", err)
-		}
-		if wire["provider_side"] != "provider-value" || wire["model_side"] != "model-value" ||
-			wire["provider_number"] != json.Number("9007199254740993") {
-			t.Fatalf("wire body sidecar members = (%v, %v, %v), want the merged provider and model sidecar layers with the exact number lexeme",
-				wire["provider_side"], wire["model_side"], wire["provider_number"])
-		}
+		testassert.NoError(t, decoder.Decode(&wire))
+		testassert.Require(t, wire["provider_side"] == "provider-value" && wire["model_side"] == "model-value" && wire["provider_number"] == json.Number("9007199254740993"), "wire body sidecar members = (%v, %v, %v), want the merged provider and model sidecar layers with the exact number lexeme", wire["provider_side"], wire["model_side"], wire["provider_number"])
 		if lastMessageRole(e.server.bodyAt(1)) != "tool" {
 			t.Fatalf("follow-up request = %s, want the tool result continuation", e.server.bodyAt(1))
 		}
@@ -684,42 +657,19 @@ func TestProductionKeyResolution(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("key-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
-		readOperationErr := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ReadOperation(ctx, session.Identity.SessionID, opID)
-				return err
-			})
-		}
+		testassert.NoError(t, err)
 
 		// A required credential that resolves empty rejects admission with
 		// the retained provider/env-name diagnostic; no Operation exists.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
-		err = submit("op-missing")
-		if !errors.Is(err, config.ErrMissingEnvVar) || !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("missing credential submit = %v, want the retained diagnostic wrapping both identities", err)
-		}
-		if !strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") || !strings.Contains(err.Error(), `for provider "prov"`) {
-			t.Fatalf("missing credential diagnostic = %v, want the env name and provider identity", err)
-		}
-		if err := readOperationErr("op-missing"); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("rejected admission left %v, want no Operation", err)
+		err = submitExpectFailure(r, session.Identity.SessionID, "op-missing", "please write")
+		testassert.Require(t, errors.Is(err, config.ErrMissingEnvVar) && errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") && strings.Contains(err.Error(), `for provider "prov"`), "missing credential submit = %v, want the retained diagnostic wrapping both identities; missing credential diagnostic = %v, want the env name and provider identity", err, err)
+		{
+			err := readOperationError(ctx, r, session.Identity.SessionID, "op-missing")
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "rejected admission left %v, want no Operation", err)
 		}
 
 		// Setting the variable lets the next admission succeed; unsetting it
@@ -728,9 +678,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// key, and the turn completes.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 		e.server.armGate()
-		if err := submit("op-1"); err != nil {
-			t.Fatalf("submit after the key is set: %v", err)
-		}
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
 		e.server.awaitRequests(1)
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
 		e.server.releaseGate()
@@ -739,8 +687,9 @@ func TestProductionKeyResolution(t *testing.T) {
 			t.Fatalf("model requests = %d, want both turns", e.server.requests())
 		}
 		for i := 0; i < 2; i++ {
-			if got := e.server.authAt(i); got != "Bearer production-secret-1" {
-				t.Fatalf("request %d authorization = %q, want the captured key", i, got)
+			{
+				got := e.server.authAt(i)
+				testassert.Require(t, got == "Bearer production-secret-1", "request %d authorization = %q, want the captured key", i, got)
 			}
 		}
 	})
@@ -760,26 +709,11 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		writeDotEnv(t, e.home, "PRODUCTION_TEST_KEY=\n")
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
-		if r.managedEnv == nil || !r.managedEnv.IsManaged("PRODUCTION_TEST_KEY") {
-			t.Fatal("the fixture credential is not managed")
-		}
+		testassert.Require(t, r.managedEnv != nil && r.managedEnv.IsManaged("PRODUCTION_TEST_KEY"), "the fixture credential is not managed")
 		session, err := r.createSession(ctx, e.workspace("race-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
+		testassert.NoError(t, err)
 
 		probe := installOwningSyncProbe(t, r.managedEnv.Path())
 		defer probe.restore()
@@ -801,32 +735,24 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		// The admission must establish its wait at configuration capture
 		// while the writer holds the publication/capture ownership.
 		submitDone := make(chan error, 1)
-		go func() { submitDone <- submit("op-race") }()
+		go func() { submitDone <- submitExpectFailure(r, session.Identity.SessionID, "op-race", "please write") }()
 		awaitConfigurationCaptureWait(t)
 		release()
 		connect := <-connectDone
-		if connect.err != nil {
-			t.Fatalf("connect: %v", connect.err)
-		}
+		testassert.Require(t, connect.err == nil, "connect: %v", connect.err)
 		select {
 		case err := <-submitDone:
-			if err != nil {
-				t.Fatalf("admitted submit: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("the admission never resumed after the write published")
 		}
 		e.server.awaitRequests(1)
-		if got := e.server.authAt(0); got != "Bearer "+key {
-			t.Fatalf("model transport authorization = %q, want the published managed key", got)
-		}
+		testassert.Equal(t, e.server.authAt(0), "Bearer "+key)
 		record := awaitOperation(t, r, session.Identity.SessionID, "op-race", harness.OperationSuccess)
-		if record.Admission.Execution.ConfigurationRevision != connect.mutation.ConfigurationRevision.Generation {
-			t.Fatalf("admitted revision = %q, writer's published generation = %s, want the same published pair",
-				record.Admission.Execution.ConfigurationRevision, connect.mutation.ConfigurationRevision.Generation)
-		}
-		if published := r.config.current(); published == nil || strconv.FormatUint(published.generation, 10) != connect.mutation.ConfigurationRevision.Generation {
-			t.Fatalf("live publication = %v, want the writer's published generation %s", published, connect.mutation.ConfigurationRevision.Generation)
+		testassert.Equal(t, record.Admission.Execution.ConfigurationRevision, connect.mutation.ConfigurationRevision.Generation)
+		{
+			published := r.config.current()
+			testassert.Require(t, published != nil && strconv.FormatUint(published.generation, 10) == connect.mutation.ConfigurationRevision.Generation, "live publication = %v, want the writer's published generation %s", published, connect.mutation.ConfigurationRevision.Generation)
 		}
 	})
 }
@@ -855,9 +781,7 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 		})
 		ctx := context.Background()
 		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, gate)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		// Teardown order: the ctx-blind validator gate is released first, so
 		// the buffered Reload and Submit result sends complete before the
 		// ordinary owner/store close joins both admission calls. A broken
@@ -867,18 +791,7 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 		defer releaseGate() // registered second: runs first
 
 		session, err := r.createSession(ctx, e.workspace("ready-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
+		testassert.NoError(t, err)
 
 		armed.Store(true)
 		reloadDone := make(chan error, 1)
@@ -892,27 +805,22 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 			t.Fatal("the reload never reached the parked validator")
 		}
 		submitDone := make(chan error, 1)
-		go func() { submitDone <- submit("op-ready") }()
+		go func() {
+			_, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-ready", "please write", harness.MessageModeRegular)
+			submitDone <- err
+		}()
 		select {
 		case err := <-submitDone:
-			if err != nil {
-				t.Fatalf("admitted submit during the parked build: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("admission did not use the ready revision while the build was parked")
 		}
 		e.server.awaitRequests(1)
-		if got := e.server.authAt(0); got != "Bearer production-secret-1" {
-			t.Fatalf("model transport authorization = %q, want the ready revision's captured key", got)
-		}
+		testassert.Equal(t, e.server.authAt(0), "Bearer production-secret-1")
 		record := awaitOperation(t, r, session.Identity.SessionID, "op-ready", harness.OperationSuccess)
-		if record.Admission.Execution.ConfigurationRevision != "1" {
-			t.Fatalf("admitted revision = %q, want the ready generation 1", record.Admission.Execution.ConfigurationRevision)
-		}
+		testassert.Equal(t, record.Admission.Execution.ConfigurationRevision, "1")
 		releaseGate()
-		if err := <-reloadDone; err != nil {
-			t.Fatalf("reload: %v", err)
-		}
+		testassert.NoError(t, <-reloadDone)
 	})
 }
 
@@ -920,9 +828,7 @@ func TestProductionModelSelectionRejection(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
 		for _, row := range []struct {
@@ -935,24 +841,12 @@ func TestProductionModelSelectionRejection(t *testing.T) {
 			{agent: "absent", opID: "op-absent", wantText: "is not available in the catalog", wantClass: harness.ErrInvalid},
 		} {
 			session, err := r.createSession(ctx, e.workspace("reject-"+row.agent), row.agent)
-			if err != nil {
-				t.Fatalf("createSession(%s): %v", row.agent, err)
-			}
-			err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: row.opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-			if !errors.Is(err, row.wantClass) || !strings.Contains(err.Error(), row.wantText) {
-				t.Fatalf("%s submit = %v, want %v with %q", row.agent, err, row.wantClass, row.wantText)
-			}
-			if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ReadOperation(ctx, session.Identity.SessionID, row.opID)
-				return err
-			}); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("%s rejection left %v, want no Operation", row.agent, err)
+			testassert.Require(t, err == nil, "createSession(%s): %v", row.agent, err)
+			err = submitExpectFailure(r, session.Identity.SessionID, row.opID, "hello")
+			testassert.Require(t, errors.Is(err, row.wantClass) && strings.Contains(err.Error(), row.wantText), "%s submit = %v, want %v with %q", row.agent, err, row.wantClass, row.wantText)
+			{
+				err := readOperationError(ctx, r, session.Identity.SessionID, row.opID)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "%s rejection left %v, want no Operation", row.agent, err)
 			}
 		}
 
@@ -960,9 +854,7 @@ func TestProductionModelSelectionRejection(t *testing.T) {
 		r.workspaces.mu.Lock()
 		live := len(r.workspaces.live)
 		r.workspaces.mu.Unlock()
-		if live != 0 {
-			t.Fatalf("live Workspace scopes after the rejections = %d, want none", live)
-		}
+		testassert.Equal(t, live, 0)
 	})
 }
 
@@ -971,40 +863,38 @@ func TestProductionReloadCapture(t *testing.T) {
 		ctx := context.Background()
 		hook := e.hookedHook()
 		r, err := e.open(ctx, hook, &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("reload-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// The in-flight admission stays on its captured revision.
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "parked")
 		e.server.awaitRequests(1)
 		writeServiceFile(t, e.configPath, productionConfigDocument(e.server.URL, "T2"))
-		if revision, err := r.Reload(ctx); err != nil || revision != "2" {
-			t.Fatalf("Reload = (%q, %v), want 2", revision, err)
+		{
+			revision, err := r.Reload(ctx)
+			testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 		}
 		e.server.releaseGate()
-		if rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess); rec.Admission.Execution.ConfigurationRevision != "1" {
-			t.Fatalf("in-flight capture revision = %q, want the captured 1", rec.Admission.Execution.ConfigurationRevision)
+		{
+			rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
+			testassert.Equal(t, rec.Admission.Execution.ConfigurationRevision, "1")
 		}
 		// The next admission prepares on the new revision and its hook reads
 		// the new tag; the fresh Session rules out any post-terminal drain
 		// racing the submit into a steering buffer.
 		next, err := r.createSession(ctx, e.workspace("reload-ws-2"), "worker")
-		if err != nil {
-			t.Fatalf("createSession(next): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-2", "hello")
-		if rec := awaitOperation(t, r, next.Identity.SessionID, "op-2", harness.OperationSuccess); rec.Admission.Execution.ConfigurationRevision != "2" {
-			t.Fatalf("next capture revision = %q, want 2", rec.Admission.Execution.ConfigurationRevision)
+		{
+			rec := awaitOperation(t, r, next.Identity.SessionID, "op-2", harness.OperationSuccess)
+			testassert.Equal(t, rec.Admission.Execution.ConfigurationRevision, "2")
 		}
-		if got := hook.calls(); !slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}) {
-			t.Fatalf("hook calls = %v, want each admission's own revision tag", got)
+		{
+			got := hook.calls()
+			testassert.Require(t, slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}), "hook calls = %v, want each admission's own revision tag", got)
 		}
 	})
 }
@@ -1013,35 +903,17 @@ func TestProductionQueuedAndFork(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("queue-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// The queued message buffers over the blocked Operation and delivers
 		// a working execution when the drain reaches it.
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "parked")
 		e.server.awaitRequests(1)
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: session.Identity.SessionID, OperationID: "op-2", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "please write"}}, Mode: harness.MessageModeQueued,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionQueued {
-				return fmt.Errorf("submit = %v, want queued", res.Disposition)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("queued submit: %v", err)
-		}
+		submitQueuedThroughRuntime(t, r, session.Identity.SessionID, "op-2", "please write")
 		e.server.releaseGate()
 		awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 		awaitOperation(t, r, session.Identity.SessionID, "op-2", harness.OperationSuccess)
@@ -1052,20 +924,16 @@ func TestProductionQueuedAndFork(t *testing.T) {
 		// compose time.
 		boundary := ""
 		entries, err := e.store.ReadEntries(ctx, session.Identity.SessionID, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range entries {
 			if entry.Kind == harness.EntryInput && entry.OperationID == "op-2" {
 				boundary = entry.ID
 				break
 			}
 		}
-		if boundary == "" {
-			t.Fatal("no admitted input entry was found for the fork boundary")
-		}
+		testassert.Require(t, boundary != "", "no admitted input entry was found for the fork boundary")
 		var forked harness.SessionRecord
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			res, err := h.Fork(ctx, harness.ForkRequest{
 				SourceSessionID: session.Identity.SessionID,
 				BoundaryEntryID: boundary,
@@ -1077,13 +945,9 @@ func TestProductionQueuedAndFork(t *testing.T) {
 			}
 			forked = res.Session
 			return nil
-		}); err != nil {
-			t.Fatalf("Fork: %v", err)
-		}
+		}))
 		rec := awaitOperation(t, r, forked.Identity.SessionID, "op-fork", harness.OperationSuccess)
-		if rec.Admission.Execution.ConfigurationRevision != "1" || !strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked") {
-			t.Fatalf("forked Operation capture = %+v, want the hooked production capture", rec.Admission.Execution)
-		}
+		testassert.Require(t, rec.Admission.Execution.ConfigurationRevision == "1" && strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "forked Operation capture = %+v, want the hooked production capture", rec.Admission.Execution)
 	})
 }
 
@@ -1092,36 +956,19 @@ func TestProductionHookCapture(t *testing.T) {
 		ctx := context.Background()
 		hook := e.hookedHook()
 		r, err := e.open(ctx, hook, &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("hook-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
-		submit := func(opID string) error {
-			return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: opID, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-		}
+		testassert.NoError(t, err)
 		// The hook's narrowed description survives into the committed
 		// capture.
 		hook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
 			c.Tools[0].Description = "narrowed by the hook"
 			return c
 		})
-		if err := submit("op-narrow"); err != nil {
-			t.Fatalf("submit: %v", err)
-		}
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-narrow", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-narrow", harness.OperationSuccess)
-		if got := rec.Admission.Execution.Tools[0].Description; got != "narrowed by the hook" {
-			t.Fatalf("committed description = %q, want the hook's narrowed form", got)
-		}
+		testassert.Equal(t, rec.Admission.Execution.Tools[0].Description, "narrowed by the hook")
 
 		// Capability expansion and constraint changes still reject with no
 		// Operation published. Every rejection runs on its own fresh Session,
@@ -1146,24 +993,12 @@ func TestProductionHookCapture(t *testing.T) {
 		} {
 			hook.set(nil, row.mutate)
 			rowSession, err := r.createSession(ctx, e.workspace("hook-"+row.name+"-ws"), "worker")
-			if err != nil {
-				t.Fatalf("createSession(%s): %v", row.name, err)
-			}
-			err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: rowSession.Identity.SessionID, OperationID: "op-" + row.name, Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
-			if !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("%s submit = %v, want the ErrInvalid rejection", row.name, err)
-			}
-			if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.ReadOperation(ctx, rowSession.Identity.SessionID, "op-"+row.name)
-				return err
-			}); !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("%s rejection left %v, want no Operation", row.name, err)
+			testassert.Require(t, err == nil, "createSession(%s): %v", row.name, err)
+			err = submitExpectFailure(r, rowSession.Identity.SessionID, "op-"+row.name, "hello")
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s submit = %v, want the ErrInvalid rejection", row.name, err)
+			{
+				err := readOperationError(ctx, r, rowSession.Identity.SessionID, "op-"+row.name)
+				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "%s rejection left %v, want no Operation", row.name, err)
 			}
 		}
 		hook.set(nil, nil)
@@ -1184,12 +1019,8 @@ func TestProductionFailedOpening(t *testing.T) {
 		// same root opens again once the document is valid.
 		writeServiceFile(t, e.configPath, productionConfigDocument(e.server.URL, "T1"))
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("reopen after failed construction: %v", err)
-		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -1198,13 +1029,9 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		ctx := context.Background()
 		park := &parkingHook{}
 		r, err := e.open(ctx, e.hookedHook(), park)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(ctx, e.workspace("shutdown-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// The armed hook parks the admission: an in-flight admitted call
 		// blocks Close until released, and the joined shutdown completes.
@@ -1213,13 +1040,7 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		park.arm(release, used)
 		done := make(chan error, 1)
 		go func() {
-			done <- r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				_, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID: session.Identity.SessionID, OperationID: "op-parked", Origin: harness.InputOriginUser,
-					Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}, Mode: harness.MessageModeRegular,
-				})
-				return err
-			})
+			done <- submitExpectFailure(r, session.Identity.SessionID, "op-parked", "hello")
 		}()
 		select {
 		case <-used:
@@ -1234,11 +1055,10 @@ func TestProductionBlockedShutdown(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 		close(release)
-		if err := <-closeDone; err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		if err := <-done; err == nil {
-			t.Fatal("the parked admission succeeded after the owner canceled; want the cancellation failure")
+		testassert.NoError(t, <-closeDone)
+		{
+			err := <-done
+			testassert.Require(t, err != nil, "the parked admission succeeded after the owner canceled; want the cancellation failure")
 		}
 	})
 
@@ -1247,39 +1067,22 @@ func TestProductionBlockedShutdown(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(ctx, e.workspace("shutdown-successor-ws"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		e.server.armGate() // the run parks at its first model request
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-run", "hello")
 		e.server.awaitRequests(1)
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: session.Identity.SessionID, OperationID: "op-steer", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "steer"}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionSteering {
-				t.Errorf("steering submit disposition = %q, want steering", res.Disposition)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("steering submit: %v", err)
-		}
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		steering, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-steer", "steer", harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Check(t, steering.Disposition == harness.DispositionSteering, "steering submit disposition = %q, want steering", steering.Disposition)
+		testassert.NoError(t, r.Close(ctx))
 		e.server.releaseGate()
-		if _, err := e.store.ReadRegister(ctx, harness.RegisterKey{
-			SessionID: session.Identity.SessionID, Kind: harness.RegisterOperation, OperationID: "op-steer",
-		}); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("shutdown started a successor: %v", err)
+		{
+			_, err := e.store.ReadRegister(ctx, harness.RegisterKey{
+				SessionID: session.Identity.SessionID, Kind: harness.RegisterOperation, OperationID: "op-steer",
+			})
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "shutdown started a successor: %v", err)
 		}
 	})
 }
@@ -1288,18 +1091,15 @@ func TestProductionDuplicateTools(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("dup-ws"), "duper")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		if got := toolNames(rec.Admission.Execution.Tools); !slices.Equal(got, []string{"prod_read", "prod_write"}) {
-			t.Fatalf("advertisement = %v, want duplicates deduped by first occurrence", got)
+		{
+			got := toolNames(rec.Admission.Execution.Tools)
+			testassert.Require(t, slices.Equal(got, []string{"prod_read", "prod_write"}), "advertisement = %v, want duplicates deduped by first occurrence", got)
 		}
 	})
 }
@@ -1308,21 +1108,16 @@ func TestProductionReadonlyAdvertisement(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("ro-ws"), "ro")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		if !rec.Admission.Execution.Readonly {
-			t.Fatalf("capture readonly = %v, want the agent's constraint", rec.Admission.Execution.Readonly)
-		}
-		if got := toolNames(rec.Admission.Execution.Tools); !slices.Equal(got, []string{"prod_read"}) {
-			t.Fatalf("advertisement = %v, want the mutation tool dropped by the hard constraint", got)
+		testassert.Require(t, rec.Admission.Execution.Readonly, "capture readonly = %v, want the agent's constraint", rec.Admission.Execution.Readonly)
+		{
+			got := toolNames(rec.Admission.Execution.Tools)
+			testassert.Require(t, slices.Equal(got, []string{"prod_read"}), "advertisement = %v, want the mutation tool dropped by the hard constraint", got)
 		}
 	})
 }
@@ -1342,53 +1137,26 @@ func TestProductionTransportConversion(t *testing.T) {
 	obs := newObservation()
 	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs)
 	snapshot, err := svc.publish(owner)
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
+	testassert.NoError(t, err)
 	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
-	if err != nil {
-		t.Fatalf("catalog lookup: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	resolved, err := p.resolveTransport(provider, entry, ref, "resolved-key")
-	if err != nil {
-		t.Fatalf("resolveTransport: %v", err)
-	}
-	if resolved.Model != ref || resolved.BaseURL != "https://prov.test/v1" || resolved.APIKey != "resolved-key" {
-		t.Fatalf("resolved identity = %+v, want the captured endpoint, key, and model", resolved)
-	}
-	if resolved.WireSystemRole != "user" {
-		t.Fatalf("wire system role = %q, want the model-level override", resolved.WireSystemRole)
-	}
-	if !resolved.StreamedUsage {
-		t.Fatal("streamed usage = false, want the model-level true override of the provider-level false")
-	}
-	if resolved.Headers["X-Trace"] != "t1" {
-		t.Fatalf("resolved headers = %v, want the captured transport headers", resolved.Headers)
-	}
-	if got := string(resolved.ProviderExtraBody["provider_side"]); got != `"p"` {
-		t.Fatalf("provider sidecar = %s, want the verbatim re-encoded value", got)
-	}
-	if got := string(resolved.ProviderExtraBody["big"]); got != "9007199254740993" {
-		t.Fatalf("provider sidecar number = %s, want the raw lexeme with no float coercion", got)
-	}
-	if got := string(resolved.ModelExtraBody["precise"]); got != "1.25" {
-		t.Fatalf("model sidecar number = %s, want the raw lexeme", got)
-	}
-	if resolved.ProtocolFamily != "fam" || !slices.Equal(resolved.MustPreserve, []string{"proto_keep"}) ||
-		!resolved.Drop["drop_me"] || len(resolved.Drop) != 1 {
-		t.Fatalf("resolved protocol metadata = family %q must-preserve %v drop %v, want the model-level effective values", resolved.ProtocolFamily, resolved.MustPreserve, resolved.Drop)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resolved.Model == ref && resolved.BaseURL == "https://prov.test/v1" && resolved.APIKey == "resolved-key" && resolved.WireSystemRole == "user", "resolved identity = %+v, want the captured endpoint, key, and model; got %v, want %v", resolved, resolved.WireSystemRole, "user")
+	testassert.Require(t, resolved.StreamedUsage, "streamed usage = false, want the model-level true override of the provider-level false")
+	testassert.Require(t, resolved.Headers["X-Trace"] == "t1", "resolved headers = %v, want the captured transport headers", resolved.Headers)
+	testassert.Equal(t, string(resolved.ProviderExtraBody["provider_side"]), `"p"`)
+	testassert.Equal(t, string(resolved.ProviderExtraBody["big"]), "9007199254740993")
+	testassert.Require(t, string(resolved.ModelExtraBody["precise"]) == "1.25" && resolved.ProtocolFamily == "fam" && slices.Equal(resolved.MustPreserve, []string{"proto_keep"}) && resolved.Drop["drop_me"] && len(resolved.Drop) == 1, "got %v, want %v; resolved protocol metadata = family %q must-preserve %v drop %v, want the model-level effective values", string(resolved.ModelExtraBody["precise"]), "1.25", resolved.ProtocolFamily, resolved.MustPreserve, resolved.Drop)
 	wantFamilies := map[model.ModelRef]string{
 		{Provider: "prov", Model: "m"}:     "fam",
 		{Provider: "prov", Model: "sib"}:   "fam",
 		{Provider: "prov", Model: "other"}: "else",
 	}
-	if len(resolved.SourceFamilies) != len(wantFamilies) {
-		t.Fatalf("source families = %v, want exactly the same-provider map %v", resolved.SourceFamilies, wantFamilies)
-	}
+	testassert.Require(t, len(resolved.SourceFamilies) == len(wantFamilies), "source families = %v, want exactly the same-provider map %v", resolved.SourceFamilies, wantFamilies)
 	for k, v := range wantFamilies {
 		if resolved.SourceFamilies[k] != v {
 			t.Fatalf("source family of %s = %q, want %q", k.String(), resolved.SourceFamilies[k], v)
@@ -1397,43 +1165,28 @@ func TestProductionTransportConversion(t *testing.T) {
 
 	// The system message encodes with the effective wire role.
 	body, _, err := model.Encode(resolved, model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "sys"}}}}}, nil)
-	if err != nil {
-		t.Fatalf("encode system: %v", err)
-	}
-	if !strings.Contains(string(body), `"role":"user"`) {
-		t.Fatalf("system message wire role = %s, want the effective user role", body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(body), `"role":"user"`), "system message wire role = %s, want the effective user role", body)
 
 	// The wire-debug opt-in: off by default; enabled it creates the
 	// home-based private directory and supplies it; a creation failure
 	// disables diagnostics, never execution.
-	if got := resolved.WireDebugDir; got != "" {
-		t.Fatalf("wire debug dir with the opt-in off = %q, want empty", got)
-	}
+	testassert.Equal(t, resolved.WireDebugDir, "")
 	t.Setenv(debugWireEnv, "1")
 	enabled, err := p.resolveTransport(provider, entry, ref, "resolved-key")
-	if err != nil {
-		t.Fatalf("resolveTransport with the opt-in on: %v", err)
-	}
+	testassert.NoError(t, err)
 	want := filepath.Join(sh.home, ".lightcode", "debug", "wire")
-	if enabled.WireDebugDir != want {
-		t.Fatalf("wire debug dir = %q, want the created home-based %q", enabled.WireDebugDir, want)
-	}
-	if info, err := os.Stat(want); err != nil || !info.IsDir() {
-		t.Fatalf("wire debug directory = (%v, %v), want the created private directory", info, err)
+	testassert.Equal(t, enabled.WireDebugDir, want)
+	{
+		info, err := os.Stat(want)
+		testassert.Require(t, err == nil && info.IsDir(), "wire debug directory = (%v, %v), want the created private directory", info, err)
 	}
 	blocked := filepath.Join(sh.home, "file.txt")
-	if err := os.WriteFile(blocked, []byte("a file, not a directory"), 0o600); err != nil {
-		t.Fatalf("write the blocking file: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(blocked, []byte("a file, not a directory"), 0o600))
 	broken := &preparation{home: filepath.Join(blocked, "sub")}
 	disabled, err := broken.resolveTransport(provider, entry, ref, "resolved-key")
-	if err != nil {
-		t.Fatalf("resolveTransport over an unusable home: %v", err)
-	}
-	if disabled.WireDebugDir != "" {
-		t.Fatalf("wire debug dir over an unusable home = %q, want the empty disabled form", disabled.WireDebugDir)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, disabled.WireDebugDir, "")
 }
 
 func conversionConfigDocument() string {
@@ -1465,14 +1218,10 @@ func TestProductionCommandRow(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("run-ws"), "runner")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please run")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 		if !slices.Equal(toolNames(rec.Admission.Execution.Tools), []string{"run_command"}) {
@@ -1481,9 +1230,7 @@ func TestProductionCommandRow(t *testing.T) {
 		// The settled result content proves the command ran through the
 		// concrete opener's dispatch.
 		entries, err := e.store.ReadEntries(ctx, session.Identity.SessionID, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		var content string
 		for _, entry := range entries {
 			if entry.Kind != harness.EntryToolResult {
@@ -1492,14 +1239,10 @@ func TestProductionCommandRow(t *testing.T) {
 			var wire struct {
 				Content string `json:"content"`
 			}
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode tool result: %v", err)
-			}
+			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 			content = wire.Content
 		}
-		if content != "production-command-row" {
-			t.Fatalf("settled run_command content = %q, want the echoed token", content)
-		}
+		testassert.Equal(t, content, "production-command-row")
 	})
 }
 
@@ -1512,34 +1255,23 @@ func TestProductionAdaptationComposes(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, prodAdaptationPlugin())
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("adapt-ws"), "adapted")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
 		prompt := rec.Admission.Execution.SystemPrompt
-		if !strings.Contains(prompt, "PROD-ADAPTATION-BLOCK") {
-			t.Fatalf("captured prompt misses the adaptation's coaching block: %.200s", prompt)
-		}
-		if !strings.Contains(prompt, "ADDITION-SAFETY-TEXT") {
-			t.Fatalf("captured prompt misses the adaptation's section addition: %.200s", prompt)
-		}
-		if got := toolNames(rec.Admission.Execution.Tools); !slices.Equal(got, []string{"prod_write"}) {
-			t.Fatalf("advertisement = %v, want the adaptation's excluded tool absent", got)
+		testassert.Require(t, strings.Contains(prompt, "PROD-ADAPTATION-BLOCK") && strings.Contains(prompt, "ADDITION-SAFETY-TEXT"), "captured prompt misses the adaptation's coaching block: %.200s; captured prompt misses the adaptation's section addition: %.200s", prompt, prompt)
+		{
+			got := toolNames(rec.Admission.Execution.Tools)
+			testassert.Require(t, slices.Equal(got, []string{"prod_write"}), "advertisement = %v, want the adaptation's excluded tool absent", got)
 		}
 
 		// The exclusion is the adaptation's work, not the hard constraints:
 		// the capture's readonly/write-dir fields stay the definition's.
-		if rec.Admission.Execution.Readonly || rec.Admission.Execution.WriteDir != "" {
-			t.Fatalf("capture constraints = (%v, %q), want the definition's untouched values",
-				rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
-		}
+		testassert.Require(t, !rec.Admission.Execution.Readonly && rec.Admission.Execution.WriteDir == "", "capture constraints = (%v, %q), want the definition's untouched values", rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
 	})
 }
 
@@ -1551,26 +1283,18 @@ func TestProductionKeylessProvider(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("keyless-ws"), "keyless")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
 		awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 		if e.server.requests() != 2 {
 			t.Fatalf("model requests = %d, want the tool-call turn and the follow-up", e.server.requests())
 		}
-		if got := e.server.authAt(0); got != "" {
-			t.Fatalf("keyless request authorization = %q, want the header omitted entirely", got)
-		}
+		testassert.Equal(t, e.server.authAt(0), "")
 		data, err := os.ReadFile(filepath.Join(e.workspace("keyless-ws"), "out.txt"))
-		if err != nil || string(data) != "written by production" {
-			t.Fatalf("prod_write effect = (%q, %v), want the written content", data, err)
-		}
+		testassert.Require(t, err == nil && string(data) == "written by production", "prod_write effect = (%q, %v), want the written content", data, err)
 	})
 }
 
@@ -1586,15 +1310,11 @@ func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		workspace := e.workspace("interval-ws")
 		session, err := r.createSession(ctx, workspace, "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 		op := submitCodeOperation(t, r, sessionID, "op-1", "first")
 		awaitRestorableSession(t, r, sessionID)
@@ -1607,28 +1327,20 @@ func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
 
 		admitted := make(chan error, 1)
 		go func() {
-			admitted <- r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-				res, err := h.Submit(ctx, harness.SubmitRequest{
-					SessionID:   sessionID,
-					OperationID: "op-write",
-					Origin:      harness.InputOriginUser,
-					Content:     []model.ContentPart{{Kind: model.PartText, Text: "write it"}},
-					Mode:        harness.MessageModeRegular,
-				})
-				if err != nil {
-					return err
-				}
-				if res.Disposition != harness.DispositionAdmitted {
-					return fmt.Errorf("disposition %q, want admitted", res.Disposition)
-				}
-				return nil
-			})
+			res, err := submitRawThroughRuntime(ctx, r, sessionID, "op-write", "write it", harness.MessageModeRegular)
+			if err != nil {
+				admitted <- err
+				return
+			}
+			if res.Disposition != harness.DispositionAdmitted {
+				admitted <- fmt.Errorf("disposition %q, want admitted", res.Disposition)
+				return
+			}
+			admitted <- nil
 		}()
 		select {
 		case err := <-admitted:
-			if err != nil {
-				t.Fatalf("admission during a parked restore: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("admission blocked during a parked restore: admission stays Harness-owned")
 		}
@@ -1640,8 +1352,9 @@ func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
 		awaitOpenerRegistered(t, r, sessionID)
 
 		// The real write has not begun: the opener cannot have won the token.
-		if data, err := os.ReadFile(file); err != nil || len(data) != 0 {
-			t.Fatalf("the tool write began inside the restore interval: (%q, %v)", data, err)
+		{
+			data, err := os.ReadFile(file)
+			testassert.Require(t, err == nil && len(data) == 0, "the tool write began inside the restore interval: (%q, %v)", data, err)
 		}
 
 		park.release("restored")
@@ -1651,18 +1364,14 @@ func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the parked restore never returned after its FIFO completed")
 		}
-		if parkedRestore.err != nil {
-			t.Fatalf("parked restore = %v", parkedRestore.err)
-		}
-		if len(parkedRestore.result.Restored) != 1 || parkedRestore.result.Restored[0] != file {
-			t.Fatalf("restored = %v, want the parked group's restore", parkedRestore.result.Restored)
-		}
+		testassert.Require(t, parkedRestore.err == nil && len(parkedRestore.result.Restored) == 1 && parkedRestore.result.Restored[0] == file, "parked restore = %v; restored = %v, want the parked group's restore", parkedRestore.err, parkedRestore.result.Restored)
 
 		// The opener won the released interval: the real tool effect ran and
 		// the durable Operation settled.
 		awaitOperation(t, r, sessionID, "op-write", harness.OperationSuccess)
-		if data, err := os.ReadFile(file); err != nil || string(data) != "written by production" {
-			t.Fatalf("file after the tool write = (%q, %v), want the tool's content", data, err)
+		{
+			data, err := os.ReadFile(file)
+			testassert.Require(t, err == nil && string(data) == "written by production", "file after the tool write = (%q, %v), want the tool's content", data, err)
 		}
 	})
 }

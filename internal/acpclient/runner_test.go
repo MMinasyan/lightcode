@@ -22,6 +22,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/acpclient"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientops"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/version"
 )
 
@@ -54,7 +55,7 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 	f := &fixture{handlers: map[string]http.HandlerFunc{}, eventsOpen: make(chan struct{}, 16)}
 	f.handlers["/v1/health"] = func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"2"}`, testInstance)
+		fmt.Fprint(w, healthBody())
 	}
 	f.handlers["/v1/events"] = f.idleEvents
 	// Startup composition defaults: an empty open-root list and one created
@@ -67,9 +68,7 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 			fmt.Fprint(w, acpclient.SessionHeader(startupSessionID, "/ws", "2026-10-01T00:00:00Z"))
 			return
 		}
-		if r.Method != http.MethodGet || r.URL.Query().Get("lifecycle") != "open" || r.URL.Query().Get("workspace") == "" {
-			t.Errorf("startup list = %s %s, want the selected Workspace's open lifecycle", r.Method, r.URL.RawQuery)
-		}
+		testassert.Check(t, r.Method == http.MethodGet && r.URL.Query().Get("lifecycle") == "open" && r.URL.Query().Get("workspace") != "", "startup list = %s %s, want the selected Workspace's open lifecycle", r.Method, r.URL.RawQuery)
 		fmt.Fprint(w, "[]")
 	}
 	f.handlers["/v1/sessions/"+startupSessionID+"/hydration"] = jsonHandler(200, hydrationBody(startupSessionID, "/ws"))
@@ -269,9 +268,7 @@ func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Write
 	dataDir := t.TempDir()
 	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"2","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
-	if err := os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600); err != nil {
-		t.Fatalf("write discovery record: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 	return startRunner(t, clienthost.Options{
 		DataDir:    dataDir,
 		ConfigPath: filepath.Join(dataDir, "config.json"),
@@ -318,8 +315,9 @@ func startRunner(t *testing.T, startup clienthost.Options, workspace string, wri
 
 func (b *bridge) send(t *testing.T, line string) {
 	t.Helper()
-	if _, err := io.WriteString(b.in, line+"\n"); err != nil {
-		t.Fatalf("write input: %v", err)
+	{
+		_, err := io.WriteString(b.in, line+"\n")
+		testassert.NoError(t, err)
 	}
 }
 
@@ -342,8 +340,9 @@ func (b *bridge) recv(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
 	line := b.recvLine(t)
 	var frame map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(line), &frame); err != nil {
-		t.Fatalf("output frame %q: %v", line, err)
+	{
+		err := json.Unmarshal([]byte(line), &frame)
+		testassert.Require(t, err == nil, "output frame %q: %v", line, err)
 	}
 	return frame
 }
@@ -353,9 +352,7 @@ func (b *bridge) recvLine(t *testing.T) string {
 	t.Helper()
 	select {
 	case line, ok := <-b.lines:
-		if !ok {
-			t.Fatal("bridge output ended")
-		}
+		testassert.Require(t, ok, "bridge output ended")
 		return line
 	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for one output frame")
@@ -380,12 +377,11 @@ func (b *bridge) collectFrames(t *testing.T, stop func(map[string]json.RawMessag
 	for {
 		select {
 		case line, ok := <-b.lines:
-			if !ok {
-				t.Fatal("bridge output ended before the expected frame")
-			}
+			testassert.Require(t, ok, "bridge output ended before the expected frame")
 			var frame map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(line), &frame); err != nil {
-				t.Fatalf("output frame %q: %v", line, err)
+			{
+				err := json.Unmarshal([]byte(line), &frame)
+				testassert.Require(t, err == nil, "output frame %q: %v", line, err)
 			}
 			frames = append(frames, frame)
 			if stop(frame) {
@@ -462,16 +458,15 @@ func (b *bridge) call(t *testing.T, id, method, params string) map[string]json.R
 func errorFrame(t *testing.T, frame map[string]json.RawMessage) (int, string, json.RawMessage) {
 	t.Helper()
 	raw, ok := frame["error"]
-	if !ok {
-		t.Fatalf("frame carries no error: %s", frame)
-	}
+	testassert.Require(t, ok, "frame carries no error: %s", frame)
 	var rpcErr struct {
 		Code    int             `json:"code"`
 		Message string          `json:"message"`
 		Data    json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &rpcErr); err != nil {
-		t.Fatalf("error frame %s: %v", raw, err)
+	{
+		err := json.Unmarshal(raw, &rpcErr)
+		testassert.Require(t, err == nil, "error frame %s: %v", raw, err)
 	}
 	return rpcErr.Code, rpcErr.Message, rpcErr.Data
 }
@@ -485,9 +480,7 @@ func errorCode(t *testing.T, frame map[string]json.RawMessage) int {
 func resultOf(t *testing.T, frame map[string]json.RawMessage) string {
 	t.Helper()
 	raw, ok := frame["result"]
-	if !ok {
-		t.Fatalf("frame carries no result: %s", frame)
-	}
+	testassert.Require(t, ok, "frame carries no result: %s", frame)
 	return string(raw)
 }
 
@@ -517,39 +510,25 @@ func TestACPFraming(t *testing.T) {
 		b.send(t, "not json")
 		line := b.recvLine(t)
 		want := `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`
-		if line != want {
-			t.Fatalf("frame = %s, want %s", line, want)
-		}
+		testassert.Equal(t, line, want)
 	})
 	t.Run("invalid version", func(t *testing.T) {
 		b.send(t, `{"jsonrpc":"1.0","id":7,"method":"workspace/current"}`)
 		frame := b.recv(t)
-		if code := errorCode(t, frame); code != -32600 {
-			t.Fatalf("code = %d, want -32600", code)
-		}
-		if string(frame["id"]) != "7" {
-			t.Fatalf("id = %s, want 7", frame["id"])
-		}
+		testassert.Equal(t, errorCode(t, frame), -32600)
+		testassert.Require(t, string(frame["id"]) == "7", "id = %s, want 7", frame["id"])
 	})
 	t.Run("missing method", func(t *testing.T) {
 		b.send(t, `{"jsonrpc":"2.0","id":"a"}`)
 		frame := b.recv(t)
-		if code := errorCode(t, frame); code != -32600 {
-			t.Fatalf("code = %d, want -32600", code)
-		}
-		if string(frame["id"]) != `"a"` {
-			t.Fatalf("id = %s, want \"a\"", frame["id"])
-		}
+		testassert.Equal(t, errorCode(t, frame), -32600)
+		testassert.Require(t, string(frame["id"]) == `"a"`, "id = %s, want \"a\"", frame["id"])
 	})
 	t.Run("invalid id", func(t *testing.T) {
 		b.send(t, `{"jsonrpc":"2.0","id":true,"method":"workspace/current"}`)
 		frame := b.recv(t)
-		if code := errorCode(t, frame); code != -32600 {
-			t.Fatalf("code = %d, want -32600", code)
-		}
-		if string(frame["id"]) != "null" {
-			t.Fatalf("id = %s, want null", frame["id"])
-		}
+		testassert.Equal(t, errorCode(t, frame), -32600)
+		testassert.Require(t, string(frame["id"]) == "null", "id = %s, want null", frame["id"])
 	})
 	t.Run("valid JSON with a non-object root", func(t *testing.T) {
 		for _, row := range []struct{ name, line string }{
@@ -562,12 +541,8 @@ func TestACPFraming(t *testing.T) {
 			t.Run(row.name, func(t *testing.T) {
 				b.send(t, row.line)
 				frame := b.recv(t)
-				if code := errorCode(t, frame); code != -32600 {
-					t.Fatalf("code = %d, want -32600 for valid JSON outside the request object shape", code)
-				}
-				if string(frame["id"]) != "null" {
-					t.Fatalf("id = %s, want null", frame["id"])
-				}
+				testassert.Equal(t, errorCode(t, frame), -32600)
+				testassert.Require(t, string(frame["id"]) == "null", "id = %s, want null", frame["id"])
 			})
 		}
 	})
@@ -582,12 +557,8 @@ func TestACPFraming(t *testing.T) {
 			t.Run(row.name, func(t *testing.T) {
 				b.send(t, row.line)
 				frame := b.recv(t)
-				if code := errorCode(t, frame); code != -32600 {
-					t.Fatalf("code = %d, want -32600", code)
-				}
-				if string(frame["id"]) != row.id {
-					t.Fatalf("id = %s, want the available caller ID %s", frame["id"], row.id)
-				}
+				testassert.Equal(t, errorCode(t, frame), -32600)
+				testassert.Require(t, string(frame["id"]) == row.id, "id = %s, want the available caller ID %s", frame["id"], row.id)
 			})
 		}
 	})
@@ -595,67 +566,48 @@ func TestACPFraming(t *testing.T) {
 		b.send(t, `{"jsonrpc":"1.0","method":"workspace/current"}`)
 		b.send(t, requestLine("1", "workspace/current", ""))
 		frame := b.recv(t)
-		if string(frame["id"]) != "null" {
-			t.Fatalf("first frame after an invalid notification-shaped envelope = %s, want the null-id invalid request", frame)
-		}
-		if code := errorCode(t, frame); code != -32600 {
-			t.Fatalf("code = %d, want -32600", code)
-		}
-		if marker := b.recv(t); string(marker["id"]) != "1" {
-			t.Fatalf("marker response = %s, want the drained caller request", marker)
+		testassert.Require(t, string(frame["id"]) == "null", "first frame after an invalid notification-shaped envelope = %s, want the null-id invalid request", frame)
+		testassert.Equal(t, errorCode(t, frame), -32600)
+		{
+			marker := b.recv(t)
+			testassert.Require(t, string(marker["id"]) == "1", "marker response = %s, want the drained caller request", marker)
 		}
 	})
 	t.Run("truncated JSON is a parse error", func(t *testing.T) {
 		b.send(t, `{"jsonrpc":`)
 		frame := b.recv(t)
-		if code := errorCode(t, frame); code != -32700 {
-			t.Fatalf("code = %d, want -32700 for invalid JSON", code)
-		}
-		if string(frame["id"]) != "null" {
-			t.Fatalf("id = %s, want null", frame["id"])
-		}
+		testassert.Equal(t, errorCode(t, frame), -32700)
+		testassert.Require(t, string(frame["id"]) == "null", "id = %s, want null", frame["id"])
 	})
 	t.Run("unknown method", func(t *testing.T) {
 		frame := b.call(t, "7", "session/new", "")
 		code, message, _ := errorFrame(t, frame)
-		if code != -32601 || message != "method not found: session/new" {
-			t.Fatalf("error = (%d, %q), want -32601 method not found", code, message)
-		}
+		testassert.Require(t, code == -32601 && message == "method not found: session/new", "error = (%d, %q), want -32601 method not found", code, message)
 	})
 	t.Run("notification produces no response", func(t *testing.T) {
 		b.send(t, notificationLine("workspace/current", ""))
 		b.send(t, requestLine("1", "workspace/current", ""))
 		frame := b.recv(t)
-		if string(frame["id"]) != "1" {
-			t.Fatalf("first frame after a notification = %s, want the marker response", frame)
-		}
+		testassert.Require(t, string(frame["id"]) == "1", "first frame after a notification = %s, want the marker response", frame)
 	})
 	t.Run("explicit null id responds", func(t *testing.T) {
 		frame := b.call(t, "null", "workspace/current", "")
-		if string(frame["id"]) != "null" {
-			t.Fatalf("id = %s, want null", frame["id"])
-		}
+		testassert.Require(t, string(frame["id"]) == "null", "id = %s, want null", frame["id"])
 		if resultOf(t, frame) != `"/ws"` {
 			t.Fatalf("result = %s, want the initial workspace", resultOf(t, frame))
 		}
 	})
 	t.Run("large number id stays exact", func(t *testing.T) {
 		frame := b.call(t, "9007199254740993", "workspace/current", "")
-		if string(frame["id"]) != "9007199254740993" {
-			t.Fatalf("id = %s, want the exact caller number", frame["id"])
-		}
+		testassert.Require(t, string(frame["id"]) == "9007199254740993", "id = %s, want the exact caller number", frame["id"])
 	})
 	t.Run("string id stays exact", func(t *testing.T) {
 		frame := b.call(t, `"caller-id"`, "workspace/current", "")
-		if string(frame["id"]) != `"caller-id"` {
-			t.Fatalf("id = %s", frame["id"])
-		}
+		testassert.Require(t, string(frame["id"]) == `"caller-id"`, "id = %s", frame["id"])
 	})
 	t.Run("negative number id", func(t *testing.T) {
 		frame := b.call(t, "-5", "workspace/current", "")
-		if string(frame["id"]) != "-5" {
-			t.Fatalf("id = %s", frame["id"])
-		}
+		testassert.Require(t, string(frame["id"]) == "-5", "id = %s", frame["id"])
 	})
 }
 
@@ -668,19 +620,14 @@ func TestACPStartupFailureIsUnavailable(t *testing.T) {
 		ConfigPath: filepath.Join(dataDir, "config.json"),
 		Executable: filepath.Join(dataDir, "absent-runtime"),
 	}, "/ws", nil)
-	if code, _, _ := errorFrame(t, b.call(t, "1", "initialize", "")); code != -32001 {
-		t.Fatalf("initialize = %d, want -32001 for a failed startup", code)
+	{
+		code, _, _ := errorFrame(t, b.call(t, "1", "initialize", ""))
+		testassert.Equal(t, code, -32001)
 	}
-	if code := errorCode(t, b.call(t, "2", "runtime/GetHealth", "")); code != -32001 {
-		t.Fatalf("runtime method after a failed initialize = %d, want -32001", code)
-	}
-	if result := resultOf(t, b.call(t, "3", "workspace/current", "")); result != `"/ws"` {
-		t.Fatalf("workspace/current = %s, want the local workspace after startup failure", result)
-	}
+	testassert.Equal(t, errorCode(t, b.call(t, "2", "runtime/GetHealth", "")), -32001)
+	testassert.Equal(t, resultOf(t, b.call(t, "3", "workspace/current", "")), `"/ws"`)
 	b.eof()
-	if err := b.awaitRun(t); err != nil {
-		t.Fatalf("Run = %v, want nil", err)
-	}
+	testassert.NoError(t, b.awaitRun(t))
 }
 
 // TestACPInitializeRequiresAHealthyStream proves a candidate whose event
@@ -708,26 +655,14 @@ func TestACPInitializeRequiresAHealthyStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, map[string]http.HandlerFunc{"/v1/events": tc.events})
 			b := startBridge(t, f, "/ws")
-			if code := errorCode(t, b.call(t, "1", "initialize", "")); code != -32001 {
-				t.Fatalf("initialize = %d, want -32001", code)
-			}
-			if code := errorCode(t, b.call(t, "2", "runtime/GetHealth", "")); code != -32001 {
-				t.Fatalf("runtime after a failed initialize = %d, want -32001", code)
-			}
+			testassert.Equal(t, errorCode(t, b.call(t, "1", "initialize", "")), -32001)
+			testassert.Equal(t, errorCode(t, b.call(t, "2", "runtime/GetHealth", "")), -32001)
 			attempts := f.count("/v1/events")
-			if attempts == 0 {
-				t.Fatal("initialize never attempted the event stream")
-			}
-			if result := resultOf(t, b.call(t, "3", "workspace/current", "")); result != `"/ws"` {
-				t.Fatalf("workspace/current = %s, want the local workspace", result)
-			}
-			if got := f.count("/v1/events"); got != attempts {
-				t.Fatalf("event stream attempts grew from %d to %d without a loss", attempts, got)
-			}
+			testassert.Require(t, attempts != 0, "initialize never attempted the event stream")
+			testassert.Equal(t, resultOf(t, b.call(t, "3", "workspace/current", "")), `"/ws"`)
+			testassert.Equal(t, f.count("/v1/events"), attempts)
 			for _, path := range f.paths() {
-				if strings.HasPrefix(path, "/v1/sessions") || strings.HasPrefix(path, "/v1/configuration") {
-					t.Fatalf("a failed initialize performed %s", path)
-				}
+				testassert.Require(t, !strings.HasPrefix(path, "/v1/sessions") && !strings.HasPrefix(path, "/v1/configuration"), "a failed initialize performed %s", path)
 			}
 		})
 	}
@@ -741,12 +676,8 @@ func TestACPOversizedLine(t *testing.T) {
 		_, _ = io.WriteString(b.in, strings.Repeat("x", (1<<20)+1)+"\n")
 	}()
 	err := b.awaitRun(t)
-	if err == nil {
-		t.Fatal("an oversized line ended Run without an error")
-	}
-	if !strings.Contains(err.Error(), "token too long") {
-		t.Fatalf("error = %v, want the scanner's line-bound error", err)
-	}
+	testassert.Require(t, err != nil, "an oversized line ended Run without an error")
+	testassert.Require(t, strings.Contains(err.Error(), "token too long"), "error = %v, want the scanner's line-bound error", err)
 }
 
 // TestACPInitializeBeforeAndAfter pins the initializing gate, the exact
@@ -756,27 +687,13 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	b := startBridge(t, f, "/ws")
 
 	// Local methods and method classification operate before initialization.
-	if result := resultOf(t, b.call(t, "1", "workspace/current", "")); result != `"/ws"` {
-		t.Fatalf("workspace/current = %s, want the initial normalized workspace", result)
-	}
-	if result := resultOf(t, b.call(t, "2", "workspace/select", `{"workspace":"/other"}`)); result != `"/other"` {
-		t.Fatalf("workspace/select = %s, want the normalized selection", result)
-	}
-	if code := errorCode(t, b.call(t, "3", "runtime/GetHealth", "")); code != -32001 {
-		t.Fatalf("pre-initialize runtime/GetHealth = %d, want -32001", code)
-	}
-	if code := errorCode(t, b.call(t, "4", "session/current", "")); code != -32001 {
-		t.Fatalf("pre-initialize session/current = %d, want -32001", code)
-	}
-	if code := errorCode(t, b.call(t, "5", "session/select", `{"session_id":"s1"}`)); code != -32001 {
-		t.Fatalf("pre-initialize session/select = %d, want -32001", code)
-	}
-	if code := errorCode(t, b.call(t, "6", "runtime/Nope", "{}")); code != -32001 {
-		t.Fatalf("unknown operation before a connection = %d, want -32001", code)
-	}
-	if requests := f.total(); requests != 0 {
-		t.Fatalf("pre-initialize requests reached the Runtime: %d", requests)
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "1", "workspace/current", "")), `"/ws"`)
+	testassert.Equal(t, resultOf(t, b.call(t, "2", "workspace/select", `{"workspace":"/other"}`)), `"/other"`)
+	testassert.Equal(t, errorCode(t, b.call(t, "3", "runtime/GetHealth", "")), -32001)
+	testassert.Equal(t, errorCode(t, b.call(t, "4", "session/current", "")), -32001)
+	testassert.Equal(t, errorCode(t, b.call(t, "5", "session/select", `{"session_id":"s1"}`)), -32001)
+	testassert.Equal(t, errorCode(t, b.call(t, "6", "runtime/Nope", "{}")), -32001)
+	testassert.Equal(t, f.total(), 0)
 
 	b.send(t, requestLine("10", "initialize", ""))
 	var sawResponse, sawConnected bool
@@ -804,35 +721,20 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 		Methods []string        `json:"methods"`
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(resultOf(t, response)), &members); err != nil {
-		t.Fatalf("initialize result: %v", err)
-	}
-	if len(members) != 3 {
-		t.Fatalf("initialize result members = %v, want exactly serverInfo, runtime, and methods", members)
-	}
-	if err := json.Unmarshal([]byte(resultOf(t, response)), &result); err != nil {
-		t.Fatalf("initialize result: %v", err)
-	}
-	if result.ServerInfo.Name != "lightcode" || result.ServerInfo.Version != version.String() {
-		t.Fatalf("serverInfo = %+v, want the native identity", result.ServerInfo)
-	}
-	if string(result.Runtime) != healthBody() {
-		t.Fatalf("runtime = %s, want the generated Health", result.Runtime)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(resultOf(t, response)), &members))
+	testassert.Require(t, len(members) == 3, "initialize result members = %v, want exactly serverInfo, runtime, and methods", members)
+	testassert.NoError(t, json.Unmarshal([]byte(resultOf(t, response)), &result))
+	testassert.Require(t, result.ServerInfo.Name == "lightcode" && result.ServerInfo.Version == version.String() && string(result.Runtime) == healthBody(), "serverInfo = %+v, want the native identity; runtime = %s, want the generated Health", result.ServerInfo, result.Runtime)
 	wantMethods := clientops.OperationNames()
 	slices.Sort(wantMethods)
-	if !reflect.DeepEqual(result.Methods, wantMethods) {
-		t.Fatalf("methods = %v, want the sorted supported invocation names", result.Methods)
-	}
+	testassert.Require(t, reflect.DeepEqual(result.Methods, wantMethods), "methods = %v, want the sorted supported invocation names", result.Methods)
 	if f.count("/v1/events") != 1 {
 		t.Fatalf("initialize opened %d event streams, want one", f.count("/v1/events"))
 	}
 	// The one startup composition created one primary Session in the captured
 	// Workspace (the pre-initialize selection); the scripted list handler
 	// checked its query and method.
-	if got := f.lastBody(t, "/v1/sessions"); got != `{"agent_type":"primary","workspace":"/other"}` {
-		t.Fatalf("startup create body = %s", got)
-	}
+	testassert.Equal(t, f.lastBody(t, "/v1/sessions"), `{"agent_type":"primary","workspace":"/other"}`)
 
 	// A repeated initialize describes the current connection and never
 	// composes or creates again.
@@ -842,20 +744,14 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	if resultOf(t, again) != resultOf(t, response) {
 		t.Fatalf("repeated initialize = %s, want the current description", resultOf(t, again))
 	}
-	if f.count("/v1/events") != before {
-		t.Fatal("repeated initialize opened a second event stream")
-	}
-	if f.count("/v1/sessions") != startupReads {
-		t.Fatal("a repeated initialize composed again")
-	}
+	testassert.Require(t, f.count("/v1/events") == before, "repeated initialize opened a second event stream")
+	testassert.Require(t, f.count("/v1/sessions") == startupReads, "a repeated initialize composed again")
 
 	health := b.call(t, "12", "runtime/GetHealth", "")
 	if resultOf(t, health) != healthBody() {
 		t.Fatalf("runtime/GetHealth = %s, want the exact health document", resultOf(t, health))
 	}
-	if code := errorCode(t, b.call(t, "13", "runtime/GetHealth", `{"bogus":true}`)); code != -32602 {
-		t.Fatalf("malformed envelope = %d, want -32602", code)
-	}
+	testassert.Equal(t, errorCode(t, b.call(t, "13", "runtime/GetHealth", `{"bogus":true}`)), -32602)
 }
 
 // TestACPSelection pins explicit session selection, its Workspace adoption,
@@ -887,54 +783,38 @@ func TestACPSelection(t *testing.T) {
 
 	// The startup composition adopted the newest root by last activity and ID;
 	// an older root and a newer child header never win.
-	if result := resultOf(t, b.call(t, "2", "session/current", "")); result != hydrationBody("s-a", "/ws") {
-		t.Fatalf("startup selection = %s, want the newest root's fresh hydration", result)
+	{
+		result := resultOf(t, b.call(t, "2", "session/current", ""))
+		testassert.Require(t, result == hydrationBody("s-a", "/ws"), "startup selection = %s, want the newest root's fresh hydration", result)
 	}
 	// The local workspace operation clears the selection so the null result is
 	// observable.
-	if result := resultOf(t, b.call(t, "3", "workspace/select", `{"workspace":"/ws"}`)); result != `"/ws"` {
-		t.Fatalf("workspace/select = %s, want the normalized selection", result)
-	}
-	if result := resultOf(t, b.call(t, "4", "session/current", "")); result != "null" {
-		t.Fatalf("session/current with no selection = %s, want null", result)
-	}
-	if f.count("/v1/sessions/s1/hydration") != 0 {
-		t.Fatal("session/current without a selection performed a hydration read")
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "3", "workspace/select", `{"workspace":"/ws"}`)), `"/ws"`)
+	testassert.Equal(t, resultOf(t, b.call(t, "4", "session/current", "")), "null")
+	testassert.Require(t, f.count("/v1/sessions/s1/hydration") == 0, "session/current without a selection performed a hydration read")
 
 	selected := b.call(t, "5", "session/select", `{"session_id":"s1"}`)
 	if resultOf(t, selected) != hydrationBody("s1", "/ws/s1") {
 		t.Fatalf("session/select = %s, want the exact generated hydration", resultOf(t, selected))
 	}
-	if result := resultOf(t, b.call(t, "6", "workspace/current", "")); result != `"/ws/s1"` {
-		t.Fatalf("workspace/current after selection = %s, want the selected Session's workspace", result)
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "6", "workspace/current", "")), `"/ws/s1"`)
 	b.call(t, "7", "session/current", "")
 	if f.count("/v1/sessions/s1/hydration") != 2 {
 		t.Fatalf("hydration reads = %d, want the selection read and one fresh current read", f.count("/v1/sessions/s1/hydration"))
 	}
 
-	if result := resultOf(t, b.call(t, "8", "workspace/select", `{"workspace":"/other"}`)); result != `"/other"` {
-		t.Fatalf("workspace/select = %s", result)
+	testassert.Equal(t, resultOf(t, b.call(t, "8", "workspace/select", `{"workspace":"/other"}`)), `"/other"`)
+	testassert.Equal(t, resultOf(t, b.call(t, "9", "session/current", "")), "null")
+	{
+		result := resultOf(t, b.call(t, "10", "session/select", `{"session_id":"s2"}`))
+		testassert.Require(t, result == hydrationBody("s2", "/ws/s2"), "session/select s2 = %s", result)
 	}
-	if result := resultOf(t, b.call(t, "9", "session/current", "")); result != "null" {
-		t.Fatalf("session/current after clearing = %s, want null", result)
-	}
-	if result := resultOf(t, b.call(t, "10", "session/select", `{"session_id":"s2"}`)); result != hydrationBody("s2", "/ws/s2") {
-		t.Fatalf("session/select s2 = %s", result)
-	}
-	if result := resultOf(t, b.call(t, "11", "workspace/current", "")); result != `"/ws/s2"` {
-		t.Fatalf("workspace/current = %s, want the second Session's workspace", result)
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "11", "workspace/current", "")), `"/ws/s2"`)
 
 	rejected := b.call(t, "12", "session/select", `{"session_id":"s3"}`)
 	code, message, data := errorFrame(t, rejected)
-	if code != -32000 || message != "no such session" {
-		t.Fatalf("received error = (%d, %q), want -32000 with the returned message", code, message)
-	}
-	if string(data) != `{"code":"not_found","message":"no such session"}` {
-		t.Fatalf("error.data = %s, want the generated Error document", data)
-	}
+	testassert.Require(t, code == -32000 && message == "no such session", "received error = (%d, %q), want -32000 with the returned message", code, message)
+	testassert.Require(t, string(data) == `{"code":"not_found","message":"no such session"}`, "error.data = %s, want the generated Error document", data)
 
 	for _, row := range []struct {
 		name   string
@@ -952,9 +832,7 @@ func TestACPSelection(t *testing.T) {
 		{"initialize unknown member", "initialize", `{"x":1}`},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			if code := errorCode(t, b.call(t, `"`+row.name+`"`, row.method, row.params)); code != -32602 {
-				t.Fatalf("code = %d, want -32602", code)
-			}
+			testassert.Equal(t, errorCode(t, b.call(t, `"`+row.name+`"`, row.method, row.params)), -32602)
 		})
 	}
 }
@@ -1008,35 +886,24 @@ func TestACPEventsAndRepair(t *testing.T) {
 		return sawResponse && sawConnected && sawEvent
 	})
 	var forwarded, original map[string]any
-	if err := json.Unmarshal(eventParams, &forwarded); err != nil {
-		t.Fatalf("runtime/event params: %v", err)
-	}
-	if err := json.Unmarshal([]byte(event), &original); err != nil {
-		t.Fatalf("fixture event: %v", err)
-	}
-	if !reflect.DeepEqual(forwarded, original) {
-		t.Fatalf("forwarded event = %v, want the generated event %v", forwarded, original)
-	}
+	testassert.NoError(t, json.Unmarshal(eventParams, &forwarded))
+	testassert.NoError(t, json.Unmarshal([]byte(event), &original))
+	testassert.Require(t, reflect.DeepEqual(forwarded, original), "forwarded event = %v, want the generated event %v", forwarded, original)
 
 	b.call(t, "2", "session/select", `{"session_id":"s1"}`)
 	close(release)
 
 	connected := b.awaitFrame(t, methodFrame("runtime/connected"))
 	var health map[string]any
-	if err := json.Unmarshal(connected["params"], &health); err != nil {
-		t.Fatalf("runtime/connected params: %v", err)
-	}
-	if health["instance_id"] != testInstance || health["protocol_version"] != "2" {
-		t.Fatalf("runtime/connected params = %v, want the generated Health", health)
-	}
+	testassert.NoError(t, json.Unmarshal(connected["params"], &health))
+	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "2", "runtime/connected params = %v, want the generated Health", health)
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))
-	if params, ok := resync["params"]; ok {
-		t.Fatalf("runtime/resync_required carries params %s, want none", params)
+	{
+		params, ok := resync["params"]
+		testassert.Require(t, !ok, "runtime/resync_required carries params %s, want none", params)
 	}
 	snapshot := b.awaitFrame(t, methodFrame("session/snapshot"))
-	if string(snapshot["params"]) != hydrationBody("s1", "/ws/s1") {
-		t.Fatalf("session/snapshot = %s, want the selected Session's fresh hydration", snapshot["params"])
-	}
+	testassert.Require(t, string(snapshot["params"]) == hydrationBody("s1", "/ws/s1"), "session/snapshot = %s, want the selected Session's fresh hydration", snapshot["params"])
 	if f.count("/v1/events") != 2 {
 		t.Fatalf("event streams opened = %d, want one repair reconnect", f.count("/v1/events"))
 	}
@@ -1054,45 +921,30 @@ func TestACPNoParameterParams(t *testing.T) {
 	b := startBridge(t, f, "/ws")
 
 	// initialize rejects a supplied null before any connection is made.
-	if code := errorCode(t, b.call(t, "1", "initialize", "null")); code != -32602 {
-		t.Fatalf("initialize with null params = %d, want -32602", code)
-	}
+	testassert.Equal(t, errorCode(t, b.call(t, "1", "initialize", "null")), -32602)
 	if f.total() != 0 {
 		t.Fatalf("a rejected initialize started %d Runtime requests", f.total())
 	}
 	// initialize accepts the empty object.
 	initialized := b.call(t, "2", "initialize", "{}")
-	if _, ok := initialized["result"]; !ok {
-		t.Fatalf("initialize with {} = %s, want the connection description", initialized)
+	{
+		_, ok := initialized["result"]
+		testassert.Require(t, ok, "initialize with {} = %s, want the connection description", initialized)
 	}
 	// A repeated initialize accepts absent params.
-	if resultOf(t, b.call(t, "3", "initialize", "")) != resultOf(t, initialized) {
-		t.Fatal("initialize with absent params did not describe the connection")
-	}
+	testassert.Require(t, resultOf(t, b.call(t, "3", "initialize", "")) == resultOf(t, initialized), "initialize with absent params did not describe the connection")
 
 	// workspace/current accepts absent and {}, and rejects null.
-	if result := resultOf(t, b.call(t, "4", "workspace/current", "")); result != `"/ws"` {
-		t.Fatalf("workspace/current with absent params = %s", result)
-	}
-	if result := resultOf(t, b.call(t, "5", "workspace/current", "{}")); result != `"/ws"` {
-		t.Fatalf("workspace/current with {} = %s", result)
-	}
-	if code := errorCode(t, b.call(t, "6", "workspace/current", "null")); code != -32602 {
-		t.Fatalf("workspace/current with null params = %d, want -32602", code)
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "4", "workspace/current", "")), `"/ws"`)
+	testassert.Equal(t, resultOf(t, b.call(t, "5", "workspace/current", "{}")), `"/ws"`)
+	testassert.Equal(t, errorCode(t, b.call(t, "6", "workspace/current", "null")), -32602)
 
 	// With the startup selection cleared, session/current accepts absent and
 	// {}, and rejects null.
 	b.call(t, "61", "workspace/select", `{"workspace":"/ws"}`)
-	if result := resultOf(t, b.call(t, "7", "session/current", "")); result != "null" {
-		t.Fatalf("session/current with absent params = %s, want null", result)
-	}
-	if result := resultOf(t, b.call(t, "8", "session/current", "{}")); result != "null" {
-		t.Fatalf("session/current with {} = %s, want null", result)
-	}
-	if code := errorCode(t, b.call(t, "9", "session/current", "null")); code != -32602 {
-		t.Fatalf("session/current with null params = %d, want -32602", code)
-	}
+	testassert.Equal(t, resultOf(t, b.call(t, "7", "session/current", "")), "null")
+	testassert.Equal(t, resultOf(t, b.call(t, "8", "session/current", "{}")), "null")
+	testassert.Equal(t, errorCode(t, b.call(t, "9", "session/current", "null")), -32602)
 }
 
 // TestACPProgressOverflowDisconnectsAndResyncs pins that a full progress
@@ -1183,15 +1035,9 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 			t.Fatal("EOF did not cancel the parked Runtime call")
 		}
 		writer.release()
-		if err := b.awaitRun(t); err != nil {
-			t.Fatalf("Run after EOF = %v, want nil", err)
-		}
-		if got := f.count("/v1/health"); got != healthBefore {
-			t.Fatalf("the queued line was dispatched after EOF: health requests %d -> %d", healthBefore, got)
-		}
-		if f.count("/v1/sessions/s1/stop") != 1 {
-			t.Fatal("the bridge issued an implicit control beyond the explicit call")
-		}
+		testassert.NoError(t, b.awaitRun(t))
+		testassert.Equal(t, f.count("/v1/health"), healthBefore)
+		testassert.Require(t, f.count("/v1/sessions/s1/stop") == 1, "the bridge issued an implicit control beyond the explicit call")
 	})
 
 	t.Run("EOF behind a capacity-blocked line is observed in order", func(t *testing.T) {
@@ -1230,9 +1076,7 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 			t.Fatalf("the line admitted before EOF never progressed: health requests %d -> %d, calls=%v", healthBefore, got, f.paths())
 		}
 		// The ordered EOF then ends the run normally, never as an overflow.
-		if err := b.awaitRun(t); err != nil {
-			t.Fatalf("Run after an ordered EOF = %v, want nil", err)
-		}
+		testassert.NoError(t, b.awaitRun(t))
 		// Every line that reached dispatch kept its admission order; the racy
 		// tail behind the observed EOF may be released, never reordered.
 		want := []string{"/v1/health", "/v1/warnings", "/v1/health"}
@@ -1267,13 +1111,12 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 		case <-time.After(15 * time.Second):
 			t.Fatal("out-of-band cancellation did not cancel the parked Runtime call")
 		}
-		if err := b.awaitRun(t); err == nil {
-			t.Fatal("Run returned nil after its context was canceled")
+		{
+			err := b.awaitRun(t)
+			testassert.Require(t, err != nil, "Run returned nil after its context was canceled")
 		}
 		writer.release()
-		if got := f.total(); got != before {
-			t.Fatalf("a capacity-blocked line was dispatched after cancellation: requests %d -> %d", before, got)
-		}
+		testassert.Equal(t, f.total(), before)
 	})
 
 	t.Run("an uninterruptible output write stays bounded", func(t *testing.T) {
@@ -1285,11 +1128,10 @@ func TestACPInputPressureCancelsParkedCalls(t *testing.T) {
 		writer.awaitBlocked(t)
 		b.eof()
 		start := time.Now()
-		if err := b.awaitRun(t); err != nil {
-			t.Fatalf("Run after EOF with a parked writer = %v, want nil", err)
-		}
-		if elapsed := time.Since(start); elapsed > 10*time.Second {
-			t.Fatalf("Run waited %s for the parked writer, want the bounded join", elapsed)
+		testassert.NoError(t, b.awaitRun(t))
+		{
+			elapsed := time.Since(start)
+			testassert.Require(t, elapsed <= 10*time.Second, "Run waited %s for the parked writer, want the bounded join", elapsed)
 		}
 	})
 }
@@ -1378,15 +1220,12 @@ func TestACPFailedWriterEndsRun(t *testing.T) {
 			if tc.short {
 				wantErr = io.ErrShortWrite
 			}
-			if err := b.awaitRun(t); !errors.Is(err, wantErr) {
-				t.Fatalf("Run = %v, want %v", err, wantErr)
+			{
+				err := b.awaitRun(t)
+				testassert.Require(t, errors.Is(err, wantErr), "Run = %v, want %v", err, wantErr)
 			}
-			if got := f.count("/v1/health"); got != healthBefore {
-				t.Fatalf("a request was dispatched after the output failure: health %d -> %d", healthBefore, got)
-			}
-			if f.count("/v1/sessions/s1/stop") != 1 {
-				t.Fatal("the output failure issued an implicit Runtime control")
-			}
+			testassert.Equal(t, f.count("/v1/health"), healthBefore)
+			testassert.Require(t, f.count("/v1/sessions/s1/stop") == 1, "the output failure issued an implicit Runtime control")
 		})
 	}
 }
@@ -1417,54 +1256,34 @@ func TestACPRuntimeForwarding(t *testing.T) {
 	if resultOf(t, created) != `{"session_id":"s1","durable_revision":"9007199254740993"}` {
 		t.Fatalf("CreateSession result = %s, want the exact raw body", resultOf(t, created))
 	}
-	if got := f.lastBody(t, "/v1/sessions"); got != body {
-		t.Fatalf("Runtime received %s, want the caller's exact body %s", got, body)
-	}
-	if resultOf(t, b.call(t, "3", "runtime/DiscoverProviderCandidates", `{"body":{"base_url":"x","api_key_env":"K"}}`)) != "[]" {
-		t.Fatalf("DiscoverProviderCandidates result did not pass through raw")
-	}
+	testassert.Equal(t, f.lastBody(t, "/v1/sessions"), body)
+	testassert.Require(t, resultOf(t, b.call(t, "3", "runtime/DiscoverProviderCandidates", `{"body":{"base_url":"x","api_key_env":"K"}}`)) == "[]", "DiscoverProviderCandidates result did not pass through raw")
 
 	reverted := b.call(t, "4", "runtime/RevertSessionCode", `{"session_id":"s1","body":{"operation_id":"op"}}`)
 	code, message, data := errorFrame(t, reverted)
-	if code != -32000 || message != "partial restore" {
-		t.Fatalf("partial error = (%d, %q)", code, message)
-	}
+	testassert.Require(t, code == -32000 && message == "partial restore", "partial error = (%d, %q)", code, message)
 	var gotPartial, wantPartial any
-	if err := json.Unmarshal(data, &gotPartial); err != nil {
-		t.Fatalf("partial error.data %s: %v", data, err)
+	{
+		err := json.Unmarshal(data, &gotPartial)
+		testassert.Require(t, err == nil, "partial error.data %s: %v", data, err)
 	}
-	if err := json.Unmarshal([]byte(`{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","reason":"denied"}]}`), &wantPartial); err != nil {
-		t.Fatalf("fixture partial: %v", err)
-	}
-	if !reflect.DeepEqual(gotPartial, wantPartial) {
-		t.Fatalf("error.data = %s, want the complete generated result", data)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(`{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","reason":"denied"}]}`), &wantPartial))
+	testassert.Require(t, reflect.DeepEqual(gotPartial, wantPartial), "error.data = %s, want the complete generated result", data)
 
 	malformed := b.call(t, "5", "runtime/GetSessionHydration", `{"session_id":"s1"}`)
-	if code, _, _ := errorFrame(t, malformed); code != -32001 {
-		t.Fatalf("malformed Runtime response = %d, want the separate transport code", code)
+	{
+		code, _, _ := errorFrame(t, malformed)
+		testassert.Equal(t, code, -32001)
 	}
 
 	unknownBefore := f.total()
-	if code := errorCode(t, b.call(t, "6", "runtime/NoSuchOperation", `{}`)); code != -32602 {
-		t.Fatalf("unknown operation = %d, want -32602", code)
-	}
-	if f.total() != unknownBefore {
-		t.Fatal("an unknown operation reached the Runtime")
-	}
-	if code := errorCode(t, b.call(t, "7", "runtime/CreateSession", `{"body":[]}`)); code != -32602 {
-		t.Fatalf("local envelope failure = %d, want -32602", code)
-	}
-	if code := errorCode(t, b.call(t, "8", "runtime/GetHealth", `{"query":{}}`)); code != -32602 {
-		t.Fatalf("unrelated envelope member = %d, want -32602", code)
-	}
+	testassert.Equal(t, errorCode(t, b.call(t, "6", "runtime/NoSuchOperation", `{}`)), -32602)
+	testassert.Require(t, f.total() == unknownBefore, "an unknown operation reached the Runtime")
+	testassert.Equal(t, errorCode(t, b.call(t, "7", "runtime/CreateSession", `{"body":[]}`)), -32602)
+	testassert.Equal(t, errorCode(t, b.call(t, "8", "runtime/GetHealth", `{"query":{}}`)), -32602)
 	healthBefore := f.count("/v1/health")
-	if code := errorCode(t, b.call(t, "9", "runtime/GetHealth", "null")); code != -32602 {
-		t.Fatalf("null invocation params = %d, want -32602", code)
-	}
-	if f.count("/v1/health") != healthBefore {
-		t.Fatal("a rejected null envelope reached the Runtime")
-	}
+	testassert.Equal(t, errorCode(t, b.call(t, "9", "runtime/GetHealth", "null")), -32602)
+	testassert.Require(t, f.count("/v1/health") == healthBefore, "a rejected null envelope reached the Runtime")
 }
 
 // A composition failure ends that attempt through the RPC error mapping and
@@ -1475,10 +1294,9 @@ func TestACPStartupCompositionFailureLeavesTransportAvailable(t *testing.T) {
 	})
 	b := startBridge(t, f, "/ws")
 	code, message, _ := errorFrame(t, b.call(t, "1", "initialize", ""))
-	if code != -32000 || message != "list failed" {
-		t.Fatalf("composition failure = (%d, %q), want the received Runtime error mapping", code, message)
-	}
-	if result := resultOf(t, b.call(t, "2", "runtime/GetHealth", "")); result != healthBody() {
-		t.Fatalf("runtime/GetHealth after a composition failure = %s", result)
+	testassert.Require(t, code == -32000 && message == "list failed", "composition failure = (%d, %q), want the received Runtime error mapping", code, message)
+	{
+		result := resultOf(t, b.call(t, "2", "runtime/GetHealth", ""))
+		testassert.Require(t, result == healthBody(), "runtime/GetHealth after a composition failure = %s", result)
 	}
 }

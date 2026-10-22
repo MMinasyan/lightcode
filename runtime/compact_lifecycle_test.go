@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -26,13 +27,13 @@ import (
 // the paging and recovery rows seed with, and the exported-surface pin.
 
 // compactObservationConfigDocument configures the conversation model with a
-// window the sized overflow input exceeds while the post-compaction
-// projection fits, and the compact model as a distinct catalog identity with a
-// generous window, so the wire distinguishes the transports by model ID.
+// window whose trigger threshold the seed turn's reported usage overflows,
+// and the compact model as a distinct catalog identity, so the wire
+// distinguishes the transports by model ID.
 func compactObservationConfigDocument(endpoint string) string {
-	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{` +
-		`"m":{"name":"M","context_window":8192,"max_output_tokens":4096},` +
-		`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}}}}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
+		`{"m":{"name":"M","context_window":8192,"max_output_tokens":4096},`+
+			`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}`) + `}}`
 }
 
 // compactObservationAgentsDocument selects the conversation model for the
@@ -43,16 +44,10 @@ const compactObservationAgentsDocument = `{
 	"compact": {"model": "prov/k"}
 }`
 
-// compactFillerRepeats sizes the overflow input. The repeated unit's pinned
-// cl100k_base cost over the bundled data is 8194 tokens for these repetitions
-// — 4096 repetitions cost only 4098 — comfortably past the 4096-token trigger
-// threshold of the configured window (8192) minus reserve (4096). The
-// post-compaction projection stays far below it.
-const compactFillerRepeats = 8192
-
 // TestCompactLifecycleNativeCompactionObservation keeps the Runtime observer
-// oracle through the native pipeline: a sized overflowing admission triggers
-// one automatic compaction whose piece request reaches the compact model's
+// oracle through the native pipeline: the first turn's reported conversation
+// usage overflows the captured window, the next admission's checkpoint runs
+// one automatic compaction whose summary request reaches the compact model's
 // transport — distinguished by its model ID, with the captured compact
 // prompt and no tools — the committed summary turns the conversation
 // projection, and the observation bus carries only well-scoped facts: the
@@ -64,104 +59,87 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
 		r, err := e.open(context.Background(), e.storagePlugin(store))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		ctx := context.Background()
-		// The overflow input exceeds the window minus the reserve, while the
-		// post-compaction projection — the composed prompt plus the summary —
-		// fits.
-		overflowInput := strings.Repeat("filler ", compactFillerRepeats)
 
 		e.server.setScript(func(_ context.Context, body string) []string {
 			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
+				if lastUserText(body) == "first question" {
+					// The seed report: {5000,10} overflows the window 8192
+					// minus the reserve 4096.
+					return append(textTurnEvents("seeded answer"),
+						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
+				}
 				return nil // conversation turns: the default completed text turn
 			}
-			return []string{
-				`{"choices":[{"delta":{"role":"assistant","content":"native summary one"},"finish_reason":null}]}`,
-				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`,
-			}
+			return append(textTurnEvents("native summary one"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
 		})
 
 		sub, err := r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(ctx, e.dataDir, "tight")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
-		submitThroughRuntime(t, r, sessionID, "op-1", overflowInput)
-		op1 := awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
-		if op1.State.Status != harness.OperationSuccess {
-			t.Fatalf("overflowing operation = %+v, want the compacted success", op1.State)
-		}
-		submitConvergedThroughRuntime(t, r, sessionID, "op-2", "second question", harness.OperationSuccess)
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
+		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess) // the seed turn commits the report
+		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
+		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
+		testassert.Require(t, op2.State.Status == harness.OperationSuccess, "overflowing operation = %+v, want the compacted success", op2.State)
+		submitConvergedThroughRuntime(t, r, sessionID, "op-3", "second question", harness.OperationSuccess)
+		testassert.NoError(t, r.Close(ctx))
 
-		// The wire: one compact piece on the compact model, then the two
-		// conversation requests against the summary projection.
-		var compactPiece string
+		// The wire: the seed conversation request, one compact summary on
+		// the compact model, then the two conversation requests against the
+		// summary projection.
+		var compactSummary string
 		var conversation []string
 		for i := 0; i < e.server.requests(); i++ {
 			body := e.server.bodyAt(i)
 			doc := decodeWireChatBody(t, body)
 			if doc.Model == "k" {
-				compactPiece = body
+				compactSummary = body
 				continue
 			}
-			if doc.Model != "m" {
-				t.Fatalf("wire request %d names model %q, want one of the configured identities", i, doc.Model)
-			}
+			testassert.Require(t, doc.Model == "m", "wire request %d names model %q, want one of the configured identities", i, doc.Model)
 			conversation = append(conversation, body)
 		}
-		if compactPiece == "" {
-			t.Fatal("the compaction never reached the compact model's transport")
+		testassert.Require(t, compactSummary != "", "the compaction never reached the compact model's transport")
+		testassert.Equal(t, len(conversation), 3)
+		seed := decodeWireChatBody(t, conversation[0])
+		{
+			roles := wireRoles(seed)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "user"}), "seed request roles = %v, want the prompt and the first message", roles)
 		}
-		if len(conversation) != 2 {
-			t.Fatalf("conversation requests = %d, want the compacted turn plus the later one", len(conversation))
-		}
-		piece := decodeWireChatBody(t, compactPiece)
-		if len(piece.Tools) != 0 {
-			t.Fatalf("compact piece advertised %d tools, want none", len(piece.Tools))
-		}
-		if len(piece.Messages) == 0 || piece.Messages[0].Role != "system" {
-			t.Fatalf("compact piece = %+v, want the leading compact system prompt", piece.Messages)
-		}
+		summary := decodeWireChatBody(t, compactSummary)
+		testassert.Require(t, len(summary.Tools) == 0 && len(summary.Messages) != 0 && summary.Messages[0].Role == "system", "got %v, want %v; compact summary request = %+v, want the leading compact system prompt", len(summary.Tools), 0, summary.Messages)
 		var systemText string
-		if err := json.Unmarshal(piece.Messages[0].Content, &systemText); err != nil || systemText != op1.Admission.Execution.Compact.SystemPrompt {
-			t.Fatalf("compact piece system = %q (err %v), want the captured compact prompt %q", systemText, err, op1.Admission.Execution.Compact.SystemPrompt)
+		{
+			err := json.Unmarshal(summary.Messages[0].Content, &systemText)
+			testassert.Require(t, err == nil && systemText == op2.Admission.Execution.Compact.SystemPrompt, "compact summary system = %q (err %v), want the captured compact prompt %q", systemText, err, op2.Admission.Execution.Compact.SystemPrompt)
 		}
-		if op1.Admission.Execution.Compact.Model != (model.ModelRef{Provider: "prov", Model: "k"}) {
-			t.Fatalf("captured compact model = %+v, want the overlaid prov/k", op1.Admission.Execution.Compact.Model)
-		}
-		first := decodeWireChatBody(t, conversation[0])
-		if roles := wireRoles(first); !slices.Equal(roles, []string{"system", "assistant"}) {
-			t.Fatalf("post-compaction request roles = %v, want the prompt and the summary alone", roles)
+		testassert.Require(t, op2.Admission.Execution.Compact.Model == (model.ModelRef{Provider: "prov", Model: "k"}), "captured compact model = %+v, want the overlaid prov/k", op2.Admission.Execution.Compact.Model)
+		first := decodeWireChatBody(t, conversation[1])
+		{
+			roles := wireRoles(first)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "assistant"}), "post-compaction request roles = %v, want the prompt and the summary alone", roles)
 		}
 		var summaryText string
 		if len(first.Messages) > 1 {
 			_ = json.Unmarshal(first.Messages[1].Content, &summaryText)
 		}
-		if !strings.Contains(summaryText, "native summary one") {
-			t.Fatalf("post-compaction assistant = %q, want the committed summary", summaryText)
-		}
-		second := decodeWireChatBody(t, conversation[1])
-		if roles := wireRoles(second); !slices.Equal(roles, []string{"system", "assistant", "assistant", "user"}) {
-			t.Fatalf("second request roles = %v, want the prompt, the summary, the first closing turn and the new message", roles)
+		testassert.Require(t, strings.Contains(summaryText, "native summary one"), "post-compaction assistant = %q, want the committed summary", summaryText)
+		second := decodeWireChatBody(t, conversation[2])
+		{
+			roles := wireRoles(second)
+			testassert.Require(t, slices.Equal(roles, []string{"system", "assistant", "assistant", "user"}), "second request roles = %v, want the prompt, the summary, the first closing turn and the new message", roles)
 		}
 
 		// The durable state: exactly one committed compaction entry owned by
 		// the overflowing Operation.
 		entries, err := store.ReadEntries(ctx, sessionID, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		compactions := 0
 		for _, entry := range entries {
 			if entry.Kind != harness.EntryCompaction {
@@ -172,16 +150,10 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				OperationID string `json:"operation_id"`
 				Summary     string `json:"summary"`
 			}
-			if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-				t.Fatalf("decode compaction entry: %v", err)
-			}
-			if wire.OperationID != "op-1" || wire.Summary != "native summary one" {
-				t.Fatalf("compaction entry = %+v, want op-1's committed summary", wire)
-			}
+			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
+			testassert.Require(t, wire.OperationID == "op-2" && wire.Summary == "native summary one", "compaction entry = %+v, want op-2's committed summary", wire)
 		}
-		if compactions != 1 {
-			t.Fatalf("compaction entries = %d, want exactly the overflowing Operation's one", compactions)
-		}
+		testassert.Equal(t, compactions, 1)
 
 		// The observation set: every session invalidation names the real
 		// Session, every text progress the real running Operation, and no
@@ -191,21 +163,13 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			switch eventKind(t, event) {
 			case "session_changed":
 				body, err := event.AsSessionChangedEvent()
-				if err != nil {
-					t.Fatalf("session event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				scope, err := body.Scope.AsSessionScope()
-				if err != nil {
-					t.Fatalf("session invalidation scope: %v", err)
-				}
-				if scope.SessionId != sessionID {
-					t.Fatalf("session invalidation for %q, want the real session", scope.SessionId)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, scope.SessionId, sessionID)
 				sawInvalidation = true
 			case "text_delta":
-				if err := assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2"); err != nil {
-					t.Fatalf("text progress: %v", err)
-				}
+				testassert.NoError(t, assertProgressScopedToOperations(t, event, sessionID, "op-1", "op-2", "op-3"))
 				sawDelta = true
 			case "scope_opened", "scope_closed", "warning_changed", "configuration_changed":
 				// scope lifecycle and publication facts stay allowed beside the passive set
@@ -213,9 +177,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 				t.Fatalf("unexpected event %s", eventJSON(t, event))
 			}
 		}
-		if !sawInvalidation || !sawDelta {
-			t.Fatalf("observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
-		}
+		testassert.Require(t, sawInvalidation && sawDelta, "observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
 	})
 }
 
@@ -237,9 +199,7 @@ func assertProgressScopedToOperations(t *testing.T, event Event, sessionID strin
 		return errors.New("progress carries a non-operation scope")
 	}
 	body, err := scope.AsOperationScope()
-	if err != nil {
-		t.Fatalf("operation scope: %v", err)
-	}
+	testassert.NoError(t, err)
 	if body.SessionId != sessionID {
 		return errors.New("progress carries a foreign session identity")
 	}
@@ -251,17 +211,47 @@ func assertProgressScopedToOperations(t *testing.T, event Event, sessionID strin
 	return fmt.Errorf("progress carries operation %q outside %v", body.OperationId, operationIDs)
 }
 
-// compactRawMessageAdmission builds one message-kind admission payload.
-func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
+// rawAdmissionValues carries the authored execution values of one raw
+// message-kind admission seed.
+type rawAdmissionValues struct {
+	agentType     string
+	model         usageWireRef
+	outputReserve int
+	systemPrompt  string
+	tools         string
+	compactModel  usageWireRef
+	compactPrompt string
+}
+
+// rawMessageAdmission builds one message-kind admission payload from the
+// caller's authored execution values.
+func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionValues) string {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return fmt.Sprintf(
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":"solo",`+
-			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"m"},`+
-			`"context_window":4096,"output_reserve":1024,`+
-			`"system_prompt":"compact-sys","tools":[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"prov","model":"m"},"context_window":2048,"output_reserve":1024,"system_prompt":"summarize"}},"admitted_at":%q}`,
-		sessionID, operationID, sessionID, entryID, now)
+			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":%q,`+
+			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
+			`"context_window":4096,"output_reserve":%d,`+
+			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
+			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q}},"admitted_at":%q}`,
+		sessionID, operationID, sessionID, entryID, v.agentType,
+		v.model.Provider, v.model.Model, v.outputReserve,
+		v.systemPrompt, v.tools,
+		v.compactModel.Provider, v.compactModel.Model, v.compactPrompt, now)
+}
+
+// compactRawMessageAdmission builds the compact and paging fixtures'
+// message-kind admission payload.
+func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
+	return rawMessageAdmission(sessionID, operationID, entryID, rawAdmissionValues{
+		agentType:     "solo",
+		model:         usageWireRef{Provider: "prov", Model: "m"},
+		outputReserve: 1024,
+		systemPrompt:  "compact-sys",
+		tools:         `[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}]`,
+		compactModel:  usageWireRef{Provider: "prov", Model: "m"},
+		compactPrompt: "summarize",
+	})
 }
 
 func compactRawOperationRegister(admission, state string) string {
@@ -274,16 +264,16 @@ func compactRawRunningModelState(now, reserved string) string {
 		now, reserved)
 }
 
-func compactRawSuccessState(now, settlementEntry, sessionID string) string {
+func compactRawSuccessState(now, settlementEntry, sessionID, usage string) string {
 	return fmt.Sprintf(
-		`{"status":"success","started_at":%q,"settled_at":%q,"pending_tool_calls":[],"usage":{"by_model":[]},"terminal":{"settlement_entry":{"session_id":%q,"entry_id":%q}}}`,
-		now, now, sessionID, settlementEntry)
+		`{"status":"success","started_at":%q,"settled_at":%q,"pending_tool_calls":[],"usage":%s,"terminal":{"settlement_entry":{"session_id":%q,"entry_id":%q}}}`,
+		now, now, usage, sessionID, settlementEntry)
 }
 
-func compactRawInputEntry(sessionID, entryID, operationID, text string) string {
+func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"user","content":[{"kind":"text","text":%q}]}`,
-		sessionID, entryID, operationID, text)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":%q,"content":[{"kind":"text","text":%q}]}`,
+		sessionID, entryID, operationID, origin, text)
 }
 
 func compactRawAssistantEntry(sessionID, entryID, operationID, text string) string {
@@ -293,10 +283,10 @@ func compactRawAssistantEntry(sessionID, entryID, operationID, text string) stri
 		sessionID, entryID, operationID, text)
 }
 
-func compactRawSettlementEntry(sessionID, entryID, operationID string) string {
+func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`,
-		sessionID, entryID, operationID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"%s}`,
+		sessionID, entryID, operationID, extra)
 }
 
 func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundaryID string) string {
@@ -315,11 +305,11 @@ func compactRawSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inputID, assistantID, settlementID := newLifecycleID(t), newLifecycleID(t), newLifecycleID(t)
-	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, inputText))
+	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, "user", inputText))
 	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, assistantText))
-	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID))
+	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID, ""))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
-		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID)))
+		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID, `{"by_model":[]}`)))
 	return assistantID
 }
 
@@ -347,44 +337,24 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		freedHook := &recordHook{name: "hook.freed", events: &traceLog{}}
 		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsWithFreedHook())
 		r, err := e.openWithPlugins(ctx, hook, &parkingHook{}, freedHookPlugin(freedHook))
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("compact-capture"), "worker")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 
 		// The capture carries the compact configuration from one revision.
 		submitThroughRuntime(t, r, sessionID, "op-1", "please write")
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
-		var durable harness.ExecutionCapture
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			rec, err := h.ReadOperation(ctx, sessionID, "op-1")
-			if err != nil {
-				return err
-			}
-			durable = rec.Admission.Execution
-			return nil
-		}); err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
+		durable := readOperation(t, r, sessionID, "op-1").Admission.Execution
 		seenMu.Lock()
 		seen := seenCompact
 		revision := seenRevision
 		seenMu.Unlock()
-		if seen != durable.Compact {
-			t.Fatalf("hook-saw compact capture %+v differs from the durable %+v", seen, durable.Compact)
-		}
-		if revision != durable.ConfigurationRevision {
-			t.Fatalf("hook-saw revision %q differs from the durable %q", revision, durable.ConfigurationRevision)
-		}
-		if seen.Model.Provider == "" || seen.Model.Model == "" || seen.ContextWindow <= 0 || seen.OutputReserve <= 0 || seen.SystemPrompt == "" {
-			t.Fatalf("captured compact configuration incomplete: %+v", seen)
-		}
+		testassert.Equal(t, seen, durable.Compact)
+		testassert.Equal(t, revision, durable.ConfigurationRevision)
+		testassert.Require(t, seen.Model.Provider != "" && seen.Model.Model != "" && seen.SystemPrompt != "", "captured compact configuration incomplete: %+v", seen)
 
 		// A hook attempting to change a compact member is rejected. The
 		// mutation stays installed on this session for the phase's whole
@@ -402,23 +372,11 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		// capture, whose admission rejects and whose item is dropped — the
 		// never-admitted check below pins every path, so only an accepted
 		// admission fails the row.
-		var rejected harness.SubmitResult
-		err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			var serr error
-			rejected, serr = h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   sessionID,
-				OperationID: "op-2",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "please write"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return serr
-		})
-		if err == nil && rejected.Disposition == harness.DispositionAdmitted {
-			t.Fatalf("a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
-		}
-		if _, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"}); !errors.Is(rerr, harness.ErrNotFound) {
-			t.Fatalf("the rejected admission left a register (%v), want none", rerr)
+		rejected, err := submitRawThroughRuntime(ctx, r, sessionID, "op-2", "please write", harness.MessageModeRegular)
+		testassert.Require(t, err != nil || rejected.Disposition != harness.DispositionAdmitted, "a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
+		{
+			_, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"})
+			testassert.Require(t, errors.Is(rerr, harness.ErrNotFound), "the rejected admission left a register (%v), want none", rerr)
 		}
 
 		// The prompt and tool-definition replacement freedoms hold on a
@@ -437,44 +395,14 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 			return c
 		})
 		freedSession, err := r.createSession(ctx, e.workspace("compact-freed"), "freedworker")
-		if err != nil {
-			t.Fatalf("createSession(freed): %v", err)
-		}
+		testassert.NoError(t, err)
 		freedID := freedSession.Identity.SessionID
-		var freed harness.SubmitResult
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			var serr error
-			freed, serr = h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   freedID,
-				OperationID: "op-3",
-				Origin:      harness.InputOriginUser,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "please write"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			return serr
-		}); err != nil {
-			t.Fatalf("submit op-3: %v", err)
-		}
-		if freed.Disposition != harness.DispositionAdmitted {
-			t.Fatalf("submit op-3 disposition = %q, want admission on the fresh session", freed.Disposition)
-		}
+		submitThroughRuntime(t, r, freedID, "op-3", "please write")
 		awaitOperation(t, r, freedID, "op-3", harness.OperationSuccess)
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			rec, err := h.ReadOperation(ctx, freedID, "op-3")
-			if err != nil {
-				return err
-			}
-			if !strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed") {
-				t.Fatalf("capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
-			}
-			for _, tool := range rec.Admission.Execution.Tools {
-				if tool.Description != "freed description" {
-					t.Fatalf("tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
-				}
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("ReadOperation(op-3): %v", err)
+		rec := readOperation(t, r, freedID, "op-3")
+		testassert.Require(t, strings.Contains(rec.Admission.Execution.SystemPrompt, "|freed"), "capture prompt = %q, want the hook's replacement", rec.Admission.Execution.SystemPrompt)
+		for _, tool := range rec.Admission.Execution.Tools {
+			testassert.Require(t, tool.Description == "freed description", "tool %q description = %q, want the hook's replacement", tool.Name, tool.Description)
 		}
 	})
 }
@@ -564,18 +492,14 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("glob package sources: %v", err)
-	}
+	testassert.NoError(t, err)
 	got := map[string]string{}
 	for _, file := range files {
 		if strings.HasSuffix(file, "_test.go") {
 			continue
 		}
 		parsed, err := parser.ParseFile(fset, file, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", file, err)
-		}
+		testassert.Require(t, err == nil, "parse %s: %v", file, err)
 		for _, decl := range parsed.Decls {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
@@ -618,17 +542,16 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 			}
 		}
 	}
-	if len(files) == 0 {
-		t.Fatal("the package source scan found no production files")
-	}
+	testassert.Require(t, len(files) != 0, "the package source scan found no production files")
 	for name := range got {
 		if !want[name] {
 			t.Fatalf("exported declaration %q (%s) is outside the fixed pre-compaction surface", name, got[name])
 		}
 	}
 	for name := range want {
-		if _, ok := got[name]; !ok {
-			t.Fatalf("pinned exported declaration %q missing from the package source scan", name)
+		{
+			_, ok := got[name]
+			testassert.Require(t, ok, "pinned exported declaration %q missing from the package source scan", name)
 		}
 	}
 }

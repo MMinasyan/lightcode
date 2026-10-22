@@ -39,7 +39,7 @@ Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. 
 
 **Permissions** — One automatic allow/deny policy checked before every tool call: workspace file access, sensitive-file denials, and optional global/per-workspace rule lists. Nothing prompts.
 
-**Context compaction** — Automatic summarization when a request would exceed the model's context window: the frozen conversation is packed and summarized in rolling pieces, and `/compact` triggers it manually.
+**Context compaction** — Automatic single-request summarization over the frozen conversation when provider-reported usage would exceed the model's context window; `/compact` triggers it manually.
 
 **LSP** — Diagnostics and symbol search across Go, Python, TypeScript/JS, Rust, C/C++, C#. Auto-detected; servers auto-installed where supported.
 

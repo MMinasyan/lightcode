@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"path/filepath"
 	"strings"
@@ -42,9 +43,10 @@ const executionInterruptedDetail = "agent interrupted"
 // modelEffectIntent is the committed intent of one logical model effect: the
 // facts the result transaction needs after the callback returns.
 type modelEffectIntent struct {
-	sessionID string
-	expected  model.ModelRef
-	resultID  string
+	sessionID  string
+	expected   model.ModelRef
+	resultID   string
+	compaction bool // true for the compact effect's intent: its usage is summary usage
 }
 
 // modelResult is the settlement content of one logical model effect: the
@@ -53,7 +55,9 @@ type modelEffectIntent struct {
 // classification when the effect settles the Operation, and the terminal
 // no-output model usage when a reported usage has no assistant entry to ride.
 // The usage model is the intent's expected identity while an intent is live;
-// without one the result declares its own usage model.
+// without one the result declares its own usage model. The compaction flag
+// carries that usage's provenance: true marks summary usage produced by the
+// compaction summarizer, and conversation producers leave it false.
 type modelResult struct {
 	assistant  *assistantEntry // nil when no eligible assistant payload exists
 	signal     SignalKind      // empty unless the disposition continues
@@ -61,6 +65,7 @@ type modelResult struct {
 	detail     string          // terminal detail; empty for ready/continue
 	usage      *UsageCount     // terminal no-output usage; nil when the assistant entry carries it or none was reported
 	usageModel model.ModelRef  // the terminal no-output usage model when no intent is live; zero otherwise
+	compaction bool            // true when the carried terminal usage is summary usage
 	// successContext is the execution context of an outer prospective
 	// success only; the publisher's shared guard consults it before the
 	// transaction. Effect-origin terminals, compaction commits and recovery
@@ -83,26 +88,31 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 	advertised := advertisedToolNames(capture)
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		// The compaction trigger sits before every model boundary, before any
-		// intent commits: a request whose messages plus the output reserve
-		// exceed the conversation window compacts first. The request's
-		// messages already carry the projected system message, so the
-		// estimate covers the complete request; the frozen snapshot is the
-		// projected conversation minus the leading system message. The
-		// orchestration and the automatic commit run to completion, then the
-		// request is rebuilt in full from the pure projection without
-		// draining steering again — steering that arrived during the
-		// orchestration stays buffered for the next model boundary. Every
-		// orchestration or commit failure converts through the settled-state
-		// discriminator: one whose terminal already settled durably (a piece
-		// failure inside its own effect, any other failure through the
-		// direct terminal settlement) keeps the failure settlement — the
-		// request whose checkpoint failed is never sent, with no retry and
-		// no uncompacted fallback — while a failure that left the Operation
-		// running returns its raw error exactly like the conversation
-		// effect's own publication failures, for recovery. The compact model
-		// effect performs no trigger check — the structural recursion guard
-		// keeps the compact Agent outside Session compaction.
-		if estimateTokens("", req.Messages)+capture.OutputReserve > capture.ContextWindow {
+		// intent commits: the newest reported conversation usage after the
+		// current compaction boundary — InputTokens plus CachedInputTokens
+		// plus OutputTokens, compared with big.Int exactness against the
+		// captured context window minus the output reserve — compacts the
+		// conversation first when it strictly exceeds that threshold. A
+		// missing report never triggers, and a present zero obeys the same
+		// inequality, including when the reserve exceeds the window; the
+		// report is the last provider measurement, not an exact pre-count of
+		// the next request. The frozen snapshot is the projected conversation
+		// minus the leading system message. The orchestration and the
+		// automatic commit run to completion, then the request is rebuilt in
+		// full from the pure projection without draining steering again —
+		// steering that arrived during the orchestration stays buffered for
+		// the next model boundary. Every orchestration or commit failure
+		// converts through the settled-state discriminator: one whose
+		// terminal already settled durably (a summary failure inside its own
+		// effect, any other failure through the direct terminal settlement)
+		// keeps the failure settlement — the request whose checkpoint failed
+		// is never sent, with no retry and no uncompacted fallback — while a
+		// failure that left the Operation running returns its raw error
+		// exactly like the conversation effect's own publication failures,
+		// for recovery. The compact model effect performs no trigger check —
+		// the structural recursion guard keeps the compact Agent outside
+		// Session compaction.
+		if conversationOverflows(c, capture) {
 			snapshot := req.Messages
 			if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
 				snapshot = snapshot[1:]
@@ -216,6 +226,25 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		}
 		return owned, nil
 	}
+}
+
+// conversationOverflows samples the newest reported conversation usage after
+// the current compaction boundary under a brief coordinator hold and reports
+// whether its exact signed total exceeds the captured window minus the output
+// reserve. Input is already uncached, so cached input is added once. A
+// missing report never overflows.
+func conversationOverflows(c *coordinator, capture ExecutionCapture) bool {
+	c.mu.Lock()
+	usage := latestContextUsage(c.graph.Entries, c.graph.Session.State.CompactionEntryID)
+	c.mu.Unlock()
+	if usage == nil {
+		return false
+	}
+	total := new(big.Int).SetInt64(usage.InputTokens)
+	total.Add(total, big.NewInt(usage.CachedInputTokens))
+	total.Add(total, big.NewInt(usage.OutputTokens))
+	threshold := big.NewInt(int64(capture.ContextWindow) - int64(capture.OutputReserve))
+	return total.Cmp(threshold) > 0
 }
 
 // interruptModelEffect settles one committed model effect intent as the fixed
@@ -450,14 +479,16 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		// A terminal result runs the common terminal helper on this
 		// transaction's own decoded records.
 		if res.terminal != "" {
-			// The usage model is the live intent's expected identity; a
-			// quiet direct settlement declares its own.
+			// The usage model and the usage provenance come from the live
+			// intent; a quiet direct settlement declares its own.
 			usageModel := res.usageModel
+			compactionUsage := res.compaction
 			if intent != nil {
 				usageModel = intent.expected
+				compactionUsage = intent.compaction
 			}
 			var err error
-			committedOp, committedSess, newEntries, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, res.terminal, res.detail, res.assistant, usageModel, res.usage)
+			committedOp, committedSess, newEntries, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, res.terminal, res.detail, res.assistant, usageModel, res.usage, compactionUsage)
 			if err != nil {
 				return err
 			}
@@ -580,7 +611,7 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 // transaction after its own preconditions; recovery calls it from its own
 // re-reading transaction. It performs no precondition check of its own: the
 // caller passes only records whose state it may settle.
-func commitTerminalSettlement(tx Transaction, sessionID, operationID string, currentSession SessionRecord, currentOp OperationRecord, sregRevision, oregRevision int64, terminal OperationState, detail string, assistant *assistantEntry, usageModel model.ModelRef, usage *UsageCount) (OperationRecord, SessionRecord, []graphEntry, error) {
+func commitTerminalSettlement(tx Transaction, sessionID, operationID string, currentSession SessionRecord, currentOp OperationRecord, sregRevision, oregRevision int64, terminal OperationState, detail string, assistant *assistantEntry, usageModel model.ModelRef, usage *UsageCount, compactionUsage bool) (OperationRecord, SessionRecord, []graphEntry, error) {
 	var newEntries []graphEntry
 
 	// The transaction's usage contribution rides the produced assistant
@@ -713,11 +744,12 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 		}
 	}
 	settlement := operationSettlementEntry{
-		SessionID:   sessionID,
-		EntryID:     settlementID,
-		OperationID: operationID,
-		Status:      terminal,
-		Detail:      detail,
+		SessionID:       sessionID,
+		EntryID:         settlementID,
+		OperationID:     operationID,
+		Status:          terminal,
+		Detail:          detail,
+		CompactionUsage: compactionUsage,
 	}
 	if assistant == nil && usage != nil { // terminal no-output model usage rides the settlement entry
 		modelRef := usageModel
@@ -1751,7 +1783,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	// orchestration over it, and commits the manual compaction whose one
 	// transaction also settles the Operation's success. Every orchestration
 	// failure or interruption has already settled the terminal durably with
-	// the accumulated usage (a piece failure inside its own effect, any other
+	// the reported usage (a summary failure inside its own effect, any other
 	// failure through the direct terminal settlement), and only an actually
 	// empty conversation fails with the retained detail.
 	if admission.RequestKind == RequestKindCompact {

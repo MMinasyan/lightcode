@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/agent"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -34,15 +35,12 @@ func newAdmittedHarness(t *testing.T, hctx context.Context, prepared PreparedExe
 	h, err := New(hctx, Dependencies{Storage: store, Prepare: func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
 	}})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	testassert.NoError(t, err)
 	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello")); disposition != DispositionAdmitted {
-		t.Fatalf("disposition %q, want admitted", disposition)
+	testassert.NoError(t, err)
+	{
+		_, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
+		testassert.Equal(t, disposition, DispositionAdmitted)
 	}
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	return h, store, c, session.Identity.SessionID
@@ -56,23 +54,24 @@ func newEffectHarness(t *testing.T, modelFn func(context.Context, model.Request)
 	return newAdmittedHarness(t, context.Background(), modelPrepared(modelFn))
 }
 
-// invokeModelEffect drives one model effect with a validated request; a nil
-// assemble callback runs the real Agent assembly.
-func invokeModelEffect(t *testing.T, me agent.ModelEffect, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+// defaultModelRequest builds the fixture conversation request the default
+// invocation callers drive.
+func defaultModelRequest(t *testing.T) model.Request {
 	t.Helper()
 	req, err := model.NewRequest(model.Request{
 		Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("hello")}},
 		Tools:    []model.ToolDefinition{testToolDefinition()},
 	})
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
-	if assemble == nil {
-		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		}
-	}
-	return me(context.Background(), req, assemble)
+	testassert.NoError(t, err)
+	return req
+}
+
+// invokeModelEffect drives one model effect with the given validated request
+// under a background context; a nil assemble callback runs the real Agent
+// assembly.
+func invokeModelEffect(t *testing.T, me agent.ModelEffect, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+	t.Helper()
+	return invokeModelEffectCtx(t, me, context.Background(), req, assemble)
 }
 
 func testToolCall(id string) model.ToolCall {
@@ -219,96 +218,52 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 
 	calls := 0
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffect(t, me, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
+	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		calls++
 		return agent.Assemble(context.Background(), source, stream)
 	})
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoReady {
-		t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-	}
-	if calls != 1 {
-		t.Fatalf("assembly callback calls = %d, want exactly one", calls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	testassert.Equal(t, calls, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-ready graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	var assistant *assistantEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Assistant != nil {
 			assistant = graph.Entries[i].Assistant
 		}
 	}
-	if assistant == nil {
-		t.Fatalf("ready settlement published no assistant entry")
-	}
-	if assistant.EntryID != reservedID {
-		t.Fatalf("assistant entry %s does not consume the reserved identity %s", assistant.EntryID, reservedID)
-	}
-	if assistant.Status != model.OutputCompleted || len(assistant.ToolCalls) != 2 {
-		t.Fatalf("assistant entry = %+v, want completed output with two calls", assistant)
-	}
-	if assistant.Usage == nil || *assistant.Usage != (UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}) {
-		t.Fatalf("assistant usage = %+v, want the reported counts", assistant.Usage)
-	}
+	testassert.Require(t, assistant != nil, "ready settlement published no assistant entry")
+	testassert.Require(t, assistant.EntryID == reservedID && (assistant.Status == model.OutputCompleted && len(assistant.ToolCalls) == 2), "got %v, want %v; assistant entry = %+v, want completed output with two calls", assistant.EntryID, reservedID, assistant)
+	testassert.Require(t, assistant.Usage != nil && *assistant.Usage == (UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}), "assistant usage = %+v, want the reported counts", assistant.Usage)
 	for i, call := range assistant.ToolCalls {
-		if call.Ordinal != int64(i) || call.ID != fmt.Sprintf("call-%d", i+1) || call.ResultEntryID == "" {
-			t.Fatalf("tool_calls[%d] = %+v, want ordered reserved call", i, call)
-		}
-		if raw, derr := base64.StdEncoding.DecodeString(call.ArgumentsBase64); derr != nil || string(raw) != `{"x":1}` {
-			t.Fatalf("tool_calls[%d] arguments = %q (%v), want the exact raw bytes", i, raw, derr)
+		testassert.Require(t, call.Ordinal == int64(i) && call.ID == fmt.Sprintf("call-%d", i+1) && call.ResultEntryID != "", "tool_calls[%d] = %+v, want ordered reserved call", i, call)
+		{
+			raw, derr := base64.StdEncoding.DecodeString(call.ArgumentsBase64)
+			testassert.Require(t, derr == nil && string(raw) == `{"x":1}`, "tool_calls[%d] arguments = %q (%v), want the exact raw bytes", i, raw, derr)
 		}
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
-		t.Fatalf("operation state = %+v, want running with the effect cleared", rec.State)
-	}
-	if len(rec.State.PendingToolCalls) != 2 {
-		t.Fatalf("pending calls = %+v, want the two published calls", rec.State.PendingToolCalls)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 2, "operation state = %+v, want running with the effect cleared; pending calls = %+v, want the two published calls", rec.State, rec.State.PendingToolCalls)
 	for i, call := range rec.State.PendingToolCalls {
-		if call.CallID != assistant.ToolCalls[i].ID || call.ResultEntryID != assistant.ToolCalls[i].ResultEntryID ||
-			call.AssistantEntry.EntryID != assistant.EntryID {
-			t.Fatalf("pending call %d = %+v, want the assistant's reservation", i, call)
-		}
+		testassert.Require(t, call.CallID == assistant.ToolCalls[i].ID && call.ResultEntryID == assistant.ToolCalls[i].ResultEntryID && call.AssistantEntry.EntryID == assistant.EntryID, "pending call %d = %+v, want the assistant's reservation", i, call)
 	}
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}}}}
-	if !usageTotalsEqual(rec.State.Usage, want) {
-		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
-	}
+	testassert.Require(t, usageTotalsEqual(rec.State.Usage, want), "operation usage = %+v, want %+v", rec.State.Usage, want)
 	view, err := h.ReadSessionView(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSessionView: %v", err)
-	}
-	if view.Header.CurrentOperationID != testOpID {
-		t.Fatalf("current operation %q, want the still-running %q", view.Header.CurrentOperationID, testOpID)
-	}
-	if !usageTotalsEqual(view.TotalUsage, want) {
-		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, view.Header.CurrentOperationID == testOpID && usageTotalsEqual(view.TotalUsage, want), "got %v, want %v; session usage = %+v, want %+v", view.Header.CurrentOperationID, testOpID, view.TotalUsage, want)
 
 	// The second context projection reads the entry the first effect committed.
 	source := h.contextSource(c, testOpID)
 	msgs, err := source(context.Background())
-	if err != nil {
-		t.Fatalf("second context projection: %v", err)
-	}
-	if len(msgs) != 3 { // system prompt, admitted input, committed assistant
-		t.Fatalf("second projection carried %d messages, want 3", len(msgs))
-	}
+	testassert.NoError(t, err)
+	// system prompt, admitted input, committed assistant
+	testassert.Equal(t, len(msgs), 3)
 	last := msgs[len(msgs)-1]
-	if last.Role != model.RoleAssistant || last.Source != testModelRef() || last.TextContent() != "done" || len(last.ToolCalls) != 2 {
-		t.Fatalf("second projection's last message = %+v, want the committed assistant", last)
-	}
-	if string(last.ToolCalls[0].Arguments) != `{"x":1}` {
-		t.Fatalf("projected call arguments = %s, want the exact raw bytes", last.ToolCalls[0].Arguments)
-	}
+	testassert.Require(t, last.Role == model.RoleAssistant && last.Source == testModelRef() && last.TextContent() == "done" && len(last.ToolCalls) == 2, "second projection's last message = %+v, want the committed assistant", last)
+	testassert.Require(t, string(last.ToolCalls[0].Arguments) == `{"x":1}`, "projected call arguments = %s, want the exact raw bytes", last.ToolCalls[0].Arguments)
 }
 
 // TestModelEffectContinueRemainsRunning proves the continuation transition:
@@ -319,17 +274,11 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if set.Disposition != agent.DispoContinue {
-		t.Fatalf("settlement disposition %q, want continue", set.Disposition)
-	}
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+	testassert.NoError(t, err)
+	testassert.Equal(t, set.Disposition, agent.DispoContinue)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-continue graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	var assistant *assistantEntry
 	var signal *signalEntry
 	for i := range graph.Entries {
@@ -340,30 +289,16 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 			signal = graph.Entries[i].Signal
 		}
 	}
-	if assistant == nil || assistant.Status != model.OutputErrored || len(assistant.Content) != 1 || assistant.Content[0].Text != "partial" {
-		t.Fatalf("assistant entry = %+v, want the retained errored partial", assistant)
-	}
-	if signal == nil || signal.Signal != SignalModelFailureContinuation || signal.Content != signalModelFailureContinuationContent {
-		t.Fatalf("signal entry = %+v, want the fixed continuation signal", signal)
-	}
+	testassert.Require(t, assistant != nil && assistant.Status == model.OutputErrored && len(assistant.Content) == 1 && assistant.Content[0].Text == "partial", "assistant entry = %+v, want the retained errored partial", assistant)
+	testassert.Require(t, signal != nil && signal.Signal == SignalModelFailureContinuation && signal.Content == signalModelFailureContinuationContent, "signal entry = %+v, want the fixed continuation signal", signal)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
-		t.Fatalf("operation state = %+v, want running with the effect cleared and no pending calls", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 0, "operation state = %+v, want running with the effect cleared and no pending calls", rec.State)
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: UsageCount{InputTokens: 5, OutputTokens: 7}}}}
-	if !usageTotalsEqual(rec.State.Usage, want) {
-		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
-	}
+	testassert.Require(t, usageTotalsEqual(rec.State.Usage, want), "operation usage = %+v, want %+v", rec.State.Usage, want)
 	view, err := h.ReadSessionView(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSessionView: %v", err)
-	}
-	if view.Header.CurrentOperationID != testOpID || !usageTotalsEqual(view.TotalUsage, want) {
-		t.Fatalf("session view = %+v, want the running operation and updated usage", view)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, view.Header.CurrentOperationID == testOpID && usageTotalsEqual(view.TotalUsage, want), "session view = %+v, want the running operation and updated usage", view)
 }
 
 // TestModelEffectTerminalSettlement proves the model-derived failure and
@@ -389,34 +324,22 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, nil)
-		if err != nil {
-			t.Fatalf("model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoInterruption {
-			t.Fatalf("settlement disposition %q, want interruption", set.Disposition)
-		}
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
+		testassert.Equal(t, set.Disposition, agent.DispoInterruption)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-interruption graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		var assistant *assistantEntry
 		for i := range graph.Entries {
 			if graph.Entries[i].Assistant != nil {
 				assistant = graph.Entries[i].Assistant
 			}
 		}
-		if assistant == nil || assistant.EntryID != reservedID {
-			t.Fatalf("assistant entry %v does not consume the reserved identity %s", assistant, reservedID)
-		}
+		testassert.Require(t, assistant != nil && assistant.EntryID == reservedID, "assistant entry %v does not consume the reserved identity %s", assistant, reservedID)
 		requireSessionCleared(t, h, sessionID)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "stream interrupted: context canceled" {
-			t.Fatalf("operation state = %+v, want terminal interruption with the assembly's detail", rec.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "stream interrupted: context canceled", "operation state = %+v, want terminal interruption with the assembly's detail", rec.State)
 	})
 
 	t.Run("nonretryable invocation failure settles under the reserved identity without an assistant payload", func(t *testing.T) {
@@ -431,24 +354,13 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil)
-		if err != nil {
-			t.Fatalf("model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoFailure || set.Detail != "model failure" {
-			t.Fatalf("settlement = %+v, want the committed failure with its diagnostic", set)
-		}
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail == "model failure", "settlement = %+v, want the committed failure with its diagnostic", set)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-failure graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range graph.Entries {
-			if entry.Assistant != nil {
-				t.Fatalf("assistant entry %s published for a payload-less failure", entry.Envelope.ID)
-			}
-			if entry.Settlement != nil && entry.Envelope.ID != reservedID {
-				t.Fatalf("settlement entry %s does not consume the reserved identity %s", entry.Envelope.ID, reservedID)
-			}
+			testassert.Require(t, entry.Assistant == nil && (entry.Settlement == nil || entry.Envelope.ID == reservedID), "assistant entry %s published for a payload-less failure; settlement entry %s does not consume the reserved identity %s", entry.Envelope.ID, entry.Envelope.ID, reservedID)
 		}
 		requireSessionCleared(t, h, sessionID)
 	})
@@ -463,20 +375,12 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // the execution context dies before any attempt could start
 		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-		set, err := invokeModelEffectCtx(t, me, ctx, nil)
-		if err != nil {
-			t.Fatalf("model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
-			t.Fatalf("settlement = %+v, want the committed interruption settlement", set)
-		}
-		if attempts != 0 {
-			t.Fatalf("physical attempts = %d, want zero after observed cancellation", attempts)
-		}
+		set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
+		testassert.Equal(t, attempts, 0)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-interruption graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		signals, settlements := 0, 0
 		for _, entry := range graph.Entries {
 			switch {
@@ -490,9 +394,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 				settlements++
 			}
 		}
-		if signals != 1 || settlements != 1 {
-			t.Fatalf("committed %d signals and %d settlements, want one of each", signals, settlements)
-		}
+		testassert.Require(t, signals == 1 && settlements == 1, "committed %d signals and %d settlements, want one of each", signals, settlements)
 		requireSessionCleared(t, h, sessionID)
 	})
 }
@@ -514,34 +416,25 @@ func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	if _, err := invokeModelEffect(t, me, nil); err != nil {
-		t.Fatalf("first effect: %v", err)
+	{
+		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
 	}
-	_, err := invokeModelEffect(t, me, nil)
-	if err == nil {
-		t.Fatalf("second effect settled, want the repeated-call protocol violation")
-	}
+	_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
+	testassert.Require(t, err != nil, "second effect settled, want the repeated-call protocol violation")
 	wantErr := err
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the repeated-call failure: %v", err)
-	}
+	testassert.NoError(t, err)
 	assistants := 0
 	for _, entry := range graph.Entries {
 		if entry.Assistant != nil {
 			assistants++
 		}
 	}
-	if assistants != 1 {
-		t.Fatalf("%d assistant entries after the repeated-call failure, want only turn 1's", assistants)
-	}
+	testassert.Equal(t, assistants, 1)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != wantErr.Error() {
-		t.Fatalf("operation state = %+v, want terminal failure with the protocol error detail", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == wantErr.Error(), "operation state = %+v, want terminal failure with the protocol error detail", rec.State)
 	requireSessionCleared(t, h, sessionID)
 }
 
@@ -553,38 +446,29 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 		return failStream(errors.New("empty failure"), usageDelta(model.Usage{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6})), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-		t.Fatalf("model effect: %v", err)
+	{
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-failure graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
 		if entry.Settlement == nil {
 			continue
 		}
-		if entry.Settlement.Model == nil || *entry.Settlement.Model != testModelRef() {
-			t.Fatalf("settlement model = %+v, want the expected identity beside its usage", entry.Settlement.Model)
-		}
-		if entry.Settlement.Usage == nil || *entry.Settlement.Usage != (UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}) {
-			t.Fatalf("settlement usage = %+v, want the reported no-output counts", entry.Settlement.Usage)
-		}
+		testassert.Require(t, entry.Settlement.Model != nil && *entry.Settlement.Model == testModelRef(), "settlement model = %+v, want the expected identity beside its usage", entry.Settlement.Model)
+		testassert.Require(t, entry.Settlement.Usage != nil && *entry.Settlement.Usage == (UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}) && !entry.Settlement.CompactionUsage, "settlement usage = %+v, want the reported no-output counts; settlement compaction_usage = true, want the conversation usage unmarked", entry.Settlement.Usage)
 	}
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}}}}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if !usageTotalsEqual(rec.State.Usage, want) {
-		t.Fatalf("operation usage = %+v, want %+v", rec.State.Usage, want)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, usageTotalsEqual(rec.State.Usage, want), "operation usage = %+v, want %+v", rec.State.Usage, want)
 	view, err := h.ReadSessionView(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSessionView: %v", err)
-	}
-	if !usageTotalsEqual(view.TotalUsage, want) {
-		t.Fatalf("session usage = %+v, want %+v", view.TotalUsage, want)
+	testassert.NoError(t, err)
+	testassert.Require(t, usageTotalsEqual(view.TotalUsage, want), "session usage = %+v, want %+v", view.TotalUsage, want)
+	{
+		measured := view.History.LatestContextUsage()
+		testassert.Require(t, measured != nil && *measured == (UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 6}), "latest context measurement = %+v, want the conversation no-output usage eligible", measured)
 	}
 }
 
@@ -594,16 +478,10 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 func readReservedIntent(t *testing.T, store *graphStorage, sessionID string) string {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID})
-	if err != nil {
-		t.Fatalf("read operation register mid-effect: %v", err)
-	}
+	testassert.NoError(t, err)
 	op, err := decodeOperationRegister(reg)
-	if err != nil {
-		t.Fatalf("decode operation register mid-effect: %v", err)
-	}
-	if op.State.ActiveEffect == nil || op.State.ActiveEffect.Kind != EffectModel {
-		t.Fatalf("no model effect intent is durable while the effect runs: %+v", op.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, op.State.ActiveEffect != nil && op.State.ActiveEffect.Kind == EffectModel, "no model effect intent is durable while the effect runs: %+v", op.State)
 	return op.State.ActiveEffect.ResultEntryID
 }
 
@@ -612,12 +490,8 @@ func readReservedIntent(t *testing.T, store *graphStorage, sessionID string) str
 func requireSessionCleared(t *testing.T, h *Harness, sessionID string) {
 	t.Helper()
 	session, err := h.ReadSessionHeader(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if session.CurrentOperationID != "" {
-		t.Fatalf("current operation %q survived a terminal settlement", session.CurrentOperationID)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, session.CurrentOperationID, "")
 }
 
 // TestModelEffectPublicationFailureLeavesIntentState proves the model result
@@ -649,23 +523,17 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err == nil {
-				t.Fatalf("model effect succeeded past an injected %s failure", fail.step)
+			{
+				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+				testassert.Require(t, err != nil, "model effect succeeded past an injected %s failure", fail.step)
 			}
 			graph, err := validateFixture(t, store, sessionID)
-			if err != nil {
-				t.Fatalf("graph after rollback: %v", err)
-			}
-			if len(graph.Entries) != 1 { // only the admitted input entry
-				t.Fatalf("%d entries committed after rollback, want only the admitted input", len(graph.Entries))
-			}
+			testassert.NoError(t, err)
+			// only the admitted input entry
+			testassert.Equal(t, len(graph.Entries), 1)
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-			if err != nil {
-				t.Fatalf("ReadOperation: %v", err)
-			}
-			if rec.State.Status != OperationRunning || rec.State.ActiveEffect == nil {
-				t.Fatalf("operation state = %+v, want the committed running/intent state", rec.State)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect != nil, "operation state = %+v, want the committed running/intent state", rec.State)
 		})
 	}
 }
@@ -717,32 +585,15 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	msgs, err := h.contextSource(c, testOpID)(context.Background())
-	if err != nil {
-		t.Fatalf("context projection: %v", err)
-	}
-	if len(msgs) != 5 {
-		t.Fatalf("projection carried %d messages, want 5", len(msgs))
-	}
-	if msgs[0].Role != model.RoleSystem || msgs[0].TextContent() != "system" {
-		t.Fatalf("first message = %+v, want the captured system prompt", msgs[0])
-	}
-	if msgs[1].Role != model.RoleUser || msgs[1].TextContent() != "hello" {
-		t.Fatalf("input message = %+v, want the admitted user input", msgs[1])
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(msgs), 5)
+	testassert.Require(t, msgs[0].Role == model.RoleSystem && msgs[0].TextContent() == "system", "first message = %+v, want the captured system prompt", msgs[0])
+	testassert.Require(t, msgs[1].Role == model.RoleUser && msgs[1].TextContent() == "hello", "input message = %+v, want the admitted user input", msgs[1])
 	assistant := msgs[2]
-	if assistant.Role != model.RoleAssistant || assistant.Source != testModelRef() || assistant.TextContent() != "hi" {
-		t.Fatalf("assistant message = %+v, want the committed assistant payload", assistant)
-	}
-	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "call-1" || string(assistant.ToolCalls[0].Arguments) != `{"x":1}` {
-		t.Fatalf("assistant call = %+v, want the call with its exact raw argument bytes", assistant.ToolCalls)
-	}
-	if msgs[3].Role != model.RoleTool || msgs[3].ToolCallID != "call-1" || msgs[3].TextContent() != "done" {
-		t.Fatalf("tool message = %+v, want the tool result under its call identity", msgs[3])
-	}
+	testassert.Require(t, assistant.Role == model.RoleAssistant && assistant.Source == testModelRef() && assistant.TextContent() == "hi" && (len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].ID == "call-1" && string(assistant.ToolCalls[0].Arguments) == `{"x":1}`), "assistant message = %+v, want the committed assistant payload; assistant call = %+v, want the call with its exact raw argument bytes", assistant, assistant.ToolCalls)
+	testassert.Require(t, msgs[3].Role == model.RoleTool && msgs[3].ToolCallID == "call-1" && msgs[3].TextContent() == "done", "tool message = %+v, want the tool result under its call identity", msgs[3])
 	want := "<system-signal>" + signalInterruptionContent + "</system-signal>"
-	if msgs[4].Role != model.RoleUser || msgs[4].TextContent() != want {
-		t.Fatalf("signal message = %+v, want the wrapped signal text %q", msgs[4], want)
-	}
+	testassert.Require(t, msgs[4].Role == model.RoleUser && msgs[4].TextContent() == want, "signal message = %+v, want the wrapped signal text %q", msgs[4], want)
 
 	// The two live boundary-selection cases share the fixture pieces: one
 	// immediate tool plan and the real model/tool effect drivers, whose
@@ -753,11 +604,13 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 	runEffects := func(t *testing.T, h *Harness, c *coordinator, modelFn func(context.Context, model.Request) (model.Stream, error)) {
 		t.Helper()
 		exec := effectExecution(modelFn, plan)
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), nil); err != nil {
-			t.Fatalf("model effect: %v", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), defaultModelRequest(t), nil)
+			testassert.NoError(t, err)
 		}
-		if _, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1")); err != nil {
-			t.Fatalf("tool effect: %v", err)
+		{
+			_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+			testassert.NoError(t, err)
 		}
 	}
 
@@ -766,16 +619,13 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 			return completedTurnStream(testToolCall("call-1")), nil
 		}
 		h, _, c, sessionID := newEffectHarness(t, modelFn)
-		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
-			t.Fatalf("steering submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
+			testassert.NoError(t, err)
 		}
 		first, err := h.contextSource(c, testOpID)(context.Background())
-		if err != nil {
-			t.Fatalf("first projection with pending steering: %v", err)
-		}
-		if len(first) != 2 || first[1].TextContent() != "hello" {
-			t.Fatalf("first projection = %+v, want the admitted input only despite the pending head", first)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(first) == 2 && first[1].TextContent() == "hello", "first projection = %+v, want the admitted input only despite the pending head", first)
 	})
 
 	t.Run("late arrival selects the boundary at the next call", func(t *testing.T) {
@@ -793,33 +643,26 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 		c.mu.Unlock()
 		source := h.contextSource(c, testOpID)
 		first, err := source(context.Background()) // steering is empty through the first projection
-		if err != nil || len(first) != 2 || first[1].TextContent() != "hello" {
-			t.Fatalf("first projection = (%+v, %v), want the admitted input with empty steering", first, err)
-		}
+		testassert.Require(t, err == nil && len(first) == 2 && first[1].TextContent() == "hello", "first projection = (%+v, %v), want the admitted input with empty steering", first, err)
 		runEffects(t, h, c, modelFn) // the real model and tool callbacks return before the head arrives
-		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
-			t.Fatalf("late steering submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
+			testassert.NoError(t, err)
 		}
 		before := storedEntryCount(store, sessionID)
 		msgs, err := source(context.Background())
-		if err != errSteeringBoundary { // exact identity: the private token, never a text or cancellation class
-			t.Fatalf("boundary selection = (%v, %v), want the private boundary token verbatim", msgs, err)
+		// exact identity: the private token, never a text or cancellation class
+		testassert.Require(t, err == errSteeringBoundary, "boundary selection = (%v, %v), want the private boundary token verbatim", msgs, err)
+		testassert.Require(t, msgs == nil, "boundary selection projected %v, want no messages", msgs)
+		{
+			got := storedEntryCount(store, sessionID)
+			testassert.Require(t, got == before, "boundary selection wrote %d entries, want no storage", got-before)
 		}
-		if msgs != nil {
-			t.Fatalf("boundary selection projected %v, want no messages", msgs)
-		}
-		if got := storedEntryCount(store, sessionID); got != before {
-			t.Fatalf("boundary selection wrote %d entries, want no storage", got-before)
-		}
-		if modelCalls != 1 {
-			t.Fatalf("model calls = %d, want no second request behind the token", modelCalls)
-		}
+		testassert.Equal(t, modelCalls, 1)
 		c.mu.Lock()
 		buffered := len(c.steering)
 		c.mu.Unlock()
-		if buffered != 1 {
-			t.Fatalf("buffered heads = %d, want the sole head still pending after selection", buffered)
-		}
+		testassert.Equal(t, buffered, 1)
 		if run.execCtx.Err() != nil {
 			t.Fatalf("execution context = %v, want it unchanged and live after selection", run.execCtx.Err())
 		}
@@ -830,9 +673,7 @@ func TestContextSourceProjectsFullHistory(t *testing.T) {
 // in the signal content.
 func TestSignalProjectionEscaping(t *testing.T) {
 	got := signalProjectedText(`a & b < c > d`)
-	if got != "<system-signal>a &amp; b &lt; c &gt; d</system-signal>" {
-		t.Fatalf("signalProjectedText = %q, want the escaped wrapper", got)
-	}
+	testassert.Equal(t, got, "<system-signal>a &amp; b &lt; c &gt; d</system-signal>")
 }
 
 // foreignEffectRace writes one foreign state change under the coordinator's
@@ -876,9 +717,7 @@ func foreignEffectRace(t *testing.T, store *graphStorage, sessionID, operationID
 		_, err = tx.ReplaceRegister(opKey, oreg.Revision, opPayload)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("foreign race write: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // TestEffectTransactionsRematerializeOnRevisionRace proves every effect
@@ -892,11 +731,13 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		}
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
-			t.Fatalf("intent over a foreign revision = %v, want the revision-race conflict", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			testassert.Require(t, errors.Is(err, ErrConflict), "intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
-		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
-			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
+		{
+			session, err := h.ReadSessionHeader(context.Background(), sessionID)
+			testassert.Require(t, err == nil && session.CurrentAgentType == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
 	t.Run("result transaction", func(t *testing.T) {
@@ -910,11 +751,13 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrConflict) {
-			t.Fatalf("result over a foreign revision = %v, want the revision-race conflict", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			testassert.Require(t, errors.Is(err, ErrConflict), "result over a foreign revision = %v, want the revision-race conflict", err)
 		}
-		if session, err := h.ReadSessionHeader(context.Background(), sessionID); err != nil || session.CurrentAgentType != "foreign" {
-			t.Fatalf("session after the race = %+v (%v), want the foreign agent type", session, err)
+		{
+			session, err := h.ReadSessionHeader(context.Background(), sessionID)
+			testassert.Require(t, err == nil && session.CurrentAgentType == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
 }
@@ -947,9 +790,7 @@ func foreignTerminalSettle(t *testing.T, store *graphStorage, sessionID, operati
 		_, err = tx.ReplaceRegister(key, reg.Revision, payload)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("foreign terminal settle: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 // TestEffectTransactionsPreconditionsOutrankRevisionRace proves the mismatch
@@ -964,8 +805,9 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 			return completedTurnStream(), nil
 		}
 		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-		if _, err := invokeModelEffect(t, me, nil); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("intent over a foreign terminal operation = %v, want ErrInvalid", err)
+		{
+			_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
+			testassert.Require(t, errors.Is(err, ErrInvalid), "intent over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
 	t.Run("result over a foreign terminal operation", func(t *testing.T) {
@@ -979,8 +821,9 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("result over a foreign terminal operation = %v, want ErrInvalid", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			testassert.Require(t, errors.Is(err, ErrInvalid), "result over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
 }
@@ -1025,25 +868,17 @@ func newOpenerHarness(t *testing.T, open func(context.Context, OperationAdmissio
 // the execution fixtures need.
 func newExecutionHarness(t *testing.T, modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) (*Harness, *graphStorage, *coordinator, string, PreparedExecution, context.CancelFunc) {
 	t.Helper()
-	if toolFn == nil {
-		t.Fatalf("execution fixtures require a prepared tool function")
-	}
+	testassert.Require(t, toolFn != nil, "execution fixtures require a prepared tool function")
 	return newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 		return effectExecution(modelFn, toolFn), nil
 	})
 }
 
-// invokeModelEffectCtx drives one model effect with an explicit context; a nil
-// assemble callback runs the real Agent assembly.
-func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+// invokeModelEffectCtx drives one model effect with the given validated
+// request and an explicit context; a nil assemble callback runs the real Agent
+// assembly under that context.
+func invokeModelEffectCtx(t *testing.T, me agent.ModelEffect, ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 	t.Helper()
-	req, err := model.NewRequest(model.Request{
-		Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("hello")}},
-		Tools:    []model.ToolDefinition{testToolDefinition()},
-	})
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
 	if assemble == nil {
 		assemble = func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 			return agent.Assemble(ctx, source, stream)
@@ -1071,26 +906,17 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 		return nil
 	}
 	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
-	set, err := invokeModelEffectCtx(t, me, ctx, nil)
-	if err != nil {
-		t.Fatalf("model effect: %v", err)
-	}
-	if invoked != 0 {
-		t.Fatalf("prepared callback invoked %d times after cancellation, want zero", invoked)
-	}
-	if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
-		t.Fatalf("settlement = %+v, want the committed interruption settlement", set)
-	}
+	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
+	testassert.NoError(t, err)
+	testassert.Equal(t, invoked, 0)
+	testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption", rec.State)
 	requireSessionCleared(t, h, sessionID)
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph after the gate: %v", err)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -1103,33 +929,24 @@ func TestExecuteSuccessSettlesOuterTerminal(t *testing.T) {
 	}
 	spy := &toolSpy{}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
-		t.Fatalf("operation state = %+v, want terminal success without detail", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.Detail == "", "operation state = %+v, want terminal success without detail", rec.State)
 	requireSessionCleared(t, h, sessionID)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after success: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlements := 0
 	for _, entry := range graph.Entries {
 		if entry.Settlement != nil {
 			settlements++
-			if entry.Settlement.Status != OperationSuccess || entry.Settlement.Detail != "" {
-				t.Fatalf("settlement = %+v, want success without detail", entry.Settlement)
-			}
+			testassert.Require(t, entry.Settlement.Status == OperationSuccess && entry.Settlement.Detail == "", "settlement = %+v, want success without detail", entry.Settlement)
 		}
 	}
-	if settlements != 1 {
-		t.Fatalf("%d settlement entries, want exactly one", settlements)
-	}
+	testassert.Equal(t, settlements, 1)
 }
 
 // TestExecuteOpensOnceWithCommittedAdmission proves the opener row: execute
@@ -1150,29 +967,17 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 		opens = append(opens, openRecord{ctx: ctx, adm: adm})
 		return effectExecution(modelFn, spy.tool), nil
 	})
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
-	if len(opens) != 1 {
-		t.Fatalf("%d opener calls, want exactly one per execution", len(opens))
-	}
-	if opens[0].ctx != h.ctx {
-		t.Fatalf("opener ran on a foreign context, want the execution context")
-	}
+	testassert.Equal(t, len(opens), 1)
+	testassert.Equal(t, opens[0].ctx, h.ctx)
 	adm := opens[0].adm
-	if adm.SessionID != sessionID || adm.OperationID != testOpID || adm.AgentType != "coder" {
-		t.Fatalf("opener admission = %+v, want the owned committed admission", adm)
-	}
-	if !reflect.DeepEqual(adm.Execution, testCapture()) {
-		t.Fatalf("opener capture = %+v, want the prepared capture", adm.Execution)
-	}
+	testassert.Require(t, adm.SessionID == sessionID && adm.OperationID == testOpID && adm.AgentType == "coder" && reflect.DeepEqual(adm.Execution, testCapture()), "opener admission = %+v, want the owned committed admission; opener capture = %+v, want the prepared capture", adm, adm.Execution)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationSuccess {
-		t.Fatalf("operation status = %s, want the Agent run over the opened effects", rec.State.Status)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, rec.State.Status, OperationSuccess)
 }
 
 // TestExecuteCanceledBeforeOpenSkipsOpener proves the canceled-execution row:
@@ -1188,22 +993,18 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 		return effectExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
 	})
 	cancel() // the execution context is lost before the opener could start
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); !errors.Is(err, context.Canceled) {
-		t.Fatalf("execute = %v, want the context error", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the context error", err)
 	}
-	if opens != 0 {
-		t.Fatalf("opener calls = %d, want a canceled execution to skip the unstarted opener", opens)
-	}
+	testassert.Equal(t, opens, 0)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption", rec.State)
 	requireSessionCleared(t, h, sessionID)
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph after the skipped opener: %v", err)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -1225,22 +1026,18 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
 			}, openErr
 		})
-		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != openErr {
-			t.Fatalf("execute = %v, want the exact opener error", err)
+		{
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
+			testassert.Equal(t, err, openErr)
 		}
-		if modelRuns != 0 {
-			t.Fatalf("model effect ran %d times after a failed open, want zero", modelRuns)
-		}
+		testassert.Equal(t, modelRuns, 0)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "open broke" {
-			t.Fatalf("operation state = %+v, want terminal failure with the opener error text", rec.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "open broke", "operation state = %+v, want terminal failure with the opener error text", rec.State)
 		requireSessionCleared(t, h, sessionID)
-		if _, err := validateFixture(t, store, sessionID); err != nil {
-			t.Fatalf("graph after the opening failure: %v", err)
+		{
+			_, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1249,23 +1046,16 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		h, _, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{}, storageErr
 		})
-		if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != storageErr {
-			t.Fatalf("execute = %v, want the exact storage-class error", err)
+		{
+			err := executeDirect(h, c, h.ctx, testOpID, prepared)
+			testassert.Equal(t, err, storageErr)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationRunning {
-			t.Fatalf("operation status = %s, want the committed running state preserved for recovery", rec.State.Status)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, rec.State.Status, OperationRunning)
 		session, err := h.ReadSessionHeader(context.Background(), sessionID)
-		if err != nil {
-			t.Fatalf("ReadSession: %v", err)
-		}
-		if session.CurrentOperationID != testOpID {
-			t.Fatalf("session current operation = %q, want the running Operation still current", session.CurrentOperationID)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, session.CurrentOperationID, testOpID)
 	})
 }
 
@@ -1297,9 +1087,7 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 				exec.Close = func() error {
 					closes++
 					rec, err := h.ReadOperation(context.Background(), adm.SessionID, adm.OperationID)
-					if err != nil {
-						t.Errorf("read operation from the rejection closer: %v", err)
-					}
+					testassert.Check(t, err == nil, "read operation from the rejection closer: %v", err)
 					statusDuringClose = rec.State.Status
 					return nil
 				}
@@ -1311,28 +1099,17 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			var prepared PreparedExecution
 			h, store, c, sessionID, prepared, _ = newOpenerHarness(t, open)
 			err := executeDirect(h, c, h.ctx, testOpID, prepared)
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("execute = %v, want the invalid-execution rejection", err)
-			}
-			if modelRuns != 0 {
-				t.Fatalf("model effect ran %d times with an invalid execution, want zero: no Agent runs with invalid effects", modelRuns)
-			}
-			if closes != 1 {
-				t.Fatalf("Close calls = %d, want exactly one for an invalid successful Execution", closes)
-			}
-			if statusDuringClose != OperationRunning {
-				t.Fatalf("close observed status %s, want the rejection published only after the cleanup", statusDuringClose)
-			}
+			testassert.Require(t, errors.Is(err, ErrInvalid), "execute = %v, want the invalid-execution rejection", err)
+			testassert.Equal(t, modelRuns, 0)
+			testassert.Equal(t, closes, 1)
+			testassert.Equal(t, statusDuringClose, OperationRunning)
 			settled, readErr := h.ReadOperation(context.Background(), sessionID, testOpID)
-			if readErr != nil {
-				t.Fatalf("ReadOperation: %v", readErr)
-			}
-			if settled.State.Status != OperationFailure || settled.State.Terminal == nil || settled.State.Terminal.Detail != err.Error() {
-				t.Fatalf("operation state = %+v, want terminal failure with the rejection text %q", settled.State, err)
-			}
+			testassert.NoError(t, readErr)
+			testassert.Require(t, settled.State.Status == OperationFailure && settled.State.Terminal != nil && settled.State.Terminal.Detail == err.Error(), "operation state = %+v, want terminal failure with the rejection text %q", settled.State, err)
 			requireSessionCleared(t, h, sessionID)
-			if _, err := validateFixture(t, store, sessionID); err != nil {
-				t.Fatalf("graph after the rejected execution: %v", err)
+			{
+				_, err := validateFixture(t, store, sessionID)
+				testassert.NoError(t, err)
 			}
 		})
 	}
@@ -1352,8 +1129,9 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(testToolCall("call-1")), nil
 		}
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-			t.Fatalf("model effect: %v", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			testassert.NoError(t, err)
 		}
 	}
 	success := func(_ context.Context, call model.ToolCall) PreparedTool {
@@ -1506,41 +1284,23 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 				return inner
 			}
 			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"))
-			if err != nil {
-				t.Fatalf("tool effect: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("committed result = %+v, want %+v", got, tc.want)
-			}
-			if executions != tc.wantExecutions {
-				t.Fatalf("executor ran %d times, want %d", executions, tc.wantExecutions)
-			}
-			if replaces != tc.wantReplaces {
-				t.Fatalf("%d register replacements, want %d", replaces, tc.wantReplaces)
-			}
+			testassert.NoError(t, err)
+			testassert.Equal(t, got, tc.want)
+			testassert.Equal(t, executions, tc.wantExecutions)
+			testassert.Equal(t, replaces, tc.wantReplaces)
 			graph, err := validateFixture(t, store, sessionID)
-			if err != nil {
-				t.Fatalf("graph after the tool effect: %v", err)
-			}
+			testassert.NoError(t, err)
 			results := 0
 			for _, entry := range graph.Entries {
 				if entry.ToolResult != nil {
 					results++
-					if entry.ToolResult.ToolCallID != "call-1" || entry.ToolResult.Status != tc.want.Status || entry.ToolResult.Content != tc.want.Content {
-						t.Fatalf("tool result = %+v, want %+v", entry.ToolResult, tc.want)
-					}
+					testassert.Require(t, entry.ToolResult.ToolCallID == "call-1" && entry.ToolResult.Status == tc.want.Status && entry.ToolResult.Content == tc.want.Content, "tool result = %+v, want %+v", entry.ToolResult, tc.want)
 				}
 			}
-			if results != 1 {
-				t.Fatalf("%d tool result entries, want exactly one", results)
-			}
+			testassert.Equal(t, results, 1)
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-			if err != nil {
-				t.Fatalf("ReadOperation: %v", err)
-			}
-			if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil || len(rec.State.PendingToolCalls) != 0 {
-				t.Fatalf("operation state = %+v, want running with the effect cleared and the call resolved", rec.State)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 0, "operation state = %+v, want running with the effect cleared and the call resolved", rec.State)
 		})
 	}
 }
@@ -1569,6 +1329,11 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 	}
 	filePlan := func(permissions ...PermissionRequest) func(_ context.Context, call model.ToolCall) PreparedTool {
 		return filePlanRoots("/w", "/w/sub", permissions...)
+	}
+	captureWith := func(writeDir string, readonly bool) ExecutionCapture {
+		capture := testCapture()
+		capture.WriteDir, capture.Readonly = writeDir, readonly
+		return capture
 	}
 	cases := []struct {
 		name         string
@@ -1639,46 +1404,46 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "a relative canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical write root is denied",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir denies file.write",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     captureWith("", true),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "readonly without write_dir still allows file.read",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture:     captureWith("", true),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir confines file.write inside it",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir denies file.write outside it even when policy allows",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/other.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:    "configured write_dir without a canonical prepared write root is denied",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture: captureWith("/w/sub", false),
 			policy:  allowAllWrites,
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
@@ -1693,20 +1458,20 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "readonly with write_dir allows confined writes",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", true),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
 		{
 			name:        "write_dir does not lift the built-in sensitive-basename denial",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "an explicit user rule overrides the sensitive denial inside write_dir",
-			capture:     ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, WriteDir: "/w/sub"},
+			capture:     captureWith("/w/sub", false),
 			policy:      allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: "ran", wantExecuted: true,
@@ -1765,7 +1530,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:    "immediate success denied by the boundary carries no result content",
-			capture: ExecutionCapture{ConfigurationRevision: "rev-1", Model: testModelRef(), ContextWindow: 4096, OutputReserve: 2048, Compact: testCompactCapture(), SystemPrompt: "system", Tools: testCapture().Tools, Readonly: true},
+			capture: captureWith("", true),
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
 					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/a.txt"}},
@@ -1798,28 +1563,18 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 				return inner
 			}
 			got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: objectNormalize, Permissions: tc.policy}, capture)(context.Background(), testToolCall("call-1"))
-			if err != nil {
-				t.Fatalf("tool effect: %v", err)
-			}
+			testassert.NoError(t, err)
 			wantStatus := model.ResultSuccess
 			if tc.wantDenied {
 				wantStatus = model.ResultDenied
 			}
-			if got.Status != wantStatus || got.Content != tc.wantContent {
-				t.Fatalf("committed result = %+v, want status %s content %q", got, wantStatus, tc.wantContent)
-			}
-			if tc.wantExecuted != (executions == 1) || executions > 1 {
-				t.Fatalf("executor ran %d times, want executed=%v", executions, tc.wantExecuted)
-			}
+			testassert.Require(t, got.Status == wantStatus && got.Content == tc.wantContent, "committed result = %+v, want status %s content %q", got, wantStatus, tc.wantContent)
+			testassert.Require(t, tc.wantExecuted == (executions == 1) && executions <= 1, "executor ran %d times, want executed=%v", executions, tc.wantExecuted)
 			graph, err := validateFixture(t, store, sessionID)
-			if err != nil {
-				t.Fatalf("graph after the tool effect: %v", err)
-			}
+			testassert.NoError(t, err)
 			for _, entry := range graph.Entries {
 				if entry.ToolResult != nil {
-					if tc.wantDenied && len(entry.ToolResult.Metadata) != 0 {
-						t.Fatalf("denied result carries metadata %s, want none", entry.ToolResult.Metadata)
-					}
+					testassert.Require(t, !tc.wantDenied || len(entry.ToolResult.Metadata) == 0, "denied result carries metadata %s, want none", entry.ToolResult.Metadata)
 				}
 			}
 		})
@@ -1854,52 +1609,35 @@ func TestToolEffectDeniedSettlesOnlyItsCall(t *testing.T) {
 		return nil
 	}
 	got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"))
-	if err != nil {
-		t.Fatalf("denied tool effect: %v", err)
-	}
-	if got.Status != model.ResultDenied || got.Content != PermissionDeniedContent {
-		t.Fatalf("call-1 result = %+v, want the fixed denial", got)
-	}
-	if executions != 0 {
-		t.Fatalf("concrete effects started = %d, want none for the denied call", executions)
-	}
-	if replaces != 2 { // Operation + Session only: denial never writes an effect intent
-		t.Fatalf("%d register replacements for the denial, want the intent-free transition (2)", replaces)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, got.Status == model.ResultDenied && got.Content == PermissionDeniedContent, "call-1 result = %+v, want the fixed denial", got)
+	testassert.Equal(t, executions, 0)
+	// Operation + Session only: denial never writes an effect intent
+	testassert.Equal(t, replaces, 2)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && (len(rec.State.PendingToolCalls) == 1 && rec.State.PendingToolCalls[0].CallID == "call-2"), "operation after the denial = %+v, want running with no active effect; pending calls = %+v, want the later call untouched", rec.State, rec.State.PendingToolCalls)
+	{
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-2"))
+		testassert.NoError(t, err)
 	}
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
-		t.Fatalf("operation after the denial = %+v, want running with no active effect", rec.State)
-	}
-	if len(rec.State.PendingToolCalls) != 1 || rec.State.PendingToolCalls[0].CallID != "call-2" {
-		t.Fatalf("pending calls = %+v, want the later call untouched", rec.State.PendingToolCalls)
-	}
-	if _, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-2")); err != nil {
-		t.Fatalf("later tool effect: %v", err)
-	}
-	if executions != 1 {
-		t.Fatalf("concrete effects started = %d, want exactly the later allowed call", executions)
-	}
+	testassert.Equal(t, executions, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after both calls: %v", err)
-	}
+	testassert.NoError(t, err)
 	byCall := map[string]toolResultEntry{}
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
 		}
 	}
-	if len(byCall) != 2 {
-		t.Fatalf("%d settled calls, want exactly one per call", len(byCall))
+	testassert.Equal(t, len(byCall), 2)
+	{
+		got := byCall["call-1"]
+		testassert.Require(t, got.Status == model.ResultDenied && len(got.Metadata) == 0, "call-1 result = %+v, want the metadata-less denial", got)
 	}
-	if got := byCall["call-1"]; got.Status != model.ResultDenied || len(got.Metadata) != 0 {
-		t.Fatalf("call-1 result = %+v, want the metadata-less denial", got)
-	}
-	if got := byCall["call-2"]; got.Status != model.ResultSuccess || got.Content != "ran" {
-		t.Fatalf("call-2 result = %+v, want the allowed execution", got)
+	{
+		got := byCall["call-2"]
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "ran", "call-2 result = %+v, want the allowed execution", got)
 	}
 }
 
@@ -1920,38 +1658,29 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 			testToolCall("call-2"),
 		), nil
 	}
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
-		t.Fatalf("model effect: %v", err)
+	{
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
 	}
-	if normalized != 1 {
-		t.Fatalf("normalization callback ran %d times, want only the advertised call", normalized)
-	}
+	testassert.Equal(t, normalized, 1)
 	prepared := 0
 	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
 		prepared++
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
-	if err != nil {
-		t.Fatalf("unadvertised tool effect: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, got.Status == model.ResultError && got.Content == `Tool "ghost" is not available.`, "unadvertised result = %+v, want the ordinary unavailable-tool error", got)
+	testassert.Equal(t, normalized, 1)
+	testassert.Equal(t, prepared, 0)
+	{
+		_, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-2"))
+		testassert.NoError(t, err)
 	}
-	if got.Status != model.ResultError || got.Content != `Tool "ghost" is not available.` {
-		t.Fatalf("unadvertised result = %+v, want the ordinary unavailable-tool error", got)
-	}
-	if normalized != 1 {
-		t.Fatalf("normalization callback after the rejection = %d, want the gate to precede any normalization", normalized)
-	}
-	if prepared != 0 {
-		t.Fatalf("preparations = %d, want none before the advertisement gate", prepared)
-	}
-	if _, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-2")); err != nil {
-		t.Fatalf("advertised tool effect: %v", err)
-	}
-	if prepared != 1 {
-		t.Fatalf("preparations = %d, want the advertised sibling to reach the preparer", prepared)
-	}
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph after the gate: %v", err)
+	testassert.Equal(t, prepared, 1)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -1968,16 +1697,15 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(calls...), nil
 		}
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
-			t.Fatalf("model effect: %v", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			testassert.NoError(t, err)
 		}
 	}
 	committedAssistant := func(t *testing.T, store *graphStorage, sessionID string) toolCallRecord {
 		t.Helper()
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range graph.Entries {
 			if entry.Assistant != nil && len(entry.Assistant.ToolCalls) > 0 {
 				return entry.Assistant.ToolCalls[0]
@@ -1999,13 +1727,9 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return objectNormalize(model.ToolCall{ID: call.ID, Name: call.Name, Arguments: original})
 		}
 		publishWithNormalize(t, h, c, normalize, model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)})
-		if normalized != 1 {
-			t.Fatalf("producer normalizations = %d, want one", normalized)
-		}
+		testassert.Equal(t, normalized, 1)
 		before := committedAssistant(t, store, sessionID)
-		if string(before.NormalizedArguments) != `{"x":1}` {
-			t.Fatalf("committed member = %q, want the compacted object", before.NormalizedArguments)
-		}
+		testassert.Require(t, string(before.NormalizedArguments) == `{"x":1}`, "committed member = %q, want the compacted object", before.NormalizedArguments)
 		var seenName string
 		var seen json.RawMessage
 		plan := func(_ context.Context, call model.ToolCall) PreparedTool {
@@ -2022,27 +1746,16 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		// unadvertised name would trip the advertisement gate if it were used.
 		forged := model.ToolCall{ID: "call-1", Name: "forged", Arguments: json.RawMessage(`{"y":99}`)}
 		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), forged)
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if got.Status != model.ResultSuccess || got.Content != "done" {
-			t.Fatalf("result = %+v, want the committed call to execute, not a forged-name rejection", got)
-		}
-		if normalized != 1 {
-			t.Fatalf("normalizations after the boundary = %d, want the committed value consumed without a second pass", normalized)
-		}
-		if seenName != "echo" {
-			t.Fatalf("preparer name = %q, want the committed record's name", seenName)
-		}
-		if string(seen) != `{"x":1}` {
-			t.Fatalf("preparer arguments = %q, want byte-identical committed bytes", seen)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "done", "result = %+v, want the committed call to execute, not a forged-name rejection", got)
+		testassert.Equal(t, normalized, 1)
+		testassert.Equal(t, seenName, "echo")
+		testassert.Require(t, string(seen) == `{"x":1}`, "preparer arguments = %q, want byte-identical committed bytes", seen)
 		after := committedAssistant(t, store, sessionID)
-		if string(after.NormalizedArguments) != string(before.NormalizedArguments) {
-			t.Fatalf("assistant normalized member mutated to %q", after.NormalizedArguments)
-		}
-		if raw, err := base64.StdEncoding.DecodeString(after.ArgumentsBase64); err != nil || string(raw) != ` {"x": 1} ` {
-			t.Fatalf("assistant raw arguments mutated to %q (%v)", raw, err)
+		testassert.Require(t, string(after.NormalizedArguments) == string(before.NormalizedArguments), "assistant normalized member mutated to %q", after.NormalizedArguments)
+		{
+			raw, err := base64.StdEncoding.DecodeString(after.ArgumentsBase64)
+			testassert.Require(t, err == nil && string(raw) == ` {"x": 1} `, "assistant raw arguments mutated to %q (%v)", raw, err)
 		}
 	})
 
@@ -2054,9 +1767,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return objectNormalize(call)
 		}
 		publishWithNormalize(t, h, c, normalize, model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)})
-		if normalized != 1 {
-			t.Fatalf("producer normalizations = %d, want one", normalized)
-		}
+		testassert.Equal(t, normalized, 1)
 		var seen json.RawMessage
 		plan := func(_ context.Context, call model.ToolCall) PreparedTool {
 			seen = append(json.RawMessage(nil), call.Arguments...)
@@ -2072,37 +1783,22 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return nil
 		}
 		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if got.Status != model.ResultSuccess || got.Content != "ran" {
-			t.Fatalf("result = %+v, want the executed outcome", got)
-		}
-		if replaces != 3 { // Operation + Session + the tool intent
-			t.Fatalf("%d register replacements, want the intent-backed 3", replaces)
-		}
-		if normalized != 1 {
-			t.Fatalf("normalizations = %d, want the committed value consumed through intent without a second pass", normalized)
-		}
-		if string(seen) != `{"x":1}` {
-			t.Fatalf("preparer arguments = %q, want the committed normalized bytes, not the raw %q", seen, ` {"x": 1} `)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "ran", "result = %+v, want the executed outcome", got)
+		// Operation + Session + the tool intent
+		testassert.Equal(t, replaces, 3)
+		testassert.Equal(t, normalized, 1)
+		testassert.Require(t, string(seen) == `{"x":1}`, "preparer arguments = %q, want the committed normalized bytes, not the raw %q", seen, ` {"x": 1} `)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		results := 0
 		for _, entry := range graph.Entries {
 			if entry.ToolResult != nil {
 				results++
-				if entry.ToolResult.Status != model.ResultSuccess || entry.ToolResult.Content != "ran" {
-					t.Fatalf("committed result = %+v, want the executor's outcome", *entry.ToolResult)
-				}
+				testassert.Require(t, entry.ToolResult.Status == model.ResultSuccess && entry.ToolResult.Content == "ran", "committed result = %+v, want the executor's outcome", *entry.ToolResult)
 			}
 		}
-		if results != 1 {
-			t.Fatalf("%d tool results committed, want the one executor outcome", results)
-		}
+		testassert.Equal(t, results, 1)
 	})
 
 	t.Run("invalid original re-normalizes once at the boundary for its diagnostic", func(t *testing.T) {
@@ -2113,30 +1809,18 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return objectNormalize(call)
 		}
 		publishWithNormalize(t, h, c, normalize, model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`not json`)})
-		if normalized != 1 {
-			t.Fatalf("producer normalizations = %d, want one failed attempt", normalized)
-		}
-		if len(committedAssistant(t, store, sessionID).NormalizedArguments) != 0 {
-			t.Fatalf("committed member present for an invalid original")
-		}
+		testassert.Equal(t, normalized, 1)
+		testassert.Equal(t, len(committedAssistant(t, store, sessionID).NormalizedArguments), 0)
 		prepared := 0
 		plan := func(context.Context, model.ToolCall) PreparedTool {
 			prepared++
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"}}}
 		}
 		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if normalized != 2 {
-			t.Fatalf("normalizations = %d, want one more at the boundary for the diagnostic", normalized)
-		}
-		if got.Status != model.ResultError || got.Content != "arguments must be one non-null JSON object" {
-			t.Fatalf("result = %+v, want the callback's useful validation diagnostic", got)
-		}
-		if prepared != 0 {
-			t.Fatalf("preparations = %d, want none for an invalid original", prepared)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, normalized, 2)
+		testassert.Require(t, got.Status == model.ResultError && got.Content == "arguments must be one non-null JSON object", "result = %+v, want the callback's useful validation diagnostic", got)
+		testassert.Equal(t, prepared, 0)
 	})
 
 	t.Run("committed extras reach the boundary in the decoded encoded form", func(t *testing.T) {
@@ -2152,11 +1836,13 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			d.ToolFragments[0].Extra = model.Extra{"form": producer}
 			return streamOf(d, usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})), nil
 		}
-		if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
-			t.Fatalf("model effect: %v", err)
+		{
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			testassert.NoError(t, err)
 		}
-		if got := string(committedAssistant(t, store, sessionID).Extra["form"]); got != `{"n":[1,1.0,9007199254740993]}` {
-			t.Fatalf("committed extra = %q, want the decoded encoded form", got)
+		{
+			got := string(committedAssistant(t, store, sessionID).Extra["form"])
+			testassert.Equal(t, got, `{"n":[1,1.0,9007199254740993]}`)
 		}
 		for i := range producer { // ownership oracle: clobber the producer's buffer after the commit
 			producer[i] = ' '
@@ -2165,15 +1851,9 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			t.Fatalf("preparer must not run for the invalid original")
 			return PreparedTool{}
 		}, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if got.Status != model.ResultError {
-			t.Fatalf("result = %+v, want the invalid original's validation error", got)
-		}
-		if seenAtBoundary != `{"n":[1,1.0,9007199254740993]}` {
-			t.Fatalf("boundary saw extra = %q, want the committed encoded form", seenAtBoundary)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultError, "result = %+v, want the invalid original's validation error", got)
+		testassert.Equal(t, seenAtBoundary, `{"n":[1,1.0,9007199254740993]}`)
 	})
 
 	t.Run("oversized diagnostic is bounded", func(t *testing.T) {
@@ -2187,12 +1867,8 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			t.Fatalf("preparer must not run for an invalid original")
 			return PreparedTool{}
 		}, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"))
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if got.Status != model.ResultError || len(got.Content) > maxToolDiagnosticBytes || !strings.HasPrefix(got.Content, "xyyyyy") {
-			t.Fatalf("result = %+v, want the diagnostic truncated within %d bytes", got, maxToolDiagnosticBytes)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultError && len(got.Content) <= maxToolDiagnosticBytes && strings.HasPrefix(got.Content, "xyyyyy"), "result = %+v, want the diagnostic truncated within %d bytes", got, maxToolDiagnosticBytes)
 	})
 
 	t.Run("malformed callback outcome at the boundary is the internal-validation error", func(t *testing.T) {
@@ -2211,15 +1887,9 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			t.Fatalf("preparer must not run for a malformed callback outcome")
 			return PreparedTool{}
 		}, NormalizeTool: boundaryNormalize}, testCapture())(context.Background(), testToolCall("call-1"))
-		if err != nil {
-			t.Fatalf("tool effect: %v", err)
-		}
-		if normalized != 2 {
-			t.Fatalf("normalizations = %d, want one producer failure and one boundary failure", normalized)
-		}
-		if got.Status != model.ResultError || got.Content != invalidToolResultContent {
-			t.Fatalf("result = %+v, want the fixed internal-validation error", got)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, normalized, 2)
+		testassert.Require(t, got.Status == model.ResultError && got.Content == invalidToolResultContent, "result = %+v, want the fixed internal-validation error", got)
 	})
 }
 
@@ -2267,33 +1937,20 @@ func TestToolOutcomeMetadataRules(t *testing.T) {
 				return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome { return outcome }}
 			}
 			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"))
-			if err != nil {
-				t.Fatalf("tool effect: %v", err)
-			}
+			testassert.NoError(t, err)
 			want := model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}
-			if got != want {
-				t.Fatalf("agent-facing result = %+v, want only the plain Result", got)
-			}
+			testassert.Equal(t, got, want)
 			graph, err := validateFixture(t, store, sessionID)
-			if err != nil {
-				t.Fatalf("graph after the tool effect: %v", err)
-			}
+			testassert.NoError(t, err)
 			var result *toolResultEntry
 			for i := range graph.Entries {
 				if graph.Entries[i].ToolResult != nil {
 					result = graph.Entries[i].ToolResult
 				}
 			}
-			if result == nil {
-				t.Fatalf("no tool result committed, want the result to survive any metadata decision")
-			}
-			if result.Status != model.ResultSuccess || result.Content != "ran" {
-				t.Fatalf("committed result = %+v, want the settled result", result)
-			}
+			testassert.Require(t, result != nil && (result.Status == model.ResultSuccess && result.Content == "ran"), "no tool result committed, want the result to survive any metadata decision; committed result = %+v, want the settled result", result)
 			if tc.stored == "" {
-				if len(result.Metadata) != 0 {
-					t.Fatalf("committed metadata = %s, want absent", result.Metadata)
-				}
+				testassert.Require(t, len(result.Metadata) == 0, "committed metadata = %s, want absent", result.Metadata)
 			} else if string(result.Metadata) != tc.stored {
 				t.Fatalf("committed metadata = %q..., want %q...", result.Metadata[:min(len(result.Metadata), 20)], tc.stored[:min(len(tc.stored), 20)])
 			}
@@ -2320,60 +1977,50 @@ func TestExecuteOrderedBatchSettlesExactlyOnce(t *testing.T) {
 	toolFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		if !steered { // pending steering arrives inside the batch
 			steered = true
-			if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-batch"); err != nil {
-				t.Errorf("steering submit: %v", err)
+			{
+				_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-batch")
+				testassert.Check(t, err == nil, "steering submit: %v", err)
 			}
 		}
 		return spy.tool(ctx, call)
 	}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, toolFn)
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head's own successor settles
 	awaitHarnessQuiet(t, h, sessionID)
-	if got := spy.dispatched(); len(got) != 2 || got[0] != "call-1" || got[1] != "call-2" {
-		t.Fatalf("dispatch order = %v, want [call-1 call-2]", got)
+	{
+		got := spy.dispatched()
+		testassert.Require(t, len(got) == 2 && got[0] == "call-1" && got[1] == "call-2", "dispatch order = %v, want [call-1 call-2]", got)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the batch: %v", err)
-	}
+	testassert.NoError(t, err)
 	results := map[string]int{}
 	var lastSeq, firstAdmission int64
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			results[entry.ToolResult.ToolCallID]++
-			if entry.Envelope.Sequence <= lastSeq {
-				t.Fatalf("tool result %s committed out of order", entry.Envelope.ID)
-			}
+			testassert.Require(t, entry.Envelope.Sequence > lastSeq, "tool result %s committed out of order", entry.Envelope.ID)
 		}
 		if entry.Input != nil && entry.Input.Content[0].Text == "steer-batch" {
 			firstAdmission = entry.Envelope.Sequence
 		}
 		lastSeq = entry.Envelope.Sequence
 	}
-	if results["call-1"] != 1 || results["call-2"] != 1 {
-		t.Fatalf("result counts = %v, want exactly one per call", results)
-	}
-	if firstAdmission == 0 || lastSeq == 0 {
-		t.Fatalf("missing the successor admission or the last result entry")
-	}
+	testassert.Require(t, results["call-1"] == 1 && results["call-2"] == 1, "result counts = %v, want exactly one per call", results)
+	testassert.Require(t, firstAdmission != 0 && lastSeq != 0, "missing the successor admission or the last result entry")
 	for _, entry := range graph.Entries {
-		if entry.ToolResult != nil && entry.Envelope.Sequence >= firstAdmission {
-			t.Fatalf("tool result %s committed after the successor admission", entry.Envelope.ID)
-		}
+		testassert.Require(t, entry.ToolResult == nil || entry.Envelope.Sequence < firstAdmission, "tool result %s committed after the successor admission", entry.Envelope.ID)
 	}
-	if owner, _ := steeringInputOwner(t, store, sessionID, "steer-batch"); owner != "op-2" {
-		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
+	{
+		owner, _ := steeringInputOwner(t, store, sessionID, "steer-batch")
+		testassert.Equal(t, owner, "op-2")
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationSuccess || len(rec.State.PendingToolCalls) != 0 {
-		t.Fatalf("operation state = %+v, want terminal success with every call resolved", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationSuccess && len(rec.State.PendingToolCalls) == 0, "operation state = %+v, want terminal success with every call resolved", rec.State)
 }
 
 // TestToolEffectRealOutcomeWinsCancellationRace proves a returned real outcome
@@ -2396,27 +2043,20 @@ func TestToolEffectRealOutcomeWinsCancellationRace(t *testing.T) {
 	}
 	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, toolFn)
 	cancel = harnessCancel
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the race: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil && entry.ToolResult.ToolCallID == "call-1" {
-			if entry.ToolResult.Status != model.ResultSuccess || entry.ToolResult.Content != "ran" {
-				t.Fatalf("tool result = %+v, want the real outcome", entry.ToolResult)
-			}
+			testassert.Require(t, entry.ToolResult.Status == model.ResultSuccess && entry.ToolResult.Content == "ran", "tool result = %+v, want the real outcome", entry.ToolResult)
 		}
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption {
-		t.Fatalf("operation status = %s, want the outer interruption after the real outcome", rec.State.Status)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, rec.State.Status, OperationInterruption)
 }
 
 // TestToolOriginatedInterruptionSettlesUnstartedCalls proves the reused
@@ -2439,42 +2079,43 @@ func TestToolOriginatedInterruptionSettlesUnstartedCalls(t *testing.T) {
 	}
 	spy := &toolSpy{plan: toolFn}
 	h, store, c, sessionID, prepared, _ := newExecutionHarness(t, modelFn, spy.tool)
-	if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-int"); err != nil { // pending steering through the stopped batch
-		t.Fatalf("steering submit: %v", err)
+	// pending steering through the stopped batch
+	{
+		_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "steer-int")
+		testassert.NoError(t, err)
 	}
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head drains as its own Operation
 	awaitHarnessQuiet(t, h, sessionID)
-	if got := spy.dispatched(); len(got) != 1 || got[0] != "call-1" {
-		t.Fatalf("dispatch order = %v, want the batch stopped after call-1", got)
+	{
+		got := spy.dispatched()
+		testassert.Require(t, len(got) == 1 && got[0] == "call-1", "dispatch order = %v, want the batch stopped after call-1", got)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the interruption: %v", err)
-	}
+	testassert.NoError(t, err)
 	byCall := map[string]toolResultEntry{}
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
 		}
 	}
-	if got := byCall["call-1"]; got.Status != model.ResultInterrupted || got.Content != "stopped by the tool" {
-		t.Fatalf("call-1 result = %+v, want the executor's real interrupted result", got)
+	{
+		got := byCall["call-1"]
+		testassert.Require(t, got.Status == model.ResultInterrupted && got.Content == "stopped by the tool", "call-1 result = %+v, want the executor's real interrupted result", got)
 	}
-	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
-		t.Fatalf("call-2 result = %+v, want the fixed interrupted-before-execution result", got)
+	{
+		got := byCall["call-2"]
+		testassert.Require(t, got.Status == model.ResultInterrupted && got.Content == interruptedToolResultContent, "call-2 result = %+v, want the fixed interrupted-before-execution result", got)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
-		t.Fatalf("operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
-	}
-	if owner, _ := steeringInputOwner(t, store, sessionID, "steer-int"); owner != "op-2" {
-		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent interrupted", "operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
+	{
+		owner, _ := steeringInputOwner(t, store, sessionID, "steer-int")
+		testassert.Equal(t, owner, "op-2")
 	}
 	requireSessionCleared(t, h, sessionID)
 }
@@ -2500,19 +2141,17 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	})
 	cancel = harnessCancel
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
-		t.Fatalf("operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent interrupted", "operation state = %+v, want terminal interruption with the Agent's detail", rec.State)
 	requireSessionCleared(t, h, sessionID)
-	if _, err := validateFixture(t, store, sessionID); err != nil {
-		t.Fatalf("graph after the cancellation: %v", err)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -2546,26 +2185,22 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- executeDirect(h, c, h.ctx, testOpID, prepared) }()
 	receiveBounded(t, arrived25, "the 25th model effect")
-	if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
-		t.Fatalf("steering submit: %v", err)
+	{
+		_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
+		testassert.NoError(t, err)
 	}
 	close(gate25)
-	if err := <-done; err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := <-done
+		testassert.NoError(t, err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent exceeded 25 model effects" {
-		t.Fatalf("operation state = %+v, want terminal failure at the cap", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent exceeded 25 model effects", "operation state = %+v, want terminal failure at the cap", rec.State)
 	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head drains as its own Operation
 	awaitHarnessQuiet(t, h, sessionID)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph at the cap: %v", err)
-	}
+	testassert.NoError(t, err)
 	assistants, signals := 0, 0
 	for _, entry := range graph.Entries {
 		if entry.Assistant != nil && entry.Envelope.OperationID == testOpID {
@@ -2575,11 +2210,10 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 			signals++
 		}
 	}
-	if assistants != 25 || signals != 25 {
-		t.Fatalf("%d assistants and %d signals committed, want 25 of each", assistants, signals)
-	}
-	if owner, _ := steeringInputOwner(t, store, sessionID, "s1"); owner != "op-2" {
-		t.Fatalf("steering input owned by %q, want its own Operation op-2", owner)
+	testassert.Require(t, assistants == 25 && signals == 25, "%d assistants and %d signals committed, want 25 of each", assistants, signals)
+	{
+		owner, _ := steeringInputOwner(t, store, sessionID, "s1")
+		testassert.Equal(t, owner, "op-2")
 	}
 	requireSessionCleared(t, h, sessionID)
 }
@@ -2608,33 +2242,25 @@ func TestToolResultAdoptsIntoView(t *testing.T) {
 	immediate := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}}
 	}
-	if _, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-1")); err != nil {
-		t.Fatalf("first tool effect: %v", err)
+	{
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-1"))
+		testassert.NoError(t, err)
 	}
 	msgs, err := source(context.Background())
-	if err != nil {
-		t.Fatalf("projection after the first tool result: %v", err)
-	}
-	if len(msgs) != 4 { // system, input, assistant, tool result
-		t.Fatalf("projection carried %d messages, want the committed tool result included (4)", len(msgs))
-	}
+	testassert.NoError(t, err)
+	// system, input, assistant, tool result
+	testassert.Equal(t, len(msgs), 4)
 	tool := msgs[len(msgs)-1]
-	if tool.Role != model.RoleTool || tool.ToolCallID != "call-1" || tool.TextContent() != "ran call-1" {
-		t.Fatalf("projected tool message = %+v, want the committed call-1 result", tool)
-	}
-	if _, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-2")); err != nil {
-		t.Fatalf("second tool effect: %v", err)
+	testassert.Require(t, tool.Role == model.RoleTool && tool.ToolCallID == "call-1" && tool.TextContent() == "ran call-1", "projected tool message = %+v, want the committed call-1 result", tool)
+	{
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-2"))
+		testassert.NoError(t, err)
 	}
 	msgs, err = source(context.Background())
-	if err != nil {
-		t.Fatalf("projection after the second tool result: %v", err)
-	}
-	if len(msgs) != 5 {
-		t.Fatalf("projection carried %d messages, want both tool results (5)", len(msgs))
-	}
-	if tool = msgs[len(msgs)-1]; tool.ToolCallID != "call-2" || tool.TextContent() != "ran call-2" {
-		t.Fatalf("projected tool message = %+v, want the committed call-2 result", tool)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(msgs), 5)
+	tool = msgs[len(msgs)-1]
+	testassert.Require(t, tool.ToolCallID == "call-2" && tool.TextContent() == "ran call-2", "projected tool message = %+v, want the committed call-2 result", tool)
 }
 
 // publishCalls drives one ready model effect publishing the given calls as
@@ -2644,8 +2270,9 @@ func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, ca
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		return completedTurnStream(calls...), nil
 	}
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), nil); err != nil {
-		t.Fatalf("model effect: %v", err)
+	{
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -2672,76 +2299,56 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			return nil
 		}
 		err := executeDirect(h, c, h.ctx, testOpID, prepared)
-		if !errors.Is(err, ErrStorage) {
-			t.Fatalf("execute = %v, want the injected storage failure", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage), "execute = %v, want the injected storage failure", err)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationRunning {
-			t.Fatalf("operation status = %s, want the committed running state left for recovery", rec.State.Status)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, rec.State.Status, OperationRunning)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after the storage failure: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range graph.Entries {
-			if entry.Settlement != nil {
-				t.Fatalf("settlement entry %s published over a storage failure", entry.Envelope.ID)
-			}
+			testassert.Require(t, entry.Settlement == nil, "settlement entry %s published over a storage failure", entry.Envelope.ID)
 		}
 	})
 	t.Run("execution-context error settles the fixed interruption detail", func(t *testing.T) {
 		for _, runErr := range []error{context.Canceled, context.DeadlineExceeded} {
 			h, store, c, sessionID := newEffectHarness(t, nil)
 			publishCalls(t, h, c, sessionID, testToolCall("call-1"))
-			if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background()); !errors.Is(err, runErr) {
-				t.Fatalf("settleAgentTerminal(%v) = %v, want the run error back", runErr, err)
+			{
+				err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background())
+				testassert.Require(t, errors.Is(err, runErr), "settleAgentTerminal(%v) = %v, want the run error back", runErr, err)
 			}
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-			if err != nil {
-				t.Fatalf("ReadOperation: %v", err)
-			}
-			if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-				t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
-			}
-			if _, err := validateFixture(t, store, sessionID); err != nil {
-				t.Fatalf("graph after the interruption: %v", err)
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+			{
+				_, err := validateFixture(t, store, sessionID)
+				testassert.NoError(t, err)
 			}
 		}
 	})
 	t.Run("non-storage protocol error still settles failure", func(t *testing.T) {
 		h, _, c, sessionID := newEffectHarness(t, nil)
 		runErr := errors.New("context source broke")
-		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background()); !errors.Is(err, runErr) {
-			t.Fatalf("settleAgentTerminal = %v, want the run error back", err)
+		{
+			err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background())
+			testassert.Require(t, errors.Is(err, runErr), "settleAgentTerminal = %v, want the run error back", err)
 		}
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		if err != nil {
-			t.Fatalf("ReadOperation: %v", err)
-		}
-		if rec.State.Status != OperationFailure || rec.State.Terminal == nil || rec.State.Terminal.Detail != runErr.Error() {
-			t.Fatalf("operation state = %+v, want terminal failure with the error text", rec.State)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == runErr.Error(), "operation state = %+v, want terminal failure with the error text", rec.State)
 	})
 	t.Run("boundary token settles the quiet success", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
-		if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, errSteeringBoundary, context.Background()); err != nil {
-			t.Fatalf("settleAgentTerminal(token) = %v, want the cleared run error", err)
+		{
+			err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, errSteeringBoundary, context.Background())
+			testassert.NoError(t, err)
 		}
 		rec := settledOperation(t, store, sessionID, testOpID)
-		if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.Detail != "" {
-			t.Fatalf("operation state = %+v, want quiet success with empty detail", rec.State)
-		}
+		testassert.Require(t, rec.State.Status == OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.Detail == "", "operation state = %+v, want quiet success with empty detail", rec.State)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after the token: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range graph.Entries {
-			if entry.Signal != nil || (entry.Assistant != nil && entry.Envelope.OperationID == testOpID) {
-				t.Fatalf("entry %s added a signal or assistant behind the boundary token", entry.Envelope.ID)
-			}
+			testassert.Require(t, entry.Signal == nil && (entry.Assistant == nil || entry.Envelope.OperationID != testOpID), "entry %s added a signal or assistant behind the boundary token", entry.Envelope.ID)
 		}
 	})
 	t.Run("shared success guard converts only the matching interruption", func(t *testing.T) {
@@ -2771,23 +2378,21 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 					cancel()
 					execCtx = canceled
 				}
-				if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, execCtx); err != nil {
-					t.Fatalf("settleAgentTerminal = %v, want the guarded success settled", err)
+				{
+					err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalSuccess}, nil, execCtx)
+					testassert.NoError(t, err)
 				}
 				rec := settledOperation(t, store, sessionID, testOpID)
-				if rec.State.Status != tc.want {
-					t.Fatalf("operation state = %+v, want %s", rec.State, tc.want)
-				}
-				if tc.want == OperationInterruption && (rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail) {
-					t.Fatalf("terminal = %+v, want the fixed interrupted detail", rec.State.Terminal)
-				}
+				testassert.Require(t, rec.State.Status == tc.want, "operation state = %+v, want %s", rec.State, tc.want)
+				testassert.Require(t, tc.want != OperationInterruption || rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "terminal = %+v, want the fixed interrupted detail", rec.State.Terminal)
 			})
 		}
 	})
 	t.Run("one attempted success publication keeps its original error", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
-		if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
-			t.Fatalf("steering submit: %v", err)
+		{
+			_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
+			testassert.NoError(t, err)
 		}
 		attempts := 0
 		injected := fmt.Errorf("%w: injected publication failure", ErrStorage)
@@ -2800,27 +2405,18 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 		}
 		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
 		err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
-		if !errors.Is(err, ErrStorage) || err.Error() != injected.Error() {
-			t.Fatalf("finishExecution = %v, want the original injected error", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage) && err.Error() == injected.Error(), "finishExecution = %v, want the original injected error", err)
 		store.txHook = nil
-		if attempts != 1 {
-			t.Fatalf("publication attempts = %d, want exactly one", attempts)
-		}
+		testassert.Equal(t, attempts, 1)
 		c.mu.Lock()
 		held, buffered := c.reserved != nil, len(c.steering)
 		c.mu.Unlock()
-		if held {
-			t.Fatalf("admission reservation stayed held after the completion")
-		}
-		if buffered != 1 {
-			t.Fatalf("buffered heads = %d, want the pending head retained", buffered)
-		}
-		if storedOperationExists(store, sessionID, "op-2") {
-			t.Fatalf("successor admitted while the current work remains")
-		}
-		if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != OperationRunning {
-			t.Fatalf("operation state = %+v, want the running state left for recovery", rec.State)
+		testassert.Require(t, !held, "admission reservation stayed held after the completion")
+		testassert.Equal(t, buffered, 1)
+		testassert.Require(t, !storedOperationExists(store, sessionID, "op-2"), "successor admitted while the current work remains")
+		{
+			rec := settledOperation(t, store, sessionID, testOpID)
+			testassert.Require(t, rec.State.Status == OperationRunning, "operation state = %+v, want the running state left for recovery", rec.State)
 		}
 	})
 	t.Run("acquisition cancellation skips only the drain", func(t *testing.T) {
@@ -2840,13 +2436,12 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				}, func(_ context.Context, call model.ToolCall) PreparedTool {
 					return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 				})
-				if _, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1"); err != nil {
-					t.Fatalf("steering submit: %v", err)
+				{
+					_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
+					testassert.NoError(t, err)
 				}
 				release, err := h.reserve(context.Background(), c) // another holder owns the reservation
-				if err != nil {
-					t.Fatalf("reserve: %v", err)
-				}
+				testassert.NoError(t, err)
 				defer release()
 				harnessCancel() // the Harness context dies: the acquisition is canceled
 				closes := 0
@@ -2855,47 +2450,32 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 					closes++
 					return nil
 				})
-				if tc.res == nil && got != tc.runErr {
-					t.Fatalf("finishExecution = %v, want the original run error retained", got)
-				}
-				if tc.res != nil && got != nil {
-					t.Fatalf("finishExecution = %v, want the settled outcome, never the acquisition error", got)
-				}
-				if closes != 1 {
-					t.Fatalf("Close calls = %d, want exactly one", closes)
-				}
+				testassert.Require(t, tc.res != nil || got == tc.runErr, "finishExecution = %v, want the original run error retained", got)
+				testassert.Require(t, tc.res == nil || got == nil, "finishExecution = %v, want the settled outcome, never the acquisition error", got)
+				testassert.Equal(t, closes, 1)
 				c.mu.Lock()
 				held, buffered := c.reserved != nil, len(c.steering)
 				c.mu.Unlock()
-				if !held {
-					t.Fatalf("the other holder's reservation was released")
-				}
-				if buffered != 1 {
-					t.Fatalf("buffered heads = %d, want the drain skipped and the head retained", buffered)
-				}
-				if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != tc.want {
-					t.Fatalf("operation state = %+v, want %s", rec.State, tc.want)
+				testassert.Require(t, held, "the other holder's reservation was released")
+				testassert.Equal(t, buffered, 1)
+				{
+					rec := settledOperation(t, store, sessionID, testOpID)
+					testassert.Require(t, rec.State.Status == tc.want, "operation state = %+v, want %s", rec.State, tc.want)
 				}
 				graph, err := validateFixture(t, store, sessionID)
-				if err != nil {
-					t.Fatalf("graph: %v", err)
-				}
+				testassert.NoError(t, err)
 				settlements := 0
 				for _, entry := range graph.Entries {
 					if entry.Settlement != nil && entry.Envelope.OperationID == testOpID {
 						settlements++
 					}
 				}
-				if settlements != tc.wantSet {
-					t.Fatalf("settlement entries = %d, want %d", settlements, tc.wantSet)
-				}
+				testassert.Equal(t, settlements, tc.wantSet)
 				h.mu.Lock()
 				latched, cleanup := h.storageFailure, h.cleanupFailure
 				h.mu.Unlock()
 				if tc.res == nil {
-					if latched != tc.runErr {
-						t.Fatalf("recorded storage failure = %v, want the authoritative original %v", latched, tc.runErr)
-					}
+					testassert.Equal(t, latched, tc.runErr)
 				} else if latched != nil || cleanup != nil {
 					t.Fatalf("recorded failures = (%v, %v), want the successful outcome unmodified", latched, cleanup)
 				}
@@ -2912,28 +2492,30 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				foreignEffectRace(t, store, sessionID, testOpID, "foreign")
 			}},
 			{"retained active effect", func(t *testing.T, h *Harness, store *graphStorage, c *coordinator, sessionID string) {
-				if err := store.Transact(context.Background(), func(tx Transaction) error {
-					key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
-					reg, err := tx.ReadRegister(key)
-					if err != nil {
+				{
+					err := store.Transact(context.Background(), func(tx Transaction) error {
+						key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+						reg, err := tx.ReadRegister(key)
+						if err != nil {
+							return err
+						}
+						op, err := decodeOperationRegister(reg)
+						if err != nil {
+							return err
+						}
+						op.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(7)}
+						payload, err := encodeOperationRegister(op)
+						if err != nil {
+							return err
+						}
+						_, err = tx.ReplaceRegister(key, reg.Revision, payload)
 						return err
-					}
-					op, err := decodeOperationRegister(reg)
-					if err != nil {
-						return err
-					}
-					op.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(7)}
-					payload, err := encodeOperationRegister(op)
-					if err != nil {
-						return err
-					}
-					_, err = tx.ReplaceRegister(key, reg.Revision, payload)
-					return err
-				}); err != nil {
-					t.Fatalf("foreign active effect: %v", err)
+					})
+					testassert.NoError(t, err)
 				}
-				if err := h.rematerialize(context.Background(), c, sessionID); err != nil {
-					t.Fatalf("rematerialize: %v", err)
+				{
+					err := h.rematerialize(context.Background(), c, sessionID)
+					testassert.NoError(t, err)
 				}
 			}},
 		} {
@@ -2942,23 +2524,16 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				tc.foreign(t, h, store, c, sessionID)
 				run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
 				err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
-				if tc.name == "quiet running state" && !errors.Is(err, ErrConflict) {
-					t.Fatalf("finishExecution = %v, want the revision race's original error", err)
-				}
-				if tc.name == "retained active effect" && err != nil {
-					t.Fatalf("finishExecution = %v, want the guarded skip's cleared value", err)
-				}
+				testassert.Require(t, tc.name != "quiet running state" || errors.Is(err, ErrConflict), "finishExecution = %v, want the revision race's original error", err)
+				testassert.Require(t, tc.name != "retained active effect" || err == nil, "finishExecution = %v, want the guarded skip's cleared value", err)
 				graph, err := validateFixture(t, store, sessionID)
-				if err != nil {
-					t.Fatalf("graph after the completion: %v", err)
-				}
+				testassert.NoError(t, err)
 				for _, entry := range graph.Entries {
-					if entry.Settlement != nil && entry.Envelope.OperationID == testOpID {
-						t.Fatalf("settlement entry %s published over the rematerialized running state", entry.Envelope.ID)
-					}
+					testassert.Require(t, entry.Settlement == nil || entry.Envelope.OperationID != testOpID, "settlement entry %s published over the rematerialized running state", entry.Envelope.ID)
 				}
-				if rec := settledOperation(t, store, sessionID, testOpID); rec.State.Status != OperationRunning {
-					t.Fatalf("operation state = %+v, want the running state left for recovery", rec.State)
+				{
+					rec := settledOperation(t, store, sessionID, testOpID)
+					testassert.Require(t, rec.State.Status == OperationRunning, "operation state = %+v, want the running state left for recovery", rec.State)
 				}
 			})
 		}
@@ -2966,53 +2541,51 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 	t.Run("an already committed settlement is never rewritten", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		var settlementID string
-		if err := store.Transact(context.Background(), func(tx Transaction) error { // one coherent foreign settle
-			skey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
-			sreg, err := tx.ReadRegister(skey)
-			if err != nil {
-				return err
-			}
-			session, err := decodeSessionRegister(sreg)
-			if err != nil {
-				return err
-			}
-			okey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
-			oreg, err := tx.ReadRegister(okey)
-			if err != nil {
-				return err
-			}
-			op, err := decodeOperationRegister(oreg)
-			if err != nil {
-				return err
-			}
-			committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil)
-			if err != nil {
-				return err
-			}
-			settlementID = committed.State.Terminal.SettlementEntry.EntryID
-			return nil
-		}); err != nil {
-			t.Fatalf("foreign settle: %v", err)
+		// one coherent foreign settle
+		{
+			err := store.Transact(context.Background(), func(tx Transaction) error { // one coherent foreign settle
+				skey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+				sreg, err := tx.ReadRegister(skey)
+				if err != nil {
+					return err
+				}
+				session, err := decodeSessionRegister(sreg)
+				if err != nil {
+					return err
+				}
+				okey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
+				oreg, err := tx.ReadRegister(okey)
+				if err != nil {
+					return err
+				}
+				op, err := decodeOperationRegister(oreg)
+				if err != nil {
+					return err
+				}
+				committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil, false)
+				if err != nil {
+					return err
+				}
+				settlementID = committed.State.Terminal.SettlementEntry.EntryID
+				return nil
+			})
+			testassert.NoError(t, err)
 		}
-		if err := h.rematerialize(context.Background(), c, sessionID); err != nil {
-			t.Fatalf("rematerialize: %v", err)
+		{
+			err := h.rematerialize(context.Background(), c, sessionID)
+			testassert.NoError(t, err)
 		}
 		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
-		if err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil); err != nil {
-			t.Fatalf("finishExecution = %v, want the guarded skip's cleared value", err)
+		{
+			err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+			testassert.NoError(t, err)
 		}
 		rec := settledOperation(t, store, sessionID, testOpID)
-		if rec.State.Status != OperationSuccess || rec.State.Terminal == nil || rec.State.Terminal.SettlementEntry.EntryID != settlementID {
-			t.Fatalf("operation state = %+v, want the committed settlement %s preserved", rec.State, settlementID)
-		}
+		testassert.Require(t, rec.State.Status == OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.SettlementEntry.EntryID == settlementID, "operation state = %+v, want the committed settlement %s preserved", rec.State, settlementID)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("graph after the completion: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range graph.Entries {
-			if entry.Settlement != nil && entry.Envelope.OperationID == testOpID && entry.Envelope.ID != settlementID {
-				t.Fatalf("settlement entry %s rewrote the committed settlement", entry.Envelope.ID)
-			}
+			testassert.Require(t, entry.Settlement == nil || entry.Envelope.OperationID != testOpID || entry.Envelope.ID == settlementID, "settlement entry %s rewrote the committed settlement", entry.Envelope.ID)
 		}
 	})
 }
@@ -3035,43 +2608,35 @@ func TestToolEffectGateBeforePreparation(t *testing.T) {
 		return nil
 	}
 	got, err := h.toolEffect(c, testOpID, effectExecution(nil, spy.tool), testCapture())(ctx, testToolCall("call-1"))
-	if err != nil {
-		t.Fatalf("tool effect: %v", err)
+	testassert.NoError(t, err)
+	{
+		dispatched := spy.dispatched()
+		testassert.Require(t, len(dispatched) == 0, "prepared invoked for %v, want zero preparations", dispatched)
 	}
-	if dispatched := spy.dispatched(); len(dispatched) != 0 {
-		t.Fatalf("prepared invoked for %v, want zero preparations", dispatched)
-	}
-	if got != (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}) {
-		t.Fatalf("committed result = %+v, want the interrupted-before-execution result", got)
-	}
-	if replaces != 2 { // Operation + Session registers only: no effect intent
-		t.Fatalf("%d register replacements, want the intent-free transition (2)", replaces)
-	}
+	testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}))
+	// Operation + Session registers only: no effect intent
+	testassert.Equal(t, replaces, 2)
 	// The run settles interruption and the terminal helper interrupts the
 	// remaining unstarted call.
-	if err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}, nil, context.Background()); err != nil {
-		t.Fatalf("outer settlement: %v", err)
+	{
+		err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}, nil, context.Background())
+		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the interruption: %v", err)
-	}
+	testassert.NoError(t, err)
 	byCall := map[string]toolResultEntry{}
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
 		}
 	}
-	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
-		t.Fatalf("call-2 result = %+v, want the terminal helper's interrupted result", got)
+	{
+		got := byCall["call-2"]
+		testassert.Require(t, got.Status == model.ResultInterrupted && got.Content == interruptedToolResultContent, "call-2 result = %+v, want the terminal helper's interrupted result", got)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption", rec.State)
 	requireSessionCleared(t, h, sessionID)
 }
 
@@ -3103,39 +2668,30 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 		), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	if _, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), nil); err != nil {
-		t.Fatalf("model effect: %v", err)
+	{
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
 	}
-	if normalized != 3 {
-		t.Fatalf("normalization callback ran %d times, want exactly one per advertised completed call", normalized)
-	}
+	testassert.Equal(t, normalized, 3)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the model effect: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
 		if entry.Assistant == nil || len(entry.Assistant.ToolCalls) != 4 {
 			continue
 		}
 		calls := entry.Assistant.ToolCalls
-		if raw, err := base64.StdEncoding.DecodeString(calls[0].ArgumentsBase64); err != nil || string(raw) != string(valid) {
-			t.Fatalf("call-1 raw arguments = %q err %v, want the exact caller bytes", raw, err)
+		{
+			raw, err := base64.StdEncoding.DecodeString(calls[0].ArgumentsBase64)
+			testassert.Require(t, err == nil && string(raw) == string(valid), "call-1 raw arguments = %q err %v, want the exact caller bytes", raw, err)
 		}
-		if string(calls[0].NormalizedArguments) != `{"x":1}` {
-			t.Fatalf("call-1 normalized arguments = %q, want the successful callback object", calls[0].NormalizedArguments)
+		testassert.Require(t, string(calls[0].NormalizedArguments) == `{"x":1}`, "call-1 normalized arguments = %q, want the successful callback object", calls[0].NormalizedArguments)
+		{
+			raw, err := base64.StdEncoding.DecodeString(calls[1].ArgumentsBase64)
+			testassert.Require(t, err == nil && string(raw) == string(malformed), "call-2 raw arguments = %q err %v, want the exact malformed bytes preserved", raw, err)
 		}
-		if raw, err := base64.StdEncoding.DecodeString(calls[1].ArgumentsBase64); err != nil || string(raw) != string(malformed) {
-			t.Fatalf("call-2 raw arguments = %q err %v, want the exact malformed bytes preserved", raw, err)
-		}
-		if len(calls[1].NormalizedArguments) != 0 {
-			t.Fatalf("call-2 normalized arguments = %q, want the member absent for a failed normalization", calls[1].NormalizedArguments)
-		}
-		if len(calls[2].NormalizedArguments) != 0 {
-			t.Fatalf("call-3 normalized arguments = %q, want the member absent for a malformed callback result", calls[2].NormalizedArguments)
-		}
-		if len(calls[3].NormalizedArguments) != 0 {
-			t.Fatalf("call-4 normalized arguments = %q, want the member absent for an unadvertised name", calls[3].NormalizedArguments)
-		}
+		testassert.Require(t, len(calls[1].NormalizedArguments) == 0, "call-2 normalized arguments = %q, want the member absent for a failed normalization", calls[1].NormalizedArguments)
+		testassert.Require(t, len(calls[2].NormalizedArguments) == 0, "call-3 normalized arguments = %q, want the member absent for a malformed callback result", calls[2].NormalizedArguments)
+		testassert.Require(t, len(calls[3].NormalizedArguments) == 0, "call-4 normalized arguments = %q, want the member absent for an unadvertised name", calls[3].NormalizedArguments)
 		return
 	}
 	t.Fatalf("no assistant entry with four calls committed")
@@ -3163,24 +2719,17 @@ func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
 		}
 		return nil
 	}
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the cancellation: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range graph.Entries {
-		if entry.Assistant != nil {
-			t.Fatalf("assistant entry %s published after an aborted intent", entry.Envelope.ID)
-		}
+		testassert.Require(t, entry.Assistant == nil, "assistant entry %s published after an aborted intent", entry.Envelope.ID)
 	}
 	requireSessionCleared(t, h, sessionID)
 }
@@ -3217,37 +2766,32 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 		}
 		return nil
 	}
-	if err := executeDirect(h, c, h.ctx, testOpID, prepared); err != nil {
-		t.Fatalf("execute: %v", err)
+	{
+		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("graph after the cancellation: %v", err)
-	}
+	testassert.NoError(t, err)
 	byCall := map[string]toolResultEntry{}
 	for _, entry := range graph.Entries {
 		if entry.ToolResult != nil {
 			byCall[entry.ToolResult.ToolCallID] = *entry.ToolResult
 		}
 	}
-	if got := byCall["call-1"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
-		t.Fatalf("call-1 result = %+v, want the interrupted-before-execution result", got)
+	{
+		got := byCall["call-1"]
+		testassert.Require(t, got.Status == model.ResultInterrupted && got.Content == interruptedToolResultContent, "call-1 result = %+v, want the interrupted-before-execution result", got)
 	}
-	if got := byCall["call-2"]; got.Status != model.ResultInterrupted || got.Content != interruptedToolResultContent {
-		t.Fatalf("call-2 result = %+v, want the terminal helper's interrupted result", got)
+	{
+		got := byCall["call-2"]
+		testassert.Require(t, got.Status == model.ResultInterrupted && got.Content == interruptedToolResultContent, "call-2 result = %+v, want the terminal helper's interrupted result", got)
 	}
 	for call, got := range byCall {
-		if len(got.Metadata) != 0 {
-			t.Fatalf("%s result carries metadata %s, want none on synthetic results", call, got.Metadata)
-		}
+		testassert.Require(t, len(got.Metadata) == 0, "%s result carries metadata %s, want none on synthetic results", call, got.Metadata)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationInterruption || rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("operation state = %+v, want terminal interruption with the fixed detail", rec.State)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
 	requireSessionCleared(t, h, sessionID)
 }
 
@@ -3276,24 +2820,16 @@ func TestSessionGraphReplaceOperation(t *testing.T) {
 
 	t.Run("replaces only the addressed record", func(t *testing.T) {
 		g := &sessionGraph{Operations: []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}}
-		if !g.replaceOperation("op-2", record("op-2", 42)) {
-			t.Fatalf("replaceOperation of a carried identity = false, want true")
-		}
+		testassert.Require(t, g.replaceOperation("op-2", record("op-2", 42)), "replaceOperation of a carried identity = false, want true")
 		want := []OperationRecord{record("op-1", 1), record("op-2", 42), record("op-3", 3)}
-		if !reflect.DeepEqual(g.Operations, want) {
-			t.Fatalf("operations after replacement = %+v, want %+v", g.Operations, want)
-		}
+		testassert.Require(t, reflect.DeepEqual(g.Operations, want), "operations after replacement = %+v, want %+v", g.Operations, want)
 	})
 
 	t.Run("missing identity is a no-op", func(t *testing.T) {
 		g := &sessionGraph{Operations: []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}}
-		if g.replaceOperation("op-ghost", record("op-ghost", 9)) {
-			t.Fatalf("replaceOperation of an absent identity = true, want false")
-		}
+		testassert.Require(t, !g.replaceOperation("op-ghost", record("op-ghost", 9)), "replaceOperation of an absent identity = true, want false")
 		want := []OperationRecord{record("op-1", 1), record("op-2", 2), record("op-3", 3)}
-		if !reflect.DeepEqual(g.Operations, want) {
-			t.Fatalf("operations after a missing identity = %+v, want the untouched records %+v", g.Operations, want)
-		}
+		testassert.Require(t, reflect.DeepEqual(g.Operations, want), "operations after a missing identity = %+v, want the untouched records %+v", g.Operations, want)
 	})
 
 	t.Run("replacement allocates nothing", func(t *testing.T) {
@@ -3304,8 +2840,9 @@ func TestSessionGraphReplaceOperation(t *testing.T) {
 		}
 		g := &sessionGraph{Operations: operations}
 		updated := record("op-63", 999)
-		if n := testing.AllocsPerRun(100, func() { g.replaceOperation("op-63", updated) }); n != 0 {
-			t.Fatalf("one-record replacement over %d operations allocated %v times, want zero", count, n)
+		{
+			n := testing.AllocsPerRun(100, func() { g.replaceOperation("op-63", updated) })
+			testassert.Require(t, n == 0, "one-record replacement over %d operations allocated %v times, want zero", count, n)
 		}
 	})
 }

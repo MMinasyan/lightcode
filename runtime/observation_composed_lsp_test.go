@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -97,44 +98,31 @@ func TestComposedLSPWarningLandsInGlobalStoreAndEvents(t *testing.T) {
 	e := newComposeEnv(t)
 	t.Setenv("PATH", t.TempDir()) // no resolvable language server anywhere
 	server := newLSPModelServer(t)
-	if err := os.WriteFile(e.configPath, []byte(lspConfigDocument(server.URL)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(filepath.Dir(e.configPath), "agents.json"), []byte(lspAgentsDocument), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(e.configPath, []byte(lspConfigDocument(server.URL)), 0o600))
+	testassert.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(e.configPath), "agents.json"), []byte(lspAgentsDocument), 0o600))
 
 	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "CMakeLists.txt"), []byte("cmake_minimum_required(VERSION 3.10)\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "CMakeLists.txt"), []byte("cmake_minimum_required(VERSION 3.10)\n"), 0o600))
 
 	ctx := context.Background()
 	r, err := runtime.Open(ctx, runtime.Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: builtin.Plugins()})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	// The owner closes on every exit: the deferred Close is idempotent and
 	// joins the same shutdown, covering an assertion failure before the
 	// server and data-root cleanups run.
 	defer func() {
-		if err := r.Close(context.Background()); err != nil {
-			t.Errorf("Close: %v", err)
+		{
+			err := r.Close(context.Background())
+			testassert.Check(t, err == nil, "Close: %v", err)
 		}
 	}()
 	sub, err := r.Subscribe(256)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer sub.Close()
 
 	session, err := runtime.CreateSessionForTest(ctx, r, workspace, "worker")
-	if err != nil {
-		t.Fatalf("createSession: %v", err)
-	}
-	if err := runtime.SubmitForTest(ctx, r, session.Identity.SessionID, "op-lsp", "find Foo"); err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, runtime.SubmitForTest(ctx, r, session.Identity.SessionID, "op-lsp", "find Foo"))
 
 	// The real warning arrives through the real manager's report: the
 	// runtime-scoped warning_changed hint, then the global store read. The
@@ -144,17 +132,13 @@ func TestComposedLSPWarningLandsInGlobalStoreAndEvents(t *testing.T) {
 	for hint == nil {
 		select {
 		case event, ok := <-sub.Events():
-			if !ok {
-				t.Fatal("the subscription closed before the LSP warning hint")
-			}
+			testassert.Require(t, ok, "the subscription closed before the LSP warning hint")
 			kind, err := event.Discriminator()
 			if err != nil || kind != "warning_changed" {
 				continue
 			}
 			body, err := event.AsWarningChangedEvent()
-			if err != nil {
-				t.Fatalf("warning event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			if composedScopeKind(body.Scope) == "runtime" {
 				hint = &body
 			}
@@ -162,24 +146,19 @@ func TestComposedLSPWarningLandsInGlobalStoreAndEvents(t *testing.T) {
 			t.Fatal("the real LSP warning hint never arrived")
 		}
 	}
-	if _, err := strconv.ParseUint(hint.WarningsRevision.Revision, 10, 64); err != nil {
-		t.Fatalf("warning hint revision = %q, want a decimal value", hint.WarningsRevision.Revision)
+	{
+		_, err := strconv.ParseUint(hint.WarningsRevision.Revision, 10, 64)
+		testassert.Require(t, err == nil, "warning hint revision = %q, want a decimal value", hint.WarningsRevision.Revision)
 	}
 
 	warnings, err := runtime.GetWarningsForTest(r)
-	if err != nil {
-		t.Fatalf("GetWarningsForTest: %v", err)
-	}
+	testassert.NoError(t, err)
 	found := false
 	for _, warning := range warnings.Warnings {
 		if warning.Source == "plugin:lsp" && strings.Contains(warning.Kind, "lsp_") {
 			found = true
 		}
 	}
-	if !found {
-		t.Fatalf("the global warning read misses the real LSP report: %+v", warnings.Warnings)
-	}
-	if err := r.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.Require(t, found, "the global warning read misses the real LSP report: %+v", warnings.Warnings)
+	testassert.NoError(t, r.Close(ctx))
 }

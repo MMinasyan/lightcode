@@ -5,31 +5,15 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// TestRunForgedModelSettlementsRejected pins every malformed settlement shape ending the run with one typed boundary-protocol error naming the "model" boundary and a zero terminal, through the shared validator — no effect after it runs.
+// TestRunForgedModelSettlementsRejected pins every shared malformed settlement
+// shape ending the run with its typed boundary-protocol error and a zero
+// terminal, through the shared validator — no effect after it runs.
 func TestRunForgedModelSettlementsRejected(t *testing.T) {
-	errored := mkOutput(model.OutputErrored, "boom", nil)
-	completed := mkOutput(model.OutputCompleted, "", nil)
-	foreign := mkForeignSettlementOutput(model.OutputCompleted, "", model.ModelRef{Provider: "acme", Model: "other"})
-
-	rows := []struct {
-		name string
-		set  ModelSettlement
-	}{
-		{"ready-nil-output", ModelSettlement{Disposition: DispoReady}},
-		{"ready-errored-output", ModelSettlement{Disposition: DispoReady, Output: errored}},
-		{"continue-nil-output", ModelSettlement{Disposition: DispoContinue}},
-		{"failure-completed-output", ModelSettlement{Disposition: DispoFailure, Output: completed, Detail: "d"}},
-		{"failure-empty-detail", ModelSettlement{Disposition: DispoFailure}},
-		{"interruption-errored-output", ModelSettlement{Disposition: DispoInterruption, Output: errored, Detail: "d"}},
-		{"interruption-empty-detail", ModelSettlement{Disposition: DispoInterruption}},
-		{"unknown-disposition", ModelSettlement{Disposition: "bogus"}},
-		{"foreign-source", ModelSettlement{Disposition: DispoReady, Output: foreign}},
-	}
-
-	for _, row := range rows {
+	for _, row := range forgedModelSettlements() {
 		t.Run(row.name, func(t *testing.T) {
 			f := &runFakes{}
 			f.modelSet = setScript(row.set)
@@ -37,9 +21,7 @@ func TestRunForgedModelSettlementsRejected(t *testing.T) {
 			res, err := Run(context.Background(), f.invocation())
 			requireBoundaryViolation(t, err, "model")
 			requireZeroTerminal(t, res)
-			if f.modelCalls != 1 || f.toolCalls != 0 {
-				t.Fatalf("model=%d tool=%d, want the run to stop at the forged settlement", f.modelCalls, f.toolCalls)
-			}
+			testassert.Require(t, f.modelCalls == 1 && f.toolCalls == 0, "model=%d tool=%d, want the run to stop at the forged settlement", f.modelCalls, f.toolCalls)
 		})
 	}
 }
@@ -53,12 +35,8 @@ func TestRunContinueCompletedOutputContinues(t *testing.T) {
 	)
 
 	res, err := Run(context.Background(), f.invocation())
-	if err != nil || res.Status != TerminalSuccess {
-		t.Fatalf("run = %#v, %v; want success after completed continuation", res, err)
-	}
-	if f.modelCalls != 2 || f.sourceCalls != 2 || f.toolCalls != 0 {
-		t.Fatalf("model=%d source=%d tool=%d, want the continuation to fetch a fresh snapshot", f.modelCalls, f.sourceCalls, f.toolCalls)
-	}
+	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success after completed continuation", res, err)
+	testassert.Require(t, f.modelCalls == 2 && f.sourceCalls == 2 && f.toolCalls == 0, "model=%d source=%d tool=%d, want the continuation to fetch a fresh snapshot", f.modelCalls, f.sourceCalls, f.toolCalls)
 }
 
 // TestRunForgedToolResultsRejected pins the shared tool-result validator inside the batch: a settlement answering another call, carrying an unclosed status, or omitting mandated content ends the run with one typed "tool" violation, and no later call in the batch starts.
@@ -83,9 +61,7 @@ func TestRunForgedToolResultsRejected(t *testing.T) {
 			res, err := Run(context.Background(), f.invocation())
 			requireBoundaryViolation(t, err, "tool")
 			requireZeroTerminal(t, res)
-			if f.toolCalls != 1 {
-				t.Fatalf("tool calls = %d, want the batch to stop at the forged settlement", f.toolCalls)
-			}
+			testassert.Equal(t, f.toolCalls, 1)
 		})
 	}
 }
@@ -100,9 +76,7 @@ func TestRunInvalidSnapshotMessagesRejected(t *testing.T) {
 	res, err := Run(context.Background(), f.invocation())
 	requireBoundaryViolation(t, err, "agent")
 	requireZeroTerminal(t, res)
-	if f.modelCalls != 0 || f.toolCalls != 0 {
-		t.Fatalf("model=%d tool=%d, want the request rejection to precede any effect", f.modelCalls, f.toolCalls)
-	}
+	testassert.Require(t, f.modelCalls == 0 && f.toolCalls == 0, "model=%d tool=%d, want the request rejection to precede any effect", f.modelCalls, f.toolCalls)
 }
 
 // TestRunDuplicateCallIDSettlementsRejected pins the shared completed-call identity rule inside the loop: duplicate IDs on a retained completed output are one typed model-boundary violation on both dispositions that may carry it, the run stops with a zero terminal, no call dispatches, and the interruption path cannot panic its way into a terminal.
@@ -129,9 +103,7 @@ func TestRunDuplicateCallIDSettlementsRejected(t *testing.T) {
 			res, err := Run(context.Background(), f.invocation())
 			requireBoundaryViolation(t, err, "model")
 			requireZeroTerminal(t, res)
-			if f.toolCalls != 0 {
-				t.Fatalf("tool calls = %d, want no duplicate dispatch", f.toolCalls)
-			}
+			testassert.Equal(t, f.toolCalls, 0)
 		})
 	}
 }
@@ -150,9 +122,7 @@ func TestRunDetailMismatchDispositionsRejectedThroughRun(t *testing.T) {
 		res, err := Run(context.Background(), f.invocation())
 		requireBoundaryViolation(t, err, "model")
 		requireZeroTerminal(t, res)
-		if f.modelCalls != 1 {
-			t.Fatalf("row %d model calls = %d, want 1", i, f.modelCalls)
-		}
+		testassert.Require(t, f.modelCalls == 1, "row %d model calls = %d, want 1", i, f.modelCalls)
 	}
 }
 
@@ -168,12 +138,8 @@ func TestRunInfraErrorAfterPriorContinuationVerbatim(t *testing.T) {
 
 	res, err := Run(context.Background(), f.invocation())
 	requireZeroTerminal(t, res)
-	if !errors.Is(err, errInfra) {
-		t.Fatalf("error = %v, want the infrastructure error verbatim", err)
-	}
-	if f.modelCalls != 2 || f.sourceCalls != 2 || f.toolCalls != 0 {
-		t.Fatalf("model=%d source=%d tool=%d, want 2/2/0", f.modelCalls, f.sourceCalls, f.toolCalls)
-	}
+	testassert.Require(t, errors.Is(err, errInfra), "error = %v, want the infrastructure error verbatim", err)
+	testassert.Require(t, f.modelCalls == 2 && f.sourceCalls == 2 && f.toolCalls == 0, "model=%d source=%d tool=%d, want 2/2/0", f.modelCalls, f.sourceCalls, f.toolCalls)
 }
 
 // TestDuplicateCallIDSharedValidator pins the one identity rule under both shared validators: a completed output whose tool calls repeat an ID is rejected naming the "model" boundary from the settlement validator and the "agent" boundary from the terminal validator, while distinct IDs pass both — the nearest allowed sibling.
@@ -181,18 +147,22 @@ func TestDuplicateCallIDSharedValidator(t *testing.T) {
 	dup := mkOutput(model.OutputCompleted, "", []model.ToolCall{{ID: "a", Name: "fnA"}, {ID: "a", Name: "fnB"}})
 	distinct := mkCallsTerminalOutput()
 
-	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef, true); !isBoundaryViolation(err, "model") {
-		t.Fatalf("settlement validator on duplicate IDs = %v, want a model-boundary violation", err)
+	{
+		_, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: dup}, testRef, true)
+		testassert.Require(t, isBoundaryViolation(err, "model"), "settlement validator on duplicate IDs = %v, want a model-boundary violation", err)
 	}
-	if _, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef, true); err != nil {
-		t.Fatalf("settlement validator on distinct IDs = %v, want acceptance", err)
+	{
+		_, err := validateSettlement(ModelSettlement{Disposition: DispoReady, Output: distinct}, testRef, true)
+		testassert.NoError(t, err)
 	}
 
-	if err := validateTerminalResult(TerminalResult{Status: TerminalFailure, LastOutput: dup, Detail: "d"}); !isBoundaryViolation(err, "agent") {
-		t.Fatalf("terminal validator on duplicate IDs = %v, want an agent-boundary violation", err)
+	{
+		err := validateTerminalResult(TerminalResult{Status: TerminalFailure, LastOutput: dup, Detail: "d"})
+		testassert.Require(t, isBoundaryViolation(err, "agent"), "terminal validator on duplicate IDs = %v, want an agent-boundary violation", err)
 	}
-	if err := validateTerminalResult(TerminalResult{Status: TerminalInterruption, LastOutput: distinct, UnstartedCalls: distinct.Message.ToolCalls[1:], Detail: "d"}); err != nil {
-		t.Fatalf("terminal validator on distinct IDs = %v, want acceptance", err)
+	{
+		err := validateTerminalResult(TerminalResult{Status: TerminalInterruption, LastOutput: distinct, UnstartedCalls: distinct.Message.ToolCalls[1:], Detail: "d"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -205,7 +175,7 @@ func isBoundaryViolation(err error, boundary string) bool {
 	return errors.As(err, &pe) && pe.Boundary == boundary && pe.Detail != ""
 }
 
-// TestRunFailureDispositionPassthrough pins the failure row of step 6: the matching terminal keeps the settlement's own detail and its optional errored (or absent) output, and nothing continues.
+// TestRunFailureDispositionPassthrough pins the failure disposition: the matching terminal keeps the settlement's own detail and its optional errored (or absent) output, and nothing continues.
 func TestRunFailureDispositionPassthrough(t *testing.T) {
 	t.Run("with-errored-output", func(t *testing.T) {
 		f := &runFakes{}
@@ -213,15 +183,9 @@ func TestRunFailureDispositionPassthrough(t *testing.T) {
 		f.modelSet = setScript(ModelSettlement{Disposition: DispoFailure, Output: errored, Detail: "gave up"})
 
 		res, err := Run(context.Background(), f.invocation())
-		if err != nil || res.Status != TerminalFailure || res.Detail != "gave up" {
-			t.Fatalf("terminal = %#v, %v; want failure carrying the settlement detail", res, err)
-		}
-		if res.LastOutput != errored {
-			t.Fatalf("failure dropped the settlement output: %p vs %p", res.LastOutput, errored)
-		}
-		if f.modelCalls != 1 || f.toolCalls != 0 {
-			t.Fatalf("model=%d tool=%d, want 1/0", f.modelCalls, f.toolCalls)
-		}
+		testassert.Require(t, err == nil && res.Status == TerminalFailure && res.Detail == "gave up", "terminal = %#v, %v; want failure carrying the settlement detail", res, err)
+		testassert.Equal(t, res.LastOutput, errored)
+		testassert.Require(t, f.modelCalls == 1 && f.toolCalls == 0, "model=%d tool=%d, want 1/0", f.modelCalls, f.toolCalls)
 	})
 
 	t.Run("without-output", func(t *testing.T) {
@@ -229,13 +193,11 @@ func TestRunFailureDispositionPassthrough(t *testing.T) {
 		f.modelSet = setScript(ModelSettlement{Disposition: DispoFailure, Detail: "no accepted stream"})
 
 		res, err := Run(context.Background(), f.invocation())
-		if err != nil || res.Status != TerminalFailure || res.LastOutput != nil || res.Detail != "no accepted stream" {
-			t.Fatalf("terminal = %#v, %v; want outputless failure", res, err)
-		}
+		testassert.Require(t, err == nil && res.Status == TerminalFailure && res.LastOutput == nil && res.Detail == "no accepted stream", "terminal = %#v, %v; want outputless failure", res, err)
 	})
 }
 
-// TestRunInterruptionDispositionPassthrough pins the interruption row of step 6: the settlement keeps its own detail (never re-labelled), and a retained completed response is never discarded — its not-yet-dispatched calls, all of them here, return in message order.
+// TestRunInterruptionDispositionPassthrough pins the interruption disposition: the settlement keeps its own detail (never re-labelled), and a retained completed response is never discarded — its not-yet-dispatched calls, all of them here, return in message order.
 func TestRunInterruptionDispositionPassthrough(t *testing.T) {
 	t.Run("in-flight-interrupted-output", func(t *testing.T) {
 		f := &runFakes{}
@@ -244,9 +206,7 @@ func TestRunInterruptionDispositionPassthrough(t *testing.T) {
 
 		res, err := Run(context.Background(), f.invocation())
 		requireRunInterrupted(t, res, err, "cancelled mid-generation")
-		if res.LastOutput != partial || res.UnstartedCalls != nil {
-			t.Fatalf("terminal = %#v, want the settlement output carried verbatim", res)
-		}
+		testassert.Require(t, res.LastOutput == partial && res.UnstartedCalls == nil, "terminal = %#v, want the settlement output carried verbatim", res)
 	})
 
 	t.Run("retained-completed-output", func(t *testing.T) {
@@ -256,15 +216,12 @@ func TestRunInterruptionDispositionPassthrough(t *testing.T) {
 
 		res, err := Run(context.Background(), f.invocation())
 		requireRunInterrupted(t, res, err, "cancelled after completion")
-		if res.LastOutput != callsOut {
-			t.Fatalf("established completion was discarded: %p vs %p", res.LastOutput, callsOut)
+		testassert.Equal(t, res.LastOutput, callsOut)
+		{
+			got := joinedIDs(res.UnstartedCalls)
+			testassert.Equal(t, got, "[a b c]")
 		}
-		if got := joinedIDs(res.UnstartedCalls); got != "[a b c]" {
-			t.Fatalf("unstarted = %s, want every undispatched call of the retained output", got)
-		}
-		if f.toolCalls != 0 {
-			t.Fatalf("tool calls = %d, want no dispatch after an interrupted settlement", f.toolCalls)
-		}
+		testassert.Equal(t, f.toolCalls, 0)
 	})
 
 	t.Run("nothing-accepted", func(t *testing.T) {
@@ -273,8 +230,6 @@ func TestRunInterruptionDispositionPassthrough(t *testing.T) {
 
 		res, err := Run(context.Background(), f.invocation())
 		requireRunInterrupted(t, res, err, "cancelled pre-acceptance")
-		if res.LastOutput != nil || res.UnstartedCalls != nil {
-			t.Fatalf("terminal = %#v, want a bare interruption", res)
-		}
+		testassert.Require(t, res.LastOutput == nil && res.UnstartedCalls == nil, "terminal = %#v, want a bare interruption", res)
 	})
 }

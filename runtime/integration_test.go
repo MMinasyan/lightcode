@@ -16,6 +16,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -28,16 +29,8 @@ import (
 // parked execution, and restart repair on the same store.
 
 func assembledConfigDocument(endpoint, tag, label string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "ASSEMBLED_TEST_KEY"},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 262144}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "` + tag + `"}, "depper": {"label": "` + label + `"}}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY",
+		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
 }
 
 // The "leaky" definition selects the Core storage export by ID: raw storage
@@ -200,17 +193,13 @@ func writeSSE(w http.ResponseWriter, events ...string) {
 }
 
 func writeTextTurn(w http.ResponseWriter, text string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","content":"`+text+`"},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-	)
+	writeSSE(w, textTurnEvents(text)...)
 }
 
-func writeToolCallTurn(w http.ResponseWriter, name, args string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"`+name+`","arguments":`+strconv.Quote(args)+`}}]},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-	)
+// writeToolCallTurn writes one completed assistant turn publishing one tool
+// call under the given call identity.
+func writeToolCallTurn(w http.ResponseWriter, id, name, args string) {
+	writeSSE(w, toolCallTurnEvents(id, name, args)...)
 }
 
 func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *workspaceOpens) []Plugin {
@@ -277,9 +266,7 @@ func operationRegisterStatus(t *testing.T, store harness.Storage, sessionID, ope
 func operationRegisterTerminal(t *testing.T, store harness.Storage, sessionID, operationID string) (harness.OperationState, string) {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID})
-	if err != nil {
-		t.Fatalf("ReadRegister(%s): %v", operationID, err)
-	}
+	testassert.Require(t, err == nil, "ReadRegister(%s): %v", operationID, err)
 	var wire struct {
 		State struct {
 			Status   harness.OperationState `json:"status"`
@@ -288,9 +275,7 @@ func operationRegisterTerminal(t *testing.T, store harness.Storage, sessionID, o
 			} `json:"terminal"`
 		} `json:"state"`
 	}
-	if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-		t.Fatalf("decode operation register payload: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(reg.Payload, &wire))
 	var detail string
 	if wire.State.Terminal != nil {
 		detail = wire.State.Terminal.Detail
@@ -342,57 +327,34 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// The combined scenario runs through the public production
 		// construction: concrete preparation, custom plugin slice.
 		openAssembled := func() (*Runtime, error) {
-			return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins})
+			return e.open(ctx, plugins...)
 		}
 
 		// Raw storage is never exported into execution: the Core export ID is
 		// outside the ordinary capability universe, so a definition selecting
 		// it drops and the type is unknown at admission.
 		leaky, err := openAssembled()
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		leakySession, err := leaky.createSession(ctx, e.dataDir, "leaky")
-		if err != nil {
-			t.Fatalf("createSession(leaky): %v", err)
-		}
-		if err := leaky.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			_, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: leakySession.Identity.SessionID, OperationID: "op-leaky", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}, Mode: harness.MessageModeRegular,
-			})
-			return err
-		}); !errors.Is(err, harness.ErrInvalid) {
-			t.Fatalf("submit through a definition selecting the Core storage export = %v, want harness.ErrInvalid (raw storage must not be exported into execution)", err)
-		}
-		if err := leaky.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
+		_, err = submitRawThroughRuntime(ctx, leaky, leakySession.Identity.SessionID, "op-leaky", "x", harness.MessageModeRegular)
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit through a definition selecting the Core storage export = %v, want harness.ErrInvalid (raw storage must not be exported into execution)", err)
+		testassert.NoError(t, leaky.Close(ctx))
 
 		r, err := openAssembled()
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		sat, err := r.Subscribe(1)
-		if err != nil {
-			t.Fatalf("Subscribe(saturated): %v", err)
-		}
+		testassert.NoError(t, err)
 		healthy, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe(healthy): %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Two Sessions in two distinct Workspaces run over their own scopes.
 		wsA := filepath.Join(e.home, "int-wsa")
 		wsB := filepath.Join(e.home, "int-wsb")
 		sessionA, err := r.createSession(ctx, wsA, "integrated")
-		if err != nil {
-			t.Fatalf("createSession(A): %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionB, err := r.createSession(ctx, wsB, "integrated")
-		if err != nil {
-			t.Fatalf("createSession(B): %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// Baseline turn on B: the composed production turn calls the real
 		// probe tool through the transport — one model request for the tool
@@ -401,13 +363,11 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// settings.
 		submitThroughRuntime(t, r, sessionB.Identity.SessionID, "op-b1", "hello")
 		rec := awaitOperation(t, r, sessionB.Identity.SessionID, "op-b1", harness.OperationSuccess)
-		if got := ws.constructed(); !slices.Equal(got, []string{wsB}) {
-			t.Fatalf("Workspace scope constructions after the first turn = %v, want exactly the %q identity", got, wsB)
+		{
+			got := ws.constructed()
+			testassert.Require(t, slices.Equal(got, []string{wsB}), "Workspace scope constructions after the first turn = %v, want exactly the %q identity", got, wsB)
 		}
-		if rec.Admission.Execution.ConfigurationRevision != "1" || rec.Admission.Execution.SystemPrompt == "" ||
-			!strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked") {
-			t.Fatalf("first turn record = %+v, want the hooked revision-1 success with the composed prompt", rec.Admission.Execution)
-		}
+		testassert.Require(t, rec.Admission.Execution.ConfigurationRevision == "1" && rec.Admission.Execution.SystemPrompt != "" && strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "first turn record = %+v, want the hooked revision-1 success with the composed prompt", rec.Admission.Execution)
 		if !slices.Equal(toolNames(rec.Admission.Execution.Tools), []string{"probe"}) {
 			t.Fatalf("first turn advertisement = %v, want the composed probe tool", toolNames(rec.Admission.Execution.Tools))
 		}
@@ -417,9 +377,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		if server.requests() != 2 {
 			t.Fatalf("model requests = %d, want the tool-call turn and the follow-up", server.requests())
 		}
-		if auth := server.authAt(0); auth != "Bearer assembled-key-1" {
-			t.Fatalf("resolved credential on the wire = %q, want the resolved key's bearer form", auth)
-		}
+		testassert.Equal(t, server.authAt(0), "Bearer assembled-key-1")
 
 		// The cleanup of the turn precedes the asynchronous Operation-close
 		// publication: consume the healthy subscription until that exact
@@ -428,9 +386,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		var observed []Event
 		for {
 			event, ok := nextEvent(t, healthy)
-			if !ok {
-				t.Fatal("the healthy subscription closed before op-b1's Operation-close publication")
-			}
+			testassert.Require(t, ok, "the healthy subscription closed before op-b1's Operation-close publication")
 			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsB {
 				recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 				break
@@ -443,66 +399,52 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		server.armGate()
 		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a1", "parked")
 		server.awaitRequests(3)
-		if got := ws.constructed(); !slices.Equal(got, []string{wsB, wsA}) {
-			t.Fatalf("Workspace scope constructions = %v, want one per distinct key in first-use order", got)
+		{
+			got := ws.constructed()
+			testassert.Require(t, slices.Equal(got, []string{wsB, wsA}), "Workspace scope constructions = %v, want one per distinct key in first-use order", got)
 		}
 		// The saturated subscriber filled on the first publication — a
 		// passive fact now precedes every scope opening — and is removed at
 		// the second, while the healthy one continues.
 		first, ok := nextEvent(t, sat)
-		if !ok {
-			t.Fatal("saturated subscriber closed before its first buffered event")
-		}
+		testassert.Require(t, ok, "saturated subscriber closed before its first buffered event")
 		switch eventKind(t, first) {
 		case "configuration_changed", "scope_opened", "scope_closed", "session_changed", "text_delta", "tool_started", "tool_finished", "warning_changed":
 		default:
 			t.Fatalf("saturated subscriber first event = %s, outside the closed event set", eventJSON(t, first))
 		}
-		if _, ok := nextEvent(t, sat); ok {
-			t.Fatal("saturated subscriber still open at the second publication, want it removed and closed")
+		{
+			_, ok := nextEvent(t, sat)
+			testassert.Require(t, !ok, "saturated subscriber still open at the second publication, want it removed and closed")
 		}
 		sat.Close()
 
 		// The queued next revision is buffered while the Operation is blocked.
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionA.Identity.SessionID, OperationID: "op-a2", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "queued"}}, Mode: harness.MessageModeQueued,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionQueued {
-				return fmt.Errorf("queued submit = %+v, want queued", res.Disposition)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("queued submit: %v", err)
-		}
+		submitQueuedThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a2", "queued")
 
 		// Reload publishes the next revision over the blocked Operation.
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T2", "L2"))
-		if revision, err := r.Reload(ctx); err != nil || revision != "2" {
-			t.Fatalf("Reload over the blocked Operation = (%q, %v), want 2", revision, err)
+		{
+			revision, err := r.Reload(ctx)
+			testassert.Require(t, err == nil && revision == "2", "Reload over the blocked Operation = (%q, %v), want 2", revision, err)
 		}
 
 		// Release: the blocked Operation completes on its captured revision 1.
 		server.releaseGate()
 		awaitOperation(t, r, sessionA.Identity.SessionID, "op-a1", harness.OperationSuccess)
-		if rec := readOperation(t, r, sessionA.Identity.SessionID, "op-a1"); rec.Admission.Execution.ConfigurationRevision != "1" ||
-			!strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked") {
-			t.Fatalf("blocked Operation record = %+v, want the revision-1 hooked success", rec.Admission.Execution)
+		{
+			rec := readOperation(t, r, sessionA.Identity.SessionID, "op-a1")
+			testassert.Require(t, rec.Admission.Execution.ConfigurationRevision == "1" && strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "blocked Operation record = %+v, want the revision-1 hooked success", rec.Admission.Execution)
 		}
 
 		// The queued delivery captures the next revision: new hook settings
 		// and the dependency's own settings from the same revision, while the
 		// old capture keeps its content.
 		recA2 := awaitOperation(t, r, sessionA.Identity.SessionID, "op-a2", harness.OperationSuccess)
-		if recA2.Admission.Execution.ConfigurationRevision != "2" {
-			t.Fatalf("queued Operation record = %+v, want the revision-2 success", recA2.Admission.Execution)
-		}
-		if got := hook.calls(); !slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}) {
-			t.Fatalf("hook calls = %v, want the configured tag of each call's own revision", got)
+		testassert.Require(t, recA2.Admission.Execution.ConfigurationRevision == "2", "queued Operation record = %+v, want the revision-2 success", recA2.Admission.Execution)
+		{
+			got := hook.calls()
+			testassert.Require(t, slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}), "hook calls = %v, want the configured tag of each call's own revision", got)
 		}
 		if n := countEvents(e.events.all(), "work:L2:base"); n != 1 {
 			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())
@@ -512,9 +454,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		closedOps := 0
 		for closedOps < 2 {
 			event, ok := nextEvent(t, healthy)
-			if !ok {
-				t.Fatal("the healthy subscription closed before the queued delivery settled")
-			}
+			testassert.Require(t, ok, "the healthy subscription closed before the queued delivery settled")
 			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
 				closedOps++
 			}
@@ -530,21 +470,9 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// A submit racing the predecessor's post-terminal drain is buffered
 		// and delivered by that drain, so either disposition starts this
 		// execution.
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionA.Identity.SessionID, OperationID: "op-a3", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: "parked"}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionAdmitted && res.Disposition != harness.DispositionSteering {
-				return fmt.Errorf("submit op-a3 = %+v, want admitted or buffered steering", res.Disposition)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("Submit(op-a3): %v", err)
-		}
+		parked, err := submitRawThroughRuntime(ctx, r, sessionA.Identity.SessionID, "op-a3", "parked", harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Require(t, parked.Disposition == harness.DispositionAdmitted || parked.Disposition == harness.DispositionSteering, "submit op-a3 = %+v, want admitted or buffered steering", parked.Disposition)
 		server.awaitRequests(before + 1)
 		closeDone := make(chan error, 1)
 		go func() { closeDone <- r.Close(ctx) }()
@@ -555,15 +483,11 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		}
 		select {
 		case err := <-closeDone:
-			if err != nil {
-				t.Fatalf("Close: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("Close never converged after the parked execution settled")
 		}
-		if status := operationRegisterStatus(t, store, sessionA.Identity.SessionID, "op-a3"); status != harness.OperationInterruption {
-			t.Fatalf("parked Operation terminal after Close = %q, want the committed interruption", status)
-		}
+		testassert.Equal(t, operationRegisterStatus(t, store, sessionA.Identity.SessionID, "op-a3"), harness.OperationInterruption)
 		server.releaseGate()
 
 		// The healthy observer saw every committed transition in publication
@@ -608,22 +532,16 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// admission proceeds on the repaired state.
 		seededSession, _ := seedRunningOperation(t, store, filepath.Join(e.home, "int-reseed"))
 		r2, err := openAssembled()
-		if err != nil {
-			t.Fatalf("reopen: %v", err)
-		}
-		if rec := readOperation(t, r2, seededSession, "seed-op"); rec.State.Status != harness.OperationInterruption ||
-			rec.State.Terminal == nil || rec.State.Terminal.Detail != "Operation interrupted by Runtime loss." {
-			t.Fatalf("restarted Operation state = %+v, want the terminal interruption repair", rec.State)
+		testassert.NoError(t, err)
+		{
+			rec := readOperation(t, r2, seededSession, "seed-op")
+			testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "Operation interrupted by Runtime loss.", "restarted Operation state = %+v, want the terminal interruption repair", rec.State)
 		}
 		next, err := r2.createSession(ctx, wsB, "integrated")
-		if err != nil {
-			t.Fatalf("createSession after repair: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r2, next.Identity.SessionID, "op-after-repair", "continue")
 		awaitOperation(t, r2, next.Identity.SessionID, "op-after-repair", harness.OperationSuccess)
-		if err := r2.Close(ctx); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r2.Close(ctx))
 	})
 }
 
@@ -643,9 +561,7 @@ func recordCommittedEvent(t *testing.T, observed *[]Event, event Event, sessionI
 		// carries the runtime scope, a session event the real Session's
 		// scope.
 		body, err := event.AsWarningChangedEvent()
-		if err != nil {
-			t.Fatalf("warning event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		if scopeKind(t, body.Scope) == "runtime" {
 			// the global reload groups
 		} else if scopeNamesRealSession(t, body.Scope, sessionIDs...) {
@@ -653,14 +569,13 @@ func recordCommittedEvent(t *testing.T, observed *[]Event, event Event, sessionI
 		} else {
 			t.Fatalf("warning event scope = %+v, want the runtime scope or a real session", body.Scope)
 		}
-		if _, err := strconv.ParseUint(body.WarningsRevision.Revision, 10, 64); err != nil {
-			t.Fatalf("warning event revision %q is not a decimal integer", body.WarningsRevision.Revision)
+		{
+			_, err := strconv.ParseUint(body.WarningsRevision.Revision, 10, 64)
+			testassert.Require(t, err == nil, "warning event revision %q is not a decimal integer", body.WarningsRevision.Revision)
 		}
 	case "session_changed":
 		body, err := event.AsSessionChangedEvent()
-		if err != nil {
-			t.Fatalf("session event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		if !scopeNamesRealSession(t, body.Scope, sessionIDs...) {
 			invalidation, _ := scopeSessionIdentity(t, body.Scope)
 			t.Fatalf("passive invalidation for %v, want a real session", invalidation)
@@ -684,9 +599,7 @@ func scopeClosedEvent(t *testing.T, event Event) (protocol.ScopeEvent, bool) {
 		return protocol.ScopeEvent{}, false
 	}
 	body, err := event.AsScopeEvent()
-	if err != nil {
-		t.Fatalf("scope event body: %v", err)
-	}
+	testassert.NoError(t, err)
 	return body, true
 }
 
@@ -726,9 +639,7 @@ func operationScopeWorkspace(t *testing.T, scope protocol.Scope) string {
 		return ""
 	}
 	body, err := scope.AsOperationScope()
-	if err != nil {
-		t.Fatalf("operation scope: %v", err)
-	}
+	testassert.NoError(t, err)
 	return deref(body.Workspace)
 }
 

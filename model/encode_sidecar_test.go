@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestSidecarLayersShallowMergeInOrder pins rule 6: provider, then model, then runtime extra-body layers shallow-merge over the base in that order with later winning per key; values pass through byte-exact from whichever layer won them. (Reserved keys can never reach this point — their presence rejects encoding first, pinned by TestReservedKeys*.)
@@ -16,9 +18,7 @@ func TestSidecarLayersShallowMergeInOrder(t *testing.T) {
 		"temperature": json.RawMessage(`3`), "frequency_penalty": json.RawMessage(`0.25`)}
 
 	body, _, err := Encode(rtWithLayers(rt, providerLayer, modelLayer), Request{Messages: []Message{userText("hi")}}, runtimeExtras)
-	if err != nil {
-		t.Fatalf("Encode returned unexpected error: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	obj := decodeObject(t, body)
 
@@ -26,23 +26,21 @@ func TestSidecarLayersShallowMergeInOrder(t *testing.T) {
 		"temperature": `3`, "top_p": `0.5`, "frequency_penalty": `0.25`}
 
 	for k, v := range want {
-		if got, ok := obj[k]; !ok || string(got) != v {
-			t.Fatalf("body[%s] = %v (present=%v), want exact value %q", k, got, ok, v)
+		{
+			got, ok := obj[k]
+			testassert.Require(t, ok && string(got) == v, "body[%s] = %v (present=%v), want exact value %q", k, got, ok, v)
 		}
 	}
 
 	body2, _, err := Encode(rtWithLayers(rt, Extra{"temperature": json.RawMessage(`1`)}, Extra{"temperature": json.RawMessage(`2`)}), Request{Messages: []Message{userText("hi")}}, nil)
-	if err != nil {
-		t.Fatalf("second Encode returned unexpected error: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	obj2 := decodeObject(t, body2)
-	if string(obj2["temperature"]) != `2` {
-		t.Fatalf("model layer failed to beat provider layer: temperature = %s, want 2", obj2["temperature"])
-	}
+	testassert.Require(t, string(obj2["temperature"]) == `2`, "model layer failed to beat provider layer: temperature = %s, want 2", obj2["temperature"])
 
-	if _, ok := obj2["top_p"]; ok {
-		t.Fatalf("second body unexpectedly carries top_p from a different fixture: %s", string(body2))
+	{
+		_, ok := obj2["top_p"]
+		testassert.Require(t, !ok, "second body unexpectedly carries top_p from a different fixture: %s", string(body2))
 	}
 }
 
@@ -56,24 +54,14 @@ func TestEncodeCallerImmutability(t *testing.T) {
 	rt.Headers = map[string]string{"X-Shared": "original-header-value"}
 	partExtra := Extra{"part_shared": sharedRuntime}
 	reqMsg, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "body", Extra: partExtra}}})
-	if err != nil {
-		t.Fatalf("NewMessage(immuability fixture): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	req := Request{Messages: []Message{reqMsg}}
 
 	body1, _, err := Encode(rt, req, map[string]json.RawMessage{"rt_marker": sharedRuntime})
-	if err != nil {
-		t.Fatalf("Encode returned unexpected error: %v", err)
-	}
+	testassert.NoError(t, err)
 
-	if !strings.Contains(string(body1), `"rt_marker":"runtime-shared-value-1"`) {
-		t.Fatalf("first encode lost expected runtime marker bytes (pre-mutation baseline broken): %s", string(body1))
-	}
-
-	if !strings.Contains(string(body1), `"prov_marker":"provider-shared-value-1"`) {
-		t.Fatalf("first encode lost expected provider marker bytes: %s", string(body1))
-	}
+	testassert.Require(t, strings.Contains(string(body1), `"rt_marker":"runtime-shared-value-1"`) && strings.Contains(string(body1), `"prov_marker":"provider-shared-value-1"`), "first encode lost expected runtime marker bytes (pre-mutation baseline broken): %s; first encode lost expected provider marker bytes: %s", string(body1), string(body1))
 
 	copy(sharedRuntime, []byte(`"CORRUPTED--RUNTIME-XXX"`))
 	copy(sharedProvider, []byte(`"CORRUPTED--PROVIDER-XXX"`)) // same exact-length discipline at provider scope too (inner text must match its original 23-char length for the identical reason above).
@@ -81,25 +69,13 @@ func TestEncodeCallerImmutability(t *testing.T) {
 	rt.Headers["X-Shared"] = "mutated-header-value"
 	reqMsg.Content[0].Extra["part_shared"] = json.RawMessage(`"CORRUPTED-PART-XX"`)
 	body2, _, err := Encode(rt, req, map[string]json.RawMessage{"rt_marker": sharedRuntime})
-	if err != nil {
-		t.Fatalf("second Encode returned unexpected error: %v", err)
-	}
+	testassert.NoError(t, err)
 
-	if !strings.Contains(string(body2), `"rt_marker":"CORRUPTED--RUNTIME-XXX"`) {
-		t.Fatalf("second encode did not reflect mutated runtime input: %s", string(body2))
-	}
+	testassert.Require(t, strings.Contains(string(body2), `"rt_marker":"CORRUPTED--RUNTIME-XXX"`), "second encode did not reflect mutated runtime input: %s", string(body2))
 
-	if strings.Contains(string(body1), "CORRUPTED") {
-		t.Fatalf("previously returned body was corrupted by post-call input mutation: %s", string(body1))
-	}
+	testassert.Require(t, !strings.Contains(string(body1), "CORRUPTED") && strings.Contains(string(body1), `"part_shared":"runtime-shared-value-1"`), "previously returned body was corrupted by post-call input mutation: %s; previously returned body lost its part-scope shared bytes after mutation: %s", string(body1), string(body1))
 
-	if !strings.Contains(string(body1), `"part_shared":"runtime-shared-value-1"`) {
-		t.Fatalf("previously returned body lost its part-scope shared bytes after mutation: %s", string(body1))
-	}
-
-	if !strings.Contains(string(body2), `"part_shared":"CORRUPTED-PART-XX"`) {
-		t.Fatalf("second encode did not reflect replaced part-scope extra value: %s", string(body2))
-	}
+	testassert.Require(t, strings.Contains(string(body2), `"part_shared":"CORRUPTED-PART-XX"`), "second encode did not reflect replaced part-scope extra value: %s", string(body2))
 }
 
 // TestOutputTokenFieldsNeverEmitted pins rule 4: neither max_tokens nor max_completion_tokens may appear in any successfully encoded body under every tools/usage trigger combination, checked as exact decoded top-level keys (never substring scans) so unrelated extra names cannot mask a leak.
@@ -108,9 +84,7 @@ func TestOutputTokenFieldsNeverEmitted(t *testing.T) {
 	withTools := Request{Messages: []Message{userText("go")}, Tools: []ToolDefinition{{Name: "noop", Description: "", Parameters: json.RawMessage(`{}`)}}} // minimal valid tool definition (object parameters per the constructor contract; parameter-shape rows are Commit 1's scope, not this encoder test's).
 
 	plainReq, err := NewRequest(withTools)
-	if err != nil {
-		t.Fatalf("NewRequest(output-token fixture): %v", err)
-	}
+	testassert.NoError(t, err)
 
 	cases := []struct {
 		name          string
@@ -132,14 +106,13 @@ func TestOutputTokenFieldsNeverEmitted(t *testing.T) {
 			}
 
 			body, _, err := Encode(rowRt, rowReq, nil)
-			if err != nil {
-				t.Fatalf("Encode returned unexpected error: %v", err)
-			}
+			testassert.NoError(t, err)
 
 			obj := decodeObject(t, body)
 			for _, key := range []string{"max_tokens", "max_completion_tokens"} {
-				if _, ok := obj[key]; ok {
-					t.Fatalf("body carries forbidden output-token key %q with triggers {tools:%v usage:%v}: %s", key, tc.useTools, tc.streamedUsage, string(body))
+				{
+					_, ok := obj[key]
+					testassert.Require(t, !ok, "body carries forbidden output-token key %q with triggers {tools:%v usage:%v}: %s", key, tc.useTools, tc.streamedUsage, string(body))
 				}
 			}
 		})
@@ -167,18 +140,16 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 			}
 
 			body, _, err := Encode(rt, req, nil) // the private key must be dropped on its way in; nothing here may fail for it.
-			if err != nil {
-				t.Fatalf("Encode returned unexpected error for layer %s: %v", tc.name, err)
-			}
+			testassert.Require(t, err == nil, "Encode returned unexpected error for layer %s: %v", tc.name, err)
 
 			obj := decodeObject(t, body)
 			for k := range obj { // no private field of any spelling reaches the wire from this scope.
-				if strings.HasPrefix(k, "_lightcode_") {
-					t.Fatalf("body carries private key %q from layer %s: %s", k, tc.name, string(body))
-				}
+				testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q from layer %s: %s", k, tc.name, string(body))
 			}
-			if got := obj[tc.wantKey]; len(got) == 0 || string(got) == "" { // the sibling merge must survive stripping exactly as usual.
-				t.Fatalf("sibling key %q lost while stripping private fields (layer %s): %s", tc.wantKey, tc.name, string(body))
+			// the sibling merge must survive stripping exactly as usual.
+			{
+				got := obj[tc.wantKey]
+				testassert.Require(t, len(got) != 0 && string(got) != "", "sibling key %q lost while stripping private fields (layer %s): %s", tc.wantKey, tc.name, string(body))
 			}
 		})
 	}
@@ -191,18 +162,15 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 		}
 
 		body, _, err := Encode(rt, req, runtimeExtras) // same expectation as every other scope: dropped on entry, no error for it specifically.
-		if err != nil {
-			t.Fatalf("Encode returned unexpected error for layer runtime: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		obj := decodeObject(t, body)
 		for k := range obj { // the private floor applies at top level exactly like in message scopes (rule 9 shared).
-			if strings.HasPrefix(k, "_lightcode_") {
-				t.Fatalf("body carries private key %q from layer runtime: %s", k, string(body))
-			}
+			testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q from layer runtime: %s", k, string(body))
 		}
-		if got := obj["frequency_penalty"]; len(got) == 0 || string(got) != `0.25` {
-			t.Fatalf("runtime sibling merge disturbed by private stripping: frequency_penalty = %v (body=%s)", obj["frequency_penalty"], string(body))
+		{
+			got := obj["frequency_penalty"]
+			testassert.Require(t, len(got) != 0 && string(got) == `0.25`, "runtime sibling merge disturbed by private stripping: frequency_penalty = %v (body=%s)", obj["frequency_penalty"], string(body))
 		}
 	})
 
@@ -213,15 +181,11 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 		runtimeExtras := map[string]json.RawMessage{"_lightcode_c": json.RawMessage(`3`)}
 
 		body, _, err := Encode(rt, req, runtimeExtras) // all three must vanish; a valid encode with nothing else to say about them.
-		if err != nil {
-			t.Fatalf("Encode returned unexpected error for the combined layer set: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		obj := decodeObject(t, body)
 		for k := range obj { // absence across every scope is what this row exists to pin in one shot.
-			if strings.HasPrefix(k, "_lightcode_") {
-				t.Fatalf("body carries private key %q: %s", k, string(body))
-			}
+			testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q: %s", k, string(body))
 		}
 	})
 }
@@ -260,25 +224,28 @@ func TestCloneResolvedInputClonesEvenWhenEmpty(t *testing.T) {
 		t.Fatalf("cloned Headers not empty: %#v (input was non-nil but had no entries at clone time)", out.Headers) // only the pre-clone contents belong in an independent copy of this input shape.
 	}
 
-	if _, ok := out.Drop["k-late"]; ok || len(out.Drop) != 0 {
-		t.Fatalf("retained Drop aliases caller storage or gained a late key: %#v", out.Drop) // one check covers both the leak (key present) and any phantom pre-clone content for this fixture.
+	// one check covers both the leak (key present) and any phantom pre-clone content for this fixture.
+	{
+		_, ok := out.Drop["k-late"]
+		testassert.Require(t, !ok && len(out.Drop) == 0, "retained Drop aliases caller storage or gained a late key: %#v", out.Drop)
 	}
 
-	if _, ok := out.SourceFamilies[ModelRef{Provider: "p", Model: "m"}]; ok || len(out.SourceFamilies) != 0 {
-		t.Fatalf("retained SourceFamilies alias caller storage or gained a late entry: %#v", out.SourceFamilies) // same combined assertion as Drop for the family table scope.
+	// same combined assertion as Drop for the family table scope.
+	{
+		_, ok := out.SourceFamilies[ModelRef{Provider: "p", Model: "m"}]
+		testassert.Require(t, !ok && len(out.SourceFamilies) == 0, "retained SourceFamilies alias caller storage or gained a late entry: %#v", out.SourceFamilies)
 	}
 
-	if len(out.MustPreserve) != 0 { // the caller's slice really did grow to one entry by now, so any length visible in the clone means a shared header.
-		t.Fatalf("retained MustPreserve aliases caller storage: post-clone append visible (len=%d)", len(out.MustPreserve)) // no independent copy can report an appended element — its own head was copied while still empty.
-	}
+	// the caller's slice really did grow to one entry by now, so any length visible in the clone means a shared header.
+	// no independent copy can report an appended element — its own head was copied while still empty.
+	testassert.Equal(t, len(out.MustPreserve), 0)
 
 	for _, scope := range []struct {
 		name  string
 		layer Extra
 	}{{"ProviderExtraBody", out.ProviderExtraBody}, {"ModelExtraBody", out.ModelExtraBody}} { // retained extra scopes must be empty (or nil) and never see the late caller insertions above in either direction of aliasing.
-		if len(scope.layer) != 0 {
-			t.Fatalf("retained %s observed post-clone caller insertion or pre-ghost content: %#v", scope.name, scope.layer) // any entry here means this field's clone state shares storage with the fixture maps above — exactly what the clone-on-entry ownership rule forbids.
-		}
+		// any entry here means this field's clone state shares storage with the fixture maps above — exactly what the clone-on-entry ownership rule forbids.
+		testassert.Require(t, len(scope.layer) == 0, "retained %s observed post-clone caller insertion or pre-ghost content: %#v", scope.name, scope.layer)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -30,15 +31,11 @@ func TestRunCancelledAfterSettledBatchRetainsCompletedOutput(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != callsOut {
-		t.Fatalf("interruption dropped the completed output: %p vs %p", res.LastOutput, callsOut)
-	}
+	testassert.Equal(t, res.LastOutput, callsOut)
 	if len(res.UnstartedCalls) != 0 {
 		t.Fatalf("unstarted = %s, want none after a fully settled batch", joinedIDs(res.UnstartedCalls))
 	}
-	if f.modelCalls != 1 {
-		t.Fatalf("model calls = %d, want no second effect after cancellation", f.modelCalls)
-	}
+	testassert.Equal(t, f.modelCalls, 1)
 }
 
 // TestRunCancelledBeforeFirstEffect pins the very first checkpoint: an already-done run context ends in a bare interruption with no caller function ever starting.
@@ -49,12 +46,8 @@ func TestRunCancelledBeforeFirstEffect(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != nil || res.UnstartedCalls != nil {
-		t.Fatalf("bare interruption expected, got %#v", res)
-	}
-	if f.sourceCalls != 0 || f.modelCalls != 0 || f.toolCalls != 0 {
-		t.Fatalf("cancelled run started caller functions: source=%d model=%d tool=%d", f.sourceCalls, f.modelCalls, f.toolCalls)
-	}
+	testassert.Require(t, res.LastOutput == nil && res.UnstartedCalls == nil, "bare interruption expected, got %#v", res)
+	testassert.Require(t, f.sourceCalls == 0 && f.modelCalls == 0 && f.toolCalls == 0, "cancelled run started caller functions: source=%d model=%d tool=%d", f.sourceCalls, f.modelCalls, f.toolCalls)
 }
 
 // TestRunCancelledDuringSnapshot pins the checkpoint between obtaining the fresh context and invoking the model effect: the effect must never start.
@@ -65,9 +58,7 @@ func TestRunCancelledDuringSnapshot(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if f.sourceCalls != 1 || f.modelCalls != 0 || f.toolCalls != 0 {
-		t.Fatalf("source=%d model=%d tool=%d, want 1/0/0", f.sourceCalls, f.modelCalls, f.toolCalls)
-	}
+	testassert.Require(t, f.sourceCalls == 1 && f.modelCalls == 0 && f.toolCalls == 0, "source=%d model=%d tool=%d, want 1/0/0", f.sourceCalls, f.modelCalls, f.toolCalls)
 }
 
 // TestRunContextSourceCancellationRouting pins both halves of the source rule: a cancellation report under a genuinely done run context maps to Agent interruption, while the same-shaped report under a live context is an ordinary infrastructure error returned verbatim with no terminal.
@@ -81,9 +72,7 @@ func TestRunContextSourceCancellationRouting(t *testing.T) {
 
 		res, err := Run(ctx, f.invocation())
 		requireRunInterrupted(t, res, err, "agent interrupted")
-		if f.modelCalls != 0 {
-			t.Fatalf("model calls = %d, want 0", f.modelCalls)
-		}
+		testassert.Equal(t, f.modelCalls, 0)
 	})
 
 	t.Run("live-context-infrastructure-error", func(t *testing.T) {
@@ -92,12 +81,8 @@ func TestRunContextSourceCancellationRouting(t *testing.T) {
 
 		res, err := Run(context.Background(), f.invocation())
 		requireZeroTerminal(t, res)
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("error = %v, want the verbatim cancellation-shaped infrastructure failure", err)
-		}
-		if f.modelCalls != 0 || f.toolCalls != 0 {
-			t.Fatalf("later effects started: model=%d tool=%d", f.modelCalls, f.toolCalls)
-		}
+		testassert.Require(t, errors.Is(err, context.Canceled), "error = %v, want the verbatim cancellation-shaped infrastructure failure", err)
+		testassert.Require(t, f.modelCalls == 0 && f.toolCalls == 0, "later effects started: model=%d tool=%d", f.modelCalls, f.toolCalls)
 	})
 
 	t.Run("deadline-under-done-context-interruption", func(t *testing.T) {
@@ -124,15 +109,12 @@ func TestRunCancelledBeforeToolDispatch(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != callsOut {
-		t.Fatalf("interruption dropped the completed output: %p vs %p", res.LastOutput, callsOut)
+	testassert.Equal(t, res.LastOutput, callsOut)
+	{
+		got := joinedIDs(res.UnstartedCalls)
+		testassert.Equal(t, got, "[a b c]")
 	}
-	if got := joinedIDs(res.UnstartedCalls); got != "[a b c]" {
-		t.Fatalf("unstarted = %s, want all three calls in order", got)
-	}
-	if f.toolCalls != 0 {
-		t.Fatalf("tool calls = %d, want 0 — no effect starts after cancellation", f.toolCalls)
-	}
+	testassert.Equal(t, f.toolCalls, 0)
 }
 
 // TestRunCancelledAfterSettledToolPinsLaterUnstarted pins that after a settled tool result only the LATER calls are unstarted: the already-answered call never reappears and the batch stops at the checkpoint.
@@ -150,15 +132,12 @@ func TestRunCancelledAfterSettledToolPinsLaterUnstarted(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != callsOut {
-		t.Fatalf("interruption dropped the completed output")
+	testassert.Equal(t, res.LastOutput, callsOut)
+	{
+		got := joinedIDs(res.UnstartedCalls)
+		testassert.Equal(t, got, "[b c]")
 	}
-	if got := joinedIDs(res.UnstartedCalls); got != "[b c]" {
-		t.Fatalf("unstarted = %s, want only calls after the settled one", got)
-	}
-	if f.toolCalls != 1 {
-		t.Fatalf("tool calls = %d, want the batch to stop after call a", f.toolCalls)
-	}
+	testassert.Equal(t, f.toolCalls, 1)
 }
 
 // TestRunStepSevenCancellationCarriesCompletedOutput pins the last checkpoint on a call-free response: the established completion is never discarded — the interruption carries exactly the output the run would have succeeded with.
@@ -172,9 +151,7 @@ func TestRunStepSevenCancellationCarriesCompletedOutput(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != final || res.UnstartedCalls != nil {
-		t.Fatalf("terminal = %#v, want the completed output carried verbatim", res)
-	}
+	testassert.Require(t, res.LastOutput == final && res.UnstartedCalls == nil, "terminal = %#v, want the completed output carried verbatim", res)
 }
 
 // TestRunInterruptedToolResultStopsBatch pins the interrupted-tool row: the batch stops immediately, the terminal detail is the fixed interruption text, the settled interrupted call is not unstarted, and only later calls are.
@@ -189,15 +166,12 @@ func TestRunInterruptedToolResultStopsBatch(t *testing.T) {
 
 	res, err := Run(context.Background(), f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != callsOut {
-		t.Fatalf("interruption dropped the completed output")
+	testassert.Equal(t, res.LastOutput, callsOut)
+	{
+		got := joinedIDs(res.UnstartedCalls)
+		testassert.Equal(t, got, "[b c]")
 	}
-	if got := joinedIDs(res.UnstartedCalls); got != "[b c]" {
-		t.Fatalf("unstarted = %s, want only calls after the settled interrupted one", got)
-	}
-	if f.toolCalls != 1 {
-		t.Fatalf("tool calls = %d, want no later effect to start", f.toolCalls)
-	}
+	testassert.Equal(t, f.toolCalls, 1)
 }
 
 // TestRunEffectCancellationErrorsAreProtocolViolations pins that active-effect cancellation must come back as a settlement, never as a Go error: a cancellation-shaped error out of either effect is one typed boundary-protocol error naming that effect's boundary even while the run context is done.
@@ -213,9 +187,7 @@ func TestRunEffectCancellationErrorsAreProtocolViolations(t *testing.T) {
 		res, err := Run(ctx, f.invocation())
 		requireBoundaryViolation(t, err, "model")
 		requireZeroTerminal(t, res)
-		if f.toolCalls != 0 {
-			t.Fatalf("tool calls = %d, want 0", f.toolCalls)
-		}
+		testassert.Equal(t, f.toolCalls, 0)
 	})
 
 	t.Run("model-effect-live-context", func(t *testing.T) {
@@ -268,9 +240,7 @@ func TestRunInfraErrorsWinOverCancellation(t *testing.T) {
 
 		res, err := Run(ctx, f.invocation())
 		requireZeroTerminal(t, res)
-		if !errors.Is(err, errInfra) {
-			t.Fatalf("error = %v, want the infrastructure error verbatim", err)
-		}
+		testassert.Require(t, errors.Is(err, errInfra), "error = %v, want the infrastructure error verbatim", err)
 	})
 
 	t.Run("tool-effect", func(t *testing.T) {
@@ -284,12 +254,8 @@ func TestRunInfraErrorsWinOverCancellation(t *testing.T) {
 
 		res, err := Run(ctx, f.invocation())
 		requireZeroTerminal(t, res)
-		if !errors.Is(err, errInfra) {
-			t.Fatalf("error = %v, want the infrastructure error verbatim", err)
-		}
-		if f.toolCalls != 1 {
-			t.Fatalf("tool calls = %d, want the batch to stop at the failing call", f.toolCalls)
-		}
+		testassert.Require(t, errors.Is(err, errInfra), "error = %v, want the infrastructure error verbatim", err)
+		testassert.Equal(t, f.toolCalls, 1)
 	})
 }
 
@@ -310,10 +276,7 @@ func TestRunCancellationDominatesCap(t *testing.T) {
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
-	if res.LastOutput != nil { // the last settlement was errored, which no interruption terminal may carry.
-		t.Fatalf("interruption carried %#v, want no output", res.LastOutput)
-	}
-	if f.modelCalls != maxModelEffects || f.sourceCalls != maxModelEffects {
-		t.Fatalf("model=%d source=%d, want 25/25", f.modelCalls, f.sourceCalls)
-	}
+	// the last settlement was errored, which no interruption terminal may carry.
+	testassert.Require(t, res.LastOutput == nil, "interruption carried %#v, want no output", res.LastOutput)
+	testassert.Require(t, f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "model=%d source=%d, want 25/25", f.modelCalls, f.sourceCalls)
 }

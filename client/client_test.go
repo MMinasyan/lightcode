@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -41,12 +42,8 @@ func recordContent(endpoint, instance, version, credential string) string {
 func writeDiscoveryContent(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "discovery.json")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write discovery record: %v", err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		t.Fatalf("chmod discovery record: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	testassert.NoError(t, os.Chmod(path, 0o600))
 	return path
 }
 
@@ -85,9 +82,7 @@ func jsonHealth(instance, version string) http.HandlerFunc {
 func connectFixture(t *testing.T, path string) *client.Client {
 	t.Helper()
 	c, err := client.Connect(context.Background(), path)
-	if err != nil {
-		t.Fatalf("Connect(%s): %v", path, err)
-	}
+	testassert.Require(t, err == nil, "Connect(%s): %v", path, err)
 	return c
 }
 
@@ -104,9 +99,7 @@ func drainEvents(events <-chan protocol.Event, errs <-chan error) ([]protocol.Ev
 func notificationFrame(t *testing.T, event protocol.Event) string {
 	t.Helper()
 	data, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("marshal event: %v", err)
-	}
+	testassert.NoError(t, err)
 	return "event: notification\ndata: " + string(data) + "\n\n"
 }
 
@@ -138,9 +131,7 @@ func operationEventScope() protocol.Scope {
 func scopeOpenedEvent(t *testing.T, scope protocol.Scope) protocol.Event {
 	t.Helper()
 	var event protocol.Event
-	if err := event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}); err != nil {
-		t.Fatalf("build scope_opened: %v", err)
-	}
+	testassert.NoError(t, event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}))
 	return event
 }
 
@@ -203,7 +194,7 @@ func jobEventScope() protocol.Scope {
 func sessionChangedEvent(t *testing.T, instance, durable, local string) protocol.Event {
 	t.Helper()
 	var event protocol.Event
-	if err := event.FromSessionChangedEvent(protocol.SessionChangedEvent{
+	testassert.NoError(t, event.FromSessionChangedEvent(protocol.SessionChangedEvent{
 		Kind:  protocol.SessionChanged,
 		Scope: sessionEventScope(),
 		SessionRevision: protocol.SessionRevision{
@@ -211,9 +202,7 @@ func sessionChangedEvent(t *testing.T, instance, durable, local string) protocol
 			DurableRevision: durable,
 			LocalRevision:   local,
 		},
-	}); err != nil {
-		t.Fatalf("build session_changed: %v", err)
-	}
+	}))
 	return event
 }
 
@@ -247,18 +236,14 @@ func TestConnectStrictDiscovery(t *testing.T) {
 
 	t.Run("wrong mode", func(t *testing.T) {
 		path := writeDiscoveryContent(t, valid)
-		if err := os.Chmod(path, 0o644); err != nil {
-			t.Fatalf("chmod: %v", err)
-		}
+		testassert.NoError(t, os.Chmod(path, 0o644))
 		_, err := client.Connect(context.Background(), path)
 		assertNoRuntime(t, err)
 	})
 
 	t.Run("directory", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "discovery.json")
-		if err := os.Mkdir(path, 0o700); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
+		testassert.NoError(t, os.Mkdir(path, 0o700))
 		_, err := client.Connect(context.Background(), path)
 		assertNoRuntime(t, err)
 	})
@@ -371,18 +356,15 @@ func TestConnectHealthClassification(t *testing.T) {
 		mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
 		})
-		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, r *http.Request) {
 			redirected = true
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":%q}`, testInstance, testVersion)
+			jsonHealth(testInstance, testVersion)(w, r)
 		})
 		server := httptest.NewServer(mux)
 		t.Cleanup(server.Close)
 		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		assertNoRuntime(t, err)
-		if redirected {
-			t.Fatal("the readiness probe followed the redirect")
-		}
+		testassert.Require(t, !redirected, "the readiness probe followed the redirect")
 	})
 
 	t.Run("caller cancellation is preserved", func(t *testing.T) {
@@ -400,8 +382,9 @@ func TestConnectHealthClassification(t *testing.T) {
 		}()
 		<-arrived
 		cancel()
-		if err := <-done; !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled Connect = %v, want context.Canceled", err)
+		{
+			err := <-done
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled Connect = %v, want context.Canceled", err)
 		}
 	})
 }
@@ -421,24 +404,17 @@ func TestEventsFrames(t *testing.T) {
 		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
-		}
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
 		want := []string{"3", "3", "2"}
-		if len(delivered) != len(want) {
-			t.Fatalf("delivered %d hints, want %d", len(delivered), len(want))
-		}
+		testassert.Equal(t, len(delivered), len(want))
 		for i, event := range delivered {
-			if kind, err := event.Discriminator(); err != nil || kind != "session_changed" {
-				t.Fatalf("hint %d kind = %q (%v), want session_changed", i, kind, err)
+			{
+				kind, err := event.Discriminator()
+				testassert.Require(t, err == nil && kind == "session_changed", "hint %d kind = %q (%v), want session_changed", i, kind, err)
 			}
 			body, err := event.AsSessionChangedEvent()
-			if err != nil {
-				t.Fatalf("hint %d decode: %v", i, err)
-			}
-			if body.SessionRevision.DurableRevision != want[i] {
-				t.Fatalf("hint %d durable revision = %q, want %q", i, body.SessionRevision.DurableRevision, want[i])
-			}
+			testassert.Require(t, err == nil, "hint %d decode: %v", i, err)
+			testassert.Require(t, body.SessionRevision.DurableRevision == want[i], "hint %d durable revision = %q, want %q", i, body.SessionRevision.DurableRevision, want[i])
 			if body.SessionRevision.InstanceId != c.InstanceID() {
 				t.Fatalf("hint %d instance = %q, want the connection instance %q", i, body.SessionRevision.InstanceId, c.InstanceID())
 			}
@@ -447,49 +423,36 @@ func TestEventsFrames(t *testing.T) {
 
 	t.Run("valid transient progress", func(t *testing.T) {
 		var delta protocol.Event
-		if err := delta.FromTextDeltaEvent(protocol.TextDeltaEvent{
+		testassert.NoError(t, delta.FromTextDeltaEvent(protocol.TextDeltaEvent{
 			Kind: protocol.TextDelta, Scope: operationEventScope(), Position: 7, Content: "chunk",
-		}); err != nil {
-			t.Fatalf("build text_delta: %v", err)
-		}
+		}))
 		var refusal protocol.Event
-		if err := refusal.FromRefusalDeltaEvent(protocol.RefusalDeltaEvent{
+		testassert.NoError(t, refusal.FromRefusalDeltaEvent(protocol.RefusalDeltaEvent{
 			Kind: protocol.RefusalDelta, Scope: operationEventScope(), Content: "refused",
-		}); err != nil {
-			t.Fatalf("build refusal_delta: %v", err)
-		}
+		}))
 		var started protocol.Event
-		if err := started.FromToolStartedEvent(protocol.ToolStartedEvent{
+		testassert.NoError(t, started.FromToolStartedEvent(protocol.ToolStartedEvent{
 			Kind: protocol.ToolStarted, Scope: operationEventScope(), CallId: "call-1", Ordinal: 0, Name: "read",
-		}); err != nil {
-			t.Fatalf("build tool_started: %v", err)
-		}
+		}))
 		var finished protocol.Event
-		if err := finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{
+		testassert.NoError(t, finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{
 			Kind: protocol.ToolFinished, Scope: operationEventScope(), CallId: "call-1", Status: protocol.ToolCallStatusSuccess,
-		}); err != nil {
-			t.Fatalf("build tool_finished: %v", err)
-		}
+		}))
 		frames := notificationFrame(t, delta) + notificationFrame(t, refusal) + notificationFrame(t, started) + notificationFrame(t, finished)
 		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
 		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
-		}
-		if len(delivered) != 4 {
-			t.Fatalf("delivered %d transient events, want 4", len(delivered))
-		}
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 4)
 		for i, want := range []string{"text_delta", "refusal_delta", "tool_started", "tool_finished"} {
-			if kind, _ := delivered[i].Discriminator(); kind != want {
-				t.Fatalf("event %d kind = %q, want %q", i, kind, want)
+			{
+				kind, _ := delivered[i].Discriminator()
+				testassert.Require(t, kind == want, "event %d kind = %q, want %q", i, kind, want)
 			}
 		}
 		refusalBody, err := delivered[1].AsRefusalDeltaEvent()
-		if err != nil || refusalBody.Content != "refused" {
-			t.Fatalf("delivered refusal delta = (%+v, %v), want its distinct refusal content", refusalBody, err)
-		}
+		testassert.Require(t, err == nil && refusalBody.Content == "refused", "delivered refusal delta = (%+v, %v), want its distinct refusal content", refusalBody, err)
 	})
 
 	// Every non-global scope kind delivers through its real producer shape:
@@ -497,13 +460,11 @@ func TestEventsFrames(t *testing.T) {
 	// invalidation hint carry the identities that address their subject.
 	t.Run("addressable scope kinds", func(t *testing.T) {
 		var job protocol.Event
-		if err := job.FromSessionChangedEvent(protocol.SessionChangedEvent{
+		testassert.NoError(t, job.FromSessionChangedEvent(protocol.SessionChangedEvent{
 			Kind:            protocol.SessionChanged,
 			Scope:           jobEventScope(),
 			SessionRevision: protocol.SessionRevision{InstanceId: testInstance, DurableRevision: "1", LocalRevision: "0"},
-		}); err != nil {
-			t.Fatalf("build session_changed: %v", err)
-		}
+		}))
 		frames := notificationFrame(t, scopeOpenedEvent(t, workspaceEventScope())) +
 			notificationFrame(t, scopeOpenedEvent(t, agentEventScope())) +
 			notificationFrame(t, job)
@@ -511,15 +472,12 @@ func TestEventsFrames(t *testing.T) {
 		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("disconnect error = %v, want ErrResyncRequired", err)
-		}
-		if len(delivered) != 3 {
-			t.Fatalf("delivered %d events, want the workspace, agent, and job hints", len(delivered))
-		}
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 3)
 		for i, want := range []string{"scope_opened", "scope_opened", "session_changed"} {
-			if kind, _ := delivered[i].Discriminator(); kind != want {
-				t.Fatalf("event %d kind = %q, want %q", i, kind, want)
+			{
+				kind, _ := delivered[i].Discriminator()
+				testassert.Require(t, kind == want, "event %d kind = %q, want %q", i, kind, want)
 			}
 		}
 	})
@@ -564,12 +522,8 @@ func TestEventsFrames(t *testing.T) {
 			c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 			events, errs := c.Events(context.Background())
 			delivered, err := drainEvents(events, errs)
-			if !errors.Is(err, client.ErrResyncRequired) {
-				t.Fatalf("malformed frame error = %v, want ErrResyncRequired", err)
-			}
-			if len(delivered) != 0 {
-				t.Fatalf("malformed frame delivered %d events, want none", len(delivered))
-			}
+			testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "malformed frame error = %v, want ErrResyncRequired", err)
+			testassert.Equal(t, len(delivered), 0)
 		})
 	}
 
@@ -580,12 +534,8 @@ func TestEventsFrames(t *testing.T) {
 		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
 		events, errs := c.Events(context.Background())
 		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("status failure error = %v, want ErrResyncRequired", err)
-		}
-		if len(delivered) != 0 {
-			t.Fatalf("status failure delivered %d events, want none", len(delivered))
-		}
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "status failure error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 0)
 	})
 
 	t.Run("queue overflow", func(t *testing.T) {
@@ -611,12 +561,8 @@ func TestEventsFrames(t *testing.T) {
 		// The caller never reads, so the bounded queue overflows on frame 257
 		// and the stream ends with the resync signal alone.
 		err := <-errs
-		if !errors.Is(err, client.ErrResyncRequired) {
-			t.Fatalf("overflow error = %v, want ErrResyncRequired", err)
-		}
-		if got := len(events); got != 256 {
-			t.Fatalf("buffered events = %d, want the 256-event queue", got)
-		}
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "overflow error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(events), 256)
 	})
 
 	t.Run("caller cancellation", func(t *testing.T) {
@@ -633,43 +579,27 @@ func TestEventsFrames(t *testing.T) {
 		events, errs := c.Events(ctx)
 		cancel()
 		delivered, err := drainEvents(events, errs)
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled stream error = %v, want context.Canceled", err)
-		}
-		if len(delivered) != 0 {
-			t.Fatalf("canceled stream delivered %d events, want none", len(delivered))
-		}
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
+		testassert.Equal(t, len(delivered), 0)
 	})
 }
 
 // assertNoRuntime proves one failure is the single usable-owner classification.
 func assertNoRuntime(t *testing.T, err error) {
 	t.Helper()
-	if !errors.Is(err, client.ErrNoRuntime) {
-		t.Fatalf("error = %v, want ErrNoRuntime", err)
-	}
-	if errors.Is(err, client.ErrIncompatibleProtocol) {
-		t.Fatalf("error = %v, must not be ErrIncompatibleProtocol", err)
-	}
+	testassert.Require(t, errors.Is(err, client.ErrNoRuntime) && !errors.Is(err, client.ErrIncompatibleProtocol), "error = %v, want ErrNoRuntime; error = %v, must not be ErrIncompatibleProtocol", err, err)
 }
 
 // assertIncompatible proves one authenticated version mismatch classification.
 func assertIncompatible(t *testing.T, err error) {
 	t.Helper()
-	if !errors.Is(err, client.ErrIncompatibleProtocol) {
-		t.Fatalf("error = %v, want ErrIncompatibleProtocol", err)
-	}
-	if errors.Is(err, client.ErrNoRuntime) {
-		t.Fatalf("error = %v, must not be ErrNoRuntime", err)
-	}
+	testassert.Require(t, errors.Is(err, client.ErrIncompatibleProtocol) && !errors.Is(err, client.ErrNoRuntime), "error = %v, want ErrIncompatibleProtocol; error = %v, must not be ErrNoRuntime", err, err)
 }
 
 // mustMarshal encodes one generated event as JSON.
 func mustMarshal(t *testing.T, event protocol.Event) string {
 	t.Helper()
 	data, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("marshal event: %v", err)
-	}
+	testassert.NoError(t, err)
 	return string(data)
 }

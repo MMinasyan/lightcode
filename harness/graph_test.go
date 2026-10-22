@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -301,19 +302,12 @@ type testGraph struct {
 	entries            []testEntry
 }
 
-func mustEncode(t testing.TB, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("fixture encode: %v", err)
-	}
-}
-
 // storage encodes every fixture record into a fresh read-only substitute.
 func (g *testGraph) storage(t testing.TB) *graphStorage {
 	t.Helper()
 	out := &graphStorage{registers: map[string][]Register{}, entries: map[string][]Entry{}}
 	sessionRaw, err := encodeSessionRegister(g.session)
-	mustEncode(t, err)
+	testassert.NoError(t, err)
 	if g.sessionRawOverride != nil {
 		sessionRaw = g.sessionRawOverride
 	}
@@ -322,7 +316,7 @@ func (g *testGraph) storage(t testing.TB) *graphStorage {
 	for i := range g.ops {
 		op := &g.ops[i]
 		opRaw, err := encodeOperationRegister(*op)
-		mustEncode(t, err)
+		testassert.NoError(t, err)
 		out.registers[g.session.Identity.SessionID] = append(out.registers[g.session.Identity.SessionID],
 			Register{Key: RegisterKey{SessionID: g.session.Identity.SessionID, Kind: RegisterOperation, OperationID: op.Admission.OperationID}, Revision: op.Revision, Payload: opRaw})
 	}
@@ -333,31 +327,31 @@ func (g *testGraph) storage(t testing.TB) *graphStorage {
 			env.Payload = entry.rawOverride
 		case entry.input != nil:
 			raw, err := encodeInputEntry(*entry.input)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.assistant != nil:
 			raw, err := encodeAssistantEntry(*entry.assistant)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.toolResult != nil:
 			raw, err := encodeToolResultEntry(*entry.toolResult)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.signal != nil:
 			raw, err := encodeSignalEntry(*entry.signal)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.hookResult != nil:
 			raw, err := encodeHookResultEntry(*entry.hookResult)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.settlement != nil:
 			raw, err := encodeOperationSettlementEntry(*entry.settlement)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.compaction != nil:
 			raw, err := encodeCompactionEntry(*entry.compaction)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			env.Payload = raw
 		default:
 			t.Fatalf("fixture entry %s has no payload", env.ID)
@@ -401,24 +395,16 @@ func mustState(t *testing.T, raw json.RawMessage) json.RawMessage {
 	t.Helper()
 	obj := wireObject(t, raw)
 	state, ok := obj["state"]
-	if !ok {
-		t.Fatalf("session payload carries no state member")
-	}
+	testassert.Require(t, ok, "session payload carries no state member")
 	return state
 }
 
 func wantCorruption(t *testing.T, err error) *CorruptionError {
 	t.Helper()
-	if err == nil {
-		t.Fatalf("expected corruption, got a valid graph")
-	}
+	testassert.Require(t, err != nil, "expected corruption, got a valid graph")
 	var corrupt *CorruptionError
-	if !errors.As(err, &corrupt) {
-		t.Fatalf("error %v is not a CorruptionError", err)
-	}
-	if corrupt.SessionID != testSessionID {
-		t.Fatalf("corruption names session %q, want %q", corrupt.SessionID, testSessionID)
-	}
+	testassert.Require(t, errors.As(err, &corrupt), "error %v is not a CorruptionError", err)
+	testassert.Equal(t, corrupt.SessionID, testSessionID)
 	return corrupt
 }
 
@@ -447,49 +433,30 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 	t.Run("running session", func(t *testing.T) {
 		fixture := validTestGraph()
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid graph rejected: %v", err)
+		testassert.NoError(t, err)
+		testassert.Require(t, view.Session.Revision == validSessionRecord().Revision && view.Session.Identity.SessionID == testSessionID && view.Session.State.CurrentOperationID == testOpID, "view session = %+v", view.Session)
+		testassert.Require(t, len(view.Operations) == 1 && view.Operations[0].Admission.OperationID == testOpID, "view operations = %+v", view.Operations)
+		{
+			_, ok := view.Operation(testOpID)
+			testassert.Require(t, ok, "Operation lookup by identity failed")
 		}
-		if view.Session.Revision != validSessionRecord().Revision ||
-			view.Session.Identity.SessionID != testSessionID ||
-			view.Session.State.CurrentOperationID != testOpID {
-			t.Fatalf("view session = %+v", view.Session)
-		}
-		if len(view.Operations) != 1 || view.Operations[0].Admission.OperationID != testOpID {
-			t.Fatalf("view operations = %+v", view.Operations)
-		}
-		if _, ok := view.Operation(testOpID); !ok {
-			t.Fatalf("Operation lookup by identity failed")
-		}
-		if len(view.Entries) != 2 || view.Entries[0].Input == nil || view.Entries[1].Assistant == nil {
-			t.Fatalf("view entries = %+v", view.Entries)
-		}
-		if view.Entries[0].Envelope.ID != hexID(1) || view.Entries[1].Envelope.ID != hexID(2) {
-			t.Fatalf("view entries are not in committed order: %+v", view.Entries)
-		}
+		testassert.Require(t, len(view.Entries) == 2 && view.Entries[0].Input != nil && view.Entries[1].Assistant != nil, "view entries = %+v", view.Entries)
+		testassert.Require(t, view.Entries[0].Envelope.ID == hexID(1) && view.Entries[1].Envelope.ID == hexID(2), "view entries are not in committed order: %+v", view.Entries)
 	})
 
 	t.Run("running model effect", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid model-effect graph rejected: %v", err)
-		}
-		if view.Operations[0].State.ActiveEffect == nil || view.Operations[0].State.ActiveEffect.Kind != EffectModel {
-			t.Fatalf("typed view lost the active model effect")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, view.Operations[0].State.ActiveEffect != nil && view.Operations[0].State.ActiveEffect.Kind == EffectModel, "typed view lost the active model effect")
 	})
 
 	t.Run("pending tool call", func(t *testing.T) {
 		fixture := singleCallGraph(hexID(3))
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid pending shape rejected: %v", err)
-		}
-		if len(view.Entries[1].Assistant.ToolCalls) != 1 {
-			t.Fatalf("typed assistant payload lost its call: %+v", view.Entries[1])
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Entries[1].Assistant.ToolCalls) == 1, "typed assistant payload lost its call: %+v", view.Entries[1])
 	})
 
 	t.Run("resolved tool result", func(t *testing.T) {
@@ -507,8 +474,9 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 			env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 3, CommittedAt: testTime},
 			toolResult: &result,
 		})
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("valid resolved shape rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -537,8 +505,9 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		totals := UsageTotals{ByModel: []ModelUsage{{Model: ref, Usage: *testUsage(5)}}}
 		op.State.Usage = totals
 		session.State.Usage = totals
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("valid terminal shape rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -565,8 +534,9 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 			{env: Entry{SessionID: testSessionID, ID: hexID(3), Kind: EntryToolResult, Sequence: 3, CommittedAt: testTime}, toolResult: &copiedResult},
 			{env: Entry{SessionID: testSessionID, ID: hexID(4), Kind: EntrySignal, Sequence: 4, CommittedAt: testTime}, signal: &copiedSignal},
 		}
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("valid fork prefix rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -587,24 +557,16 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &second},
 		)
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid hook-result shape rejected: %v", err)
-		}
-		if len(view.Entries) != 4 || view.Entries[2].HookResult == nil || view.Entries[3].HookResult == nil {
-			t.Fatalf("typed view lost the hook results: %+v", view.Entries)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Entries) == 4 && view.Entries[2].HookResult != nil && view.Entries[3].HookResult != nil, "typed view lost the hook results: %+v", view.Entries)
 	})
 
 	t.Run("running hook effect", func(t *testing.T) {
 		fixture := singleCallGraph(hexID(3))
 		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid hook-effect shape rejected: %v", err)
-		}
-		if view.Operations[0].State.ActiveEffect == nil || view.Operations[0].State.ActiveEffect.Kind != EffectHook {
-			t.Fatalf("typed view lost the active hook effect")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, view.Operations[0].State.ActiveEffect != nil && view.Operations[0].State.ActiveEffect.Kind == EffectHook, "typed view lost the active hook effect")
 	})
 
 	t.Run("distinct hook identities containing separators", func(t *testing.T) {
@@ -633,8 +595,9 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &firstResult},
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryHookResult, Sequence: 6, CommittedAt: testTime}, hookResult: &two},
 		)
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("distinct hook identities whose joined forms collide rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -661,9 +624,7 @@ func TestGraphValidatorSessionUsageOverflowAcrossOperations(t *testing.T) {
 			_, err := validateFixture(t, fixture.storage(t), testSessionID)
 			if tc.overflow {
 				corrupt := wantCorruption(t, err)
-				if !strings.Contains(corrupt.Error(), "session usage overflows:") {
-					t.Fatalf("overflow = %v, want the Session accumulator's rejection", corrupt)
-				}
+				testassert.Require(t, strings.Contains(corrupt.Error(), "session usage overflows:"), "overflow = %v, want the Session accumulator's rejection", corrupt)
 			} else if err != nil {
 				t.Fatalf("representable total rejected: %v", err)
 			}
@@ -693,8 +654,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 
 	t.Run("valid sibling stays usable", func(t *testing.T) {
 		store := sibling.storage(t)
-		if _, err := validateFixture(t, store, siblingID); err != nil {
-			t.Fatalf("valid sibling rejected: %v", err)
+		{
+			_, err := validateFixture(t, store, siblingID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -704,21 +666,21 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 	}{
 		{"corrupt entry payload", func(t *testing.T, fixture *testGraph) {
 			raw, err := encodeInputEntry(*fixture.entries[0].input)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			fixture.entries[0].rawOverride = setKey(raw, "bogus", json.RawMessage(`1`))
 		}},
 		{"corrupt session register payload", func(t *testing.T, fixture *testGraph) {
 			raw, err := encodeSessionRegister(fixture.session)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			state, err := decodePayloadObject(mustState(t, raw))
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			state["lifecycle"] = json.RawMessage(`"stopping"`)
 			patchedState, err := json.Marshal(state)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			obj := wireObject(t, raw)
 			obj["state"] = patchedState
 			patched, err := json.Marshal(obj)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			fixture.sessionRawOverride = patched
 		}},
 		{"two running operations", func(t *testing.T, fixture *testGraph) {
@@ -1159,7 +1121,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			copied := validAssistantEntry("")
 			copied.EntryID = hexID(1)
 			raw, err := encodeAssistantEntry(copied)
-			mustEncode(t, err)
+			testassert.NoError(t, err)
 			withUsage := setKey(raw, "usage", json.RawMessage(`{"input_tokens":2,"cached_input_tokens":0,"output_tokens":0}`))
 			fixture.entries = []testEntry{
 				{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryAssistant, Sequence: 1, CommittedAt: testTime}, rawOverride: withUsage},
@@ -1435,11 +1397,10 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				_, err := validateFixture(t, store, testSessionID)
 				return err
 			}())
-			if ownership[tc.name] && corrupt.Detail != ownershipDetail {
-				t.Fatalf("ownership corruption detail = %q, want the one generic %q", corrupt.Detail, ownershipDetail)
-			}
-			if want, ok := usageOverflowDetail[tc.name]; ok && corrupt.Detail != want {
-				t.Fatalf("overflow corruption detail = %q, want %q", corrupt.Detail, want)
+			testassert.Require(t, !ownership[tc.name] || corrupt.Detail == ownershipDetail, "ownership corruption detail = %q, want the one generic %q", corrupt.Detail, ownershipDetail)
+			{
+				want, ok := usageOverflowDetail[tc.name]
+				testassert.Require(t, !ok || corrupt.Detail == want, "overflow corruption detail = %q, want %q", corrupt.Detail, want)
 			}
 		})
 	}
@@ -1447,7 +1408,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 	t.Run("one corrupt record among valid siblings", func(t *testing.T) {
 		broken := validTestGraph()
 		raw, err := encodeInputEntry(*broken.entries[0].input)
-		mustEncode(t, err)
+		testassert.NoError(t, err)
 		broken.entries[0].rawOverride = setKey(raw, "bogus", json.RawMessage(`1`))
 		store := broken.storage(t)
 		for id, regs := range sibling.storage(t).registers {
@@ -1460,8 +1421,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			_, err := validateFixture(t, store, testSessionID)
 			return err
 		}())
-		if _, err := validateFixture(t, store, siblingID); err != nil {
-			t.Fatalf("valid sibling session not usable alongside corruption: %v", err)
+		{
+			_, err := validateFixture(t, store, siblingID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1478,13 +1440,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 	t.Run("fully absent session passes not-found through", func(t *testing.T) {
 		store := &graphStorage{registers: map[string][]Register{}, entries: map[string][]Entry{}}
 		_, err := validateFixture(t, store, testSessionID)
-		if err == nil || !errors.Is(err, ErrNotFound) {
-			t.Fatalf("absent session = %v, want the ErrNotFound class", err)
-		}
+		testassert.Require(t, err != nil && errors.Is(err, ErrNotFound), "absent session = %v, want the ErrNotFound class", err)
 		var corrupt *CorruptionError
-		if errors.As(err, &corrupt) {
-			t.Fatalf("absent session misclassified as corruption: %v", err)
-		}
+		testassert.Require(t, !errors.As(err, &corrupt), "absent session misclassified as corruption: %v", err)
 	})
 }
 
@@ -1499,34 +1457,26 @@ func TestGraphValidatorPassesStorageFailuresThrough(t *testing.T) {
 		store := fixture.storage(t)
 		store.registersErr = failure
 		_, err := validateFixture(t, store, testSessionID)
-		if !errors.Is(err, failure) || err != failure {
-			t.Fatalf("registers failure = %v, want the exact error unmodified", err)
-		}
+		testassert.Require(t, errors.Is(err, failure) && err == failure, "registers failure = %v, want the exact error unmodified", err)
 		wantNotCorruption(t, err)
 	})
 	t.Run("read entries failure", func(t *testing.T) {
 		store := fixture.storage(t)
 		store.entriesErr = failure
 		_, err := validateFixture(t, store, testSessionID)
-		if err != failure {
-			t.Fatalf("entries failure = %v, want the exact error unmodified", err)
-		}
+		testassert.Equal(t, err, failure)
 		wantNotCorruption(t, err)
 	})
 	t.Run("addressed-but-absent record", func(t *testing.T) {
 		store := fixture.storage(t)
 		store.registersErr = fmt.Errorf("session row: %w", ErrNotFound)
 		_, err := validateFixture(t, store, testSessionID)
-		if !errors.Is(err, ErrNotFound) {
-			t.Fatalf("absent record = %v, want the landed not-found class unchanged", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrNotFound), "absent record = %v, want the landed not-found class unchanged", err)
 		wantNotCorruption(t, err)
 	})
 	t.Run("malformed session identity is invalid input", func(t *testing.T) {
 		_, err := validateFixture(t, fixture.storage(t), "not-an-id")
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("malformed session id = %v, want ErrInvalid", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrInvalid), "malformed session id = %v, want ErrInvalid", err)
 		wantNotCorruption(t, err)
 	})
 }
@@ -1534,9 +1484,7 @@ func TestGraphValidatorPassesStorageFailuresThrough(t *testing.T) {
 func wantNotCorruption(t *testing.T, err error) {
 	t.Helper()
 	var corrupt *CorruptionError
-	if errors.As(err, &corrupt) {
-		t.Fatalf("storage failure reclassified as corruption: %v", err)
-	}
+	testassert.Require(t, !errors.As(err, &corrupt), "storage failure reclassified as corruption: %v", err)
 }
 
 // TestGraphValidatorForkReferenceRules proves the rewritten-reference rules
@@ -1579,8 +1527,9 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			env:        Entry{SessionID: testSessionID, ID: hexID(4), Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime},
 			toolResult: &copiedResult,
 		})
-		if _, err := validateFixture(t, fork.storage(t), testSessionID); err != nil {
-			t.Fatalf("valid copied prefix rejected: %v", err)
+		{
+			_, err := validateFixture(t, fork.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1622,8 +1571,9 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 			env:    Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntrySignal, Sequence: 3, CommittedAt: testTime},
 			signal: &owned,
 		})
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("owned signal with resolvable reference rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1656,8 +1606,9 @@ func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
 	t.Run("root with operationless completion validates", func(t *testing.T) {
 		fixture := &testGraph{session: validSessionRecord()}
 		fixture.entries = []testEntry{completion(hexID(9), 1)}
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("root with operationless completion rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1665,8 +1616,9 @@ func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
 		fixture := &testGraph{session: validSessionRecord()}
 		fixture.session.Identity.ParentSessionID = otherSession()
 		fixture.entries = []testEntry{completion(hexID(9), 1)}
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("child with operationless completion rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1675,8 +1627,9 @@ func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
 		fixture.session.Identity.SourceSessionID = otherSession()
 		fixture.session.Identity.SourceBoundaryEntryID = otherEntry()
 		fixture.entries = append(fixture.entries, completion(hexID(9), 3))
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("fork completion after an owned entry rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1690,9 +1643,7 @@ func TestGraphValidatorBackgroundCompletionOwnership(t *testing.T) {
 		}
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		corrupt := wantCorruption(t, err)
-		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
-			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
-		}
+		testassert.Require(t, strings.Contains(corrupt.Detail, "root Session carries independently copied entry"), "corruption detail = %q, want the copied-entry rule", corrupt.Detail)
 	})
 }
 
@@ -1703,18 +1654,10 @@ func TestGraphViewCarriesEnvelopeMetadata(t *testing.T) {
 	fixture.session.Revision = 42
 	fixture.ops[0].Revision = 7
 	view, err := validateFixture(t, fixture.storage(t), testSessionID)
-	if err != nil {
-		t.Fatalf("valid graph rejected: %v", err)
-	}
-	if view.Session.Revision != 42 {
-		t.Fatalf("view session revision = %d", view.Session.Revision)
-	}
-	if view.Operations[0].Revision != 7 {
-		t.Fatalf("view operation revision = %d", view.Operations[0].Revision)
-	}
-	if !view.Entries[0].Envelope.CommittedAt.Equal(testTime) || view.Entries[0].Envelope.Sequence != 1 {
-		t.Fatalf("view entry envelope = %+v", view.Entries[0].Envelope)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, view.Session.Revision, 42)
+	testassert.Equal(t, view.Operations[0].Revision, 7)
+	testassert.Require(t, view.Entries[0].Envelope.CommittedAt.Equal(testTime) && view.Entries[0].Envelope.Sequence == 1, "view entry envelope = %+v", view.Entries[0].Envelope)
 }
 
 // Compile-time proof the fixture storage implements the landed read side.
@@ -1741,12 +1684,8 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 		fixture.entries = append(fixture.entries, compactionAt(hexID(3), hexID(2), testOpID, 3))
 		fixture.session.State.CompactionEntryID = hexID(3)
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
-		if err != nil {
-			t.Fatalf("valid compaction shape rejected: %v", err)
-		}
-		if len(view.Entries) != 3 || view.Entries[2].Compaction == nil {
-			t.Fatalf("decoded view does not carry the compaction payload")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Entries) == 3 && view.Entries[2].Compaction != nil, "decoded view does not carry the compaction payload")
 		if view.Entries[2].Compaction.BoundaryEntryID != hexID(2) {
 			t.Fatalf("decoded boundary %q, want %q", view.Entries[2].Compaction.BoundaryEntryID, hexID(2))
 		}
@@ -1757,9 +1696,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 		fixture.session.State.CompactionEntryID = otherEntry()
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		corrupt := wantCorruption(t, err)
-		if !strings.Contains(corrupt.Detail, "compaction") {
-			t.Fatalf("corruption detail = %q, want the compaction rule", corrupt.Detail)
-		}
+		testassert.Require(t, strings.Contains(corrupt.Detail, "compaction"), "corruption detail = %q, want the compaction rule", corrupt.Detail)
 	})
 
 	t.Run("projection naming a non-compaction entry corrupts", func(t *testing.T) {
@@ -1802,8 +1739,9 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			compactionAt(hexID(4), hexID(3), testOpID, 4),
 		)
 		fixture.session.State.CompactionEntryID = hexID(4)
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("two same-operation compaction entries rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1840,8 +1778,9 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: "op-2", Kind: EntryInput, Sequence: 5, CommittedAt: testTime}, input: &secondInput},
 			compactionAt(hexID(6), hexID(5), "op-2", 6),
 		}
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("two different-operation compaction entries rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1856,8 +1795,9 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			{env: Entry{SessionID: testSessionID, ID: hexID(2), Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &copiedAssistant},
 			compactionAt(hexID(3), hexID(2), "", 3),
 		}
-		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-			t.Fatalf("copied compaction prefix rejected: %v", err)
+		{
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			testassert.NoError(t, err)
 		}
 	})
 
@@ -1866,9 +1806,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 		fixture.entries = []testEntry{compactionAt(hexID(3), hexID(2), "", 1)}
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		corrupt := wantCorruption(t, err)
-		if !strings.Contains(corrupt.Detail, "root Session carries independently copied entry") {
-			t.Fatalf("corruption detail = %q, want the copied-entry rule", corrupt.Detail)
-		}
+		testassert.Require(t, strings.Contains(corrupt.Detail, "root Session carries independently copied entry"), "corruption detail = %q, want the copied-entry rule", corrupt.Detail)
 	})
 }
 
@@ -1897,9 +1835,7 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 					UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: assistantUsage}}},
 					UsageTotals{ByModel: []ModelUsage{{Model: otherRef, Usage: compactionUsage}}},
 				)
-				if err != nil {
-					t.Fatalf("merge: %v", err)
-				}
+				testassert.NoError(t, err)
 				fixture.ops[0].State.Usage = merged
 				fixture.session.State.Usage = merged
 			},
@@ -1929,9 +1865,7 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 				wantCorruption(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("valid compaction usage rejected: %v", err)
-			}
+			testassert.NoError(t, err)
 		})
 	}
 }
@@ -1989,9 +1923,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 				Content:         []model.ContentPart{{Kind: model.PartText, Text: "continue"}},
 			}, nil, testCapture(), &commit)
 		})
-		if err != nil {
-			t.Fatalf("forkTransaction: %v", err)
-		}
+		testassert.NoError(t, err)
 		return &commit
 	}
 
@@ -2011,82 +1943,46 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 				copiedCompactionIDs = append(copiedCompactionIDs, entry.Envelope.ID)
 			}
 		}
-		if len(copiedCompactions) != 2 {
-			t.Fatalf("copied %d compaction entries, want 2", len(copiedCompactions))
-		}
-		if copiedCompactionIDs[0] == hexID(3) || copiedCompactionIDs[1] == hexID(4) {
-			t.Fatalf("copied compaction identities %v are not both fresh", copiedCompactionIDs)
-		}
+		testassert.Equal(t, len(copiedCompactions), 2)
+		testassert.Require(t, copiedCompactionIDs[0] != hexID(3) && copiedCompactionIDs[1] != hexID(4), "copied compaction identities %v are not both fresh", copiedCompactionIDs)
 		for i, v := range copiedCompactions {
-			if v.SessionID != destID || v.EntryID != copiedCompactionIDs[i] {
-				t.Fatalf("copied compaction identity %s/%s, want destination identities", v.SessionID, v.EntryID)
-			}
-			if v.OperationID != "" {
-				t.Fatalf("copied compaction carries operation ownership %q", v.OperationID)
-			}
+			testassert.Require(t, v.SessionID == destID && v.EntryID == copiedCompactionIDs[i], "copied compaction identity %s/%s, want destination identities", v.SessionID, v.EntryID)
+			testassert.Equal(t, v.OperationID, "")
 			if v.Usage != nil {
 				t.Fatalf("copied compaction carries source usage %+v", *v.Usage)
 			}
-			if v.Model != testModelRef() {
-				t.Fatalf("copied model %+v did not survive", v.Model)
-			}
-			if v.ConfigurationRevision != "rev-1" {
-				t.Fatalf("copied configuration revision %q did not survive", v.ConfigurationRevision)
-			}
+			testassert.Equal(t, v.Model, testModelRef())
+			testassert.Equal(t, v.ConfigurationRevision, "rev-1")
 		}
-		if copiedCompactions[0].Summary != "Summary of the earlier conversation." || copiedCompactions[1].Summary != "Second summary." {
-			t.Fatalf("copied summaries %q and %q did not survive", copiedCompactions[0].Summary, copiedCompactions[1].Summary)
-		}
-		if copiedCompactions[0].BoundaryEntryID != copiedAssistantID {
-			t.Fatalf("first copied boundary %q, want the copied assistant %q", copiedCompactions[0].BoundaryEntryID, copiedAssistantID)
-		}
-		if copiedCompactions[1].BoundaryEntryID != copiedCompactionIDs[0] {
-			t.Fatalf("second copied boundary %q, want the first copied compaction entry %q", copiedCompactions[1].BoundaryEntryID, copiedCompactionIDs[0])
-		}
-		if commit.session.State.CompactionEntryID != copiedCompactionIDs[1] {
-			t.Fatalf("destination CompactionEntryID = %q, want the last copied compaction entry %q", commit.session.State.CompactionEntryID, copiedCompactionIDs[1])
-		}
+		testassert.Require(t, copiedCompactions[0].Summary == "Summary of the earlier conversation." && copiedCompactions[1].Summary == "Second summary.", "copied summaries %q and %q did not survive", copiedCompactions[0].Summary, copiedCompactions[1].Summary)
+		testassert.Equal(t, copiedCompactions[0].BoundaryEntryID, copiedAssistantID)
+		testassert.Equal(t, copiedCompactions[1].BoundaryEntryID, copiedCompactionIDs[0])
+		testassert.Equal(t, commit.session.State.CompactionEntryID, copiedCompactionIDs[1])
 	})
 
 	t.Run("prefix without compaction entries yields an empty field", func(t *testing.T) {
 		commit := runFork(t, buildSource(t, false))
 		for _, entry := range commit.entries {
-			if entry.Compaction != nil {
-				t.Fatalf("prefix without compaction entries copied one")
-			}
+			testassert.Require(t, entry.Compaction == nil, "prefix without compaction entries copied one")
 		}
-		if commit.session.State.CompactionEntryID != "" {
-			t.Fatalf("destination CompactionEntryID = %q, want empty", commit.session.State.CompactionEntryID)
-		}
+		testassert.Equal(t, commit.session.State.CompactionEntryID, "")
 	})
 
 	t.Run("source session is unchanged", func(t *testing.T) {
 		fixture := buildSource(t, true)
 		store := fixture.storage(t)
 		before, err := store.ReadEntries(context.Background(), testSessionID, 0)
-		if err != nil {
-			t.Fatalf("read source entries: %v", err)
-		}
+		testassert.NoError(t, err)
 		runFork(t, fixture)
 		after, err := store.ReadEntries(context.Background(), testSessionID, 0)
-		if err != nil {
-			t.Fatalf("read source entries: %v", err)
-		}
-		if len(after) != len(before) {
-			t.Fatalf("source entry count changed: %d, want %d", len(after), len(before))
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, len(after), len(before))
 		for i := range before {
-			if after[i].ID != before[i].ID || string(after[i].Payload) != string(before[i].Payload) {
-				t.Fatalf("source entry %d changed", i)
-			}
+			testassert.Require(t, after[i].ID == before[i].ID && string(after[i].Payload) == string(before[i].Payload), "source entry %d changed", i)
 		}
 		reg, err := store.ReadRegister(context.Background(), RegisterKey{SessionID: testSessionID, Kind: RegisterSession})
-		if err != nil {
-			t.Fatalf("read source register: %v", err)
-		}
-		if reg.Revision != fixture.session.Revision {
-			t.Fatalf("source register revision = %d, want %d", reg.Revision, fixture.session.Revision)
-		}
+		testassert.NoError(t, err)
+		testassert.Equal(t, reg.Revision, fixture.session.Revision)
 	})
 }
 
@@ -2154,7 +2050,8 @@ func TestGraphValidatorGroupsEntriesByOperation(t *testing.T) {
 		{env: Entry{SessionID: testSessionID, ID: hexID(7), OperationID: "op-2", Kind: EntryToolResult, Sequence: 7, CommittedAt: testTime}, toolResult: &resultB},
 		{env: Entry{SessionID: testSessionID, ID: hexID(8), OperationID: "op-2", Kind: EntryOperationSettlement, Sequence: 8, CommittedAt: testTime}, settlement: &settlementB},
 	}
-	if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
-		t.Fatalf("interleaved multi-operation history rejected: %v", err)
+	{
+		_, err := validateFixture(t, fixture.storage(t), testSessionID)
+		testassert.NoError(t, err)
 	}
 }

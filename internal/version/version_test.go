@@ -4,6 +4,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestIsRelease(t *testing.T) {
@@ -32,8 +34,9 @@ func TestIsRelease(t *testing.T) {
 		{"v0.0.3 ", false},
 	}
 	for _, c := range cases {
-		if got := IsRelease(c.v); got != c.want {
-			t.Errorf("IsRelease(%q) = %v, want %v", c.v, got, c.want)
+		{
+			got := IsRelease(c.v)
+			testassert.Check(t, got == c.want, "IsRelease(%q) = %v, want %v", c.v, got, c.want)
 		}
 	}
 }
@@ -73,8 +76,9 @@ func TestCompare(t *testing.T) {
 		{"v2.0.0", "v1.18446744073709551615.18446744073709551615", 1},
 	}
 	for _, c := range cases {
-		if got := Compare(c.a, c.b); got != c.want {
-			t.Errorf("Compare(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		{
+			got := Compare(c.a, c.b)
+			testassert.Check(t, got == c.want, "Compare(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
 		}
 	}
 }
@@ -101,8 +105,9 @@ func TestStringClassification(t *testing.T) {
 	}
 	for _, c := range cases {
 		setIdentity(t, c.v, c.commit)
-		if got := String(); got != c.want {
-			t.Errorf("String() with Version=%q Commit=%q = %q, want %q", c.v, c.commit, got, c.want)
+		{
+			got := String()
+			testassert.Check(t, got == c.want, "String() with Version=%q Commit=%q = %q, want %q", c.v, c.commit, got, c.want)
 		}
 	}
 }
@@ -119,8 +124,9 @@ func TestLineShapes(t *testing.T) {
 	}
 	for _, c := range cases {
 		setIdentity(t, c.v, c.commit)
-		if got := Line(); got != c.want {
-			t.Errorf("Line() with Version=%q Commit=%q = %q, want %q", c.v, c.commit, got, c.want)
+		{
+			got := Line()
+			testassert.Check(t, got == c.want, "Line() with Version=%q Commit=%q = %q, want %q", c.v, c.commit, got, c.want)
 		}
 	}
 }
@@ -128,16 +134,9 @@ func TestLineShapes(t *testing.T) {
 func TestCurrentReportsRawValues(t *testing.T) {
 	setIdentity(t, "v9.9.9", "abcdef1")
 	info := Current()
-	if info.Version != "v9.9.9" || info.Commit != "abcdef1" {
-		t.Fatalf("Current() = %+v, want raw stamped values", info)
-	}
-	if info.OS == "" || info.Arch == "" {
-		t.Fatalf("Current() must fill os/arch, got %+v", info)
-	}
+	testassert.Require(t, info.Version == "v9.9.9" && info.Commit == "abcdef1" && info.OS != "" && info.Arch != "", "Current() = %+v, want raw stamped values; Current() must fill os/arch, got %+v", info, info)
 
 	setIdentity(t, "dev", "")
 	info = Current()
-	if info.Version != "dev" || info.Commit != "" {
-		t.Fatalf("Current() = %+v, want dev with empty commit", info)
-	}
+	testassert.Require(t, info.Version == "dev" && info.Commit == "", "Current() = %+v, want dev with empty commit", info)
 }

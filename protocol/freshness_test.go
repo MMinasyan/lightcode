@@ -10,76 +10,46 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"gopkg.in/yaml.v3"
 )
 
-// TestGeneratedContractsFresh regenerates the Go protocol artifact from the
-// committed schema with the committed generator configuration and compares
-// the bytes against the committed protocol/protocol.gen.go: any hand edit or
-// schema change without regeneration fails. The TypeScript artifact is not
-// covered here — its regeneration needs the frontend toolchain and is
+// TestGeneratedContractsFresh regenerates the SDK, the native operation
+// bindings and the test-only native invocation contract from the committed
+// schema with the committed build command and compares all three byte-for-byte
+// against the committed artifacts. Two runs must agree, so a hand edit, a stale
+// artifact or a nondeterministic generator fails here. The TypeScript artifact
+// is not covered here — its regeneration needs the frontend toolchain and is
 // gated by the make check-protocol target.
 func TestGeneratedContractsFresh(t *testing.T) {
-	// go test runs the test binary with the package directory as its working
-	// directory, so the module root is exactly "..".
-	committed, err := os.ReadFile(filepath.Join("..", "protocol", "protocol.gen.go"))
-	if err != nil {
-		t.Fatalf("reading committed generated contracts: %v", err)
-	}
-	generated := filepath.Join(t.TempDir(), "protocol.gen.go")
-	cmd := exec.Command("go", "tool", "oapi-codegen",
-		"--config", "protocol/oapi-codegen.yaml",
-		"-o", generated,
-		"protocol/openapi.yaml")
-	cmd.Dir = ".."
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("regenerating protocol contracts: %v\n%s", err, out)
-	}
-	regenerated, err := os.ReadFile(generated)
-	if err != nil {
-		t.Fatalf("reading regenerated contracts: %v", err)
-	}
-	if !bytes.Equal(committed, regenerated) {
-		t.Fatalf("committed protocol/protocol.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committed), len(regenerated))
-	}
-}
-
-// TestGeneratedNativeBindingsFresh regenerates the native operation bindings
-// and the test-only native invocation contract from the committed schema with
-// the committed build command and compares both byte-for-byte against the
-// committed artifacts. Two runs must agree, so a hand edit, a stale artifact
-// or a nondeterministic generator fails here. The TypeScript artifact is not
-// covered here — its regeneration needs the frontend toolchain and is gated by
-// the make check-protocol target.
-func TestGeneratedNativeBindingsFresh(t *testing.T) {
+	committedSDK := committedArtifact(t, "protocol/protocol.gen.go")
 	committedSource := committedArtifact(t, "internal/clientops/operations.gen.go")
 	committedContract := committedArtifact(t, "frontend/src/generated/native-invocations.json")
-	generate := func(t *testing.T) ([]byte, []byte) {
+	generate := func(t *testing.T) ([]byte, []byte, []byte) {
 		t.Helper()
 		dir := t.TempDir()
+		sdk := filepath.Join(dir, "protocol.gen.go")
 		source := filepath.Join(dir, "operations.gen.go")
 		contract := filepath.Join(dir, "native-invocations.json")
 		cmd := exec.Command("go", "run", "./internal/protocolgen",
 			"-schema", "protocol/openapi.yaml",
+			"-config", "protocol/oapi-codegen.yaml",
+			"-sdk-out", sdk,
 			"-out", source,
 			"-native-contract-out", contract)
 		cmd.Dir = ".."
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("regenerating native bindings: %v\n%s", err, out)
+		{
+			out, err := cmd.CombinedOutput()
+			testassert.Require(t, err == nil, "regenerating protocol contracts: %v\n%s", err, out)
 		}
-		return readArtifact(t, source), readArtifact(t, contract)
+		return readArtifact(t, sdk), readArtifact(t, source), readArtifact(t, contract)
 	}
-	source, contract := generate(t)
-	againSource, againContract := generate(t)
-	if !bytes.Equal(source, againSource) || !bytes.Equal(contract, againContract) {
-		t.Fatal("the native bindings generator is not deterministic")
-	}
-	if !bytes.Equal(committedSource, source) {
-		t.Fatalf("committed internal/clientops/operations.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedSource), len(source))
-	}
-	if !bytes.Equal(committedContract, contract) {
-		t.Fatalf("committed frontend/src/generated/native-invocations.json is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedContract), len(contract))
-	}
+	sdk, source, contract := generate(t)
+	againSDK, againSource, againContract := generate(t)
+	testassert.Require(t, bytes.Equal(sdk, againSDK) && bytes.Equal(source, againSource) && bytes.Equal(contract, againContract), "the protocol generator is not deterministic")
+	testassert.Require(t, bytes.Equal(committedSDK, sdk), "committed protocol/protocol.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedSDK), len(sdk))
+	testassert.Require(t, bytes.Equal(committedSource, source), "committed internal/clientops/operations.gen.go is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedSource), len(source))
+	testassert.Require(t, bytes.Equal(committedContract, contract), "committed frontend/src/generated/native-invocations.json is stale: regenerate with make generate-protocol (%d committed bytes, %d regenerated)", len(committedContract), len(contract))
 }
 
 // committedArtifact reads one committed artifact relative to the module root.
@@ -92,9 +62,7 @@ func committedArtifact(t *testing.T, rel string) []byte {
 func readArtifact(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "reading %s: %v", path, err)
 	return data
 }
 
@@ -108,9 +76,7 @@ func readArtifact(t *testing.T, path string) []byte {
 // fixture.
 func TestGeneratedFileSetGate(t *testing.T) {
 	script, err := filepath.Abs(filepath.Join("..", "scripts", "check-generated-files.sh"))
-	if err != nil {
-		t.Fatalf("resolving the freshness script: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	// The two real invocations: make check-protocol names the four protocol
 	// artifacts (directories included) and make check-wails-bindings names the
@@ -141,35 +107,27 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		dir := t.TempDir()
 		for _, output := range outputs {
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				t.Fatalf("creating fixture directory: %v", err)
-			}
-			if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
-				t.Fatalf("writing fixture artifact: %v", err)
-			}
+			testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			testassert.NoError(t, os.WriteFile(path, []byte("generated"), 0o644))
 		}
 		// Ignored output the gates must never flag: the ignored Wails runtime
 		// tree and an ignored sibling inside the checked bindings directory.
-		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("frontend/client-bindings/wailsjs/runtime/\n*.ignored\n"), 0o644); err != nil {
-			t.Fatalf("writing fixture ignore file: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("frontend/client-bindings/wailsjs/runtime/\n*.ignored\n"), 0o644))
 		for _, file := range []string{
 			"frontend/client-bindings/wailsjs/runtime/runtime.js",
 			"frontend/client-bindings/wailsjs/go/desktopclient/Host.js.ignored",
 		} {
 			path := filepath.Join(dir, filepath.FromSlash(file))
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				t.Fatalf("creating ignored fixture directory: %v", err)
-			}
-			if err := os.WriteFile(path, []byte("ignored"), 0o644); err != nil {
-				t.Fatalf("writing ignored fixture file: %v", err)
-			}
+			testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+			testassert.NoError(t, os.WriteFile(path, []byte("ignored"), 0o644))
 		}
-		if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
-			t.Fatalf("fixture git init: %v\n%s", err, out)
+		{
+			out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput()
+			testassert.Require(t, err == nil, "fixture git init: %v\n%s", err, out)
 		}
-		if out, err := exec.Command("git", "-C", dir, "add", ".").CombinedOutput(); err != nil {
-			t.Fatalf("fixture git add: %v\n%s", err, out)
+		{
+			out, err := exec.Command("git", "-C", dir, "add", ".").CombinedOutput()
+			testassert.Require(t, err == nil, "fixture git add: %v\n%s", err, out)
 		}
 		return dir
 	}
@@ -186,17 +144,14 @@ func TestGeneratedFileSetGate(t *testing.T) {
 
 	t.Run("matching staged bytes pass", func(t *testing.T) {
 		dir := fixture(t)
-		if err := run(t, dir, protocolPaths...); err != nil {
-			t.Fatalf("gate rejected matching staged protocol artifacts: %v", err)
-		}
-		if err := run(t, dir, wailsPaths...); err != nil {
-			t.Fatalf("gate rejected matching staged Wails bindings: %v", err)
-		}
+		testassert.NoError(t, run(t, dir, protocolPaths...))
+		testassert.NoError(t, run(t, dir, wailsPaths...))
 	})
 
 	t.Run("no path arguments fail", func(t *testing.T) {
-		if err := run(t, fixture(t)); err == nil {
-			t.Fatal("gate accepted an invocation without path arguments")
+		{
+			err := run(t, fixture(t))
+			testassert.Require(t, err != nil, "gate accepted an invocation without path arguments")
 		}
 	})
 
@@ -204,11 +159,10 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.WriteFile(path, []byte("hand-edited"), 0o644); err != nil {
-				t.Fatalf("modifying fixture artifact: %v", err)
-			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a modified tracked artifact: %s", output.path)
+			testassert.NoError(t, os.WriteFile(path, []byte("hand-edited"), 0o644))
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a modified tracked artifact: %s", output.path)
 			}
 		}
 	})
@@ -217,11 +171,10 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.Remove(path); err != nil {
-				t.Fatalf("deleting fixture artifact: %v", err)
-			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a deleted tracked artifact: %s", output.path)
+			testassert.NoError(t, os.Remove(path))
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a deleted tracked artifact: %s", output.path)
 			}
 		}
 	})
@@ -230,11 +183,13 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		for _, output := range outputs {
 			dir := fixture(t)
 			// The staged artifact becomes untracked output again.
-			if out, err := exec.Command("git", "-C", dir, "rm", "--cached", "-q", "--", output.path).CombinedOutput(); err != nil {
-				t.Fatalf("unstaging fixture artifact %s: %v\n%s", output.path, err, out)
+			{
+				out, err := exec.Command("git", "-C", dir, "rm", "--cached", "-q", "--", output.path).CombinedOutput()
+				testassert.Require(t, err == nil, "unstaging fixture artifact %s: %v\n%s", output.path, err, out)
 			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a newly untracked artifact: %s", output.path)
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a newly untracked artifact: %s", output.path)
 			}
 		}
 		for _, output := range []struct {
@@ -246,39 +201,31 @@ func TestGeneratedFileSetGate(t *testing.T) {
 		} {
 			dir := fixture(t)
 			path := filepath.Join(dir, filepath.FromSlash(output.path))
-			if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
-				t.Fatalf("emitting untracked fixture artifact %s: %v", output.path, err)
+			{
+				err := os.WriteFile(path, []byte("generated"), 0o644)
+				testassert.Require(t, err == nil, "emitting untracked fixture artifact %s: %v", output.path, err)
 			}
-			if err := run(t, dir, output.paths...); err == nil {
-				t.Fatalf("gate accepted a newly emitted untracked artifact: %s", output.path)
+			{
+				err := run(t, dir, output.paths...)
+				testassert.Require(t, err != nil, "gate accepted a newly emitted untracked artifact: %s", output.path)
 			}
 		}
 	})
 
 	t.Run("output outside the supplied paths passes", func(t *testing.T) {
 		dir := fixture(t)
-		if err := os.WriteFile(filepath.Join(dir, "protocol", "protocol.gen.go"), []byte("hand-edited"), 0o644); err != nil {
-			t.Fatalf("modifying fixture artifact: %v", err)
-		}
-		if err := run(t, dir, wailsPaths...); err != nil {
-			t.Fatalf("gate flagged output outside its path arguments: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "protocol", "protocol.gen.go"), []byte("hand-edited"), 0o644))
+		testassert.NoError(t, run(t, dir, wailsPaths...))
 	})
 
 	t.Run("unrelated untracked file passes", func(t *testing.T) {
 		dir := fixture(t)
-		if err := os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("junk"), 0o644); err != nil {
-			t.Fatalf("writing unrelated fixture file: %v", err)
-		}
-		if err := run(t, dir, protocolPaths...); err != nil {
-			t.Fatalf("gate rejected an unrelated untracked file: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("junk"), 0o644))
+		testassert.NoError(t, run(t, dir, protocolPaths...))
 	})
 
 	t.Run("ignored output passes", func(t *testing.T) {
-		if err := run(t, fixture(t), wailsPaths...); err != nil {
-			t.Fatalf("gate flagged ignored output: %v", err)
-		}
+		testassert.NoError(t, run(t, fixture(t), wailsPaths...))
 	})
 }
 
@@ -312,12 +259,11 @@ type workflowFile struct {
 func parseWorkflow(t *testing.T, path string) workflowFile {
 	t.Helper()
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading workflow %s: %v", path, err)
-	}
+	testassert.Require(t, err == nil, "reading workflow %s: %v", path, err)
 	var workflow workflowFile
-	if err := yaml.Unmarshal(data, &workflow); err != nil {
-		t.Fatalf("decoding workflow %s: %v", path, err)
+	{
+		err := yaml.Unmarshal(data, &workflow)
+		testassert.Require(t, err == nil, "decoding workflow %s: %v", path, err)
 	}
 	return workflow
 }
@@ -328,50 +274,61 @@ func parsedSteps(t *testing.T, path, job string) []workflowStep {
 	t.Helper()
 	workflow := parseWorkflow(t, path)
 	parsed, ok := workflow.Jobs[job]
-	if !ok {
-		t.Fatalf("workflow %s has no %s job", path, job)
-	}
+	testassert.Require(t, ok, "workflow %s has no %s job", path, job)
 	return parsed.Steps
 }
 
-// findRunStep returns the index of the first step whose trimmed run command is
-// exactly want, or -1.
-func findRunStep(steps []workflowStep, want string) int {
-	for i, step := range steps {
-		if strings.TrimSpace(step.Run) == want {
-			return i
-		}
-	}
-	return -1
+// publicationStepNames are the release steps both delivery gates must precede.
+var publicationStepNames = []string{"Package release assets", "Upload release assets"}
+
+// deliveryWiring is one job's single scan for the steps the delivery rules
+// name: the tagged Wails build, the two exact gates and every publication
+// step. The first matching step owns each slot, so the scan is the one place
+// step lookup is defined; the rules below read only this result.
+type deliveryWiring struct {
+	steps       []workflowStep
+	wails       int
+	bindings    int
+	protocol    int
+	publication map[string]int
 }
 
-// findContainingRunStep returns the index of the first step whose run command
-// contains want, or -1.
-func findContainingRunStep(steps []workflowStep, want string) int {
-	for i, step := range steps {
-		if strings.Contains(step.Run, want) {
-			return i
+// scanDeliveryWiring collects the required step indices in one pass.
+func scanDeliveryWiring(steps []workflowStep) deliveryWiring {
+	wiring := deliveryWiring{
+		steps:       steps,
+		wails:       -1,
+		bindings:    -1,
+		protocol:    -1,
+		publication: make(map[string]int, len(publicationStepNames)),
+	}
+	for index, step := range steps {
+		if wiring.wails < 0 && strings.Contains(step.Run, wailsBuildRun) {
+			wiring.wails = index
+		}
+		if wiring.bindings < 0 && strings.TrimSpace(step.Run) == bindingsGateRun {
+			wiring.bindings = index
+		}
+		if wiring.protocol < 0 && strings.TrimSpace(step.Run) == protocolGateRun {
+			wiring.protocol = index
+		}
+		for _, name := range publicationStepNames {
+			if _, ok := wiring.publication[name]; !ok && step.Name == name {
+				wiring.publication[name] = index
+			}
 		}
 	}
-	return -1
-}
-
-// findNamedStep returns the index of the first step named want, or -1.
-func findNamedStep(steps []workflowStep, want string) int {
-	for i, step := range steps {
-		if step.Name == want {
-			return i
-		}
-	}
-	return -1
+	return wiring
 }
 
 // stepBypass names the bypass on one step, or "" when it is unconditional.
+// continue-on-error accepts only an explicit false as equivalent to omission;
+// any true value still allows the step to fail.
 func stepBypass(step workflowStep) string {
 	if step.If != "" {
 		return "conditionally skipped"
 	}
-	if step.ContinueOnError != nil {
+	if step.ContinueOnError != nil && *step.ContinueOnError {
 		return "allowed to fail"
 	}
 	return ""
@@ -384,40 +341,37 @@ func stepBypass(step workflowStep) string {
 // gates must precede every Package release assets or Upload release assets step
 // the job declares. The protocol check has no ordering constraint against the
 // Wails build, and a job without publication steps (Test) skips that last rule.
-func checkDeliveryGates(steps []workflowStep) error {
-	wails := findContainingRunStep(steps, wailsBuildRun)
-	if wails < 0 {
+func checkDeliveryGates(wiring deliveryWiring) error {
+	if wiring.wails < 0 {
 		return fmt.Errorf("missing the tagged Wails build command")
 	}
-	if bypass := stepBypass(steps[wails]); bypass != "" {
+	if bypass := stepBypass(wiring.steps[wiring.wails]); bypass != "" {
 		return fmt.Errorf("Wails build is %s", bypass)
 	}
-	bindings := findRunStep(steps, bindingsGateRun)
-	if bindings < 0 {
+	if wiring.bindings < 0 {
 		return fmt.Errorf("missing the exact run step %s", bindingsGateRun)
 	}
-	if bypass := stepBypass(steps[bindings]); bypass != "" {
+	if bypass := stepBypass(wiring.steps[wiring.bindings]); bypass != "" {
 		return fmt.Errorf("%s is %s", bindingsGateRun, bypass)
 	}
-	if bindings < wails {
+	if wiring.bindings < wiring.wails {
 		return fmt.Errorf("%s runs before the Wails build", bindingsGateRun)
 	}
-	protocol := findRunStep(steps, protocolGateRun)
-	if protocol < 0 {
+	if wiring.protocol < 0 {
 		return fmt.Errorf("missing the exact run step %s", protocolGateRun)
 	}
-	if bypass := stepBypass(steps[protocol]); bypass != "" {
+	if bypass := stepBypass(wiring.steps[wiring.protocol]); bypass != "" {
 		return fmt.Errorf("%s is %s", protocolGateRun, bypass)
 	}
-	for _, publication := range []string{"Package release assets", "Upload release assets"} {
-		index := findNamedStep(steps, publication)
-		if index < 0 {
+	for _, publication := range publicationStepNames {
+		index, ok := wiring.publication[publication]
+		if !ok {
 			continue
 		}
-		if protocol > index {
+		if wiring.protocol > index {
 			return fmt.Errorf("%s does not precede %s", protocolGateRun, publication)
 		}
-		if bindings > index {
+		if wiring.bindings > index {
 			return fmt.Errorf("%s does not precede %s", bindingsGateRun, publication)
 		}
 	}
@@ -432,32 +386,34 @@ func checkDeliveryGates(steps []workflowStep) error {
 // constrains the protocol check against the Wails build, and the Release
 // workflow must still declare its two publication steps. Mutation rows prove
 // removed, conditionally skipped, allowed-to-fail, suppressed and reordered
-// gates are rejected, and that a protocol check before the build is accepted
+// gates are rejected, that an explicit continue-on-error false is equivalent
+// to an omitted key, and that a protocol check before the build is accepted
 // in both workflows. This verifies repository wiring, not GitHub branch
 // protection or hosted execution.
 func TestDeliveryGateWorkflowWiring(t *testing.T) {
 	testPath := filepath.Join("..", ".github", "workflows", "test.yml")
 	releasePath := filepath.Join("..", ".github", "workflows", "release.yml")
 
-	testSteps := parsedSteps(t, testPath, "test")
-	if err := checkDeliveryGates(testSteps); err != nil {
-		t.Errorf("test workflow: %v", err)
+	testWiring := scanDeliveryWiring(parsedSteps(t, testPath, "test"))
+	{
+		err := checkDeliveryGates(testWiring)
+		testassert.Check(t, err == nil, "test workflow: %v", err)
 	}
-	releaseSteps := parsedSteps(t, releasePath, "build")
-	if err := checkDeliveryGates(releaseSteps); err != nil {
-		t.Errorf("release workflow: %v", err)
+	releaseWiring := scanDeliveryWiring(parsedSteps(t, releasePath, "build"))
+	{
+		err := checkDeliveryGates(releaseWiring)
+		testassert.Check(t, err == nil, "release workflow: %v", err)
 	}
-	for _, publication := range []string{"Package release assets", "Upload release assets"} {
-		if findNamedStep(releaseSteps, publication) < 0 {
-			t.Errorf("release workflow is missing the %s step", publication)
-		}
+	for _, publication := range publicationStepNames {
+		_, ok := releaseWiring.publication[publication]
+		testassert.Check(t, ok, "release workflow is missing the %s step", publication)
 	}
 
 	// protocolBeforeWails moves the exact protocol gate step to just before the
 	// tagged Wails build: the order both workflows must accept.
 	protocolBeforeWails := func(steps []workflowStep) []workflowStep {
-		from := findRunStep(steps, protocolGateRun)
-		to := findContainingRunStep(steps, wailsBuildRun)
+		wiring := scanDeliveryWiring(steps)
+		from, to := wiring.protocol, wiring.wails
 		step := steps[from]
 		steps = slices.Delete(steps, from, from+1)
 		if from < to {
@@ -466,6 +422,7 @@ func TestDeliveryGateWorkflowWiring(t *testing.T) {
 		return slices.Insert(steps, to, step)
 	}
 	allowedToFail := true
+	allowedToFailFalse := false
 
 	for _, mutation := range []struct {
 		name   string
@@ -477,69 +434,69 @@ func TestDeliveryGateWorkflowWiring(t *testing.T) {
 		{"protocol gate before the Wails build in Test is accepted", testPath, "test", true, protocolBeforeWails},
 		{"protocol gate before the Wails build in Release is accepted", releasePath, "build", true, protocolBeforeWails},
 		{"removed binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			index := findRunStep(steps, bindingsGateRun)
+			index := scanDeliveryWiring(steps).bindings
 			return slices.Delete(steps, index, index+1)
 		}},
 		{"conditional binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			steps[findRunStep(steps, bindingsGateRun)].If = "${{ false }}"
+			steps[scanDeliveryWiring(steps).bindings].If = "${{ false }}"
 			return steps
 		}},
 		{"continue-on-error binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			steps[findRunStep(steps, bindingsGateRun)].ContinueOnError = &allowedToFail
+			steps[scanDeliveryWiring(steps).bindings].ContinueOnError = &allowedToFail
+			return steps
+		}},
+		{"continue-on-error false binding gate is accepted", testPath, "test", true, func(steps []workflowStep) []workflowStep {
+			steps[scanDeliveryWiring(steps).bindings].ContinueOnError = &allowedToFailFalse
 			return steps
 		}},
 		{"suppressed binding gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			steps[findRunStep(steps, bindingsGateRun)].Run += " || true"
+			steps[scanDeliveryWiring(steps).bindings].Run += " || true"
 			return steps
 		}},
 		{"removed protocol gate", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			index := findRunStep(steps, protocolGateRun)
+			index := scanDeliveryWiring(steps).protocol
 			return slices.Delete(steps, index, index+1)
 		}},
 		{"binding gate before the Wails build", testPath, "test", false, func(steps []workflowStep) []workflowStep {
-			bindings, wails := findRunStep(steps, bindingsGateRun), findContainingRunStep(steps, wailsBuildRun)
-			steps[bindings], steps[wails] = steps[wails], steps[bindings]
+			wiring := scanDeliveryWiring(steps)
+			steps[wiring.bindings], steps[wiring.wails] = steps[wiring.wails], steps[wiring.bindings]
 			return steps
 		}},
 		{"removed release binding gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			index := findRunStep(steps, bindingsGateRun)
+			index := scanDeliveryWiring(steps).bindings
 			return slices.Delete(steps, index, index+1)
 		}},
 		{"continue-on-error release protocol gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			steps[findRunStep(steps, protocolGateRun)].ContinueOnError = &allowedToFail
+			steps[scanDeliveryWiring(steps).protocol].ContinueOnError = &allowedToFail
 			return steps
 		}},
 		{"suppressed release protocol gate", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			steps[findRunStep(steps, protocolGateRun)].Run += " || true"
+			steps[scanDeliveryWiring(steps).protocol].Run += " || true"
 			return steps
 		}},
 		{"release binding gate after packaging", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			index := findRunStep(steps, bindingsGateRun)
+			index := scanDeliveryWiring(steps).bindings
 			step := steps[index]
 			return append(slices.Delete(steps, index, index+1), step)
 		}},
 		{"release binding gate before the Wails build", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			bindings, wails := findRunStep(steps, bindingsGateRun), findContainingRunStep(steps, wailsBuildRun)
-			steps[bindings], steps[wails] = steps[wails], steps[bindings]
+			wiring := scanDeliveryWiring(steps)
+			steps[wiring.bindings], steps[wiring.wails] = steps[wiring.wails], steps[wiring.bindings]
 			return steps
 		}},
 		{"release Wails build allowed to fail", releasePath, "build", false, func(steps []workflowStep) []workflowStep {
-			steps[findContainingRunStep(steps, wailsBuildRun)].ContinueOnError = &allowedToFail
+			steps[scanDeliveryWiring(steps).wails].ContinueOnError = &allowedToFail
 			return steps
 		}},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
 			steps := mutation.mutate(parsedSteps(t, mutation.path, mutation.job))
-			err := checkDeliveryGates(steps)
+			err := checkDeliveryGates(scanDeliveryWiring(steps))
 			if mutation.accept {
-				if err != nil {
-					t.Fatalf("accepted workflow mutation reported %v", err)
-				}
+				testassert.NoError(t, err)
 				return
 			}
-			if err == nil {
-				t.Fatal("mutated workflow was accepted")
-			}
+			testassert.Require(t, err != nil, "mutated workflow was accepted")
 		})
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // execEdit runs one edit through the exported Normalize* + Prepare* entries.
@@ -39,12 +41,8 @@ func TestPreparedEditReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 		"old_string": "beta",
 		"new_string": "delta",
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if result != "Edited "+path+" (1 replacement, lines 2-2)." {
-		t.Fatalf("Execute result = %q, want one-replacement summary", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, result, "Edited "+path+" (1 replacement, lines 2-2).")
 	assertFileContent(t, path, "alpha\ndelta\ngamma")
 }
 
@@ -58,12 +56,8 @@ func TestPreparedEditReplaceAllReportsAllLineRanges(t *testing.T) {
 		"new_string":  "done",
 		"replace_all": true,
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if result != "Edited "+path+" (2 replacements, lines 1-1, 3-3)." {
-		t.Fatalf("Execute result = %q, want plural summary with both line ranges", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, result, "Edited "+path+" (2 replacements, lines 1-1, 3-3).")
 	assertFileContent(t, path, "done\nother\ndone")
 }
 
@@ -76,9 +70,7 @@ func TestPreparedEditRejectsAmbiguousMatchWithoutReplaceAll(t *testing.T) {
 		"old_string": "same",
 		"new_string": "done",
 	})
-	if err == nil || !strings.Contains(err.Error(), "old_string matches 2 locations") {
-		t.Fatalf("Execute error = %v, want ambiguous-match error", err)
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "old_string matches 2 locations"), "Execute error = %v, want ambiguous-match error", err)
 	assertFileContent(t, path, "same\nsame")
 }
 
@@ -104,9 +96,7 @@ func TestPreparedEditValidatesOldString(t *testing.T) {
 				"old_string": tt.oldString,
 				"new_string": tt.newString,
 			})
-			if err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("Execute error = %v, want containing %q", err, tt.want)
-			}
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), tt.want), "Execute error = %v, want containing %q", err, tt.want)
 			assertFileContent(t, path, "content")
 		})
 	}
@@ -121,12 +111,8 @@ func TestPreparedEditMultilineReplacementLineRange(t *testing.T) {
 		"old_string": "old",
 		"new_string": "new\nline",
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if result != "Edited "+path+" (1 replacement, lines 2-3)." {
-		t.Fatalf("Execute result = %q, want multiline replacement range", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, result, "Edited "+path+" (1 replacement, lines 2-3).")
 	assertFileContent(t, path, "start\nnew\nline\nend")
 }
 
@@ -140,21 +126,11 @@ func TestPreparedEditWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 		"old_string": "before",
 		"new_string": "after",
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if result != "Edited "+path+" (1 replacement, lines 1-1)." {
-		t.Fatalf("Execute result = %q, want edit summary", result)
-	}
-	if len(store.calls) != 1 {
-		t.Fatalf("snapshot calls = %d, want 1", len(store.calls))
-	}
-	if store.calls[0].turn != 11 || store.calls[0].path != path {
-		t.Fatalf("snapshot call = %+v, want turn=11 path=%q", store.calls[0], path)
-	}
-	if store.before[path] != "before" {
-		t.Fatalf("snapshot saw %q, want pre-edit content", store.before[path])
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, result, "Edited "+path+" (1 replacement, lines 1-1).")
+	testassert.Equal(t, len(store.calls), 1)
+	testassert.Require(t, store.calls[0].turn == 11 && store.calls[0].path == path, "snapshot call = %+v, want turn=11 path=%q", store.calls[0], path)
+	testassert.Require(t, store.before[path] == "before", "snapshot saw %q, want pre-edit content", store.before[path])
 	assertFileContent(t, path, "after")
 }
 
@@ -162,13 +138,9 @@ func TestPreparedEditWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testin
 	root := t.TempDir()
 	realDir := t.TempDir()
 	target := filepath.Join(realDir, "file.txt")
-	if err := os.WriteFile(target, []byte("before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(target, []byte("before"), 0o644))
 	linkDir := filepath.Join(root, "linked")
-	if err := os.Symlink(realDir, linkDir); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(realDir, linkDir))
 	requested := filepath.Join(linkDir, "file.txt")
 	store := &recordingSnapshotStore{turn: 12, before: map[string]string{}}
 
@@ -178,30 +150,16 @@ func TestPreparedEditWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testin
 		"new_string": "after",
 	})
 
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if result != "Edited "+requested+" (1 replacement, lines 1-1)." {
-		t.Fatalf("Execute result = %q, want requested path in edit summary", result)
-	}
-	if len(store.calls) != 1 {
-		t.Fatalf("snapshot calls = %d, want 1", len(store.calls))
-	}
-	if store.calls[0].path != requested || store.calls[0].canonical != target {
-		t.Fatalf("snapshot call = %+v, want original=%q canonical=%q", store.calls[0], requested, target)
-	}
-	if store.before[target] != "before" {
-		t.Fatalf("snapshot saw %q, want pre-edit content", store.before[target])
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, result, "Edited "+requested+" (1 replacement, lines 1-1).")
+	testassert.Equal(t, len(store.calls), 1)
+	testassert.Require(t, store.calls[0].path == requested && store.calls[0].canonical == target, "snapshot call = %+v, want original=%q canonical=%q", store.calls[0], requested, target)
+	testassert.Require(t, store.before[target] == "before", "snapshot saw %q, want pre-edit content", store.before[target])
 	assertFileContent(t, target, "after")
 }
 
 func TestApplyEditPureHelper(t *testing.T) {
 	edit, err := ApplyEdit("a\nb\na", "a", "z", true, "file.txt")
-	if err != nil {
-		t.Fatalf("ApplyEdit error = %v", err)
-	}
-	if edit.UpdatedContent != "z\nb\nz" || edit.Summary != "Edited file.txt (2 replacements, lines 1-1, 3-3)." || edit.LineRanges != "1-1, 3-3" || edit.Count != 2 {
-		t.Fatalf("ApplyEdit result = %+v, want all replacements and line ranges", edit)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, edit.UpdatedContent == "z\nb\nz" && edit.Summary == "Edited file.txt (2 replacements, lines 1-1, 3-3)." && edit.LineRanges == "1-1, 3-3" && edit.Count == 2, "ApplyEdit result = %+v, want all replacements and line ranges", edit)
 }

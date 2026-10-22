@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -136,9 +138,7 @@ func awaitStopInterval(t *testing.T, c *coordinator, done <-chan error) {
 		if waiting {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Stop never entered its stop interval")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "Stop never entered its stop interval")
 		time.Sleep(2 * time.Millisecond)
 	}
 }
@@ -155,6 +155,66 @@ func stopResult(t *testing.T, done <-chan error) error {
 	}
 }
 
+// awaitStopJoiners waits until count distinct current-test goroutines are
+// parked in the concurrent-join receive: each must be blocked in a channel
+// receive with (*Harness).stopCoordinator as its top application frame and
+// must carry this test's wrapper. The owner parked in its gated StopJob —
+// its stopCoordinator frame sits deeper — and a goroutine merely started by
+// the test do not match, so the wait proves real joining before release.
+func awaitStopJoiners(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		stacks := string(buf[:goruntime.Stack(buf, true)])
+		seen := 0
+		for _, stack := range strings.Split(stacks, "\n\n") {
+			if stopJoinerStack(stack, t.Name()) {
+				seen++
+			}
+		}
+		if seen >= count {
+			return
+		}
+		testassert.Require(t, !time.Now().After(deadline), "%d concurrent Stop callers: only %d parked in the join receive", count, seen)
+		goruntime.Gosched()
+	}
+}
+
+// stopJoinerStack reports whether one goroutine dump is a concurrent joiner
+// of the current test's Stop: parked in a channel receive with
+// stopCoordinator as the top application frame and created by the named test.
+// No source line is consulted; a deeper stopCoordinator frame (the owner
+// under gatedJobStopper) and a caller that has only started never match.
+func stopJoinerStack(stack, testName string) bool {
+	lines := strings.Split(stack, "\n")
+	if len(lines) < 2 {
+		return false
+	}
+	if !strings.Contains(lines[0], "chan receive") { // the join receive itself, not a started caller
+		return false
+	}
+	if !strings.Contains(lines[1], "(*Harness).stopCoordinator") { // the top application frame
+		return false
+	}
+	return strings.Contains(stack, testName) // this test's wrapper, not another Stop stack
+}
+
+// waitStopCallers bounds the cleanup join of every started Stop caller: the
+// fixture gate is released before this runs, so each unblocked caller
+// converges and Done fires; one held past the bound is reported, never hung
+// on, and the owner is never left parked.
+func waitStopCallers(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("a Stop caller did not converge during cleanup")
+	}
+}
+
 // runtimeInputText reads the first runtime-origin input entry's text straight
 // from durable storage. Graph validation is deliberately skipped: its
 // registers-then-entries reads can tear against a concurrent settlement
@@ -168,9 +228,7 @@ func runtimeInputTextRaw(t *testing.T, store *graphStorage, sessionID string) st
 			continue
 		}
 		ie, err := decodeInputEntry(env)
-		if err != nil {
-			t.Fatalf("decode input entry %s: %v", env.ID, err)
-		}
+		testassert.Require(t, err == nil, "decode input entry %s: %v", env.ID, err)
 		if ie.Origin == InputOriginRuntime {
 			return ie.Content[0].Text
 		}
@@ -191,9 +249,7 @@ func inputTexts(t *testing.T, store *graphStorage, sessionID string) []string {
 			continue
 		}
 		ie, err := decodeInputEntry(env)
-		if err != nil {
-			t.Fatalf("decode input entry %s: %v", env.ID, err)
-		}
+		testassert.Require(t, err == nil, "decode input entry %s: %v", env.ID, err)
 		out = append(out, ie.Content[0].Text)
 	}
 	return out
@@ -214,9 +270,7 @@ func waitQuiet(t *testing.T, c *coordinator) {
 		if quiet {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the session never went quiet")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "the session never went quiet")
 		time.Sleep(5 * time.Millisecond)
 	}
 }
@@ -305,25 +359,29 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 	tree := newStopTree(t)
 	defer tree.cancel()
 	watch := watchSettlements(tree.store) // armed before the stop's child interruption commits
-	if _, err := submitText(t, tree.h, tree.root, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, tree.h, tree.root, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
-	if _, err := submitText(t, tree.h, tree.root, "op-2", MessageModeQueued, "queued-msg"); err != nil {
-		t.Fatalf("queued submit: %v", err)
-	}
-
-	if err := tree.h.Stop(context.Background(), tree.root); err != nil {
-		t.Fatalf("Stop: %v", err)
+	{
+		_, err := submitText(t, tree.h, tree.root, "op-2", MessageModeQueued, "queued-msg")
+		testassert.NoError(t, err)
 	}
 
-	if got := tree.stopper.stopped; len(got) != 1 || got[0] != tree.root+"/"+jobFixtureID {
-		t.Fatalf("StopJob calls = %v, want the tree's job killed", got)
+	{
+		err := tree.h.Stop(context.Background(), tree.root)
+		testassert.NoError(t, err)
+	}
+
+	{
+		got := tree.stopper.stopped
+		testassert.Require(t, len(got) == 1 && got[0] == tree.root+"/"+jobFixtureID, "StopJob calls = %v, want the tree's job killed", got)
 	}
 	waitMemberDone(t, tree.childMember)
 	waitMemberDone(t, tree.jobMember)
-	if rec := settledOperation(t, tree.store, tree.child, "child-op-1"); rec.State.Status != OperationInterruption ||
-		rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("child operation state = %+v, want terminal interruption with the contract detail", rec.State)
+	{
+		rec := settledOperation(t, tree.store, tree.child, "child-op-1")
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "child operation state = %+v, want terminal interruption with the contract detail", rec.State)
 	}
 	rootC := cachedCoordinator(t, tree.h, tree.root)
 	rootC.mu.Lock()
@@ -333,15 +391,9 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 	current := rootC.graph.Session.State.CurrentOperationID
 	running := rootC.run != nil
 	rootC.mu.Unlock()
-	if !reopened || !groupEmpty {
-		t.Fatalf("after Stop: reopened=%v groupEmpty=%v, want the group reopened and empty", reopened, groupEmpty)
-	}
-	if queued != 1 {
-		t.Fatalf("root queued buffer after Stop = %d items, want the queued message intact", queued)
-	}
-	if current != "op-1" || !running {
-		t.Fatalf("root operation after Stop = %q (run %v), want op-1 still running", current, running)
-	}
+	testassert.Require(t, reopened && groupEmpty, "after Stop: reopened=%v groupEmpty=%v, want the group reopened and empty", reopened, groupEmpty)
+	testassert.Equal(t, queued, 1)
+	testassert.Require(t, current == "op-1" && running, "root operation after Stop = %q (run %v), want op-1 still running", current, running)
 	childC := cachedCoordinator(t, tree.h, tree.child)
 	childC.mu.Lock()
 	closed := childC.bgState == bgClosed
@@ -356,11 +408,13 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 	watch.next()        // the first steered completion's own Operation settles
 	watch.next()        // the second steered completion's own Operation settles
 	watch.next()        // the queued message admitted after the reopen
-	if rec := settledOperation(t, tree.store, tree.root, "op-2"); rec.State.Status != OperationSuccess {
-		t.Fatalf("queued operation status = %s, want the preserved queued message admitted and successful", rec.State.Status)
+	{
+		rec := settledOperation(t, tree.store, tree.root, "op-2")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
-	if rec := settledOperation(t, tree.store, tree.root, "op-1"); rec.State.Status != OperationSuccess {
-		t.Fatalf("root operation status = %s, want the quiet success", rec.State.Status)
+	{
+		rec := settledOperation(t, tree.store, tree.root, "op-1")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 	// The member-stop order is unspecified (snapshot map iteration), so the
 	// two completions may commit in either order; the set is what survives.
@@ -368,28 +422,20 @@ func TestStopRootStopsMembersAndReopens(t *testing.T) {
 	sort.Strings(texts)
 	want := []string{"Task interrupted.", "hello", "job done", "queued-msg"}
 	sort.Strings(want)
-	if !reflect.DeepEqual(texts, want) {
-		t.Fatalf("root entries = %q, want the surviving buffers delivered", texts)
-	}
+	testassert.Require(t, reflect.DeepEqual(texts, want), "root entries = %q, want the surviving buffers delivered", texts)
 	// Each delivered completion owns its own Operation: op-1 keeps exactly its
 	// admitted input and the completions arrive through ordinary admission.
 	rootGraph, err := validateFixture(t, tree.store, tree.root)
-	if err != nil {
-		t.Fatalf("root graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range rootGraph.Entries {
 		if entry.Input == nil || len(entry.Input.Content) == 0 {
 			continue
 		}
 		switch entry.Input.Content[0].Text {
 		case "hello":
-			if entry.Envelope.OperationID != "op-1" {
-				t.Fatalf("admitted input owned by %q, want op-1", entry.Envelope.OperationID)
-			}
+			testassert.Equal(t, entry.Envelope.OperationID, "op-1")
 		case "queued-msg":
-			if entry.Envelope.OperationID != "op-2" {
-				t.Fatalf("queued input owned by %q, want op-2", entry.Envelope.OperationID)
-			}
+			testassert.Equal(t, entry.Envelope.OperationID, "op-2")
 		default:
 			if entry.Envelope.OperationID == "op-1" || entry.Input.Origin != InputOriginRuntime {
 				t.Fatalf("completion input %q owned by %q (%q), want its own successor Operation with runtime origin", entry.Input.Content[0].Text, entry.Envelope.OperationID, entry.Input.Origin)
@@ -410,24 +456,25 @@ func TestStopChildClosesPermanently(t *testing.T) {
 	defer close(release)
 	root := createSession(t, h)
 	res, err := h.LaunchChildSession(context.Background(), launchRequestFor(root))
-	if err != nil {
-		t.Fatalf("LaunchChildSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	child := res.ChildSessionID
 	childC := cachedCoordinator(t, h, child)
 	childC.mu.Lock()
 	run := childC.run
 	childC.mu.Unlock()
-	if _, err := submitText(t, h, child, "op-2", MessageModeRegular, "steer-me"); err != nil {
-		t.Fatalf("steering submit to the child: %v", err)
+	{
+		_, err := submitText(t, h, child, "op-2", MessageModeRegular, "steer-me")
+		testassert.NoError(t, err)
 	}
 
-	if err := h.Stop(context.Background(), child); err != nil {
-		t.Fatalf("Stop(child): %v", err)
+	{
+		err := h.Stop(context.Background(), child)
+		testassert.NoError(t, err)
 	}
 
-	if rec := settledOperation(t, store, child, "child-op-1"); rec.State.Status != OperationInterruption {
-		t.Fatalf("child operation status = %s, want the interrupted run", rec.State.Status)
+	{
+		rec := settledOperation(t, store, child, "child-op-1")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
 	select {
 	case <-run.done:
@@ -441,18 +488,15 @@ func TestStopChildClosesPermanently(t *testing.T) {
 	if !closed {
 		t.Fatalf("child bgState after Stop = %q, want permanently closed", childC.bgState)
 	}
-	if buffers != 0 {
-		t.Fatalf("closed child kept %d buffered items, want the buffers discarded", buffers)
+	testassert.Equal(t, buffers, 0)
+	testassert.Require(t, !storedOperationExists(store, child, "op-2"), "the closed child's discarded head admitted a successor")
+	{
+		_, err := submitText(t, h, child, "op-3", MessageModeRegular, "nope")
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "session is closed to agent work"), "Submit on the closed child = %v, want the closed-to-agent-work rejection", err)
 	}
-	if storedOperationExists(store, child, "op-2") {
-		t.Fatalf("the closed child's discarded head admitted a successor")
-	}
-	if _, err := submitText(t, h, child, "op-3", MessageModeRegular, "nope"); !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "session is closed to agent work") {
-		t.Fatalf("Submit on the closed child = %v, want the closed-to-agent-work rejection", err)
-	}
-	if got := runtimeInputTextRaw(t, store, root); got != "Task interrupted." {
-		t.Fatalf("parent runtime input = %q, want the child completion delivered to the idle parent", got)
+	{
+		got := runtimeInputTextRaw(t, store, root)
+		testassert.Equal(t, got, "Task interrupted.")
 	}
 }
 
@@ -465,9 +509,9 @@ func TestSubmitRejectsClosedActiveChild(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 	childC := leaseCoordinator(t, h, completionChildID)
 	closeBackgroundMode(childC)
-	if _, err := submitText(t, h, completionChildID, "op-x", MessageModeRegular, "hi"); !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "session is closed to agent work") {
-		t.Fatalf("Submit on the closed active child = %v, want the closed-to-agent-work rejection", err)
+	{
+		_, err := submitText(t, h, completionChildID, "op-x", MessageModeRegular, "hi")
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "session is closed to agent work"), "Submit on the closed active child = %v, want the closed-to-agent-work rejection", err)
 	}
 }
 
@@ -509,9 +553,7 @@ func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
 			childID = id
 		}
 	}
-	if childID == "" {
-		t.Fatalf("the committed child register is missing")
-	}
+	testassert.Require(t, childID != "", "the committed child register is missing")
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), childID) }()
@@ -521,28 +563,31 @@ func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	sharedLoads := gate.readCount() // the parent's load plus the parked child's: the stop must not add a third
-	if sharedLoads != 2 {
-		t.Fatalf("register reads while the stop waited = %d, want the parent's and the parked child's two", sharedLoads)
-	}
+	testassert.Equal(t, sharedLoads, 2)
 
 	close(gate.readRelease)
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(child) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
-	if err := <-launchDone; err != nil {
-		t.Fatalf("LaunchChildSession = %v, want the launch to succeed", err)
+	{
+		err := <-launchDone
+		testassert.NoError(t, err)
 	}
 	// The stop's own acquisition joins the launch's just-published graph when
 	// it arrives in time, or — under the one release rule — loads the child
 	// once itself; it never loads more than that one.
-	if got := gate.readCount(); got != sharedLoads && got != sharedLoads+1 {
-		t.Fatalf("register reads after the stop joined = %d, want at most the stop's own one load beyond %d", got, sharedLoads)
+	{
+		got := gate.readCount()
+		testassert.Require(t, got == sharedLoads || got == sharedLoads+1, "register reads after the stop joined = %d, want at most the stop's own one load beyond %d", got, sharedLoads)
 	}
-	if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status == OperationRunning || rec.State.Terminal == nil {
-		t.Fatalf("child operation state = %+v, want a terminal settlement", rec.State)
+	{
+		rec := settledOperation(t, store, childID, "child-op-1")
+		testassert.Require(t, rec.State.Status != OperationRunning && rec.State.Terminal != nil, "child operation state = %+v, want a terminal settlement", rec.State)
 	}
-	if got := runtimeInputTextRaw(t, store, testSessionID); got == "" {
-		t.Fatalf("parent runtime input = %q, want the child completion delivered", got)
+	{
+		got := runtimeInputTextRaw(t, store, testSessionID)
+		testassert.Require(t, got != "", "parent runtime input = %q, want the child completion delivered", got)
 	}
 	if len(storedSignals(t, store, testSessionID)) != 0 {
 		t.Fatalf("parent signals = %+v, want the idle parent's admission delivery, not a signal", storedSignals(t, store, testSessionID))
@@ -594,9 +639,7 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 			childID = id
 		}
 	}
-	if childID == "" {
-		t.Fatalf("the committed child register is missing")
-	}
+	testassert.Require(t, childID != "", "the committed child register is missing")
 
 	childC := leaseCoordinator(t, h, childID)
 	stopDone := make(chan error, 1)
@@ -604,11 +647,13 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 	awaitStopInterval(t, childC, stopDone) // the parent membership holds the stop
 
 	close(gate.txRelease)
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(child) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
-	if err := <-launchDone; err != nil {
-		t.Fatalf("gated launch = %v, want the launch to succeed with the entry interruption", err)
+	{
+		err := <-launchDone
+		testassert.NoError(t, err)
 	}
 	mu.Lock()
 	childOpened := false
@@ -618,15 +663,14 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 		}
 	}
 	mu.Unlock()
-	if childOpened {
-		t.Fatalf("the racing child execution opened; want it settled without starting")
+	testassert.Require(t, !childOpened, "the racing child execution opened; want it settled without starting")
+	{
+		rec := settledOperation(t, store, childID, "child-op-1")
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "child operation state = %+v, want terminal interruption with the contract detail", rec.State)
 	}
-	if rec := settledOperation(t, store, childID, "child-op-1"); rec.State.Status != OperationInterruption ||
-		rec.State.Terminal == nil || rec.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("child operation state = %+v, want terminal interruption with the contract detail", rec.State)
-	}
-	if got := runtimeInputTextRaw(t, store, testSessionID); got != "Task interrupted." {
-		t.Fatalf("parent runtime input = %q, want the racing start's completion delivered", got)
+	{
+		got := runtimeInputTextRaw(t, store, testSessionID)
+		testassert.Equal(t, got, "Task interrupted.")
 	}
 }
 
@@ -641,9 +685,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 	defer cancel()
 	childC := leaseCoordinator(t, h, completionChildID)
 	release, err := h.reserve(context.Background(), childC)
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	rec, prepared, _, err := h.admitReserved(context.Background(), childC, admissionRequest{
 		SessionID:   completionChildID,
 		OperationID: "op-2",
@@ -651,9 +693,7 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 		Origin:      InputOriginUser,
 		Content:     admissionContent("later"),
 	})
-	if err != nil || prepared == nil {
-		t.Fatalf("admission = (%+v, %+v, %v), want a published new Operation", rec, prepared, err)
-	}
+	testassert.Require(t, err == nil && prepared != nil, "admission = (%+v, %+v, %v), want a published new Operation", rec, prepared, err)
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), completionChildID) }()
@@ -661,16 +701,17 @@ func TestStopChildJoinsReservationAndRun(t *testing.T) {
 
 	h.startExecution(childC, "op-2", *prepared) // the ordinary admission installs before releasing
 	release()
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(child) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
-	if settled := settledOperation(t, store, completionChildID, "op-2"); settled.State.Status != OperationInterruption ||
-		settled.State.Terminal == nil || settled.State.Terminal.Detail != executionInterruptedDetail {
-		t.Fatalf("installed operation state = %+v, want the closed-entry interruption", settled.State)
+	{
+		settled := settledOperation(t, store, completionChildID, "op-2")
+		testassert.Require(t, settled.State.Status == OperationInterruption && settled.State.Terminal != nil && settled.State.Terminal.Detail == executionInterruptedDetail, "installed operation state = %+v, want the closed-entry interruption", settled.State)
 	}
-	if _, err := submitText(t, h, completionChildID, "op-3", MessageModeRegular, "nope"); !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "session is closed to agent work") {
-		t.Fatalf("Submit on the closed child = %v, want the closed-to-agent-work rejection", err)
+	{
+		_, err := submitText(t, h, completionChildID, "op-3", MessageModeRegular, "nope")
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "session is closed to agent work"), "Submit on the closed child = %v, want the closed-to-agent-work rejection", err)
 	}
 }
 
@@ -686,9 +727,7 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 	defer close(release)
 	root := createSession(t, h)
 	res, err := h.LaunchChildSession(context.Background(), launchRequestFor(root))
-	if err != nil {
-		t.Fatalf("LaunchChildSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	child := res.ChildSessionID
 
 	gate := make(chan struct{})
@@ -697,11 +736,12 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 		h.DeliverBackgroundCompletion(context.Background(), sessionID, completions[jobID], "job done")
 	}}
 	h.deps.Jobs = stopper
-	if err := h.StartJob(context.Background(), child, jobFixtureID, func(_ context.Context, completionID string) error {
-		completions[jobFixtureID] = completionID
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob on the child: %v", err)
+	{
+		err := h.StartJob(context.Background(), child, jobFixtureID, func(_ context.Context, completionID string) error {
+			completions[jobFixtureID] = completionID
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 	rootC := cachedCoordinator(t, h, root)
 	rootC.mu.Lock()
@@ -712,15 +752,14 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 		}
 	}
 	rootC.mu.Unlock()
-	if membership == nil {
-		t.Fatalf("the child's parent membership is missing")
-	}
+	testassert.Require(t, membership != nil, "the child's parent membership is missing")
 
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- h.Stop(context.Background(), child) }()
 	awaitStopInterval(t, cachedCoordinator(t, h, child), stopDone)
-	if signals := storedSignals(t, store, root); len(signals) != 0 {
-		t.Fatalf("parent signals while the job is live = %d, want none", len(signals))
+	{
+		signals := storedSignals(t, store, root)
+		testassert.Equal(t, len(signals), 0)
 	}
 	select {
 	case <-membership:
@@ -729,25 +768,29 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 	}
 
 	close(gate) // the job finishes: its kill-completion closes the child, then the child delivers
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(child) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
-	if got := runtimeInputTextRaw(t, store, root); got != "Task interrupted." {
-		t.Fatalf("parent runtime input = %q, want the child completion delivered after the job finished", got)
+	{
+		got := runtimeInputTextRaw(t, store, root)
+		testassert.Equal(t, got, "Task interrupted.")
 	}
 	if len(storedSignals(t, store, root)) != 0 {
 		t.Fatalf("parent signals = %+v, want the idle parent's admission delivery, not a signal", storedSignals(t, store, root))
 	}
-	if signals := storedSignals(t, store, child); len(signals) != 1 || signals[0].Content != "job done" {
-		t.Fatalf("child signals = %+v, want the job's closed-delivery signal", signals)
+	{
+		signals := storedSignals(t, store, child)
+		testassert.Require(t, len(signals) == 1 && signals[0].Content == "job done", "child signals = %+v, want the job's closed-delivery signal", signals)
 	}
 	select {
 	case <-membership:
 	default:
 		t.Fatalf("the parent membership did not close")
 	}
-	if rec := settledOperation(t, store, child, "child-op-1"); rec.State.Status != OperationInterruption {
-		t.Fatalf("child operation status = %s, want interruption", rec.State.Status)
+	{
+		rec := settledOperation(t, store, child, "child-op-1")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
 }
 
@@ -755,23 +798,26 @@ func TestStopChildWaitsForLiveJobDelivery(t *testing.T) {
 // the corruption-class fixture both error-path stop tests resolve.
 func insertMalformedChildSession(t *testing.T, store *graphStorage, sessionID string) {
 	t.Helper()
-	if err := store.Transact(context.Background(), func(tx Transaction) error {
-		_, err := tx.InsertRegister(RegisterDraft{
-			Key:     RegisterKey{SessionID: sessionID, Kind: RegisterSession},
-			Payload: json.RawMessage(`{"bogus":true}`),
+	{
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			_, err := tx.InsertRegister(RegisterDraft{
+				Key:     RegisterKey{SessionID: sessionID, Kind: RegisterSession},
+				Payload: json.RawMessage(`{"bogus":true}`),
+			})
+			return err
 		})
-		return err
-	}); err != nil {
-		t.Fatalf("insert corrupt child register: %v", err)
+		testassert.NoError(t, err)
 	}
 }
 
 // TestStopConcurrentCallersJoinSameError proves the join row: concurrent
-// stops share one interval and every caller receives the same stored error —
-// here the corruption-class child failure that Stop claim-finishes without
-// delivery. The stopper stops the job member exactly once, the corrupt child
-// register stays byte-identical, and the root admits and completes ordinary
-// work after convergence.
+// stops share one interval and every joining caller receives the same stored
+// error — here the corruption-class child failure that Stop claim-finishes
+// without delivery — while a later public Stop after retirement is not a
+// joiner and observes the reopened empty root as a nil no-op. The stopper
+// stops the job member exactly once, the corrupt child register stays
+// byte-identical, and the root admits and completes ordinary work after
+// convergence.
 func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	store := freshSessionStore(t)
 	childID := hexID(9)
@@ -780,64 +826,77 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	defer cancel()
 	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberChild, childID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	testassert.NoError(t, err)
 	corruptKey := RegisterKey{SessionID: childID, Kind: RegisterSession}
 	corruptBefore, err := store.ReadRegister(context.Background(), corruptKey)
-	if err != nil {
-		t.Fatalf("read the corrupt child register: %v", err)
-	}
+	testassert.NoError(t, err)
 	gate := make(chan struct{})
 	completions := map[string]string{}
 	stopper := &gatedJobStopper{gate: gate, deliver: func(sessionID, jobID string) {
 		h.DeliverBackgroundCompletion(context.Background(), sessionID, completions[jobID], "job done")
 	}}
 	h.deps.Jobs = stopper
-	if err := h.StartJob(context.Background(), testSessionID, jobFixtureID, func(_ context.Context, completionID string) error {
-		completions[jobFixtureID] = completionID
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
+	{
+		err := h.StartJob(context.Background(), testSessionID, jobFixtureID, func(_ context.Context, completionID string) error {
+			completions[jobFixtureID] = completionID
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 
-	// The first stop owns the interval and parks at the gated job. The two
-	// joiners signal entry immediately before their Stop calls while that
-	// interval is provably open; the rendezvous receives both entries, then
-	// the gate releases — the joiners have joined and cannot return before
-	// the owner converges.
+	// The first stop owns the interval and parks at the gated job. Every
+	// concurrent caller below starts while that interval is provably open.
+	// The bounded stack wait then requires the two joiners actually parked
+	// in the join receive — not merely announced — before the gate releases.
+	// A later public Stop runs synchronously after retirement: it is not a
+	// joiner and observes the reopened empty root as a nil no-op —
+	// goroutine start is not a join.
 	ownerDone := make(chan error, 1)
-	go func() { ownerDone <- h.Stop(context.Background(), testSessionID) }()
-	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
-	joinerEntered := make(chan struct{}, 2)
 	joinerDone := make(chan error, 2)
+	var (
+		releaseGate sync.Once
+		stopWG      sync.WaitGroup
+	)
+	stopWG.Add(1)
+	go func() {
+		defer stopWG.Done()
+		ownerDone <- h.Stop(context.Background(), testSessionID)
+	}()
+	defer func() { // a failed phase still releases the fixture gate once and joins the started Stop callers
+		releaseGate.Do(func() { close(gate) })
+		waitStopCallers(t, &stopWG)
+	}()
+	awaitStopInterval(t, cachedCoordinator(t, h, testSessionID), ownerDone)
 	for i := 0; i < 2; i++ {
+		stopWG.Add(1)
 		go func() {
-			joinerEntered <- struct{}{}
+			defer stopWG.Done()
 			joinerDone <- h.Stop(context.Background(), testSessionID)
 		}()
 	}
-	<-joinerEntered
-	<-joinerEntered
+	awaitStopJoiners(t, 2)
 
-	close(gate) // the job finishes: the owner collects the child error and stores it
+	releaseGate.Do(func() { close(gate) }) // the job finishes: the owner collects the child error and stores it
 	err = stopResult(t, ownerDone)
-	if err2 := stopResult(t, joinerDone); err2 != err {
-		t.Fatalf("joiner = %v, want the same stored error as the owner (%v)", err2, err)
+	{
+		err2 := stopResult(t, joinerDone)
+		testassert.Equal(t, err2, err)
 	}
-	if err3 := stopResult(t, joinerDone); err3 != err {
-		t.Fatalf("joiner = %v, want the same stored error as the owner (%v)", err3, err)
+	{
+		err3 := stopResult(t, joinerDone)
+		testassert.Equal(t, err3, err)
 	}
-	if err == nil {
-		t.Fatalf("the joined error = nil, want the stored child error")
+	{
+		errLate := h.Stop(context.Background(), testSessionID) // a post-retirement public Stop is not a joiner
+		testassert.NoError(t, errLate)                         // the empty reopened root stops as a nil no-op
 	}
+	testassert.Require(t, err != nil, "the joined error = nil, want the stored child error")
 	var corrupt *CorruptionError
-	if !errors.As(err, &corrupt) {
-		t.Fatalf("joined error = %v, want the corruption class", err)
-	}
+	testassert.Require(t, errors.As(err, &corrupt), "joined error = %v, want the corruption class", err)
 	waitMemberDone(t, member) // claim-finished without delivery
-	if signals := storedSignals(t, store, testSessionID); len(signals) != 0 {
-		t.Fatalf("root signals = %+v, want no delivery from the claim-finished child", signals)
+	{
+		signals := storedSignals(t, store, testSessionID)
+		testassert.Require(t, len(signals) == 0, "root signals = %+v, want no delivery from the claim-finished child", signals)
 	}
 	c.mu.Lock()
 	reopened := c.bgState == bgOpen
@@ -845,23 +904,21 @@ func TestStopConcurrentCallersJoinSameError(t *testing.T) {
 	if !reopened {
 		t.Fatalf("root bgState after Stop = %q, want reopened", c.bgState)
 	}
-	if stopped := stopper.stopped; len(stopped) != 1 || stopped[0] != testSessionID+"/"+jobFixtureID {
-		t.Fatalf("StopJob calls = %q, want exactly the one job member's stop", stopped)
+	{
+		stopped := stopper.stopped
+		testassert.Require(t, len(stopped) == 1 && stopped[0] == testSessionID+"/"+jobFixtureID, "StopJob calls = %q, want exactly the one job member's stop", stopped)
 	}
 	corruptAfter, err := store.ReadRegister(context.Background(), corruptKey)
-	if err != nil {
-		t.Fatalf("reread the corrupt child register: %v", err)
-	}
-	if !reflect.DeepEqual(corruptBefore, corruptAfter) {
-		t.Fatalf("the corrupt child register changed: before %+v after %+v", corruptBefore, corruptAfter)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, reflect.DeepEqual(corruptBefore, corruptAfter), "the corrupt child register changed: before %+v after %+v", corruptBefore, corruptAfter)
 
 	// The root lifecycle is usable after convergence: once the delivered
 	// job completion's own Operation retires, the next ordinary input
 	// admits and completes.
 	waitQuiet(t, c)
-	if _, err := submitText(t, h, testSessionID, "op-root", MessageModeRegular, "after stop"); err != nil {
-		t.Fatalf("post-stop submit: %v", err)
+	{
+		_, err := submitText(t, h, testSessionID, "op-root", MessageModeRegular, "after stop")
+		testassert.NoError(t, err)
 	}
 	awaitOperationTerminal(t, store, testSessionID, "op-root", OperationSuccess)
 }
@@ -878,17 +935,14 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		h := newTestHarness(t, store, nil)
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, childID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 		err = h.Stop(context.Background(), testSessionID)
 		var corrupt *CorruptionError
-		if !errors.As(err, &corrupt) {
-			t.Fatalf("Stop = %v, want the collected corruption error", err)
-		}
+		testassert.Require(t, errors.As(err, &corrupt), "Stop = %v, want the collected corruption error", err)
 		waitMemberDone(t, member)
-		if signals := storedSignals(t, store, testSessionID); len(signals) != 0 {
-			t.Fatalf("root signals = %+v, want no delivery", signals)
+		{
+			signals := storedSignals(t, store, testSessionID)
+			testassert.Require(t, len(signals) == 0, "root signals = %+v, want no delivery", signals)
 		}
 	})
 
@@ -900,9 +954,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		defer cancel()
 		c := leaseCoordinator(t, h, testSessionID)
 		member, err := admitLocked(h, c, memberChild, completionChildID, 0)
-		if err != nil {
-			t.Fatalf("admission: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		store.mu.Lock()
 		store.registersErr = fmt.Errorf("%w: storage down", ErrStorage) // the child resolution fails
@@ -913,9 +965,7 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		c.mu.Lock()
 		claimed := member.claimed
 		c.mu.Unlock()
-		if claimed {
-			t.Fatalf("Stop claim-finished a member whose failure does not prevent natural delivery")
-		}
+		testassert.Require(t, !claimed, "Stop claim-finished a member whose failure does not prevent natural delivery")
 
 		store.mu.Lock()
 		store.registersErr = nil // the transient failure clears: the natural path converges
@@ -927,12 +977,11 @@ func TestStopReportsChildErrorAndWaitsForNaturalDelivery(t *testing.T) {
 		h.childCompletionSettled(childC, "") // the settled child's completion delivers on its own
 
 		err = stopResult(t, stopDone)
-		if !errors.Is(err, ErrStorage) {
-			t.Fatalf("Stop = %v, want the reported storage-class child error", err)
-		}
+		testassert.Require(t, errors.Is(err, ErrStorage), "Stop = %v, want the reported storage-class child error", err)
 		waitMemberDone(t, member)
-		if got := runtimeInputTextRaw(t, store, testSessionID); got != "Task completed." {
-			t.Fatalf("root runtime input = %q, want the natural delivery", got)
+		{
+			got := runtimeInputTextRaw(t, store, testSessionID)
+			testassert.Equal(t, got, "Task completed.")
 		}
 		c.mu.Lock()
 		reopened := c.bgState == bgOpen
@@ -959,11 +1008,12 @@ func TestStopRootRejectsStartWhileStopping(t *testing.T) {
 		h.DeliverBackgroundCompletion(context.Background(), sessionID, completions[jobID], "job done")
 	}}
 	h.deps.Jobs = stopper
-	if err := h.StartJob(context.Background(), root, jobFixtureID, func(_ context.Context, completionID string) error {
-		completions[jobFixtureID] = completionID
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
+	{
+		err := h.StartJob(context.Background(), root, jobFixtureID, func(_ context.Context, completionID string) error {
+			completions[jobFixtureID] = completionID
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 
 	stopDone := make(chan error, 1)
@@ -971,20 +1021,20 @@ func TestStopRootRejectsStartWhileStopping(t *testing.T) {
 	awaitStopInterval(t, cachedCoordinator(t, h, root), stopDone) // the parked kill-completion holds the stop
 
 	spawns := 0
-	if err := h.StartJob(context.Background(), root, "feedface", func(context.Context, string) error {
-		spawns++
-		return nil
-	}); err == nil || err.Error() != "harness: invalid storage request: background group is closed or stopping" {
-		t.Fatalf("start while stopping = %v, want the closed-or-stopping rejection", err)
+	{
+		err := h.StartJob(context.Background(), root, "feedface", func(context.Context, string) error {
+			spawns++
+			return nil
+		})
+		testassert.Require(t, err != nil && err.Error() == "harness: invalid storage request: background group is closed or stopping", "start while stopping = %v, want the closed-or-stopping rejection", err)
 	}
-	if spawns != 0 {
-		t.Fatalf("the rejected start spawned %d times", spawns)
-	}
+	testassert.Equal(t, spawns, 0)
 
 	watch := watchSettlements(store) // both kill-completion admissions settle
 	close(gate)
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(root) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
 	c := cachedCoordinator(t, h, root)
 	c.mu.Lock()
@@ -996,19 +1046,22 @@ func TestStopRootRejectsStartWhileStopping(t *testing.T) {
 	watch.next() // the first kill-completion admission settled
 
 	var completion2 string
-	if err := h.StartJob(context.Background(), root, "feedface", func(_ context.Context, completionID string) error {
-		completion2 = completionID
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob after reopen: %v", err)
+	{
+		err := h.StartJob(context.Background(), root, "feedface", func(_ context.Context, completionID string) error {
+			completion2 = completionID
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 	waitQuiet(t, c) // the retiring run releases before the second delivery resolves its mode
-	if err := h.DeliverBackgroundCompletion(context.Background(), root, completion2, "job done"); err != nil {
-		t.Fatalf("second delivery: %v", err)
+	{
+		err := h.DeliverBackgroundCompletion(context.Background(), root, completion2, "job done")
+		testassert.NoError(t, err)
 	}
 	watch.next() // the second kill-completion admission
-	if rec := settledOperation(t, store, root, completion2); rec.State.Status != OperationSuccess {
-		t.Fatalf("new work status = %s, want the reopened group completing it normally", rec.State.Status)
+	{
+		rec := settledOperation(t, store, root, completion2)
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
 	}
 }
 
@@ -1035,8 +1088,9 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 	defer cancel()
 	defer close(release)
 	root := createSession(t, h)
-	if _, err := submitText(t, h, root, "op-1", MessageModeRegular, "hello"); err != nil {
-		t.Fatalf("first submit: %v", err)
+	{
+		_, err := submitText(t, h, root, "op-1", MessageModeRegular, "hello")
+		testassert.NoError(t, err)
 	}
 
 	gate := make(chan struct{})
@@ -1045,11 +1099,12 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 		h.DeliverBackgroundCompletion(context.Background(), sessionID, completions[jobID], "job done")
 	}}
 	h.deps.Jobs = stopper
-	if err := h.StartJob(context.Background(), root, jobFixtureID, func(_ context.Context, completionID string) error {
-		completions[jobFixtureID] = completionID
-		return nil
-	}); err != nil {
-		t.Fatalf("StartJob: %v", err)
+	{
+		err := h.StartJob(context.Background(), root, jobFixtureID, func(_ context.Context, completionID string) error {
+			completions[jobFixtureID] = completionID
+			return nil
+		})
+		testassert.NoError(t, err)
 	}
 
 	stopDone := make(chan error, 1)
@@ -1068,12 +1123,14 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 	}
 
 	close(gate) // the stop completes and reopens; the kill-completion steers without a register write
-	if err := stopResult(t, stopDone); err != nil {
-		t.Fatalf("Stop(root) = %v, want nil", err)
+	{
+		err := stopResult(t, stopDone)
+		testassert.NoError(t, err)
 	}
 	close(hold) // the held preparation registers against the reopened group
-	if err := <-launchDone; err != nil {
-		t.Fatalf("held launch after reopen = %v, want success", err)
+	{
+		err := <-launchDone
+		testassert.NoError(t, err)
 	}
 	c := cachedCoordinator(t, h, root)
 	c.mu.Lock()
@@ -1083,9 +1140,7 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 	if !reopened {
 		t.Fatalf("root bgState after the held registration = %q, want reopened", c.bgState)
 	}
-	if current != "op-1" {
-		t.Fatalf("root current operation = %q, want the untouched running Operation", current)
-	}
+	testassert.Equal(t, current, "op-1")
 }
 
 // TestArchiveGateRejectsLiveMembers proves the archive gate: a Session with a
@@ -1096,35 +1151,27 @@ func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 	h := newTestHarness(t, store, nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	member, err := admitLocked(h, c, memberJob, jobFixtureID, 0)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
-	if _, ok := claimLocked(h, c, member.completionID); !ok {
-		t.Fatalf("the fixture member was not claimed")
+	testassert.NoError(t, err)
+	{
+		_, ok := claimLocked(h, c, member.completionID)
+		testassert.Require(t, ok, "the fixture member was not claimed")
 	}
 
-	if _, err := h.ArchiveSession(context.Background(), testSessionID); !errors.Is(err, ErrInvalid) ||
-		!strings.Contains(err.Error(), "session has live background work; stop it first") {
-		t.Fatalf("ArchiveSession = %v, want the live-background rejection", err)
+	{
+		_, err := h.ArchiveSession(context.Background(), testSessionID)
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "session has live background work; stop it first"), "ArchiveSession = %v, want the live-background rejection", err)
 	}
 	deleted, err := h.SweepSession(context.Background(), testSessionID, SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
-	if err != nil {
-		t.Fatalf("SweepSession: %v", err)
-	}
-	if deleted {
-		t.Fatalf("SweepSession deleted the Session, want the live member to skip it")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !deleted, "SweepSession deleted the Session, want the live member to skip it")
 	rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
-	if err != nil {
-		t.Fatalf("ReadSession: %v", err)
-	}
-	if rec.Lifecycle != LifecycleOpen {
-		t.Fatalf("swept lifecycle = %q, want the skipped open Session", rec.Lifecycle)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, rec.Lifecycle, LifecycleOpen)
 
 	h.finishBackgroundMember(c, member) // the member finishes: both paths proceed
-	if _, err := h.ArchiveSession(context.Background(), testSessionID); err != nil {
-		t.Fatalf("ArchiveSession after the member finished: %v", err)
+	{
+		_, err := h.ArchiveSession(context.Background(), testSessionID)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -1137,14 +1184,17 @@ func TestStopAllMixedTree(t *testing.T) {
 	defer close(tree.release)
 	extra := createSession(t, tree.h)
 
-	if err := tree.h.StopAll(context.Background()); err != nil {
-		t.Fatalf("StopAll: %v", err)
+	{
+		err := tree.h.StopAll(context.Background())
+		testassert.NoError(t, err)
 	}
-	if got := tree.stopper.stopped; len(got) != 1 || got[0] != tree.root+"/"+jobFixtureID {
-		t.Fatalf("StopJob calls = %v, want the tree's job killed", got)
+	{
+		got := tree.stopper.stopped
+		testassert.Require(t, len(got) == 1 && got[0] == tree.root+"/"+jobFixtureID, "StopJob calls = %v, want the tree's job killed", got)
 	}
-	if rec := settledOperation(t, tree.store, tree.child, "child-op-1"); rec.State.Status != OperationInterruption {
-		t.Fatalf("child operation status = %s, want interruption", rec.State.Status)
+	{
+		rec := settledOperation(t, tree.store, tree.child, "child-op-1")
+		testassert.Equal(t, rec.State.Status, OperationInterruption)
 	}
 	childC := cachedCoordinator(t, tree.h, tree.child)
 	childC.mu.Lock()
@@ -1156,14 +1206,12 @@ func TestStopAllMixedTree(t *testing.T) {
 	rootEmpty := rootC.group == nil || len(rootC.group.members) == 0
 	extraOpen := tree.h.sessions[extra] != nil
 	rootC.mu.Unlock()
-	if !childClosed || !rootOpen || !rootEmpty {
-		t.Fatalf("after StopAll: childClosed=%v rootOpen=%v rootEmpty=%v", childClosed, rootOpen, rootEmpty)
-	}
-	if !extraOpen {
-		t.Fatalf("the idle root vanished from the registry")
-	}
+	testassert.Require(t, childClosed && rootOpen && rootEmpty, "after StopAll: childClosed=%v rootOpen=%v rootEmpty=%v", childClosed, rootOpen, rootEmpty)
+	testassert.Require(t, extraOpen, "the idle root vanished from the registry")
 
-	if err := tree.h.StopAll(context.Background()); err != nil { // idempotent
-		t.Fatalf("second StopAll = %v, want nil", err)
+	// idempotent
+	{
+		err := tree.h.StopAll(context.Background())
+		testassert.NoError(t, err)
 	}
 }

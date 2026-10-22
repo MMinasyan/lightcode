@@ -13,41 +13,29 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestWriteReplacesAtomicallyWithMode(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "sub")
-	if err := os.MkdirAll(sub, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(sub, 0o700))
 	path := filepath.Join(sub, "rec.json")
 
-	if err := Write(path, []byte("first"), 0o600); err != nil {
-		t.Fatalf("first write: %v", err)
-	}
+	testassert.NoError(t, Write(path, []byte("first"), 0o600))
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if string(got) != "first" {
-		t.Fatalf("content = %q, want first", got)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(got) == "first", "content = %q, want first", got)
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
+	testassert.NoError(t, err)
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
 	}
 
-	if err := Write(path, []byte("second"), 0o600); err != nil {
-		t.Fatalf("second write: %v", err)
-	}
+	testassert.NoError(t, Write(path, []byte("second"), 0o600))
 	got, _ = os.ReadFile(path)
-	if string(got) != "second" {
-		t.Fatalf("content after replace = %q, want second", got)
-	}
+	testassert.Require(t, string(got) == "second", "content after replace = %q, want second", got)
 
 	// No temp file is left behind in the destination directory.
 	entries, _ := os.ReadDir(filepath.Dir(path))
@@ -64,11 +52,13 @@ func TestWriteReplacesAtomicallyWithMode(t *testing.T) {
 func TestWriteDoesNotCreateDestinationDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gone", "rec.json")
-	if err := Write(path, []byte("data"), 0o600); err == nil {
-		t.Fatal("Write into a missing directory succeeded; want failure")
+	{
+		err := Write(path, []byte("data"), 0o600)
+		testassert.Require(t, err != nil, "Write into a missing directory succeeded; want failure")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "gone")); !os.IsNotExist(err) {
-		t.Fatalf("Write recreated the missing directory: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(dir, "gone"))
+		testassert.Require(t, os.IsNotExist(err), "Write recreated the missing directory: %v", err)
 	}
 }
 
@@ -77,30 +67,18 @@ func TestCreateExclusiveRefusesOverwrite(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 
 	created, err := CreateExclusive(path, []byte("mine"), 0o600)
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if !created {
-		t.Fatal("first CreateExclusive: created = false, want true")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, created, "first CreateExclusive: created = false, want true")
 
 	created, err = CreateExclusive(path, []byte("theirs"), 0o600)
-	if err != nil {
-		t.Fatalf("second create: %v", err)
-	}
-	if created {
-		t.Fatal("second CreateExclusive: created = true, want false")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !created, "second CreateExclusive: created = true, want false")
 	got, _ := os.ReadFile(path)
-	if string(got) != "mine" {
-		t.Fatalf("existing file overwritten: %q, want mine", got)
-	}
+	testassert.Require(t, string(got) == "mine", "existing file overwritten: %q, want mine", got)
 
 	// No temp file is left behind after either call.
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 || entries[0].Name() != "config.json" {
-		t.Fatalf("unexpected dir entries: %v", entries)
-	}
+	testassert.Require(t, len(entries) == 1 && entries[0].Name() == "config.json", "unexpected dir entries: %v", entries)
 }
 
 // TestPrePublicationSyncFailureRows covers both publishers with absent and
@@ -132,9 +110,7 @@ func TestPrePublicationSyncFailureRows(t *testing.T) {
 
 			if tc.present {
 				created, err := tc.publish(path, []byte("original"), 0o600)
-				if err != nil || !created {
-					t.Fatalf("seed publish: (%v, %v)", created, err)
-				}
+				testassert.Require(t, err == nil && created, "seed publish: (%v, %v)", created, err)
 			}
 
 			injected := errors.New("injected temp sync failure")
@@ -142,32 +118,20 @@ func TestPrePublicationSyncFailureRows(t *testing.T) {
 			defer func() { SyncFileFunc = nil }()
 
 			created, err := tc.publish(path, []byte("replacement"), 0o600)
-			if err == nil {
-				t.Fatal("publish succeeded; want the injected temp sync failure")
-			}
-			if created {
-				t.Fatal("created = true on a failed write")
-			}
-			if tc.wantErrPart != "" && !strings.Contains(err.Error(), tc.wantErrPart) {
-				t.Fatalf("error = %v, want a %s error", err, tc.wantErrPart)
-			}
+			testassert.Require(t, err != nil, "publish succeeded; want the injected temp sync failure")
+			testassert.Require(t, !created, "created = true on a failed write")
+			testassert.Require(t, tc.wantErrPart == "" || strings.Contains(err.Error(), tc.wantErrPart), "error = %v, want a %s error", err, tc.wantErrPart)
 
 			if tc.present {
 				got, readErr := os.ReadFile(path)
-				if readErr != nil {
-					t.Fatalf("read destination: %v", readErr)
-				}
-				if string(got) != "original" {
-					t.Fatalf("destination = %q after the failed write, want original", got)
-				}
+				testassert.Require(t, readErr == nil, "read destination: %v", readErr)
+				testassert.Require(t, string(got) == "original", "destination = %q after the failed write, want original", got)
 			} else if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 				t.Fatalf("path exists after the aborted write: %v", statErr)
 			}
 			entries, _ := os.ReadDir(dir)
 			if tc.present {
-				if len(entries) != 1 || entries[0].Name() != "rec.json" {
-					t.Fatalf("leftover entries after the aborted write: %v", entries)
-				}
+				testassert.Require(t, len(entries) == 1 && entries[0].Name() == "rec.json", "leftover entries after the aborted write: %v", entries)
 			} else if len(entries) != 0 {
 				t.Fatalf("leftover entries after the aborted write: %v", entries)
 			}
@@ -189,21 +153,14 @@ func TestWriteDirSyncFailureAfterPublicationReturnsSuccess(t *testing.T) {
 	defer func() { SyncDirFunc = nil }()
 	stderr := captureStderr(t)
 
-	if err := Write(path, []byte("data"), 0o600); err != nil {
-		t.Fatalf("Write returned %v; want nil after publication", err)
-	}
+	testassert.NoError(t, Write(path, []byte("data"), 0o600))
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("published file unreadable: %v", err)
-	}
-	if string(got) != "data" {
-		t.Fatalf("published content = %q, want data", got)
-	}
-	if len(synced) != 1 || synced[0] != dir {
-		t.Fatalf("dir syncs = %v, want [%s]", synced, dir)
-	}
-	if out := stderr(); !strings.Contains(out, "injected dir sync failure") {
-		t.Fatalf("stderr = %q, want the dir sync diagnostic", out)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(got) == "data", "published content = %q, want data", got)
+	testassert.Require(t, len(synced) == 1 && synced[0] == dir, "dir syncs = %v, want [%s]", synced, dir)
+	{
+		out := stderr()
+		testassert.Require(t, strings.Contains(out, "injected dir sync failure"), "stderr = %q, want the dir sync diagnostic", out)
 	}
 }
 
@@ -229,23 +186,16 @@ func TestCreateExclusiveDirSyncFailureAfterPublicationReturnsSuccess(t *testing.
 	stderr := captureStderr(t)
 
 	created, err := CreateExclusive(path, []byte("data"), 0o600)
-	if err != nil || !created {
-		t.Fatalf("CreateExclusive = (%v, %v); want (true, nil)", created, err)
-	}
+	testassert.Require(t, err == nil && created, "CreateExclusive = (%v, %v); want (true, nil)", created, err)
 	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("published file unreadable: %v", err)
-	}
-	if string(got) != "data" {
-		t.Fatalf("published content = %q, want data", got)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(got) == "data", "published content = %q, want data", got)
 	// The ancestors are synced before publication; the destination directory
 	// is synced after it, last.
-	if len(synced) == 0 || synced[len(synced)-1] != dir {
-		t.Fatalf("dir syncs = %v, want destination dir %s synced last", synced, dir)
-	}
-	if out := stderr(); !strings.Contains(out, "injected dir sync failure") {
-		t.Fatalf("stderr = %q, want the dir sync diagnostic", out)
+	testassert.Require(t, len(synced) != 0 && synced[len(synced)-1] == dir, "dir syncs = %v, want destination dir %s synced last", synced, dir)
+	{
+		out := stderr()
+		testassert.Require(t, strings.Contains(out, "injected dir sync failure"), "stderr = %q, want the dir sync diagnostic", out)
 	}
 }
 
@@ -258,9 +208,7 @@ func TestCreateExclusiveDirSyncFailureAfterPublicationReturnsSuccess(t *testing.
 func TestCreateExclusiveExistingPathPerformsNoDirSync(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rec.json")
-	if err := os.WriteFile(path, []byte("mine"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(path, []byte("mine"), 0o600))
 
 	dirSyncs := 0
 	SyncDirFunc = func(d string) error {
@@ -275,23 +223,13 @@ func TestCreateExclusiveExistingPathPerformsNoDirSync(t *testing.T) {
 	defer func() { SyncFileFunc = nil }()
 
 	created, err := CreateExclusive(path, []byte("theirs"), 0o600)
-	if err != nil || created {
-		t.Fatalf("CreateExclusive = (%v, %v); want (false, nil)", created, err)
-	}
-	if dirSyncs != 0 {
-		t.Fatalf("destination dir syncs = %d, want 0 (nothing was published)", dirSyncs)
-	}
-	if tempSyncs != 1 {
-		t.Fatalf("temp syncs = %d, want 1 (the temp is always synced before the link attempt)", tempSyncs)
-	}
+	testassert.Require(t, err == nil && !created, "CreateExclusive = (%v, %v); want (false, nil)", created, err)
+	testassert.Equal(t, dirSyncs, 0)
+	testassert.Equal(t, tempSyncs, 1)
 	got, _ := os.ReadFile(path)
-	if string(got) != "mine" {
-		t.Fatalf("existing file changed: %q, want mine", got)
-	}
+	testassert.Require(t, string(got) == "mine", "existing file changed: %q, want mine", got)
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 || entries[0].Name() != "rec.json" {
-		t.Fatalf("unexpected dir entries: %v", entries)
-	}
+	testassert.Require(t, len(entries) == 1 && entries[0].Name() == "rec.json", "unexpected dir entries: %v", entries)
 }
 
 // TestCreateExclusiveSyncsAncestorChainWhenCallerMadeTheDirectory proves a
@@ -305,9 +243,7 @@ func TestCreateExclusiveExistingPathPerformsNoDirSync(t *testing.T) {
 func TestCreateExclusiveSyncsAncestorChainWhenCallerMadeTheDirectory(t *testing.T) {
 	dir := t.TempDir()
 	configDir := filepath.Join(dir, "config")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(configDir, 0o700))
 	path := filepath.Join(configDir, ".env")
 
 	var synced []string
@@ -318,9 +254,7 @@ func TestCreateExclusiveSyncsAncestorChainWhenCallerMadeTheDirectory(t *testing.
 	defer func() { SyncDirFunc = nil }()
 
 	created, err := CreateExclusive(path, []byte("#OPENAI_API_KEY=\n"), 0o600)
-	if err != nil || !created {
-		t.Fatalf("CreateExclusive = (%v, %v); want (true, nil)", created, err)
-	}
+	testassert.Require(t, err == nil && created, "CreateExclusive = (%v, %v); want (true, nil)", created, err)
 
 	// Every level from the destination directory's parent upward must have
 	// been synced before publication.
@@ -332,17 +266,13 @@ func TestCreateExclusiveSyncsAncestorChainWhenCallerMadeTheDirectory(t *testing.
 				break
 			}
 		}
-		if !found {
-			t.Fatalf("ancestor %s was not synced; synced = %v", d, synced)
-		}
+		testassert.Require(t, found, "ancestor %s was not synced; synced = %v", d, synced)
 		if d == filepath.Dir(d) {
 			break
 		}
 	}
 	// The destination directory's own sync follows publication, last.
-	if len(synced) == 0 || synced[len(synced)-1] != configDir {
-		t.Fatalf("synced = %v, want destination dir %s synced last", synced, configDir)
-	}
+	testassert.Require(t, len(synced) != 0 && synced[len(synced)-1] == configDir, "synced = %v, want destination dir %s synced last", synced, configDir)
 }
 
 // TestCreateExclusiveAncestorSyncFailurePublishesNothing proves an injected
@@ -368,22 +298,15 @@ func TestCreateExclusiveAncestorSyncFailurePublishesNothing(t *testing.T) {
 	defer func() { SyncDirFunc = nil }()
 
 	created, err := CreateExclusive(path, []byte("#OPENAI_API_KEY=\n"), 0o600)
-	if err == nil {
-		t.Fatal("CreateExclusive succeeded; want the injected ancestor sync failure")
-	}
-	if !strings.Contains(err.Error(), "injected ancestor sync failure") {
-		t.Fatalf("error = %v, want the injected ancestor sync failure", err)
-	}
-	if created {
-		t.Fatal("created = true on an aborted publication")
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatalf("path exists after the aborted publication: %v", statErr)
+	testassert.Require(t, err != nil, "CreateExclusive succeeded; want the injected ancestor sync failure")
+	testassert.Require(t, strings.Contains(err.Error(), "injected ancestor sync failure"), "error = %v, want the injected ancestor sync failure", err)
+	testassert.Require(t, !created, "created = true on an aborted publication")
+	{
+		_, statErr := os.Stat(path)
+		testassert.Require(t, os.IsNotExist(statErr), "path exists after the aborted publication: %v", statErr)
 	}
 	entries, _ := os.ReadDir(filepath.Join(dir, "a", "b"))
-	if len(entries) != 0 {
-		t.Fatalf("leftover entries after the aborted publication: %v", entries)
-	}
+	testassert.Require(t, len(entries) == 0, "leftover entries after the aborted publication: %v", entries)
 	// The walk started at the destination directory's parent and stopped at
 	// the next level up, where the failure was injected.
 	if len(synced) != 2 || synced[0] != filepath.Join(dir, "a") || synced[1] != dir {
@@ -397,9 +320,7 @@ func captureStderr(t *testing.T) func() string {
 	t.Helper()
 	old := os.Stderr
 	f, err := os.CreateTemp(t.TempDir(), "stderr-*")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	os.Stderr = f
 	t.Cleanup(func() {
 		os.Stderr = old
@@ -416,27 +337,19 @@ func TestTryAcquireReportsContention(t *testing.T) {
 	lockPath := filepath.Join(dir, ".locks", "rec.lock")
 
 	held, ok, err := TryAcquire(lockPath)
-	if err != nil || !ok {
-		t.Fatalf("first TryAcquire: ok=%v err=%v, want true/nil", ok, err)
-	}
+	testassert.Require(t, err == nil && ok, "first TryAcquire: ok=%v err=%v, want true/nil", ok, err)
 
 	contender, ok, err := TryAcquire(lockPath)
-	if err != nil {
-		t.Fatalf("second TryAcquire: %v", err)
-	}
+	testassert.NoError(t, err)
 	if ok {
 		contender.Release()
 		t.Fatal("second TryAcquire acquired while first held; want contention")
 	}
 
-	if err := held.Release(); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	testassert.NoError(t, held.Release())
 
 	regained, ok, err := TryAcquire(lockPath)
-	if err != nil || !ok {
-		t.Fatalf("TryAcquire after release: ok=%v err=%v, want true/nil", ok, err)
-	}
+	testassert.Require(t, err == nil && ok, "TryAcquire after release: ok=%v err=%v, want true/nil", ok, err)
 	regained.Release()
 }
 
@@ -447,9 +360,7 @@ func TestWithLockSerializesReadModifyWrite(t *testing.T) {
 	dir := t.TempDir()
 	counter := filepath.Join(dir, "counter")
 	lockPath := filepath.Join(dir, ".locks", "counter.lock")
-	if err := os.WriteFile(counter, []byte("0"), 0o600); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(counter, []byte("0"), 0o600))
 
 	const workers = 24
 	var wg sync.WaitGroup
@@ -468,18 +379,14 @@ func TestWithLockSerializesReadModifyWrite(t *testing.T) {
 				}
 				return Write(counter, []byte(strconv.Itoa(n+1)), 0o600)
 			})
-			if err != nil {
-				t.Errorf("withlock: %v", err)
-			}
+			testassert.Check(t, err == nil, "withlock: %v", err)
 		}()
 	}
 	wg.Wait()
 
 	raw, _ := os.ReadFile(counter)
 	n, _ := strconv.Atoi(string(raw))
-	if n != workers {
-		t.Fatalf("counter = %d, want %d (lost updates)", n, workers)
-	}
+	testassert.Equal(t, n, workers)
 }
 
 // TestWithLockReportsReleaseFailureToStderr proves WithLock retains the
@@ -497,12 +404,10 @@ func TestWithLockReportsReleaseFailureToStderr(t *testing.T) {
 	stderr := captureStderr(t)
 
 	callbackErr := errors.New("callback failure")
-	err := WithLock(lockPath, func() error { return callbackErr })
-	if err != callbackErr {
-		t.Fatalf("WithLock = %v, want the callback result unchanged", err)
-	}
-	if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
-		t.Fatalf("stderr = %q, want the one exact release diagnostic", out)
+	testassert.Equal(t, WithLock(lockPath, func() error { return callbackErr }), callbackErr)
+	{
+		out := stderr()
+		testassert.Require(t, out == "lightcode: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
 	}
 }
 
@@ -517,20 +422,17 @@ func TestWithLockReleasesOnCallbackPanic(t *testing.T) {
 
 	func() {
 		defer func() {
-			if r := recover(); r == nil {
-				t.Fatal("WithLock callback did not panic")
+			{
+				r := recover()
+				testassert.Require(t, r != nil, "WithLock callback did not panic")
 			}
 		}()
 		_ = WithLock(lockPath, func() error { panic("callback panic") })
 	}()
 
 	regained, ok, err := TryAcquire(lockPath)
-	if err != nil {
-		t.Fatalf("TryAcquire after the recovered panic: %v", err)
-	}
-	if !ok {
-		t.Fatal("lock still held after a panicking WithLock callback; the release did not run")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, ok, "lock still held after a panicking WithLock callback; the release did not run")
 	regained.Release()
 }
 
@@ -548,44 +450,30 @@ func TestTryWithLockRows(t *testing.T) {
 			called = true
 			return nil
 		})
-		if !ok || err != nil {
-			t.Fatalf("TryWithLock = (%v, %v), want (true, nil)", ok, err)
-		}
-		if !called {
-			t.Fatal("callback was not invoked")
-		}
+		testassert.Require(t, ok && err == nil, "TryWithLock = (%v, %v), want (true, nil)", ok, err)
+		testassert.Require(t, called, "callback was not invoked")
 	})
 	t.Run("contention_skips_callback", func(t *testing.T) {
 		dir := t.TempDir()
 		lockPath := filepath.Join(dir, ".locks", "rec.lock")
 		held, ok, err := TryAcquire(lockPath)
-		if err != nil || !ok {
-			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-		}
+		testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 		defer held.Release()
 		called := false
 		got, err := TryWithLock(lockPath, func() error {
 			called = true
 			return nil
 		})
-		if got {
-			t.Fatal("TryWithLock acquired while the lock was held")
-		}
-		if err != nil {
-			t.Fatalf("TryWithLock contention err = %v, want nil", err)
-		}
-		if called {
-			t.Fatal("callback ran despite contention")
-		}
+		testassert.Require(t, !got, "TryWithLock acquired while the lock was held")
+		testassert.NoError(t, err)
+		testassert.Require(t, !called, "callback ran despite contention")
 	})
 	t.Run("callback_error_preserved", func(t *testing.T) {
 		dir := t.TempDir()
 		lockPath := filepath.Join(dir, ".locks", "rec.lock")
 		callbackErr := errors.New("callback failure")
 		ok, err := TryWithLock(lockPath, func() error { return callbackErr })
-		if !ok || err != callbackErr {
-			t.Fatalf("TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
-		}
+		testassert.Require(t, ok && err == callbackErr, "TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
 	})
 	t.Run("release_error_diagnostic_only", func(t *testing.T) {
 		dir := t.TempDir()
@@ -596,11 +484,10 @@ func TestTryWithLockRows(t *testing.T) {
 		stderr := captureStderr(t)
 		callbackErr := errors.New("callback failure")
 		ok, err := TryWithLock(lockPath, func() error { return callbackErr })
-		if !ok || err != callbackErr {
-			t.Fatalf("TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
-		}
-		if out := stderr(); out != "lightcode: release lock "+lockPath+": "+injected.Error()+"\n" {
-			t.Fatalf("stderr = %q, want the one exact release diagnostic", out)
+		testassert.Require(t, ok && err == callbackErr, "TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
+		{
+			out := stderr()
+			testassert.Require(t, out == "lightcode: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
 		}
 	})
 	t.Run("panic_releases", func(t *testing.T) {
@@ -608,19 +495,16 @@ func TestTryWithLockRows(t *testing.T) {
 		lockPath := filepath.Join(dir, ".locks", "rec.lock")
 		func() {
 			defer func() {
-				if r := recover(); r == nil {
-					t.Fatal("callback did not panic")
+				{
+					r := recover()
+					testassert.Require(t, r != nil, "callback did not panic")
 				}
 			}()
 			_, _ = TryWithLock(lockPath, func() error { panic("callback panic") })
 		}()
 		regained, ok, err := TryAcquire(lockPath)
-		if err != nil {
-			t.Fatalf("TryAcquire after the recovered panic: %v", err)
-		}
-		if !ok {
-			t.Fatal("lock still held after a panicking TryWithLock callback")
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, ok, "lock still held after a panicking TryWithLock callback")
 		regained.Release()
 	})
 }
@@ -672,33 +556,24 @@ func TestCrashBeforeRenameLeavesReadableOrphanTemp(t *testing.T) {
 	t.Run("write", func(t *testing.T) {
 		dir := t.TempDir()
 		dest := filepath.Join(dir, "rec.json")
-		if err := Write(dest, []byte("original"), 0o600); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
+		testassert.NoError(t, Write(dest, []byte("original"), 0o600))
 		runCrashChild(t, dir, dest, false)
 		got, err := os.ReadFile(dest)
-		if err != nil {
-			t.Fatalf("read destination: %v", err)
-		}
-		if string(got) != "original" {
-			t.Fatalf("destination = %q after the crash, want original", got)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(got) == "original", "destination = %q after the crash, want original", got)
 		orphan := readOrphan(t, dir)
-		if string(orphan) != "replacement" {
-			t.Fatalf("orphan = %q, want the complete replacement data", orphan)
-		}
+		testassert.Require(t, string(orphan) == "replacement", "orphan = %q, want the complete replacement data", orphan)
 	})
 	t.Run("create", func(t *testing.T) {
 		dir := t.TempDir()
 		dest := filepath.Join(dir, "rec.json")
 		runCrashChild(t, dir, dest, true)
-		if _, err := os.Stat(dest); !os.IsNotExist(err) {
-			t.Fatalf("destination exists after the crash: %v", err)
+		{
+			_, err := os.Stat(dest)
+			testassert.Require(t, os.IsNotExist(err), "destination exists after the crash: %v", err)
 		}
 		orphan := readOrphan(t, dir)
-		if string(orphan) != "replacement" {
-			t.Fatalf("orphan = %q, want the complete replacement data", orphan)
-		}
+		testassert.Require(t, string(orphan) == "replacement", "orphan = %q, want the complete replacement data", orphan)
 	})
 }
 
@@ -713,14 +588,10 @@ func runCrashChild(t *testing.T, dir, dest string, create bool) {
 		cmd.Env = append(cmd.Env, crashChildCreateEnv+"=1")
 	}
 	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("child stdout pipe: %v", err)
-	}
+	testassert.NoError(t, err)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
-	}
+	testassert.NoError(t, cmd.Start())
 	ready := make(chan struct{})
 	scannerDone := make(chan struct{})
 	go func() {
@@ -749,9 +620,7 @@ func runCrashChild(t *testing.T, dir, dest string, create bool) {
 	killErr := cmd.Process.Kill()
 	_ = cmd.Wait()
 	<-scannerDone
-	if killErr != nil {
-		t.Fatalf("kill child: %v", killErr)
-	}
+	testassert.Require(t, killErr == nil, "kill child: %v", killErr)
 }
 
 // readOrphan returns the single *.tmp-* orphan in dir, failing the test when
@@ -759,15 +628,9 @@ func runCrashChild(t *testing.T, dir, dest string, create bool) {
 func readOrphan(t *testing.T, dir string) []byte {
 	t.Helper()
 	orphans, err := filepath.Glob(filepath.Join(dir, "*.tmp-*"))
-	if err != nil {
-		t.Fatalf("glob orphans: %v", err)
-	}
-	if len(orphans) != 1 {
-		t.Fatalf("orphans = %v, want exactly one", orphans)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(orphans) == 1, "orphans = %v, want exactly one", orphans)
 	data, err := os.ReadFile(orphans[0])
-	if err != nil {
-		t.Fatalf("read orphan %s: %v", orphans[0], err)
-	}
+	testassert.Require(t, err == nil, "read orphan %s: %v", orphans[0], err)
 	return data
 }

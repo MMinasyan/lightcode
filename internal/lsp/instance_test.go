@@ -10,6 +10,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/lsp/protocol"
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestInstanceDiagnosticsAndReadyNotification(t *testing.T) {
@@ -25,23 +26,15 @@ func TestInstanceDiagnosticsAndReadyNotification(t *testing.T) {
 		URI:         uri,
 		Diagnostics: []protocol.Diagnostic{{Severity: &severity, Message: "bad", Range: protocol.Range{Start: protocol.Position{Line: 3}}}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	inst.handleNotification("textDocument/publishDiagnostics", params, inst.readyCh)
 	diags := inst.fileDiagnostics(uri)
-	if len(diags) != 1 || diags[0].Message != "bad" || diags[0].Range.Start.Line != 3 {
-		t.Fatalf("diagnostics = %+v", diags)
-	}
+	testassert.Require(t, len(diags) == 1 && diags[0].Message == "bad" && diags[0].Range.Start.Line == 3, "diagnostics = %+v", diags)
 
 	progress, err := json.Marshal(protocol.ProgressParams{Value: json.RawMessage(`{"kind":"end"}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, err)
 	inst.handleNotification("$/progress", progress, inst.readyCh)
-	if err := inst.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady after progress end: %v", err)
-	}
+	testassert.NoError(t, inst.waitReady(context.Background()))
 }
 
 // TestCaptureDiagnosticsNeverSamplesClearedCacheAsLive pins the capture
@@ -109,9 +102,7 @@ func TestCaptureDiagnosticsNeverSamplesClearedCacheAsLive(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if len(sample) != 1 || len(sample[0]) != 1 || sample[0][0].Message != "seeded error" {
-			t.Fatalf("iteration %d: live sample = %+v, want the seeded error or the unavailable refusal", i, sample)
-		}
+		testassert.Require(t, len(sample) == 1 && len(sample[0]) == 1 && sample[0][0].Message == "seeded error", "iteration %d: live sample = %+v, want the seeded error or the unavailable refusal", i, sample)
 	}
 }
 
@@ -125,7 +116,5 @@ func TestInstanceWaitReadyCanceledWhenStarting(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := inst.waitReady(ctx); err != context.Canceled {
-		t.Fatalf("waitReady canceled = %v, want context.Canceled", err)
-	}
+	testassert.Equal(t, inst.waitReady(ctx), context.Canceled)
 }

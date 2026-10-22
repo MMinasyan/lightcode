@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -38,26 +39,18 @@ func TestStaleOlderPageRetriesThroughTheSameReader(t *testing.T) {
 	c.mu.Unlock()
 	receive(t, transport.requests).respond(protocol.HistoryPage{SessionRevision: revision("4"), Items: inputs(1, 50)})
 	fresh := receive(t, transport.requests)
-	if !strings.HasSuffix(fresh.req.URL.Path, "/hydration") {
-		t.Fatal("stale page did not dirty hydration")
-	}
+	testassert.Require(t, strings.HasSuffix(fresh.req.URL.Path, "/hydration"), "stale page did not dirty hydration")
 	fresh.respond(h)
 	retry := receive(t, transport.requests)
-	if retry.req.URL.Query().Get("cursor") != "real-oldest" {
-		t.Fatal("stale older request lost or cursor changed")
-	}
+	testassert.Require(t, retry.req.URL.Query().Get("cursor") == "real-oldest", "stale older request lost or cursor changed")
 	c.mu.Lock()
-	if r.chain != chain || len(r.items) != 50 || r.hydration.SessionRevision.DurableRevision != "5" {
-		t.Fatal("stale page advanced view or spawned second chain")
-	}
+	testassert.Require(t, r.chain == chain && len(r.items) == 50 && r.hydration.SessionRevision.DurableRevision == "5", "stale page advanced view or spawned second chain")
 	c.mu.Unlock()
 	retry.respond(protocol.HistoryPage{SessionRevision: revision("5"), Items: inputs(1, 50)})
 	barrier(t, chain.done)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(r.items) != 100 {
-		t.Fatal("valid disjoint older page rejected")
-	}
+	testassert.Require(t, len(r.items) == 100, "valid disjoint older page rejected")
 }
 
 func TestMalformedGlobalsAndLostConversationContinuityRepairActualConnection(t *testing.T) {
@@ -116,9 +109,7 @@ func TestMalformedGlobalsAndLostConversationContinuityRepairActualConnection(t *
 				frameContaining(t, screen, "input 5")
 			}
 			write.Close()
-			if err := receive(t, done); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, receive(t, done))
 			assertNoImplicitControls(t, live)
 		})
 	}
@@ -153,9 +144,7 @@ func TestQueuedTaskMenuAndErrorCannotPublishAfterNavigation(t *testing.T) {
 			settleTasks(t, c)
 			close(blocked.release)
 			c.mu.Lock()
-			if c.menu != nil {
-				t.Fatal("queued menu survived newer selection")
-			}
+			testassert.Require(t, c.menu == nil, "queued menu survived newer selection")
 			current := c.stampLocked()
 			c.mu.Unlock()
 			c.report(current, terminal.RenderSystemMsg("current command marker"), false)
@@ -175,9 +164,7 @@ func TestRuntimeFileSuccessAndErrorAreStampedAndUseGeneratedAddress(t *testing.T
 			settledReader(t, c, transport)
 			c.command(`/runtime ReadWorkspaceFile {"body":{"workspace":"/workspace","path":"file.go"}}`)
 			old := receive(t, transport.requests)
-			if !strings.Contains(string(old.body), `"workspace":"/workspace"`) || !strings.Contains(string(old.body), `"path":"file.go"`) {
-				t.Fatal("file read omitted explicit address")
-			}
+			testassert.Require(t, strings.Contains(string(old.body), `"workspace":"/workspace"`) && strings.Contains(string(old.body), `"path":"file.go"`), "file read omitted explicit address")
 			c.selectRoot(rootB)
 			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
@@ -187,21 +174,18 @@ func TestRuntimeFileSuccessAndErrorAreStampedAndUseGeneratedAddress(t *testing.T
 				old.respond(protocol.ReadFileResult{CanonicalPath: "/workspace/stale.go", Content: "stale content", Truncated: true})
 			}
 			settleTasks(t, c)
-			if strings.Contains(outputs(c), "stale") {
-				t.Fatal("superseded viewer success/error printed")
-			}
+			testassert.Require(t, !strings.Contains(outputs(c), "stale"), "superseded viewer success/error printed")
 			c.command(`/runtime ReadWorkspaceFile {"body":{"workspace":"/workspace","path":"current.go"}}`)
 			receive(t, transport.requests).respond(protocol.ReadFileResult{CanonicalPath: "/workspace/current.go", Content: "current", Truncated: true})
 			settleTasks(t, c)
 			text := outputs(c)
-			if !strings.Contains(text, "/workspace/current.go") || !strings.Contains(text, `"truncated":true`) {
-				t.Fatal("canonical path/truncation lost")
-			}
+			testassert.Require(t, strings.Contains(text, "/workspace/current.go") && strings.Contains(text, `"truncated":true`), "canonical path/truncation lost")
 			c.command(`/runtime ReadWorkspaceFile {"body":{"workspace":"/workspace","path":"../denied"}}`)
 			receive(t, transport.requests).reject(400, protocol.Error{Code: "invalid", Message: "denied workspace path"})
 			settleTasks(t, c)
-			if text := outputs(c); !strings.Contains(text, "denied workspace path") || strings.Contains(text, "Outcome unknown") {
-				t.Fatal("denied read hidden or treated as unknown mutation")
+			{
+				text := outputs(c)
+				testassert.Require(t, strings.Contains(text, "denied workspace path") && !strings.Contains(text, "Outcome unknown"), "denied read hidden or treated as unknown mutation")
 			}
 		})
 	}
@@ -225,25 +209,19 @@ func TestForkBoundaryMenusUserOwnedCopiedRuntimeAndPlugin(t *testing.T) {
 	c.command("/fork")
 	settleTasks(t, c)
 	c.mu.Lock()
-	if len(c.menu.items) != 2 {
-		t.Fatal("non-user input became a fork boundary")
-	}
+	testassert.Require(t, len(c.menu.items) == 2, "non-user input became a fork boundary")
 	c.mu.Unlock()
 	press(c, terminal.KeyMsg{Special: terminal.KeyDown})
 	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
 	c.mu.Lock()
-	if c.menu != nil || c.forkBoundary.OperationId != nil || c.forkRewind {
-		t.Fatal("copied input invented a source restore boundary")
-	}
+	testassert.Require(t, c.menu == nil && c.forkBoundary.OperationId == nil && !c.forkRewind, "copied input invented a source restore boundary")
 	c.forkBoundary = nil
 	c.mu.Unlock()
 	c.command("/revert")
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.menu.items) != 1 || c.menu.items[0].Extra.(protocol.InputItem).OperationId == nil || r != c.root {
-		t.Fatal("copied/non-user rewind sibling admitted")
-	}
+	testassert.Require(t, len(c.menu.items) == 1 && c.menu.items[0].Extra.(protocol.InputItem).OperationId != nil && r == c.root, "copied/non-user rewind sibling admitted")
 }
 
 func TestRejectedSubmissionKeepsDraftAndDoesNotBecomeEmptySuccess(t *testing.T) {
@@ -255,14 +233,10 @@ func TestRejectedSubmissionKeepsDraftAndDoesNotBecomeEmptySuccess(t *testing.T) 
 	receive(t, transport.requests).respond(hydration(rootA, "2", inputs(1, 1), nil))
 	settleTasks(t, c)
 	c.mu.Lock()
-	if c.draft.String() != "rejected draft" {
-		t.Fatal("rejected draft cleared")
-	}
+	testassert.Require(t, c.draft.String() == "rejected draft", "rejected draft cleared")
 	c.mu.Unlock()
 	text := outputs(c)
-	if !strings.Contains(text, "server gate rejection") || strings.Contains(text, "Outcome unknown") {
-		t.Fatal("known rejection hidden/reclassified")
-	}
+	testassert.Require(t, strings.Contains(text, "server gate rejection") && !strings.Contains(text, "Outcome unknown"), "known rejection hidden/reclassified")
 }
 
 func TestChildListOldConnectionSuccessAndErrorAreSuperseded(t *testing.T) {
@@ -289,16 +263,12 @@ func TestChildListOldConnectionSuccessAndErrorAreSuperseded(t *testing.T) {
 			}
 			barrier(t, oldDone)
 			c.mu.Lock()
-			if c.menu != nil || c.conn == s.conn {
-				t.Fatal("old connection child menu published")
-			}
+			testassert.Require(t, c.menu == nil && c.conn != s.conn, "old connection child menu published")
 			fresh := c.stampLocked()
 			c.mu.Unlock()
 			c.report(fresh, terminal.RenderSystemMsg("new owner marker"), false)
 			frameContaining(t, screen, "new owner marker")
-			if strings.Contains(screen.text(), "old owner child error") {
-				t.Fatal("old-owner error published")
-			}
+			testassert.Require(t, !strings.Contains(screen.text(), "old owner child error"), "old-owner error published")
 			c.mu.Lock()
 			c.closed = true
 			c.cancel()
@@ -315,9 +285,7 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	settledReader(t, c, transport)
 	c.command("/agent planner")
 	req := receive(t, transport.requests)
-	if !strings.Contains(req.req.URL.Path, rootA) || string(req.body) != `{"agent_type":"planner"}` {
-		t.Fatalf("wrong Session Agent edit: %s %s", req.req.URL, req.body)
-	}
+	testassert.Require(t, strings.Contains(req.req.URL.Path, rootA) && string(req.body) == `{"agent_type":"planner"}`, "wrong Session Agent edit: %s %s", req.req.URL, req.body)
 	req.respond(protocol.Session{SessionId: rootA, AgentType: "planner"})
 	next := hydration(rootA, "2", inputs(1, 1), nil)
 	next.Session.AgentType = "planner"
@@ -326,9 +294,7 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	settleTasks(t, c)
 	c.command("/model provider/next")
 	req = receive(t, transport.requests)
-	if req.req.URL.Query().Get("agent_type") != "planner" || string(req.body) != `{"model":"provider/next"}` || strings.Contains(req.req.URL.Path, rootA) {
-		t.Fatalf("model was not a type-wide future edit: %s %s", req.req.URL, req.body)
-	}
+	testassert.Require(t, req.req.URL.Query().Get("agent_type") == "planner" && string(req.body) == `{"model":"provider/next"}` && !strings.Contains(req.req.URL.Path, rootA), "model was not a type-wide future edit: %s %s", req.req.URL, req.body)
 	req.respond(protocol.RevisionResponse{ConfigurationRevision: configuration("2").ConfigurationRevision})
 	next.SessionRevision = revision("3")
 	next.SelectedModel = pointer("provider/next")
@@ -342,9 +308,7 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	c.mu.Unlock()
 	frameContaining(t, screen, "captured-old")
 	text := strings.ReplaceAll(screen.text(), "\n", "")
-	if !strings.Contains(text, "Future: planner / provider/next") || !strings.Contains(text, "captured-old / captured/model") {
-		t.Fatal("future selection overwrote active capture")
-	}
+	testassert.Require(t, strings.Contains(text, "Future: planner / provider/next") && strings.Contains(text, "captured-old / captured/model"), "future selection overwrote active capture")
 	c.requestExit(nil)
 }
 
@@ -359,21 +323,21 @@ func TestCreateFailureCapturedAddressAndExplicitWorkspaceIntent(t *testing.T) {
 	c.task(func() { c.create(s) })
 	old := receive(t, transport.requests)
 	var pending protocol.CreateSessionRequest
-	if err := json.Unmarshal(old.body, &pending); err != nil || pending.Workspace != "/workspace" {
-		t.Fatalf("pending create captured %q (%v)", pending.Workspace, err)
+	{
+		err := json.Unmarshal(old.body, &pending)
+		testassert.Require(t, err == nil && pending.Workspace == "/workspace", "pending create captured %q (%v)", pending.Workspace, err)
 	}
 	c.selectWorkspace("/workspace/../different")
 	list := receive(t, transport.requests)
-	if list.req.URL.Query().Get("workspace") != "/different" {
-		t.Fatal("Workspace did not use lexical Abs")
-	}
+	testassert.Require(t, list.req.URL.Query().Get("workspace") == "/different", "Workspace did not use lexical Abs")
 	// A child-only header list leaves no eligible root: the next request is
 	// still the Create for the captured Workspace.
 	list.respond([]protocol.Session{{SessionId: childA, ParentSessionId: pointer(rootB)}})
 	newCreate := receive(t, transport.requests)
 	var sent protocol.CreateSessionRequest
-	if err := json.Unmarshal(newCreate.body, &sent); err != nil || sent.Workspace != "/different" {
-		t.Fatalf("explicit Workspace composition create = %s (%v)", newCreate.body, err)
+	{
+		err := json.Unmarshal(newCreate.body, &sent)
+		testassert.Require(t, err == nil && sent.Workspace == "/different", "explicit Workspace composition create = %s (%v)", newCreate.body, err)
 	}
 	newCreate.reject(201, protocol.Session{SessionId: rootB, Workspace: "/different", AgentType: "primary"})
 	fresh := hydration(rootB, "1", nil, nil)
@@ -384,12 +348,8 @@ func TestCreateFailureCapturedAddressAndExplicitWorkspaceIntent(t *testing.T) {
 	c.mu.Lock()
 	adopted := c.rootID == rootB
 	c.mu.Unlock()
-	if !adopted {
-		t.Fatal("an old-Workspace completion or a failed intent blocked the new explicit composition")
-	}
-	if strings.Contains(outputs(c), "Outcome unknown") {
-		t.Fatal("an old-Workspace completion published a stale local error")
-	}
+	testassert.Require(t, adopted, "an old-Workspace completion or a failed intent blocked the new explicit composition")
+	testassert.Require(t, !strings.Contains(outputs(c), "Outcome unknown"), "an old-Workspace completion published a stale local error")
 }
 
 func TestExplicitResumeCannotPromoteChildOrSubmitToItBeforeAdoption(t *testing.T) {
@@ -403,17 +363,13 @@ func TestExplicitResumeCannotPromoteChildOrSubmitToItBeforeAdoption(t *testing.T
 	c.mu.Unlock()
 	c.command("/resume " + childA)
 	destination := receive(t, transport.requests)
-	if !strings.HasSuffix(destination.req.URL.Path, "/hydration") {
-		t.Fatal("named resume did not read its destination globally")
-	}
+	testassert.Require(t, strings.HasSuffix(destination.req.URL.Path, "/hydration"), "named resume did not read its destination globally")
 	// The retained source keeps accepting explicit work while the destination is
 	// resolved, and nothing is addressed to the unadopted child.
 	setDraft(c, "forged child follow up")
 	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
 	submit := receive(t, transport.requests)
-	if !strings.Contains(submit.req.URL.Path, sourceID) {
-		t.Fatalf("follow-up addressed outside the accepted source: %s", submit.req.URL.Path)
-	}
+	testassert.Require(t, strings.Contains(submit.req.URL.Path, sourceID), "follow-up addressed outside the accepted source: %s", submit.req.URL.Path)
 	submit.respond(protocol.SubmitResult{Disposition: "admitted", Operation: &protocol.Operation{OperationId: "forged"}})
 	// The destination read's own Session record is the eligibility authority.
 	child := hydration(childA, "1", nil, nil)
@@ -421,16 +377,12 @@ func TestExplicitResumeCannotPromoteChildOrSubmitToItBeforeAdoption(t *testing.T
 	destination.respond(child)
 	settleAnswering(t, c, transport)
 	c.mu.Lock()
-	if c.rootID != sourceID || c.root != source || c.childID != "" {
-		t.Fatal("child resume promoted the child or erased the source")
-	}
+	testassert.Require(t, c.rootID == sourceID && c.root == source && c.childID == "", "child resume promoted the child or erased the source")
 	c.mu.Unlock()
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	for _, route := range transport.calls {
-		if strings.Contains(route, "/reopen") || strings.Contains(route, childA+"/submit") {
-			t.Fatalf("child root bypass %s", route)
-		}
+		testassert.Require(t, !strings.Contains(route, "/reopen") && !strings.Contains(route, childA+"/submit"), "child root bypass %s", route)
 	}
 }
 
@@ -446,9 +398,7 @@ func TestNamedResumeAdoptsCrossWorkspaceRootAndReopensArchived(t *testing.T) {
 	receive(t, transport.requests).respond(destination)
 	settleTasks(t, c)
 	c.mu.Lock()
-	if c.rootID != rootB || c.workspace != "/different" || c.root == nil {
-		t.Fatalf("cross-Workspace root resume was refused or not adopted: root=%q workspace=%q", c.rootID, c.workspace)
-	}
+	testassert.Require(t, c.rootID == rootB && c.workspace == "/different" && c.root != nil, "cross-Workspace root resume was refused or not adopted: root=%q workspace=%q", c.rootID, c.workspace)
 	c.mu.Unlock()
 	// An archived root is reopened first and its fresh hydration is then adopted.
 	c.command("/resume " + childA)
@@ -456,22 +406,16 @@ func TestNamedResumeAdoptsCrossWorkspaceRootAndReopensArchived(t *testing.T) {
 	archived.Session.Lifecycle = protocol.Archived
 	receive(t, transport.requests).respond(archived)
 	reopen := receive(t, transport.requests)
-	if !strings.HasSuffix(reopen.req.URL.Path, "/reopen") {
-		t.Fatal("archived destination did not reopen before work")
-	}
+	testassert.Require(t, strings.HasSuffix(reopen.req.URL.Path, "/reopen"), "archived destination did not reopen before work")
 	reopen.respond(protocol.Session{SessionId: childA, Lifecycle: protocol.Open})
 	// The adopted reader owns the one fresh hydration after the reopen.
 	fresh := receive(t, transport.requests)
-	if !strings.HasSuffix(fresh.req.URL.Path, "/hydration") {
-		t.Fatal("reopen did not precede the fresh destination read")
-	}
+	testassert.Require(t, strings.HasSuffix(fresh.req.URL.Path, "/hydration"), "reopen did not precede the fresh destination read")
 	fresh.respond(hydration(childA, "2", nil, nil))
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rootID != childA || c.root == nil || c.root.hydration == nil || c.root.hydration.SessionRevision.DurableRevision != "2" {
-		t.Fatal("reopened root was not adopted with its fresh read")
-	}
+	testassert.Require(t, c.rootID == childA && c.root != nil && c.root.hydration != nil && c.root.hydration.SessionRevision.DurableRevision == "2", "reopened root was not adopted with its fresh read")
 }
 
 func TestBareResumeSelectsNewestOpenRootAndKeepsSelectionWithoutAny(t *testing.T) {
@@ -487,9 +431,7 @@ func TestBareResumeSelectsNewestOpenRootAndKeepsSelectionWithoutAny(t *testing.T
 	receive(t, transport.requests).respond(hydration(rootB, "2", nil, nil))
 	settleTasks(t, c)
 	c.mu.Lock()
-	if c.rootID != rootB || c.menu != nil {
-		t.Fatalf("bare resume did not select the newest open root: root=%q menu=%v", c.rootID, c.menu)
-	}
+	testassert.Require(t, c.rootID == rootB && c.menu == nil, "bare resume did not select the newest open root: root=%q menu=%v", c.rootID, c.menu)
 	c.mu.Unlock()
 	// No available root reports the retained no-session outcome and keeps the
 	// current selection; no Session is created.
@@ -498,19 +440,13 @@ func TestBareResumeSelectsNewestOpenRootAndKeepsSelectionWithoutAny(t *testing.T
 	// The retained source stays live: its own refresh follows the failed intent.
 	settleAnsweringRequested(t, c, transport)
 	c.mu.Lock()
-	if c.rootID != rootB {
-		t.Fatalf("empty bare resume moved the selection: %q", c.rootID)
-	}
+	testassert.Equal(t, c.rootID, rootB)
 	c.mu.Unlock()
-	if !strings.Contains(outputs(c), "no active sessions") {
-		t.Fatal("no-session outcome was not reported")
-	}
+	testassert.Require(t, strings.Contains(outputs(c), "no active sessions"), "no-session outcome was not reported")
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	for _, route := range transport.calls {
-		if strings.Contains(route, "/create") || strings.Contains(route, "/archived") {
-			t.Fatalf("bare resume created a Session or consulted archived Sessions: %s", route)
-		}
+		testassert.Require(t, !strings.Contains(route, "/create") && !strings.Contains(route, "/archived"), "bare resume created a Session or consulted archived Sessions: %s", route)
 	}
 }
 
@@ -540,20 +476,14 @@ func TestFailedRootNavigationKeepsTheAcceptedSelection(t *testing.T) {
 			test.fail(receive(t, transport.requests))
 			// The retained source readers resume under the current selection.
 			resumed := receive(t, transport.requests)
-			if !strings.Contains(resumed.req.URL.Path, rootA+"/hydration") {
-				t.Fatalf("failed navigation did not resume the source read: %s", resumed.req.URL)
-			}
+			testassert.Require(t, strings.Contains(resumed.req.URL.Path, rootA+"/hydration"), "failed navigation did not resume the source read: %s", resumed.req.URL)
 			resumed.respond(hydration(rootA, "2", inputs(1, 1), nil))
 			settleTasks(t, c)
 			c.mu.Lock()
 			kept := c.root == source && c.rootID == sourceID && c.workspace == workspace && c.child == nil && c.childID == "" && c.menu == nil
 			c.mu.Unlock()
-			if !kept {
-				t.Fatal("failed navigation changed the accepted selection")
-			}
-			if !strings.Contains(outputs(c), test.note) {
-				t.Fatal("failed navigation hid its outcome")
-			}
+			testassert.Require(t, kept, "failed navigation changed the accepted selection")
+			testassert.Require(t, strings.Contains(outputs(c), test.note), "failed navigation hid its outcome")
 			press(c, terminal.KeyMsg{Rune: 'z'})
 			press(c, terminal.KeyMsg{Special: terminal.KeyUp})
 			if c.draft.String() != "input 1" {
@@ -578,12 +508,8 @@ func TestFailedRootNavigationKeepsTheAcceptedSelection(t *testing.T) {
 		settleTasks(t, c)
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.rootID != rootB {
-			t.Fatal("a superseded completion adopted over newer navigation")
-		}
-		if strings.Contains(outputs(c), "stale destination error") {
-			t.Fatal("superseded destination error printed")
-		}
+		testassert.Require(t, c.rootID == rootB, "a superseded completion adopted over newer navigation")
+		testassert.Require(t, !strings.Contains(outputs(c), "stale destination error"), "superseded destination error printed")
 	})
 }
 
@@ -599,9 +525,7 @@ func TestSourceAgentMenuCannotPublishAfterDestinationAdoption(t *testing.T) {
 	destination := receive(t, transport.requests)
 	c.command("/agent")
 	menuRead := receive(t, transport.requests)
-	if !strings.HasSuffix(menuRead.req.URL.Path, "/configuration") {
-		t.Fatalf("agent menu did not read the configuration: %s", menuRead.req.URL.Path)
-	}
+	testassert.Require(t, strings.HasSuffix(menuRead.req.URL.Path, "/configuration"), "agent menu did not read the configuration: %s", menuRead.req.URL.Path)
 	// The adopted reader's own read proves the destination published, then the
 	// menu task completes afterwards.
 	destination.respond(hydration(rootB, "2", nil, nil))
@@ -611,12 +535,7 @@ func TestSourceAgentMenuCannotPublishAfterDestinationAdoption(t *testing.T) {
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.menu != nil {
-		t.Fatalf("source agent menu published after destination adoption: %+v", c.menu)
-	}
-	if c.rootID != rootB || c.root == nil {
-		t.Fatalf("destination was not adopted: root=%q", c.rootID)
-	}
+	testassert.Require(t, c.menu == nil && c.rootID == rootB && c.root != nil, "source agent menu published after destination adoption: %+v; destination was not adopted: root=%q", c.menu, c.rootID)
 }
 
 func TestSourceForkCompletionCannotReplaceAdoptedDestination(t *testing.T) {
@@ -629,14 +548,10 @@ func TestSourceForkCompletionCannotReplaceAdoptedDestination(t *testing.T) {
 	c.forkBoundary = &protocol.InputItem{ItemId: "boundary"}
 	a, err := c.formAttemptLocked("ForkSession", "fork-op")
 	c.mu.Unlock()
-	if err != nil {
-		t.Fatalf("fork attempt: %v", err)
-	}
+	testassert.NoError(t, err)
 	c.task(func() { c.runAttempt(a.id) })
 	fork := receive(t, transport.requests)
-	if !strings.HasSuffix(fork.req.URL.Path, "/fork") {
-		t.Fatalf("fork attempt did not fork: %s", fork.req.URL.Path)
-	}
+	testassert.Require(t, strings.HasSuffix(fork.req.URL.Path, "/fork"), "fork attempt did not fork: %s", fork.req.URL.Path)
 	// The adopted reader's own read proves the destination published, then the
 	// source Fork completes afterwards.
 	destination.respond(hydration(rootB, "2", nil, nil))
@@ -646,14 +561,10 @@ func TestSourceForkCompletionCannotReplaceAdoptedDestination(t *testing.T) {
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rootID != rootB || c.root == nil {
-		t.Fatalf("source Fork completion replaced the adopted destination: root=%q", c.rootID)
-	}
+	testassert.Require(t, c.rootID == rootB && c.root != nil, "source Fork completion replaced the adopted destination: root=%q", c.rootID)
 	// The attempt's own outcome and identity survive.
 	settled := c.attempts["fork-op"]
-	if settled == nil || settled.outcome != "accepted" || settled.session != rootA {
-		t.Fatalf("fork outcome/identity lost: %+v", settled)
-	}
+	testassert.Require(t, settled != nil && settled.outcome == "accepted" && settled.session == rootA, "fork outcome/identity lost: %+v", settled)
 }
 
 func TestFailedResumeLeavesTheSourceLiveUnderAHeldHydration(t *testing.T) {
@@ -674,16 +585,12 @@ func TestFailedResumeLeavesTheSourceLiveUnderAHeldHydration(t *testing.T) {
 	destination.reject(404, protocol.Error{Code: "not_found", Message: "no such session"})
 	held.respond(hydration(rootA, "2", inputs(1, 1), nil))
 	fresh := receive(t, transport.requests)
-	if !strings.Contains(fresh.req.URL.Path, rootA) || !strings.HasSuffix(fresh.req.URL.Path, "/hydration") {
-		t.Fatalf("the retained source did not resume reading: %s", fresh.req.URL.Path)
-	}
+	testassert.Require(t, strings.Contains(fresh.req.URL.Path, rootA) && strings.HasSuffix(fresh.req.URL.Path, "/hydration"), "the retained source did not resume reading: %s", fresh.req.URL.Path)
 	fresh.respond(hydration(rootA, "3", inputs(1, 1), nil))
 	settleTasks(t, c)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rootID != rootA || c.root == nil || c.root.hydration == nil || c.root.hydration.SessionRevision.DurableRevision != "3" {
-		t.Fatal("the retained source was left stale after a failed resume")
-	}
+	testassert.Require(t, c.rootID == rootA && c.root != nil && c.root.hydration != nil && c.root.hydration.SessionRevision.DurableRevision == "3", "the retained source was left stale after a failed resume")
 }
 
 func TestRuntimeCurrentRetainedSnapshotsAndPartialRestoreRemainReachable(t *testing.T) {
@@ -691,34 +598,22 @@ func TestRuntimeCurrentRetainedSnapshotsAndPartialRestoreRemainReachable(t *test
 	settledReader(t, c, transport)
 	c.command(`/runtime GetSessionCodeSnapshots {"session_id":"` + rootA + `"}`)
 	current := receive(t, transport.requests)
-	if !strings.Contains(current.req.URL.Path, rootA) {
-		t.Fatal("current snapshots did not address Session")
-	}
+	testassert.Require(t, strings.Contains(current.req.URL.Path, rootA), "current snapshots did not address Session")
 	current.respond([]protocol.CodeSnapshotGroup{{OperationId: "owned-operation", GroupItemId: "group", Files: []protocol.SnapshotFile{}}})
 	settleTasks(t, c)
-	if !strings.Contains(outputs(c), "owned-operation") {
-		t.Fatal("Operation snapshot boundary dropped")
-	}
+	testassert.Require(t, strings.Contains(outputs(c), "owned-operation"), "Operation snapshot boundary dropped")
 	c.command(`/runtime GetRetainedCodeSnapshots {"query":{"workspace":"/workspace","session_id":"1234abcd"}}`)
 	retained := receive(t, transport.requests)
-	if retained.req.URL.Query().Get("workspace") != "/workspace" || retained.req.URL.Query().Get("session_id") != "1234abcd" {
-		t.Fatal("retained snapshot address changed")
-	}
+	testassert.Require(t, retained.req.URL.Query().Get("workspace") == "/workspace" && retained.req.URL.Query().Get("session_id") == "1234abcd", "retained snapshot address changed")
 	retained.respond(protocol.RetainedTurns{Turns: []protocol.RetainedTurn{{Turn: 7, Files: []protocol.SnapshotFile{}}}})
 	settleTasks(t, c)
-	if !strings.Contains(outputs(c), "retained snapshot boundaries") {
-		t.Fatal("retained boundary labelled as conversation turn")
-	}
+	testassert.Require(t, strings.Contains(outputs(c), "retained snapshot boundaries"), "retained boundary labelled as conversation turn")
 	c.command(`/runtime RevertRetainedCode {"body":{"workspace":"/workspace","session_id":"1234abcd","after_turn":7}}`)
 	restore := receive(t, transport.requests)
-	if !strings.Contains(string(restore.body), `"after_turn":7`) {
-		t.Fatal("retained restore boundary rewritten")
-	}
+	testassert.Require(t, strings.Contains(string(restore.body), `"after_turn":7`), "retained restore boundary rewritten")
 	restore.reject(409, protocol.CodeRevertResult{Restored: []string{"one.go"}, Skipped: []protocol.SkippedFile{{Path: "two.go", Reason: "changed"}}, Error: &protocol.Error{Code: "conflict", Message: "partial restore"}})
 	receive(t, transport.requests).respond(hydration(rootA, "2", inputs(1, 1), nil))
 	settleTasks(t, c)
 	text := outputs(c)
-	if !strings.Contains(text, "one.go") || !strings.Contains(text, "two.go") || !strings.Contains(text, "partial restore") {
-		t.Fatal("/runtime dropped complete partial restore")
-	}
+	testassert.Require(t, strings.Contains(text, "one.go") && strings.Contains(text, "two.go") && strings.Contains(text, "partial restore"), "/runtime dropped complete partial restore")
 }

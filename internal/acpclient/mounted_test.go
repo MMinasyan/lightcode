@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientops"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -32,11 +33,10 @@ const mountedAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"
 
 func writeServiceFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create config directory: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
 }
 
@@ -46,9 +46,7 @@ func writeServiceFile(t *testing.T, path, content string) {
 func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join("..", "..", "internal", "catalog", "builtin"))
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -83,12 +81,11 @@ func newMountedRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string, 
 	writeServiceFile(t, configPath, fmt.Sprintf(mountedConfigDocument, baseURL))
 	writeServiceFile(t, agents.PathForConfig(configPath), mountedAgentsDocument)
 	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
-	if err != nil {
-		t.Fatalf("runtime.Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() {
-		if err := r.Close(context.Background()); err != nil {
-			t.Errorf("runtime.Close: %v", err)
+		{
+			err := r.Close(context.Background())
+			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
 	return r, dataDir, configPath
@@ -162,27 +159,19 @@ func TestACPMountedRuntimeDepartureKeepsAcceptedWork(t *testing.T) {
 	model := newParkedModel(t)
 	owner, dataDir, configPath := newMountedRuntime(t, model.URL)
 	ps, err := owner.OpenProtocol(context.Background())
-	if err != nil {
-		t.Fatalf("OpenProtocol: %v", err)
-	}
+	testassert.NoError(t, err)
 	record := filepath.Join(dataDir, "runtime.json")
-	if err := ps.PublishDiscovery(record); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, ps.PublishDiscovery(record))
 	workspace := t.TempDir()
 	direct, err := client.Connect(context.Background(), record)
-	if err != nil {
-		t.Fatalf("direct connect: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	b := startMountedBridge(t, dataDir, configPath, workspace)
 	initialized := b.call(t, "1", "initialize", "")
 	var description struct {
 		Runtime protocol.Health `json:"runtime"`
 	}
-	if err := json.Unmarshal([]byte(resultOf(t, initialized)), &description); err != nil {
-		t.Fatalf("initialize result: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(resultOf(t, initialized)), &description))
 	if description.Runtime.InstanceId != direct.InstanceID() {
 		t.Fatalf("initialize runtime instance = %q, want the mounted owner %q", description.Runtime.InstanceId, direct.InstanceID())
 	}
@@ -203,18 +192,12 @@ func TestACPMountedRuntimeDepartureKeepsAcceptedWork(t *testing.T) {
 
 	// The host departs while its accepted work is parked in the model.
 	b.eof()
-	if err := b.awaitRun(t); err != nil {
-		t.Fatalf("Run after EOF = %v, want nil", err)
-	}
-	if model.wasCanceled() {
-		t.Fatal("the departing bridge canceled the accepted model work")
-	}
+	testassert.NoError(t, b.awaitRun(t))
+	testassert.Require(t, !model.wasCanceled(), "the departing bridge canceled the accepted model work")
 
 	model.unblock()
 	awaitOperationSuccess(t, direct, session.SessionID, "op-depart")
-	if model.wasCanceled() {
-		t.Fatal("the accepted model work was canceled during settlement")
-	}
+	testassert.Require(t, !model.wasCanceled(), "the accepted model work was canceled during settlement")
 }
 
 // awaitOperationSuccess polls the real owner's hydration until the operation
@@ -225,21 +208,15 @@ func awaitOperationSuccess(t *testing.T, c *client.Client, sessionID, operationI
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		raw, err := clientops.Call(context.Background(), c, "GetSessionHydration", params)
-		if err != nil {
-			t.Fatalf("GetSessionHydration: %v", err)
-		}
+		testassert.NoError(t, err)
 		var hydration protocol.Hydration
-		if err := json.Unmarshal(raw, &hydration); err != nil {
-			t.Fatalf("hydration: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(raw, &hydration))
 		for _, operation := range hydration.Operations {
 			if operation.OperationId == operationID && operation.Status == protocol.OperationStatusSuccess {
 				return
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("operation %s never reached success: %s", operationID, raw)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "operation %s never reached success: %s", operationID, raw)
 		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -72,9 +73,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 
 		firstToken := first.await("acquired", "owned")
 		secondToken := second.await("acquired", "owned")
-		if (firstToken == "owned") == (secondToken == "owned") {
-			t.Fatalf("contender dispositions = (%q, %q), want exactly one owner and one ErrOwned loser", firstToken, secondToken)
-		}
+		testassert.Require(t, (firstToken == "owned") != (secondToken == "owned"), "contender dispositions = (%q, %q), want exactly one owner and one ErrOwned loser", firstToken, secondToken)
 		winner, loser := first, second
 		winnerMarker, loserMarker := firstMarker, secondMarker
 		if firstToken == "owned" {
@@ -85,25 +84,27 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		if err := loser.awaitExit(); err != nil {
 			t.Fatalf("losing contender exit: %v output=%q", err, loser.log.text())
 		}
-		if _, err := os.Stat(winnerMarker); err != nil {
-			t.Fatalf("the winner's Runtime factory marker: %v", err)
+		{
+			_, err := os.Stat(winnerMarker)
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(loserMarker); !os.IsNotExist(err) {
-			t.Fatalf("the losing contender invoked a factory: marker stat error = %v", err)
+		{
+			_, err := os.Stat(loserMarker)
+			testassert.Require(t, os.IsNotExist(err), "the losing contender invoked a factory: marker stat error = %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(dataDir, "lightcode.db")); err != nil {
-			t.Fatalf("the winner's SQLite derivation under the data root: %v", err)
+		{
+			_, err := os.Stat(filepath.Join(dataDir, "lightcode.db"))
+			testassert.NoError(t, err)
 		}
 
 		record := readDiscoveryRecord(t, recordPath)
 		health := healthSnapshot(t, record)
-		if health.InstanceId != record.InstanceId || health.ProtocolVersion != protocol.N2 {
-			t.Fatalf("authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
-		}
+		testassert.Require(t, health.InstanceId == record.InstanceId && health.ProtocolVersion == protocol.N2, "authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
 
 		winner.shutdown()
-		if after := readDiscoveryBytes(t, recordPath); after != nil {
-			t.Fatalf("the record survived managed shutdown (%d bytes)", len(after))
+		{
+			after := readDiscoveryBytes(t, recordPath)
+			testassert.Require(t, after == nil, "the record survived managed shutdown (%d bytes)", len(after))
 		}
 		e.assertLockReleased(t)
 	})
@@ -116,17 +117,18 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		dead := readDiscoveryRecord(t, recordPath)
 		before := readDiscoveryBytes(t, recordPath)
 
-		if err := first.cmd.Process.Kill(); err != nil {
-			t.Fatalf("kill the first owner: %v", err)
+		testassert.NoError(t, first.cmd.Process.Kill())
+		{
+			err := first.awaitExit()
+			testassert.Require(t, err != nil, "the hard-killed owner reported success")
 		}
-		if err := first.awaitExit(); err == nil {
-			t.Fatal("the hard-killed owner reported success")
+		{
+			_, err := os.Stat(recordPath)
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(recordPath); err != nil {
-			t.Fatalf("the hard-killed owner's record disappeared: %v", err)
-		}
-		if err := probeHealth(dead.Endpoint, dead.Credential); err == nil {
-			t.Fatal("the health probe to the dead owner's endpoint succeeded")
+		{
+			err := probeHealth(dead.Endpoint, dead.Credential)
+			testassert.Require(t, err != nil, "the health probe to the dead owner's endpoint succeeded")
 		}
 
 		incumbent := startDiscoveryChild(t, e.home, dataDir, recordPath, filepath.Join(t.TempDir(), "marker"), discoveryModeHold)
@@ -137,19 +139,20 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		if err := contender.awaitExit(); err != nil {
 			t.Fatalf("contender exit: %v output=%q", err, contender.log.text())
 		}
-		if _, err := os.Stat(contenderMarker); !os.IsNotExist(err) {
-			t.Fatalf("the contender invoked a factory over a dead record: marker stat error = %v", err)
+		{
+			_, err := os.Stat(contenderMarker)
+			testassert.Require(t, os.IsNotExist(err), "the contender invoked a factory over a dead record: marker stat error = %v", err)
 		}
-		if err := incumbent.alive(); err != nil {
-			t.Fatalf("the incumbent died after the contender attempt: %v", err)
-		}
-		if after := readDiscoveryBytes(t, recordPath); !bytes.Equal(after, before) {
-			t.Fatalf("the dead record changed across the contender attempt")
+		testassert.NoError(t, incumbent.alive())
+		{
+			after := readDiscoveryBytes(t, recordPath)
+			testassert.Require(t, bytes.Equal(after, before), "the dead record changed across the contender attempt")
 		}
 
 		incumbent.shutdown()
-		if after := readDiscoveryBytes(t, recordPath); !bytes.Equal(after, before) {
-			t.Fatalf("the incumbent shutdown changed a record it never published")
+		{
+			after := readDiscoveryBytes(t, recordPath)
+			testassert.Require(t, bytes.Equal(after, before), "the incumbent shutdown changed a record it never published")
 		}
 	})
 
@@ -163,9 +166,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		record := readDiscoveryRecord(t, recordPath)
 		before := readDiscoveryBytes(t, recordPath)
 		first := healthSnapshot(t, record)
-		if first.InstanceId != record.InstanceId || first.ProtocolVersion == "" || first.ProtocolVersion == protocol.N2 {
-			t.Fatalf("incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
-		}
+		testassert.Require(t, first.InstanceId == record.InstanceId && first.ProtocolVersion != "" && first.ProtocolVersion != protocol.N2, "incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
 
 		contenderMarker := filepath.Join(t.TempDir(), "marker")
 		contender := startDiscoveryChild(t, e.home, dataDir, recordPath, contenderMarker, discoveryModeOwner)
@@ -173,23 +174,22 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		if err := contender.awaitExit(); err != nil {
 			t.Fatalf("contender exit: %v output=%q", err, contender.log.text())
 		}
-		if _, err := os.Stat(contenderMarker); !os.IsNotExist(err) {
-			t.Fatalf("the contender invoked a factory over an incompatible live record: marker stat error = %v", err)
+		{
+			_, err := os.Stat(contenderMarker)
+			testassert.Require(t, os.IsNotExist(err), "the contender invoked a factory over an incompatible live record: marker stat error = %v", err)
 		}
-		if after := readDiscoveryBytes(t, recordPath); !bytes.Equal(after, before) {
-			t.Fatalf("the incompatible record changed across the contender attempt")
+		{
+			after := readDiscoveryBytes(t, recordPath)
+			testassert.Require(t, bytes.Equal(after, before), "the incompatible record changed across the contender attempt")
 		}
-		if err := owner.alive(); err != nil {
-			t.Fatalf("the incumbent died after the contender attempt: %v", err)
-		}
+		testassert.NoError(t, owner.alive())
 		second := healthSnapshot(t, record)
-		if second.InstanceId != first.InstanceId || second.ProtocolVersion != first.ProtocolVersion {
-			t.Fatalf("the incumbent health changed after the contender attempt: %s/%s -> %s/%s", first.InstanceId, first.ProtocolVersion, second.InstanceId, second.ProtocolVersion)
-		}
+		testassert.Require(t, second.InstanceId == first.InstanceId && second.ProtocolVersion == first.ProtocolVersion, "the incumbent health changed after the contender attempt: %s/%s -> %s/%s", first.InstanceId, first.ProtocolVersion, second.InstanceId, second.ProtocolVersion)
 
 		owner.shutdown()
-		if after := readDiscoveryBytes(t, recordPath); after != nil {
-			t.Fatalf("the record survived managed shutdown (%d bytes)", len(after))
+		{
+			after := readDiscoveryBytes(t, recordPath)
+			testassert.Require(t, after == nil, "the record survived managed shutdown (%d bytes)", len(after))
 		}
 	})
 
@@ -198,9 +198,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 			e, dataDir := newDiscoveryRoot(t)
 			recordPath := filepath.Join(t.TempDir(), "discovery.json")
 			child := startDiscoveryChild(t, e.home, dataDir, recordPath, filepath.Join(t.TempDir(), "marker"), discoveryModeUnready)
-			if token := child.await("refused", "published"); token != "refused" {
-				t.Fatalf("publication while readiness reported an incompatible version = %q, want the refusal", token)
-			}
+			testassert.Equal(t, child.await("refused", "published"), "refused")
 			refuseDiscovery(t, recordPath)
 			child.shutdown()
 			refuseDiscovery(t, recordPath)
@@ -209,9 +207,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 			e, dataDir := newDiscoveryRoot(t)
 			recordPath := filepath.Join(t.TempDir(), "discovery.json")
 			child := startDiscoveryChild(t, e.home, dataDir, recordPath, filepath.Join(t.TempDir(), "marker"), discoveryModeCancel)
-			if token := child.await("refused", "published"); token != "refused" {
-				t.Fatalf("publication after cancellation during readiness = %q, want the refusal", token)
-			}
+			testassert.Equal(t, child.await("refused", "published"), "refused")
 			refuseDiscovery(t, recordPath)
 			child.shutdown()
 			refuseDiscovery(t, recordPath)
@@ -280,19 +276,13 @@ func runDiscoveryChild(t *testing.T, dataDir string) {
 		fmt.Println("owned")
 		return
 	}
-	if err != nil {
-		t.Fatalf("discovery child open: %v", err)
-	}
+	testassert.NoError(t, err)
 	ps, err := r.OpenProtocol(context.Background())
-	if err != nil {
-		t.Fatalf("discovery child OpenProtocol: %v", err)
-	}
+	testassert.NoError(t, err)
 	fmt.Println("acquired")
 	switch mode {
 	case discoveryModeOwner, discoveryModeIncompatible:
-		if err := ps.PublishDiscovery(recordPath); err != nil {
-			t.Fatalf("discovery child PublishDiscovery: %v", err)
-		}
+		testassert.NoError(t, ps.PublishDiscovery(recordPath))
 		fmt.Println("published")
 		if mode == discoveryModeIncompatible {
 			ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "1")
@@ -303,8 +293,9 @@ func runDiscoveryChild(t *testing.T, dataDir string) {
 		// publishes nothing, leaving any existing record untouched.
 	case discoveryModeUnready:
 		ps.server.Handler = incompatibleHealthHandler(ps, ps.server.Handler, "1")
-		if err := ps.PublishDiscovery(recordPath); err == nil {
-			t.Fatal("publication succeeded while authenticated health reported an incompatible version")
+		{
+			err := ps.PublishDiscovery(recordPath)
+			testassert.Require(t, err != nil, "publication succeeded while authenticated health reported an incompatible version")
 		}
 		refuseDiscovery(t, recordPath)
 		fmt.Println("refused")
@@ -316,9 +307,7 @@ func runDiscoveryChild(t *testing.T, dataDir string) {
 		t.Fatalf("unknown discovery child mode %q", mode)
 	}
 	_, _ = io.Copy(io.Discard, os.Stdin)
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("discovery child Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	fmt.Println("closed")
 }
 
@@ -353,15 +342,14 @@ func cancelDuringReadiness(t *testing.T, ps *ProtocolServer, r *Runtime) {
 	}
 	r.cancelWork()
 	close(gate)
-	if err := <-publishDone; err == nil {
-		t.Fatal("publication succeeded after cancellation during readiness")
+	{
+		err := <-publishDone
+		testassert.Require(t, err != nil, "publication succeeded after cancellation during readiness")
 	}
 	ps.pubMu.Lock()
 	remembered := ps.discoveryPath
 	ps.pubMu.Unlock()
-	if remembered != "" {
-		t.Fatalf("canceled publication remembered path %q", remembered)
-	}
+	testassert.Equal(t, remembered, "")
 }
 
 // incompatibleHealthHandler is a test-only native handler wrapper: an
@@ -391,8 +379,9 @@ func incompatibleHealthHandler(ps *ProtocolServer, original http.Handler, versio
 // refuseDiscovery proves no usable discovery record exists at the path.
 func refuseDiscovery(t *testing.T, path string) {
 	t.Helper()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("refused publication left a record at %s: %v", path, err)
+	{
+		_, err := os.Stat(path)
+		testassert.Require(t, os.IsNotExist(err), "refused publication left a record at %s: %v", path, err)
 	}
 }
 
@@ -402,30 +391,20 @@ func refuseDiscovery(t *testing.T, path string) {
 func readDiscoveryRecord(t *testing.T, path string) discoveryRecord {
 	t.Helper()
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat discovery record: %v", err)
-	}
+	testassert.NoError(t, err)
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("discovery record mode = %o, want 0600", info.Mode().Perm())
 	}
 	data := readDiscoveryBytes(t, path)
 	var record discoveryRecord
-	if err := decodeOneDocument(data, &record); err != nil {
-		t.Fatalf("decode discovery record at %s: %v", path, err)
+	{
+		err := decodeOneDocument(data, &record)
+		testassert.Require(t, err == nil, "decode discovery record at %s: %v", path, err)
 	}
-	if record.ProtocolVersion != string(protocol.N2) {
-		t.Fatalf("discovery record protocol version = %q, want %q", record.ProtocolVersion, protocol.N2)
-	}
-	if len(record.InstanceId) != 32 || strings.Trim(record.InstanceId, "0123456789abcdef") != "" {
-		t.Fatalf("discovery instance %q is not 32 lowercase hex", record.InstanceId)
-	}
-	if len(record.Credential) != 64 || strings.Trim(record.Credential, "0123456789abcdef") != "" {
-		t.Fatal("discovery credential is not 64 lowercase hex")
-	}
+	testassert.Require(t, record.ProtocolVersion == string(protocol.N2) && len(record.InstanceId) == 32 && strings.Trim(record.InstanceId, "0123456789abcdef") == "", "discovery record protocol version = %q, want %q; discovery instance %q is not 32 lowercase hex", record.ProtocolVersion, protocol.N2, record.InstanceId)
+	testassert.Require(t, len(record.Credential) == 64 && strings.Trim(record.Credential, "0123456789abcdef") == "", "discovery credential is not 64 lowercase hex")
 	endpoint, err := url.Parse(record.Endpoint)
-	if err != nil || endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" || endpoint.Port() == "" {
-		t.Fatalf("discovery endpoint %q is not an http loopback host:port", record.Endpoint)
-	}
+	testassert.Require(t, err == nil && endpoint.Scheme == "http" && endpoint.Hostname() == "127.0.0.1" && endpoint.Port() != "", "discovery endpoint %q is not an http loopback host:port", record.Endpoint)
 	return record
 }
 
@@ -450,15 +429,12 @@ func healthSnapshot(t *testing.T, record discoveryRecord) protocol.Health {
 	resp := rawProtocol(t, http.MethodGet, record.Endpoint+"/v1/health", record.Credential, "")
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read health body: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("health status = %d body=%q, want 200", resp.StatusCode, body)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, resp.StatusCode == http.StatusOK, "health status = %d body=%q, want 200", resp.StatusCode, body)
 	var health protocol.Health
-	if err := decodeOneDocument(body, &health); err != nil {
-		t.Fatalf("decode health body %q: %v", body, err)
+	{
+		err := decodeOneDocument(body, &health)
+		testassert.Require(t, err == nil, "decode health body %q: %v", body, err)
 	}
 	return health
 }
@@ -509,18 +485,12 @@ func startDiscoveryChild(t *testing.T, home, dataDir, record, marker, mode strin
 		discoveryChildModeEnv+"="+mode,
 	)
 	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("discovery child StdinPipe: %v", err)
-	}
+	testassert.NoError(t, err)
 	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("discovery child StdoutPipe: %v", err)
-	}
+	testassert.NoError(t, err)
 	log := &discoveryLog{}
 	cmd.Stderr = log
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("discovery child Start: %v", err)
-	}
+	testassert.NoError(t, cmd.Start())
 	c := &discoveryChild{
 		t: t, cmd: cmd, stdin: stdin,
 		tokens: make(chan string, 64),

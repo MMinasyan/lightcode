@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestManagedEnvCrossInstanceOperations proves two independent managers (as
@@ -34,44 +36,40 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 		key := k
 		go func() {
 			defer wg.Done()
-			if err := newMgr().Set(key, "v-"+key); err != nil {
-				t.Errorf("Set %s: %v", key, err)
+			{
+				err := newMgr().Set(key, "v-"+key)
+				testassert.Check(t, err == nil, "Set %s: %v", key, err)
 			}
 		}()
 	}
 	wg.Wait()
 
 	present, _, err := ReadDotEnvKeys(envPath)
-	if err != nil {
-		t.Fatalf("ReadDotEnvKeys: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, k := range keys {
-		if _, ok := present[k]; !ok {
-			t.Fatalf("key %s lost from .env; present=%v", k, present)
+		{
+			_, ok := present[k]
+			testassert.Require(t, ok, "key %s lost from .env; present=%v", k, present)
 		}
 	}
 
 	// A managed key is removed.
 	remover := newMgr()
 	remover.managed[keys[0]] = struct{}{}
-	if err := remover.Remove(keys[0]); err != nil {
-		t.Fatalf("Remove managed: %v", err)
-	}
+	testassert.NoError(t, remover.Remove(keys[0]))
 	present, _, _ = ReadDotEnvKeys(envPath)
-	if _, ok := present[keys[0]]; ok {
-		t.Fatalf("removed key %s still present", keys[0])
+	{
+		_, ok := present[keys[0]]
+		testassert.Require(t, !ok, "removed key %s still present", keys[0])
 	}
 
 	// An unmanaged removal (fresh manager does not own the key) is a no-op.
 	before, _, _ := ReadDotEnvKeys(envPath)
-	if err := newMgr().Remove(keys[1]); err != nil {
-		t.Fatalf("Remove unmanaged: %v", err)
-	}
+	testassert.NoError(t, newMgr().Remove(keys[1]))
 	after, _, _ := ReadDotEnvKeys(envPath)
-	if len(before) != len(after) {
-		t.Fatalf("unmanaged removal changed the file: %v -> %v", before, after)
-	}
-	if _, ok := after[keys[1]]; !ok {
-		t.Fatalf("unmanaged key %s wrongly removed", keys[1])
+	testassert.Require(t, len(before) == len(after), "unmanaged removal changed the file: %v -> %v", before, after)
+	{
+		_, ok := after[keys[1]]
+		testassert.Require(t, ok, "unmanaged key %s wrongly removed", keys[1])
 	}
 }

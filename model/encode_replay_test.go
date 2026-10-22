@@ -3,6 +3,8 @@ package model
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // keptAssistant returns a same-source assistant message with an optional tool call.
@@ -24,9 +26,7 @@ func keptAssistant(t *testing.T, source ModelRef, withCall bool) Message {
 func withExtra(t *testing.T, in Message, key string) Message {
 	in.Extra = Extra{key: json.RawMessage(`"kept"`)} // re-run construction so ownership/clone rules match production paths for every fixture in this file (NewMessage deep-copies extras at its accepting boundary).
 	out, err := NewMessage(in)
-	if err != nil {
-		t.Fatalf("NewMessage with extra %q failed: %v", key, err)
-	}
+	testassert.Require(t, err == nil, "NewMessage with extra %q failed: %v", key, err)
 	return out
 }
 
@@ -55,8 +55,10 @@ func TestReplayPolicyMatrix(t *testing.T) {
 
 			body := mustEncode(t, rt, Request{Messages: []Message{msg}})
 			objs := decodeMessages(t, body) // exactly one message for this fixture on every row.
-			if _, ok := objs[0]["marker"]; (ok && !tc.wantKeep) || (!ok && tc.wantKeep) {
-				t.Fatalf("marker present=%v want keep=%v: %#v", ok, tc.wantKeep, objs[0]) // wire presence is the whole observable policy outcome here.
+			// wire presence is the whole observable policy outcome here.
+			{
+				_, ok := objs[0]["marker"]
+				testassert.Require(t, (!ok || tc.wantKeep) && (ok || !tc.wantKeep), "marker present=%v want keep=%v: %#v", ok, tc.wantKeep, objs[0])
 			}
 		})
 	}
@@ -86,50 +88,53 @@ func TestTargetDropSetAppliesAtEveryRetainedScope(t *testing.T) {
 			}
 
 			call, err := NewToolCall(ToolCall{ID: "c-drop", Name: "lookup", Arguments: json.RawMessage(`{}`), Extra: Extra{"drop_me": json.RawMessage(`3`), "keep_me": json.RawMessage(`4`)}})
-			if err != nil {
-				t.Fatalf("NewToolCall(drop-scope fixture): %v", err)
-			}
+			testassert.NoError(t, err)
 
 			msg.ToolCalls = append(msg.ToolCalls, call)
 
 			msg.Extra["keep_me"] = json.RawMessage(`"m-kept"`)
 			validated, err := NewMessage(msg)
-			if err != nil {
-				t.Fatalf("NewMessage(drop-scope message): %v", err)
-			}
+			testassert.NoError(t, err)
 
 			body := mustEncode(t, rtRow, Request{Messages: []Message{validated}})
 			msgs := decodeMessages(t, body)
 			obj := msgs[0]
 
-			if _, ok := obj["drop_me"]; ok {
-				t.Fatalf("dropped message-scope key survived onto the wire: %#v", obj)
+			{
+				_, ok := obj["drop_me"]
+				testassert.Require(t, !ok, "dropped message-scope key survived onto the wire: %#v", obj)
 			}
 
-			if _, ok := wireString(t, obj, "keep_me"); !ok {
-				t.Fatalf("non-dropped message-scope key lost during drop-set application: %#v", obj)
+			{
+				_, ok := wireString(t, obj, "keep_me")
+				testassert.Require(t, ok, "non-dropped message-scope key lost during drop-set application: %#v", obj)
 			}
 
 			parts := unmarshalContentParts(t, obj)
-			if _, ok := parts[0]["drop_me"]; ok {
-				t.Fatalf("dropped content-part-scope key survived onto the wire: %#v", parts[0])
+			{
+				_, ok := parts[0]["drop_me"]
+				testassert.Require(t, !ok, "dropped content-part-scope key survived onto the wire: %#v", parts[0])
 			}
 
-			if _, ok := parts[0]["keep_me"]; !ok {
-				t.Fatalf("non-dropped content-part-scope key lost during drop-set application: %#v", parts[0])
+			{
+				_, ok := parts[0]["keep_me"]
+				testassert.Require(t, ok, "non-dropped content-part-scope key lost during drop-set application: %#v", parts[0])
 			}
 
 			var calls []map[string]json.RawMessage
-			if err := json.Unmarshal(obj["tool_calls"], &calls); err != nil || len(calls) != 1 {
-				t.Fatalf("tool_calls not a one-object array: %s", obj["tool_calls"])
+			{
+				err := json.Unmarshal(obj["tool_calls"], &calls)
+				testassert.Require(t, err == nil && len(calls) == 1, "tool_calls not a one-object array: %s", obj["tool_calls"])
 			}
 
-			if _, ok := calls[0]["drop_me"]; ok {
-				t.Fatalf("dropped tool-call-scope key survived onto the wire: %#v", calls[0])
+			{
+				_, ok := calls[0]["drop_me"]
+				testassert.Require(t, !ok, "dropped tool-call-scope key survived onto the wire: %#v", calls[0])
 			}
 
-			if _, ok := calls[0]["keep_me"]; !ok {
-				t.Fatalf("non-dropped tool-call-scope key lost during drop-set application: %#v", calls[0])
+			{
+				_, ok := calls[0]["keep_me"]
+				testassert.Require(t, ok, "non-dropped tool-call-scope key lost during drop-set application: %#v", calls[0])
 			}
 		})
 	}

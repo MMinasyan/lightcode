@@ -14,6 +14,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -36,9 +37,7 @@ func equalEvent(a, b Event) bool {
 func eventKind(t *testing.T, event Event) string {
 	t.Helper()
 	kind, err := event.Discriminator()
-	if err != nil {
-		t.Fatalf("event discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -46,9 +45,7 @@ func eventKind(t *testing.T, event Event) string {
 func scopeKind(t *testing.T, scope protocol.Scope) string {
 	t.Helper()
 	kind, err := scope.Discriminator()
-	if err != nil {
-		t.Fatalf("scope discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -60,27 +57,19 @@ func scopeSessionIdentity(t *testing.T, scope protocol.Scope) (string, bool) {
 	switch scopeKind(t, scope) {
 	case "session":
 		body, err := scope.AsSessionScope()
-		if err != nil {
-			t.Fatalf("session scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	case "operation":
 		body, err := scope.AsOperationScope()
-		if err != nil {
-			t.Fatalf("operation scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	case "agent":
 		body, err := scope.AsAgentScope()
-		if err != nil {
-			t.Fatalf("agent scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	case "job":
 		body, err := scope.AsJobScope()
-		if err != nil {
-			t.Fatalf("job scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	default:
 		return "", false
@@ -97,39 +86,27 @@ func scopeWorkspaceAttribution(t *testing.T, scope protocol.Scope) (string, bool
 	switch scopeKind(t, scope) {
 	case "runtime":
 		body, err := scope.AsRuntimeScope()
-		if err != nil {
-			t.Fatalf("runtime scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "workspace":
 		body, err := scope.AsWorkspaceScope()
-		if err != nil {
-			t.Fatalf("workspace scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		return body.Workspace, true
 	case "session":
 		body, err := scope.AsSessionScope()
-		if err != nil {
-			t.Fatalf("session scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "operation":
 		body, err := scope.AsOperationScope()
-		if err != nil {
-			t.Fatalf("operation scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "agent":
 		body, err := scope.AsAgentScope()
-		if err != nil {
-			t.Fatalf("agent scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "job":
 		body, err := scope.AsJobScope()
-		if err != nil {
-			t.Fatalf("job scope: %v", err)
-		}
+		testassert.NoError(t, err)
 		workspace = body.Workspace
 	default:
 		return "", false
@@ -144,9 +121,7 @@ func scopeWorkspaceAttribution(t *testing.T, scope protocol.Scope) (string, bool
 func eventGeneration(t *testing.T, event Event) string {
 	t.Helper()
 	body, err := event.AsConfigurationChangedEvent()
-	if err != nil {
-		t.Fatalf("configuration event body: %v", err)
-	}
+	testassert.NoError(t, err)
 	return body.ConfigurationRevision.Generation
 }
 
@@ -179,33 +154,29 @@ func drainClosed(t *testing.T, sub *Subscription) []Event {
 func TestRuntimeSubscribeValidatesCapacityAndUsesTheClosedGate(t *testing.T) {
 	e := newOwnerEnv(t)
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := r.Subscribe(0)
+		testassert.Require(t, err != nil, "Subscribe(0) succeeded, want capacity > 0 required")
 	}
-	if _, err := r.Subscribe(0); err == nil {
-		t.Fatal("Subscribe(0) succeeded, want capacity > 0 required")
-	}
-	if _, err := r.Subscribe(-2); err == nil {
-		t.Fatal("Subscribe(-2) succeeded, want capacity > 0 required")
+	{
+		_, err := r.Subscribe(-2)
+		testassert.Require(t, err != nil, "Subscribe(-2) succeeded, want capacity > 0 required")
 	}
 	sub, err := r.Subscribe(4)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
-	if _, err := r.Reload(context.Background()); err != nil {
-		t.Fatalf("Reload: %v", err)
+	testassert.NoError(t, err)
+	{
+		_, err := r.Reload(context.Background())
+		testassert.NoError(t, err)
 	}
 	sub.Close()
 	sub.Close() // idempotent
 	got := drainClosed(t, sub)
-	if len(got) != 1 || eventKind(t, got[0]) != "configuration_changed" || eventGeneration(t, got[0]) != "2" {
-		t.Fatalf("events = %+v, want the buffered configuration event 2 then closure", got)
-	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if _, err := r.Subscribe(1); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Subscribe after Close = %v, want ErrClosed", err)
+	testassert.Require(t, len(got) == 1 && eventKind(t, got[0]) == "configuration_changed" && eventGeneration(t, got[0]) == "2", "events = %+v, want the buffered configuration event 2 then closure", got)
+	testassert.NoError(t, r.Close(context.Background()))
+	{
+		_, err := r.Subscribe(1)
+		testassert.Require(t, errors.Is(err, ErrClosed), "Subscribe after Close = %v, want ErrClosed", err)
 	}
 }
 
@@ -214,25 +185,22 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 	r, err := e.open(context.Background(),
 		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	sub, err := r.Subscribe(16)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
+	testassert.NoError(t, err)
+	{
+		revision, err := r.Reload(context.Background())
+		testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 	}
-	if revision, err := r.Reload(context.Background()); err != nil || revision != "2" {
-		t.Fatalf("Reload = (%q, %v), want 2", revision, err)
+	{
+		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		testassert.NoError(t, err)
 	}
-	if _, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace}); err != nil {
-		t.Fatalf("workspace get: %v", err)
+	{
+		revision, err := r.Reload(context.Background())
+		testassert.Require(t, err == nil && revision == "3", "Reload = (%q, %v), want 3", revision, err)
 	}
-	if revision, err := r.Reload(context.Background()); err != nil || revision != "3" {
-		t.Fatalf("Reload = (%q, %v), want 3", revision, err)
-	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	want := []Event{
 		configurationChangedEvent(2),
 		scopeEvent(protocol.ScopeOpened, ScopeInfo{Kind: ScopeWorkspace, Workspace: obsWorkspace}),
@@ -251,18 +219,15 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 	r, err := e.open(context.Background(),
 		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	defer func() {
-		if err := r.Close(context.Background()); err != nil {
-			t.Errorf("Close: %v", err)
+		{
+			err := r.Close(context.Background())
+			testassert.Check(t, err == nil, "Close: %v", err)
 		}
 	}()
 	sub, err := r.Subscribe(8)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	pausedEvent := scopeEvent(protocol.ScopeOpened, ScopeInfo{Kind: ScopeWorkspace, Workspace: "/ws-paused-synthetic"})
 	pausedSecond := scopeEvent(protocol.ScopeClosed, ScopeInfo{Kind: ScopeWorkspace, Workspace: "/ws-paused-synthetic"})
 
@@ -281,13 +246,12 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 			t.Fatalf("event %s enqueued before its publication committed (ok=%v)", eventJSON(t, event), ok)
 		case <-time.After(200 * time.Millisecond):
 		}
-		if snapshot := r.config.current(); snapshot == nil || snapshot.generation != 1 {
-			t.Fatalf("published generation during pause = %+v, want the paused publication's state commit to block the next one", snapshot)
+		{
+			snapshot := r.config.current()
+			testassert.Require(t, snapshot != nil && snapshot.generation == 1, "published generation during pause = %+v, want the paused publication's state commit to block the next one", snapshot)
 		}
 		release()
-		if err := <-reloadDone; err != nil {
-			t.Fatalf("Reload after release: %v", err)
-		}
+		testassert.NoError(t, <-reloadDone)
 		first, ok := nextEvent(t, sub)
 		if !ok || !equalEvent(first, pausedEvent) {
 			t.Fatalf("first event = %s (ok=%v), want the paused publication's event before the next revision", eventJSON(t, first), ok)
@@ -314,9 +278,7 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 		release()
-		if err := <-getDone; err != nil {
-			t.Fatalf("workspace get after release: %v", err)
-		}
+		testassert.NoError(t, <-getDone)
 		first, ok := nextEvent(t, sub)
 		if !ok || !equalEvent(first, pausedSecond) {
 			t.Fatalf("first event = %s (ok=%v), want the paused publication's event first", eventJSON(t, first), ok)
@@ -383,63 +345,52 @@ func pauseObservation(t *testing.T, o *observation, event Event) (<-chan struct{
 func TestObservationSaturatedSubscriberIsRemovedAndHealthyOnesContinue(t *testing.T) {
 	e := newOwnerEnv(t)
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	full, err := r.Subscribe(1)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	healthy, err := r.Subscribe(8)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3", "4"} {
-		if revision, err := r.Reload(context.Background()); err != nil || revision != want {
-			t.Fatalf("Reload = (%q, %v), want %s", revision, err, want)
+		{
+			revision, err := r.Reload(context.Background())
+			testassert.Require(t, err == nil && revision == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}
 	first, ok := nextEvent(t, full)
 	if !ok || eventGeneration(t, first) != "2" {
 		t.Fatalf("saturated subscriber first event = %s (ok=%v), want revision 2", eventJSON(t, first), ok)
 	}
-	if _, ok := nextEvent(t, full); ok {
-		t.Fatal("saturated subscriber still open, want it removed and closed")
+	{
+		_, ok := nextEvent(t, full)
+		testassert.Require(t, !ok, "saturated subscriber still open, want it removed and closed")
 	}
 	full.Close()
 	full.Close() // idempotent after producer removal
 	for _, want := range []string{"2", "3", "4"} {
 		event, ok := nextEvent(t, healthy)
-		if !ok {
-			t.Fatalf("healthy subscriber closed early, want revision %s", want)
-		}
+		testassert.Require(t, ok, "healthy subscriber closed early, want revision %s", want)
 		if eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != want {
 			t.Fatalf("healthy subscriber event = %s, want configuration %s", eventJSON(t, event), want)
 		}
 	}
-	if revision, err := r.Reload(context.Background()); err != nil || revision != "5" {
-		t.Fatalf("Reload = (%q, %v), want 5", revision, err)
+	{
+		revision, err := r.Reload(context.Background())
+		testassert.Require(t, err == nil && revision == "5", "Reload = (%q, %v), want 5", revision, err)
 	}
 	event, ok := nextEvent(t, healthy)
 	if !ok || eventGeneration(t, event) != "5" {
 		t.Fatalf("post-saturation event = %s (ok=%v), want revision 5", eventJSON(t, event), ok)
 	}
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	drainClosed(t, healthy)
 }
 
 func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 	e := newOwnerEnv(t)
 	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	healthy, err := r.Subscribe(64)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	var churn, reloads sync.WaitGroup
 	for range 8 {
 		churn.Add(1)
@@ -467,16 +418,15 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 		reloads.Add(1)
 		go func(i int) {
 			defer reloads.Done()
-			if _, err := r.Reload(context.Background()); err != nil {
-				t.Errorf("Reload %d: %v", i, err)
+			{
+				_, err := r.Reload(context.Background())
+				testassert.Check(t, err == nil, "Reload %d: %v", i, err)
 			}
 		}(i)
 	}
 	reloads.Wait()
 	churn.Wait()
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	var revisions []string
 	for _, event := range drainClosed(t, healthy) {
 		switch eventKind(t, event) {
@@ -484,16 +434,12 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 			revisions = append(revisions, eventGeneration(t, event))
 		case "scope_closed":
 			body, err := event.AsScopeEvent()
-			if err != nil {
-				t.Fatalf("scope event body: %v", err)
-			}
+			testassert.NoError(t, err)
 			if scopeKind(t, body.Scope) != "runtime" {
 				t.Fatalf("unexpected closure event %s, only the Runtime scope closes here", eventJSON(t, event))
 			}
 			runtimeScope, err := body.Scope.AsRuntimeScope()
-			if err != nil {
-				t.Fatalf("runtime scope: %v", err)
-			}
+			testassert.NoError(t, err)
 			if runtimeScope.Workspace != nil {
 				t.Fatalf("unexpected closure event %s, only the Runtime scope closes here", eventJSON(t, event))
 			}
@@ -505,9 +451,7 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 	for generation := uint64(2); generation <= 11; generation++ {
 		want = append(want, strconv.FormatUint(generation, 10))
 	}
-	if !slices.Equal(revisions, want) {
-		t.Fatalf("raced publication revisions = %v, want every committed generation exactly once in order %v", revisions, want)
-	}
+	testassert.Require(t, slices.Equal(revisions, want), "raced publication revisions = %v, want every committed generation exactly once in order %v", revisions, want)
 }
 
 func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
@@ -515,28 +459,24 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 	r, err := e.open(context.Background(),
 		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	stalled, err := r.Subscribe(1)
-	if err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3"} {
-		if revision, err := r.Reload(context.Background()); err != nil || revision != want {
-			t.Fatalf("Reload = (%q, %v), want %s", revision, err, want)
+		{
+			revision, err := r.Reload(context.Background())
+			testassert.Require(t, err == nil && revision == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}
-	if _, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace}); err != nil {
-		t.Fatalf("workspace get: %v", err)
+	{
+		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		testassert.NoError(t, err)
 	}
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- r.Close(context.Background()) }()
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("shutdown waited for undrained observer output")
 	}
@@ -544,8 +484,9 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 	if !ok || eventGeneration(t, first) != "2" {
 		t.Fatalf("stalled subscriber event = %s (ok=%v), want its one buffered event", eventJSON(t, first), ok)
 	}
-	if _, ok := nextEvent(t, stalled); ok {
-		t.Fatal("stalled subscriber was never closed")
+	{
+		_, ok := nextEvent(t, stalled)
+		testassert.Require(t, !ok, "stalled subscriber was never closed")
 	}
 	e.assertLockReleased(t)
 }
@@ -555,13 +496,9 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 		e := newOwnerEnv(t)
 		r, err := e.open(context.Background(), e.storagePlugin(store),
 			e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		testassert.NoError(t, err)
 		session, err := r.createSession(context.Background(), e.dataDir, "solo")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 		gate := make(chan struct{})
 		e.server.setHold(gate)
@@ -572,31 +509,28 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 			t.Fatal("the gated execution never reached its model request")
 		}
 		full, err := r.Subscribe(1)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		healthy, err := r.Subscribe(64)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, want := range []string{"2", "3"} {
-			if revision, err := r.Reload(context.Background()); err != nil || revision != want {
-				t.Fatalf("Reload during execution = (%q, %v), want %s", revision, err, want)
+			{
+				revision, err := r.Reload(context.Background())
+				testassert.Require(t, err == nil && revision == want, "Reload during execution = (%q, %v), want %s", revision, err, want)
 			}
 		}
 		close(gate)
-		if rec := awaitOperation(t, r, sessionID, "op-observed", harness.OperationSuccess); rec.State.Status != harness.OperationSuccess {
-			t.Fatalf("Operation state = %+v, want success: subscriber saturation changed no execution outcome", rec.State)
+		{
+			rec := awaitOperation(t, r, sessionID, "op-observed", harness.OperationSuccess)
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "Operation state = %+v, want success: subscriber saturation changed no execution outcome", rec.State)
 		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, r.Close(context.Background()))
 		first, ok := nextEvent(t, full)
 		if !ok || eventGeneration(t, first) != "2" {
 			t.Fatalf("saturated subscriber event = %s (ok=%v), want revision 2", eventJSON(t, first), ok)
 		}
-		if _, ok := nextEvent(t, full); ok {
-			t.Fatal("saturated subscriber was never removed")
+		{
+			_, ok := nextEvent(t, full)
+			testassert.Require(t, !ok, "saturated subscriber was never removed")
 		}
 		want := []Event{
 			configurationChangedEvent(2),
@@ -621,16 +555,10 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 				continue
 			case "session_changed":
 				body, err := event.AsSessionChangedEvent()
-				if err != nil {
-					t.Fatalf("session event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				invalidation, err := body.Scope.AsSessionScope()
-				if err != nil {
-					t.Fatalf("passive invalidation scope: %v", err)
-				}
-				if invalidation.SessionId != sessionID {
-					t.Fatalf("passive invalidation for %q, want the real session", invalidation.SessionId)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, invalidation.SessionId, sessionID)
 			case "text_delta", "tool_started", "tool_finished":
 				if err := assertOperationScoped(t, event, sessionID, "op-observed"); err != nil {
 					t.Fatalf("passive progress %s: %v", eventJSON(t, event), err)
@@ -652,27 +580,19 @@ func progressEventScope(t *testing.T, event Event) protocol.Scope {
 	switch eventKind(t, event) {
 	case "text_delta":
 		body, err := event.AsTextDeltaEvent()
-		if err != nil {
-			t.Fatalf("delta event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		return body.Scope
 	case "refusal_delta":
 		body, err := event.AsRefusalDeltaEvent()
-		if err != nil {
-			t.Fatalf("refusal event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		return body.Scope
 	case "tool_started":
 		body, err := event.AsToolStartedEvent()
-		if err != nil {
-			t.Fatalf("tool event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		return body.Scope
 	case "tool_finished":
 		body, err := event.AsToolFinishedEvent()
-		if err != nil {
-			t.Fatalf("tool event body: %v", err)
-		}
+		testassert.NoError(t, err)
 		return body.Scope
 	}
 	t.Fatalf("event %s is not a progress event", eventJSON(t, event))
@@ -688,9 +608,7 @@ func assertOperationScoped(t *testing.T, event Event, sessionID, operationID str
 		return fmt.Errorf("progress carries the %s scope, want the operation scope", scopeKind(t, scope))
 	}
 	body, err := scope.AsOperationScope()
-	if err != nil {
-		t.Fatalf("operation scope: %v", err)
-	}
+	testassert.NoError(t, err)
 	if body.SessionId != sessionID || body.OperationId != operationID {
 		return errors.New("progress carries a foreign session or operation identity")
 	}
@@ -718,9 +636,7 @@ func TestObservationRefusalDeltaProgress(t *testing.T) {
 			}
 		}()
 		sub, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		session := bg.session("refusal")
 		// The wire dispatch: the request whose history carries no refusal
 		// receives the refusal-only turn; the later one — whose history
@@ -754,30 +670,20 @@ func TestObservationRefusalDeltaProgress(t *testing.T) {
 		for {
 			select {
 			case event, ok := <-sub.Events():
-				if !ok {
-					t.Fatal("the subscription closed before the drain finished")
-				}
+				testassert.Require(t, ok, "the subscription closed before the drain finished")
 				var entry progress
 				switch eventKind(t, event) {
 				case "text_delta":
 					body, err := event.AsTextDeltaEvent()
-					if err != nil {
-						t.Fatalf("delta event body: %v", err)
-					}
+					testassert.NoError(t, err)
 					scope, err := body.Scope.AsOperationScope()
-					if err != nil {
-						t.Fatalf("text progress scope: %v", err)
-					}
+					testassert.NoError(t, err)
 					entry = progress{kind: "text_delta", content: body.Content, op: scope.OperationId}
 				case "refusal_delta":
 					body, err := event.AsRefusalDeltaEvent()
-					if err != nil {
-						t.Fatalf("refusal event body: %v", err)
-					}
+					testassert.NoError(t, err)
 					scope, err := body.Scope.AsOperationScope()
-					if err != nil {
-						t.Fatalf("refusal progress scope: %v", err)
-					}
+					testassert.NoError(t, err)
 					entry = progress{kind: "refusal_delta", content: body.Content, op: scope.OperationId}
 				default:
 					// committed and lifecycle publications interleave with progress
@@ -803,9 +709,7 @@ func TestObservationRefusalDeltaProgress(t *testing.T) {
 			{kind: "refusal_delta", content: " but no", op: "op-mixed"},
 			{kind: "refusal_delta", content: " can do.", op: "op-mixed"},
 		}
-		if !slices.Equal(got, want) {
-			t.Fatalf("progress = %+v, want the exact fragment order and operation identity %+v", got, want)
-		}
+		testassert.Require(t, slices.Equal(got, want), "progress = %+v, want the exact fragment order and operation identity %+v", got, want)
 	})
 }
 
@@ -816,20 +720,12 @@ func TestObservationRefusalDeltaProgress(t *testing.T) {
 func lessPair(t *testing.T, a, b protocol.SessionRevision) bool {
 	t.Helper()
 	ad, err := strconv.ParseInt(a.DurableRevision, 10, 64)
-	if err != nil {
-		t.Fatalf("revision durable member %q is not a decimal integer", a.DurableRevision)
-	}
+	testassert.Require(t, err == nil, "revision durable member %q is not a decimal integer", a.DurableRevision)
 	bd, err := strconv.ParseInt(b.DurableRevision, 10, 64)
-	if err != nil {
-		t.Fatalf("revision durable member %q is not a decimal integer", b.DurableRevision)
-	}
+	testassert.Require(t, err == nil, "revision durable member %q is not a decimal integer", b.DurableRevision)
 	al, err := strconv.ParseUint(a.LocalRevision, 10, 64)
-	if err != nil {
-		t.Fatalf("revision local member %q is not a decimal integer", a.LocalRevision)
-	}
+	testassert.Require(t, err == nil, "revision local member %q is not a decimal integer", a.LocalRevision)
 	bl, err := strconv.ParseUint(b.LocalRevision, 10, 64)
-	if err != nil {
-		t.Fatalf("revision local member %q is not a decimal integer", b.LocalRevision)
-	}
+	testassert.Require(t, err == nil, "revision local member %q is not a decimal integer", b.LocalRevision)
 	return ad < bd || (ad == bd && al < bl)
 }

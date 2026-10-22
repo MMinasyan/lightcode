@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -34,9 +35,7 @@ func openProjectionRuntime(t *testing.T, store harness.Storage) (*Runtime, *owne
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 	r, err := e.open(context.Background(), e.storagePlugin(store))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	testassert.NoError(t, err)
 	return r, e
 }
 
@@ -50,9 +49,7 @@ func closeProjectionRuntime(r *Runtime) {
 func projectionSession(t *testing.T, r *Runtime, workspace, agentType string) harness.SessionRecord {
 	t.Helper()
 	rec, err := r.createSession(context.Background(), workspace, agentType)
-	if err != nil {
-		t.Fatalf("createSession(%s): %v", workspace, err)
-	}
+	testassert.Require(t, err == nil, "createSession(%s): %v", workspace, err)
 	return rec
 }
 
@@ -64,9 +61,7 @@ func sessionViewThroughRuntime(t *testing.T, r *Runtime, sessionID string) harne
 		view, err = h.ReadSessionView(ctx, sessionID)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("ReadSessionView(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadSessionView(%s): %v", sessionID, err)
 	return view
 }
 
@@ -81,9 +76,7 @@ func headerThroughRuntime(t *testing.T, r *Runtime, sessionID string) harness.Se
 		header, err = h.ReadSessionHeader(ctx, sessionID)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("ReadSessionHeader(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadSessionHeader(%s): %v", sessionID, err)
 	return header
 }
 
@@ -105,9 +98,7 @@ func historyThroughRuntime(t *testing.T, r *Runtime, sessionID string) ([]harnes
 		revision = view.Revision
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("ReadHistoryView(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadHistoryView(%s): %v", sessionID, err)
 	return facts, revision
 }
 
@@ -145,25 +136,9 @@ func historyFactsOf(view harness.HistoryReadView) []harness.HistoryFact {
 // submitQueuedThroughRuntime submits one buffered queued message.
 func submitQueuedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string) {
 	t.Helper()
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, err := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeQueued,
-		})
-		if err != nil {
-			return err
-		}
-		if res.Disposition != harness.DispositionQueued {
-			return errors.New("submit " + operationID + " = " + string(res.Disposition) + ", want queued")
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("queued Submit(%q): %v", operationID, err)
-	}
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeQueued)
+	testassert.Require(t, err == nil, "queued Submit(%q): %v", operationID, err)
+	testassert.Require(t, res.Disposition == harness.DispositionQueued, "queued submit %q = %+v, want queued", operationID, res.Disposition)
 }
 
 // forkThroughRuntime forks one source Session at the input entry of the named
@@ -184,9 +159,7 @@ func forkThroughRuntime(t *testing.T, r *Runtime, sourceID, boundaryEntryID, ope
 		dest = res.Session.Identity.SessionID
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Fork: %v", err)
-	}
+	testassert.NoError(t, err)
 	return dest
 }
 
@@ -209,9 +182,7 @@ func launchChildThroughRuntime(t *testing.T, r *Runtime, parent, operationID str
 		childID = res.ChildSessionID
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("LaunchChildSession: %v", err)
-	}
+	testassert.NoError(t, err)
 	return childID
 }
 
@@ -251,9 +222,7 @@ func historyViewThroughRuntime(t *testing.T, r *Runtime, sessionID string) harne
 		view, err = h.ReadHistoryView(ctx, sessionID)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("ReadHistoryView(%s): %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "ReadHistoryView(%s): %v", sessionID, err)
 	return view
 }
 
@@ -276,20 +245,8 @@ func assertStableHeader(t *testing.T, header protocol.Session, sessionHeader har
 	t.Helper()
 	currentOK := (wantCurrent == "") == (header.CurrentOperationId == nil) &&
 		(wantCurrent == "" || *header.CurrentOperationId == wantCurrent)
-	if header.SessionId != sessionID ||
-		header.Workspace != workspace ||
-		header.Lifecycle != protocol.Open ||
-		header.AgentType != agent ||
-		header.ArchivedAt != nil ||
-		!currentOK {
-		t.Fatalf("header = %+v, want the open %s header at %s with current operation %q", header, sessionID, workspace, wantCurrent)
-	}
-	if !header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) || !header.LastActivity.Equal(sessionHeader.LastActivity) {
-		t.Fatalf("header times = (%v, %v), want the read times (%v, %v)", header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
-	}
-	if loc := header.CreatedAt.Location(); loc != time.UTC {
-		t.Fatalf("created_at zone = %v, want UTC", loc)
-	}
+	testassert.Require(t, header.SessionId == sessionID && header.Workspace == workspace && header.Lifecycle == protocol.Open && header.AgentType == agent && header.ArchivedAt == nil && currentOK && header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) && header.LastActivity.Equal(sessionHeader.LastActivity), "header = %+v, want the open %s header at %s with current operation %q; header times = (%v, %v), want the read times (%v, %v)", header, sessionID, workspace, wantCurrent, header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
+	testassert.Equal(t, header.CreatedAt.Location(), time.UTC)
 	if header.SessionRevision != wantSessionRevision(t, sessionHeader) {
 		t.Fatalf("session_revision = %+v, want the read pair %+v", header.SessionRevision, wantSessionRevision(t, sessionHeader))
 	}
@@ -311,9 +268,7 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		rootHeader := projectSession(headerThroughRuntime(t, r, root.Identity.SessionID))
 		assertStableHeader(t, rootHeader, headerThroughRuntime(t, r, root.Identity.SessionID),
 			root.Identity.SessionID, workspace, "solo", "")
-		if rootHeader.ParentSessionId != nil || rootHeader.SourceSessionId != nil {
-			t.Fatalf("root lineage pointers = (%v, %v), want none", rootHeader.ParentSessionId, rootHeader.SourceSessionId)
-		}
+		testassert.Require(t, rootHeader.ParentSessionId == nil && rootHeader.SourceSessionId == nil, "root lineage pointers = (%v, %v), want none", rootHeader.ParentSessionId, rootHeader.SourceSessionId)
 
 		// One settled admission gives the fork its committed input boundary;
 		// its terminal cleanup proves the settled idle source Fork requires.
@@ -333,24 +288,14 @@ func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
 		forkHeader := projectSession(headerThroughRuntime(t, r, forked))
 		assertStableHeader(t, forkHeader, headerThroughRuntime(t, r, forked),
 			forked, workspace, "solo", "fork-op-1")
-		if forkHeader.SourceSessionId == nil || *forkHeader.SourceSessionId != root.Identity.SessionID {
-			t.Fatalf("fork source = %v, want %s", forkHeader.SourceSessionId, root.Identity.SessionID)
-		}
-		if forkHeader.ParentSessionId != nil {
-			t.Fatalf("fork parent pointer = %v, want none", forkHeader.ParentSessionId)
-		}
+		testassert.Require(t, forkHeader.SourceSessionId != nil && *forkHeader.SourceSessionId == root.Identity.SessionID && forkHeader.ParentSessionId == nil, "fork source = %v, want %s; fork parent pointer = %v, want none", forkHeader.SourceSessionId, root.Identity.SessionID, forkHeader.ParentSessionId)
 
 		child := launchChildThroughRuntime(t, r, root.Identity.SessionID, "child-op-1")
 		awaitModelArrival(t, e)
 		childHeader := projectSession(headerThroughRuntime(t, r, child))
 		assertStableHeader(t, childHeader, headerThroughRuntime(t, r, child),
 			child, workspace, "worker", "child-op-1")
-		if childHeader.ParentSessionId == nil || *childHeader.ParentSessionId != root.Identity.SessionID {
-			t.Fatalf("child parent = %v, want %s", childHeader.ParentSessionId, root.Identity.SessionID)
-		}
-		if childHeader.SourceSessionId != nil {
-			t.Fatalf("child source pointer = %v, want none", childHeader.SourceSessionId)
-		}
+		testassert.Require(t, childHeader.ParentSessionId != nil && *childHeader.ParentSessionId == root.Identity.SessionID && childHeader.SourceSessionId == nil, "child parent = %v, want %s; child source pointer = %v, want none", childHeader.ParentSessionId, root.Identity.SessionID, childHeader.SourceSessionId)
 
 		release()
 		awaitOperation(t, r, forked, "fork-op-1", harness.OperationSuccess)
@@ -373,21 +318,13 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		awaitModelArrival(t, e)
 
 		active := projectOperation(readOperation(t, r, session, "op-1"))
-		if active.OperationId != "op-1" || active.RequestKind != protocol.Message ||
-			active.Status != protocol.OperationStatusRunning || active.SettledAt != nil || active.Detail != nil ||
-			active.AgentType != "solo" || active.Model != "prov/m" || active.AdmittedAt.IsZero() {
-			t.Fatalf("active projection = %+v, want the running message op-1 with no terminal members", active)
-		}
+		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.Message && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentType == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
 
 		close(gate)
 		record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 		settled := projectOperation(record)
-		if settled.Status != protocol.OperationStatusSuccess || settled.SettledAt == nil || settled.Detail != nil {
-			t.Fatalf("settled projection = %+v, want success with a settlement time and no detail", settled)
-		}
-		if !settled.AdmittedAt.Equal(record.Admission.AdmittedAt) {
-			t.Fatal("settled admitted_at drifted from the register admission")
-		}
+		testassert.Require(t, settled.Status == protocol.OperationStatusSuccess && settled.SettledAt != nil && settled.Detail == nil, "settled projection = %+v, want success with a settlement time and no detail", settled)
+		testassert.Require(t, settled.AdmittedAt.Equal(record.Admission.AdmittedAt), "settled admitted_at drifted from the register admission")
 
 		// The interrupted terminal requires its diagnostic detail, on a fresh
 		// Session: the terminal cleanup of the settled row does not imply the
@@ -398,17 +335,9 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		e.server.setHold(gate)
 		submitThroughRuntime(t, r, interruptedSession, "op-2", "again")
 		awaitModelArrival(t, e)
-		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, interruptedSession)
-		})
-		if err != nil {
-			t.Fatalf("Interrupt: %v", err)
-		}
+		testassert.NoError(t, r.interruptSession(context.Background(), interruptedSession))
 		interrupted := projectOperation(awaitOperation(t, r, interruptedSession, "op-2", harness.OperationInterruption))
-		if interrupted.Status != protocol.OperationStatusInterruption || interrupted.SettledAt == nil ||
-			interrupted.Detail == nil || *interrupted.Detail == "" {
-			t.Fatalf("interrupted projection = %+v, want interruption with a required detail", interrupted)
-		}
+		testassert.Require(t, interrupted.Status == protocol.OperationStatusInterruption && interrupted.SettledAt != nil && interrupted.Detail != nil && *interrupted.Detail != "", "interrupted projection = %+v, want interruption with a required detail", interrupted)
 	})
 }
 
@@ -426,9 +355,7 @@ func TestProjectionListFilters(t *testing.T) {
 			_, err := h.ArchiveSession(ctx, archived)
 			return err
 		})
-		if err != nil {
-			t.Fatalf("ArchiveSession: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		invalid := map[string]protocol.ListSessionsParams{
 			"absent workspace":  {Lifecycle: "open"},
@@ -436,49 +363,30 @@ func TestProjectionListFilters(t *testing.T) {
 			"unknown lifecycle": {Workspace: ws1, Lifecycle: "paused"},
 		}
 		for name, params := range invalid {
-			if _, err := r.listSessions(context.Background(), params); !errors.Is(err, harness.ErrInvalid) {
-				t.Fatalf("%s: listSessions = %v, want harness.ErrInvalid", name, err)
+			{
+				_, err := r.listSessions(context.Background(), params)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s: listSessions = %v, want harness.ErrInvalid", name, err)
 			}
 		}
 
 		openList, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws1, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions open: %v", err)
-		}
-		if len(openList) != 1 || openList[0].SessionId != open1 {
-			t.Fatalf("open list = %+v, want exactly %s", openList, open1)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(openList) == 1 && openList[0].SessionId == open1, "open list = %+v, want exactly %s", openList, open1)
 		archivedList, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "archived"})
-		if err != nil {
-			t.Fatalf("listSessions archived: %v", err)
-		}
-		if len(archivedList) != 1 || archivedList[0].SessionId != archived || archivedList[0].Lifecycle != protocol.Archived || archivedList[0].ArchivedAt == nil {
-			t.Fatalf("archived list = %+v, want exactly the archived %s", archivedList, archived)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(archivedList) == 1 && archivedList[0].SessionId == archived && archivedList[0].Lifecycle == protocol.Archived && archivedList[0].ArchivedAt != nil, "archived list = %+v, want exactly the archived %s", archivedList, archived)
 		noMatch, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions no match: %v", err)
-		}
-		if len(noMatch) != 0 {
-			t.Fatalf("no-match list = %+v, want empty", noMatch)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(noMatch) == 0, "no-match list = %+v, want empty", noMatch)
 
 		// A nonempty relative root is normalized before filtering.
 		cwd, err := os.Getwd()
-		if err != nil {
-			t.Fatalf("Getwd: %v", err)
-		}
+		testassert.NoError(t, err)
 		relative, err := filepath.Rel(cwd, ws1)
-		if err != nil {
-			t.Fatalf("Rel: %v", err)
-		}
+		testassert.NoError(t, err)
 		relativeList, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: relative, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions relative: %v", err)
-		}
-		if len(relativeList) != 1 || relativeList[0].SessionId != open1 || relativeList[0].Workspace != ws1 {
-			t.Fatalf("relative-root list = %+v, want exactly the normalized %s row", relativeList, ws1)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(relativeList) == 1 && relativeList[0].SessionId == open1 && relativeList[0].Workspace == ws1, "relative-root list = %+v, want exactly the normalized %s row", relativeList, ws1)
 	})
 }
 
@@ -500,32 +408,21 @@ func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
 			_, err := h.ArchiveSession(ctx, deleted)
 			return err
 		})
-		if err != nil {
-			t.Fatalf("ArchiveSession: %v", err)
-		}
-		if err := r.deleteSession(context.Background(), deleted); err != nil {
-			t.Fatalf("DeleteSession: %v", err)
-		}
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.deleteSession(context.Background(), deleted))
 
 		list, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions: %v", err)
-		}
-		if len(list) != 1 || list[0].SessionId != valid {
-			t.Fatalf("list = %+v, want exactly the valid %s", list, valid)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, len(list) == 1 && list[0].SessionId == valid, "list = %+v, want exactly the valid %s", list, valid)
 
-		if err := headerErrorThroughRuntime(context.Background(), r, deleted); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("deleted read = %v, want harness.ErrNotFound", err)
+		{
+			err := headerErrorThroughRuntime(context.Background(), r, deleted)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted read = %v, want harness.ErrNotFound", err)
 		}
 		err = headerErrorThroughRuntime(context.Background(), r, corruptID)
-		if !errors.Is(err, harness.ErrCorrupt) {
-			t.Fatalf("corrupt read = %v, want the harness.ErrCorrupt class", err)
-		}
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt read = %v, want the harness.ErrCorrupt class", err)
 		var corruptErr *harness.CorruptionError
-		if !errors.As(err, &corruptErr) {
-			t.Fatal("corrupt read lost its typed CorruptionError identity")
-		}
+		testassert.Require(t, errors.As(err, &corruptErr), "corrupt read lost its typed CorruptionError identity")
 	})
 }
 
@@ -538,9 +435,7 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 		// The empty navigation result is the non-nil [] shape before any
 		// Session exists.
 		initial, err := r.listWorkspaces(context.Background())
-		if err != nil || initial == nil || len(initial) != 0 {
-			t.Fatalf("initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
-		}
+		testassert.Require(t, err == nil && initial != nil && len(initial) == 0, "initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
 		wsA := filepath.Join(e.home, "alpha")
 		wsB := filepath.Join(e.home, "beta")
 		root := projectionSession(t, r, wsA, "solo").Identity.SessionID
@@ -548,16 +443,12 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 		projectionSession(t, r, wsB, "solo")
 
 		workspaces, err := r.listWorkspaces(context.Background())
-		if err != nil {
-			t.Fatalf("listWorkspaces: %v", err)
-		}
+		testassert.NoError(t, err)
 		want := []protocol.Workspace{
 			{Root: wsA, DisplayName: filepath.Base(wsA)},
 			{Root: wsB, DisplayName: filepath.Base(wsB)},
 		}
-		if !reflect.DeepEqual(workspaces, want) {
-			t.Fatalf("workspaces = %+v, want exactly %+v", workspaces, want)
-		}
+		testassert.Require(t, reflect.DeepEqual(workspaces, want), "workspaces = %+v, want exactly %+v", workspaces, want)
 	})
 }
 
@@ -581,40 +472,26 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 		header.CreatedAt = time.Time{}
 
 		list, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions: %v", err)
-		}
+		testassert.NoError(t, err)
 		wantList := append([]protocol.Session(nil), list...)
 		list[0].SessionId = "mutated"
 		list[0].SessionRevision.LocalRevision = "0"
 
 		workspaces, err := r.listWorkspaces(context.Background())
-		if err != nil {
-			t.Fatalf("listWorkspaces: %v", err)
-		}
+		testassert.NoError(t, err)
 		wantWorkspaces := append([]protocol.Workspace(nil), workspaces...)
 		if len(workspaces) == 1 {
 			workspaces[0].Root = "mutated"
 		}
 
 		reread := projectSession(headerThroughRuntime(t, r, session))
-		if reread != wantHeader {
-			t.Fatalf("re-read header = %+v, want the immutable pre-mutation %+v", reread, wantHeader)
-		}
+		testassert.Equal(t, reread, wantHeader)
 		relisted, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
-		if err != nil {
-			t.Fatalf("listSessions re-read: %v", err)
-		}
-		if !reflect.DeepEqual(relisted, wantList) {
-			t.Fatalf("re-read list = %+v, want the immutable pre-mutation %+v", relisted, wantList)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(relisted, wantList), "re-read list = %+v, want the immutable pre-mutation %+v", relisted, wantList)
 		rews, err := r.listWorkspaces(context.Background())
-		if err != nil {
-			t.Fatalf("listWorkspaces re-read: %v", err)
-		}
-		if !reflect.DeepEqual(rews, wantWorkspaces) {
-			t.Fatalf("re-read workspaces = %+v, want the immutable pre-mutation %+v", rews, wantWorkspaces)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(rews, wantWorkspaces), "re-read workspaces = %+v, want the immutable pre-mutation %+v", rews, wantWorkspaces)
 	})
 }
 
@@ -632,16 +509,12 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 			_, err := h.ArchiveSession(ctx, session)
 			return err
 		})
-		if err != nil {
-			t.Fatalf("ArchiveSession: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		// The complete old outcome: a read that finishes before the deletion
 		// commit returns the full header.
 		before := projectSession(headerThroughRuntime(t, r, session))
-		if before.SessionId != session || before.Lifecycle != protocol.Archived {
-			t.Fatalf("pre-delete header = %+v, want the complete archived header", before)
-		}
+		testassert.Require(t, before.SessionId == session && before.Lifecycle == protocol.Archived, "pre-delete header = %+v, want the complete archived header", before)
 
 		// The complete new outcome: a read parked behind the deletion
 		// transaction converges to the typed not-found with no header.
@@ -666,14 +539,10 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 			readDone <- headerErrorThroughRuntime(context.Background(), r, session)
 		}()
 		release()
-		if err := <-deleteDone; err != nil {
-			t.Fatalf("DeleteSession: %v", err)
-		}
+		testassert.NoError(t, <-deleteDone)
 		select {
 		case err := <-readDone:
-			if !errors.Is(err, harness.ErrNotFound) {
-				t.Fatalf("read racing the delete = %v, want the typed not-found", err)
-			}
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read racing the delete = %v, want the typed not-found", err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("the racing read never converged")
 		}
@@ -697,20 +566,12 @@ func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
 		submitQueuedThroughRuntime(t, r, session, "op-2", "queued")
 
 		after := projectSession(headerThroughRuntime(t, r, session))
-		if after.SessionRevision.DurableRevision != before.SessionRevision.DurableRevision {
-			t.Fatalf("durable revision = %s, want the unchanged %s", after.SessionRevision.DurableRevision, before.SessionRevision.DurableRevision)
-		}
+		testassert.Equal(t, after.SessionRevision.DurableRevision, before.SessionRevision.DurableRevision)
 		beforeLocal, err := strconv.ParseUint(before.SessionRevision.LocalRevision, 10, 64)
-		if err != nil {
-			t.Fatalf("parse before local revision: %v", err)
-		}
+		testassert.NoError(t, err)
 		afterLocal, err := strconv.ParseUint(after.SessionRevision.LocalRevision, 10, 64)
-		if err != nil {
-			t.Fatalf("parse after local revision: %v", err)
-		}
-		if afterLocal <= beforeLocal {
-			t.Fatalf("local revision %d did not advance past %d after the queued publication", afterLocal, beforeLocal)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, afterLocal > beforeLocal, "local revision %d did not advance past %d after the queued publication", afterLocal, beforeLocal)
 
 		close(gate)
 		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
@@ -723,9 +584,7 @@ func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
 func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 	r, _ := openProjectionRuntime(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	closed := []func() error{
 		func() error {
 			return headerErrorThroughRuntime(context.Background(), r, "0123456789abcdef0123456789abcdef")
@@ -737,8 +596,9 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 		func() error { _, err := r.listWorkspaces(context.Background()); return err },
 	}
 	for i, call := range closed {
-		if err := call(); !errors.Is(err, ErrClosed) {
-			t.Fatalf("closed caller %d = %v, want ErrClosed", i, err)
+		{
+			err := call()
+			testassert.Require(t, errors.Is(err, ErrClosed), "closed caller %d = %v, want ErrClosed", i, err)
 		}
 	}
 
@@ -757,8 +617,9 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 		func() error { _, err := r2.listWorkspaces(canceled); return err },
 	}
 	for i, call := range canceledCalls {
-		if err := call(); !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled caller %d = %v, want context.Canceled", i, err)
+		{
+			err := call()
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled caller %d = %v, want context.Canceled", i, err)
 		}
 	}
 }
@@ -786,9 +647,7 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
 			"settled_at", "status", "usage", "usage.by_model",
 		})
-		if !strings.Contains(operationJSON, `"by_model":[]`) {
-			t.Fatalf("empty usage = %s, want the non-nil [] array", operationJSON)
-		}
+		testassert.Require(t, strings.Contains(operationJSON, `"by_model":[]`), "empty usage = %s, want the non-nil [] array", operationJSON)
 		// The canonical register totals project as decimal strings.
 		usage := projectUsage(harness.UsageTotals{ByModel: []harness.ModelUsage{{
 			Model: model.ModelRef{Provider: "prov", Model: "m"},
@@ -798,9 +657,7 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 			Model: "prov/m",
 			Usage: protocol.UsageCount{InputTokens: "11", CachedInputTokens: "3", OutputTokens: "5"},
 		}}}
-		if !reflect.DeepEqual(usage, wantUsage) {
-			t.Fatalf("usage projection = %+v, want %+v", usage, wantUsage)
-		}
+		testassert.Require(t, reflect.DeepEqual(usage, wantUsage), "usage projection = %+v, want %+v", usage, wantUsage)
 	})
 }
 
@@ -810,14 +667,13 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 func assertExactJSONKeys(t *testing.T, v any, want []string) string {
 	t.Helper()
 	data, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal %T: %v", v, err)
-	}
+	testassert.Require(t, err == nil, "marshal %T: %v", v, err)
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	var top map[string]any
-	if err := decoder.Decode(&top); err != nil {
-		t.Fatalf("unmarshal %T: %v", v, err)
+	{
+		err := decoder.Decode(&top)
+		testassert.Require(t, err == nil, "unmarshal %T: %v", v, err)
 	}
 	var got []string
 	for key, value := range top {
@@ -831,9 +687,7 @@ func assertExactJSONKeys(t *testing.T, v any, want []string) string {
 	sort.Strings(got)
 	wantSorted := append([]string(nil), want...)
 	sort.Strings(wantSorted)
-	if !reflect.DeepEqual(got, wantSorted) {
-		t.Fatalf("wire keys = %v, want exactly %v", got, wantSorted)
-	}
+	testassert.Require(t, reflect.DeepEqual(got, wantSorted), "wire keys = %v, want exactly %v", got, wantSorted)
 	return string(data)
 }
 
@@ -912,9 +766,7 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		// Warm the victim before arming: the scan reaches it only after the
 		// parked survivor, so a missed gone check would return its cached
 		// header instead of omitting it.
-		if err := headerErrorThroughRuntime(context.Background(), r, victim); err != nil {
-			t.Fatalf("warm ReadSessionHeader: %v", err)
-		}
+		testassert.NoError(t, headerErrorThroughRuntime(context.Background(), r, victim))
 
 		gated.arm()
 		defer gated.releaseGate() // failure cleanup: runs before the owner close below
@@ -932,23 +784,18 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		}
 		// While the survivor's read is parked, the already-copied victim is
 		// deleted: the scan must observe it as absent, not fail.
-		if err := r.deleteSession(context.Background(), victim); err != nil {
-			t.Fatalf("delete during scan: %v", err)
-		}
+		testassert.NoError(t, r.deleteSession(context.Background(), victim))
 		gated.releaseGate()
 		select {
 		case err := <-listDone:
-			if err != nil {
-				t.Fatalf("listSessions: %v", err)
-			}
+			testassert.NoError(t, err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("the scan never converged")
 		}
-		if len(list) != 1 || list[0].SessionId != survivor || list[0].Lifecycle != protocol.Archived || list[0].ArchivedAt == nil {
-			t.Fatalf("list = %+v, want exactly the complete survivor %s header", list, survivor)
-		}
-		if err := headerErrorThroughRuntime(context.Background(), r, victim); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("victim read = %v, want harness.ErrNotFound", err)
+		testassert.Require(t, len(list) == 1 && list[0].SessionId == survivor && list[0].Lifecycle == protocol.Archived && list[0].ArchivedAt != nil, "list = %+v, want exactly the complete survivor %s header", list, survivor)
+		{
+			err := headerErrorThroughRuntime(context.Background(), r, victim)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "victim read = %v, want harness.ErrNotFound", err)
 		}
 	})
 }

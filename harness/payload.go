@@ -1003,21 +1003,23 @@ func encodeOperationSettlementEntry(v operationSettlementEntry) (json.RawMessage
 		modelRaw = raw
 	}
 	wire, err := json.Marshal(struct {
-		SessionID   string          `json:"session_id"`
-		EntryID     string          `json:"entry_id"`
-		OperationID string          `json:"operation_id"`
-		Status      string          `json:"status"`
-		Detail      string          `json:"detail,omitempty"`
-		Model       json.RawMessage `json:"model,omitempty"`
-		Usage       *UsageCount     `json:"usage,omitempty"`
+		SessionID       string          `json:"session_id"`
+		EntryID         string          `json:"entry_id"`
+		OperationID     string          `json:"operation_id"`
+		Status          string          `json:"status"`
+		Detail          string          `json:"detail,omitempty"`
+		Model           json.RawMessage `json:"model,omitempty"`
+		Usage           *UsageCount     `json:"usage,omitempty"`
+		CompactionUsage bool            `json:"compaction_usage,omitempty"`
 	}{
-		SessionID:   v.SessionID,
-		EntryID:     v.EntryID,
-		OperationID: v.OperationID,
-		Status:      string(v.Status),
-		Detail:      v.Detail,
-		Model:       modelRaw,
-		Usage:       v.Usage,
+		SessionID:       v.SessionID,
+		EntryID:         v.EntryID,
+		OperationID:     v.OperationID,
+		Status:          string(v.Status),
+		Detail:          v.Detail,
+		Model:           modelRaw,
+		Usage:           v.Usage,
+		CompactionUsage: v.CompactionUsage,
 	})
 	if err != nil {
 		return nil, err
@@ -1036,7 +1038,7 @@ func decodeOperationSettlementEntry(env Entry) (operationSettlementEntry, error)
 	if err != nil {
 		return operationSettlementEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "status", "detail", "model", "usage"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "status", "detail", "model", "usage", "compaction_usage"); err != nil {
 		return operationSettlementEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -1083,6 +1085,10 @@ func decodeOperationSettlementEntry(env Entry) (operationSettlementEntry, error)
 		}
 		usage = &counts
 	}
+	compactionUsage, err := boolMember(obj, "compaction_usage", false)
+	if err != nil {
+		return operationSettlementEntry{}, err
+	}
 	if sessionID != env.SessionID {
 		return operationSettlementEntry{}, fmt.Errorf("payload session id %q does not agree with the envelope", sessionID)
 	}
@@ -1093,13 +1099,14 @@ func decodeOperationSettlementEntry(env Entry) (operationSettlementEntry, error)
 		return operationSettlementEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
 	}
 	v := operationSettlementEntry{
-		SessionID:   sessionID,
-		EntryID:     entryID,
-		OperationID: operationID,
-		Status:      OperationState(status),
-		Detail:      detail,
-		Model:       ref,
-		Usage:       usage,
+		SessionID:       sessionID,
+		EntryID:         entryID,
+		OperationID:     operationID,
+		Status:          OperationState(status),
+		Detail:          detail,
+		Model:           ref,
+		Usage:           usage,
+		CompactionUsage: compactionUsage,
 	}
 	if err := validateOperationSettlementEntry(v); err != nil {
 		return operationSettlementEntry{}, err
@@ -1795,15 +1802,11 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		return nil, err
 	}
 	compactRaw, err := json.Marshal(struct {
-		Model         json.RawMessage `json:"model"`
-		ContextWindow int             `json:"context_window"`
-		OutputReserve int             `json:"output_reserve"`
-		SystemPrompt  string          `json:"system_prompt"`
+		Model        json.RawMessage `json:"model"`
+		SystemPrompt string          `json:"system_prompt"`
 	}{
-		Model:         compactModelRaw,
-		ContextWindow: v.Compact.ContextWindow,
-		OutputReserve: v.Compact.OutputReserve,
-		SystemPrompt:  v.Compact.SystemPrompt,
+		Model:        compactModelRaw,
+		SystemPrompt: v.Compact.SystemPrompt,
 	})
 	if err != nil {
 		return nil, err
@@ -2082,10 +2085,10 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 }
 
 // decodeCompactCapture reads the durable compaction configuration's exact
-// keys: the durable two-field model identity, window, reserve, and system
-// prompt. Their values are validated by the enclosing capture validation.
+// keys: the durable two-field model identity and the system prompt. Their
+// values are validated by the enclosing capture validation.
 func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error) {
-	if err := rejectUnknownMembers(obj, "model", "context_window", "output_reserve", "system_prompt"); err != nil {
+	if err := rejectUnknownMembers(obj, "model", "system_prompt"); err != nil {
 		return CompactCapture{}, err
 	}
 	modelObj, err := objectMember(obj, "model", true)
@@ -2096,19 +2099,11 @@ func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error
 	if err != nil {
 		return CompactCapture{}, fmt.Errorf("member %q: %w", "model", err)
 	}
-	contextWindow, err := int64Member(obj, "context_window", true)
-	if err != nil {
-		return CompactCapture{}, err
-	}
-	outputReserve, err := int64Member(obj, "output_reserve", true)
-	if err != nil {
-		return CompactCapture{}, err
-	}
 	systemPrompt, err := stringMember(obj, "system_prompt", true)
 	if err != nil {
 		return CompactCapture{}, err
 	}
-	v := CompactCapture{Model: ref, ContextWindow: int(contextWindow), OutputReserve: int(outputReserve), SystemPrompt: systemPrompt}
+	v := CompactCapture{Model: ref, SystemPrompt: systemPrompt}
 	return v, nil
 }
 
@@ -2152,17 +2147,10 @@ func validateExecutionCapture(v ExecutionCapture) error {
 }
 
 // validateCompactCapture enforces the compaction configuration's closed
-// shape: a complete model identity, positive window and reserve, and a
-// non-empty compact system prompt.
+// shape: a complete model identity and a non-empty compact system prompt.
 func validateCompactCapture(v CompactCapture) error {
 	if v.Model.Provider == "" || v.Model.Model == "" {
 		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
-	}
-	if v.ContextWindow <= 0 {
-		return fmt.Errorf("context_window %d must be positive", v.ContextWindow)
-	}
-	if v.OutputReserve <= 0 {
-		return fmt.Errorf("output_reserve %d must be positive", v.OutputReserve)
 	}
 	if v.SystemPrompt == "" {
 		return errors.New("system_prompt must be non-empty")

@@ -10,6 +10,7 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -52,13 +53,9 @@ type contractCorpus struct {
 func loadContractCorpus(t *testing.T) contractCorpus {
 	t.Helper()
 	data, err := os.ReadFile(contractCorpusPath)
-	if err != nil {
-		t.Fatalf("reading the shared contract corpus: %v", err)
-	}
+	testassert.NoError(t, err)
 	var corpus contractCorpus
-	if err := json.Unmarshal(data, &corpus); err != nil {
-		t.Fatalf("decoding the shared contract corpus: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(data, &corpus))
 	return corpus
 }
 
@@ -96,8 +93,9 @@ func contractFixtureObjects(t *testing.T, corpus contractCorpus, component strin
 		objects := make([]map[string]json.RawMessage, 0, len(entry.Accept))
 		for _, fixture := range entry.Accept {
 			var members map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(fixture.JSON), &members); err != nil {
-				t.Fatalf("%s accept %q: %v", component, fixture.Name, err)
+			{
+				err := json.Unmarshal([]byte(fixture.JSON), &members)
+				testassert.Require(t, err == nil, "%s accept %q: %v", component, fixture.Name, err)
 			}
 			objects = append(objects, members)
 		}
@@ -123,9 +121,7 @@ func requireSameSet(t *testing.T, what string, want, have map[string]bool) {
 	}
 	sort.Strings(missing)
 	sort.Strings(extra)
-	if len(missing) != 0 || len(extra) != 0 {
-		t.Fatalf("%s fixture coverage missing=%v extra=%v", what, missing, extra)
-	}
+	testassert.Require(t, len(missing) == 0 && len(extra) == 0, "%s fixture coverage missing=%v extra=%v", what, missing, extra)
 }
 
 // TestContractCorpusMatchesSchemaComponents proves the corpus names exactly
@@ -152,9 +148,7 @@ func TestContractCorpusMatchesSchemaComponents(t *testing.T) {
 	}
 	sort.Strings(missing)
 	sort.Strings(unknown)
-	if len(missing) != 0 || len(unknown) != 0 {
-		t.Fatalf("schema↔corpus component set mismatch: missing from corpus=%v, unknown to schema=%v", missing, unknown)
-	}
+	testassert.Require(t, len(missing) == 0 && len(unknown) == 0, "schema↔corpus component set mismatch: missing from corpus=%v, unknown to schema=%v", missing, unknown)
 }
 
 // TestContractCorpusFixtureNamesUnique rejects a repeated fixture name inside
@@ -182,16 +176,13 @@ func TestContractCorpusGeneratedTypeCoverage(t *testing.T) {
 	corpus := loadContractCorpus(t)
 	seen := map[string]bool{}
 	for _, entry := range corpus.Components {
-		if seen[entry.Schema] {
-			t.Fatalf("component %q appears twice in the corpus", entry.Schema)
-		}
+		testassert.Require(t, !seen[entry.Schema], "component %q appears twice in the corpus", entry.Schema)
 		seen[entry.Schema] = true
-		if _, ok := contractGeneratedTypes[entry.Schema]; !ok {
-			t.Fatalf("component %q has no generated Go target", entry.Schema)
+		{
+			_, ok := contractGeneratedTypes[entry.Schema]
+			testassert.Require(t, ok, "component %q has no generated Go target", entry.Schema)
 		}
-		if len(entry.Accept) == 0 {
-			t.Fatalf("component %q has no accepted fixture", entry.Schema)
-		}
+		testassert.Require(t, len(entry.Accept) != 0, "component %q has no accepted fixture", entry.Schema)
 	}
 	var untested []string
 	for name := range contractGeneratedTypes {
@@ -200,9 +191,7 @@ func TestContractCorpusGeneratedTypeCoverage(t *testing.T) {
 		}
 	}
 	sort.Strings(untested)
-	if len(untested) != 0 {
-		t.Fatalf("generated targets missing from the corpus: %v", untested)
-	}
+	testassert.Require(t, len(untested) == 0, "generated targets missing from the corpus: %v", untested)
 }
 
 // TestContractCorpusAcceptedFixturesRoundTrip drives every accepted fixture
@@ -228,8 +217,9 @@ func TestContractCorpusAcceptedFixturesRoundTrip(t *testing.T) {
 				t.Errorf("%s accept %q: re-encoding generated value: %v", entry.Schema, fixture.Name, err)
 				continue
 			}
-			if err := schemaRef.VisitJSON(decodeSchemaJSON(t, string(encoded))); err != nil {
-				t.Errorf("%s accept %q: schema rejected the re-encoded value %s: %v", entry.Schema, fixture.Name, encoded, err)
+			{
+				err := schemaRef.VisitJSON(decodeSchemaJSON(t, string(encoded)))
+				testassert.Check(t, err == nil, "%s accept %q: schema rejected the re-encoded value %s: %v", entry.Schema, fixture.Name, encoded, err)
 			}
 		}
 	}
@@ -242,8 +232,9 @@ func TestContractCorpusRejectedFixturesFailSchema(t *testing.T) {
 	for _, entry := range corpus.Components {
 		schemaRef := componentSchema(t, entry.Schema)
 		for _, fixture := range entry.Reject {
-			if err := schemaRef.VisitJSON(decodeSchemaJSON(t, fixture.JSON)); err == nil {
-				t.Errorf("%s reject %q: schema accepted an invalid value: %s", entry.Schema, fixture.Name, fixture.JSON)
+			{
+				err := schemaRef.VisitJSON(decodeSchemaJSON(t, fixture.JSON))
+				testassert.Check(t, err != nil, "%s reject %q: schema accepted an invalid value: %s", entry.Schema, fixture.Name, fixture.JSON)
 			}
 		}
 	}
@@ -256,32 +247,24 @@ func TestContractCorpusEnumValueCoverage(t *testing.T) {
 	corpus := loadContractCorpus(t)
 
 	codeProperty := componentSchema(t, "Error").Properties["code"]
-	if codeProperty == nil || codeProperty.Value == nil {
-		t.Fatal("Error.code has no schema property")
-	}
+	testassert.Require(t, codeProperty != nil && codeProperty.Value != nil, "Error.code has no schema property")
 	allowedCodes := map[string]bool{}
 	for _, value := range codeProperty.Value.Enum {
 		code, ok := value.(string)
-		if !ok {
-			t.Fatalf("Error.code enum value %v is not a string", value)
-		}
+		testassert.Require(t, ok, "Error.code enum value %v is not a string", value)
 		allowedCodes[code] = true
 	}
 	haveCodes := map[string]bool{}
 	for _, members := range contractFixtureObjects(t, corpus, "Error") {
 		var code string
-		if err := json.Unmarshal(members["code"], &code); err != nil {
-			t.Fatalf("Error accept fixture code: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(members["code"], &code))
 		haveCodes[code] = true
 	}
 	requireSameSet(t, "Error.code", allowedCodes, haveCodes)
 
 	for _, union := range []string{"ConversationItem", "Event"} {
 		unionSchema := componentSchema(t, union)
-		if unionSchema.Discriminator == nil {
-			t.Fatalf("%s has no discriminator", union)
-		}
+		testassert.Require(t, unionSchema.Discriminator != nil, "%s has no discriminator", union)
 		allowedKinds := map[string]bool{}
 		for kind := range unionSchema.Discriminator.Mapping {
 			allowedKinds[kind] = true
@@ -289,8 +272,9 @@ func TestContractCorpusEnumValueCoverage(t *testing.T) {
 		haveKinds := map[string]bool{}
 		for _, members := range contractFixtureObjects(t, corpus, union) {
 			var kind string
-			if err := json.Unmarshal(members["kind"], &kind); err != nil {
-				t.Fatalf("%s accept fixture kind: %v", union, err)
+			{
+				err := json.Unmarshal(members["kind"], &kind)
+				testassert.Require(t, err == nil, "%s accept fixture kind: %v", union, err)
 			}
 			haveKinds[kind] = true
 		}
@@ -329,9 +313,7 @@ func TestContractCorpusOptionalMembersPresentAndAbsent(t *testing.T) {
 					absent = true
 				}
 			}
-			if !present || !absent {
-				t.Errorf("%s optional member %q is not pinned by accepted present and absent fixtures (present=%v absent=%v)", entry.Schema, member, present, absent)
-			}
+			testassert.Check(t, present && absent, "%s optional member %q is not pinned by accepted present and absent fixtures (present=%v absent=%v)", entry.Schema, member, present, absent)
 		}
 	}
 }
@@ -344,8 +326,9 @@ func TestContractCorpusOperationsMatchSchema(t *testing.T) {
 	corpus := loadContractCorpus(t)
 	have := map[string]contractOperation{}
 	for _, operation := range corpus.Operations {
-		if _, duplicate := have[operation.OperationID]; duplicate {
-			t.Fatalf("operation %q appears twice in the corpus", operation.OperationID)
+		{
+			_, duplicate := have[operation.OperationID]
+			testassert.Require(t, !duplicate, "operation %q appears twice in the corpus", operation.OperationID)
 		}
 		have[operation.OperationID] = operation
 	}
@@ -362,12 +345,8 @@ func TestContractCorpusOperationsMatchSchema(t *testing.T) {
 				Responses:   operationResponseComponents(doc, operation),
 			}
 			found, ok := have[operation.OperationID]
-			if !ok {
-				t.Fatalf("operation %q is missing from the contract corpus", operation.OperationID)
-			}
-			if !reflect.DeepEqual(found, want) {
-				t.Fatalf("operation %q corpus mapping = %+v, want %+v", operation.OperationID, found, want)
-			}
+			testassert.Require(t, ok, "operation %q is missing from the contract corpus", operation.OperationID)
+			testassert.Require(t, reflect.DeepEqual(found, want), "operation %q corpus mapping = %+v, want %+v", operation.OperationID, found, want)
 			delete(have, operation.OperationID)
 		}
 	}
@@ -482,23 +461,22 @@ func TestContractCorpusRawFidelity(t *testing.T) {
 	for _, entry := range corpus.RawFidelity {
 		schemaRef := componentSchema(t, entry.Schema)
 		original := decodeSchemaJSON(t, entry.JSON)
-		if err := schemaRef.VisitJSON(original); err != nil {
-			t.Fatalf("%s raw fixture %s: schema rejected it: %v", entry.Schema, entry.JSON, err)
+		{
+			err := schemaRef.VisitJSON(original)
+			testassert.Require(t, err == nil, "%s raw fixture %s: schema rejected it: %v", entry.Schema, entry.JSON, err)
 		}
 		target, ok := contractGeneratedTypes[entry.Schema]
-		if !ok {
-			t.Fatalf("raw fixture schema %q has no generated Go target", entry.Schema)
-		}
+		testassert.Require(t, ok, "raw fixture schema %q has no generated Go target", entry.Schema)
 		value := target()
-		if err := json.Unmarshal([]byte(entry.JSON), value); err != nil {
-			t.Fatalf("%s raw fixture: generated decode: %v", entry.Schema, err)
+		{
+			err := json.Unmarshal([]byte(entry.JSON), value)
+			testassert.Require(t, err == nil, "%s raw fixture: generated decode: %v", entry.Schema, err)
 		}
 		encoded, err := json.Marshal(value)
-		if err != nil {
-			t.Fatalf("%s raw fixture: re-encode: %v", entry.Schema, err)
-		}
-		if reencoded := decodeSchemaJSON(t, string(encoded)); !reflect.DeepEqual(original, reencoded) {
-			t.Fatalf("%s raw fixture re-encoded to %s, want the decoded original %s preserved exactly", entry.Schema, encoded, entry.JSON)
+		testassert.Require(t, err == nil, "%s raw fixture: re-encode: %v", entry.Schema, err)
+		{
+			reencoded := decodeSchemaJSON(t, string(encoded))
+			testassert.Require(t, reflect.DeepEqual(original, reencoded), "%s raw fixture re-encoded to %s, want the decoded original %s preserved exactly", entry.Schema, encoded, entry.JSON)
 		}
 	}
 }
@@ -522,18 +500,22 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 			{"Event", contractComponentFixture(t, corpus, "Event", component)},
 		} {
 			var members map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(fixture.json), &members); err != nil {
-				t.Fatalf("%s fixture %q: %v", component, fixture.name, err)
+			{
+				err := json.Unmarshal([]byte(fixture.json), &members)
+				testassert.Require(t, err == nil, "%s fixture %q: %v", component, fixture.name, err)
 			}
-			if _, duplicate := members["instance_id"]; duplicate {
-				t.Fatalf("%s fixture %q carries a top-level instance_id", component, fixture.name)
+			{
+				_, duplicate := members["instance_id"]
+				testassert.Require(t, !duplicate, "%s fixture %q carries a top-level instance_id", component, fixture.name)
 			}
 			var revision map[string]json.RawMessage
-			if err := json.Unmarshal(members[revisionMember], &revision); err != nil {
-				t.Fatalf("%s fixture %q: revision member %q: %v", component, fixture.name, revisionMember, err)
+			{
+				err := json.Unmarshal(members[revisionMember], &revision)
+				testassert.Require(t, err == nil, "%s fixture %q: revision member %q: %v", component, fixture.name, revisionMember, err)
 			}
-			if _, ok := revision["instance_id"]; !ok {
-				t.Fatalf("%s fixture %q: revision %q has no instance_id", component, fixture.name, revisionMember)
+			{
+				_, ok := revision["instance_id"]
+				testassert.Require(t, ok, "%s fixture %q: revision %q has no instance_id", component, fixture.name, revisionMember)
 			}
 		}
 	}
@@ -541,11 +523,13 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 	for _, component := range []string{"TextDeltaEvent", "RefusalDeltaEvent", "ToolStartedEvent", "ToolFinishedEvent"} {
 		fixture := contractComponentFixture(t, corpus, component, "progress")
 		var members map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(fixture), &members); err != nil {
-			t.Fatalf("%s progress fixture: %v", component, err)
+		{
+			err := json.Unmarshal([]byte(fixture), &members)
+			testassert.Require(t, err == nil, "%s progress fixture: %v", component, err)
 		}
-		if _, ok := members["instance_id"]; ok {
-			t.Fatalf("%s progress fixture carries an instance identity", component)
+		{
+			_, ok := members["instance_id"]
+			testassert.Require(t, !ok, "%s progress fixture carries an instance identity", component)
 		}
 	}
 }

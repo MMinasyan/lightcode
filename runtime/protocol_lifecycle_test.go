@@ -22,6 +22,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -46,9 +47,7 @@ func dialSmallBuffer(t *testing.T, ps *ProtocolServer) net.Conn {
 		})
 	}}
 	conn, err := dialer.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://"))
-	if err != nil {
-		t.Fatalf("dial small-buffer connection: %v", err)
-	}
+	testassert.NoError(t, err)
 	return conn
 }
 
@@ -58,19 +57,16 @@ func dialSmallBuffer(t *testing.T, ps *ProtocolServer) net.Conn {
 func openSSEOverConn(t *testing.T, conn net.Conn, ps *ProtocolServer) {
 	t.Helper()
 	request := "GET /v1/events HTTP/1.1\r\nHost: events\r\nAuthorization: Bearer " + ps.credential + "\r\n\r\n"
-	if _, err := conn.Write([]byte(request)); err != nil {
-		t.Fatalf("write events request: %v", err)
+	{
+		_, err := conn.Write([]byte(request))
+		testassert.NoError(t, err)
 	}
 	reader := bufio.NewReader(conn)
 	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "200") {
-		t.Fatalf("events handshake = (%q, %v), want the 200 status line", status, err)
-	}
+	testassert.Require(t, err == nil && strings.Contains(status, "200"), "events handshake = (%q, %v), want the 200 status line", status, err)
 	for {
 		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read events headers: %v", err)
-		}
+		testassert.NoError(t, err)
 		if strings.TrimSpace(line) == "" {
 			break
 		}
@@ -120,11 +116,12 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	e.server.setHold(parked)
 	gate := sync.OnceFunc(func() { close(parked) })
 	defer gate()
-	if _, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
-		OperationId: "op-1", Mode: "regular",
-		Content: []protocol.ContentPart{textContentPart(t, "running", nil)},
-	}); err != nil {
-		t.Fatalf("gated submit: %v", err)
+	{
+		_, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
+			OperationId: "op-1", Mode: "regular",
+			Content: []protocol.ContentPart{textContentPart(t, "running", nil)},
+		})
+		testassert.NoError(t, err)
 	}
 	awaitModelArrival(t, e)
 
@@ -148,21 +145,18 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 		overflowed = subscriberCount(r) == 1
 		time.Sleep(time.Millisecond)
 	}
-	if !overflowed {
-		t.Fatalf("the overflowing stream survived %d published frames, want its subscription removed alone", flooded)
-	}
+	testassert.Require(t, overflowed, "the overflowing stream survived %d published frames, want its subscription removed alone", flooded)
 
 	// The removed subscription's watcher closed exactly this connection
 	// while its socket write was blocked: draining the buffered window now
 	// ends in EOF. A live connection would answer a timeout, which is the
 	// forbidden sibling.
-	if err := victimConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatalf("set victim read deadline: %v", err)
-	}
+	testassert.NoError(t, victimConn.SetReadDeadline(time.Now().Add(10*time.Second)))
 	// io.Copy reports nil only when the peer's EOF ends the read; a live
 	// connection would answer the read deadline instead.
-	if _, err := io.Copy(io.Discard, victimConn); err != nil {
-		t.Fatalf("draining the removed stream's connection ended with %v, want the watcher's EOF", err)
+	{
+		_, err := io.Copy(io.Discard, victimConn)
+		testassert.NoError(t, err)
 	}
 
 	// The healthy sibling observed a substantial share of the flood, keeps
@@ -180,14 +174,16 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	}
 	awaitHealthy(100)
 	before := healthyCount.Load()
-	if _, err := r.submitSession(ctx, session, protocol.SubmitRequest{
-		OperationId: "op-final", Mode: "queued",
-		Content: []protocol.ContentPart{textContentPart(t, "final", nil)},
-	}); err != nil {
-		t.Fatalf("post-flood submit: %v", err)
+	{
+		_, err := r.submitSession(ctx, session, protocol.SubmitRequest{
+			OperationId: "op-final", Mode: "queued",
+			Content: []protocol.ContentPart{textContentPart(t, "final", nil)},
+		})
+		testassert.NoError(t, err)
 	}
-	if _, err := client.GetSessionHydrationWithResponse(ctx, session); err != nil {
-		t.Fatalf("post-flood session read: %v", err)
+	{
+		_, err := client.GetSessionHydrationWithResponse(ctx, session)
+		testassert.NoError(t, err)
 	}
 	awaitHealthy(before + 1)
 
@@ -195,9 +191,7 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	// it settle success.
 	gate()
 	record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
-	if record.State.Status != harness.OperationSuccess {
-		t.Fatalf("the gated operation settled as %q, want success after the stream loss", record.State.Status)
-	}
+	testassert.Equal(t, record.State.Status, harness.OperationSuccess)
 }
 
 // TestProtocolServerHeartbeat pins the 15-second keepalive comment on one
@@ -229,9 +223,7 @@ func TestProtocolServerHeartbeat(t *testing.T) {
 	}()
 	select {
 	case line := <-keepalive:
-		if line != ": keepalive" {
-			t.Fatalf("keepalive comment = %q, want exactly %q", line, ": keepalive")
-		}
+		testassert.Equal(t, line, ": keepalive")
 	case <-time.After(sseHeartbeatInterval + 5*time.Second):
 		t.Fatalf("no keepalive comment within one heartbeat interval (%s)", sseHeartbeatInterval)
 	}
@@ -248,20 +240,14 @@ func TestProtocolServerEventQualification(t *testing.T) {
 	warning := warningChangedEvent(runtimeEventScope(), 7)
 	qualified := qualifyEvent(warning, instance)
 	value, err := qualified.AsWarningChangedEvent()
-	if err != nil || value.WarningsRevision.InstanceId != instance || value.WarningsRevision.Revision != "7" {
-		t.Fatalf("qualified warning event = (%+v, %v), want the instance-qualified revision", value, err)
-	}
+	testassert.Require(t, err == nil && value.WarningsRevision.InstanceId == instance && value.WarningsRevision.Revision == "7", "qualified warning event = (%+v, %v), want the instance-qualified revision", value, err)
 
 	delta := textDeltaEvent(operationEventScope("ws", "session", "op"), 3, "chunk")
 	unmodified := qualifyEvent(delta, instance)
 	frame, err := json.Marshal(unmodified)
-	if err != nil || strings.Contains(string(frame), "instance_id") {
-		t.Fatalf("qualified transient event = %s (%v), want no instance member on the wire", frame, err)
-	}
+	testassert.Require(t, err == nil && !strings.Contains(string(frame), "instance_id"), "qualified transient event = %s (%v), want no instance member on the wire", frame, err)
 	transient, err := unmodified.AsTextDeltaEvent()
-	if err != nil || transient.Content != "chunk" || transient.Position != 3 {
-		t.Fatalf("qualified transient event = (%+v, %v), want the unchanged payload", transient, err)
-	}
+	testassert.Require(t, err == nil && transient.Content == "chunk" && transient.Position == 3, "qualified transient event = (%+v, %v), want the unchanged payload", transient, err)
 
 	store := storage.NewMemory()
 	r, _ := openProjectionRuntime(t, store)
@@ -272,13 +258,12 @@ func TestProtocolServerEventQualification(t *testing.T) {
 
 	stream := openSSEStream(t, ps)
 	defer stream.close()
-	if _, err := client.ReloadConfigurationWithResponse(ctx); err != nil {
-		t.Fatalf("reload: %v", err)
+	{
+		_, err := client.ReloadConfigurationWithResponse(ctx)
+		testassert.NoError(t, err)
 	}
 	frameEvent := readUntilEvent(t, stream, "configuration_changed", 16)
-	if got := eventRevisionInstance(t, frameEvent["configuration_revision"], "configuration_changed"); got != ps.instance {
-		t.Fatalf("stream configuration revision instance = %q, want the minted %q", got, ps.instance)
-	}
+	testassert.Equal(t, eventRevisionInstance(t, frameEvent["configuration_revision"], "configuration_changed"), ps.instance)
 }
 
 // TestProtocolServerShutdownTopology pins the shutdown ordering: the listener
@@ -289,11 +274,7 @@ func TestProtocolServerEventQualification(t *testing.T) {
 func TestProtocolServerShutdownTopology(t *testing.T) {
 	store := storage.NewMemory()
 	blocked := newTargetedBlockStore(store)
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(blocked))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, e := openProtocolOwner(t, blocked)
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	client := protocolClient(t, ps)
@@ -337,18 +318,15 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 
 	// One published discovery record the shutdown must withdraw.
 	record := filepath.Join(t.TempDir(), "discovery.json")
-	if err := ps.PublishDiscovery(record); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, ps.PublishDiscovery(record))
 
 	workspace := filepath.Join(e.home, "shutdown")
 	created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
-	if err != nil || created.JSON201 == nil {
-		t.Fatalf("create: %v", err)
-	}
+	testassert.Require(t, err == nil && created.JSON201 != nil, "create: %v", err)
 	session := created.JSON201.SessionId
-	if response, err := client.ArchiveSessionWithResponse(ctx, session); err != nil || response.JSON200 == nil {
-		t.Fatalf("archive: %v", err)
+	{
+		response, err := client.ArchiveSessionWithResponse(ctx, session)
+		testassert.Require(t, err == nil && response.JSON200 != nil, "archive: %v", err)
 	}
 
 	// One active stream closes when the server's connections close.
@@ -403,13 +381,15 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 	}
 
 	// The record is still in place while the owner is joined on the command.
-	if _, err := os.Stat(record); err != nil {
-		t.Fatalf("the discovery record was withdrawn before the joined command settled: %v", err)
+	{
+		_, err := os.Stat(record)
+		testassert.NoError(t, err)
 	}
 
 	// A racing attachment after shutdown began cannot attach.
-	if second, err := r.OpenProtocol(context.Background()); err == nil || !errors.Is(err, ErrClosed) {
-		t.Fatalf("post-shutdown attachment = (%v, %v), want the closed refusal", second, err)
+	{
+		second, err := r.OpenProtocol(context.Background())
+		testassert.Require(t, err != nil && errors.Is(err, ErrClosed), "post-shutdown attachment = (%v, %v), want the closed refusal", second, err)
 	}
 
 	// Releasing the parked transaction lets the deletion settle, the close
@@ -427,17 +407,17 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 	select {
 	case err := <-closeDone:
 		closeJoined = true
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("the owner shutdown never converged after the command settled")
 	}
-	if _, err := os.Stat(record); !os.IsNotExist(err) {
-		t.Fatalf("the discovery record survived shutdown: %v", err)
+	{
+		_, err := os.Stat(record)
+		testassert.Require(t, os.IsNotExist(err), "the discovery record survived shutdown: %v", err)
 	}
-	if _, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://")); err == nil {
-		t.Fatal("the protocol listener still accepts after shutdown")
+	{
+		_, err := net.Dial("tcp", strings.TrimPrefix(ps.Endpoint(), "http://"))
+		testassert.Require(t, err != nil, "the protocol listener still accepts after shutdown")
 	}
 	e.assertLockReleased(t)
 }
@@ -447,30 +427,20 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 // claim after a failed pre-write attempt, the required existing parent, and
 // the post-shutdown refusal.
 func TestProtocolServerDiscoveryPublication(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
 	dir := t.TempDir()
 	record := filepath.Join(dir, "discovery.json")
-	if err := ps.PublishDiscovery(record); err != nil {
-		t.Fatalf("PublishDiscovery: %v", err)
-	}
+	testassert.NoError(t, ps.PublishDiscovery(record))
 	info, err := os.Stat(record)
-	if err != nil {
-		t.Fatalf("published record: %v", err)
-	}
+	testassert.NoError(t, err)
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("published record mode = %o, want 0600", info.Mode().Perm())
 	}
 	data, err := os.ReadFile(record)
-	if err != nil {
-		t.Fatalf("read published record: %v", err)
-	}
+	testassert.NoError(t, err)
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	var published struct {
@@ -482,34 +452,34 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 	if err := decoder.Decode(&published); err != nil {
 		t.Fatalf("decode published record %s: %v", string(data), err)
 	}
-	if published.Endpoint != ps.Endpoint() || published.InstanceId != ps.instance ||
-		published.ProtocolVersion != string(protocol.N2) || published.Credential != ps.credential {
-		t.Fatalf("published record = %+v, want the endpoint, identity, wire version, and credential", published)
-	}
+	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N2) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
 
 	// A second publication is refused — successful publication cannot repeat.
 	second := filepath.Join(dir, "second.json")
-	if err := ps.PublishDiscovery(second); err == nil {
-		t.Fatal("repeat publication was accepted")
+	{
+		err := ps.PublishDiscovery(second)
+		testassert.Require(t, err != nil, "repeat publication was accepted")
 	}
-	if _, err := os.Stat(second); !os.IsNotExist(err) {
-		t.Fatal("the refused repeat published a second record")
+	{
+		_, err := os.Stat(second)
+		testassert.Require(t, os.IsNotExist(err), "the refused repeat published a second record")
 	}
 
 	// After the owner's shutdown, publication is refused and leaves no
 	// record: the owner never answers health again.
-	if err := r.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	testassert.NoError(t, r.Close(context.Background()))
 	late := filepath.Join(dir, "late.json")
-	if err := ps.PublishDiscovery(late); err == nil || !errors.Is(err, ErrClosed) {
-		t.Fatalf("post-shutdown publication = %v, want the closed refusal", err)
+	{
+		err := ps.PublishDiscovery(late)
+		testassert.Require(t, err != nil && errors.Is(err, ErrClosed), "post-shutdown publication = %v, want the closed refusal", err)
 	}
-	if _, err := os.Stat(late); !os.IsNotExist(err) {
-		t.Fatal("the refused post-shutdown publication wrote a record")
+	{
+		_, err := os.Stat(late)
+		testassert.Require(t, os.IsNotExist(err), "the refused post-shutdown publication wrote a record")
 	}
-	if _, err := os.Stat(record); !os.IsNotExist(err) {
-		t.Fatalf("the discovery record %s survived shutdown", record)
+	{
+		_, err := os.Stat(record)
+		testassert.Require(t, os.IsNotExist(err), "the discovery record %s survived shutdown", record)
 	}
 }
 
@@ -517,31 +487,29 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 // claim: a pre-write failure — the parent directory must already exist —
 // leaves the server free to publish at the next valid path.
 func TestProtocolServerDiscoveryClaimRelease(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "absent-parent", "discovery.json")
-	if err := ps.PublishDiscovery(missing); err == nil {
-		t.Fatal("publication into a missing parent was accepted")
+	{
+		err := ps.PublishDiscovery(missing)
+		testassert.Require(t, err != nil, "publication into a missing parent was accepted")
 	}
-	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatal("the failed attempt published a record")
+	{
+		_, err := os.Stat(missing)
+		testassert.Require(t, os.IsNotExist(err), "the failed attempt published a record")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "absent-parent")); !os.IsNotExist(err) {
-		t.Fatal("the failed attempt resurrected the parent directory")
+	{
+		_, err := os.Stat(filepath.Join(dir, "absent-parent"))
+		testassert.Require(t, os.IsNotExist(err), "the failed attempt resurrected the parent directory")
 	}
 	retry := filepath.Join(dir, "retry.json")
-	if err := ps.PublishDiscovery(retry); err != nil {
-		t.Fatalf("publication after the failed attempt: %v", err)
-	}
-	if _, err := os.Stat(retry); err != nil {
-		t.Fatalf("the retried publication's record: %v", err)
+	testassert.NoError(t, ps.PublishDiscovery(retry))
+	{
+		_, err := os.Stat(retry)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -549,28 +517,18 @@ func TestProtocolServerDiscoveryClaimRelease(t *testing.T) {
 // second attachment while one exists fails invalid and the first server keeps
 // serving.
 func TestProtocolServerAttachmentRaces(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	first := openProtocolServer(t, r)
 
 	second, err := r.OpenProtocol(context.Background())
-	if err == nil || !errors.Is(err, harness.ErrInvalid) {
-		t.Fatalf("second attachment = (%v, %v), want the invalid refusal", second, err)
-	}
-	if second != nil {
-		t.Fatal("the refused attachment returned a server")
-	}
+	testassert.Require(t, err != nil && errors.Is(err, harness.ErrInvalid), "second attachment = (%v, %v), want the invalid refusal", second, err)
+	testassert.Require(t, second == nil, "the refused attachment returned a server")
 
 	// The first server is untouched: health still answers.
 	resp := rawProtocol(t, http.MethodGet, protocolTarget(first, "/v1/health"), first.credential, "")
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("health after the refused attachment = %d, want 200", resp.StatusCode)
-	}
+	testassert.Equal(t, resp.StatusCode, http.StatusOK)
 }
 
 // TestProtocolServerDiscoveryPublicationRacingClose pins the publication
@@ -579,11 +537,7 @@ func TestProtocolServerAttachmentRaces(t *testing.T) {
 // written record is withdrawn before the ownership lock releases, and a
 // publication attempted after closure is the refused sibling.
 func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, e := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -623,8 +577,9 @@ func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
 		t.Fatalf("the parked publication returned before its write completed: %v", err)
 	default:
 	}
-	if _, err := os.Stat(record); !os.IsNotExist(err) {
-		t.Fatalf("the parked write exposed the record before publication completed: %v", err)
+	{
+		_, err := os.Stat(record)
+		testassert.Require(t, os.IsNotExist(err), "the parked write exposed the record before publication completed: %v", err)
 	}
 
 	closeDone := make(chan error, 1)
@@ -641,15 +596,11 @@ func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
 	releaseWrite()
 	select {
 	case err := <-publishDone:
-		if err != nil {
-			t.Fatalf("the joined publication failed: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("the released publication never returned")
 	}
-	if got := probe.count(); got != 1 {
-		t.Fatalf("the owning probe matched %d syncs, want exactly the discovery write", got)
-	}
+	testassert.Equal(t, probe.count(), 1)
 
 	select {
 	case <-releaseArrived:
@@ -657,15 +608,14 @@ func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
 		t.Fatal("the owner lock release was never reached")
 	}
 	// The record is already withdrawn while the lock release is parked.
-	if _, err := os.Stat(record); !os.IsNotExist(err) {
-		t.Fatalf("the discovery record survived into the lock release: %v", err)
+	{
+		_, err := os.Stat(record)
+		testassert.Require(t, os.IsNotExist(err), "the discovery record survived into the lock release: %v", err)
 	}
 	releaseLock()
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close never converged after the lock release")
 	}
@@ -673,19 +623,19 @@ func TestProtocolServerDiscoveryPublicationRacingClose(t *testing.T) {
 	// The hooked release reported success without dropping the flock; drop
 	// it for real and prove the ownership lock is free.
 	atomicfs.ReleaseFunc = previousRelease
-	if err := r.lock.Release(); err != nil {
-		t.Fatalf("real ownership lock release: %v", err)
-	}
+	testassert.NoError(t, r.lock.Release())
 	e.assertLockReleased(t)
 
 	// The nearest sibling: a publication attempted after closure is refused
 	// and leaves no record.
 	late := filepath.Join(dir, "late.json")
-	if err := ps.PublishDiscovery(late); err == nil || !errors.Is(err, ErrClosed) {
-		t.Fatalf("post-shutdown publication = %v, want the closed refusal", err)
+	{
+		err := ps.PublishDiscovery(late)
+		testassert.Require(t, err != nil && errors.Is(err, ErrClosed), "post-shutdown publication = %v, want the closed refusal", err)
 	}
-	if _, err := os.Stat(late); !os.IsNotExist(err) {
-		t.Fatal("the refused post-shutdown publication wrote a record")
+	{
+		_, err := os.Stat(late)
+		testassert.Require(t, os.IsNotExist(err), "the refused post-shutdown publication wrote a record")
 	}
 }
 
@@ -704,38 +654,22 @@ func TestProtocolServerStreamDisconnectPreservesLiveJob(t *testing.T) {
 	stream.close()
 
 	hydration, err := client.GetSessionHydrationWithResponse(ctx, session)
-	if err != nil || hydration.JSON200 == nil {
-		t.Fatalf("hydration after disconnect: %v", err)
-	}
+	testassert.Require(t, err == nil && hydration.JSON200 != nil, "hydration after disconnect: %v", err)
 	live := false
 	for _, member := range hydration.JSON200.Background {
 		if member.Kind == protocol.BackgroundMemberKindJob && member.Id == "0a1b2c3d" {
 			live = true
 		}
 	}
-	if !live {
-		t.Fatalf("hydration background = %+v, want the live job member after the stream disconnect", hydration.JSON200.Background)
-	}
-	if stops := countEvents(e.events.all(), "stopjob"); stops != 0 {
-		t.Fatalf("the stream disconnect invoked the job stopper %d times", stops)
-	}
+	testassert.Require(t, live, "hydration background = %+v, want the live job member after the stream disconnect", hydration.JSON200.Background)
+	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 0)
 
 	// The existing stop path completes the job through the fixture seam.
-	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		return h.Stop(ctx, session)
-	}); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if stops := countEvents(e.events.all(), "stopjob"); stops != 1 {
-		t.Fatalf("stop invoked the job stopper %d times, want exactly one", stops)
-	}
+	testassert.NoError(t, r.stopSession(ctx, session))
+	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 1)
 	settled, err := client.GetSessionHydrationWithResponse(ctx, session)
-	if err != nil || settled.JSON200 == nil {
-		t.Fatalf("hydration after stop: %v", err)
-	}
-	if len(settled.JSON200.Background) != 0 {
-		t.Fatalf("hydration background = %+v, want the stopped job removed", settled.JSON200.Background)
-	}
+	testassert.Require(t, err == nil && settled.JSON200 != nil, "hydration after stop: %v", err)
+	testassert.Require(t, len(settled.JSON200.Background) == 0, "hydration background = %+v, want the stopped job removed", settled.JSON200.Background)
 }
 
 // firstNonLoopbackAddress returns the machine's first usable non-loopback
@@ -743,9 +677,7 @@ func TestProtocolServerStreamDisconnectPreservesLiveJob(t *testing.T) {
 func firstNonLoopbackAddress(t *testing.T) string {
 	t.Helper()
 	interfaces, err := net.Interfaces()
-	if err != nil {
-		t.Fatalf("list network interfaces: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 {
 			continue
@@ -770,11 +702,7 @@ func firstNonLoopbackAddress(t *testing.T) string {
 // endpoint answers only on the loopback interface: dialing the bound port
 // through a non-loopback local address fails.
 func TestProtocolServerListenerIsLoopbackOnly(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(ps.Endpoint(), "http://"))
@@ -851,11 +779,7 @@ func processListenPorts(t *testing.T) map[int]bool {
 // attachment returns the closed refusal with no attachment while the
 // process-table-captured listener port stops answering.
 func TestProtocolServerPostBindCloseRace(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 
 	before := processListenPorts(t)
@@ -909,14 +833,10 @@ func TestProtocolServerPostBindCloseRace(t *testing.T) {
 		if before[port] {
 			continue
 		}
-		if boundPort != 0 {
-			t.Fatalf("more than one new listening socket appeared: %d and %d", boundPort, port)
-		}
+		testassert.Require(t, boundPort == 0, "more than one new listening socket appeared: %d and %d", boundPort, port)
 		boundPort = port
 	}
-	if boundPort == 0 {
-		t.Fatal("no newly bound listening socket appeared while OpenProtocol was parked")
-	}
+	testassert.Require(t, boundPort != 0, "no newly bound listening socket appeared while OpenProtocol was parked")
 	boundAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(boundPort))
 
 	closeStarted = true
@@ -929,9 +849,7 @@ func TestProtocolServerPostBindCloseRace(t *testing.T) {
 		if closed {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("Close never marked admission closed")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "Close never marked admission closed")
 		time.Sleep(time.Millisecond)
 	}
 
@@ -951,16 +869,12 @@ func TestProtocolServerPostBindCloseRace(t *testing.T) {
 	r.mu.Lock()
 	attached := r.protocol != nil
 	r.mu.Unlock()
-	if attached {
-		t.Fatal("the rejected OpenProtocol left an attachment")
-	}
+	testassert.Require(t, !attached, "the rejected OpenProtocol left an attachment")
 
 	select {
 	case err := <-closeDone:
 		closeConsumed = true
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close never converged after the rejected attachment")
 	}
@@ -975,11 +889,7 @@ func TestProtocolServerPostBindCloseRace(t *testing.T) {
 // verification completes, Close cancels the owner work context, and the
 // admitted publisher errors without remembering a path or writing a record.
 func TestProtocolServerPublicationReadinessVsClose(t *testing.T) {
-	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	r, _ := openProtocolOwner(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
 
@@ -1016,26 +926,21 @@ func TestProtocolServerPublicationReadinessVsClose(t *testing.T) {
 	go func() { closeDone <- r.Close(context.Background()) }()
 	select {
 	case err := <-publishDone:
-		if err == nil {
-			t.Fatal("the readiness-gated publication succeeded")
-		}
+		testassert.Require(t, err != nil, "the readiness-gated publication succeeded")
 	case <-time.After(10 * time.Second):
 		t.Fatal("the readiness-gated publication never returned")
 	}
 	ps.pubMu.Lock()
 	remembered := ps.discoveryPath
 	ps.pubMu.Unlock()
-	if remembered != "" {
-		t.Fatalf("the refused publication remembered path %q", remembered)
-	}
-	if _, err := os.Stat(record); !os.IsNotExist(err) {
-		t.Fatalf("the refused publication wrote a record: %v", err)
+	testassert.Equal(t, remembered, "")
+	{
+		_, err := os.Stat(record)
+		testassert.Require(t, os.IsNotExist(err), "the refused publication wrote a record: %v", err)
 	}
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close never converged while readiness was gated")
 	}
@@ -1048,29 +953,25 @@ func TestProtocolServerPublicationReadinessVsClose(t *testing.T) {
 func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 	assertOnePublication := func(t *testing.T, remembered string, firstErr, secondErr error, first, second string) {
 		t.Helper()
-		if (firstErr == nil) == (secondErr == nil) {
-			t.Fatalf("concurrent publications = (%v, %v), want exactly one success", firstErr, secondErr)
-		}
+		testassert.Require(t, (firstErr == nil) != (secondErr == nil), "concurrent publications = (%v, %v), want exactly one success", firstErr, secondErr)
 		winner, loser := first, second
 		if remembered == second {
 			winner, loser = second, first
 		} else if remembered != first {
 			t.Fatalf("remembered path %q is neither published path", remembered)
 		}
-		if _, err := os.Stat(winner); err != nil {
-			t.Fatalf("the successful publication's record: %v", err)
+		{
+			_, err := os.Stat(winner)
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(loser); !os.IsNotExist(err) {
-			t.Fatalf("the refused publication left a record at %s: %v", loser, err)
+		{
+			_, err := os.Stat(loser)
+			testassert.Require(t, os.IsNotExist(err), "the refused publication left a record at %s: %v", loser, err)
 		}
 	}
 
 	t.Run("parked first write leaves one remembered path", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		r, _ := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		dir := t.TempDir()
@@ -1098,9 +999,7 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 		releaseWrite()
 		firstErr := <-firstResult
 		secondErr := <-secondResult
-		if got := probe.count(); got != 1 {
-			t.Fatalf("the owning probe matched %d syncs, want only the first path's write", got)
-		}
+		testassert.Equal(t, probe.count(), 1)
 		ps.pubMu.Lock()
 		remembered := ps.discoveryPath
 		ps.pubMu.Unlock()
@@ -1108,11 +1007,7 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 	})
 
 	t.Run("injected first-write failure lets the waiter succeed", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		r, _ := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		dir := t.TempDir()
@@ -1135,26 +1030,20 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 		go func() { secondResult <- ps.PublishDiscovery(second) }()
 		firstErr := <-firstResult
 		secondErr := <-secondResult
-		if !errors.Is(firstErr, injected) {
-			t.Fatalf("the injected first write = %v, want the injected failure", firstErr)
-		}
-		if secondErr != nil {
-			t.Fatalf("the waiting second publication = %v, want success after the released claim", secondErr)
-		}
-		if got := probe.count(); got != 1 {
-			t.Fatalf("the owning probe matched %d syncs, want only the first path's write", got)
-		}
+		testassert.Require(t, errors.Is(firstErr, injected), "the injected first write = %v, want the injected failure", firstErr)
+		testassert.NoError(t, secondErr)
+		testassert.Equal(t, probe.count(), 1)
 		ps.pubMu.Lock()
 		remembered := ps.discoveryPath
 		ps.pubMu.Unlock()
-		if remembered != second {
-			t.Fatalf("remembered path = %q, want the second publisher's %q", remembered, second)
+		testassert.Equal(t, remembered, second)
+		{
+			_, err := os.Stat(second)
+			testassert.NoError(t, err)
 		}
-		if _, err := os.Stat(second); err != nil {
-			t.Fatalf("the second publication's record: %v", err)
-		}
-		if _, err := os.Stat(first); !os.IsNotExist(err) {
-			t.Fatalf("the failed publication left a record at %s: %v", first, err)
+		{
+			_, err := os.Stat(first)
+			testassert.Require(t, os.IsNotExist(err), "the failed publication left a record at %s: %v", first, err)
 		}
 	})
 }
@@ -1165,57 +1054,35 @@ func TestProtocolServerDiscoveryConcurrentPublishers(t *testing.T) {
 // releases and the directory contents survive.
 func TestProtocolServerDiscoveryWithdrawalStates(t *testing.T) {
 	t.Run("already removed", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		r, e := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		record := filepath.Join(t.TempDir(), "discovery.json")
-		if err := ps.PublishDiscovery(record); err != nil {
-			t.Fatalf("PublishDiscovery: %v", err)
-		}
-		if err := os.Remove(record); err != nil {
-			t.Fatalf("remove the record before shutdown: %v", err)
-		}
-		if err := r.Close(context.Background()); err != nil {
-			t.Fatalf("Close with an already-removed record: %v", err)
-		}
-		if _, err := os.Stat(record); !os.IsNotExist(err) {
-			t.Fatalf("the removed record reappeared: %v", err)
+		testassert.NoError(t, ps.PublishDiscovery(record))
+		testassert.NoError(t, os.Remove(record))
+		testassert.NoError(t, r.Close(context.Background()))
+		{
+			_, err := os.Stat(record)
+			testassert.Require(t, os.IsNotExist(err), "the removed record reappeared: %v", err)
 		}
 		e.assertLockReleased(t)
 	})
 
 	t.Run("replaced by a nonempty directory", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+		r, e := openProtocolOwner(t, storage.NewMemory())
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
 		record := filepath.Join(t.TempDir(), "discovery.json")
-		if err := ps.PublishDiscovery(record); err != nil {
-			t.Fatalf("PublishDiscovery: %v", err)
-		}
-		if err := os.Remove(record); err != nil {
-			t.Fatalf("remove the record: %v", err)
-		}
-		if err := os.Mkdir(record, 0o700); err != nil {
-			t.Fatalf("replace the record with a directory: %v", err)
-		}
+		testassert.NoError(t, ps.PublishDiscovery(record))
+		testassert.NoError(t, os.Remove(record))
+		testassert.NoError(t, os.Mkdir(record, 0o700))
 		inner := filepath.Join(record, "inner.txt")
-		if err := os.WriteFile(inner, []byte("kept"), 0o600); err != nil {
-			t.Fatalf("write the directory content: %v", err)
-		}
-		err = r.Close(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "withdraw discovery record") {
-			t.Fatalf("Close with a replaced record = %v, want the removal failure", err)
-		}
-		if data, err := os.ReadFile(inner); err != nil || string(data) != "kept" {
-			t.Fatalf("the directory content = (%q, %v), want it preserved", data, err)
+		testassert.NoError(t, os.WriteFile(inner, []byte("kept"), 0o600))
+		err := r.Close(context.Background())
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "withdraw discovery record"), "Close with a replaced record = %v, want the removal failure", err)
+		{
+			data, err := os.ReadFile(inner)
+			testassert.Require(t, err == nil && string(data) == "kept", "the directory content = (%q, %v), want it preserved", data, err)
 		}
 		e.assertLockReleased(t)
 	})

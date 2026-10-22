@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func readFileTestFile(t *testing.T, name, content string) string {
@@ -19,9 +20,7 @@ func readFileTestFile(t *testing.T, name, content string) string {
 func readFileTestFileBytes(t *testing.T, name string, data []byte) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(path, data, 0o644))
 	return path
 }
 
@@ -56,18 +55,14 @@ func TestPreparedReadLineRangesAndFooter(t *testing.T) {
 		"offset": json.Number("2"),
 		"limit":  json.Number("2"),
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
+	testassert.NoError(t, err)
 
 	want := strings.Join([]string{
 		"2\ttwo",
 		"3\tthree",
 		"(Showing lines 2-3 of 4.)",
 	}, "\n")
-	if result != want {
-		t.Fatalf("read_file output = %q, want %q", result, want)
-	}
+	testassert.Equal(t, result, want)
 }
 
 func TestPreparedReadDefaultLimitAndFooter(t *testing.T) {
@@ -79,18 +74,14 @@ func TestPreparedReadDefaultLimitAndFooter(t *testing.T) {
 		"offset": json.Number("-10"),
 		"limit":  json.Number("0"),
 	})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
+	testassert.NoError(t, err)
 
 	want := strings.Join([]string{
 		"1\tone",
 		"2\ttwo",
 		"(Showing lines 1-2 of 3. Use offset=3 to continue.)",
 	}, "\n")
-	if result != want {
-		t.Fatalf("read_file output = %q, want %q", result, want)
-	}
+	testassert.Equal(t, result, want)
 }
 
 func TestPreparedReadRejectsBinaryFiles(t *testing.T) {
@@ -108,9 +99,7 @@ func TestPreparedReadRejectsBinaryFiles(t *testing.T) {
 			root := filepath.Dir(path)
 
 			_, err := execRead(t, root, "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
-			if err == nil || !strings.Contains(err.Error(), "appears to be a binary file") {
-				t.Fatalf("Execute error = %v, want binary-file error", err)
-			}
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "appears to be a binary file"), "Execute error = %v, want binary-file error", err)
 		})
 	}
 }
@@ -120,12 +109,8 @@ func TestPreparedReadToleratesInvalidUTF8Text(t *testing.T) {
 	root := filepath.Dir(path)
 
 	result, err := execRead(t, root, "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if !strings.Contains(result, "1\tok") || !strings.Contains(result, "2\tnext") {
-		t.Fatalf("Execute result = %q, want line-numbered fallback text", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result, "1\tok") && strings.Contains(result, "2\tnext"), "Execute result = %q, want line-numbered fallback text", result)
 }
 
 func TestPreparedReadTruncatesLongLinesAndOutputBytes(t *testing.T) {
@@ -137,13 +122,6 @@ func TestPreparedReadTruncatesLongLinesAndOutputBytes(t *testing.T) {
 		ReadLineMaxChars: 3,
 		MaxOutputBytes:   24,
 	}, map[string]any{"path": path})
-	if err != nil {
-		t.Fatalf("Execute error = %v", err)
-	}
-	if !strings.Contains(result, "1\tabc... [truncated]") {
-		t.Fatalf("Execute result = %q, want per-line truncation", result)
-	}
-	if !strings.Contains(result, "Output truncated at 24 bytes") {
-		t.Fatalf("Execute result = %q, want byte-cap truncation footer", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result, "1\tabc... [truncated]") && strings.Contains(result, "Output truncated at 24 bytes"), "Execute result = %q, want per-line truncation; Execute result = %q, want byte-cap truncation footer", result, result)
 }

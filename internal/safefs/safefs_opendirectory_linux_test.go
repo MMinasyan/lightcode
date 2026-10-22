@@ -6,51 +6,38 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestOpenDirectoryOpensRealDirectory(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644))
+	testassert.NoError(t, os.Mkdir(filepath.Join(root, "sub"), 0o755))
 	f, err := OpenDirectory(root)
-	if err != nil {
-		t.Fatalf("OpenDirectory error = %v", err)
-	}
+	testassert.NoError(t, err)
 	defer f.Close()
 	entries, err := f.ReadDir(-1)
-	if err != nil {
-		t.Fatalf("ReadDir error = %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("entries = %d, want 2", len(entries))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(entries), 2)
 }
 
 func TestOpenDirectoryOpensFilesystemRoot(t *testing.T) {
 	f, err := OpenDirectory("/")
-	if err != nil {
-		t.Fatalf("OpenDirectory(/) error = %v", err)
-	}
+	testassert.NoError(t, err)
 	defer f.Close()
-	if _, err := f.ReadDir(-1); err != nil {
-		t.Fatalf("ReadDir error = %v", err)
+	{
+		_, err := f.ReadDir(-1)
+		testassert.NoError(t, err)
 	}
 }
 
 func TestOpenDirectoryRefusesSymlinkLeafWithoutFollowing(t *testing.T) {
 	root := t.TempDir()
 	real := filepath.Join(t.TempDir(), "real")
-	if err := os.Mkdir(real, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Mkdir(real, 0o755))
 	link := filepath.Join(root, "link")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(real, link))
 	f, err := OpenDirectory(link)
 	if err == nil {
 		f.Close()
@@ -61,9 +48,7 @@ func TestOpenDirectoryRefusesSymlinkLeafWithoutFollowing(t *testing.T) {
 func TestOpenDirectoryRefusesRegularFileLeaf(t *testing.T) {
 	root := t.TempDir()
 	file := filepath.Join(root, "file.txt")
-	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(file, []byte("x"), 0o644))
 	f, err := OpenDirectory(file)
 	if err == nil {
 		f.Close()
@@ -72,7 +57,8 @@ func TestOpenDirectoryRefusesRegularFileLeaf(t *testing.T) {
 }
 
 func TestOpenDirectoryRefusesMissingLeaf(t *testing.T) {
-	if _, err := OpenDirectory(filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatal("OpenDirectory accepted a missing leaf")
+	{
+		_, err := OpenDirectory(filepath.Join(t.TempDir(), "missing"))
+		testassert.Require(t, err != nil, "OpenDirectory accepted a missing leaf")
 	}
 }

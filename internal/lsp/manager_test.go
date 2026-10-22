@@ -15,30 +15,30 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/lsp/server"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestManagerForFileAndAllInstances(t *testing.T) {
 	m := NewManager(t.TempDir(), t.TempDir())
-	if got := m.ForFile("main.go"); got != nil {
-		t.Fatalf("ForFile without instance = %+v, want nil", got)
+	{
+		got := m.ForFile("main.go")
+		testassert.Require(t, got == nil, "ForFile without instance = %+v, want nil", got)
 	}
-	if got := m.ForFile("README"); got != nil {
-		t.Fatalf("ForFile without extension = %+v, want nil", got)
+	{
+		got := m.ForFile("README")
+		testassert.Require(t, got == nil, "ForFile without extension = %+v, want nil", got)
 	}
-	if got := m.ForFile("file.unknown"); got != nil {
-		t.Fatalf("ForFile unknown extension = %+v, want nil", got)
+	{
+		got := m.ForFile("file.unknown")
+		testassert.Require(t, got == nil, "ForFile unknown extension = %+v, want nil", got)
 	}
 
 	def := server.ForExtension(".go")
 	inst := newInstance(def, m.projectRoot, m.home, context.Background(), nil)
 	m.instances[def.Name] = inst
-	if got := m.ForFile("main.go"); got != inst {
-		t.Fatalf("ForFile(main.go) = %+v, want inserted instance", got)
-	}
+	testassert.Equal(t, m.ForFile("main.go"), inst)
 	all := m.AllInstances()
-	if len(all) != 1 || all[0] != inst {
-		t.Fatalf("AllInstances = %+v, want inserted instance", all)
-	}
+	testassert.Require(t, len(all) == 1 && all[0] == inst, "AllInstances = %+v, want inserted instance", all)
 }
 
 func TestManagerConcurrentHandlerAndInstances(t *testing.T) {
@@ -75,9 +75,7 @@ func TestManagerWarningHandler(t *testing.T) {
 	m.SetWarningHandler(func(kind, message string) { warningKind, warningMessage = kind, message })
 
 	m.emitWarning("kind", "message")
-	if warningKind != "kind" || warningMessage != "message" {
-		t.Fatalf("warning = %q/%q", warningKind, warningMessage)
-	}
+	testassert.Require(t, warningKind == "kind" && warningMessage == "message", "warning = %q/%q", warningKind, warningMessage)
 }
 
 func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
@@ -97,8 +95,9 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 			stubborn = "1"
 		}
 		inst := newFakeServerInstance(t, log, "", 0, 0, "", stubborn)
-		if err := inst.waitReady(context.Background()); err != nil {
-			t.Fatalf("waitReady server %d: %v", i, err)
+		{
+			err := inst.waitReady(context.Background())
+			testassert.Require(t, err == nil, "waitReady server %d: %v", i, err)
 		}
 		servers[i] = server{inst: inst, pid: inst.cmd.Process.Pid, stubborn: stubborn == "1"}
 	}
@@ -117,15 +116,14 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 	t.Logf("ShutdownAll with %d unresponsive servers took %s", 2, elapsed)
 	// The negotiate path waits shutdownWait per unresponsive instance before
 	// killing it; the teardown must kill instead, well below that.
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt teardown (the negotiate path waited %s per unresponsive server)", elapsed, shutdownWait)
-	}
+	testassert.Require(t, elapsed < 2*time.Second, "ShutdownAll took %s, want a prompt teardown (the negotiate path waited %s per unresponsive server)", elapsed, shutdownWait)
 
 	for i, s := range servers {
 		// The process must be gone and reaped, not merely left to the owner's
 		// own process exit: kill(pid, 0) returns ESRCH only once reaped.
-		if err := syscall.Kill(s.pid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Errorf("server %d (stubborn=%v) process %d still alive after ShutdownAll: kill err = %v", i, s.stubborn, s.pid, err)
+		{
+			err := syscall.Kill(s.pid, 0)
+			testassert.Check(t, errors.Is(err, syscall.ESRCH), "server %d (stubborn=%v) process %d still alive after ShutdownAll: kill err = %v", i, s.stubborn, s.pid, err)
 		}
 		s.inst.mu.Lock()
 		state := s.inst.state
@@ -137,9 +135,7 @@ func TestManagerShutdownAllKillsUnresponsiveServers(t *testing.T) {
 		if state != stateFailed {
 			t.Errorf("server %d state = %d (%s), want %d (failed)", i, state, stateName(state), stateFailed)
 		}
-		if rpc != nil || cmd != nil {
-			t.Errorf("server %d handles not cleared: rpc = %v, cmd = %v", i, rpc, cmd)
-		}
+		testassert.Check(t, rpc == nil && cmd == nil, "server %d handles not cleared: rpc = %v, cmd = %v", i, rpc, cmd)
 	}
 }
 
@@ -160,21 +156,18 @@ func TestStartServerAfterClosedRejectsBeforeStart(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("startServer after closed took %s", elapsed)
 	// Rejection happens before any start or negotiation, so it is prompt.
-	if elapsed >= 2*time.Second {
-		t.Fatalf("startServer after closed took %s, want an immediate rejection", elapsed)
-	}
+	testassert.Require(t, elapsed < 2*time.Second, "startServer after closed took %s, want an immediate rejection", elapsed)
 
 	// No process was ever launched: the wrapper never wrote the pidfile.
-	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
-		t.Fatalf("pidfile exists after rejected start: a process was launched after close (stat err = %v)", err)
+	{
+		_, err := os.Stat(pidfile)
+		testassert.Require(t, os.IsNotExist(err), "pidfile exists after rejected start: a process was launched after close (stat err = %v)", err)
 	}
 	// And no instance was registered.
 	m.mu.Lock()
 	_, mapped := m.instances[def.Name]
 	m.mu.Unlock()
-	if mapped {
-		t.Fatal("startServer after closed registered an instance")
-	}
+	testassert.Require(t, !mapped, "startServer after closed registered an instance")
 }
 
 // TestStartServerAfterClosedSkipsInstall covers the LSP close-before-install
@@ -206,21 +199,15 @@ func TestStartServerAfterClosedSkipsInstall(t *testing.T) {
 	m.startServer(context.Background(), def)
 	elapsed := time.Since(start)
 	t.Logf("startServer after CloseAdmission with missing binary took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("startServer after CloseAdmission took %s, want an immediate rejection", elapsed)
-	}
-	if installed {
-		t.Fatal("Install was called after CloseAdmission: the early admission check did not reject")
-	}
+	testassert.Require(t, elapsed < 2*time.Second, "startServer after CloseAdmission took %s, want an immediate rejection", elapsed)
+	testassert.Require(t, !installed, "Install was called after CloseAdmission: the early admission check did not reject")
 	if warnings.Load() != 0 {
 		t.Fatalf("warnings=%d after rejected start, want none", warnings.Load())
 	}
 	m.mu.Lock()
 	_, mapped := m.instances[def.Name]
 	m.mu.Unlock()
-	if mapped {
-		t.Fatal("startServer after CloseAdmission mapped an instance")
-	}
+	testassert.Require(t, !mapped, "startServer after CloseAdmission mapped an instance")
 }
 
 // TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission proves the
@@ -261,9 +248,7 @@ func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing
 	m.ShutdownAll()
 	elapsed := time.Since(start)
 	t.Logf("ShutdownAll with a probe-blocked start took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt permanent close", elapsed)
-	}
+	testassert.Require(t, elapsed < 2*time.Second, "ShutdownAll took %s, want a prompt permanent close", elapsed)
 
 	close(release)
 	select {
@@ -274,18 +259,15 @@ func TestStartServerCloseRaceProvisionalMappingHoldsTerminalAdmission(t *testing
 
 	// The released start could not launch an OS process: the mapped instance
 	// was already terminal, so inst.start refused before cmd.Start.
-	if _, err := os.Stat(pidfile); !os.IsNotExist(err) {
-		t.Fatalf("pidfile exists: the released start launched a process after permanent close (stat err = %v)", err)
+	{
+		_, err := os.Stat(pidfile)
+		testassert.Require(t, os.IsNotExist(err), "pidfile exists: the released start launched a process after permanent close (stat err = %v)", err)
 	}
-	if n := countLaunches(log); n != 0 {
-		t.Fatalf("server processes launched = %d, want 0", n)
-	}
+	testassert.Equal(t, countLaunches(log), 0)
 	m.mu.Lock()
 	inst := m.instances[def.Name]
 	m.mu.Unlock()
-	if inst == nil {
-		t.Fatal("provisionally mapped instance missing after permanent close")
-	}
+	testassert.Require(t, inst != nil, "provisionally mapped instance missing after permanent close")
 	inst.mu.Lock()
 	state := inst.state
 	inst.mu.Unlock()
@@ -338,9 +320,7 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 	m.mu.Lock()
 	_, mapped := m.instances[def.Name]
 	m.mu.Unlock()
-	if !mapped {
-		t.Fatal("startServer never mapped the instance")
-	}
+	testassert.Require(t, mapped, "startServer never mapped the instance")
 	// The wrapper's pidfile can precede handle installation. Receiving
 	// initialize proves cmd/procDone are installed and the delayed call is
 	// underway, so teardown owns the process this row asserts was reaped.
@@ -356,29 +336,24 @@ func TestStartServerCloseRaceMappedInstanceIsTornDown(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if pid == 0 {
-		t.Fatal("language server never reached initialization")
-	}
+	testassert.Require(t, pid != 0, "language server never reached initialization")
 
 	start := time.Now()
 	m.ShutdownAll()
 	elapsed := time.Since(start)
 	t.Logf("ShutdownAll with a mid-start mapped server took %s", elapsed)
-	if elapsed >= 2*time.Second {
-		t.Fatalf("ShutdownAll took %s, want a prompt teardown (no negotiation with the unresponsive server)", elapsed)
-	}
+	testassert.Require(t, elapsed < 2*time.Second, "ShutdownAll took %s, want a prompt teardown (no negotiation with the unresponsive server)", elapsed)
 
 	// The mapped mid-start instance's process is killed and reaped inside the
 	// call: kill(pid, 0) returns ESRCH only once reaped.
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("mid-start server process %d still alive after ShutdownAll returned (kill err = %v)", pid, err)
+	{
+		err := syscall.Kill(pid, 0)
+		testassert.Require(t, errors.Is(err, syscall.ESRCH), "mid-start server process %d still alive after ShutdownAll returned (kill err = %v)", pid, err)
 	}
 	// The instance ended terminal and the failed start cleans the mapping.
 	<-started
 	m.mu.Lock()
 	_, stillMapped := m.instances[def.Name]
 	m.mu.Unlock()
-	if stillMapped {
-		t.Fatal("failed start left its instance mapped")
-	}
+	testassert.Require(t, !stillMapped, "failed start left its instance mapped")
 }

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
@@ -18,21 +20,15 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 			name: "deleted",
 			mutate: func(t *testing.T, path string) {
 				t.Helper()
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Remove(path))
 			},
 		},
 		{
 			name: "recreated",
 			mutate: func(t *testing.T, path string) {
 				t.Helper()
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(path, []byte("external"), 0o644); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Remove(path))
+				testassert.NoError(t, os.WriteFile(path, []byte("external"), 0o644))
 			},
 		},
 	} {
@@ -52,17 +48,11 @@ func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 				"content": "after",
 			})
 
-			if err != nil {
-				t.Fatalf("write_file error = %v", err)
-			}
+			testassert.NoError(t, err)
 			assertFileContent(t, path, "after")
 			affected, err := store.RevertCode(0)
-			if err != nil {
-				t.Fatalf("RevertCode error = %v", err)
-			}
-			if len(affected.Restored) != 1 || affected.Restored[0] != path {
-				t.Fatalf("RevertCode affected = %v, want restored %s", affected, path)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path, "RevertCode affected = %v, want restored %s", affected, path)
 			assertFileContent(t, path, "before")
 		})
 	}
@@ -79,16 +69,10 @@ func TestEditFileDiscardsSnapshotWhenEditFailsBeforeMutation(t *testing.T) {
 		"new_string": "after",
 	})
 
-	if err == nil {
-		t.Fatal("edit_file succeeded, want missing match error")
-	}
+	testassert.Require(t, err != nil, "edit_file succeeded, want missing match error")
 	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatalf("RevertCode error = %v, want no active snapshot entry", err)
-	}
-	if len(affected.Restored) != 0 {
-		t.Fatalf("RevertCode affected = %v, want no files", affected)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(affected.Restored) == 0, "RevertCode affected = %v, want no files", affected)
 	assertFileContent(t, path, "before")
 }
 
@@ -99,12 +83,8 @@ func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 	wrapped := &mutatingTransactionalSnapshotStore{
 		testCodeGroupStore: store,
 		mutate: func() {
-			if err := os.Remove(path); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(path, []byte("external"), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, os.Remove(path))
+			testassert.NoError(t, os.WriteFile(path, []byte("external"), 0o644))
 		},
 	}
 
@@ -114,17 +94,11 @@ func TestEditFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
 		"new_string": "after",
 	})
 
-	if err != nil {
-		t.Fatalf("edit_file error = %v", err)
-	}
+	testassert.NoError(t, err)
 	assertFileContent(t, path, "after")
 	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatalf("RevertCode error = %v", err)
-	}
-	if len(affected.Restored) != 1 || affected.Restored[0] != path {
-		t.Fatalf("RevertCode affected = %v, want restored %s", affected, path)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path, "RevertCode affected = %v, want restored %s", affected, path)
 	assertFileContent(t, path, "before")
 }
 
@@ -133,27 +107,22 @@ func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) 
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t)
 
-	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
-		"path":    path,
-		"content": "after",
-	}); err != nil {
-		t.Fatal(err)
+	{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
+			"path":    path,
+			"content": "after",
+		})
+		testassert.NoError(t, err)
 	}
 	_, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
 		"old_string": "missing",
 		"new_string": "other",
 	})
-	if err == nil {
-		t.Fatal("edit_file succeeded, want missing match error")
-	}
+	testassert.Require(t, err != nil, "edit_file succeeded, want missing match error")
 	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(affected.Restored) != 1 || affected.Restored[0] != path {
-		t.Fatalf("RevertCode affected = %v, want retained snapshot for %s", affected, path)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path, "RevertCode affected = %v, want retained snapshot for %s", affected, path)
 	assertFileContent(t, path, "before")
 }
 
@@ -162,32 +131,25 @@ func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t)
 
-	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
-		"path":    path,
-		"content": "first",
-	}); err != nil {
-		t.Fatal(err)
+	{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
+			"path":    path,
+			"content": "first",
+		})
+		testassert.NoError(t, err)
 	}
-	if _, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
-		"path":    path,
-		"content": "second",
-	}); err != nil {
-		t.Fatal(err)
+	{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
+			"path":    path,
+			"content": "second",
+		})
+		testassert.NoError(t, err)
 	}
-	if err := os.WriteFile(path, []byte("first"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(path, []byte("first"), 0o644))
 
 	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(affected.Restored) != 0 {
-		t.Fatalf("RevertCode restored = %v, want none", affected.Restored)
-	}
-	if len(affected.Skipped) != 1 || affected.Skipped[0].Path != path {
-		t.Fatalf("RevertCode skipped = %+v, want skipped %s", affected, path)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == path, "RevertCode restored = %v, want none; RevertCode skipped = %+v, want skipped %s", affected.Restored, affected, path)
 	assertFileContent(t, path, "first")
 }
 
@@ -223,9 +185,7 @@ func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
 	secondFinishedBeforeRelease := false
 	select {
 	case err := <-secondDone:
-		if err != nil {
-			t.Fatalf("second write before first release: %v", err)
-		}
+		testassert.NoError(t, err)
 		secondFinishedBeforeRelease = true
 	case <-store.secondLockAttempt:
 	case <-time.After(time.Second):
@@ -233,26 +193,15 @@ func TestConcurrentSameTurnWritesKeepLatestSnapshotIdentity(t *testing.T) {
 	}
 
 	close(store.releaseFirstRecord)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("first write: %v", err)
-	}
+	testassert.NoError(t, <-firstDone)
 	if !secondFinishedBeforeRelease {
-		if err := <-secondDone; err != nil {
-			t.Fatalf("second write: %v", err)
-		}
+		testassert.NoError(t, <-secondDone)
 	}
 
 	assertFileContent(t, path, "second")
 	affected, err := store.RevertCode(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(affected.Restored) != 1 || affected.Restored[0] != path {
-		t.Fatalf("RevertCode restored = %v, want %s", affected.Restored, path)
-	}
-	if len(affected.Skipped) != 0 {
-		t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path && len(affected.Skipped) == 0, "RevertCode restored = %v, want %s; RevertCode skipped = %+v, want none", affected.Restored, path, affected.Skipped)
 	assertFileContent(t, path, "before")
 }
 
@@ -306,19 +255,10 @@ func TestRetainedPartialMutationRecordsCurrentIdentityAndReverts(t *testing.T) {
 
 				err := tc.run(t, root, path, store)
 
-				if err == nil {
-					t.Fatalf("%s with %s succeeded, want injected I/O failure", tc.name, step)
-				}
+				testassert.Require(t, err != nil, "%s with %s succeeded, want injected I/O failure", tc.name, step)
 				affected, revErr := store.RevertCode(0)
-				if revErr != nil {
-					t.Fatalf("RevertCode error = %v", revErr)
-				}
-				if len(affected.Restored) != 1 || affected.Restored[0] != path {
-					t.Fatalf("RevertCode affected = %+v, want restored %s", affected, path)
-				}
-				if len(affected.Skipped) != 0 {
-					t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
-				}
+				testassert.Require(t, revErr == nil, "RevertCode error = %v", revErr)
+				testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path && len(affected.Skipped) == 0, "RevertCode affected = %+v, want restored %s; RevertCode skipped = %+v, want none", affected, path, affected.Skipped)
 				assertFileContent(t, path, "before")
 			})
 		}
@@ -363,21 +303,13 @@ func TestRetainedPartialCreatedFileMutationRecordsCurrentIdentityAndDeletesOnRev
 
 				err := tc.run(t, root, path, store)
 
-				if err == nil {
-					t.Fatalf("%s with %s succeeded, want injected I/O failure", tc.name, step)
-				}
+				testassert.Require(t, err != nil, "%s with %s succeeded, want injected I/O failure", tc.name, step)
 				affected, revErr := store.RevertCode(0)
-				if revErr != nil {
-					t.Fatalf("RevertCode error = %v", revErr)
-				}
-				if len(affected.Restored) != 1 || affected.Restored[0] != path {
-					t.Fatalf("RevertCode affected = %+v, want restored %s", affected, path)
-				}
-				if len(affected.Skipped) != 0 {
-					t.Fatalf("RevertCode skipped = %+v, want none", affected.Skipped)
-				}
-				if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
-					t.Fatalf("created file should be removed after RevertCode, stat err = %v", statErr)
+				testassert.Require(t, revErr == nil, "RevertCode error = %v", revErr)
+				testassert.Require(t, len(affected.Restored) == 1 && affected.Restored[0] == path && len(affected.Skipped) == 0, "RevertCode affected = %+v, want restored %s; RevertCode skipped = %+v, want none", affected, path, affected.Skipped)
+				{
+					_, statErr := os.Lstat(path)
+					testassert.Require(t, os.IsNotExist(statErr), "created file should be removed after RevertCode, stat err = %v", statErr)
 				}
 			})
 		}
@@ -521,11 +453,7 @@ func newSnapshotLifecycleStore(t *testing.T) testCodeGroupStore {
 func snapshotLifecycleFile(t *testing.T, root, name, content string) string {
 	t.Helper()
 	path := filepath.Join(root, name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	testassert.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	return path
 }

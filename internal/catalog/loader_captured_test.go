@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestLoaderLoadCapturedUsesInputWithoutReadingConfig(t *testing.T) {
@@ -30,22 +31,20 @@ func TestLoaderLoadCapturedUsesInputWithoutReadingConfig(t *testing.T) {
 	}}
 
 	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), userRaw)
-	if err != nil {
-		t.Fatalf("LoadCaptured: %v", err)
-	}
-	if len(result.Warnings) != 0 {
-		t.Fatalf("warnings = %#v, want none: the captured layer must not report config problems", result.Warnings)
-	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "base", Model: "known"}); err != nil {
-		t.Fatalf("bundled provider missing from the captured build: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(result.Warnings) == 0, "warnings = %#v, want none: the captured layer must not report config problems", result.Warnings)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "base", Model: "known"})
+		testassert.NoError(t, err)
 	}
 	if _, model, err := result.Catalog.Lookup(ModelRef{Provider: "local", Model: "known"}); err != nil {
 		t.Fatalf("captured provider missing: %v", err)
 	} else if model.ContextWindow != 9007199254740993 {
 		t.Fatalf("captured model = %#v, want the exact number preserved from the captured input", model)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "config.json")); !os.IsNotExist(err) {
-		t.Fatalf("LoadCaptured read or created the main configuration: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		testassert.Require(t, os.IsNotExist(err), "LoadCaptured read or created the main configuration: %v", err)
 	}
 }
 
@@ -69,31 +68,28 @@ func TestLoaderLoadCapturedCostProtectionUsesCapturedInput(t *testing.T) {
 	loader := NewLoader(home, fsys)
 
 	result, err := loader.LoadCaptured(context.Background(), userRaw)
-	if err != nil {
-		t.Fatalf("LoadCaptured: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want the due provider to be fetched", calls)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, calls, 1)
 	if _, model, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "m"}); err != nil {
 		t.Fatalf("discovered model missing after the one-attempt publication: %v", err)
 	} else if model.Cost == nil || model.Cost.Input == nil || *model.Cost.Input != 0.5 || model.Cost.Output == nil || *model.Cost.Output != 1.2 {
 		t.Fatalf("discovered model cost = %#v, want the captured-declared input protected and the discovered output filled", model.Cost)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); err != nil {
-		t.Fatalf("discovery cache was not published: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "config.json")); !os.IsNotExist(err) {
-		t.Fatalf("cost protection reread the main configuration: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		testassert.Require(t, os.IsNotExist(err), "cost protection reread the main configuration: %v", err)
 	}
 
 	// The retained 24h attempted-at TTL suppresses a duplicate fetch.
-	if _, err := loader.LoadCaptured(context.Background(), userRaw); err != nil {
-		t.Fatalf("second LoadCaptured: %v", err)
+	{
+		_, err := loader.LoadCaptured(context.Background(), userRaw)
+		testassert.NoError(t, err)
 	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want the recent attempt TTL retained", calls)
-	}
+	testassert.Equal(t, calls, 1)
 }
 
 func TestLoaderLoadCapturedCancellationSkipsPublicationWithoutUndoingWrites(t *testing.T) {
@@ -134,17 +130,15 @@ func TestLoaderLoadCapturedCancellationSkipsPublicationWithoutUndoingWrites(t *t
 	}
 
 	result, err := NewLoader(home, fsys).LoadCaptured(ctx, nil)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("LoadCaptured error = %v, want the caller's context error unwrapped", err)
+	testassert.Require(t, errors.Is(err, context.Canceled), "LoadCaptured error = %v, want the caller's context error unwrapped", err)
+	testassert.Require(t, result.Catalog == nil && result.Warnings == nil, "canceled LoadCaptured published result %#v, want the zero BuildResult", result)
+	{
+		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "aa.json"))
+		testassert.Require(t, statErr == nil, "the cache write that had started was undone: %v", statErr)
 	}
-	if result.Catalog != nil || result.Warnings != nil {
-		t.Fatalf("canceled LoadCaptured published result %#v, want the zero BuildResult", result)
-	}
-	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "aa.json")); statErr != nil {
-		t.Fatalf("the cache write that had started was undone: %v", statErr)
-	}
-	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "bb.json")); !os.IsNotExist(statErr) {
-		t.Fatalf("the canceled fetch's publication was not skipped: %v", statErr)
+	{
+		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "bb.json"))
+		testassert.Require(t, os.IsNotExist(statErr), "the canceled fetch's publication was not skipped: %v", statErr)
 	}
 }
 
@@ -189,17 +183,15 @@ func TestLoaderLoadCapturedFailedFetchKeepsWarningAndAttempt(t *testing.T) {
 	}`)}}
 
 	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("a failed fetch must stay a warning, not an error: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, hasWarningForProvider(result.Warnings, "discovery_failure", "remote"), "warnings = %#v, want the discovery_failure warning", result.Warnings)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "known"})
+		testassert.NoError(t, err)
 	}
-	if !hasWarningForProvider(result.Warnings, "discovery_failure", "remote") {
-		t.Fatalf("warnings = %#v, want the discovery_failure warning", result.Warnings)
-	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "known"}); err != nil {
-		t.Fatalf("cached input lost after a failed fetch: %v", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); statErr != nil {
-		t.Fatalf("the failed fetch's attempt marker was not written: %v", statErr)
+	{
+		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.Require(t, statErr == nil, "the failed fetch's attempt marker was not written: %v", statErr)
 	}
 }
 
@@ -210,15 +202,11 @@ func TestLoaderLoadCapturedContentionWarnsAndKeepsCachedInput(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	transport := Transport{BaseURL: server.URL + "/v1"}
-	if err := WriteDiscoveryCache(home, "remote", transport, DiscoveredProvider{
+	testassert.NoError(t, WriteDiscoveryCache(home, "remote", transport, DiscoveredProvider{
 		Models: map[string]DiscoveredModel{"cached-model": {ContextWindow: 4096}},
-	}, time.Now().Add(-48*time.Hour).UTC()); err != nil {
-		t.Fatal(err)
-	}
+	}, time.Now().Add(-48*time.Hour).UTC()))
 	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "remote"))
-	if err != nil || !ok {
-		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-	}
+	testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 	defer holder.Release()
 
 	fsys := fstest.MapFS{"builtin/remote.json": {Data: []byte(`{
@@ -228,17 +216,15 @@ func TestLoaderLoadCapturedContentionWarnsAndKeepsCachedInput(t *testing.T) {
 		"models": {}
 	}`)}}
 	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("LoadCaptured under discovery contention = %v, want a result plus warnings", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, hasWarningForProvider(result.Warnings, "discovery_failure", "remote"), "warnings = %#v, want the retained contention warning", result.Warnings)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "cached-model"})
+		testassert.NoError(t, err)
 	}
-	if !hasWarningForProvider(result.Warnings, "discovery_failure", "remote") {
-		t.Fatalf("warnings = %#v, want the retained contention warning", result.Warnings)
-	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "cached-model"}); err != nil {
-		t.Fatalf("cached input lost under contention: %v", err)
-	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err == nil {
-		t.Fatal("the contended publication merged anyway")
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "remote-model"})
+		testassert.Require(t, err != nil, "the contended publication merged anyway")
 	}
 }
 
@@ -250,11 +236,9 @@ func TestLoaderLoadCapturedAllowRefreshFilterRetained(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":1000}]}`))
 	}))
 	t.Cleanup(server.Close)
-	if err := WriteDiscoveryCache(home, "remote", Transport{BaseURL: server.URL + "/v1"}, DiscoveredProvider{
+	testassert.NoError(t, WriteDiscoveryCache(home, "remote", Transport{BaseURL: server.URL + "/v1"}, DiscoveredProvider{
 		Models: map[string]DiscoveredModel{"cached-model": {ContextWindow: 4096}},
-	}, time.Now().Add(-48*time.Hour).UTC()); err != nil {
-		t.Fatal(err)
-	}
+	}, time.Now().Add(-48*time.Hour).UTC()))
 	fsys := fstest.MapFS{"builtin/remote.json": {Data: []byte(`{
 		"id": "remote",
 		"transport": {"base_url": "` + server.URL + `/v1", "api_key_env": ""},
@@ -265,14 +249,11 @@ func TestLoaderLoadCapturedAllowRefreshFilterRetained(t *testing.T) {
 	loader := NewLoader(home, fsys)
 	loader.AllowRefresh = func(_ string, _ *Provider) bool { return false }
 	result, err := loader.LoadCaptured(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("LoadCaptured: %v", err)
-	}
-	if calls != 0 {
-		t.Fatalf("discovery calls = %d, want the AllowRefresh filter retained", calls)
-	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "cached-model"}); err != nil {
-		t.Fatalf("cached input lost under the filter: %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, calls, 0)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "cached-model"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -323,58 +304,52 @@ func TestLoaderLoadCapturedConnectionOverlaysOneProviderWithoutRefresh(t *testin
 	transport := Transport{BaseURL: server.URL + "/v1", APIKeyEnv: "REMOTE_KEY"}
 
 	result, err := loader.LoadCapturedConnection(context.Background(), userRaw, "remote", transport, &DiscoveredProvider{Models: fetched})
-	if err != nil {
-		t.Fatalf("LoadCapturedConnection: %v", err)
-	}
-	if fetches != 0 {
-		t.Fatalf("connection candidate performed %d network fetches, want none", fetches)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, fetches, 0)
 	prov := result.Catalog.Providers["remote"]
-	if prov == nil {
-		t.Fatal("remote provider missing from the connection candidate")
-	}
-	if entry := prov.Models["fresh"]; entry == nil || entry.ContextWindow != 4096 {
-		t.Fatalf("overlay record missing the fetched model: %#v", prov.Models)
+	testassert.Require(t, prov != nil, "remote provider missing from the connection candidate")
+	{
+		entry := prov.Models["fresh"]
+		testassert.Require(t, entry != nil && entry.ContextWindow == 4096, "overlay record missing the fetched model: %#v", prov.Models)
 	}
 	if entry := prov.Models["fresh"]; entry != nil && entry.Source != SourceDiscovered {
 		t.Fatalf("overlay model source = %q, want discovered", entry.Source)
 	}
-	if entry := prov.Models["plain"]; entry == nil || entry.ContextWindow != 4096 || entry.Source != SourceDiscovered {
-		t.Fatalf("nil-metadata overlay sibling = %#v, want the allowed discovered model", prov.Models["plain"])
+	{
+		entry := prov.Models["plain"]
+		testassert.Require(t, entry != nil && entry.ContextWindow == 4096 && entry.Source == SourceDiscovered, "nil-metadata overlay sibling = %#v, want the allowed discovered model", prov.Models["plain"])
 	}
-	if entry, ok := prov.Models["blocked"]; ok {
-		t.Fatalf("filtered metadata model reached the catalog: %#v", entry)
+	{
+		entry, ok := prov.Models["blocked"]
+		testassert.Require(t, !ok, "filtered metadata model reached the catalog: %#v", entry)
 	}
-	if _, ok := result.Catalog.Providers["local"]; !ok {
-		t.Fatal("the non-connection sibling disappeared from the candidate")
+	{
+		_, ok := result.Catalog.Providers["local"]
+		testassert.Require(t, ok, "the non-connection sibling disappeared from the candidate")
 	}
 
 	// Nil discovery: the ordinary cached inputs, still no fetch and no
 	// cache write.
 	result, err = loader.LoadCapturedConnection(context.Background(), userRaw, "remote", transport, nil)
-	if err != nil {
-		t.Fatalf("LoadCapturedConnection nil discovery: %v", err)
-	}
-	if fetches != 0 {
-		t.Fatalf("nil-discovery candidate performed %d network fetches, want none", fetches)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, fetches, 0)
 	if prov = result.Catalog.Providers["remote"]; prov == nil || len(prov.Models) != 0 {
 		t.Fatalf("nil-discovery candidate carried %v, want the empty cached model set", prov.Models)
 	}
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "base", Model: "known"}); err != nil {
-		t.Fatalf("bundled provider missing: %v", err)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "base", Model: "known"})
+		testassert.NoError(t, err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); !os.IsNotExist(err) {
-		t.Fatalf("the connection candidate wrote a cache file: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.Require(t, os.IsNotExist(err), "the connection candidate wrote a cache file: %v", err)
 	}
 
 	// A fingerprint over a different transport never binds the overlay: the
 	// same Build producer computes it inside catalog.
 	other := Transport{BaseURL: "http://other.test/v1", APIKeyEnv: "REMOTE_KEY"}
 	result, err = loader.LoadCapturedConnection(context.Background(), userRaw, "remote", other, &DiscoveredProvider{Models: fetched})
-	if err != nil {
-		t.Fatalf("LoadCapturedConnection other transport: %v", err)
-	}
+	testassert.NoError(t, err)
 	if prov = result.Catalog.Providers["remote"]; prov != nil && len(prov.Models) != 0 {
 		t.Fatalf("misbound overlay contributed %v, want no models", prov.Models)
 	}

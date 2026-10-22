@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
@@ -29,15 +30,9 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 	seenRequest := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenRequest = true
-		if r.URL.Path != "/v1/models" {
-			t.Fatalf("discovery path = %q, want /v1/models", r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {
-			t.Fatalf("Authorization header = %q", got)
-		}
-		if got := r.Header.Get("X-Test-Header"); got != "yes" {
-			t.Fatalf("X-Test-Header = %q", got)
-		}
+		testassert.Equal(t, r.URL.Path, "/v1/models")
+		testassert.Equal(t, r.Header.Get("Authorization"), "Bearer secret-token")
+		testassert.Equal(t, r.Header.Get("X-Test-Header"), "yes")
 		w.Header().Set("Content-Type", "application/json")
 		// One successful shape: the valid document may be followed by JSON
 		// whitespace (space, tab, CR, LF). Non-whitespace trailing data is
@@ -75,29 +70,13 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 		},
 	}
 	discovered, err := FetchDiscovery(context.Background(), server.Client(), provider)
-	if err != nil {
-		t.Fatalf("FetchDiscovery returned error: %v", err)
-	}
-	if !seenRequest {
-		t.Fatalf("test server was not called")
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, seenRequest, "test server was not called")
 	rich := discovered.Models["rich"]
-	if rich.Name != "Rich Model" || rich.ContextWindow != 128000 || rich.MaxOutputTokens != 16384 {
-		t.Fatalf("rich model = %#v", rich)
-	}
-	if rich.Cost == nil || rich.Cost.Input == nil || rich.Cost.Output == nil {
-		t.Fatalf("rich cost = %#v, want input/output", rich.Cost)
-	}
-	if rich.Cost.CacheRead == nil || rich.Cost.CacheWrite == nil {
-		t.Fatalf("rich cost = %#v, want cache read/write", rich.Cost)
-	}
-	if !floatNear(*rich.Cost.Input, 0.15) || !floatNear(*rich.Cost.Output, 0.60) || !floatNear(*rich.Cost.CacheRead, 0.03) || !floatNear(*rich.Cost.CacheWrite, 0.20) {
-		t.Fatalf("rich cost = %#v, want 0.15/0.60/0.03/0.20 per million", rich.Cost)
-	}
+	testassert.Require(t, rich.Name == "Rich Model" && rich.ContextWindow == 128000 && rich.MaxOutputTokens == 16384 && rich.Cost != nil && rich.Cost.Input != nil && rich.Cost.Output != nil, "rich model = %#v; rich cost = %#v, want input/output", rich, rich.Cost)
+	testassert.Require(t, rich.Cost.CacheRead != nil && rich.Cost.CacheWrite != nil && floatNear(*rich.Cost.Input, 0.15) && floatNear(*rich.Cost.Output, 0.60) && floatNear(*rich.Cost.CacheRead, 0.03) && floatNear(*rich.Cost.CacheWrite, 0.20), "rich cost = %#v, want cache read/write; rich cost = %#v, want 0.15/0.60/0.03/0.20 per million", rich.Cost, rich.Cost)
 	fallback := discovered.Models["fallback"]
-	if fallback.ContextWindow != 32000 || fallback.MaxOutputTokens != 4096 {
-		t.Fatalf("fallback model = %#v", fallback)
-	}
+	testassert.Require(t, fallback.ContextWindow == 32000 && fallback.MaxOutputTokens == 4096, "fallback model = %#v", fallback)
 }
 
 func TestFetchDiscoveryReturnsBoundedFailures(t *testing.T) {
@@ -123,9 +102,7 @@ func TestFetchDiscoveryReturnsBoundedFailures(t *testing.T) {
 			defer server.Close()
 
 			_, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}})
-			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
-				t.Fatalf("FetchDiscovery error = %v, want substring %q", err, tt.wantError)
-			}
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), tt.wantError), "FetchDiscovery error = %v, want substring %q", err, tt.wantError)
 		})
 	}
 }
@@ -168,13 +145,9 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 		}))
 		defer server.Close()
 		discovered, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}})
-		if err != nil {
-			t.Fatalf("FetchDiscovery at the exact limit: %v", err)
-		}
+		testassert.NoError(t, err)
 		entry := discovered.Models["padded"]
-		if entry.ContextWindow != 8 {
-			t.Fatalf("padded model = %#v, want the padded document's own projection", entry)
-		}
+		testassert.Require(t, entry.ContextWindow == 8, "padded model = %#v, want the padded document's own projection", entry)
 	})
 
 	t.Run("over_limit_known_length", func(t *testing.T) {
@@ -183,8 +156,9 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 			_, _ = io.WriteString(w, oversized)
 		}))
 		defer server.Close()
-		if err := fetch(t, server.Client(), server.URL+"/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
-			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
+		{
+			err := fetch(t, server.Client(), server.URL+"/v1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "byte maximum"), "FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
 		}
 	})
 
@@ -193,8 +167,9 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 			_, _ = io.WriteString(w, oversized)
 		}))
 		defer server.Close()
-		if err := fetch(t, server.Client(), server.URL+"/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
-			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
+		{
+			err := fetch(t, server.Client(), server.URL+"/v1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "byte maximum"), "FetchDiscovery over the limit = %v, want the byte-maximum refusal", err)
 		}
 	})
 
@@ -207,8 +182,9 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 				Body:          io.NopCloser(strings.NewReader(oversized)),
 			}, nil
 		})}
-		if err := fetch(t, client, "https://bounds.test/v1"); err == nil || !strings.Contains(err.Error(), "byte maximum") {
-			t.Fatalf("FetchDiscovery over the limit = %v, want the byte-maximum refusal despite the misleading length", err)
+		{
+			err := fetch(t, client, "https://bounds.test/v1")
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "byte maximum"), "FetchDiscovery over the limit = %v, want the byte-maximum refusal despite the misleading length", err)
 		}
 	})
 }
@@ -217,7 +193,7 @@ func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {
 	home := t.TempDir()
 	fetchedAt := time.Now().Add(-48 * time.Hour).UTC()
 	transport := discoveryTestTransport()
-	if err := WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
+	testassert.NoError(t, WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"qwen3": {
 			Name:            "Qwen 3",
 			ContextWindow:   40960,
@@ -230,82 +206,54 @@ func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {
 				SupportedParameters:          []string{"tools"},
 			},
 		},
-	}}, fetchedAt); err != nil {
-		t.Fatalf("WriteDiscoveryCache returned error: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "local.json")); err != nil {
-		t.Fatalf("discovery cache file missing: %v", err)
+	}}, fetchedAt))
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "local.json"))
+		testassert.NoError(t, err)
 	}
 
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v, want none", warnings)
-	}
-	if !cache["local"].AttemptedAt.Equal(fetchedAt) {
-		t.Fatalf("attempt = %v, want %v", cache["local"].AttemptedAt, fetchedAt)
-	}
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v, want none", warnings)
+	testassert.Require(t, cache["local"].AttemptedAt.Equal(fetchedAt), "attempt = %v, want %v", cache["local"].AttemptedAt, fetchedAt)
 	model := cache["local"].Models["qwen3"]
-	if model.Name != "Qwen 3" || model.ContextWindow != 40960 || model.MaxOutputTokens != 8192 {
-		t.Fatalf("round-tripped model = %#v", model)
+	testassert.Require(t, model.Name == "Qwen 3" && model.ContextWindow == 40960 && model.MaxOutputTokens == 8192 && model.Cost != nil && model.Cost.Input != nil && floatNear(*model.Cost.Input, 0.20), "round-tripped model = %#v; round-tripped cost = %#v", model, model.Cost)
+	testassert.Require(t, model.metadata != nil, "round-tripped metadata = nil")
+	testassert.Require(t, model.metadata.Type == "chat" && reflect.DeepEqual(model.metadata.ArchitectureOutputModalities, []string{"text"}), "round-tripped metadata = %#v", model.metadata)
+	{
+		got := model.metadata.Capabilities["chat_completion"]
+		testassert.Require(t, got, "round-tripped capabilities = %#v, want chat_completion=true", model.metadata.Capabilities)
 	}
-	if model.Cost == nil || model.Cost.Input == nil || !floatNear(*model.Cost.Input, 0.20) {
-		t.Fatalf("round-tripped cost = %#v", model.Cost)
-	}
-	if model.metadata == nil {
-		t.Fatalf("round-tripped metadata = nil")
-	}
-	if model.metadata.Type != "chat" || !reflect.DeepEqual(model.metadata.ArchitectureOutputModalities, []string{"text"}) {
-		t.Fatalf("round-tripped metadata = %#v", model.metadata)
-	}
-	if got := model.metadata.Capabilities["chat_completion"]; !got {
-		t.Fatalf("round-tripped capabilities = %#v, want chat_completion=true", model.metadata.Capabilities)
-	}
-	if got := model.metadata.Capabilities["embeddings"]; got {
-		t.Fatalf("round-tripped capabilities = %#v, want embeddings=false", model.metadata.Capabilities)
+	{
+		got := model.metadata.Capabilities["embeddings"]
+		testassert.Require(t, !got, "round-tripped capabilities = %#v, want embeddings=false", model.metadata.Capabilities)
 	}
 }
 
 func TestReadDiscoveryCacheSkipsMalformedFilesWithWarning(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".lightcode", "cache", "discovery", "bad.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	testassert.NoError(t, os.WriteFile(path, []byte(`{not json`), 0o600))
 
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(cache) != 0 {
-		t.Fatalf("cache = %#v, want empty", cache)
-	}
-	if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" || warnings[0].Provider != "bad" {
-		t.Fatalf("warnings = %#v, want discovery_failure for bad", warnings)
-	}
+	testassert.Require(t, len(cache) == 0, "cache = %#v, want empty", cache)
+	testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure" && warnings[0].Provider == "bad", "warnings = %#v, want discovery_failure for bad", warnings)
 }
 
 func TestReadDiscoveryCacheOldShapeWithoutMetadataKeepsUnknown(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".lightcode", "cache", "discovery", "local.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(`{
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	testassert.NoError(t, os.WriteFile(path, []byte(`{
 		"fetched_at": "2026-05-30T00:00:00Z",
 		"models": {
 			"old": {"id": "old", "name": "Old", "context_window": 8192}
 		}
-	}`), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	}`), 0o600))
 
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v", warnings)
-	}
-	if len(cache["local"].Models) != 0 || !cache["local"].AttemptedAt.IsZero() {
-		t.Fatalf("legacy cache record = %#v, want unbound empty record", cache["local"])
-	}
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v", warnings)
+	testassert.Require(t, len(cache["local"].Models) == 0 && cache["local"].AttemptedAt.IsZero(), "legacy cache record = %#v, want unbound empty record", cache["local"])
 }
 
 func TestWriteDiscoveryAttemptPreservesCachedModels(t *testing.T) {
@@ -313,31 +261,22 @@ func TestWriteDiscoveryAttemptPreservesCachedModels(t *testing.T) {
 	fetchedAt := time.Now().Add(-48 * time.Hour).UTC()
 	attemptedAt := time.Now().UTC()
 	transport := discoveryTestTransport()
-	if err := WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
+	testassert.NoError(t, WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"qwen3": {Name: "Qwen 3", ContextWindow: 40960, MaxOutputTokens: 8192},
-	}}, fetchedAt); err != nil {
-		t.Fatalf("WriteDiscoveryCache returned error: %v", err)
-	}
-	if err := WriteDiscoveryAttempt(home, "local", transport, attemptedAt); err != nil {
-		t.Fatalf("WriteDiscoveryAttempt returned error: %v", err)
-	}
+	}}, fetchedAt))
+	testassert.NoError(t, WriteDiscoveryAttempt(home, "local", transport, attemptedAt))
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v", warnings)
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v", warnings)
+	{
+		_, ok := cache["local"].Models["qwen3"]
+		testassert.Require(t, ok, "cached model missing after attempt write: %#v", cache)
 	}
-	if _, ok := cache["local"].Models["qwen3"]; !ok {
-		t.Fatalf("cached model missing after attempt write: %#v", cache)
-	}
-	if !cache["local"].AttemptedAt.Equal(attemptedAt) {
-		t.Fatalf("attempt = %v, want %v", cache["local"].AttemptedAt, attemptedAt)
-	}
+	testassert.Require(t, cache["local"].AttemptedAt.Equal(attemptedAt), "attempt = %v, want %v", cache["local"].AttemptedAt, attemptedAt)
 }
 
 func TestWriteDiscoveryCacheRejectsUnsafeProviderID(t *testing.T) {
 	err := WriteDiscoveryCache(t.TempDir(), "../bad", discoveryTestTransport(), DiscoveredProvider{}, time.Now())
-	if err == nil || !errors.Is(err, ErrInvalidModelRef) {
-		t.Fatalf("WriteDiscoveryCache error = %v, want ErrInvalidModelRef", err)
-	}
+	testassert.Require(t, err != nil && errors.Is(err, ErrInvalidModelRef), "WriteDiscoveryCache error = %v, want ErrInvalidModelRef", err)
 }
 
 func floatPtr(v float64) *float64 {
@@ -367,35 +306,23 @@ func TestTransportFingerprintCanonicalIdentity(t *testing.T) {
 			"X-B":           "b-value",
 		},
 	}
-	if !SameTransport(base, equivalent) {
-		t.Fatal("equivalent transports did not share a fingerprint")
-	}
+	testassert.Require(t, SameTransport(base, equivalent), "equivalent transports did not share a fingerprint")
 	changedConfiguredAuthorization := equivalent
 	changedConfiguredAuthorization.Headers = map[string]string{
 		"X-A":           "a-value",
 		"Authorization": "Bearer changed-secret",
 		"X-B":           "b-value",
 	}
-	if SameTransport(base, changedConfiguredAuthorization) {
-		t.Fatal("different configured Authorization values shared a fingerprint")
-	}
-	if SameTransport(base, Transport{BaseURL: base.BaseURL, APIKeyEnv: "OTHER_KEY", Headers: base.Headers}) {
-		t.Fatal("different API key environment names shared a fingerprint")
-	}
-	if SameTransport(base, Transport{BaseURL: "https://other.test/v1", APIKeyEnv: base.APIKeyEnv, Headers: base.Headers}) {
-		t.Fatal("different base URLs shared a fingerprint")
-	}
+	testassert.Require(t, !SameTransport(base, changedConfiguredAuthorization), "different configured Authorization values shared a fingerprint")
+	testassert.Require(t, !SameTransport(base, Transport{BaseURL: base.BaseURL, APIKeyEnv: "OTHER_KEY", Headers: base.Headers}), "different API key environment names shared a fingerprint")
+	testassert.Require(t, !SameTransport(base, Transport{BaseURL: "https://other.test/v1", APIKeyEnv: base.APIKeyEnv, Headers: base.Headers}), "different base URLs shared a fingerprint")
 	changedHeader := equivalent
 	changedHeader.Headers = map[string]string{"X-A": "changed"}
-	if SameTransport(base, changedHeader) {
-		t.Fatal("different header values shared a fingerprint")
-	}
-	if !SameTransport(
+	testassert.Require(t, !SameTransport(base, changedHeader), "different header values shared a fingerprint")
+	testassert.Require(t, SameTransport(
 		Transport{BaseURL: base.BaseURL, APIKeyEnv: base.APIKeyEnv},
 		Transport{BaseURL: base.BaseURL, APIKeyEnv: base.APIKeyEnv, Headers: map[string]string{}},
-	) {
-		t.Fatal("nil and empty transport headers did not share a fingerprint")
-	}
+	), "nil and empty transport headers did not share a fingerprint")
 	if len(transportFingerprint(base)) != sha256.Size*2 || strings.ToLower(transportFingerprint(base)) != transportFingerprint(base) {
 		t.Fatalf("transport fingerprint = %q, want lowercase SHA-256 hex", transportFingerprint(base))
 	}
@@ -410,12 +337,8 @@ func TestTransportFingerprintIgnoresResolvedAPIKey(t *testing.T) {
 	t.Setenv(apiKeyEnv, "resolved-secret-b")
 	secondFingerprint := transportFingerprint(transport)
 	secondSame := SameTransport(transport, transport)
-	if firstFingerprint != secondFingerprint {
-		t.Fatalf("resolved secret changed fingerprint: first=%q second=%q", firstFingerprint, secondFingerprint)
-	}
-	if !firstSame || firstSame != secondSame {
-		t.Fatalf("SameTransport changed with resolved secret: before=%v after=%v", firstSame, secondSame)
-	}
+	testassert.Equal(t, firstFingerprint, secondFingerprint)
+	testassert.Require(t, firstSame && firstSame == secondSame, "SameTransport changed with resolved secret: before=%v after=%v", firstSame, secondSame)
 }
 
 func TestDiscoveryRecordsAreBoundForModelsAndTTL(t *testing.T) {
@@ -423,45 +346,29 @@ func TestDiscoveryRecordsAreBoundForModelsAndTTL(t *testing.T) {
 	transportA := Transport{BaseURL: "http://a.test/v1"}
 	transportB := Transport{BaseURL: "http://b.test/v1"}
 	fetchedAt := time.Now().Add(-time.Hour).UTC()
-	if err := WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a": {ContextWindow: 4096}}}, fetchedAt); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a": {ContextWindow: 4096}}}, fetchedAt))
 	records, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 || !records["p"].BoundTo(transportA) {
-		t.Fatalf("records = %#v, warnings = %#v", records, warnings)
+	testassert.Require(t, len(warnings) == 0 && records["p"].BoundTo(transportA), "records = %#v, warnings = %#v", records, warnings)
+	testassert.Require(t, records["p"].FetchedAt.Equal(fetchedAt) && records["p"].Models["a"].ContextWindow == 4096, "matching record = %#v", records["p"])
+	{
+		recent, err := DiscoveryAttemptRecent(home, "p", transportA, time.Now().UTC())
+		testassert.Require(t, err == nil && recent, "matching transport recent = (%v, %v), want (true, nil)", recent, err)
 	}
-	if !records["p"].FetchedAt.Equal(fetchedAt) || records["p"].Models["a"].ContextWindow != 4096 {
-		t.Fatalf("matching record = %#v", records["p"])
+	{
+		recent, err := DiscoveryAttemptRecent(home, "p", transportB, time.Now().UTC())
+		testassert.Require(t, err == nil && !recent, "foreign transport recent = (%v, %v), want (false, nil)", recent, err)
 	}
-	if recent, err := DiscoveryAttemptRecent(home, "p", transportA, time.Now().UTC()); err != nil || !recent {
-		t.Fatalf("matching transport recent = (%v, %v), want (true, nil)", recent, err)
-	}
-	if recent, err := DiscoveryAttemptRecent(home, "p", transportB, time.Now().UTC()); err != nil || recent {
-		t.Fatalf("foreign transport recent = (%v, %v), want (false, nil)", recent, err)
-	}
-	if err := WriteDiscoveryAttempt(home, "p", transportA, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, WriteDiscoveryAttempt(home, "p", transportA, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
-	if records["p"].Models["a"].ContextWindow != 4096 || !records["p"].FetchedAt.Equal(fetchedAt) {
-		t.Fatalf("matching attempt did not preserve record fields: %#v", records["p"])
-	}
-	if err := WriteDiscoveryAttempt(home, "p", transportB, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
+	testassert.Require(t, records["p"].Models["a"].ContextWindow == 4096 && records["p"].FetchedAt.Equal(fetchedAt), "matching attempt did not preserve record fields: %#v", records["p"])
+	testassert.NoError(t, WriteDiscoveryAttempt(home, "p", transportB, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
-	if !records["p"].BoundTo(transportB) || len(records["p"].Models) != 0 || !records["p"].FetchedAt.IsZero() {
-		t.Fatalf("foreign attempt retained stale fields: %#v", records["p"])
-	}
-	if err := WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"stale": {}}}, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
+	testassert.Require(t, records["p"].BoundTo(transportB) && len(records["p"].Models) == 0 && records["p"].FetchedAt.IsZero(), "foreign attempt retained stale fields: %#v", records["p"])
+	testassert.NoError(t, WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"stale": {}}}, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
 	cat := &Catalog{Providers: map[string]*Provider{"p": {ID: "p", Discovery: true, Transport: transportB}}}
 	candidates := DiscoveryRefreshCandidates(cat, records, time.Now().UTC())
-	if !reflect.DeepEqual(candidates, []string{"p"}) {
-		t.Fatalf("foreign physical overwrite candidates = %v, want [p]", candidates)
-	}
+	testassert.Require(t, reflect.DeepEqual(candidates, []string{"p"}), "foreign physical overwrite candidates = %v, want [p]", candidates)
 }
 
 func floatNear(a, b float64) bool {
@@ -480,15 +387,8 @@ func TestParseDiscoveredModelReadsMaxTokensFromTopProvider(t *testing.T) {
 			"max_completion_tokens": float64(16384),
 		},
 	})
-	if id != "test-model" {
-		t.Fatalf("id = %q, want test-model", id)
-	}
-	if model.ContextWindow != 128000 {
-		t.Fatalf("ContextWindow = %d, want 128000", model.ContextWindow)
-	}
-	if model.MaxOutputTokens != 16384 {
-		t.Fatalf("MaxOutputTokens = %d, want 16384", model.MaxOutputTokens)
-	}
+	testassert.Equal(t, id, "test-model")
+	testassert.Require(t, model.ContextWindow == 128000 && model.MaxOutputTokens == 16384, "got %v, want %v; got %v, want %v", model.ContextWindow, 128000, model.MaxOutputTokens, 16384)
 }
 
 func TestParseDiscoveredModelPreservesGenericMetadata(t *testing.T) {
@@ -510,37 +410,10 @@ func TestParseDiscoveredModelPreservesGenericMetadata(t *testing.T) {
 		},
 		"supported_parameters": []any{"tools", "response-format"},
 	})
-	if id != "metadata-model" {
-		t.Fatalf("id = %q, want metadata-model", id)
-	}
+	testassert.Equal(t, id, "metadata-model")
 	meta := model.metadata
-	if meta == nil {
-		t.Fatal("Metadata = nil")
-	}
-	if meta.Type != "chat" || meta.Task != "text_generation" {
-		t.Fatalf("Type/Task = %q/%q, want chat/text_generation", meta.Type, meta.Task)
-	}
-	if !reflect.DeepEqual(meta.InputModalities, []string{"image", "text"}) {
-		t.Fatalf("InputModalities = %#v", meta.InputModalities)
-	}
-	if !reflect.DeepEqual(meta.OutputModalities, []string{"text"}) {
-		t.Fatalf("OutputModalities = %#v", meta.OutputModalities)
-	}
-	if !reflect.DeepEqual(meta.ArchitectureInputModalities, []string{"audio", "text"}) {
-		t.Fatalf("ArchitectureInputModalities = %#v", meta.ArchitectureInputModalities)
-	}
-	if !reflect.DeepEqual(meta.ArchitectureOutputModalities, []string{"text"}) {
-		t.Fatalf("ArchitectureOutputModalities = %#v", meta.ArchitectureOutputModalities)
-	}
-	if meta.ArchitectureModality != "text+image->text" {
-		t.Fatalf("ArchitectureModality = %q", meta.ArchitectureModality)
-	}
-	if !meta.Capabilities["chat_completion"] || meta.Capabilities["embeddings"] {
-		t.Fatalf("Capabilities = %#v", meta.Capabilities)
-	}
-	if !reflect.DeepEqual(meta.SupportedParameters, []string{"response_format", "tools"}) {
-		t.Fatalf("SupportedParameters = %#v", meta.SupportedParameters)
-	}
+	testassert.Require(t, meta != nil, "Metadata = nil")
+	testassert.Require(t, meta.Type == "chat" && meta.Task == "text_generation" && reflect.DeepEqual(meta.InputModalities, []string{"image", "text"}) && reflect.DeepEqual(meta.OutputModalities, []string{"text"}) && reflect.DeepEqual(meta.ArchitectureInputModalities, []string{"audio", "text"}) && reflect.DeepEqual(meta.ArchitectureOutputModalities, []string{"text"}) && meta.ArchitectureModality == "text+image->text" && meta.Capabilities["chat_completion"] && !meta.Capabilities["embeddings"] && reflect.DeepEqual(meta.SupportedParameters, []string{"response_format", "tools"}), "Type/Task = %q/%q, want chat/text_generation; InputModalities = %#v; OutputModalities = %#v; ArchitectureInputModalities = %#v; ArchitectureOutputModalities = %#v; got %v, want %v; Capabilities = %#v; SupportedParameters = %#v", meta.Type, meta.Task, meta.InputModalities, meta.OutputModalities, meta.ArchitectureInputModalities, meta.ArchitectureOutputModalities, meta.ArchitectureModality, "text+image->text", meta.Capabilities, meta.SupportedParameters)
 }
 
 func TestParseDiscoveredModelPrefersNestedTopProviderOverTopLevel(t *testing.T) {
@@ -552,12 +425,8 @@ func TestParseDiscoveredModelPrefersNestedTopProviderOverTopLevel(t *testing.T) 
 			"max_completion_tokens": float64(128000),
 		},
 	})
-	if id != "aggregator-route" {
-		t.Fatalf("id = %q, want aggregator-route", id)
-	}
-	if model.MaxOutputTokens != 128000 {
-		t.Fatalf("MaxOutputTokens = %d, want 128000 (per-route cap from top_provider, not the model-wide aggregate)", model.MaxOutputTokens)
-	}
+	testassert.Equal(t, id, "aggregator-route")
+	testassert.Equal(t, model.MaxOutputTokens, 128000)
 }
 
 func TestParseDiscoveredModelSkipsNullMaxTokensInTopProvider(t *testing.T) {
@@ -568,15 +437,8 @@ func TestParseDiscoveredModelSkipsNullMaxTokensInTopProvider(t *testing.T) {
 			"max_completion_tokens": nil,
 		},
 	})
-	if id != "free-model" {
-		t.Fatalf("id = %q, want free-model", id)
-	}
-	if model.ContextWindow != 200000 {
-		t.Fatalf("ContextWindow = %d, want 200000", model.ContextWindow)
-	}
-	if model.MaxOutputTokens != 0 {
-		t.Fatalf("MaxOutputTokens = %d, want 0 (null in API, fallback happens in merge)", model.MaxOutputTokens)
-	}
+	testassert.Equal(t, id, "free-model")
+	testassert.Require(t, model.ContextWindow == 200000 && model.MaxOutputTokens == 0, "got %v, want %v; got %v, want %v", model.ContextWindow, 200000, model.MaxOutputTokens, 0)
 }
 
 // smallStale returns a small stale discovery cache. The assertions only need
@@ -629,9 +491,7 @@ func recordDiscoveryLockAcquisitions(t *testing.T) func() []string {
 // serialize and the fresh discovery survives.
 func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 	home := t.TempDir()
-	if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
-		t.Fatalf("seed WriteDiscoveryCache: %v", err)
-	}
+	testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
 		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
@@ -643,20 +503,23 @@ func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 	wg.Add(3)
 	go func() { // attempt writer 1
 		defer wg.Done()
-		if err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()); err != nil {
-			t.Errorf("WriteDiscoveryAttempt 1: %v", err)
+		{
+			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
+			testassert.Check(t, err == nil, "WriteDiscoveryAttempt 1: %v", err)
 		}
 	}()
 	go func() { // attempt writer 2
 		defer wg.Done()
-		if err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()); err != nil {
-			t.Errorf("WriteDiscoveryAttempt 2: %v", err)
+		{
+			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
+			testassert.Check(t, err == nil, "WriteDiscoveryAttempt 2: %v", err)
 		}
 	}()
 	go func() { // successful refresh: publishes fresh discovery
 		defer wg.Done()
-		if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC()); err != nil {
-			t.Errorf("WriteDiscoveryCache: %v", err)
+		{
+			err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
+			testassert.Check(t, err == nil, "WriteDiscoveryCache: %v", err)
 		}
 	}()
 	wg.Wait()
@@ -666,24 +529,16 @@ func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 	// this assertion deterministically.
 	want := discoveryLockPath(home, "p")
 	got := acquisitions()
-	if len(got) != 3 {
-		t.Fatalf("discovery lock acquisitions = %v, want 3 acquisitions of %s (a writer skipped the lock)", got, want)
-	}
+	testassert.Require(t, len(got) == 3, "discovery lock acquisitions = %v, want 3 acquisitions of %s (a writer skipped the lock)", got, want)
 	for _, p := range got {
-		if p != want {
-			t.Fatalf("discovery lock acquisition path = %q, want %q (writers did not share one lock)", p, want)
-		}
+		testassert.Equal(t, p, want)
 	}
 
 	// Nothing was lost: the fresh discovery survives the concurrent attempts.
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v, want none", warnings)
-	}
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v, want none", warnings)
 	gotModels := cache["p"].Models
-	if len(gotModels) != 2 || gotModels["fresh-a"].Name != "Fresh A" || gotModels["fresh-b"].Name != "Fresh B" {
-		t.Fatalf("fresh discovery lost by concurrent attempt writes: got %d models, want [fresh-a fresh-b]", len(gotModels))
-	}
+	testassert.Require(t, len(gotModels) == 2 && gotModels["fresh-a"].Name == "Fresh A" && gotModels["fresh-b"].Name == "Fresh B", "fresh discovery lost by concurrent attempt writes: got %d models, want [fresh-a fresh-b]", len(gotModels))
 }
 
 // TestConcurrentAttemptAndDiscoveryWriteLoseNeither proves a concurrent
@@ -695,9 +550,7 @@ func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 // fresh discovery survives.
 func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	home := t.TempDir()
-	if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
-		t.Fatalf("seed WriteDiscoveryCache: %v", err)
-	}
+	testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
 		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
@@ -709,14 +562,16 @@ func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	wg.Add(2)
 	go func() { // failed refresh: only its attempt write lands
 		defer wg.Done()
-		if err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()); err != nil {
-			t.Errorf("WriteDiscoveryAttempt: %v", err)
+		{
+			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
+			testassert.Check(t, err == nil, "WriteDiscoveryAttempt: %v", err)
 		}
 	}()
 	go func() { // successful refresh: publishes fresh discovery
 		defer wg.Done()
-		if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC()); err != nil {
-			t.Errorf("WriteDiscoveryCache: %v", err)
+		{
+			err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
+			testassert.Check(t, err == nil, "WriteDiscoveryCache: %v", err)
 		}
 	}()
 	wg.Wait()
@@ -726,33 +581,21 @@ func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	// fails this assertion deterministically.
 	want := discoveryLockPath(home, "p")
 	got := acquisitions()
-	if len(got) != 2 {
-		t.Fatalf("discovery lock acquisitions = %v, want 2 acquisitions of %s (a writer skipped the lock)", got, want)
-	}
+	testassert.Require(t, len(got) == 2, "discovery lock acquisitions = %v, want 2 acquisitions of %s (a writer skipped the lock)", got, want)
 	for _, p := range got {
-		if p != want {
-			t.Fatalf("discovery lock acquisition path = %q, want %q (writers did not share one lock)", p, want)
-		}
+		testassert.Equal(t, p, want)
 	}
 
 	// Nothing was lost: the fresh discovery survives the concurrent attempt
 	// write, and the published file is complete, parseable JSON.
 	cache, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v, want none", warnings)
-	}
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v, want none", warnings)
 	gotModels := cache["p"].Models
-	if len(gotModels) != 2 || gotModels["fresh-a"].Name != "Fresh A" || gotModels["fresh-b"].Name != "Fresh B" {
-		t.Fatalf("fresh discovery lost by concurrent attempt write: got %d models, want [fresh-a fresh-b]", len(gotModels))
-	}
+	testassert.Require(t, len(gotModels) == 2 && gotModels["fresh-a"].Name == "Fresh A" && gotModels["fresh-b"].Name == "Fresh B", "fresh discovery lost by concurrent attempt write: got %d models, want [fresh-a fresh-b]", len(gotModels))
 	data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
-	if err != nil {
-		t.Fatalf("read cache file: %v", err)
-	}
+	testassert.NoError(t, err)
 	var raw discoveryCacheFile
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("published cache not complete JSON: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(data, &raw))
 }
 
 func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
@@ -769,9 +612,7 @@ func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
 	aAcquired := make(chan struct{})
 	originalHook := discoveryLockAcquiredHook
 	discoveryLockAcquiredHook = func(lockPath string) {
-		if lockPath != discoveryLockPath(home, "p") {
-			t.Errorf("lock path = %q, want provider p lock", lockPath)
-		}
+		testassert.Check(t, lockPath == discoveryLockPath(home, "p"), "lock path = %q, want provider p lock", lockPath)
 		acquisitionMu.Lock()
 		acquisitions++
 		count := acquisitions
@@ -790,15 +631,17 @@ func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := WriteDiscoveryCache(home, "p", transportB, freshB, time.Now().UTC()); err != nil {
-			t.Errorf("fresh B WriteDiscoveryCache: %v", err)
+		{
+			err := WriteDiscoveryCache(home, "p", transportB, freshB, time.Now().UTC())
+			testassert.Check(t, err == nil, "fresh B WriteDiscoveryCache: %v", err)
 		}
 	}()
 	<-bAcquired
 	go func() {
 		defer wg.Done()
-		if err := WriteDiscoveryCache(home, "p", transportA, staleA, time.Now().Add(-48*time.Hour).UTC()); err != nil {
-			t.Errorf("stale A WriteDiscoveryCache: %v", err)
+		{
+			err := WriteDiscoveryCache(home, "p", transportA, staleA, time.Now().Add(-48*time.Hour).UTC())
+			testassert.Check(t, err == nil, "stale A WriteDiscoveryCache: %v", err)
 		}
 	}()
 	close(allowB)
@@ -810,25 +653,18 @@ func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
 	wg.Wait()
 
 	records, warnings := ReadDiscoveryCache(home)
-	if len(warnings) != 0 {
-		t.Fatalf("ReadDiscoveryCache warnings = %#v", warnings)
-	}
+	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v", warnings)
 	record := records["p"]
-	if record.TransportFingerprint != transportFingerprint(transportA) || record.Models["stale-a"].Name != "Stale A" {
-		t.Fatalf("final stale A record = %#v, want stale A after fresh B", record)
-	}
-	if record.BoundTo(transportB) {
-		t.Fatal("B reader treated stale A record as bound")
-	}
-	if recent, err := DiscoveryAttemptRecent(home, "p", transportB, time.Now().UTC()); err != nil || recent {
-		t.Fatalf("B attempt recency = (%v, %v), want (false, nil) for due stale record", recent, err)
+	testassert.Require(t, record.TransportFingerprint == transportFingerprint(transportA) && record.Models["stale-a"].Name == "Stale A", "final stale A record = %#v, want stale A after fresh B", record)
+	testassert.Require(t, !record.BoundTo(transportB), "B reader treated stale A record as bound")
+	{
+		recent, err := DiscoveryAttemptRecent(home, "p", transportB, time.Now().UTC())
+		testassert.Require(t, err == nil && !recent, "B attempt recency = (%v, %v), want (false, nil) for due stale record", recent, err)
 	}
 	candidates := DiscoveryRefreshCandidates(&Catalog{Providers: map[string]*Provider{
 		"p": {ID: "p", Transport: transportB, Discovery: true, Models: map[string]*Model{}},
 	}}, records, time.Now().UTC())
-	if !reflect.DeepEqual(candidates, []string{"p"}) {
-		t.Fatalf("B refresh candidates = %#v, want [p]", candidates)
-	}
+	testassert.Require(t, reflect.DeepEqual(candidates, []string{"p"}), "B refresh candidates = %#v, want [p]", candidates)
 	result := Build(BuildInputs{
 		UserRaw: map[string]any{"p": map[string]any{
 			"transport": map[string]any{"base_url": transportB.BaseURL, "api_key_env": transportB.APIKeyEnv},
@@ -837,8 +673,9 @@ func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
 		}},
 		Records: records,
 	})
-	if _, _, err := result.Catalog.Lookup(ModelRef{Provider: "p", Model: "stale-a"}); !errors.Is(err, ErrUnknownModel) {
-		t.Fatalf("B catalog stale model lookup = %v, want ErrUnknownModel", err)
+	{
+		_, _, err := result.Catalog.Lookup(ModelRef{Provider: "p", Model: "stale-a"})
+		testassert.Require(t, errors.Is(err, ErrUnknownModel), "B catalog stale model lookup = %v, want ErrUnknownModel", err)
 	}
 }
 
@@ -865,34 +702,33 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setA, time.Now().UTC()); err != nil {
-				t.Errorf("WriteDiscoveryCache A: %v", err)
+			{
+				err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setA, time.Now().UTC())
+				testassert.Check(t, err == nil, "WriteDiscoveryCache A: %v", err)
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setB, time.Now().UTC()); err != nil {
-				t.Errorf("WriteDiscoveryCache B: %v", err)
+			{
+				err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setB, time.Now().UTC())
+				testassert.Check(t, err == nil, "WriteDiscoveryCache B: %v", err)
 			}
 		}()
 		wg.Wait()
 
 		data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
-		if err != nil {
-			t.Fatalf("round %d: read cache file: %v", round, err)
-		}
+		testassert.Require(t, err == nil, "round %d: read cache file: %v", round, err)
 		var raw discoveryCacheFile
-		if err := json.Unmarshal(data, &raw); err != nil {
-			t.Fatalf("round %d: torn cache file, not complete JSON: %v", round, err)
+		{
+			err := json.Unmarshal(data, &raw)
+			testassert.Require(t, err == nil, "round %d: torn cache file, not complete JSON: %v", round, err)
 		}
 		got := make([]string, 0, len(raw.Models))
 		for id := range raw.Models {
 			got = append(got, id)
 		}
 		sort.Strings(got)
-		if !reflect.DeepEqual(got, keysA) && !reflect.DeepEqual(got, keysB) {
-			t.Fatalf("round %d: torn cache file mixing payloads: %v", round, got)
-		}
+		testassert.Require(t, reflect.DeepEqual(got, keysA) || reflect.DeepEqual(got, keysB), "round %d: torn cache file mixing payloads: %v", round, got)
 	}
 }
 
@@ -902,73 +738,58 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 func TestTryDiscoveryWriterRows(t *testing.T) {
 	t.Run("attempt_success", func(t *testing.T) {
 		home := t.TempDir()
-		if err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
+		testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 		ok, err := TryWriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
-		if !ok || err != nil {
-			t.Fatalf("TryWriteDiscoveryAttempt = (%v, %v), want (true, nil)", ok, err)
-		}
+		testassert.Require(t, ok && err == nil, "TryWriteDiscoveryAttempt = (%v, %v), want (true, nil)", ok, err)
 		records, _ := ReadDiscoveryCache(home)
-		if records["p"].AttemptedAt.IsZero() {
-			t.Fatal("attempted_at not recorded by TryWriteDiscoveryAttempt")
-		}
+		testassert.Require(t, !records["p"].AttemptedAt.IsZero(), "attempted_at not recorded by TryWriteDiscoveryAttempt")
 	})
 	t.Run("attempt_contention", func(t *testing.T) {
 		home := t.TempDir()
 		holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
-		if err != nil || !ok {
-			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-		}
+		testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 		defer holder.Release()
 		got, err := TryWriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
-		if got {
-			t.Fatal("TryWriteDiscoveryAttempt acquired while the lock was held")
-		}
-		if err != nil {
-			t.Fatalf("contention err = %v, want nil", err)
-		}
-		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-			t.Fatalf("contended attempt write created the cache file: %v", statErr)
+		testassert.Require(t, !got, "TryWriteDiscoveryAttempt acquired while the lock was held")
+		testassert.NoError(t, err)
+		{
+			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			testassert.Require(t, os.IsNotExist(statErr), "contended attempt write created the cache file: %v", statErr)
 		}
 	})
 	t.Run("cache_success", func(t *testing.T) {
 		home := t.TempDir()
 		discovered := DiscoveredProvider{Models: map[string]DiscoveredModel{"m": {Name: "M", ContextWindow: 4096}}}
 		ok, err := TryWriteDiscoveryCache(home, "p", discoveryTestTransport(), discovered, time.Now().UTC())
-		if !ok || err != nil {
-			t.Fatalf("TryWriteDiscoveryCache = (%v, %v), want (true, nil)", ok, err)
-		}
+		testassert.Require(t, ok && err == nil, "TryWriteDiscoveryCache = (%v, %v), want (true, nil)", ok, err)
 		cache, _ := ReadDiscoveryCache(home)
-		if _, ok := cache["p"].Models["m"]; !ok {
-			t.Fatalf("cache after TryWriteDiscoveryCache = %#v, want model m", cache["p"].Models)
+		{
+			_, ok := cache["p"].Models["m"]
+			testassert.Require(t, ok, "cache after TryWriteDiscoveryCache = %#v, want model m", cache["p"].Models)
 		}
 	})
 	t.Run("cache_contention", func(t *testing.T) {
 		home := t.TempDir()
 		holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
-		if err != nil || !ok {
-			t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-		}
+		testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 		defer holder.Release()
 		got, err := TryWriteDiscoveryCache(home, "p", discoveryTestTransport(), DiscoveredProvider{Models: map[string]DiscoveredModel{"m": {}}}, time.Now().UTC())
-		if got {
-			t.Fatal("TryWriteDiscoveryCache acquired while the lock was held")
-		}
-		if err != nil {
-			t.Fatalf("contention err = %v, want nil", err)
-		}
-		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-			t.Fatalf("contended cache write created the cache file: %v", statErr)
+		testassert.Require(t, !got, "TryWriteDiscoveryCache acquired while the lock was held")
+		testassert.NoError(t, err)
+		{
+			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			testassert.Require(t, os.IsNotExist(statErr), "contended cache write created the cache file: %v", statErr)
 		}
 	})
 	t.Run("unsafe_id", func(t *testing.T) {
 		home := t.TempDir()
-		if _, err := TryWriteDiscoveryAttempt(home, "a/b", discoveryTestTransport(), time.Now().UTC()); err == nil {
-			t.Fatal("TryWriteDiscoveryAttempt accepted an unsafe provider id")
+		{
+			_, err := TryWriteDiscoveryAttempt(home, "a/b", discoveryTestTransport(), time.Now().UTC())
+			testassert.Require(t, err != nil, "TryWriteDiscoveryAttempt accepted an unsafe provider id")
 		}
-		if _, err := TryWriteDiscoveryCache(home, "a/b", discoveryTestTransport(), DiscoveredProvider{}, time.Now().UTC()); err == nil {
-			t.Fatal("TryWriteDiscoveryCache accepted an unsafe provider id")
+		{
+			_, err := TryWriteDiscoveryCache(home, "a/b", discoveryTestTransport(), DiscoveredProvider{}, time.Now().UTC())
+			testassert.Require(t, err != nil, "TryWriteDiscoveryCache accepted an unsafe provider id")
 		}
 	})
 }
@@ -986,17 +807,12 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		defer server.Close()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: server.URL + "/v1"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if !attempted {
-			t.Fatal("FetchDiscoveryIfDue did not mark the network attempt")
-		}
-		if discovered == nil || len(discovered.Models) != 1 {
-			t.Fatalf("discovered = %#v, want one model", discovered)
-		}
-		if len(warnings) != 0 {
-			t.Fatalf("warnings = %#v, want none", warnings)
-		}
-		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-			t.Fatalf("fetch-only core wrote the cache: %v", statErr)
+		testassert.Require(t, attempted, "FetchDiscoveryIfDue did not mark the network attempt")
+		testassert.Require(t, discovered != nil && len(discovered.Models) == 1, "discovered = %#v, want one model", discovered)
+		testassert.Require(t, len(warnings) == 0, "warnings = %#v, want none", warnings)
+		{
+			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			testassert.Require(t, os.IsNotExist(statErr), "fetch-only core wrote the cache: %v", statErr)
 		}
 	})
 	t.Run("valid_request_failure_marks_attempt", func(t *testing.T) {
@@ -1006,17 +822,12 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if !attempted {
-			t.Fatal("FetchDiscoveryIfDue did not mark the network attempt on a valid-request failure")
-		}
-		if discovered != nil {
-			t.Fatalf("discovered = %#v, want nil on failure", discovered)
-		}
-		if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
-			t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
-		}
-		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-			t.Fatalf("fetch-only core wrote the attempt on failure: %v", statErr)
+		testassert.Require(t, attempted, "FetchDiscoveryIfDue did not mark the network attempt on a valid-request failure")
+		testassert.Require(t, discovered == nil, "discovered = %#v, want nil on failure", discovered)
+		testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
+		{
+			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			testassert.Require(t, os.IsNotExist(statErr), "fetch-only core wrote the attempt on failure: %v", statErr)
 		}
 	})
 	t.Run("invalid_url_refuses_before_attempt", func(t *testing.T) {
@@ -1027,29 +838,20 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if attempted {
-			t.Fatal("FetchDiscoveryIfDue marked an attempt for a pre-network URL validation failure")
-		}
-		if discovered != nil {
-			t.Fatalf("discovered = %#v, want nil for an invalid request", discovered)
-		}
-		if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
-			t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
-		}
-		if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-			t.Fatalf("invalid-request core created an attempt/cache marker: %v", statErr)
+		testassert.Require(t, !attempted, "FetchDiscoveryIfDue marked an attempt for a pre-network URL validation failure")
+		testassert.Require(t, discovered == nil, "discovered = %#v, want nil for an invalid request", discovered)
+		testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
+		{
+			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			testassert.Require(t, os.IsNotExist(statErr), "invalid-request core created an attempt/cache marker: %v", statErr)
 		}
 	})
 	t.Run("recent_attempt_suppresses", func(t *testing.T) {
 		home := t.TempDir()
-		if err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()))
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if attempted || discovered != nil || len(warnings) != 0 {
-			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a recent attempt", attempted, discovered, warnings)
-		}
+		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a recent attempt", attempted, discovered, warnings)
 	})
 	t.Run("missing_key_suppresses", func(t *testing.T) {
 		home := t.TempDir()
@@ -1057,17 +859,13 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		_ = os.Unsetenv("LIGHTCODE_FETCH_DUE_KEY")
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1", APIKeyEnv: "LIGHTCODE_FETCH_DUE_KEY"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if attempted || discovered != nil || len(warnings) != 0 {
-			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) without a key", attempted, discovered, warnings)
-		}
+		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) without a key", attempted, discovered, warnings)
 	})
 	t.Run("disabled_provider_suppresses", func(t *testing.T) {
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: false, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
-		if attempted || discovered != nil || len(warnings) != 0 {
-			t.Fatalf("FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a disabled provider", attempted, discovered, warnings)
-		}
+		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a disabled provider", attempted, discovered, warnings)
 	})
 }
 
@@ -1084,24 +882,17 @@ func TestRefreshProviderDiscoveryTryContention(t *testing.T) {
 		"p": {ID: "p", Builtin: true, Discovery: true, Models: map[string]*Model{}, Transport: Transport{BaseURL: server.URL + "/v1"}},
 	}}
 	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
-	if err != nil || !ok {
-		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-	}
+	testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 	defer holder.Release()
 
 	changed, warnings := RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, "", cat, "p")
-	if changed {
-		t.Fatal("Try refresh reported a change under foreign lock contention")
+	testassert.Require(t, !changed, "Try refresh reported a change under foreign lock contention")
+	testassert.Require(t, len(warnings) != 0 && strings.Contains(warnings[0].Message, "lock"), "warnings = %#v, want a discovery lock contention warning", warnings)
+	{
+		_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+		testassert.Require(t, os.IsNotExist(statErr), "contended Try refresh wrote the cache: %v", statErr)
 	}
-	if len(warnings) == 0 || !strings.Contains(warnings[0].Message, "lock") {
-		t.Fatalf("warnings = %#v, want a discovery lock contention warning", warnings)
-	}
-	if _, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(statErr) {
-		t.Fatalf("contended Try refresh wrote the cache: %v", statErr)
-	}
-	if len(cat.Providers["p"].Models) != 0 {
-		t.Fatalf("contended Try refresh merged models into the catalog: %#v", cat.Providers["p"].Models)
-	}
+	testassert.Require(t, len(cat.Providers["p"].Models) == 0, "contended Try refresh merged models into the catalog: %#v", cat.Providers["p"].Models)
 }
 
 // discoveryBlockHolderEnv selects the child half of
@@ -1213,15 +1004,11 @@ func TestRefreshProviderDiscoveryBlocksUntilRelease(t *testing.T) {
 	}
 	select {
 	case res := <-done:
-		if !res.changed || len(res.warnings) != 0 {
-			t.Fatalf("blocking refresh after release = (%v, %#v), want (true, none)", res.changed, res.warnings)
-		}
+		testassert.Require(t, res.changed && len(res.warnings) == 0, "blocking refresh after release = (%v, %#v), want (true, none)", res.changed, res.warnings)
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocking refresh did not complete after the holder released")
 	}
-	if len(cat.Providers["p"].Models) != 1 {
-		t.Fatalf("merged models = %#v, want the fetched model", cat.Providers["p"].Models)
-	}
+	testassert.Require(t, len(cat.Providers["p"].Models) == 1, "merged models = %#v, want the fetched model", cat.Providers["p"].Models)
 }
 
 // TestRefreshWrappersDoNotMarkInvalidURLAttempt proves a pre-network URL
@@ -1248,14 +1035,11 @@ func TestRefreshWrappersDoNotMarkInvalidURLAttempt(t *testing.T) {
 				"p": {ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}},
 			}}
 			changed, warnings := tc.run(home, cat)
-			if changed {
-				t.Fatal("invalid-URL refresh reported a change")
-			}
-			if len(warnings) != 1 || warnings[0].Kind != "discovery_failure" {
-				t.Fatalf("warnings = %#v, want one discovery_failure", warnings)
-			}
-			if _, err := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json")); !os.IsNotExist(err) {
-				t.Fatalf("invalid-URL %s wrapper created an attempt/cache marker: %v", tc.name, err)
+			testassert.Require(t, !changed, "invalid-URL refresh reported a change")
+			testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
+			{
+				_, err := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+				testassert.Require(t, os.IsNotExist(err), "invalid-URL %s wrapper created an attempt/cache marker: %v", tc.name, err)
 			}
 		})
 	}

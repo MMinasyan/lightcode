@@ -2,6 +2,10 @@ package model
 
 import "testing"
 
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+)
+
 // TestBuildHeadersPinsDefaultsKeyAndOverrides pins the single header helper: JSON content type and SSE accept defaults, Bearer authorization exactly when a key is present (empty omits it entirely), then resolved headers overwriting matching defaults case-insensitively while adding new ones — every entry stored in MIME canonical form with http.Header.Set semantics.
 func TestBuildHeadersPinsDefaultsKeyAndOverrides(t *testing.T) {
 	t.Run("defaults-without-key", func(t *testing.T) { // no API key: exactly the two protocol defaults, nothing else may appear.
@@ -58,17 +62,17 @@ func TestBuildHeadersPinsDefaultsKeyAndOverrides(t *testing.T) {
 // assertHeaderMapEqual fails with both maps shown when they differ in size or any value.
 func assertHeaderMapEqual(t *testing.T, got, want map[string]string) {
 	t.Helper() // one comparison helper for every header subtest above and below.
-	if len(got) != len(want) {
-		t.Fatalf("headers = %#v (len %d), want %#v (len %d)", got, len(got), want, len(want))
-	}
+	testassert.Require(t, len(got) == len(want), "headers = %#v (len %d), want %#v (len %d)", got, len(got), want, len(want))
 	for k, v := range want { // every expected key present with the exact value.
-		if gv, ok := got[k]; !ok || gv != v {
-			t.Fatalf("header %q = %q (present=%v), want %q", k, gv, ok, v)
+		{
+			gv, ok := got[k]
+			testassert.Require(t, ok && gv == v, "header %q = %q (present=%v), want %q", k, gv, ok, v)
 		}
 	}
 	for k := range got { // no unexpected key may appear either.
-		if _, ok := want[k]; !ok {
-			t.Fatalf("unexpected header %q: %#v", k, got)
+		{
+			_, ok := want[k]
+			testassert.Require(t, ok, "unexpected header %q: %#v", k, got)
 		}
 	}
 }
@@ -90,8 +94,9 @@ func TestChatEndpointPinsDefaultAndCustom(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := testResolved() // identity fields are irrelevant to endpoint resolution; only BaseURL varies per row.
 			rt.BaseURL = tc.base
-			if got := ChatEndpoint(rt); got != tc.want {
-				t.Fatalf("ChatEndpoint(base=%q) = %q, want %q", tc.base, got, tc.want)
+			{
+				got := ChatEndpoint(rt)
+				testassert.Require(t, got == tc.want, "ChatEndpoint(base=%q) = %q, want %q", tc.base, got, tc.want)
 			}
 		})
 	}

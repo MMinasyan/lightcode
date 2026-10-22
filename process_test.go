@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // rootExecSelector is the private test environment marker: when inherited,
@@ -77,20 +78,14 @@ func newRootSandbox(t *testing.T) *rootSandbox {
 	home := t.TempDir()
 	workspace := t.TempDir()
 	dataDir := filepath.Join(home, ".lightcode")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		t.Fatalf("prepare data root: %v", err)
-	}
+	testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 	configPath := filepath.Join(home, "config.json")
-	if err := os.WriteFile(configPath, []byte(rootFixtureConfig), 0o600); err != nil {
-		t.Fatalf("prepare config: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(configPath, []byte(rootFixtureConfig), 0o600))
 	t.Setenv("HOME", home)
 	t.Setenv("LIGHTCODE_CONFIG", configPath)
 	isolateBundledCredentials(t)
 	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve executable: %v", err)
-	}
+	testassert.NoError(t, err)
 	s := &rootSandbox{t: t, exe: exe, home: home, dataDir: dataDir, configPath: configPath, workspace: workspace}
 	s.seedOldState()
 	return s
@@ -104,9 +99,7 @@ func (s *rootSandbox) seedOldState() {
 	hash := hex.EncodeToString(sum[:])
 	sessionDir := filepath.Join(s.dataDir, "projects", "p-"+hash, "sessions", oldSessionID)
 	snapEntry := filepath.Join(sessionDir, "snapshots", "1", "0123456789abcdef")
-	if err := os.MkdirAll(snapEntry, 0o700); err != nil {
-		s.t.Fatal(err)
-	}
+	testassert.NoError(s.t, os.MkdirAll(snapEntry, 0o700))
 	meta := fmt.Sprintf(`{"id":%q,"created_at":"2026-01-01T00:00:00Z","project_path":%q,"project_hash":%q,"lightcode_version":"v0.0.0","state":"active","archived_at":0,"last_activity":0}`, oldSessionID, filepath.Clean(s.workspace), hash[:16])
 	files := map[string]string{
 		filepath.Join(sessionDir, "meta.json"):     meta,
@@ -115,8 +108,9 @@ func (s *rootSandbox) seedOldState() {
 		filepath.Join(snapEntry, "sentinel.txt"):   "old snapshot sentinel\n",
 	}
 	for path, body := range files {
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			s.t.Fatalf("seed old state %s: %v", path, err)
+		{
+			err := os.WriteFile(path, []byte(body), 0o600)
+			testassert.Require(s.t, err == nil, "seed old state %s: %v", path, err)
 		}
 	}
 }
@@ -194,14 +188,13 @@ func (s *rootSandbox) start(args ...string) *rootChild {
 	cmd.Dir = s.workspace
 	cmd.Env = s.childEnv()
 	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		s.t.Fatalf("%v: StdinPipe: %v", args, err)
-	}
+	testassert.Require(s.t, err == nil, "%v: StdinPipe: %v", args, err)
 	out := &lockedBuffer{}
 	cmd.Stdout = out
 	cmd.Stderr = out
-	if err := cmd.Start(); err != nil {
-		s.t.Fatalf("%v: start: %v", args, err)
+	{
+		err := cmd.Start()
+		testassert.Require(s.t, err == nil, "%v: start: %v", args, err)
 	}
 	c := &rootChild{t: s.t, args: args, cmd: cmd, stdin: stdin, out: out, done: make(chan struct{})}
 	go func() {
@@ -215,8 +208,9 @@ func (s *rootSandbox) start(args ...string) *rootChild {
 // signal delivers one shutdown signal to the known child process.
 func (c *rootChild) signal(sig os.Signal) {
 	c.t.Helper()
-	if err := c.cmd.Process.Signal(sig); err != nil {
-		c.t.Fatalf("%v: signal: %v", c.args, err)
+	{
+		err := c.cmd.Process.Signal(sig)
+		testassert.Require(c.t, err == nil, "%v: signal: %v", c.args, err)
 	}
 }
 
@@ -261,9 +255,7 @@ func (s *rootSandbox) awaitReady() *client.Client {
 		if err == nil {
 			return conn
 		}
-		if time.Now().After(deadline) {
-			s.t.Fatalf("owner never became ready: %v", err)
-		}
+		testassert.Require(s.t, !time.Now().After(deadline), "owner never became ready: %v", err)
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -272,8 +264,9 @@ func (s *rootSandbox) awaitReady() *client.Client {
 func (s *rootSandbox) withdrawn() {
 	s.t.Helper()
 	recordPath := filepath.Join(s.dataDir, "runtime.json")
-	if _, err := os.Lstat(recordPath); !os.IsNotExist(err) {
-		s.t.Fatalf("discovery record still present after shutdown: %v", err)
+	{
+		_, err := os.Lstat(recordPath)
+		testassert.Require(s.t, os.IsNotExist(err), "discovery record still present after shutdown: %v", err)
 	}
 }
 
@@ -285,19 +278,22 @@ func (s *rootSandbox) cliAsk(command, want string) string {
 	child := s.start("cli")
 	deadline := time.Now().Add(45 * time.Second)
 	for {
-		if _, err := io.WriteString(child.stdin, command+"\n"); err != nil {
-			child.t.Fatalf("cli stdin: %v", err)
+		{
+			_, err := io.WriteString(child.stdin, command+"\n")
+			testassert.Require(child.t, err == nil, "cli stdin: %v", err)
 		}
 		for {
 			out := child.out.String()
 			switch {
 			case strings.Contains(out, want):
-				if _, err := io.WriteString(child.stdin, "/exit\n"); err != nil {
-					child.t.Fatalf("cli stdin: %v", err)
+				{
+					_, err := io.WriteString(child.stdin, "/exit\n")
+					testassert.Require(child.t, err == nil, "cli stdin: %v", err)
 				}
 				_ = child.stdin.Close()
-				if code := child.awaitExit(); code != 0 {
-					child.t.Fatalf("cli exit = %d\noutput=%s", code, out)
+				{
+					code := child.awaitExit()
+					testassert.Require(child.t, code == 0, "cli exit = %d\noutput=%s", code, out)
 				}
 				return child.out.String()
 			case strings.Contains(out, "Runtime is not connected"):
@@ -330,8 +326,9 @@ func (s *rootSandbox) acpExchange() (healthInstance, sessionID string) {
 	s.t.Helper()
 	child := s.start("acp")
 	send := func(body string) {
-		if _, err := io.WriteString(child.stdin, body+"\n"); err != nil {
-			child.t.Fatalf("acp stdin: %v", err)
+		{
+			_, err := io.WriteString(child.stdin, body+"\n")
+			testassert.Require(child.t, err == nil, "acp stdin: %v", err)
 		}
 	}
 	read := func(id string, into any) {
@@ -356,17 +353,14 @@ func (s *rootSandbox) acpExchange() (healthInstance, sessionID string) {
 				if resp.Error != nil {
 					child.t.Fatalf("acp id %s error %d %s", id, resp.Error.Code, resp.Error.Message)
 				}
-				if err := json.Unmarshal(resp.Result, into); err != nil {
-					child.t.Fatalf("acp id %s result: %v (%s)", id, err, resp.Result)
+				{
+					err := json.Unmarshal(resp.Result, into)
+					testassert.Require(child.t, err == nil, "acp id %s result: %v (%s)", id, err, resp.Result)
 				}
 				return
 			}
-			if time.Now().After(deadline) {
-				child.t.Fatalf("acp id %s never answered\noutput=%s", id, out)
-			}
-			if childExited(child) {
-				child.t.Fatalf("acp exited before answering id %s\noutput=%s", id, out)
-			}
+			testassert.Require(child.t, !time.Now().After(deadline), "acp id %s never answered\noutput=%s", id, out)
+			testassert.Require(child.t, !childExited(child), "acp exited before answering id %s\noutput=%s", id, out)
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
@@ -407,118 +401,84 @@ func TestRootRuntimeComposition(t *testing.T) {
 	owner := s.start(s.runtimeArgs(s.configPath)...)
 	first := s.awaitReady()
 	instance := first.InstanceID()
-	if instance == "" {
-		t.Fatal("owner reported an empty instance")
-	}
+	testassert.Require(t, instance != "", "owner reported an empty instance")
 
 	t.Run("contended startup exits 0 without replacing the record", func(t *testing.T) {
 		_, stderr, code := s.runOne(s.runtimeArgs(s.configPath)...)
-		if code != 0 {
-			t.Fatalf("contender exit = %d, want 0\nstderr=%s", code, stderr)
-		}
+		testassert.Require(t, code == 0, "contender exit = %d, want 0\nstderr=%s", code, stderr)
 		again := s.awaitReady()
-		if got := again.InstanceID(); got != instance {
-			t.Fatalf("record instance = %q, want the first owner %q", got, instance)
-		}
+		testassert.Equal(t, again.InstanceID(), instance)
 	})
 
 	t.Run("models prints the configured provider projection", func(t *testing.T) {
 		stdout, stderr, code := s.runOne("models", "--json", "--all")
-		if code != 0 {
-			t.Fatalf("exit = %d\nstderr=%s", code, stderr)
-		}
+		testassert.Require(t, code == 0, "exit = %d\nstderr=%s", code, stderr)
 		var rows []map[string]any
-		if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
-			t.Fatalf("stdout not JSON: %v\n%q", err, stdout)
+		{
+			err := json.Unmarshal([]byte(stdout), &rows)
+			testassert.Require(t, err == nil, "stdout not JSON: %v\n%q", err, stdout)
 		}
 		want := []map[string]any{
 			{"ref": "fixtureprov/hid", "provider": "fixtureprov", "providerName": "fixtureprov", "model": "hid", "displayName": "Hidden", "contextWindow": float64(16384), "maxOutputTokens": float64(512), "hidden": true, "providerHidden": false, "incomplete": false, "default": false, "source": "user"},
 			{"ref": "fixtureprov/inc", "provider": "fixtureprov", "providerName": "fixtureprov", "model": "inc", "displayName": "Incomplete", "contextWindow": float64(0), "maxOutputTokens": float64(0), "hidden": false, "providerHidden": false, "incomplete": true, "default": false, "source": "user"},
 			{"ref": "fixtureprov/vis", "provider": "fixtureprov", "providerName": "fixtureprov", "model": "vis", "displayName": "Visible", "contextWindow": float64(8192), "maxOutputTokens": float64(1024), "hidden": false, "providerHidden": false, "incomplete": false, "default": false, "source": "user"},
 		}
-		if len(rows) != len(want) {
-			t.Fatalf("rows = %v", rows)
-		}
+		testassert.Require(t, len(rows) == len(want), "rows = %v", rows)
 		for i := range want {
 			for field, value := range want[i] {
-				if rows[i][field] != value {
-					t.Fatalf("rows[%d][%q] = %v, want %v", i, field, rows[i][field], value)
-				}
+				testassert.Require(t, rows[i][field] == value, "rows[%d][%q] = %v, want %v", i, field, rows[i][field], value)
 			}
-			if _, present := rows[i]["cost"]; present {
-				t.Fatalf("rows[%d] carries an unset cost: %v", i, rows[i])
+			{
+				_, present := rows[i]["cost"]
+				testassert.Require(t, !present, "rows[%d] carries an unset cost: %v", i, rows[i])
 			}
 		}
 	})
 
 	t.Run("models keeps ordinary trailing flags and hides incomplete rows by default", func(t *testing.T) {
 		stdout, stderr, code := s.runOne("models", "fixtureprov", "--all")
-		if code != 0 {
-			t.Fatalf("exit = %d\nstderr=%s", code, stderr)
-		}
+		testassert.Require(t, code == 0, "exit = %d\nstderr=%s", code, stderr)
 		want := "fixtureprov/hid\t16384\t512\thidden\n" +
 			"fixtureprov/inc\t0\t0\tincomplete\n" +
 			"fixtureprov/vis\t8192\t1024\t-\n"
-		if stdout != want {
-			t.Fatalf("stdout = %q, want %q", stdout, want)
-		}
+		testassert.Equal(t, stdout, want)
 		stdout, stderr, code = s.runOne("models", "--json")
-		if code != 0 {
-			t.Fatalf("exit = %d\nstderr=%s", code, stderr)
-		}
+		testassert.Require(t, code == 0, "exit = %d\nstderr=%s", code, stderr)
 		var rows []map[string]any
-		if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
-			t.Fatalf("stdout not JSON: %v\n%q", err, stdout)
+		{
+			err := json.Unmarshal([]byte(stdout), &rows)
+			testassert.Require(t, err == nil, "stdout not JSON: %v\n%q", err, stdout)
 		}
-		if len(rows) != 1 || rows[0]["ref"] != "fixtureprov/vis" {
-			t.Fatalf("default rows = %v, want only the visible complete model", rows)
-		}
+		testassert.Require(t, len(rows) == 1 && rows[0]["ref"] == "fixtureprov/vis", "default rows = %v, want only the visible complete model", rows)
 	})
 
 	t.Run("terminated flag-like operands stay provider operands", func(t *testing.T) {
 		stdout, stderr, code := s.runOne("models", "--", "--json=true")
-		if code != 2 {
-			t.Fatalf("exit = %d, want 2\nstdout=%s\nstderr=%s", code, stdout, stderr)
-		}
-		if !strings.Contains(stderr, `unknown provider "--json=true"`) {
-			t.Fatalf("stderr = %q, want the operand reported as an unknown provider", stderr)
-		}
+		testassert.Require(t, code == 2, "exit = %d, want 2\nstdout=%s\nstderr=%s", code, stdout, stderr)
+		testassert.Require(t, strings.Contains(stderr, `unknown provider "--json=true"`), "stderr = %q, want the operand reported as an unknown provider", stderr)
 	})
 
 	t.Run("cli exposes the same instance through the typed dispatcher", func(t *testing.T) {
 		out := s.cliAsk("/runtime GetHealth {}", instance)
-		if !strings.Contains(out, instance) {
-			t.Fatalf("cli output = %q, want instance %q", out, instance)
-		}
+		testassert.Require(t, strings.Contains(out, instance), "cli output = %q, want instance %q", out, instance)
 	})
 
 	var session string
 	t.Run("acp initialize reports the generated Runtime health", func(t *testing.T) {
 		healthInstance, sessionID := s.acpExchange()
-		if healthInstance != instance {
-			t.Fatalf("acp health instance = %q, want %q", healthInstance, instance)
-		}
-		if sessionID == "" {
-			t.Fatal("acp composed no session")
-		}
+		testassert.Equal(t, healthInstance, instance)
+		testassert.Require(t, sessionID != "", "acp composed no session")
 		session = sessionID
 	})
 
 	t.Run("target session reads never enumerate the old conversation", func(t *testing.T) {
 		out := s.cliAsk(`/runtime ListSessions {"query":{"workspace":`+jsonString(s.workspace)+`,"lifecycle":"open"}}`, session)
-		if !strings.Contains(out, session) {
-			t.Fatalf("session list = %q, want the committed session %q", out, session)
-		}
-		if strings.Contains(out, oldSessionID) {
-			t.Fatalf("session list = %q, want no old filesystem conversation %q", out, oldSessionID)
-		}
+		testassert.Require(t, strings.Contains(out, session) && !strings.Contains(out, oldSessionID), "session list = %q, want the committed session %q; session list = %q, want no old filesystem conversation %q", out, session, out, oldSessionID)
 	})
 
 	t.Run("client exit leaves the owner reachable", func(t *testing.T) {
 		again := s.awaitReady()
-		if got := again.InstanceID(); got != instance {
-			t.Fatalf("owner instance after client exits = %q, want %q", got, instance)
-		}
+		testassert.Equal(t, again.InstanceID(), instance)
 	})
 
 	t.Run("SIGINT joins managed shutdown and a fresh owner reads the same session", func(t *testing.T) {
@@ -530,13 +490,12 @@ func TestRootRuntimeComposition(t *testing.T) {
 
 		replacement := s.start(s.runtimeArgs(s.configPath)...)
 		fresh := s.awaitReady()
-		if got := fresh.InstanceID(); got == instance {
-			t.Fatalf("replacement instance = %q, want a fresh instance", got)
+		{
+			got := fresh.InstanceID()
+			testassert.Require(t, got != instance, "replacement instance = %q, want a fresh instance", got)
 		}
 		out := s.cliAsk(`/runtime ListSessions {"query":{"workspace":`+jsonString(s.workspace)+`,"lifecycle":"open"}}`, session)
-		if !strings.Contains(out, session) {
-			t.Fatalf("replacement session list = %q, want the committed session %q", out, session)
-		}
+		testassert.Require(t, strings.Contains(out, session), "replacement session list = %q, want the committed session %q", out, session)
 		replacement.signal(syscall.SIGTERM)
 		if code := replacement.awaitExit(); code != 0 {
 			t.Fatalf("SIGTERM exit = %d, want 0\noutput=%s", code, replacement.out.String())
@@ -544,8 +503,9 @@ func TestRootRuntimeComposition(t *testing.T) {
 		s.withdrawn()
 	})
 
-	if after := snapshotHome(t, oldState); !maps.Equal(before, after) {
-		t.Fatalf("old filesystem conversation moved: before=%v after=%v", before, after)
+	{
+		after := snapshotHome(t, oldState)
+		testassert.Require(t, maps.Equal(before, after), "old filesystem conversation moved: before=%v after=%v", before, after)
 	}
 }
 
@@ -556,8 +516,9 @@ func TestRootRuntimeComposition(t *testing.T) {
 func TestRootACPSignalExit(t *testing.T) {
 	s := newRootSandbox(t)
 	child := s.start("acp")
-	if _, err := io.WriteString(child.stdin, "not-json\n"); err != nil {
-		t.Fatalf("acp stdin: %v", err)
+	{
+		_, err := io.WriteString(child.stdin, "not-json\n")
+		testassert.NoError(t, err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for !strings.Contains(child.out.String(), "parse error") {
@@ -582,38 +543,25 @@ func TestRootRuntimeStartupFailures(t *testing.T) {
 	t.Run("invalid config exits 1", func(t *testing.T) {
 		s := newRootSandbox(t)
 		badPath := filepath.Join(s.home, "bad-config.json")
-		if err := os.WriteFile(badPath, []byte(`{"providers": [`), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(badPath, []byte(`{"providers": [`), 0o600))
 		stdout, stderr, code := s.runOne(s.runtimeArgs(badPath)...)
-		if code != 1 {
-			t.Fatalf("exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
-		}
-		if !strings.HasPrefix(stderr, "lightcode: ") {
-			t.Fatalf("stderr = %q, want the dispatcher diagnostic", stderr)
-		}
+		testassert.Require(t, code == 1, "exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr = %q, want the dispatcher diagnostic", stderr)
 		s.withdrawn()
 	})
 
 	t.Run("non-file discovery destination exits 1", func(t *testing.T) {
 		s := newRootSandbox(t)
 		recordPath := filepath.Join(s.dataDir, "runtime.json")
-		if err := os.MkdirAll(recordPath, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.MkdirAll(recordPath, 0o700))
 		sentinel := filepath.Join(recordPath, "keep.txt")
-		if err := os.WriteFile(sentinel, []byte("sentinel"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(sentinel, []byte("sentinel"), 0o600))
 		stdout, stderr, code := s.runOne(s.runtimeArgs(s.configPath)...)
-		if code != 1 {
-			t.Fatalf("exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
-		}
-		if !strings.HasPrefix(stderr, "lightcode: ") {
-			t.Fatalf("stderr = %q, want the dispatcher diagnostic", stderr)
-		}
-		if _, err := os.Stat(sentinel); err != nil {
-			t.Fatalf("destination sentinel lost: %v", err)
+		testassert.Require(t, code == 1, "exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr = %q, want the dispatcher diagnostic", stderr)
+		{
+			_, err := os.Stat(sentinel)
+			testassert.NoError(t, err)
 		}
 	})
 }
@@ -627,16 +575,10 @@ func TestRootRuntimeCleanupFailure(t *testing.T) {
 	s.awaitReady()
 
 	recordPath := filepath.Join(s.dataDir, "runtime.json")
-	if err := os.Remove(recordPath); err != nil {
-		t.Fatalf("remove record: %v", err)
-	}
-	if err := os.MkdirAll(recordPath, 0o700); err != nil {
-		t.Fatalf("replace record with directory: %v", err)
-	}
+	testassert.NoError(t, os.Remove(recordPath))
+	testassert.NoError(t, os.MkdirAll(recordPath, 0o700))
 	sentinel := filepath.Join(recordPath, "keep.txt")
-	if err := os.WriteFile(sentinel, []byte("sentinel"), 0o600); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
+	testassert.NoError(t, os.WriteFile(sentinel, []byte("sentinel"), 0o600))
 
 	owner.signal(os.Interrupt)
 	if code := owner.awaitExit(); code != 1 {
@@ -645,8 +587,9 @@ func TestRootRuntimeCleanupFailure(t *testing.T) {
 	if !strings.Contains(owner.out.String(), "lightcode: ") {
 		t.Fatalf("output = %q, want the dispatcher diagnostic", owner.out.String())
 	}
-	if _, err := os.Stat(sentinel); err != nil {
-		t.Fatalf("blocking sentinel lost: %v", err)
+	{
+		_, err := os.Stat(sentinel)
+		testassert.NoError(t, err)
 	}
 }
 
@@ -666,9 +609,7 @@ func isolateBundledCredentials(t *testing.T) {
 	t.Helper()
 	catalogDir := filepath.Join("internal", "catalog", "builtin")
 	entries, err := os.ReadDir(catalogDir)
-	if err != nil {
-		t.Fatalf("read bundled catalog: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue

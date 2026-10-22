@@ -1,15 +1,14 @@
 // Contract coverage for the compaction orchestration: the frozen projected
-// conversation is serialized into inert transcript lines, packed whole-message
-// into budget-fitting pieces, and each piece runs one agent.Run invocation
-// whose model effect commits the ordinary intent over the compact transport
-// and settles without writing entries.
+// conversation is serialized into inert transcript lines, joined whole into
+// one full-input compact request, and that request runs one agent.Run
+// invocation whose model effect commits the ordinary intent over the compact
+// transport and settles without writing entries.
 package harness
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/agent"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -48,9 +48,7 @@ func compactSnapshotMessages() []model.Message {
 func registerRevision(t *testing.T, store *graphStorage, sessionID string, key RegisterKey) int64 {
 	t.Helper()
 	reg, err := store.ReadRegister(context.Background(), key)
-	if err != nil {
-		t.Fatalf("ReadRegister: %v", err)
-	}
+	testassert.NoError(t, err)
 	return reg.Revision
 }
 
@@ -61,15 +59,11 @@ func settlementEntryOf(t *testing.T, graph *sessionGraph) *operationSettlementEn
 	var found *operationSettlementEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Settlement != nil {
-			if found != nil {
-				t.Fatalf("graph carries more than one settlement entry")
-			}
+			testassert.Require(t, found == nil, "graph carries more than one settlement entry")
 			found = graph.Entries[i].Settlement
 		}
 	}
-	if found == nil {
-		t.Fatalf("graph carries no settlement entry")
-	}
+	testassert.Require(t, found != nil, "graph carries no settlement entry")
 	return found
 }
 
@@ -83,12 +77,12 @@ func entryIDs(t *testing.T, graph *sessionGraph) map[string]bool {
 	return ids
 }
 
-// TestRunCompactionOneBudgetSnapshotRunsOnePiece proves the one-piece shape:
-// a snapshot that fits one budget runs exactly one request whose user text is
-// the serialized snapshot alone, one intent transaction commits before it,
-// the ready settlement inserts no entry and leaves both registers with no
-// usage, and the reserved identity stays unused.
-func TestRunCompactionOneBudgetSnapshotRunsOnePiece(t *testing.T) {
+// TestRunCompactionReadyPathRunsOneRequest proves the ready shape: the run
+// executes exactly one request whose user text is the serialized snapshot
+// alone, one intent transaction commits before it, the ready settlement
+// inserts no entry and leaves both registers with no usage, and the reserved
+// identity stays unused.
+func TestRunCompactionReadyPathRunsOneRequest(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
 	sessionKey := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
@@ -118,193 +112,91 @@ func TestRunCompactionOneBudgetSnapshotRunsOnePiece(t *testing.T) {
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
-	if err != nil {
-		t.Fatalf("runCompaction: %v", err)
-	}
-	if summary != "summary one" {
-		t.Fatalf("summary %q, want the piece output text", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}) {
-		t.Fatalf("usage = %+v, want the one piece's reported counts", usage)
-	}
-	if len(requests) != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one piece request", len(requests))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, summary, "summary one")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "usage = %+v, want the one request's reported counts", usage)
+	testassert.Equal(t, len(requests), 1)
 	req := requests[0]
-	if len(req.Messages) != 2 {
-		t.Fatalf("request messages = %d, want exactly a system and a user message", len(req.Messages))
+	testassert.Require(t, len(req.Messages) == 2 && len(req.Tools) == 0, "got %v, want %v; got %v, want %v", len(req.Messages), 2, len(req.Tools), 0)
+	testassert.Require(t, req.Messages[0].Role == model.RoleSystem && req.Messages[0].Source == (model.ModelRef{}), "system message = %+v, want role system with zero source", req.Messages[0])
+	{
+		got := req.Messages[0].TextContent()
+		testassert.Equal(t, got, testCapture().Compact.SystemPrompt)
 	}
-	if len(req.Tools) != 0 {
-		t.Fatalf("request tools = %d, want none advertised", len(req.Tools))
-	}
-	if req.Messages[0].Role != model.RoleSystem || req.Messages[0].Source != (model.ModelRef{}) {
-		t.Fatalf("system message = %+v, want role system with zero source", req.Messages[0])
-	}
-	if got := req.Messages[0].TextContent(); got != testCapture().Compact.SystemPrompt {
-		t.Fatalf("system message text %q, want the compact prompt", got)
-	}
-	if req.Messages[1].Role != model.RoleUser || req.Messages[1].Source != (model.ModelRef{}) {
-		t.Fatalf("user message = %+v, want role user with zero source", req.Messages[1])
-	}
+	testassert.Require(t, req.Messages[1].Role == model.RoleUser && req.Messages[1].Source == (model.ModelRef{}), "user message = %+v, want role user with zero source", req.Messages[1])
 	expectedLines, err := serializeCompactionMessages(snapshot)
-	if err != nil {
-		t.Fatalf("serializeCompactionMessages: %v", err)
-	}
-	if got := req.Messages[1].TextContent(); got != strings.Join(expectedLines, "\n") {
-		t.Fatalf("user request text %q, want the serialized snapshot alone", got)
+	testassert.NoError(t, err)
+	{
+		got := req.Messages[1].TextContent()
+		testassert.Equal(t, got, strings.Join(expectedLines, "\n"))
 	}
 	if strings.Contains(req.Messages[1].TextContent(), "Previous summary:") {
-		t.Fatalf("the one-piece request carries a Previous summary block: %q", req.Messages[1].TextContent())
+		t.Fatalf("the request carries a Previous summary block: %q", req.Messages[1].TextContent())
 	}
 
 	// One intent transaction and one result transaction: the operation
 	// register advanced exactly twice, the session register once.
-	if got := registerRevision(t, store, sessionID, opKey); got != opRevision+2 {
-		t.Fatalf("operation register revision %d, want %d (one intent and one result transaction)", got, opRevision+2)
+	{
+		got := registerRevision(t, store, sessionID, opKey)
+		testassert.Equal(t, got, opRevision+2)
 	}
-	if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision+1 {
-		t.Fatalf("session register revision %d, want %d", got, sessionRevision+1)
+	{
+		got := registerRevision(t, store, sessionID, sessionKey)
+		testassert.Equal(t, got, sessionRevision+1)
 	}
 	afterEntries, _ := storedSessionState(store, sessionID)
-	if len(afterEntries) != len(beforeEntries) {
-		t.Fatalf("entry count %d, want the unchanged %d", len(afterEntries), len(beforeEntries))
-	}
+	testassert.Equal(t, len(afterEntries), len(beforeEntries))
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-run graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	ids := entryIDs(t, graph)
-	if reservedID == "" || ids[reservedID] {
-		t.Fatalf("reserved identity %q must stay unused by any entry", reservedID)
-	}
+	testassert.Require(t, reservedID != "" && !ids[reservedID], "reserved identity %q must stay unused by any entry", reservedID)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	if err != nil {
-		t.Fatalf("ReadOperation: %v", err)
-	}
-	if rec.State.Status != OperationRunning || rec.State.ActiveEffect != nil {
-		t.Fatalf("operation state = %+v, want running with the effect cleared", rec.State)
-	}
-	if len(rec.State.Usage.ByModel) != 0 {
-		t.Fatalf("operation usage = %+v, want none on the ready path", rec.State.Usage)
-	}
-	if len(graph.Session.State.Usage.ByModel) != 0 {
-		t.Fatalf("session usage = %+v, want none on the ready path", graph.Session.State.Usage)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && len(rec.State.Usage.ByModel) == 0, "operation state = %+v, want running with the effect cleared; operation usage = %+v, want none on the ready path", rec.State, rec.State.Usage)
+	testassert.Require(t, len(graph.Session.State.Usage.ByModel) == 0, "session usage = %+v, want none on the ready path", graph.Session.State.Usage)
 }
 
-// TestRunCompactionMultiPieceConsumesEveryMessageOnce proves the rolling
-// shape: a message that exceeds a nonempty piece's remaining budget starts
-// the next piece, every message is consumed exactly once in order, no message
-// is split, and every continuation request carries the previous summary.
-func TestRunCompactionMultiPieceConsumesEveryMessageOnce(t *testing.T) {
+// TestRunCompactionFullInputRunsOneRequest is the single-request regression:
+// a serialized input larger than any per-piece budget the removed packing
+// loop imposed runs as one full-input request whose user text is the
+// serialized snapshot alone, with the one response's reported usage.
+func TestRunCompactionFullInputRunsOneRequest(t *testing.T) {
 	h, _, c, _ := newEffectHarness(t, nil)
 	capture := testCapture()
-
-	// Fixture sized to the contract's exact case: the middle message fits a
-	// fresh empty piece but exceeds the space left in the piece carrying the
-	// first message, so it starts the next piece, and the third message
-	// exceeds the middle piece's remaining budget and starts the third piece.
-	// No message exceeds a whole empty piece's budget.
-	budget := compactionPieceBudget(capture.Compact, "")
 	unit := "summarize the whole conversation turn carefully "
-	alpha := strings.Repeat(unit, 12)
-	alphaLines, err := serializeCompactionMessages([]model.Message{{Role: model.RoleUser, Content: admissionContent(alpha)}})
-	if err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	costAlpha := estimateTokens(alphaLines[0], nil)
-	big := ""
-	costBig := 0
-	for n := 1; ; n++ {
-		candidate := strings.Repeat(unit, n)
-		sized, err := serializeCompactionMessages([]model.Message{{Role: model.RoleUser, Content: admissionContent(candidate)}})
-		if err != nil {
-			t.Fatalf("serialize: %v", err)
-		}
-		cost := estimateTokens(sized[0], nil)
-		if cost > budget {
-			t.Fatalf("no message size lands in the %d-token window between the first piece's remaining budget and the whole piece budget", costAlpha)
-		}
-		if cost > budget-costAlpha {
-			big, costBig = candidate, cost
-			break
-		}
-	}
-	gamma := strings.Repeat(unit, 14)
-	gammaLines, err := serializeCompactionMessages([]model.Message{{Role: model.RoleUser, Content: admissionContent(gamma)}})
-	if err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	costGamma := estimateTokens(gammaLines[0], nil)
-	if costAlpha+costBig <= budget {
-		t.Fatalf("fixture precondition: the middle message would fit the first piece's remaining budget")
-	}
-	if costBig > budget {
-		t.Fatalf("fixture precondition: the middle message exceeds a whole empty piece's budget")
-	}
-	if budget2 := compactionPieceBudget(capture.Compact, "S1"); costBig+costGamma <= budget2 {
-		t.Fatalf("fixture precondition: the third message would fit the middle piece's remaining budget")
-	}
 	snapshot := []model.Message{
-		{Role: model.RoleUser, Content: admissionContent(alpha)},
-		{Role: model.RoleUser, Content: admissionContent(big)},
-		{Role: model.RoleUser, Content: admissionContent(gamma)},
+		{Role: model.RoleUser, Content: admissionContent(strings.Repeat(unit, 70))},
+		{Role: model.RoleUser, Content: admissionContent(strings.Repeat(unit, 70))},
+		{Role: model.RoleUser, Content: admissionContent(strings.Repeat(unit, 70))},
 	}
 	lines, err := serializeCompactionMessages(snapshot)
-	if err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-
+	testassert.NoError(t, err)
 	var requests []model.Request
-	usages := []model.Usage{{InputTokens: 1, OutputTokens: 2}, {InputTokens: 3, CachedInputTokens: 1, OutputTokens: 4}, {InputTokens: 5, CachedInputTokens: 2, OutputTokens: 6}}
-	call := 0
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
 		requests = append(requests, req)
-		call++
-		if call <= len(usages) {
-			return summaryStream(fmt.Sprintf("S%d", call), usages[call-1]), nil
-		}
-		return summaryStream("S9", model.Usage{}), nil
+		return summaryStream("S1", model.Usage{InputTokens: 5, OutputTokens: 3}), nil
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
-	if err != nil {
-		t.Fatalf("runCompaction: %v", err)
-	}
-	if summary != "S3" {
-		t.Fatalf("summary %q, want the final piece output", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 9, CachedInputTokens: 3, OutputTokens: 12}) {
-		t.Fatalf("usage = %+v, want the field-wise sum across the three pieces", usage)
-	}
-	if len(requests) != 3 {
-		t.Fatalf("compact transport calls = %d, want three pieces", len(requests))
-	}
-	wantUserText := []string{
-		lines[0],
-		"Previous summary:\nS1\n\nContinuation:\n" + lines[1],
-		"Previous summary:\nS2\n\nContinuation:\n" + lines[2],
-	}
-	for i, req := range requests {
-		if len(req.Messages) != 2 {
-			t.Fatalf("request %d messages = %d, want exactly two", i, len(req.Messages))
-		}
-		if got := req.Messages[1].TextContent(); got != wantUserText[i] {
-			t.Fatalf("request %d user text %q, want %q", i, got, wantUserText[i])
-		}
+	testassert.NoError(t, err)
+	testassert.Equal(t, summary, "S1")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 5, OutputTokens: 3}), "usage = %+v, want the one request's reported counts", usage)
+	testassert.Equal(t, len(requests), 1)
+	{
+		got := requests[0].Messages[1].TextContent()
+		testassert.Equal(t, got, strings.Join(lines, "\n"))
 	}
 }
 
 // TestCompactModelEffectSettlements proves the effect contract: attempts run
-// through the compact transport under the retry policy, a piece failure
-// settles the terminal with the accumulated usage keyed by the compact model
-// and carries the errored assembly on the failure row, an interrupted effect
-// settles through the existing terminal path with no output before any
-// assembly, and a textless completed output settles ready with its output —
-// the orchestration validates the summary text after the settlement. The
-// ready settlement's durable shape is pinned by the one-budget orchestration
-// test.
+// through the compact transport under the retry policy, a failed summary that
+// reports usage settles the terminal with that reported usage keyed by the
+// compact model and carries the errored assembly on the failure row, an
+// interrupted effect settles through the existing terminal path with no output
+// before any assembly, and a textless completed output settles ready with its
+// output — the orchestration validates the summary text after the settlement.
+// The ready settlement's durable shape is pinned by the ready-path
+// orchestration test.
 func TestCompactModelEffectSettlements(t *testing.T) {
 	compactRef := testCompactCapture().Model
 
@@ -317,77 +209,52 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			if calls == 1 {
 				return nil, &net.OpError{Op: "dial", Err: errors.New("boom")}
 			}
-			return summaryStream("piece summary", model.Usage{}), nil
+			return summaryStream("summary one", model.Usage{}), nil
 		}
 		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: spy.retry, NormalizeTool: objectNormalize}
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &usageAccumulator{})
-		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("piece")}}})
-		if err != nil {
-			t.Fatalf("request: %v", err)
-		}
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
-		if err != nil {
-			t.Fatalf("compact model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoReady {
-			t.Fatalf("settlement disposition %q, want ready", set.Disposition)
-		}
-		if calls != 2 {
-			t.Fatalf("compact transport calls = %d, want the retried attempt pair", calls)
-		}
-		if len(spy.attempts) != 1 || spy.attempts[0] != 1 || len(spy.seen) != 1 {
-			t.Fatalf("retry consultations = %v seen %v, want the one failed attempt classified by the policy", spy.attempts, spy.seen)
-		}
-		if _, ok := spy.seen[0].(*net.OpError); !ok {
-			t.Fatalf("classified failure %v, want the first attempt's transport error", spy.seen[0])
+		var reported *UsageCount
+		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
+		testassert.NoError(t, err)
+		set, err := invokeModelEffect(t, me, req, nil)
+		testassert.NoError(t, err)
+		testassert.Equal(t, set.Disposition, agent.DispoReady)
+		testassert.Equal(t, calls, 2)
+		testassert.Require(t, len(spy.attempts) == 1 && spy.attempts[0] == 1 && len(spy.seen) == 1, "retry consultations = %v seen %v, want the one failed attempt classified by the policy", spy.attempts, spy.seen)
+		{
+			_, ok := spy.seen[0].(*net.OpError)
+			testassert.Require(t, ok, "classified failure %v, want the first attempt's transport error", spy.seen[0])
 		}
 	})
 
-	t.Run("piece failure settles the accumulated usage", func(t *testing.T) {
+	t.Run("failed summary settles the reported usage", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
-			return failStream(errors.New("provider failure")), nil
+			// The failing response reports usage before the read failure:
+			// the errored assembly retains it.
+			return failStream(errors.New("provider failure"),
+				turnDelta("", "partial"), usageDelta(model.Usage{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5})), nil
 		}
 		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: (&retrySpy{limit: 0}).retry, NormalizeTool: objectNormalize}
-		accum := &usageAccumulator{}
-		if err := accum.add(UsageCount{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5}); err != nil {
-			t.Fatalf("seed accumulator: %v", err)
-		}
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), accum)
-		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("piece")}}})
-		if err != nil {
-			t.Fatalf("request: %v", err)
-		}
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
-		if err != nil {
-			t.Fatalf("compact model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoFailure || set.Detail == "" || !strings.Contains(set.Detail, "provider failure") {
-			t.Fatalf("settlement = %+v, want failure carrying the piece failure detail", set)
-		}
-		if set.Output == nil || set.Output.Status != model.OutputErrored {
-			t.Fatalf("settlement output = %+v, want the errored assembly carried on the failure row", set.Output)
-		}
+		var reported *UsageCount
+		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
+		testassert.NoError(t, err)
+		set, err := invokeModelEffect(t, me, req, nil)
+		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "" && strings.Contains(set.Detail, "provider failure") && (set.Output != nil && set.Output.Status == model.OutputErrored), "settlement = %+v, want the failure carrying the summary failure detail; settlement output = %+v, want the errored assembly carried on the failure row", set, set.Output)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-settlement graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		settlement := settlementEntryOf(t, graph)
-		if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "provider failure") {
-			t.Fatalf("settlement entry = %+v, want the failure terminal", settlement)
-		}
-		if settlement.Model == nil || *settlement.Model != compactRef {
-			t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-		}
-		if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5}) {
-			t.Fatalf("settlement usage = %+v, want the accumulated total", settlement.Usage)
-		}
-		if len(graph.Session.State.Usage.ByModel) != 1 || graph.Session.State.Usage.ByModel[0].Model != compactRef {
-			t.Fatalf("session usage = %+v, want the accumulated total keyed by the compact model", graph.Session.State.Usage)
+		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "provider failure"), "settlement entry = %+v, want the failure terminal", settlement)
+		testassert.Require(t, settlement.Model != nil && *settlement.Model == compactRef, "settlement model = %+v, want the compact model identity", settlement.Model)
+		testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+		testassert.Require(t, len(graph.Session.State.Usage.ByModel) == 1 && graph.Session.State.Usage.ByModel[0].Model == compactRef, "session usage = %+v, want the reported total keyed by the compact model", graph.Session.State.Usage)
+		view, err := h.ReadSessionView(context.Background(), sessionID)
+		testassert.NoError(t, err)
+		{
+			measured := view.History.LatestContextUsage()
+			testassert.Require(t, measured == nil, "latest context measurement = %+v, want the marked summary usage billed but ineligible", measured)
 		}
 	})
 
@@ -398,42 +265,26 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return nil, errors.New("unreachable")
 		}
 		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &usageAccumulator{})
-		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("piece")}}})
-		if err != nil {
-			t.Fatalf("request: %v", err)
-		}
+		var reported *UsageCount
+		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
+		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		set, err := me(ctx, req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
-		if err != nil {
-			t.Fatalf("compact model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoInterruption || set.Detail != executionInterruptedDetail {
-			t.Fatalf("settlement = %+v, want the fixed interruption settlement", set)
-		}
-		if set.Output != nil {
-			t.Fatalf("settlement output = %+v, want none on the pre-assembly cancellation", set.Output)
-		}
+		set, err := invokeModelEffectCtx(t, me, ctx, req, nil)
+		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail && set.Output == nil, "settlement = %+v, want the fixed interruption settlement; settlement output = %+v, want none on the pre-assembly cancellation", set, set.Output)
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-settlement graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		settlement := settlementEntryOf(t, graph)
-		if settlement.Status != OperationInterruption || settlement.Detail != executionInterruptedDetail {
-			t.Fatalf("settlement entry = %+v, want the interruption terminal", settlement)
-		}
+		testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail && settlement.CompactionUsage, "settlement entry = %+v, want the interruption terminal; settlement compaction_usage = false, want the compact effect's interruption provenance marked", settlement)
 		var signals int
 		for i := range graph.Entries {
 			if graph.Entries[i].Signal != nil {
 				signals++
 			}
 		}
-		if signals != 1 {
-			t.Fatalf("interruption signal entries = %d, want exactly one", signals)
-		}
+		testassert.Equal(t, signals, 1)
 	})
 
 	t.Run("refusal-only completed output settles ready with the carried output", func(t *testing.T) {
@@ -447,119 +298,59 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 		}
 		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: spy.retry, NormalizeTool: objectNormalize}
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &usageAccumulator{})
-		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("piece")}}})
-		if err != nil {
-			t.Fatalf("request: %v", err)
-		}
-		set, err := me(context.Background(), req, func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-			return agent.Assemble(context.Background(), source, stream)
-		})
-		if err != nil {
-			t.Fatalf("compact model effect: %v", err)
-		}
-		if set.Disposition != agent.DispoReady || set.Output == nil || set.Output.Status != model.OutputCompleted {
-			t.Fatalf("settlement = %+v, want the ready settlement carrying the completed output", set)
-		}
-		if calls != 1 {
-			t.Fatalf("compact transport calls = %d, want exactly one attempt and no retry", calls)
-		}
+		var reported *UsageCount
+		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
+		testassert.NoError(t, err)
+		set, err := invokeModelEffect(t, me, req, nil)
+		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoReady && set.Output != nil && set.Output.Status == model.OutputCompleted, "settlement = %+v, want the ready settlement carrying the completed output", set)
+		testassert.Equal(t, calls, 1)
 	})
 }
 
-// compactTwoPieceSnapshot returns a two-message snapshot whose second message
-// fits a fresh empty piece but exceeds the first piece's remaining budget,
-// so the orchestration runs two pieces.
-func compactTwoPieceSnapshot(t *testing.T) []model.Message {
-	t.Helper()
-	capture := testCapture()
-	budget := compactionPieceBudget(capture.Compact, "")
-	unit := "summarize the whole conversation turn carefully "
-	first := strings.Repeat(unit, 12)
-	firstLines, err := serializeCompactionMessages([]model.Message{{Role: model.RoleUser, Content: admissionContent(first)}})
-	if err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	costFirst := estimateTokens(firstLines[0], nil)
-	second := ""
-	for n := 1; ; n++ {
-		candidate := strings.Repeat(unit, n)
-		sized, err := serializeCompactionMessages([]model.Message{{Role: model.RoleUser, Content: admissionContent(candidate)}})
-		if err != nil {
-			t.Fatalf("serialize: %v", err)
-		}
-		cost := estimateTokens(sized[0], nil)
-		if cost > budget {
-			t.Fatalf("no message size lands in the %d-token window between the first piece's remaining budget and the whole piece budget", costFirst)
-		}
-		if cost > budget-costFirst {
-			second = candidate
-			break
-		}
-	}
-	return []model.Message{
-		{Role: model.RoleUser, Content: admissionContent(first)},
-		{Role: model.RoleUser, Content: admissionContent(second)},
-	}
-}
-
 // TestRunCompactionCanceledBeforeRunSettlesInterruption proves the pre-run
-// window: an execution context already canceled before the first piece makes
-// the run return interruption with no effect ever begun, and the
+// window: an execution context already canceled before the compact request
+// makes the run return interruption with no effect ever begun, and the
 // orchestration settles the quiet running Operation as interruption with no
 // usage and no compaction entry.
 func TestRunCompactionCanceledBeforeRunSettlesInterruption(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
-		t.Errorf("no piece may run under a canceled execution context")
+		t.Errorf("no request may run under a canceled execution context")
 		return nil, errors.New("unreachable")
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	summary, usage, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages())
-	if err == nil || err.Error() != executionInterruptedDetail {
-		t.Fatalf("error %v, want the run's interruption detail", err)
-	}
-	if summary != "" || usage != nil {
-		t.Fatalf("summary %q usage %+v, want no summary and no usage", summary, usage)
-	}
+	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
+	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-settlement graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationInterruption || settlement.Detail != executionInterruptedDetail {
-		t.Fatalf("settlement entry = %+v, want the run's interruption terminal", settlement)
-	}
-	if settlement.Model != nil || settlement.Usage != nil {
-		t.Fatalf("settlement entry = %+v, want no usage on the never-run compaction", settlement)
-	}
+	testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail && (settlement.Model == nil && settlement.Usage == nil) && settlement.CompactionUsage, "settlement entry = %+v, want the run's interruption terminal; settlement entry = %+v, want no usage on the never-run compaction; settlement compaction_usage = false, want the direct interruption settlement marked", settlement, settlement)
 	var signals int
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on a failure path")
-		}
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 		if graph.Entries[i].Signal != nil {
 			signals++
 		}
 	}
-	if signals != 1 {
-		t.Fatalf("interruption signal entries = %d, want exactly one", signals)
-	}
+	testassert.Equal(t, signals, 1)
 }
 
-// TestRunCompactionCanceledBetweenPiecesSettlesInterruption proves the
-// between-pieces window: a two-piece snapshot whose first piece completes and
-// settles ready durably, with cancellation observed before the run's success
-// return — the run returns interruption, and the orchestration settles the
-// quiet running Operation as interruption carrying the first piece's
-// accumulated usage keyed by the compact model. A cancellation landing
-// between the runs instead returns the same terminal at the second run's loop
-// top and takes the same direct settlement.
-func TestRunCompactionCanceledBetweenPiecesSettlesInterruption(t *testing.T) {
+// TestRunCompactionCanceledAfterSummarySettlesInterruption proves the
+// post-result window: the single summary request completes and its ready
+// settlement lands durably, with cancellation observed before the run's
+// success return — the run returns interruption, and the orchestration settles
+// the quiet running Operation as interruption carrying the summary's reported
+// usage keyed by the compact model, with the marker provenance. A
+// cancellation landing inside the run's loop instead returns the same terminal
+// and takes the same direct settlement.
+func TestRunCompactionCanceledAfterSummarySettlesInterruption(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	snapshot := compactTwoPieceSnapshot(t)
+	snapshot := compactSnapshotMessages()
 	ctx, cancel := context.WithCancel(context.Background())
 	requests := 0
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
@@ -568,36 +359,18 @@ func TestRunCompactionCanceledBetweenPiecesSettlesInterruption(t *testing.T) {
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 	summary, usage, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot)
-	if err == nil || err.Error() != executionInterruptedDetail {
-		t.Fatalf("error %v, want the run's interruption detail", err)
-	}
-	if summary != "" {
-		t.Fatalf("summary %q, want none on the interrupted orchestration", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 4, OutputTokens: 2}) {
-		t.Fatalf("usage = %+v, want the first piece's reported counts", usage)
-	}
-	if requests != 1 {
-		t.Fatalf("compact transport calls = %d, want only the first piece", requests)
-	}
+	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
+	testassert.Equal(t, summary, "")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 4, OutputTokens: 2}), "usage = %+v, want the summary's reported counts", usage)
+	testassert.Equal(t, requests, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-settlement graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationInterruption || settlement.Detail != executionInterruptedDetail {
-		t.Fatalf("settlement entry = %+v, want the run's interruption terminal", settlement)
-	}
-	if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
-		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-	}
-	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 4, OutputTokens: 2}) {
-		t.Fatalf("settlement usage = %+v, want the first piece's accumulated counts", settlement.Usage)
-	}
+	testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail, "settlement entry = %+v, want the run's interruption terminal", settlement)
+	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
+	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 4, OutputTokens: 2}) && settlement.CompactionUsage, "settlement usage = %+v, want the summary's reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on a failure path")
-		}
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
 }
 
@@ -627,118 +400,73 @@ func TestSerializeCompactionMessagesCompleteInput(t *testing.T) {
 	owned := make([]model.Message, 0, len(input))
 	for _, m := range input {
 		msg, err := model.NewMessage(m)
-		if err != nil {
-			t.Fatalf("fixture message: %v", err)
-		}
+		testassert.NoError(t, err)
 		owned = append(owned, msg)
 	}
 	snapshot := append([]model.Message(nil), owned...)
 
 	lines, err := serializeCompactionMessages(snapshot)
-	if err != nil {
-		t.Fatalf("serializeCompactionMessages: %v", err)
-	}
-	if len(lines) != len(snapshot) {
-		t.Fatalf("lines = %d, want one per message", len(lines))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(lines), len(snapshot))
 	decoded := make([]map[string]any, 0, len(lines))
 	for i, line := range lines {
-		if !json.Valid([]byte(line)) {
-			t.Fatalf("line %d is not valid JSON: %q", i, line)
-		}
+		testassert.Require(t, json.Valid([]byte(line)), "line %d is not valid JSON: %q", i, line)
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			t.Fatalf("line %d unmarshal: %v", i, err)
+		{
+			err := json.Unmarshal([]byte(line), &obj)
+			testassert.Require(t, err == nil, "line %d unmarshal: %v", i, err)
 		}
 		decoded = append(decoded, obj)
-		if strings.Contains(line, testModelRef().Provider) {
-			t.Fatalf("line %d carries model-source replay metadata: %q", i, line)
-		}
+		testassert.Require(t, !strings.Contains(line, testModelRef().Provider), "line %d carries model-source replay metadata: %q", i, line)
 	}
 
 	// The signal's wrapped text, the parts, refusal, extras and identities
 	// survive verbatim.
 	first := decoded[0]
-	if first["Role"] != "user" {
-		t.Fatalf("first line role = %v, want user", first["Role"])
-	}
+	testassert.Equal(t, first["Role"], "user")
 	signalParts, ok := first["Content"].([]any)
-	if !ok || len(signalParts) != 1 {
-		t.Fatalf("first line content = %v, want one part", first["Content"])
-	}
+	testassert.Require(t, ok && len(signalParts) == 1, "first line content = %v, want one part", first["Content"])
 	signalPart, _ := signalParts[0].(map[string]any)
-	if signalPart["Text"] != "<system-signal>hello &amp; <b>quoted</b></system-signal>" {
-		t.Fatalf("signal wrapper text lost: %v", signalPart["Text"])
-	}
+	testassert.Equal(t, signalPart["Text"], "<system-signal>hello &amp; <b>quoted</b></system-signal>")
 	second := decoded[1]
-	if second["Role"] != "assistant" || second["Refusal"] != "partly refused" {
-		t.Fatalf("assistant line = %v, want role and refusal preserved", second)
-	}
-	if second["Source"] != "" {
-		t.Fatalf("assistant line source = %v, want the cleared source identity", second["Source"])
-	}
-	if !strings.Contains(lines[1], `"OpaqueWireType":"reasoning"`) || !strings.Contains(lines[1], `"summary":"hidden"`) {
-		t.Fatalf("opaque part lost: %q", lines[1])
-	}
-	if !strings.Contains(lines[1], `"URL":"https://example.com/img.png"`) {
-		t.Fatalf("image part lost: %q", lines[1])
-	}
-	if !strings.Contains(lines[1], `"finish":"stop"`) {
-		t.Fatalf("message extra lost: %q", lines[1])
-	}
+	testassert.Require(t, second["Role"] == "assistant" && second["Refusal"] == "partly refused" && second["Source"] == "", "assistant line = %v, want role and refusal preserved; got %v, want %v", second, second["Source"], "")
+	testassert.Require(t, strings.Contains(lines[1], `"OpaqueWireType":"reasoning"`) && strings.Contains(lines[1], `"summary":"hidden"`), "opaque part lost: %q", lines[1])
+	testassert.Require(t, strings.Contains(lines[1], `"URL":"https://example.com/img.png"`), "image part lost: %q", lines[1])
+	testassert.Require(t, strings.Contains(lines[1], `"finish":"stop"`), "message extra lost: %q", lines[1])
 	calls, ok := second["ToolCalls"].([]any)
-	if !ok || len(calls) != 2 {
-		t.Fatalf("tool calls = %v, want both preserved", second["ToolCalls"])
-	}
+	testassert.Require(t, ok && len(calls) == 2, "tool calls = %v, want both preserved", second["ToolCalls"])
 	firstCall, _ := calls[0].(map[string]any)
-	if firstCall["ID"] != "call-1" || firstCall["Name"] != "echo" {
-		t.Fatalf("first call = %v, want identity preserved", firstCall)
-	}
-	if !strings.Contains(lines[1], `"kind":"custom"`) {
-		t.Fatalf("tool-call extra lost: %q", lines[1])
-	}
+	testassert.Require(t, firstCall["ID"] == "call-1" && firstCall["Name"] == "echo", "first call = %v, want identity preserved", firstCall)
+	testassert.Require(t, strings.Contains(lines[1], `"kind":"custom"`), "tool-call extra lost: %q", lines[1])
 	// Tool-call arguments ride the JSON encoding of their quoted byte
 	// representation, keeping even malformed bytes marshalable and recoverable.
 	for _, idx := range []int{0, 1} {
 		call, _ := calls[idx].(map[string]any)
 		raw, err := json.Marshal(call["Arguments"])
-		if err != nil {
-			t.Fatalf("call %d arguments marshal: %v", idx, err)
-		}
+		testassert.Require(t, err == nil, "call %d arguments marshal: %v", idx, err)
 		var quoted string
-		if err := json.Unmarshal(raw, &quoted); err != nil {
-			t.Fatalf("call %d arguments is not a JSON string: %v", idx, err)
+		{
+			err := json.Unmarshal(raw, &quoted)
+			testassert.Require(t, err == nil, "call %d arguments is not a JSON string: %v", idx, err)
 		}
 		recovered, err := strconv.Unquote(quoted)
-		if err != nil {
-			t.Fatalf("call %d quoted arguments do not unquote: %v", idx, err)
-		}
+		testassert.Require(t, err == nil, "call %d quoted arguments do not unquote: %v", idx, err)
 		want := `{"x":1}`
 		if idx == 1 {
 			want = `{"x":1`
 		}
-		if recovered != want {
-			t.Fatalf("call %d recovered arguments %q, want the original raw bytes %q", idx, recovered, want)
-		}
+		testassert.Require(t, recovered == want, "call %d recovered arguments %q, want the original raw bytes %q", idx, recovered, want)
 	}
 	third := decoded[2]
-	if third["Role"] != "tool" || third["ToolCallID"] != "call-1" {
-		t.Fatalf("tool line = %v, want the tool-result identity preserved", third)
-	}
-	if !strings.Contains(lines[2], "result body") {
-		t.Fatalf("tool result content lost: %q", lines[2])
-	}
+	testassert.Require(t, third["Role"] == "tool" && third["ToolCallID"] == "call-1", "tool line = %v, want the tool-result identity preserved", third)
+	testassert.Require(t, strings.Contains(lines[2], "result body"), "tool result content lost: %q", lines[2])
 
 	// The source messages are unchanged, including Source, the ToolCalls
 	// slice and the raw argument bytes.
 	for i := range owned {
-		if !reflect.DeepEqual(owned[i], snapshot[i]) {
-			t.Fatalf("message %d changed through serialization:\nbefore %+v\nafter  %+v", i, owned[i], snapshot[i])
-		}
+		testassert.Require(t, reflect.DeepEqual(owned[i], snapshot[i]), "message %d changed through serialization:\nbefore %+v\nafter  %+v", i, owned[i], snapshot[i])
 		for j, call := range owned[i].ToolCalls {
-			if string(call.Arguments) != string(snapshot[i].ToolCalls[j].Arguments) {
-				t.Fatalf("message %d call %d argument bytes changed", i, j)
-			}
+			testassert.Require(t, string(call.Arguments) == string(snapshot[i].ToolCalls[j].Arguments), "message %d call %d argument bytes changed", i, j)
 		}
 	}
 }
@@ -765,18 +493,15 @@ func compactedFixtureGraph(postBoundary ...testEntry) *testGraph {
 func projectedSnapshot(t *testing.T, h *Harness, c *coordinator) []model.Message {
 	t.Helper()
 	msgs, err := h.projectContext(c, testOpID)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
-	if len(msgs) == 0 || msgs[0].Role != model.RoleSystem {
-		t.Fatalf("projection = %+v, want a leading system message", msgs)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(msgs) != 0 && msgs[0].Role == model.RoleSystem, "projection = %+v, want a leading system message", msgs)
 	return msgs[1:]
 }
 
 // TestRunCompactionExistingSummaryAndNewMessages proves the register-named
 // summary message is part of the frozen snapshot together with the entries
-// after the boundary, and the system prompt stays outside the input.
+// after the boundary as ordinary projected input, and the system prompt stays
+// outside the input.
 func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 	input4, settlement4, op4 := projectionFollowUp(hexID(4), "op-2", "after the boundary", hexID(5), 4, 5)
 	fixture := compactedFixtureGraph(input4, settlement4)
@@ -784,9 +509,7 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 	h := newTestHarness(t, fixture.storage(t), nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	snapshot := projectedSnapshot(t, h, c)
-	if len(snapshot) != 2 {
-		t.Fatalf("snapshot messages = %d, want the summary message and the post-boundary entry", len(snapshot))
-	}
+	testassert.Equal(t, len(snapshot), 2)
 
 	var requests []model.Request
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
@@ -795,28 +518,11 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 	summary, _, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
-	if err != nil {
-		t.Fatalf("runCompaction: %v", err)
-	}
-	if summary != "S1" {
-		t.Fatalf("summary %q, want the piece output", summary)
-	}
-	if len(requests) != 1 {
-		t.Fatalf("compact transport calls = %d, want one piece", len(requests))
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, summary, "S1")
+	testassert.Equal(t, len(requests), 1)
 	userText := requests[0].Messages[1].TextContent()
-	if strings.Contains(userText, "Previous summary:") {
-		t.Fatalf("the first piece carries a Previous summary block: %q", userText)
-	}
-	if !strings.Contains(userText, "Summary of the earlier conversation.") {
-		t.Fatalf("the serialized input lost the existing summary: %q", userText)
-	}
-	if !strings.Contains(userText, "after the boundary") {
-		t.Fatalf("the serialized input lost the post-boundary message: %q", userText)
-	}
-	if strings.Contains(userText, `"system"`) {
-		t.Fatalf("the system prompt entered the serialized conversation: %q", userText)
-	}
+	testassert.Require(t, !strings.Contains(userText, "Previous summary:") && strings.Contains(userText, "Summary of the earlier conversation.") && strings.Contains(userText, "after the boundary") && !strings.Contains(userText, `"system"`), "the request carries a Previous summary block: %q; the serialized input lost the existing summary: %q; the serialized input lost the post-boundary message: %q; the system prompt entered the serialized conversation: %q", userText, userText, userText, userText)
 }
 
 // TestRunCompactionSummaryOnlySessionSuppliesSummary proves a summary-only
@@ -826,9 +532,7 @@ func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 	h := newTestHarness(t, fixture.storage(t), nil)
 	c := leaseCoordinator(t, h, testSessionID)
 	snapshot := projectedSnapshot(t, h, c)
-	if len(snapshot) != 1 {
-		t.Fatalf("snapshot messages = %d, want only the summary message", len(snapshot))
-	}
+	testassert.Equal(t, len(snapshot), 1)
 
 	var requests []model.Request
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
@@ -836,19 +540,13 @@ func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 		return summaryStream("S1", model.Usage{}), nil
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	if _, _, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot); err != nil {
-		t.Fatalf("runCompaction: %v", err)
+	{
+		_, _, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+		testassert.NoError(t, err)
 	}
-	if len(requests) != 1 {
-		t.Fatalf("compact transport calls = %d, want one piece", len(requests))
-	}
+	testassert.Equal(t, len(requests), 1)
 	userText := requests[0].Messages[1].TextContent()
-	if !strings.Contains(userText, "Summary of the earlier conversation.") {
-		t.Fatalf("the summary-only input lost the summary: %q", userText)
-	}
-	if strings.Contains(userText, "Previous summary:") {
-		t.Fatalf("the first piece carries a Previous summary block: %q", userText)
-	}
+	testassert.Require(t, strings.Contains(userText, "Summary of the earlier conversation.") && !strings.Contains(userText, "Previous summary:"), "the summary-only input lost the summary: %q; the request carries a Previous summary block: %q", userText, userText)
 }
 
 // TestRunCompactionEmptySnapshotFailsNothingToCompact proves an empty
@@ -857,85 +555,55 @@ func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 func TestRunCompactionEmptySnapshotFailsNothingToCompact(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
-		t.Errorf("no piece may run for an empty snapshot")
+		t.Errorf("no request may run for an empty snapshot")
 		return nil, errors.New("unreachable")
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), nil)
-	if err == nil || err.Error() != "nothing to compact" {
-		t.Fatalf("error %v, want the retained nothing-to-compact failure", err)
-	}
-	if summary != "" || usage != nil {
-		t.Fatalf("summary %q usage %+v, want no summary and no usage", summary, usage)
-	}
+	testassert.Require(t, err != nil && err.Error() == "nothing to compact", "error %v, want the retained nothing-to-compact failure", err)
+	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-failure graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationFailure || settlement.Detail != "nothing to compact" {
-		t.Fatalf("settlement entry = %+v, want the nothing-to-compact failure terminal", settlement)
-	}
-	if settlement.Model != nil || settlement.Usage != nil {
-		t.Fatalf("settlement entry = %+v, want no usage on the never-run compaction", settlement)
-	}
+	testassert.Require(t, settlement.Status == OperationFailure && settlement.Detail == "nothing to compact" && (settlement.Model == nil && settlement.Usage == nil), "settlement entry = %+v, want the nothing-to-compact failure terminal; settlement entry = %+v, want no usage on the never-run compaction", settlement, settlement)
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on a failure path")
-		}
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
 }
 
-// TestRunCompactionErroredPieceCarriesOutputThroughTheRun proves the carried
-// output through a real agent.Run: an errored piece with a retained payload
+// TestRunCompactionErroredSummaryCarriesOutputThroughTheRun proves the carried
+// output through a real agent.Run: an errored summary with a retained payload
 // settles its terminal inside its own effect and the returned failure
 // settlement carries the errored output, satisfying the run's callback gate —
-// the run returns the piece's own failure detail, never a settlement-shape
+// the run returns the summary's own failure detail, never a settlement-shape
 // boundary violation about an outputless settlement.
-func TestRunCompactionErroredPieceCarriesOutputThroughTheRun(t *testing.T) {
+func TestRunCompactionErroredSummaryCarriesOutputThroughTheRun(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
 		return erroredTurnStream(), nil // text "partial" with usage, then the read failure
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: (&retrySpy{limit: 0}).retry, NormalizeTool: objectNormalize}
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
-	if err == nil || !strings.Contains(err.Error(), "provider failure") {
-		t.Fatalf("error %v, want the piece's own failure detail, not a settlement-shape boundary violation", err)
-	}
-	if summary != "" {
-		t.Fatalf("summary %q, want none on the failed piece", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 5, OutputTokens: 7}) {
-		t.Fatalf("usage = %+v, want the errored piece's reported counts", usage)
-	}
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "provider failure"), "error %v, want the summary's own failure detail, not a settlement-shape boundary violation", err)
+	testassert.Equal(t, summary, "")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 5, OutputTokens: 7}), "usage = %+v, want the errored summary's reported counts", usage)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-settlement graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "provider failure") {
-		t.Fatalf("settlement entry = %+v, want the failure terminal", settlement)
-	}
-	if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
-		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-	}
-	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 5, OutputTokens: 7}) {
-		t.Fatalf("settlement usage = %+v, want the accumulated counts", settlement.Usage)
-	}
+	testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "provider failure"), "settlement entry = %+v, want the failure terminal", settlement)
+	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
+	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 5, OutputTokens: 7}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on a failure path")
-		}
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
 }
 
-// TestRunCompactionEmptyPieceSummaryFailsWithTheRetainedDetail proves the
-// relocated textless-completed rule: the effect settles a textless completed
-// piece ready, and the orchestration fails the empty summary after the run —
-// the direct settlement carries the retained detail and the accumulated
-// usage, exactly one model call runs with no retry and no next piece, and no
-// compaction entry commits.
-func TestRunCompactionEmptyPieceSummaryFailsWithTheRetainedDetail(t *testing.T) {
+// TestRunCompactionEmptySummaryFailsWithTheRetainedDetail proves the
+// textless-completed rule: the effect settles a textless completed summary
+// ready, and the orchestration fails the empty summary after the run — the
+// direct settlement carries the retained detail and the reported usage,
+// exactly one model call runs with no retry, and no compaction entry commits.
+func TestRunCompactionEmptySummaryFailsWithTheRetainedDetail(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	refusal := turnDelta("stop", "")
 	refusal.RefusalFragment = "no"
@@ -946,57 +614,18 @@ func TestRunCompactionEmptyPieceSummaryFailsWithTheRetainedDetail(t *testing.T) 
 	}
 	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
 	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
-	if err == nil || err.Error() != "compaction summary is empty" {
-		t.Fatalf("error %v, want the retained empty-summary detail", err)
-	}
-	if summary != "" {
-		t.Fatalf("summary %q, want none on the failed piece", summary)
-	}
-	if usage == nil || *usage != (UsageCount{InputTokens: 2, OutputTokens: 1}) {
-		t.Fatalf("usage = %+v, want the piece's reported counts", usage)
-	}
-	if calls != 1 {
-		t.Fatalf("compact transport calls = %d, want exactly one with no retry and no next piece", calls)
-	}
+	testassert.Require(t, err != nil && err.Error() == "compaction summary is empty", "error %v, want the retained empty-summary detail", err)
+	testassert.Equal(t, summary, "")
+	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 2, OutputTokens: 1}), "usage = %+v, want the summary's reported counts", usage)
+	testassert.Equal(t, calls, 1)
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-failure graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationFailure || settlement.Detail != "compaction summary is empty" {
-		t.Fatalf("settlement entry = %+v, want the empty-summary failure terminal", settlement)
-	}
-	if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
-		t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-	}
-	if settlement.Usage == nil || *settlement.Usage != (UsageCount{InputTokens: 2, OutputTokens: 1}) {
-		t.Fatalf("settlement usage = %+v, want the accumulated counts", settlement.Usage)
-	}
+	testassert.Require(t, settlement.Status == OperationFailure && settlement.Detail == "compaction summary is empty", "settlement entry = %+v, want the empty-summary failure terminal", settlement)
+	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
+	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 2, OutputTokens: 1}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
 	for i := range graph.Entries {
-		if graph.Entries[i].Compaction != nil {
-			t.Fatalf("compaction entry committed on a failure path")
-		}
-	}
-}
-
-// TestCompactionPieceBudgetArithmetic pins the budget arithmetic: the fixed
-// 64-token wrapper overhead and the previous-summary subtraction in its
-// message form.
-func TestCompactionPieceBudgetArithmetic(t *testing.T) {
-	capture := testCompactCapture()
-	base := capture.ContextWindow - capture.OutputReserve - estimateTokens(capture.SystemPrompt, nil) - 64
-	if got := compactionPieceBudget(capture, ""); got != base {
-		t.Fatalf("empty-previous budget = %d, want %d", got, base)
-	}
-	previous := "a previous summary of some length"
-	messageForm := estimateTokens("", []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: previous}}}})
-	if got := compactionPieceBudget(capture, previous); got != base-messageForm {
-		t.Fatalf("previous-summary budget = %d, want %d", got, base-messageForm)
-	}
-	// The subtraction uses the message form, not the plain-text form: the
-	// estimator's per-message overhead is part of it.
-	if messageForm != estimateTokens(previous, nil)+4 {
-		t.Fatalf("message-form estimate %d, want the plain-text estimate plus the per-message overhead", messageForm)
+		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
 }
 
@@ -1016,8 +645,9 @@ func TestCompactionBoundaryRows(t *testing.T) {
 
 	t.Run("every projectable kind derives the covered last message", func(t *testing.T) {
 		for _, covered := range []graphEntry{input, assistant, toolResult, signal} {
-			if got := compactionBoundary([]graphEntry{covered}, "", 1); got != covered.Envelope.ID {
-				t.Fatalf("boundary over the %s row = %q, want the covered entry %q", covered.Envelope.Kind, got, covered.Envelope.ID)
+			{
+				got := compactionBoundary([]graphEntry{covered}, "", 1)
+				testassert.Require(t, got == covered.Envelope.ID, "boundary over the %s row = %q, want the covered entry %q", covered.Envelope.Kind, got, covered.Envelope.ID)
 			}
 		}
 	})
@@ -1027,17 +657,31 @@ func TestCompactionBoundaryRows(t *testing.T) {
 		// The frozen snapshot carried the prior summary and the raced
 		// signal: the boundary is the first entry after the target's
 		// sequence, not the first after the named entry's own.
-		if got := compactionBoundary([]graphEntry{input, assistant, signal, compaction}, compaction.Envelope.ID, 2); got != signal.Envelope.ID {
-			t.Fatalf("boundary = %q, want the raced signal %q counted after the boundary target", got, signal.Envelope.ID)
+		{
+			got := compactionBoundary([]graphEntry{input, assistant, signal, compaction}, compaction.Envelope.ID, 2)
+			testassert.Equal(t, got, signal.Envelope.ID)
 		}
 	})
 
 	t.Run("the summary-only re-compaction names the prior compaction entry", func(t *testing.T) {
 		compaction := graphEntry{Envelope: Entry{ID: "co-1", Sequence: 3}, Compaction: &compactionEntry{BoundaryEntryID: assistant.Envelope.ID}}
-		if got := compactionBoundary([]graphEntry{input, assistant, compaction}, compaction.Envelope.ID, 1); got != compaction.Envelope.ID {
-			t.Fatalf("boundary = %q, want the named compaction entry itself", got)
+		{
+			got := compactionBoundary([]graphEntry{input, assistant, compaction}, compaction.Envelope.ID, 1)
+			testassert.Equal(t, got, compaction.Envelope.ID)
 		}
 	})
+}
+
+// UsageByModelForTest returns the totals' pieces keyed by ref: the shared
+// usage-by-model selection; each caller keeps its own expected counts.
+func UsageByModelForTest(totals UsageTotals, ref model.ModelRef) UsageTotals {
+	var out UsageTotals
+	for _, mu := range totals.ByModel {
+		if mu.Model == ref {
+			out.ByModel = append(out.ByModel, mu)
+		}
+	}
+	return out
 }
 
 // compactedEntryOf returns the one compaction entry of the validated graph.
@@ -1046,15 +690,11 @@ func compactedEntryOf(t *testing.T, graph *sessionGraph) *compactionEntry {
 	var found *compactionEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Compaction != nil {
-			if found != nil {
-				t.Fatalf("graph carries more than one compaction entry")
-			}
+			testassert.Require(t, found == nil, "graph carries more than one compaction entry")
 			found = graph.Entries[i].Compaction
 		}
 	}
-	if found == nil {
-		t.Fatalf("graph carries no compaction entry")
-	}
+	testassert.Require(t, found != nil, "graph carries no compaction entry")
 	return found
 }
 
@@ -1086,80 +726,54 @@ func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
 	usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
 	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
 	// admitted input message.
-	if err := h.commitCompaction(c, testOpID, testCapture(), "summary one", 1, usage, false); err != nil {
-		t.Fatalf("commitCompaction: %v", err)
+	{
+		err := h.commitCompaction(c, testOpID, testCapture(), "summary one", 1, usage, false)
+		testassert.NoError(t, err)
 	}
 
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-commit graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.OperationID != testOpID || comp.Summary != "summary one" {
-		t.Fatalf("compaction entry = %+v, want the Operation-owned committed summary", comp)
-	}
-	if comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
-		t.Fatalf("boundary %q, want the last projectable entry %q", comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
-	}
-	if comp.Model != testCompactCapture().Model || comp.ConfigurationRevision != "rev-1" {
-		t.Fatalf("compaction entry identity = %+v rev %q, want the compact model and the capture's revision", comp.Model, comp.ConfigurationRevision)
-	}
-	if comp.Usage == nil || *comp.Usage != *usage {
-		t.Fatalf("compaction entry usage = %+v, want the orchestration's accumulated total", comp.Usage)
-	}
-	if graph.Session.State.CompactionEntryID != comp.EntryID {
-		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
-	}
+	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
+	testassert.Equal(t, comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
+	testassert.Require(t, comp.Model == testCompactCapture().Model && comp.ConfigurationRevision == "rev-1", "compaction entry identity = %+v rev %q, want the compact model and the capture's revision", comp.Model, comp.ConfigurationRevision)
+	testassert.Require(t, comp.Usage != nil && *comp.Usage == *usage, "compaction entry usage = %+v, want the orchestration's reported total", comp.Usage)
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
 
 	// The Operation continues: running, current, quiet, with no settlement.
-	if graph.Session.State.CurrentOperationID != testOpID {
-		t.Fatalf("current Operation %q, want the continuing %q", graph.Session.State.CurrentOperationID, testOpID)
-	}
+	testassert.Equal(t, graph.Session.State.CurrentOperationID, testOpID)
 	state := operationStateOf(t, graph, testOpID)
-	if state.Status != OperationRunning || state.ActiveEffect != nil {
-		t.Fatalf("operation state = %+v, want running and quiet", state)
-	}
+	testassert.Require(t, state.Status == OperationRunning && state.ActiveEffect == nil, "operation state = %+v, want running and quiet", state)
 	for i := range graph.Entries {
-		if graph.Entries[i].Settlement != nil {
-			t.Fatalf("settlement entry committed on the automatic path")
-		}
+		testassert.Require(t, graph.Entries[i].Settlement == nil, "settlement entry committed on the automatic path")
 	}
 
-	// Both register totals carry the accumulated usage keyed by the compact
+	// Both register totals carry the reported usage keyed by the compact
 	// model.
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: *usage}}}
-	if !usageTotalsEqual(state.Usage, want) {
-		t.Fatalf("operation usage = %+v, want %+v", state.Usage, want)
-	}
-	if !usageTotalsEqual(graph.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", graph.Session.State.Usage, want)
-	}
+	testassert.Require(t, usageTotalsEqual(state.Usage, want), "operation usage = %+v, want %+v", state.Usage, want)
+	testassert.Require(t, usageTotalsEqual(graph.Session.State.Usage, want), "session usage = %+v, want %+v", graph.Session.State.Usage, want)
 
 	// One transaction: one new entry, each register advanced once.
 	afterEntries, _ := storedSessionState(store, sessionID)
-	if len(afterEntries) != len(beforeEntries)+1 {
-		t.Fatalf("entry count %d, want %d (exactly the compaction entry)", len(afterEntries), len(beforeEntries)+1)
+	testassert.Equal(t, len(afterEntries), len(beforeEntries)+1)
+	{
+		got := registerRevision(t, store, sessionID, opKey)
+		testassert.Equal(t, got, opRevision+1)
 	}
-	if got := registerRevision(t, store, sessionID, opKey); got != opRevision+1 {
-		t.Fatalf("operation register revision %d, want %d", got, opRevision+1)
-	}
-	if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision+1 {
-		t.Fatalf("session register revision %d, want %d", got, sessionRevision+1)
+	{
+		got := registerRevision(t, store, sessionID, sessionKey)
+		testassert.Equal(t, got, sessionRevision+1)
 	}
 
 	// The projection flips to the summary message.
 	after, err := h.projectContext(c, testOpID)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
-	if len(after) != 2 {
-		t.Fatalf("projection messages = %d, want the system message and the summary", len(after))
-	}
-	if after[1].Role != model.RoleAssistant || after[1].Source != testCompactCapture().Model {
-		t.Fatalf("summary message = %+v, want an assistant message sourced by the compact model", after[1])
-	}
-	if got := after[1].TextContent(); got != "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" {
-		t.Fatalf("summary message text %q, want the verbatim framing around the committed summary", got)
+	testassert.NoError(t, err)
+	testassert.Equal(t, len(after), 2)
+	testassert.Require(t, after[1].Role == model.RoleAssistant && after[1].Source == testCompactCapture().Model, "summary message = %+v, want an assistant message sourced by the compact model", after[1])
+	{
+		got := after[1].TextContent()
+		testassert.Equal(t, got, "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]")
 	}
 }
 
@@ -1167,7 +781,7 @@ func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
 // shape: the automatic members land, then the dedicated Operation settles as
 // success in the same transaction — settlement entry, terminal Operation
 // register, cleared current Operation — with the settlement itself carrying
-// no usage.
+// no usage and the unmarked source.
 func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 	h, store, c, sessionID := newEffectHarness(t, nil)
 	opKey := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: testOpID}
@@ -1179,74 +793,52 @@ func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 	usage := &UsageCount{InputTokens: 6, CachedInputTokens: 1, OutputTokens: 2}
 	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
 	// admitted input message.
-	if err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", 1, usage, true); err != nil {
-		t.Fatalf("commitCompaction: %v", err)
+	{
+		err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", 1, usage, true)
+		testassert.NoError(t, err)
 	}
 
 	graph, err := validateFixture(t, store, sessionID)
-	if err != nil {
-		t.Fatalf("post-commit graph: %v", err)
-	}
+	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	if comp.Summary != "manual summary" || comp.BoundaryEntryID != graph.Entries[0].Envelope.ID {
-		t.Fatalf("compaction entry = %+v, want the committed summary at the projectable boundary", comp)
-	}
+	testassert.Require(t, comp.Summary == "manual summary" && comp.BoundaryEntryID == graph.Entries[0].Envelope.ID, "compaction entry = %+v, want the committed summary at the projectable boundary", comp)
 	settlement := settlementEntryOf(t, graph)
-	if settlement.Status != OperationSuccess || settlement.Detail != "" {
-		t.Fatalf("settlement entry = %+v, want the success terminal with no detail", settlement)
-	}
-	if settlement.Model != nil || settlement.Usage != nil {
-		t.Fatalf("settlement entry = %+v, want no usage on the settlement itself", settlement)
-	}
+	testassert.Require(t, settlement.Status == OperationSuccess && settlement.Detail == "" && (settlement.Model == nil && settlement.Usage == nil) && !settlement.CompactionUsage, "settlement entry = %+v, want the success terminal with no detail; settlement entry = %+v, want no usage on the settlement itself; settlement compaction_usage = true, want the manual settlement unmarked", settlement, settlement)
 	state := operationStateOf(t, graph, testOpID)
-	if state.Status != OperationSuccess || state.Terminal == nil || state.Terminal.SettlementEntry.EntryID != settlement.EntryID {
-		t.Fatalf("operation state = %+v, want the success terminal naming the settlement entry", state)
-	}
-	if graph.Session.State.CurrentOperationID != "" {
-		t.Fatalf("current Operation %q, want it cleared", graph.Session.State.CurrentOperationID)
-	}
-	if graph.Session.State.CompactionEntryID != comp.EntryID {
-		t.Fatalf("compaction_entry_id %q, want the new entry %q", graph.Session.State.CompactionEntryID, comp.EntryID)
-	}
+	testassert.Require(t, state.Status == OperationSuccess && state.Terminal != nil && state.Terminal.SettlementEntry.EntryID == settlement.EntryID, "operation state = %+v, want the success terminal naming the settlement entry", state)
+	testassert.Equal(t, graph.Session.State.CurrentOperationID, "")
+	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
 
 	// The usage landed through the compaction part: both totals carry it
 	// keyed by the compact model.
 	want := UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: *usage}}}
-	if !usageTotalsEqual(state.Usage, want) {
-		t.Fatalf("operation usage = %+v, want %+v", state.Usage, want)
-	}
-	if !usageTotalsEqual(graph.Session.State.Usage, want) {
-		t.Fatalf("session usage = %+v, want %+v", graph.Session.State.Usage, want)
-	}
+	testassert.Require(t, usageTotalsEqual(state.Usage, want), "operation usage = %+v, want %+v", state.Usage, want)
+	testassert.Require(t, usageTotalsEqual(graph.Session.State.Usage, want), "session usage = %+v, want %+v", graph.Session.State.Usage, want)
 
 	// One transaction: the entry and the settlement are the only new
 	// entries, and each register advanced once per write inside it.
 	afterEntries, _ := storedSessionState(store, sessionID)
-	if len(afterEntries) != len(beforeEntries)+2 {
-		t.Fatalf("entry count %d, want %d (the compaction entry and the settlement)", len(afterEntries), len(beforeEntries)+2)
+	testassert.Equal(t, len(afterEntries), len(beforeEntries)+2)
+	{
+		got := registerRevision(t, store, sessionID, opKey)
+		testassert.Equal(t, got, opRevision+2)
 	}
-	if got := registerRevision(t, store, sessionID, opKey); got != opRevision+2 {
-		t.Fatalf("operation register revision %d, want %d", got, opRevision+2)
-	}
-	if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision+2 {
-		t.Fatalf("session register revision %d, want %d", got, sessionRevision+2)
+	{
+		got := registerRevision(t, store, sessionID, sessionKey)
+		testassert.Equal(t, got, sessionRevision+2)
 	}
 
 	// The projection flips to the summary message.
 	after, err := h.projectContext(c, testOpID)
-	if err != nil {
-		t.Fatalf("projectContext: %v", err)
-	}
-	if len(after) != 2 || after[1].Role != model.RoleAssistant || after[1].TextContent() != "[Previous conversation summary]\n\nmanual summary\n\n[End of summary. Continue from here.]" {
-		t.Fatalf("projection = %+v, want the system message and the committed summary", after)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, len(after) == 2 && after[1].Role == model.RoleAssistant && after[1].TextContent() == "[Previous conversation summary]\n\nmanual summary\n\n[End of summary. Continue from here.]", "projection = %+v, want the system message and the committed summary", after)
 }
 
 // TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent proves the
 // failure contract: an injected transaction failure commits nothing of the
 // compaction — the previous projection stays current — and the commit's own
 // failure settles the quiet running Operation through the direct terminal
-// settlement carrying the commit error and the accumulated usage keyed by the
+// settlement carrying the commit error and the reported usage keyed by the
 // compact model.
 func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T) {
 	t.Run("a persistently failing store leaves every durable value unchanged", func(t *testing.T) {
@@ -1257,51 +849,38 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		sessionRevision := registerRevision(t, store, sessionID, sessionKey)
 		beforeEntries, _ := storedSessionState(store, sessionID)
 		before, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
+		testassert.NoError(t, err)
 		store.txHook = func(string) error { return errors.New("injected storage failure") }
 
-		if err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false); err == nil {
-			t.Fatalf("commitCompaction succeeded past an injected failure")
+		{
+			err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false)
+			testassert.Require(t, err != nil, "commitCompaction succeeded past an injected failure")
 		}
 
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-failure graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		afterEntries, _ := storedSessionState(store, sessionID)
-		if len(afterEntries) != len(beforeEntries) {
-			t.Fatalf("entry count %d, want the unchanged %d", len(afterEntries), len(beforeEntries))
+		testassert.Equal(t, len(afterEntries), len(beforeEntries))
+		{
+			got := registerRevision(t, store, sessionID, opKey)
+			testassert.Equal(t, got, opRevision)
 		}
-		if got := registerRevision(t, store, sessionID, opKey); got != opRevision {
-			t.Fatalf("operation register revision %d, want the unchanged %d", got, opRevision)
+		{
+			got := registerRevision(t, store, sessionID, sessionKey)
+			testassert.Equal(t, got, sessionRevision)
 		}
-		if got := registerRevision(t, store, sessionID, sessionKey); got != sessionRevision {
-			t.Fatalf("session register revision %d, want the unchanged %d", got, sessionRevision)
-		}
-		if graph.Session.State.CompactionEntryID != "" {
-			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
-		}
+		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
 		state := operationStateOf(t, graph, testOpID)
-		if state.Status != OperationRunning {
-			t.Fatalf("operation state = %+v, want still running", state)
-		}
+		testassert.Require(t, state.Status == OperationRunning, "operation state = %+v, want still running", state)
 		after, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
 	})
 
-	t.Run("a one-shot commit failure settles the accumulated usage", func(t *testing.T) {
+	t.Run("a one-shot commit failure settles the reported usage", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		before, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
+		testassert.NoError(t, err)
 		injected := errors.New("injected commit failure")
 		seen := false
 		store.txHook = func(step string) error {
@@ -1314,47 +893,27 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
 
 		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, usage, false)
-		if err == nil || !strings.Contains(err.Error(), "injected commit failure") {
-			t.Fatalf("error %v, want the injected commit failure", err)
-		}
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected commit failure"), "error %v, want the injected commit failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-failure graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		for i := range graph.Entries {
-			if graph.Entries[i].Compaction != nil {
-				t.Fatalf("compaction entry committed on a failed transaction")
-			}
+			testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failed transaction")
 		}
-		if graph.Session.State.CompactionEntryID != "" {
-			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
-		}
+		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
 		settlement := settlementEntryOf(t, graph)
-		if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "injected commit failure") {
-			t.Fatalf("settlement entry = %+v, want the commit failure terminal", settlement)
-		}
-		if settlement.Model == nil || *settlement.Model != testCompactCapture().Model {
-			t.Fatalf("settlement model = %+v, want the compact model identity", settlement.Model)
-		}
-		if settlement.Usage == nil || *settlement.Usage != *usage {
-			t.Fatalf("settlement usage = %+v, want the accumulated total", settlement.Usage)
-		}
+		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "injected commit failure"), "settlement entry = %+v, want the commit failure terminal", settlement)
+		testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
+		testassert.Require(t, settlement.Usage != nil && *settlement.Usage == *usage && settlement.CompactionUsage, "settlement usage = %+v, want the reported total; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
 		after, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
 	})
 
 	t.Run("the manual settlement shares the commit transaction", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		before, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
+		testassert.NoError(t, err)
 		injected := errors.New("injected settlement failure")
 		inserts := 0
 		store.txHook = func(step string) error {
@@ -1368,33 +927,19 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		}
 
 		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, true)
-		if err == nil || !strings.Contains(err.Error(), "injected settlement failure") {
-			t.Fatalf("error %v, want the injected settlement failure", err)
-		}
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected settlement failure"), "error %v, want the injected settlement failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
-		if err != nil {
-			t.Fatalf("post-failure graph: %v", err)
-		}
+		testassert.NoError(t, err)
 		for i := range graph.Entries {
-			if graph.Entries[i].Compaction != nil {
-				t.Fatalf("compaction entry survived the failed shared transaction")
-			}
+			testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry survived the failed shared transaction")
 		}
-		if graph.Session.State.CompactionEntryID != "" {
-			t.Fatalf("compaction_entry_id %q, want it empty", graph.Session.State.CompactionEntryID)
-		}
+		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
 		// The commit's own failure settlement stands alone.
 		settlement := settlementEntryOf(t, graph)
-		if settlement.Status != OperationFailure || !strings.Contains(settlement.Detail, "injected settlement failure") {
-			t.Fatalf("settlement entry = %+v, want the commit failure terminal", settlement)
-		}
+		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "injected settlement failure"), "settlement entry = %+v, want the commit failure terminal", settlement)
 		after, err := h.projectContext(c, testOpID)
-		if err != nil {
-			t.Fatalf("projectContext: %v", err)
-		}
-		if !reflect.DeepEqual(before, after) {
-			t.Fatalf("projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
 	})
 }

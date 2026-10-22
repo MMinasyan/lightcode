@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -29,31 +30,16 @@ var jobIDShape = regexp.MustCompile(`^[0-9a-f]{8}$`)
 func openJobs(t *testing.T, dataDir string) *instance {
 	t.Helper()
 	p := Plugin()
-	if p.ID != "jobs" || p.Scope != runtime.ScopeRuntime || p.ValidateConfig == nil || p.Open == nil || len(p.Requires) != 0 {
-		t.Fatalf("plugin declaration = %+v, want the Runtime-scoped jobs plugin with a validator and no dependencies", p)
-	}
-	if len(p.Provides) != 2 {
-		t.Fatalf("plugin declares %d exports, want the jobs and job-stopper views", len(p.Provides))
-	}
+	testassert.Require(t, p.ID == "jobs" && p.Scope == runtime.ScopeRuntime && p.ValidateConfig != nil && p.Open != nil && len(p.Requires) == 0 && len(p.Provides) == 2, "plugin declaration = %+v, want the Runtime-scoped jobs plugin with a validator and no dependencies; got %v, want %v", p, len(p.Provides), 2)
 	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if inst.Close == nil || len(inst.Values) != 2 {
-		t.Fatalf("instance = %d exports with a nil Close %v, want exactly the two views and a closer", len(inst.Values), inst.Close == nil)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, inst.Close != nil && len(inst.Values) == 2, "instance = %d exports with a nil Close %v, want exactly the two views and a closer", len(inst.Values), inst.Close == nil)
 	jobsView, ok := inst.Values["jobs"].(Jobs)
-	if !ok {
-		t.Fatalf("jobs export supplies %T, not a Jobs", inst.Values["jobs"])
-	}
+	testassert.Require(t, ok, "jobs export supplies %T, not a Jobs", inst.Values["jobs"])
 	stopper, ok := inst.Values["job-stopper"].(interface{ StopJob(string, string) })
-	if !ok {
-		t.Fatalf("job-stopper export supplies %T, not a job stopper", inst.Values["job-stopper"])
-	}
+	testassert.Require(t, ok, "job-stopper export supplies %T, not a job stopper", inst.Values["job-stopper"])
 	core := jobsView.(*instance)
-	if stopper.(*instance) != core {
-		t.Fatal("the two declared views do not share one instance")
-	}
+	testassert.Require(t, stopper.(*instance) == core, "the two declared views do not share one instance")
 	t.Cleanup(func() { _ = inst.Close() })
 	return core
 }
@@ -82,8 +68,9 @@ func armTestReaper(t *testing.T, inst *instance) (release func()) {
 // start runs one reserved start, failing the test on error.
 func start(t *testing.T, j *instance, req StartRequest) string {
 	t.Helper()
-	if err := j.Start(req); err != nil {
-		t.Fatalf("Start(%q): %v", req.Command, err)
+	{
+		err := j.Start(req)
+		testassert.Require(t, err == nil, "Start(%q): %v", req.Command, err)
 	}
 	return req.JobID
 }
@@ -92,9 +79,7 @@ func start(t *testing.T, j *instance, req StartRequest) string {
 func reserveStart(t *testing.T, j *instance, req StartRequest) string {
 	t.Helper()
 	id, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	req.JobID = id
 	return start(t, j, req)
 }
@@ -156,28 +141,24 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 		SessionID: sid, Command: "sleep 30", Env: os.Environ(),
 		OnExit: func(r ExitResult) { emptyExit <- r },
 	})
-	if !jobIDShape.MatchString(emptyID) {
-		t.Fatalf("Reserve minted %q, want an 8-hex job ID", emptyID)
-	}
+	testassert.Require(t, jobIDShape.MatchString(emptyID), "Reserve minted %q, want an 8-hex job ID", emptyID)
 	got, err := j.Read(sid, emptyID)
-	if err != nil || got != "(No output yet)" {
-		t.Fatalf("Read of a silent running job = (%q, %v), want (No output yet)", got, err)
-	}
+	testassert.Require(t, err == nil && got == "(No output yet)", "Read of a silent running job = (%q, %v), want (No output yet)", got, err)
 	line := j.List(sid)
 	wantLine := fmt.Sprintf("%s  sleep 30  (running for ", emptyID)
-	if !strings.HasPrefix(line, wantLine) || !strings.HasSuffix(line, ")") || strings.Count(line, "\n") != 0 {
-		t.Fatalf("List = %q, want the single running line for %q without a trailing newline", line, emptyID)
-	}
-	if got := j.Live(sid); !slices.Equal(got, []string{emptyID}) {
-		t.Fatalf("Live = %v, want the running job", got)
+	testassert.Require(t, strings.HasPrefix(line, wantLine) && strings.HasSuffix(line, ")") && strings.Count(line, "\n") == 0, "List = %q, want the single running line for %q without a trailing newline", line, emptyID)
+	{
+		got := j.Live(sid)
+		testassert.Require(t, slices.Equal(got, []string{emptyID}), "Live = %v, want the running job", got)
 	}
 	// A second Start over an already-running record fails the retained
 	// unknown-ID check and leaves the record in place.
 	if err := j.Start(StartRequest{JobID: emptyID, SessionID: sid, Command: "printf hijack", Env: os.Environ()}); err == nil || err.Error() != unknownIDText(emptyID) {
 		t.Fatalf("Start over a running record = %v, want %q", err, unknownIDText(emptyID))
 	}
-	if got := j.Live(sid); !slices.Equal(got, []string{emptyID}) {
-		t.Fatalf("Live after the rejected Start = %v, want the record untouched", got)
+	{
+		got := j.Live(sid)
+		testassert.Require(t, slices.Equal(got, []string{emptyID}), "Live after the rejected Start = %v, want the record untouched", got)
 	}
 
 	exit := make(chan ExitResult, 1)
@@ -186,15 +167,7 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 		OnExit: func(r ExitResult) { exit <- r },
 	})
 	result := waitExit(t, exit)
-	if result.ID != shortID || result.Command != "printf hello" || result.Reason != "completed" || result.ExitCode != 0 {
-		t.Fatalf("completed ExitResult = %+v, want the short job's identity, completed reason, and exit code 0", result)
-	}
-	if result.Output != "hello" {
-		t.Fatalf("completed Output = %q, want %q", result.Output, "hello")
-	}
-	if result.MaxOutputBytes != 15360 {
-		t.Fatalf("completed MaxOutputBytes = %d, want the default 15360", result.MaxOutputBytes)
-	}
+	testassert.Require(t, result.ID == shortID && result.Command == "printf hello" && result.Reason == "completed" && result.ExitCode == 0 && result.Output == "hello" && result.MaxOutputBytes == 15360, "completed ExitResult = %+v, want the short job's identity, completed reason, and exit code 0; got %v, want %v; got %v, want %v", result, result.Output, "hello", result.MaxOutputBytes, 15360)
 	waitRemoved(t, j, shortID)
 	if _, err := j.Read(sid, shortID); err == nil || err.Error() != unknownIDText(shortID) {
 		t.Fatalf("Read after removal = %v, want %q", err, unknownIDText(shortID))
@@ -222,11 +195,10 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 	}
 	exitedLine := j.List(sid)
 	wantExited := fmt.Sprintf("%s  printf bye  (running for ", gatedID)
-	if !strings.Contains(exitedLine, wantExited) || !strings.Contains(exitedLine, " (exited with code 0))") {
-		t.Fatalf("List = %q, want the exited line for %q with the exited suffix", exitedLine, gatedID)
-	}
-	if got, err := j.Read(sid, gatedID); err != nil || got != "bye" {
-		t.Fatalf("Read of the exited-but-retained record = (%q, %v), want the final output", got, err)
+	testassert.Require(t, strings.Contains(exitedLine, wantExited) && strings.Contains(exitedLine, " (exited with code 0))"), "List = %q, want the exited line for %q with the exited suffix", exitedLine, gatedID)
+	{
+		got, err := j.Read(sid, gatedID)
+		testassert.Require(t, err == nil && got == "bye", "Read of the exited-but-retained record = (%q, %v), want the final output", got, err)
 	}
 	close(gatedRelease)
 	waitExit(t, gatedExit)
@@ -234,22 +206,17 @@ func TestStartReadKillListLiveRetainedTexts(t *testing.T) {
 
 	// Kill on the running silent job returns nil and delivers the killed
 	// result; Kill on the absent short job reports the retained unknown ID.
-	if err := j.Kill(sid, emptyID); err != nil {
-		t.Fatalf("Kill of a running job = %v, want nil", err)
-	}
+	testassert.NoError(t, j.Kill(sid, emptyID))
 	killed := waitExit(t, emptyExit)
-	if killed.Reason != "killed" {
-		t.Fatalf("killed ExitResult = %+v, want the killed reason", killed)
-	}
+	testassert.Require(t, killed.Reason == "killed", "killed ExitResult = %+v, want the killed reason", killed)
 	waitRemoved(t, j, emptyID)
 	if err := j.Kill(sid, shortID); err == nil || err.Error() != unknownIDText(shortID) {
 		t.Fatalf("Kill after removal = %v, want %q", err, unknownIDText(shortID))
 	}
-	if got := j.List(sid); got != "No background processes." {
-		t.Fatalf("List = %q, want the retained empty text", got)
-	}
-	if got := j.Live(sid); len(got) != 0 {
-		t.Fatalf("Live = %v, want no jobs", got)
+	testassert.Equal(t, j.List(sid), "No background processes.")
+	{
+		got := j.Live(sid)
+		testassert.Require(t, len(got) == 0, "Live = %v, want no jobs", got)
 	}
 }
 
@@ -275,9 +242,7 @@ func TestKillExitedShortCircuits(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the gated exit callback did not run")
 	}
-	if err := j.Kill(sid, id); err != nil {
-		t.Fatalf("Kill of an exited job = %v, want nil", err)
-	}
+	testassert.NoError(t, j.Kill(sid, id))
 	close(release)
 	waitExit(t, exit)
 	waitRemoved(t, j, id)
@@ -290,9 +255,7 @@ func TestKillReservedIsUnknownIDWithoutRemoval(t *testing.T) {
 	j := openJobs(t, t.TempDir())
 	const sid = "session-kill-reserved"
 	id, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	if err := j.Kill(sid, id); err == nil || err.Error() != unknownIDText(id) {
 		t.Fatalf("Kill of a reserved job = %v, want %q", err, unknownIDText(id))
 	}
@@ -319,12 +282,14 @@ func TestLiveReturnsSortedIDs(t *testing.T) {
 	}
 	want := slices.Clone(ids)
 	slices.Sort(want)
-	if got := j.Live(sid); !slices.Equal(got, want) {
-		t.Fatalf("Live = %v, want the sorted IDs %v", got, want)
+	{
+		got := j.Live(sid)
+		testassert.Require(t, slices.Equal(got, want), "Live = %v, want the sorted IDs %v", got, want)
 	}
 	for i, id := range ids {
-		if err := j.Kill(sid, id); err != nil {
-			t.Fatalf("Kill(%q): %v", id, err)
+		{
+			err := j.Kill(sid, id)
+			testassert.Require(t, err == nil, "Kill(%q): %v", id, err)
 		}
 		waitExit(t, exits[i])
 		waitRemoved(t, j, id)
@@ -357,28 +322,28 @@ func TestSessionAttributionHidesForeignJobs(t *testing.T) {
 	if err := j.Kill(foreign, ownerID); err == nil || err.Error() != unknownIDText(ownerID) {
 		t.Fatalf("foreign Kill = %v, want %q", err, unknownIDText(ownerID))
 	}
-	if got := j.Live(foreign); !slices.Equal(got, []string{foreignID}) {
-		t.Fatalf("foreign Live = %v, want only the foreign session's job", got)
+	{
+		got := j.Live(foreign)
+		testassert.Require(t, slices.Equal(got, []string{foreignID}), "foreign Live = %v, want only the foreign session's job", got)
 	}
-	if list := j.List(foreign); strings.Contains(list, ownerID) || !strings.Contains(list, foreignID) {
-		t.Fatalf("foreign List = %q, want only the foreign session's line", list)
+	{
+		list := j.List(foreign)
+		testassert.Require(t, !strings.Contains(list, ownerID) && strings.Contains(list, foreignID), "foreign List = %q, want only the foreign session's line", list)
 	}
-	if list := j.List(owner); !strings.Contains(list, ownerID) || strings.Contains(list, foreignID) {
-		t.Fatalf("owner List = %q, want only the owner session's line", list)
+	{
+		list := j.List(owner)
+		testassert.Require(t, strings.Contains(list, ownerID) && !strings.Contains(list, foreignID), "owner List = %q, want only the owner session's line", list)
 	}
 	// The foreign Kill left the owner's job running.
-	if got := j.Live(owner); !slices.Equal(got, []string{ownerID}) {
-		t.Fatalf("owner Live after a foreign Kill = %v, want the job untouched", got)
+	{
+		got := j.Live(owner)
+		testassert.Require(t, slices.Equal(got, []string{ownerID}), "owner Live after a foreign Kill = %v, want the job untouched", got)
 	}
 
-	if err := j.Kill(owner, ownerID); err != nil {
-		t.Fatalf("Kill(owner): %v", err)
-	}
+	testassert.NoError(t, j.Kill(owner, ownerID))
 	waitExit(t, ownerExit)
 	waitRemoved(t, j, ownerID)
-	if err := j.Kill(foreign, foreignID); err != nil {
-		t.Fatalf("Kill(foreign): %v", err)
-	}
+	testassert.NoError(t, j.Kill(foreign, foreignID))
 	waitExit(t, foreignExit)
 	waitRemoved(t, j, foreignID)
 }
@@ -401,17 +366,13 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 
 	blockedExit := make(chan ExitResult, 1)
 	blockedID, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	err = j.Start(StartRequest{
 		JobID: blockedID, SessionID: first, Command: "sleep 30", Env: os.Environ(), Config: cfg,
 		OnExit: func(r ExitResult) { blockedExit <- r },
 	})
 	wantErr := "process: background process limit reached (1/1). Kill existing processes or wait for them to exit"
-	if err == nil || err.Error() != wantErr {
-		t.Fatalf("Start at the cap = %v, want %q", err, wantErr)
-	}
+	testassert.Require(t, err != nil && err.Error() == wantErr, "Start at the cap = %v, want %q", err, wantErr)
 	// The limit failure consumed the reservation: the same identity fails the
 	// retained unknown-ID error.
 	err = j.Start(StartRequest{
@@ -429,9 +390,7 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 	})
 
 	// Once the first session's job exits it no longer counts against the cap.
-	if err := j.Kill(first, firstID); err != nil {
-		t.Fatalf("Kill: %v", err)
-	}
+	testassert.NoError(t, j.Kill(first, firstID))
 	waitExit(t, firstExit)
 	retryExit := make(chan ExitResult, 1)
 	retryID := reserveStart(t, j, StartRequest{
@@ -440,8 +399,9 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 	})
 
 	for sid, id := range map[string]string{first: retryID, second: otherID} {
-		if err := j.Kill(sid, id); err != nil {
-			t.Fatalf("Kill(%q): %v", id, err)
+		{
+			err := j.Kill(sid, id)
+			testassert.Require(t, err == nil, "Kill(%q): %v", id, err)
 		}
 	}
 	waitExit(t, retryExit)
@@ -472,8 +432,9 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		`{"unknown_member":{"deep":[1,2]}}`,
 		`{"unknown_member":"many","max_background_processes":5}`,
 	} {
-		if err := validate(raw); err != nil {
-			t.Errorf("ValidateConfig(%s) = %v, want accepted", raw, err)
+		{
+			err := validate(raw)
+			testassert.Check(t, err == nil, "ValidateConfig(%s) = %v, want accepted", raw, err)
 		}
 	}
 	for _, row := range []struct{ raw, want string }{
@@ -484,8 +445,9 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		{`{"read_line_max_chars":99}`, "jobs: read_line_max_chars must be between 100 and 100000"},
 		{`{"read_line_max_chars":100001}`, "jobs: read_line_max_chars must be between 100 and 100000"},
 	} {
-		if err := validate(row.raw); err == nil || err.Error() != row.want {
-			t.Errorf("ValidateConfig(%s) = %v, want %q", row.raw, err, row.want)
+		{
+			err := validate(row.raw)
+			testassert.Check(t, err != nil && err.Error() == row.want, "ValidateConfig(%s) = %v, want %q", row.raw, err, row.want)
 		}
 	}
 	for _, raw := range []string{
@@ -496,9 +458,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		`[]`, `"jobs"`, `5`,
 	} {
 		err := validate(raw)
-		if err == nil || !strings.HasPrefix(err.Error(), "jobs: invalid settings: ") {
-			t.Errorf("ValidateConfig(%s) = %v, want the jobs: invalid settings wrap", raw, err)
-		}
+		testassert.Check(t, err != nil && strings.HasPrefix(err.Error(), "jobs: invalid settings: "), "ValidateConfig(%s) = %v, want the jobs: invalid settings wrap", raw, err)
 	}
 }
 
@@ -512,16 +472,12 @@ func TestStartInvalidConfigConsumesReservation(t *testing.T) {
 		{`{not json`, "jobs: invalid settings: "},
 	} {
 		id, err := j.Reserve()
-		if err != nil {
-			t.Fatalf("Reserve: %v", err)
-		}
+		testassert.NoError(t, err)
 		err = j.Start(StartRequest{
 			JobID: id, SessionID: "session-bad-config", Command: "printf x", Env: os.Environ(),
 			Config: []byte(row.config),
 		})
-		if err == nil || !strings.HasPrefix(err.Error(), row.want) {
-			t.Fatalf("Start with Config %s = %v, want prefix %q", row.config, err, row.want)
-		}
+		testassert.Require(t, err != nil && strings.HasPrefix(err.Error(), row.want), "Start with Config %s = %v, want prefix %q", row.config, err, row.want)
 		err = j.Start(StartRequest{
 			JobID: id, SessionID: "session-bad-config", Command: "printf x", Env: os.Environ(),
 			Config: []byte(row.config),
@@ -539,12 +495,8 @@ func TestReserveAbortThenStartFailsUnknownID(t *testing.T) {
 	j := openJobs(t, t.TempDir())
 	const sid = "session-abort"
 	id, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
-	if !jobIDShape.MatchString(id) {
-		t.Fatalf("Reserve minted %q, want an 8-hex job ID", id)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, jobIDShape.MatchString(id), "Reserve minted %q, want an 8-hex job ID", id)
 	j.Abort(id)
 	j.Abort(id)         // idempotent
 	j.Abort("00000000") // absent stays a no-op
@@ -559,12 +511,11 @@ func TestReserveAbortThenStartFailsUnknownID(t *testing.T) {
 		OnExit: func(r ExitResult) { exit <- r },
 	})
 	j.Abort(runningID)
-	if got := j.Live(sid); !slices.Equal(got, []string{runningID}) {
-		t.Fatalf("Live after Abort over a running record = %v, want the record untouched", got)
+	{
+		got := j.Live(sid)
+		testassert.Require(t, slices.Equal(got, []string{runningID}), "Live after Abort over a running record = %v, want the record untouched", got)
 	}
-	if err := j.Kill(sid, runningID); err != nil {
-		t.Fatalf("Kill: %v", err)
-	}
+	testassert.NoError(t, j.Kill(sid, runningID))
 	waitExit(t, exit)
 	waitRemoved(t, j, runningID)
 }
@@ -582,12 +533,11 @@ func TestStopJobAcrossStates(t *testing.T) {
 
 	// Reserved: removed; the pending Start fails the same unknown-ID error.
 	reservedID, err := j.Reserve()
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	testassert.NoError(t, err)
 	j.StopJob(sid, reservedID)
-	if _, ok := stateOf(j, reservedID); ok {
-		t.Fatal("StopJob left the reservation in place")
+	{
+		_, ok := stateOf(j, reservedID)
+		testassert.Require(t, !ok, "StopJob left the reservation in place")
 	}
 	err = j.Start(StartRequest{JobID: reservedID, SessionID: sid, Command: "printf x", Env: os.Environ()})
 	if err == nil || err.Error() != unknownIDText(reservedID) {
@@ -602,8 +552,9 @@ func TestStopJobAcrossStates(t *testing.T) {
 		OnExit: func(r ExitResult) { runningExit <- r },
 	})
 	j.StopJob(sid, runningID)
-	if got := waitExit(t, runningExit); got.Reason != "killed" {
-		t.Fatalf("StopJob exit result = %+v, want the killed reason", got)
+	{
+		got := waitExit(t, runningExit)
+		testassert.Require(t, got.Reason == "killed", "StopJob exit result = %+v, want the killed reason", got)
 	}
 	waitRemoved(t, j, runningID)
 
@@ -626,8 +577,9 @@ func TestStopJobAcrossStates(t *testing.T) {
 	}
 	j.StopJob(sid, exitedID)
 	close(release)
-	if got := waitExit(t, exitedExit); got.Reason != "completed" {
-		t.Fatalf("StopJob over an exited record changed the result to %+v, want completed", got)
+	{
+		got := waitExit(t, exitedExit)
+		testassert.Require(t, got.Reason == "completed", "StopJob over an exited record changed the result to %+v, want completed", got)
 	}
 	waitRemoved(t, j, exitedID)
 
@@ -641,8 +593,9 @@ func TestStopJobAcrossStates(t *testing.T) {
 		OnExit: func(r ExitResult) { ownerExit <- r },
 	})
 	j.StopJob(foreign, ownerID)
-	if got := j.Live(sid); !slices.Equal(got, []string{ownerID}) {
-		t.Fatalf("Live after a foreign StopJob = %v, want the job untouched", got)
+	{
+		got := j.Live(sid)
+		testassert.Require(t, slices.Equal(got, []string{ownerID}), "Live after a foreign StopJob = %v, want the job untouched", got)
 	}
 	j.StopJob(sid, ownerID)
 	waitExit(t, ownerExit)
@@ -664,12 +617,11 @@ func TestTimeoutEscalatesToKill(t *testing.T) {
 	})
 	started := time.Now()
 	result := waitExit(t, exit)
-	if elapsed := time.Since(started); elapsed > 10*time.Second {
-		t.Fatalf("the timed job ended after %v, want the timeout escalation to converge promptly", elapsed)
+	{
+		elapsed := time.Since(started)
+		testassert.Require(t, elapsed <= 10*time.Second, "the timed job ended after %v, want the timeout escalation to converge promptly", elapsed)
 	}
-	if result.ID != id || result.Reason != "timeout" {
-		t.Fatalf("timeout ExitResult = %+v, want the timeout reason", result)
-	}
+	testassert.Require(t, result.ID == id && result.Reason == "timeout", "timeout ExitResult = %+v, want the timeout reason", result)
 	waitRemoved(t, j, id)
 }
 
@@ -705,25 +657,14 @@ func TestCaptureBoundsSpillUnderSessionOutputDir(t *testing.T) {
 	// same bounded format the callback receives.
 	wantDir := fmt.Sprintf("saved to: %s", filepath.Join(dataDir, "code", sid, "output"))
 	got, err := j.Read(sid, id)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if !strings.Contains(got, "[Output truncated. Full output (") || !strings.Contains(got, wantDir) {
-		t.Fatalf("Read = %q, want the truncation marker and a spill under %s", got, wantDir)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(got, "[Output truncated. Full output (") && strings.Contains(got, wantDir), "Read = %q, want the truncation marker and a spill under %s", got, wantDir)
 	close(release)
 	result := waitExit(t, exit)
-	if result.MaxOutputBytes != 1024 {
-		t.Fatalf("MaxOutputBytes = %d, want the per-call 1024", result.MaxOutputBytes)
-	}
-	if !strings.Contains(result.Output, "[Output truncated. Full output (") || !strings.Contains(result.Output, wantDir) {
-		t.Fatalf("Output = %q, want the truncation marker and a spill under %s", result.Output, wantDir)
-	}
+	testassert.Require(t, result.MaxOutputBytes == 1024 && strings.Contains(result.Output, "[Output truncated. Full output (") && strings.Contains(result.Output, wantDir), "got %v, want %v; Output = %q, want the truncation marker and a spill under %s", result.MaxOutputBytes, 1024, result.Output, wantDir)
 	waitRemoved(t, j, id)
 	entries, err := os.ReadDir(filepath.Join(dataDir, "code", sid, "output"))
-	if err != nil {
-		t.Fatalf("ReadDir of the session output directory: %v", err)
-	}
+	testassert.NoError(t, err)
 	found := false
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "proc_output_") && strings.HasSuffix(e.Name(), ".txt") {
@@ -797,9 +738,7 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !sawSpill {
-		t.Fatalf("no private spill appeared under %s before Close", outputDir)
-	}
+	testassert.Require(t, sawSpill, "no private spill appeared under %s before Close", outputDir)
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- j.Close() }()
@@ -812,9 +751,7 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 	waitExit(t, aExit)
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, err)
 	case <-time.After(15 * time.Second):
 		t.Fatal("Close did not converge after the admitted callback was released")
 	}
@@ -833,27 +770,26 @@ func TestCloseKillsStraysAndGatesCallbacks(t *testing.T) {
 		remaining = append(remaining, id)
 	}
 	j.mu.Unlock()
-	if len(remaining) != 0 {
-		t.Fatalf("records remaining after Close = %v, want none", remaining)
-	}
+	testassert.Require(t, len(remaining) == 0, "records remaining after Close = %v, want none", remaining)
 	if entries, err := os.ReadDir(outputDir); err != nil {
 		t.Fatalf("ReadDir after Close: %v", err)
 	} else if len(entries) != 0 {
 		t.Fatalf("capture files remaining after Close = %v, want none", names(entries))
 	}
-	if _, ok := stateOf(j, aID); ok {
-		t.Fatalf("record %q survived Close", aID)
+	{
+		_, ok := stateOf(j, aID)
+		testassert.Require(t, !ok, "record %q survived Close", aID)
 	}
-	if _, ok := stateOf(j, bID); ok {
-		t.Fatalf("record %q survived Close", bID)
+	{
+		_, ok := stateOf(j, bID)
+		testassert.Require(t, !ok, "record %q survived Close", bID)
 	}
-	if _, err := j.Reserve(); err == nil || err.Error() != "process: manager is closed" {
-		t.Fatalf("Reserve after Close = %v, want the retained closed error", err)
+	{
+		_, err := j.Reserve()
+		testassert.Require(t, err != nil && err.Error() == "process: manager is closed", "Reserve after Close = %v, want the retained closed error", err)
 	}
 	err := j.Start(StartRequest{JobID: "deadbeef", SessionID: sid, Command: "printf x", Env: os.Environ()})
-	if err == nil || err.Error() != "process: manager is closed" {
-		t.Fatalf("Start after Close = %v, want the retained closed error", err)
-	}
+	testassert.Require(t, err != nil && err.Error() == "process: manager is closed", "Start after Close = %v, want the retained closed error", err)
 }
 
 // TestKillRetainsFiveSecondDiagnoseAndAbandon proves the user-facing Kill
@@ -868,9 +804,7 @@ func TestKillRetainsFiveSecondDiagnoseAndAbandon(t *testing.T) {
 	})
 
 	pipeR, pipeW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("Pipe: %v", err)
-	}
+	testassert.NoError(t, err)
 	old := os.Stderr
 	os.Stderr = pipeW
 	started := time.Now()
@@ -881,18 +815,9 @@ func TestKillRetainsFiveSecondDiagnoseAndAbandon(t *testing.T) {
 	diagnosis, _ := io.ReadAll(pipeR)
 	_ = pipeR.Close()
 
-	if killErr != nil {
-		t.Fatalf("Kill = %v, want nil from the abandon outcome", killErr)
-	}
-	if elapsed < 5*time.Second {
-		t.Fatalf("Kill returned after %v, want the retained 5-second diagnose-and-abandon bound", elapsed)
-	}
-	if elapsed > 15*time.Second {
-		t.Fatalf("Kill returned after %v, want no unbounded wait", elapsed)
-	}
+	testassert.Require(t, killErr == nil, "Kill = %v, want nil from the abandon outcome", killErr)
+	testassert.Require(t, elapsed >= 5*time.Second && elapsed <= 15*time.Second, "Kill returned after %v, want the retained 5-second diagnose-and-abandon bound; Kill returned after %v, want no unbounded wait", elapsed, elapsed)
 	want := fmt.Sprintf("lightcode: process %s not reaped within 5s after SIGKILL\n", id)
-	if !strings.Contains(string(diagnosis), want) {
-		t.Fatalf("Kill stderr = %q, want %q", diagnosis, want)
-	}
+	testassert.Require(t, strings.Contains(string(diagnosis), want), "Kill stderr = %q, want %q", diagnosis, want)
 	release() // the exit goroutine reaps during the registered cleanup
 }

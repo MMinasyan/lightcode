@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/clienthost"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -37,9 +38,7 @@ func TestGlobalsNoReaderCoalescesAndCoveredHintsDoNotRead(t *testing.T) {
 		c.acceptEvent(eventDelivery{c.conn, warningHint("6")})
 	}
 	c.mu.Lock()
-	if !c.globalsBusy || !c.globalsDirty || c.root != nil {
-		t.Fatal("hints created an unintended Session reader")
-	}
+	testassert.Require(t, c.globalsBusy && c.globalsDirty && c.root == nil, "hints created an unintended Session reader")
 	c.mu.Unlock()
 	config := configuration("6")
 	config.Agents[0].Name = "payload-six"
@@ -58,16 +57,12 @@ func TestGlobalsNoReaderCoalescesAndCoveredHintsDoNotRead(t *testing.T) {
 		c.acceptEvent(eventDelivery{c.conn, warningHint("5")})
 	}
 	c.mu.Lock()
-	if c.globalsBusy || c.globalsDirty || c.configuration.Agents[0].Name != "payload-six" || c.warnings.Warnings[0].Message != "payload-six" {
-		t.Fatal("covered hints refreshed or payload not installed atomically")
-	}
+	testassert.Require(t, !c.globalsBusy && !c.globalsDirty && c.configuration.Agents[0].Name == "payload-six" && c.warnings.Warnings[0].Message == "payload-six", "covered hints refreshed or payload not installed atomically")
 	c.mu.Unlock()
 	transport.mu.Lock()
 	after := len(transport.calls)
 	transport.mu.Unlock()
-	if before != 4 || after != before {
-		t.Fatalf("refresh count %d -> %d", before, after)
-	}
+	testassert.Require(t, before == 4 && after == before, "refresh count %d -> %d", before, after)
 }
 
 func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
@@ -84,9 +79,7 @@ func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
 	receive(t, transport.requests).respond(warnings("8"))
 	configReq := receive(t, transport.requests)
 	c.mu.Lock()
-	if c.configuration.Agents[0].Name != "accepted-nine" || c.warnings.WarningsRevision.Revision != "9" {
-		t.Fatal("older payload replaced accepted clock")
-	}
+	testassert.Require(t, c.configuration.Agents[0].Name == "accepted-nine" && c.warnings.WarningsRevision.Revision == "9", "older payload replaced accepted clock")
 	c.mu.Unlock()
 	configReq.respond(configuration("10"))
 	receive(t, transport.requests).respond(warnings("10"))
@@ -98,9 +91,7 @@ func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
 	receive(t, transport.requests).respond(stale)
 	fresh := receive(t, transport.requests)
 	c.mu.Lock()
-	if r.hydration != nil {
-		t.Fatal("hydration installed below independent floors")
-	}
+	testassert.Require(t, r.hydration == nil, "hydration installed below independent floors")
 	c.mu.Unlock()
 	stale.ConfigurationRevision = configuration("10").ConfigurationRevision
 	stale.WarningsRevision = warnings("10").WarningsRevision
@@ -112,9 +103,7 @@ func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
 	receive(t, transport.requests).respond(stale)
 	barrier(t, done)
 	c.mu.Lock()
-	if r.hydration.ConfigurationRevision.Generation != "11" || r.hydration.WarningsRevision.Revision != "10" {
-		t.Fatal("configuration-only delivery was suppressed")
-	}
+	testassert.Require(t, r.hydration.ConfigurationRevision.Generation == "11" && r.hydration.WarningsRevision.Revision == "10", "configuration-only delivery was suppressed")
 	c.mu.Unlock()
 	done = c.refreshReader(r)
 	stale.WarningsRevision = warnings("11").WarningsRevision
@@ -122,9 +111,7 @@ func TestGlobalClockPayloadNonregressionAndHydrationFloors(t *testing.T) {
 	barrier(t, done)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if r.hydration.ConfigurationRevision.Generation != "11" || r.hydration.WarningsRevision.Revision != "11" {
-		t.Fatal("equal Session discarded independent clocks")
-	}
+	testassert.Require(t, r.hydration.ConfigurationRevision.Generation == "11" && r.hydration.WarningsRevision.Revision == "11", "equal Session discarded independent clocks")
 }
 
 // TestGlobalReadsStayValidAcrossSelectionChanges pins the Runtime-global
@@ -154,12 +141,8 @@ func TestGlobalReadsStayValidAcrossSelectionChanges(t *testing.T) {
 	receive(t, transport.requests).lost()
 	settleTasks(t, c)
 	c.mu.Lock()
-	if c.configuration == nil || c.configuration.ConfigurationRevision.Generation != "900" {
-		t.Fatal("the connection's completed global read was dropped with the selection")
-	}
-	if c.root == nil || c.root.hydration == nil || c.rootID != rootB {
-		t.Fatal("the destination root was not adopted")
-	}
+	testassert.Require(t, c.configuration != nil && c.configuration.ConfigurationRevision.Generation == "900", "the connection's completed global read was dropped with the selection")
+	testassert.Require(t, c.root != nil && c.root.hydration != nil && c.rootID == rootB, "the destination root was not adopted")
 	c.mu.Unlock()
 	transport.mu.Lock()
 	configCalls := 0
@@ -169,12 +152,8 @@ func TestGlobalReadsStayValidAcrossSelectionChanges(t *testing.T) {
 		}
 	}
 	transport.mu.Unlock()
-	if configCalls != 1 {
-		t.Fatalf("navigation triggered a global re-read: configuration reads %d", configCalls)
-	}
-	if !strings.Contains(outputs(c), "unexpected EOF") {
-		t.Fatal("a current connection's global read error was suppressed")
-	}
+	testassert.Equal(t, configCalls, 1)
+	testassert.Require(t, strings.Contains(outputs(c), "unexpected EOF"), "a current connection's global read error was suppressed")
 }
 
 func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
@@ -200,8 +179,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			requests := make(chan request, 16)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/health" {
-					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N2})
+					health(w, owner)
 					return
 				}
 				if r.URL.Path == "/v1/events" {
@@ -223,10 +201,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			}))
 			defer server.Close()
 			dir := t.TempDir()
-			raw, _ := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": owner, "protocol_version": string(protocol.N2), "credential": strings.Repeat("1", 64)})
-			if err := os.WriteFile(filepath.Join(dir, "runtime.json"), raw, 0600); err != nil {
-				t.Fatal(err)
-			}
+			testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), discoveryRecord(server.URL, owner), 0600))
 			c.mu.Lock()
 			c.opts.Startup = clienthost.Options{DataDir: dir}
 			c.mu.Unlock()
@@ -241,9 +216,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 				}
 			}
 			c.mu.Lock()
-			if c.configuration != nil || c.warnings != nil || c.provisional != "" || c.root.floor != nil {
-				t.Fatal("retirement kept old projections/floors/activity")
-			}
+			testassert.Require(t, c.configuration == nil && c.warnings == nil && c.provisional == "" && c.root.floor == nil, "retirement kept old projections/floors/activity")
 			newReader := c.root
 			newDone := newReader.chain.done
 			c.mu.Unlock()
@@ -279,9 +252,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 			}
 			c.mu.Unlock()
 			settleTasks(t, c)
-			if !accepted || strings.Contains(outputs(c), "unexpected EOF") {
-				t.Fatal("old independent read failure poisoned new owner")
-			}
+			testassert.Require(t, accepted && !strings.Contains(outputs(c), "unexpected EOF"), "old independent read failure poisoned new owner")
 		})
 	}
 }
@@ -313,12 +284,8 @@ func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
 		settleTasks(t, c)
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.configuration == nil || len(c.configuration.Agents) != 2 || c.configuration.Agents[0].Name != "primary" {
-			t.Fatal("valid opaque configuration was not adopted")
-		}
-		if c.conn != oldConn {
-			t.Fatal("valid opaque configuration triggered a repair loop")
-		}
+		testassert.Require(t, c.configuration != nil && len(c.configuration.Agents) == 2 && c.configuration.Agents[0].Name == "primary", "valid opaque configuration was not adopted")
+		testassert.Require(t, c.conn == oldConn, "valid opaque configuration triggered a repair loop")
 		select {
 		case <-c.exit:
 			t.Fatal("adoption exited the client")
@@ -374,12 +341,8 @@ func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
 		settleTasks(t, c)
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.menu == nil || len(c.menu.items) != 2 || c.menu.items[0].Label != "primary" || c.menu.items[1].Label != "planner" {
-			t.Fatal("valid opaque configuration was not listed")
-		}
-		if c.conn != oldConn {
-			t.Fatal("the /agent menu triggered a repair loop")
-		}
+		testassert.Require(t, c.menu != nil && len(c.menu.items) == 2 && c.menu.items[0].Label == "primary" && c.menu.items[1].Label == "planner", "valid opaque configuration was not listed")
+		testassert.Require(t, c.conn == oldConn, "the /agent menu triggered a repair loop")
 		select {
 		case <-c.exit:
 			t.Fatal("menu listing exited the client")
@@ -398,17 +361,11 @@ func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
 		settleTasks(t, c)
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.menu != nil {
-			t.Fatal("malformed menu data was adopted as menu items")
-		}
-		if c.configuration != nil {
-			t.Fatal("malformed menu data was adopted as global state")
-		}
+		testassert.Require(t, c.menu == nil, "malformed menu data was adopted as menu items")
+		testassert.Require(t, c.configuration == nil, "malformed menu data was adopted as global state")
 		// Command paths report the failure and keep their unknown-outcome
 		// behavior; they never repair or resend.
-		if c.conn != oldConn {
-			t.Fatal("the /agent command path repaired instead of reporting")
-		}
+		testassert.Require(t, c.conn == oldConn, "the /agent command path repaired instead of reporting")
 		select {
 		case <-c.exit:
 			t.Fatal("the /agent command path exited the client")

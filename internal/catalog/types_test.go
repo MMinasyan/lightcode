@@ -3,19 +3,15 @@ package catalog
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestParseModelRefSplitsOnFirstSlash(t *testing.T) {
 	ref, err := ParseModelRef("openrouter/openai/gpt-5.4-mini")
-	if err != nil {
-		t.Fatalf("ParseModelRef returned error: %v", err)
-	}
-	if ref.Provider != "openrouter" || ref.Model != "openai/gpt-5.4-mini" {
-		t.Fatalf("unexpected ref: %#v", ref)
-	}
-	if got := ref.String(); got != "openrouter/openai/gpt-5.4-mini" {
-		t.Fatalf("String() = %q", got)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, ref.Provider == "openrouter" && ref.Model == "openai/gpt-5.4-mini", "unexpected ref: %#v", ref)
+	testassert.Equal(t, ref.String(), "openrouter/openai/gpt-5.4-mini")
 }
 
 func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
@@ -32,19 +28,13 @@ func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.ref.String()
-			if got != tc.want {
-				t.Fatalf("String() = %q, want %q", got, tc.want)
-			}
+			testassert.Equal(t, got, tc.want)
 			if got == "" {
 				return
 			}
 			parsed, err := ParseModelRef(got)
-			if err != nil {
-				t.Fatalf("ParseModelRef(%q) returned error: %v", got, err)
-			}
-			if parsed != tc.ref {
-				t.Fatalf("parsed = %#v, want %#v", parsed, tc.ref)
-			}
+			testassert.Require(t, err == nil, "ParseModelRef(%q) returned error: %v", got, err)
+			testassert.Equal(t, parsed, tc.ref)
 		})
 	}
 }
@@ -52,26 +42,19 @@ func TestModelRefStringIsParseableWhenNonEmpty(t *testing.T) {
 func TestModelRefJSONUsesPrefixString(t *testing.T) {
 	ref := ModelRef{Provider: "openai", Model: "gpt-5.4-mini"}
 	b, err := json.Marshal(ref)
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	if string(b) != `"openai/gpt-5.4-mini"` {
-		t.Fatalf("Marshal = %s", b)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(b) == `"openai/gpt-5.4-mini"`, "Marshal = %s", b)
 
 	var parsed ModelRef
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		t.Fatalf("Unmarshal returned error: %v", err)
-	}
-	if parsed != ref {
-		t.Fatalf("parsed = %#v, want %#v", parsed, ref)
-	}
+	testassert.NoError(t, json.Unmarshal(b, &parsed))
+	testassert.Equal(t, parsed, ref)
 }
 
 func TestParseModelRefRejectsMissingParts(t *testing.T) {
 	for _, input := range []string{"", "openai", "/gpt-5.4-mini", "openai/"} {
-		if _, err := ParseModelRef(input); err == nil {
-			t.Fatalf("ParseModelRef(%q) succeeded, want error", input)
+		{
+			_, err := ParseModelRef(input)
+			testassert.Require(t, err != nil, "ParseModelRef(%q) succeeded, want error", input)
 		}
 	}
 }

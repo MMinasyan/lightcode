@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -19,9 +20,7 @@ import (
 // invalid-settings wrap.
 func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	validate := Plugin().ValidateConfig
-	if validate == nil {
-		t.Fatal("Plugin().ValidateConfig is nil, want the settings validator")
-	}
+	testassert.Require(t, validate != nil, "Plugin().ValidateConfig is nil, want the settings validator")
 	keepDefaults := []json.RawMessage{
 		nil,
 		json.RawMessage(""),
@@ -32,16 +31,13 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		json.RawMessage(`{"unknown_member":1,"max_output_bytes":null}`),
 	}
 	for _, raw := range keepDefaults {
-		if err := validate(raw); err != nil {
-			t.Errorf("ValidateConfig(%s) = %v, want nil", raw, err)
+		{
+			err := validate(raw)
+			testassert.Check(t, err == nil, "ValidateConfig(%s) = %v, want nil", raw, err)
 		}
 		s, err := decodeSettings(raw)
-		if err != nil {
-			t.Fatalf("decodeSettings(%s): %v", raw, err)
-		}
-		if s != (settings{MaxConcurrent: 4, MaxOutputBytes: 15360}) {
-			t.Errorf("decodeSettings(%s) = %+v, want the defaults 4 and 15360", raw, s)
-		}
+		testassert.Require(t, err == nil, "decodeSettings(%s): %v", raw, err)
+		testassert.Check(t, s == (settings{MaxConcurrent: 4, MaxOutputBytes: 15360}), "decodeSettings(%s) = %+v, want the defaults 4 and 15360", raw, s)
 	}
 	inRange := []json.RawMessage{
 		json.RawMessage(`{"max_concurrent":1,"max_output_bytes":1024}`),
@@ -50,8 +46,9 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		json.RawMessage(`{"max_output_bytes":2048}`),
 	}
 	for _, raw := range inRange {
-		if err := validate(raw); err != nil {
-			t.Errorf("ValidateConfig(%s) = %v, want nil", raw, err)
+		{
+			err := validate(raw)
+			testassert.Check(t, err == nil, "ValidateConfig(%s) = %v, want nil", raw, err)
 		}
 	}
 	rejected := []struct {
@@ -65,9 +62,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	}
 	for _, tc := range rejected {
 		err := validate(tc.raw)
-		if err == nil || err.Error() != tc.want {
-			t.Errorf("ValidateConfig(%s) = %v, want exactly %q", tc.raw, err, tc.want)
-		}
+		testassert.Check(t, err != nil && err.Error() == tc.want, "ValidateConfig(%s) = %v, want exactly %q", tc.raw, err, tc.want)
 	}
 	wrongType := []json.RawMessage{
 		json.RawMessage(`{"max_output_bytes":"many"}`),
@@ -77,9 +72,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	}
 	for _, raw := range wrongType {
 		err := validate(raw)
-		if err == nil || !strings.HasPrefix(err.Error(), "tasks: invalid settings: ") {
-			t.Errorf("ValidateConfig(%s) = %v, want the tasks invalid-settings wrap", raw, err)
-		}
+		testassert.Check(t, err != nil && strings.HasPrefix(err.Error(), "tasks: invalid settings: "), "ValidateConfig(%s) = %v, want the tasks invalid-settings wrap", raw, err)
 	}
 }
 
@@ -87,9 +80,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 func taskCall(t *testing.T, args string) model.ToolCall {
 	t.Helper()
 	call, err := model.NewToolCall(model.ToolCall{ID: "call-1", Name: "task", Arguments: json.RawMessage(args)})
-	if err != nil {
-		t.Fatalf("NewToolCall: %v", err)
-	}
+	testassert.NoError(t, err)
 	return call
 }
 
@@ -99,21 +90,17 @@ func taskCall(t *testing.T, args string) model.ToolCall {
 // rejected — Prepare owns the semantics.
 func TestNormalizeTaskArguments(t *testing.T) {
 	got, err := taskTool{}.Normalize(runtime.ToolContext{}, taskCall(t, `{"prompt":"do it","subagent_type":"secondary","extra":42,"_lightcode_probe":"secret"}`))
-	if err != nil {
-		t.Fatalf("Normalize: %v", err)
-	}
+	testassert.NoError(t, err)
 	var args map[string]any
-	if err := json.Unmarshal(got, &args); err != nil {
-		t.Fatalf("normalized arguments: %v", err)
+	testassert.NoError(t, json.Unmarshal(got, &args))
+	{
+		_, ok := args["_lightcode_probe"]
+		testassert.Check(t, !ok, "normalized arguments retained the private field: %s", got)
 	}
-	if _, ok := args["_lightcode_probe"]; ok {
-		t.Errorf("normalized arguments retained the private field: %s", got)
-	}
-	if args["prompt"] != "do it" || args["subagent_type"] != "secondary" {
-		t.Errorf("normalized arguments = %s, want the members preserved", got)
-	}
-	if extra, ok := args["extra"].(float64); !ok || extra != 42 {
-		t.Errorf("normalized arguments = %s, want the unrelated member preserved", got)
+	testassert.Check(t, args["prompt"] == "do it" && args["subagent_type"] == "secondary", "normalized arguments = %s, want the members preserved", got)
+	{
+		extra, ok := args["extra"].(float64)
+		testassert.Check(t, ok && extra == 42, "normalized arguments = %s, want the unrelated member preserved", got)
 	}
 	rejected := []struct {
 		args string
@@ -127,9 +114,7 @@ func TestNormalizeTaskArguments(t *testing.T) {
 	for _, tc := range rejected {
 		tool := taskTool{}
 		_, err := tool.Normalize(runtime.ToolContext{}, taskCall(t, tc.args))
-		if err == nil || err.Error() != tc.want {
-			t.Errorf("Normalize(%s) error = %v, want exactly %q", tc.args, err, tc.want)
-		}
+		testassert.Check(t, err != nil && err.Error() == tc.want, "Normalize(%s) error = %v, want exactly %q", tc.args, err, tc.want)
 	}
 }
 
@@ -146,24 +131,21 @@ func TestPrepareRejectsMissingAndUnknown(t *testing.T) {
 	prepare := func(args string) string {
 		t.Helper()
 		plan := taskTool{}.Prepare(context.Background(), tc, taskCall(t, args))
-		if plan.Immediate == nil {
-			t.Fatalf("Prepare(%s) = %+v, want an immediate validation error", args, plan)
-		}
-		if plan.Permissions != nil || plan.Execute != nil {
-			t.Errorf("Prepare(%s) declared execution behind a validation error", args)
-		}
-		if plan.Immediate.Result.Status != model.ResultError {
-			t.Errorf("Prepare(%s) status = %q, want %q", args, plan.Immediate.Result.Status, model.ResultError)
-		}
+		testassert.Require(t, plan.Immediate != nil, "Prepare(%s) = %+v, want an immediate validation error", args, plan)
+		testassert.Check(t, plan.Permissions == nil && plan.Execute == nil, "Prepare(%s) declared execution behind a validation error", args)
+		testassert.Check(t, plan.Immediate.Result.Status == model.ResultError, "Prepare(%s) status = %q, want %q", args, plan.Immediate.Result.Status, model.ResultError)
 		return plan.Immediate.Result.Content
 	}
-	if got := prepare(`{}`); got != "missing 'prompt' parameter" {
-		t.Errorf("missing prompt content = %q, want %q", got, "missing 'prompt' parameter")
+	{
+		got := prepare(`{}`)
+		testassert.Check(t, got == "missing 'prompt' parameter", "missing prompt content = %q, want %q", got, "missing 'prompt' parameter")
 	}
-	if got := prepare(`{"prompt":"do it"}`); got != "missing 'subagent_type' parameter" {
-		t.Errorf("missing subagent_type content = %q, want %q", got, "missing 'subagent_type' parameter")
+	{
+		got := prepare(`{"prompt":"do it"}`)
+		testassert.Check(t, got == "missing 'subagent_type' parameter", "missing subagent_type content = %q, want %q", got, "missing 'subagent_type' parameter")
 	}
-	if got := prepare(`{"prompt":"do it","subagent_type":"ghost"}`); got != `unknown subagent type "ghost": unknown agent type "ghost"` {
-		t.Errorf("unknown type content = %q, want the retained wrapped shape over the roster resolver's error", got)
+	{
+		got := prepare(`{"prompt":"do it","subagent_type":"ghost"}`)
+		testassert.Check(t, got == `unknown subagent type "ghost": unknown agent type "ghost"`, "unknown type content = %q, want the retained wrapped shape over the roster resolver's error", got)
 	}
 }

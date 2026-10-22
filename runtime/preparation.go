@@ -429,8 +429,6 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	// transport are kept. The recorded compact configuration is always the
 	// final effective model's.
 	compactRef := sel.agent.Model
-	compactWindow := entry.ContextWindow
-	compactReserve := outputReserve(entry.MaxOutputTokens)
 	compactTransport := transport
 	if !compactType.Model.IsZero() && compactType.Model != sel.agent.Model {
 		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compactType.Model.Provider, Model: compactType.Model.Model})
@@ -445,8 +443,6 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 				built, buildErr := p.concreteTransport(compactProvider, compactEntry, compactType.Model, compactKey)
 				if buildErr == nil {
 					compactRef = compactType.Model
-					compactWindow = compactEntry.ContextWindow
-					compactReserve = outputReserve(compactEntry.MaxOutputTokens)
 					compactTransport = built
 				}
 			}
@@ -493,10 +489,8 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		Readonly:              sel.agent.Readonly,
 		WriteDir:              sel.agent.WriteDir,
 		Compact: harness.CompactCapture{
-			Model:         compactRef,
-			ContextWindow: compactWindow,
-			OutputReserve: compactReserve,
-			SystemPrompt:  compactType.Prompt,
+			Model:        compactRef,
+			SystemPrompt: compactType.Prompt,
 		},
 	}
 	workspace := req.Session.Identity.Workspace

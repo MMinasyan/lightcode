@@ -17,6 +17,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/clientops"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -63,9 +64,7 @@ func (d *scriptDoer) Do(request *http.Request) (*http.Response, error) {
 
 func (d *scriptDoer) one(t *testing.T) scriptCall {
 	t.Helper()
-	if len(d.calls) != 1 {
-		t.Fatalf("transport received %d requests, want exactly one", len(d.calls))
-	}
+	testassert.Equal(t, len(d.calls), 1)
 	return d.calls[0]
 }
 
@@ -83,9 +82,7 @@ func newScriptFixture(t *testing.T) (*client.Client, *scriptDoer) {
 	t.Helper()
 	doer := &scriptDoer{}
 	generated, err := protocol.NewClientWithResponses("http://runtime.invalid", protocol.WithHTTPClient(doer))
-	if err != nil {
-		t.Fatalf("NewClientWithResponses: %v", err)
-	}
+	testassert.NoError(t, err)
 	return &client.Client{ClientWithResponses: generated}, doer
 }
 
@@ -406,42 +403,24 @@ func TestCallDispatchesEveryOperation(t *testing.T) {
 				return scriptedResponse(tc.status, tc.response), nil
 			}
 			result, err := clientops.Call(context.Background(), c, tc.operation, json.RawMessage(tc.params))
-			if err != nil {
-				t.Fatalf("Call(%s) = %v", tc.operation, err)
-			}
+			testassert.Require(t, err == nil, "Call(%s) = %v", tc.operation, err)
 			call := doer.one(t)
-			if call.method != tc.method {
-				t.Errorf("method = %q, want %q", call.method, tc.method)
-			}
-			if call.path != tc.path {
-				t.Errorf("path = %q, want %q", call.path, tc.path)
-			}
-			if call.rawQuery != tc.rawQuery {
-				t.Errorf("query = %q, want %q", call.rawQuery, tc.rawQuery)
-			}
-			if call.body != tc.body {
-				t.Errorf("body = %q, want %q", call.body, tc.body)
-			}
-			if tc.body != "" && call.contentType != "application/json" {
-				t.Errorf("content type = %q, want application/json", call.contentType)
-			}
+			testassert.Check(t, call.method == tc.method, "method = %q, want %q", call.method, tc.method)
+			testassert.Check(t, call.path == tc.path, "path = %q, want %q", call.path, tc.path)
+			testassert.Check(t, call.rawQuery == tc.rawQuery, "query = %q, want %q", call.rawQuery, tc.rawQuery)
+			testassert.Check(t, call.body == tc.body, "body = %q, want %q", call.body, tc.body)
+			testassert.Check(t, tc.body == "" || call.contentType == "application/json", "content type = %q, want application/json", call.contentType)
 			want := tc.response
 			if tc.status == http.StatusNoContent {
 				want = "null"
 			}
-			if string(result) != want {
-				t.Errorf("result = %s, want %s", result, want)
-			}
+			testassert.Check(t, string(result) == want, "result = %s, want %s", result, want)
 		})
 	}
 	names := clientops.OperationNames()
-	if len(names) != len(seen) {
-		t.Fatalf("dispatch table covers %d of %d supported operations", len(seen), len(names))
-	}
+	testassert.Equal(t, len(names), len(seen))
 	for _, name := range names {
-		if !seen[name] {
-			t.Errorf("supported operation %q has no dispatch case", name)
-		}
+		testassert.Check(t, seen[name], "supported operation %q has no dispatch case", name)
 	}
 }
 
@@ -454,12 +433,8 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
-		if err != nil {
-			t.Fatalf("Call(GetHealth, %q) = %v", params, err)
-		}
-		if string(result) == "" {
-			t.Fatal("GetHealth returned no result")
-		}
+		testassert.Require(t, err == nil, "Call(GetHealth, %q) = %v", params, err)
+		testassert.Require(t, string(result) != "", "GetHealth returned no result")
 	}
 }
 
@@ -515,15 +490,9 @@ func TestCallRejectsForbiddenEnvelope(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, doer := newScriptFixture(t)
 			result, err := clientops.Call(context.Background(), c, tc.operation, json.RawMessage(tc.params))
-			if len(doer.calls) != 0 {
-				t.Fatalf("transport received %d requests for a rejected envelope", len(doer.calls))
-			}
-			if err == nil {
-				t.Fatalf("Call(%s, %s) = %s, want a local invalid-params failure", tc.operation, tc.params, result)
-			}
-			if !errors.Is(err, clientops.ErrInvalidParams) {
-				t.Fatalf("error = %v, want clientops.ErrInvalidParams", err)
-			}
+			testassert.Equal(t, len(doer.calls), 0)
+			testassert.Require(t, err != nil, "Call(%s, %s) = %s, want a local invalid-params failure", tc.operation, tc.params, result)
+			testassert.Require(t, errors.Is(err, clientops.ErrInvalidParams), "error = %v, want clientops.ErrInvalidParams", err)
 		})
 	}
 }
@@ -532,13 +501,12 @@ func TestCallRejectsForbiddenEnvelope(t *testing.T) {
 // coverage lives in the invocation-table test.
 func TestOperationNames(t *testing.T) {
 	names := clientops.OperationNames()
-	if len(names) == 0 {
-		t.Fatal("OperationNames() is empty")
-	}
+	testassert.Require(t, len(names) != 0, "OperationNames() is empty")
 	first := names[0]
 	names[0] = "Mutated"
-	if again := clientops.OperationNames(); again[0] != first {
-		t.Fatalf("OperationNames() returned shared state: %q", again[0])
+	{
+		again := clientops.OperationNames()
+		testassert.Equal(t, again[0], first)
 	}
 }
 
@@ -557,12 +525,8 @@ func TestInvocationSurfaceMatchesSchema(t *testing.T) {
 		methods := item.Operations()
 		for _, method := range sortedKeys(methods) {
 			operation := methods[method]
-			if operation.OperationID == "" {
-				t.Fatalf("%s %s: operation has no operationId", method, path)
-			}
-			if declared[operation.OperationID] || streamed[operation.OperationID] {
-				t.Fatalf("operation %q is declared twice", operation.OperationID)
-			}
+			testassert.Require(t, operation.OperationID != "", "%s %s: operation has no operationId", method, path)
+			testassert.Require(t, !declared[operation.OperationID] && !streamed[operation.OperationID], "operation %q is declared twice", operation.OperationID)
 			if operationDeclaresStream(t, operation) {
 				streamed[operation.OperationID] = true
 				continue
@@ -570,63 +534,42 @@ func TestInvocationSurfaceMatchesSchema(t *testing.T) {
 			declared[operation.OperationID] = true
 		}
 	}
-	if len(declared) == 0 || len(streamed) == 0 {
-		t.Fatalf("schema declares %d native operations and %d event streams; both sets must be non-empty", len(declared), len(streamed))
-	}
+	testassert.Require(t, len(declared) != 0 && len(streamed) != 0, "schema declares %d native operations and %d event streams; both sets must be non-empty", len(declared), len(streamed))
 	names := clientops.OperationNames()
-	if !sort.StringsAreSorted(names) {
-		t.Errorf("OperationNames() is not sorted: %v", names)
-	}
+	testassert.Check(t, sort.StringsAreSorted(names), "OperationNames() is not sorted: %v", names)
 	advertised := map[string]bool{}
 	for _, name := range names {
-		if !declared[name] {
-			t.Errorf("advertised operation %q is not a declared native operation", name)
-		}
-		if advertised[name] {
-			t.Errorf("advertised operation %q appears twice", name)
-		}
+		testassert.Check(t, declared[name], "advertised operation %q is not a declared native operation", name)
+		testassert.Check(t, !advertised[name], "advertised operation %q appears twice", name)
 		advertised[name] = true
 	}
 	dispatched := map[string]bool{}
 	for _, tc := range dispatchCases {
-		if !declared[tc.operation] {
-			t.Errorf("dispatch case %q names %q, which is not a declared native operation", tc.name, tc.operation)
-		}
+		testassert.Check(t, declared[tc.operation], "dispatch case %q names %q, which is not a declared native operation", tc.name, tc.operation)
 		dispatched[tc.operation] = true
 	}
 	for name := range declared {
-		if !advertised[name] {
-			t.Errorf("declared native operation %q is not advertised", name)
-		}
-		if !dispatched[name] {
-			t.Errorf("declared native operation %q has no dispatch case", name)
-		}
+		testassert.Check(t, advertised[name], "declared native operation %q is not advertised", name)
+		testassert.Check(t, dispatched[name], "declared native operation %q has no dispatch case", name)
 	}
 	for name := range streamed {
-		if advertised[name] {
-			t.Errorf("declared event stream %q is advertised as a native operation", name)
-		}
+		testassert.Check(t, !advertised[name], "declared event stream %q is advertised as a native operation", name)
 	}
 	// The test-only native invocation contract is the second generated
 	// artifact: its root must name exactly the schema's native operations and
 	// carry no stream entry.
 	contractData, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "generated", "native-invocations.json"))
-	if err != nil {
-		t.Fatalf("reading the native invocation contract: %v", err)
-	}
+	testassert.NoError(t, err)
 	var contract map[string]json.RawMessage
-	if err := json.Unmarshal(contractData, &contract); err != nil {
-		t.Fatalf("decoding the native invocation contract: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal(contractData, &contract))
 	for name := range declared {
-		if _, ok := contract[name]; !ok {
-			t.Errorf("declared native operation %q is missing from the native invocation contract", name)
+		{
+			_, ok := contract[name]
+			testassert.Check(t, ok, "declared native operation %q is missing from the native invocation contract", name)
 		}
 	}
 	for name := range contract {
-		if !declared[name] {
-			t.Errorf("the native invocation contract names %q, which is not a declared native operation", name)
-		}
+		testassert.Check(t, declared[name], "the native invocation contract names %q, which is not a declared native operation", name)
 	}
 }
 
@@ -638,9 +581,7 @@ func operationDeclaresStream(t *testing.T, operation *openapi3.Operation) bool {
 		if len(status) != 3 || status[0] != '2' {
 			continue
 		}
-		if response.Value == nil {
-			t.Fatalf("operation %s success status %s is unresolved", operation.OperationID, status)
-		}
+		testassert.Require(t, response.Value != nil, "operation %s success status %s is unresolved", operation.OperationID, status)
 		if response.Value.Content["text/event-stream"] != nil {
 			return true
 		}
@@ -654,12 +595,8 @@ func schemaDocument(t *testing.T) *openapi3.T {
 	t.Helper()
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(filepath.Join("..", "..", "protocol", "openapi.yaml"))
-	if err != nil {
-		t.Fatalf("loading the protocol schema: %v", err)
-	}
-	if err := doc.Validate(context.Background()); err != nil {
-		t.Fatalf("validating the protocol schema: %v", err)
-	}
+	testassert.NoError(t, err)
+	testassert.NoError(t, doc.Validate(context.Background()))
 	return doc
 }
 
@@ -690,51 +627,27 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		const payload = `{"code":"conflict","message":"in use","session_id":"s1"}`
 		status, raw, err := invokeRejection(t, payload)
 		var responseErr *clientops.ResponseError
-		if !errors.As(err, &responseErr) {
-			t.Fatalf("error = %v, want *clientops.ResponseError", err)
-		}
-		if status != http.StatusConflict || string(raw) != payload {
-			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
-		}
-		if responseErr.Status != http.StatusConflict {
-			t.Errorf("status = %d, want %d", responseErr.Status, http.StatusConflict)
-		}
-		if responseErr.Payload.Code != protocol.Conflict || responseErr.Payload.Message != "in use" {
-			t.Errorf("payload = %+v", responseErr.Payload)
-		}
-		if responseErr.Partial != nil {
-			t.Errorf("partial = %+v, want nil", responseErr.Partial)
-		}
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
+		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
+		testassert.Check(t, responseErr.Status == http.StatusConflict, "status = %d, want %d", responseErr.Status, http.StatusConflict)
+		testassert.Check(t, responseErr.Payload.Code == protocol.Conflict && responseErr.Payload.Message == "in use", "payload = %+v", responseErr.Payload)
+		testassert.Check(t, responseErr.Partial == nil, "partial = %+v, want nil", responseErr.Partial)
 		if responseErr.Error() != "in use" {
 			t.Errorf("Error() = %q, want the returned message", responseErr.Error())
 		}
 		// Declared and malformed remain disjoint outcomes.
-		if errors.Is(err, clientops.ErrInvalidResponse) {
-			t.Fatalf("declared rejection wrapped ErrInvalidResponse: %v", err)
-		}
+		testassert.Require(t, !errors.Is(err, clientops.ErrInvalidResponse), "declared rejection wrapped ErrInvalidResponse: %v", err)
 	})
 	t.Run("partial result", func(t *testing.T) {
 		const payload = `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","error":"denied"}]}`
 		status, raw, err := invokeRejection(t, payload)
 		var responseErr *clientops.ResponseError
-		if !errors.As(err, &responseErr) {
-			t.Fatalf("error = %v, want *clientops.ResponseError", err)
-		}
-		if status != http.StatusConflict || string(raw) != payload {
-			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
-		}
-		if responseErr.Partial == nil {
-			t.Fatal("partial = nil, want the complete generated result")
-		}
-		if len(responseErr.Partial.Restored) != 1 || responseErr.Partial.Restored[0] != "a.go" {
-			t.Errorf("restored = %v", responseErr.Partial.Restored)
-		}
-		if len(responseErr.Partial.Skipped) != 1 || responseErr.Partial.Skipped[0].Path != "b.go" {
-			t.Errorf("skipped = %v", responseErr.Partial.Skipped)
-		}
-		if responseErr.Payload.Message != "partial restore" {
-			t.Errorf("payload = %+v", responseErr.Payload)
-		}
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
+		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
+		testassert.Require(t, responseErr.Partial != nil, "partial = nil, want the complete generated result")
+		testassert.Check(t, len(responseErr.Partial.Restored) == 1 && responseErr.Partial.Restored[0] == "a.go", "restored = %v", responseErr.Partial.Restored)
+		testassert.Check(t, len(responseErr.Partial.Skipped) == 1 && responseErr.Partial.Skipped[0].Path == "b.go", "skipped = %v", responseErr.Partial.Skipped)
+		testassert.Check(t, responseErr.Payload.Message == "partial restore", "payload = %+v", responseErr.Payload)
 		if responseErr.Error() != "partial restore" {
 			t.Errorf("Error() = %q", responseErr.Error())
 		}
@@ -742,9 +655,7 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 	t.Run("partial result with empty arrays", func(t *testing.T) {
 		_, _, err := invokeRejection(t, `{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`)
 		var responseErr *clientops.ResponseError
-		if !errors.As(err, &responseErr) || responseErr.Partial == nil {
-			t.Fatalf("error = %v, want a partial result", err)
-		}
+		testassert.Require(t, errors.As(err, &responseErr) && responseErr.Partial != nil, "error = %v, want a partial result", err)
 	})
 }
 
@@ -783,12 +694,8 @@ func TestInvokeRejectsMalformedRejectionBodies(t *testing.T) {
 				return scriptedResponse(http.StatusConflict, tc.body), nil
 			}
 			status, raw, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
-			if err == nil {
-				t.Fatal("Invoke accepted a malformed body")
-			}
-			if status != http.StatusConflict || string(raw) != tc.body {
-				t.Fatalf("Invoke = (%d, %q), want the received status and body", status, raw)
-			}
+			testassert.Require(t, err != nil, "Invoke accepted a malformed body")
+			testassert.Require(t, status == http.StatusConflict && string(raw) == tc.body, "Invoke = (%d, %q), want the received status and body", status, raw)
 			assertInvalidDelivery(t, err)
 		})
 	}
@@ -830,12 +737,8 @@ func TestCallResponseMappingAndTransportFailures(t *testing.T) {
 		}
 		_, err := clientops.Call(context.Background(), c, "GetSessionHydration", json.RawMessage(`{"session_id":"gone"}`))
 		var responseErr *clientops.ResponseError
-		if !errors.As(err, &responseErr) {
-			t.Fatalf("error = %v, want *clientops.ResponseError", err)
-		}
-		if responseErr.Status != http.StatusNotFound || responseErr.Error() != "no such session" {
-			t.Fatalf("response error = %+v", responseErr)
-		}
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
+		testassert.Require(t, responseErr.Status == http.StatusNotFound && responseErr.Error() == "no such session", "response error = %+v", responseErr)
 	})
 	t.Run("received partial result", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
@@ -844,21 +747,15 @@ func TestCallResponseMappingAndTransportFailures(t *testing.T) {
 		}
 		_, err := clientops.Call(context.Background(), c, "RevertSessionCode", json.RawMessage(`{"session_id":"s1","body":{}}`))
 		var responseErr *clientops.ResponseError
-		if !errors.As(err, &responseErr) || responseErr.Partial == nil {
-			t.Fatalf("error = %v, want a partial response error", err)
-		}
-		if len(responseErr.Partial.Restored) != 1 {
-			t.Fatalf("partial = %+v", responseErr.Partial)
-		}
+		testassert.Require(t, errors.As(err, &responseErr) && responseErr.Partial != nil, "error = %v, want a partial response error", err)
+		testassert.Require(t, len(responseErr.Partial.Restored) == 1, "partial = %+v", responseErr.Partial)
 	})
 	t.Run("transport failure", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
 		want := errors.New("dial failed")
 		doer.respond = func(*http.Request) (*http.Response, error) { return nil, want }
 		_, err := clientops.Call(context.Background(), c, "GetHealth", nil)
-		if !errors.Is(err, want) {
-			t.Fatalf("error = %v, want the transport error", err)
-		}
+		testassert.Require(t, errors.Is(err, want), "error = %v, want the transport error", err)
 		assertTransportFailure(t, err)
 	})
 	t.Run("raw success bytes are returned unremarshaled", func(t *testing.T) {
@@ -868,12 +765,8 @@ func TestCallResponseMappingAndTransportFailures(t *testing.T) {
 			return scriptedResponse(http.StatusOK, body), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", nil)
-		if err != nil {
-			t.Fatalf("Call: %v", err)
-		}
-		if string(result) != body {
-			t.Fatalf("result = %s, want the exact response bytes %s", result, body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, string(result) == body, "result = %s, want the exact response bytes %s", result, body)
 	})
 }
 
@@ -895,9 +788,7 @@ func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
 			}, nil
 		}
 		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
-		if status != http.StatusOK || string(body) != `{"partial":` {
-			t.Fatalf("Invoke = (%d, %q), want the received status and partial bytes", status, body)
-		}
+		testassert.Require(t, status == http.StatusOK && string(body) == `{"partial":`, "Invoke = (%d, %q), want the received status and partial bytes", status, body)
 		assertInvalidDelivery(t, err)
 	})
 	t.Run("malformed success body", func(t *testing.T) {
@@ -906,9 +797,7 @@ func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
 			return scriptedResponse(http.StatusOK, "not json"), nil
 		}
 		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
-		if status != http.StatusOK || string(body) != "not json" {
-			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, body)
-		}
+		testassert.Require(t, status == http.StatusOK && string(body) == "not json", "Invoke = (%d, %q), want the received status and body", status, body)
 		assertInvalidDelivery(t, err)
 	})
 	t.Run("unexpected success status", func(t *testing.T) {
@@ -917,9 +806,7 @@ func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
 			return scriptedResponse(http.StatusCreated, `{}`), nil
 		}
 		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
-		if status != http.StatusCreated || string(body) != `{}` {
-			t.Fatalf("Invoke = (%d, %q), want the received status and body", status, body)
-		}
+		testassert.Require(t, status == http.StatusCreated && string(body) == `{}`, "Invoke = (%d, %q), want the received status and body", status, body)
 		assertInvalidDelivery(t, err)
 	})
 	t.Run("valid 204 returns its status and empty body", func(t *testing.T) {
@@ -928,28 +815,20 @@ func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
 			return scriptedResponse(http.StatusNoContent, ""), nil
 		}
 		status, body, err := clientops.Invoke(context.Background(), c, "DeleteSession", json.RawMessage(`{"session_id":"s1"}`))
-		if err != nil {
-			t.Fatalf("Invoke: %v", err)
-		}
-		if status != http.StatusNoContent || len(body) != 0 {
-			t.Fatalf("Invoke = (%d, %q), want the 204 status and empty body", status, body)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, status == http.StatusNoContent && len(body) == 0, "Invoke = (%d, %q), want the 204 status and empty body", status, body)
 	})
 	t.Run("local binding failure returns zero status and no body", func(t *testing.T) {
 		c, _ := newScriptFixture(t)
 		status, body, err := clientops.Invoke(context.Background(), c, "Nope", nil)
-		if status != 0 || body != nil || !errors.Is(err, clientops.ErrInvalidParams) {
-			t.Fatalf("Invoke = (%d, %q, %v), want the zero-status local binding failure", status, body, err)
-		}
+		testassert.Require(t, status == 0 && body == nil && errors.Is(err, clientops.ErrInvalidParams), "Invoke = (%d, %q, %v), want the zero-status local binding failure", status, body, err)
 	})
 	t.Run("transport failure returns zero status and no body", func(t *testing.T) {
 		c, doer := newScriptFixture(t)
 		want := errors.New("dial failed")
 		doer.respond = func(*http.Request) (*http.Response, error) { return nil, want }
 		status, body, err := clientops.Invoke(context.Background(), c, "GetHealth", nil)
-		if status != 0 || body != nil || !errors.Is(err, want) {
-			t.Fatalf("Invoke = (%d, %q, %v), want the zero-status transport failure", status, body, err)
-		}
+		testassert.Require(t, status == 0 && body == nil && errors.Is(err, want), "Invoke = (%d, %q, %v), want the zero-status transport failure", status, body, err)
 	})
 }
 
@@ -975,31 +854,14 @@ func (r *failingReader) Close() error { return nil }
 // ResponseError or a local binding failure.
 func assertInvalidDelivery(t *testing.T, err error) {
 	t.Helper()
-	if !errors.Is(err, clientops.ErrInvalidResponse) {
-		t.Fatalf("error = %v, want ErrInvalidResponse", err)
-	}
+	testassert.Require(t, errors.Is(err, clientops.ErrInvalidResponse), "error = %v, want ErrInvalidResponse", err)
 	var responseErr *clientops.ResponseError
-	if errors.As(err, &responseErr) {
-		t.Fatalf("invalid delivery mapped to a protocol error: %v", err)
-	}
-	if errors.Is(err, clientops.ErrInvalidParams) {
-		t.Fatalf("invalid delivery mapped to a local binding failure: %v", err)
-	}
+	testassert.Require(t, !errors.As(err, &responseErr) && !errors.Is(err, clientops.ErrInvalidParams), "invalid delivery mapped to a protocol error: %v; invalid delivery mapped to a local binding failure: %v", err, err)
 }
 
 func assertTransportFailure(t *testing.T, err error) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("want a failure")
-	}
+	testassert.Require(t, err != nil, "want a failure")
 	var responseErr *clientops.ResponseError
-	if errors.As(err, &responseErr) {
-		t.Fatalf("transport failure mapped to a protocol error: %v", err)
-	}
-	if errors.Is(err, clientops.ErrInvalidParams) {
-		t.Fatalf("transport failure mapped to a local binding failure: %v", err)
-	}
-	if errors.Is(err, clientops.ErrInvalidResponse) {
-		t.Fatalf("transport failure mapped to an invalid delivery: %v", err)
-	}
+	testassert.Require(t, !errors.As(err, &responseErr) && !errors.Is(err, clientops.ErrInvalidParams) && !errors.Is(err, clientops.ErrInvalidResponse), "transport failure mapped to a protocol error: %v; transport failure mapped to a local binding failure: %v; transport failure mapped to an invalid delivery: %v", err, err, err)
 }

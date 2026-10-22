@@ -15,6 +15,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -80,14 +81,10 @@ func convResultFact(entryID, assistantID, callID, status, content, metadata stri
 // Session/entry binding, stable per binding and distinct per binding.
 func TestConversationItemIDKnownVector(t *testing.T) {
 	const want = "4EngWdrqzp5Q-GPdY7_DFw"
-	if got := projectItemID(convSessionID, convEntryID); got != want {
-		t.Fatalf("projectItemID = %q, want the pinned vector %q", got, want)
-	}
+	testassert.Equal(t, projectItemID(convSessionID, convEntryID), want)
 	otherSession := projectItemID("ffffffffffffffffffffffffffffffff", convEntryID)
 	otherEntry := projectItemID(convSessionID, "ffffffffffffffffffffffffffffffff")
-	if otherSession == want || otherEntry == want || otherSession == otherEntry {
-		t.Fatalf("derived identities collide: %q %q %q", want, otherSession, otherEntry)
-	}
+	testassert.Require(t, otherSession != want && otherEntry != want && otherSession != otherEntry, "derived identities collide: %q %q %q", want, otherSession, otherEntry)
 }
 
 // TestConversationProjectionDeterministicItemKinds proves the exact item
@@ -151,152 +148,68 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 		},
 	}
 	items, err := projectConversation(convSessionID, facts)
-	if err != nil {
-		t.Fatalf("projectConversation: %v", err)
-	}
-	if len(items) != 7 { // the tool result stays absorbed
-		t.Fatalf("items = %d, want exactly the 7 projected facts", len(items))
-	}
+	testassert.NoError(t, err)
+	// the tool result stays absorbed
+	testassert.Equal(t, len(items), 7)
 
 	// The input item keeps its literal text and per-part extras.
 	input, err := items[0].AsInputItem()
-	if err != nil {
-		t.Fatalf("AsInputItem: %v", err)
-	}
-	if input.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01") ||
-		input.Origin != protocol.InputOriginUser ||
-		!input.CommittedAt.Equal(convTime) || input.OperationId == nil || *input.OperationId != "op-1" {
-		t.Fatalf("input item = %+v, want the op-1 user input at the pinned identity", input)
-	}
-	if len(input.Content) != 3 {
-		t.Fatalf("input content = %d parts, want 3", len(input.Content))
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, input.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01") && input.Origin == protocol.InputOriginUser && input.CommittedAt.Equal(convTime) && input.OperationId != nil && *input.OperationId == "op-1" && len(input.Content) == 3, "input item = %+v, want the op-1 user input at the pinned identity; got %v, want %v", input, len(input.Content), 3)
 	textPart, err := input.Content[0].AsTextPart()
-	if err != nil || textPart.Text != "Operation interrupted." {
-		t.Fatalf("first part = %+v err %v, want the literal user text", textPart, err)
-	}
+	testassert.Require(t, err == nil && textPart.Text == "Operation interrupted.", "first part = %+v err %v, want the literal user text", textPart, err)
 	imagePart, err := input.Content[1].AsImageURLPart()
-	if err != nil || imagePart.Url != "https://img.test/p.png" {
-		t.Fatalf("second part = %+v err %v, want the image part", imagePart, err)
-	}
+	testassert.Require(t, err == nil && imagePart.Url == "https://img.test/p.png", "second part = %+v err %v, want the image part", imagePart, err)
 	opaquePart, err := input.Content[2].AsOpaquePart()
-	if err != nil || opaquePart.OpaqueWireType != "thinking" || opaquePart.Extra == nil || string((*opaquePart.Extra)["depth"]) != `1e1000` {
-		t.Fatalf("third part = %+v err %v, want the opaque part with its raw extra", opaquePart, err)
-	}
+	testassert.Require(t, err == nil && opaquePart.OpaqueWireType == "thinking" && opaquePart.Extra != nil && string((*opaquePart.Extra)["depth"]) == `1e1000`, "third part = %+v err %v, want the opaque part with its raw extra", opaquePart, err)
 
 	// The assistant item is indivisible: both calls in published order, the
 	// first carrying its terminal outcome, the second pending.
 	assistant, err := items[1].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
-	if assistant.Status != protocol.AssistantItemStatusCompleted || assistant.Source != "prov/m" ||
-		assistant.ItemId != projectItemID(convSessionID, assistantID) ||
-		!assistant.CommittedAt.Equal(convTime) {
-		t.Fatalf("assistant item = %+v, want the completed prov/m item at the pinned identity and commit time", assistant)
-	}
-	if assistant.Extra == nil || string((*assistant.Extra)["model_extra"]) != `{"k":1}` {
-		t.Fatalf("assistant extra = %v, want the validated message-level extra", assistant.Extra)
-	}
-	if assistant.Refusal == nil || *assistant.Refusal != "no" {
-		t.Fatalf("assistant refusal = %v, want the projected refusal", assistant.Refusal)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, assistant.Status == protocol.AssistantItemStatusCompleted && assistant.Source == "prov/m" && assistant.ItemId == projectItemID(convSessionID, assistantID) && assistant.CommittedAt.Equal(convTime) && assistant.Extra != nil && string((*assistant.Extra)["model_extra"]) == `{"k":1}` && assistant.Refusal != nil && *assistant.Refusal == "no", "assistant item = %+v, want the completed prov/m item at the pinned identity and commit time; assistant extra = %v, want the validated message-level extra; assistant refusal = %v, want the projected refusal", assistant, assistant.Extra, assistant.Refusal)
 	textPart, err = assistant.Content[0].AsTextPart()
-	if err != nil || textPart.Extra == nil || string((*textPart.Extra)["grade"]) != `9007199254740993` {
-		t.Fatalf("assistant part extra = %+v err %v, want the raw number preserved", textPart, err)
-	}
-	if len(assistant.ToolCalls) != 2 ||
-		assistant.ToolCalls[0].Id != "call-1" || assistant.ToolCalls[1].Id != "call-2" {
-		t.Fatalf("tool calls = %+v, want call-1 then call-2 in published order", assistant.ToolCalls)
-	}
+	testassert.Require(t, err == nil && textPart.Extra != nil && string((*textPart.Extra)["grade"]) == `9007199254740993`, "assistant part extra = %+v err %v, want the raw number preserved", textPart, err)
+	testassert.Require(t, len(assistant.ToolCalls) == 2 && assistant.ToolCalls[0].Id == "call-1" && assistant.ToolCalls[1].Id == "call-2", "tool calls = %+v, want call-1 then call-2 in published order", assistant.ToolCalls)
 	call1 := assistant.ToolCalls[0]
-	if call1.Arguments != `{"n":9007199254740993}` {
-		t.Fatalf("call-1 arguments = %q, want the decoded raw text", call1.Arguments)
-	}
+	testassert.Equal(t, call1.Arguments, `{"n":9007199254740993}`)
 	// The call-level extra is its own level, independent of the message and
 	// content-part extras, with the same raw-number fidelity.
-	if call1.Extra == nil || string((*call1.Extra)["tool_extra"]) != `{"tool_n":9007199254740993}` {
-		t.Fatalf("call-1 extra = %v, want the call-level extra with its raw number", call1.Extra)
-	}
-	if call1.NormalizedArguments == nil || string((*call1.NormalizedArguments)["x"]) != `1e1000` {
-		t.Fatalf("call-1 normalized arguments = %v, want the raw object", call1.NormalizedArguments)
-	}
-	if call1.Status == nil || *call1.Status != protocol.ToolCallStatusSuccess ||
-		call1.Content == nil || *call1.Content != "" {
-		t.Fatalf("call-1 terminal outcome = (%v, %v), want success with a present empty content", call1.Status, call1.Content)
-	}
-	if call1.Metadata == nil || string(*call1.Metadata) != `{"rows":1e1000,"zero":0}` {
-		t.Fatalf("call-1 metadata = %v, want the raw value preserved", call1.Metadata)
-	}
+	testassert.Require(t, call1.Extra != nil && string((*call1.Extra)["tool_extra"]) == `{"tool_n":9007199254740993}` && call1.NormalizedArguments != nil && string((*call1.NormalizedArguments)["x"]) == `1e1000` && call1.Status != nil && *call1.Status == protocol.ToolCallStatusSuccess && call1.Content != nil && *call1.Content == "" && call1.Metadata != nil && string(*call1.Metadata) == `{"rows":1e1000,"zero":0}`, "call-1 extra = %v, want the call-level extra with its raw number; call-1 normalized arguments = %v, want the raw object; call-1 terminal outcome = (%v, %v), want success with a present empty content; call-1 metadata = %v, want the raw value preserved", call1.Extra, call1.NormalizedArguments, call1.Status, call1.Content, call1.Metadata)
 	call2 := assistant.ToolCalls[1]
-	if call2.Status != nil || call2.Content != nil || call2.Metadata != nil || call2.NormalizedArguments != nil {
-		t.Fatalf("pending call-2 = %+v, want every terminal member omitted", call2)
-	}
-	if call2.Arguments != `[]` {
-		t.Fatalf("call-2 arguments = %q, want the decoded raw text", call2.Arguments)
-	}
+	testassert.Require(t, call2.Status == nil && call2.Content == nil && call2.Metadata == nil && call2.NormalizedArguments == nil && call2.Arguments == `[]`, "pending call-2 = %+v, want every terminal member omitted; got %v, want %v", call2, call2.Arguments, `[]`)
 
 	// The signals carry their typed subtypes; the background completion names
 	// its related member and no operation. Every kind's item identity is the
 	// fixture entry bound to this fixture Session's namespace.
 	interruption, err := items[2].AsSignalItem()
-	if err != nil || interruption.Subtype != protocol.SignalItemSubtypeInterruption ||
-		interruption.Content != "Operation interrupted." || interruption.OperationId == nil {
-		t.Fatalf("interruption item = %+v err %v, want the typed interruption signal", interruption, err)
-	}
-	if interruption.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05") {
-		t.Fatalf("interruption item_id = %q, want the fixture entry's namespace identity", interruption.ItemId)
-	}
+	testassert.Require(t, err == nil && interruption.Subtype == protocol.SignalItemSubtypeInterruption && interruption.Content == "Operation interrupted." && interruption.OperationId != nil, "interruption item = %+v err %v, want the typed interruption signal", interruption, err)
+	testassert.Require(t, interruption.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05"), "interruption item_id = %q, want the fixture entry's namespace identity", interruption.ItemId)
 	completion, err := items[3].AsSignalItem()
-	if err != nil || completion.Subtype != protocol.SignalItemSubtypeBackgroundCompletion ||
-		completion.Content != "the child finished" || completion.OperationId != nil ||
-		completion.RelatedMember == nil || completion.RelatedMember.Kind != protocol.BackgroundMemberKindChild || completion.RelatedMember.Id != "dddddddddddddddddddddddddddddd07" {
-		t.Fatalf("background completion item = %+v err %v, want the operationless typed signal with its member", completion, err)
-	}
-	if completion.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06") {
-		t.Fatalf("completion item_id = %q, want the fixture entry's namespace identity", completion.ItemId)
-	}
+	testassert.Require(t, err == nil && completion.Subtype == protocol.SignalItemSubtypeBackgroundCompletion && completion.Content == "the child finished" && completion.OperationId == nil && completion.RelatedMember != nil && completion.RelatedMember.Kind == protocol.BackgroundMemberKindChild && completion.RelatedMember.Id == "dddddddddddddddddddddddddddddd07", "background completion item = %+v err %v, want the operationless typed signal with its member", completion, err)
+	testassert.Require(t, completion.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06"), "completion item_id = %q, want the fixture entry's namespace identity", completion.ItemId)
 
 	// The compaction and terminal outcomes, each at its own entry's identity.
 	compaction, err := items[4].AsCompactionItem()
-	if err != nil || compaction.Summary != "summary two" || compaction.Model != "prov/m2" ||
-		compaction.OperationId == nil || *compaction.OperationId != "op-2" {
-		t.Fatalf("compaction item = %+v err %v, want the op-2 compaction", compaction, err)
-	}
-	if compaction.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08") {
-		t.Fatalf("compaction item_id = %q, want the fixture entry's namespace identity", compaction.ItemId)
-	}
+	testassert.Require(t, err == nil && compaction.Summary == "summary two" && compaction.Model == "prov/m2" && compaction.OperationId != nil && *compaction.OperationId == "op-2", "compaction item = %+v err %v, want the op-2 compaction", compaction, err)
+	testassert.Require(t, compaction.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08"), "compaction item_id = %q, want the fixture entry's namespace identity", compaction.ItemId)
 	failureEnd, err := items[5].AsOperationEndItem()
-	if err != nil || failureEnd.Status != protocol.OperationEndItemStatusFailure || failureEnd.Detail != "boom" {
-		t.Fatalf("failure end item = %+v err %v, want the failure detail", failureEnd, err)
-	}
-	if failureEnd.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa09") {
-		t.Fatalf("failure end item_id = %q, want the fixture entry's namespace identity", failureEnd.ItemId)
-	}
+	testassert.Require(t, err == nil && failureEnd.Status == protocol.OperationEndItemStatusFailure && failureEnd.Detail == "boom", "failure end item = %+v err %v, want the failure detail", failureEnd, err)
+	testassert.Require(t, failureEnd.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa09"), "failure end item_id = %q, want the fixture entry's namespace identity", failureEnd.ItemId)
 	successEnd, err := items[6].AsOperationEndItem()
-	if err != nil || successEnd.Status != protocol.OperationEndItemStatusSuccess || successEnd.Detail != "" {
-		t.Fatalf("success end item = %+v err %v, want the required present empty detail", successEnd, err)
-	}
-	if successEnd.ItemId != projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10") {
-		t.Fatalf("success end item_id = %q, want the fixture entry's namespace identity", successEnd.ItemId)
-	}
+	testassert.Require(t, err == nil && successEnd.Status == protocol.OperationEndItemStatusSuccess && successEnd.Detail == "", "success end item = %+v err %v, want the required present empty detail", successEnd, err)
+	testassert.Require(t, successEnd.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10"), "success end item_id = %q, want the fixture entry's namespace identity", successEnd.ItemId)
 
 	// Every item's wire shape is exactly its kind's schema surface, the raw
 	// entry identities never leave the facts, and the required arrays stay
 	// present.
 	for i, item := range items {
 		data, err := json.Marshal(item)
-		if err != nil {
-			t.Fatalf("marshal item %d: %v", i, err)
-		}
+		testassert.Require(t, err == nil, "marshal item %d: %v", i, err)
 		for _, raw := range []string{assistantID, resultID, "cccccccccccccccccccccccccccccc04"} {
-			if strings.Contains(string(data), raw) {
-				t.Fatalf("item %d wire = %s, want no raw entry identity %q", i, data, raw)
-			}
+			testassert.Require(t, !strings.Contains(string(data), raw), "item %d wire = %s, want no raw entry identity %q", i, data, raw)
 		}
-		if strings.Contains(string(data), "arguments_base64") || strings.Contains(string(data), "result_entry_id") {
-			t.Fatalf("item %d wire = %s, want no internal payload keys", i, data)
-		}
+		testassert.Require(t, !strings.Contains(string(data), "arguments_base64") && !strings.Contains(string(data), "result_entry_id"), "item %d wire = %s, want no internal payload keys", i, data)
 	}
 	assertExactJSONKeys(t, items[0], []string{
 		"committed_at", "content", "item_id", "kind", "operation_id", "origin",
@@ -306,29 +219,17 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 		"refusal", "source", "status", "tool_calls",
 	})
 	empty, err := json.Marshal(items[0])
-	if err != nil {
-		t.Fatalf("marshal input item: %v", err)
-	}
-	if !strings.Contains(string(empty), `"content":[`) {
-		t.Fatalf("input item wire = %s, want a present content array", empty)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(empty), `"content":[`), "input item wire = %s, want a present content array", empty)
 
 	// Determinism: a second projection of the same snapshot is identical.
 	again, err := projectConversation(convSessionID, facts)
-	if err != nil {
-		t.Fatalf("second projectConversation: %v", err)
-	}
+	testassert.NoError(t, err)
 	first, err := json.Marshal(items)
-	if err != nil {
-		t.Fatalf("marshal first projection: %v", err)
-	}
+	testassert.NoError(t, err)
 	second, err := json.Marshal(again)
-	if err != nil {
-		t.Fatalf("marshal second projection: %v", err)
-	}
-	if string(first) != string(second) {
-		t.Fatalf("second projection = %s, want the deterministic %s", second, first)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(first) == string(second), "second projection = %s, want the deterministic %s", second, first)
 }
 
 // TestConversationProjectionSameCallIDAcrossOperations proves the tool-result
@@ -370,36 +271,19 @@ func TestConversationProjectionSameCallIDAcrossOperations(t *testing.T) {
 		convResultFact(resultB, assistantB, "call-1", "success", "answer-b", `{"which":"b"}`),
 	}
 	items, err := projectConversation(convSessionID, facts)
-	if err != nil {
-		t.Fatalf("projectConversation: %v", err)
-	}
-	if len(items) != 2 { // the results stay absorbed
-		t.Fatalf("items = %d, want exactly the two assistants", len(items))
-	}
+	testassert.NoError(t, err)
+	// the results stay absorbed
+	testassert.Equal(t, len(items), 2)
 	first, err := items[0].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
+	testassert.NoError(t, err)
 	second, err := items[1].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
+	testassert.NoError(t, err)
 	// Independent item identities in the shared Session namespace.
-	if first.ItemId != projectItemID(convSessionID, assistantA) ||
-		second.ItemId != projectItemID(convSessionID, assistantB) ||
-		first.ItemId == second.ItemId {
-		t.Fatalf("item identities = (%q, %q), want each assistant's own namespace identity", first.ItemId, second.ItemId)
-	}
+	testassert.Require(t, first.ItemId == projectItemID(convSessionID, assistantA) && second.ItemId == projectItemID(convSessionID, assistantB) && first.ItemId != second.ItemId, "item identities = (%q, %q), want each assistant's own namespace identity", first.ItemId, second.ItemId)
 	// Each projected call carries its own assistant's result, never the
 	// same-ID sibling's.
-	if first.ToolCalls[0].Content == nil || *first.ToolCalls[0].Content != "answer-a" ||
-		first.ToolCalls[0].Metadata == nil || string(*first.ToolCalls[0].Metadata) != `{"which":"a"}` {
-		t.Fatalf("first call = %+v, want its own answer-a result", first.ToolCalls[0])
-	}
-	if second.ToolCalls[0].Content == nil || *second.ToolCalls[0].Content != "answer-b" ||
-		second.ToolCalls[0].Metadata == nil || string(*second.ToolCalls[0].Metadata) != `{"which":"b"}` {
-		t.Fatalf("second call = %+v, want its own answer-b result", second.ToolCalls[0])
-	}
+	testassert.Require(t, first.ToolCalls[0].Content != nil && *first.ToolCalls[0].Content == "answer-a" && first.ToolCalls[0].Metadata != nil && string(*first.ToolCalls[0].Metadata) == `{"which":"a"}`, "first call = %+v, want its own answer-a result", first.ToolCalls[0])
+	testassert.Require(t, second.ToolCalls[0].Content != nil && *second.ToolCalls[0].Content == "answer-b" && second.ToolCalls[0].Metadata != nil && string(*second.ToolCalls[0].Metadata) == `{"which":"b"}`, "second call = %+v, want its own answer-b result", second.ToolCalls[0])
 }
 
 // TestConversationProjectionMetadataShapeFidelity pins the tool-owned
@@ -430,27 +314,22 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 				convResultFact(resultID, assistantID, "call-1", "success", "out", raw),
 			}
 			items, err := projectConversation(convSessionID, facts)
-			if err != nil {
-				t.Fatalf("projectConversation: %v", err)
-			}
+			testassert.NoError(t, err)
 			// The generated union's own encoding compacts raw values, so the
 			// fidelity contract is the compacted byte form: every value stays
 			// byte-exact after compaction, never re-decoded to a Go float.
 			var compacted bytes.Buffer
-			if err := json.Compact(&compacted, []byte(raw)); err != nil {
-				t.Fatalf("compacting %s: %v", raw, err)
+			{
+				err := json.Compact(&compacted, []byte(raw))
+				testassert.Require(t, err == nil, "compacting %s: %v", raw, err)
 			}
 			assistant, err := items[0].AsAssistantItem()
-			if err != nil {
-				t.Fatalf("AsAssistantItem: %v", err)
-			}
+			testassert.NoError(t, err)
 			if assistant.ToolCalls[0].Metadata == nil || string(*assistant.ToolCalls[0].Metadata) != compacted.String() {
 				t.Fatalf("projected metadata = %v, want %s preserved", assistant.ToolCalls[0].Metadata, compacted.String())
 			}
 			data, err := json.Marshal(items[0])
-			if err != nil {
-				t.Fatalf("marshal item: %v", err)
-			}
+			testassert.NoError(t, err)
 			if !strings.Contains(string(data), compacted.String()) {
 				t.Fatalf("item wire = %s, want %s preserved", data, compacted.String())
 			}
@@ -470,17 +349,10 @@ func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
 		convResultFact(resultID, assistantID, "call-1", "denied", "Permission denied.", ""),
 	}
 	items, err := projectConversation(convSessionID, facts)
-	if err != nil {
-		t.Fatalf("projectConversation: %v", err)
-	}
+	testassert.NoError(t, err)
 	assistant, err := items[0].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
-	if assistant.ToolCalls[0].Metadata != nil ||
-		assistant.ToolCalls[0].Status == nil || *assistant.ToolCalls[0].Status != protocol.ToolCallStatusDenied {
-		t.Fatalf("denied call = %+v, want the denied status and omitted metadata", assistant.ToolCalls[0])
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, assistant.ToolCalls[0].Metadata == nil && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusDenied, "denied call = %+v, want the denied status and omitted metadata", assistant.ToolCalls[0])
 }
 
 // TestConversationProjectionRawArgumentText proves the decoded argument text
@@ -501,26 +373,14 @@ func TestConversationProjectionRawArgumentText(t *testing.T) {
 		}),
 	}
 	items, err := projectConversation(convSessionID, facts)
-	if err != nil {
-		t.Fatalf("projectConversation: %v", err)
-	}
+	testassert.NoError(t, err)
 	assistant, err := items[0].AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
-	if assistant.ToolCalls[0].Arguments != `[1,2,` {
-		t.Fatalf("malformed arguments = %q, want the raw text ungated", assistant.ToolCalls[0].Arguments)
-	}
-	if !strings.ContainsRune(assistant.ToolCalls[1].Arguments, '\uFFFD') {
-		t.Fatalf("non-UTF-8 arguments = %q, want the replacement text", assistant.ToolCalls[1].Arguments)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, assistant.ToolCalls[0].Arguments, `[1,2,`)
+	testassert.Require(t, strings.ContainsRune(assistant.ToolCalls[1].Arguments, '\uFFFD'), "non-UTF-8 arguments = %q, want the replacement text", assistant.ToolCalls[1].Arguments)
 	data, err := json.Marshal(items[0])
-	if err != nil {
-		t.Fatalf("marshal item: %v", err)
-	}
-	if strings.Contains(string(data), "arguments_base64") {
-		t.Fatalf("item wire = %s, want no base64 arguments", data)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(string(data), "arguments_base64"), "item wire = %s, want no base64 arguments", data)
 }
 
 // TestConversationProjectionHookEvidenceExcluded proves, over real validated
@@ -545,55 +405,37 @@ func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
 		e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 
 		runtimeSeen, _ := e.argHooks[0].received()
-		if len(runtimeSeen) != 1 {
-			t.Fatalf("argument hook received = %v, want the one real call", runtimeSeen)
-		}
+		testassert.Require(t, len(runtimeSeen) == 1, "argument hook received = %v, want the one real call", runtimeSeen)
 		entries, err := store.ReadEntries(context.Background(), session, 0)
-		if err != nil {
-			t.Fatalf("ReadEntries: %v", err)
-		}
+		testassert.NoError(t, err)
 		var hookEntries int
 		for _, entry := range entries {
 			if entry.Kind == harness.EntryHookResult {
 				hookEntries++
 			}
 		}
-		if hookEntries != 4 { // the hooky type's four argument hooks, one entry each
-			t.Fatalf("hook evidence entries = %d, want the four committed hook_result entries", hookEntries)
-		}
+		// the hooky type's four argument hooks, one entry each
+		testassert.Equal(t, hookEntries, 4)
 
 		view, err := e.sessionView(context.Background(), session)
-		if err != nil {
-			t.Fatalf("ReadSessionView: %v", err)
-		}
+		testassert.NoError(t, err)
 		hookFacts := historyFactsOf(view.History)
 		for _, fact := range hookFacts {
-			if fact.Kind == harness.EntryHookResult {
-				t.Fatal("hook evidence became a client fact")
-			}
+			testassert.Require(t, fact.Kind != harness.EntryHookResult, "hook evidence became a client fact")
 		}
 		items, err := projectConversation(view.Header.Identity.SessionID, hookFacts)
-		if err != nil {
-			t.Fatalf("projectConversation: %v", err)
-		}
+		testassert.NoError(t, err)
 		if len(items) != 4 { // input, publishing assistant, continuation assistant, end
 			t.Fatalf("items = %d (%s), want exactly the conversation items", len(items), itemKinds(t, items))
 		}
 		for _, item := range items {
 			data, err := json.Marshal(item)
-			if err != nil {
-				t.Fatalf("marshal item: %v", err)
-			}
-			if strings.Contains(string(data), "hook") {
-				t.Fatalf("item wire = %s, want no hook evidence", data)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), "hook"), "item wire = %s, want no hook evidence", data)
 		}
 		// The publishing assistant keeps the call and its normalized arguments.
 		assistant, err := items[1].AsAssistantItem()
-		if err != nil || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Id != "call-1" ||
-			assistant.ToolCalls[0].Status == nil || *assistant.ToolCalls[0].Status != protocol.ToolCallStatusError {
-			t.Fatalf("publishing assistant = %+v err %v, want the settled call-1", assistant, err)
-		}
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Id == "call-1" && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusError, "publishing assistant = %+v err %v, want the settled call-1", assistant, err)
 	})
 }
 
@@ -670,20 +512,12 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 		bg.e.server.awaitRequests(2) // the parked second call's turn arrived
 		<-toolStarted
 		pending := projectSessionItems(t, bg.r, session)
-		if len(pending) != 3 { // input, publishing assistant, pending assistant
-			t.Fatalf("pending items = %d, want the input and both assistants", len(pending))
-		}
+		// input, publishing assistant, pending assistant
+		testassert.Equal(t, len(pending), 3)
 		first, err := pending[1].AsAssistantItem()
-		if err != nil || len(first.ToolCalls) != 1 || first.ToolCalls[0].Status == nil ||
-			first.ToolCalls[0].Content == nil || *first.ToolCalls[0].Content != "first" ||
-			first.ToolCalls[0].Metadata == nil || string(*first.ToolCalls[0].Metadata) != `{"n":9007199254740993}` {
-			t.Fatalf("settled assistant = %+v err %v, want call-1 attached with its metadata", first, err)
-		}
+		testassert.Require(t, err == nil && len(first.ToolCalls) == 1 && first.ToolCalls[0].Status != nil && first.ToolCalls[0].Content != nil && *first.ToolCalls[0].Content == "first" && first.ToolCalls[0].Metadata != nil && string(*first.ToolCalls[0].Metadata) == `{"n":9007199254740993}`, "settled assistant = %+v err %v, want call-1 attached with its metadata", first, err)
 		second, err := pending[2].AsAssistantItem()
-		if err != nil || len(second.ToolCalls) != 1 || second.ToolCalls[0].Id != "call-2" ||
-			second.ToolCalls[0].Status != nil || second.ToolCalls[0].Content != nil || second.ToolCalls[0].Metadata != nil {
-			t.Fatalf("pending assistant = %+v err %v, want call-2 with every terminal member omitted", second, err)
-		}
+		testassert.Require(t, err == nil && len(second.ToolCalls) == 1 && second.ToolCalls[0].Id == "call-2" && second.ToolCalls[0].Status == nil && second.ToolCalls[0].Content == nil && second.ToolCalls[0].Metadata == nil, "pending assistant = %+v err %v, want call-2 with every terminal member omitted", second, err)
 		pendingIDs := itemIDs(t, pending)
 
 		releaseToolOnce()
@@ -692,29 +526,18 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 
 		attached := projectSessionItems(t, bg.r, session)
 		attachedIDs := itemIDs(t, attached)
-		if len(attached) != 6 { // + the two-call assistant, the closing assistant
-			t.Fatalf("attached items = %d, want the complete conversation", len(attached))
-		}
+		// + the two-call assistant, the closing assistant
+		testassert.Equal(t, len(attached), 6)
 		for i, id := range pendingIDs {
 			if attachedIDs[i] != id {
 				t.Fatalf("item %d identity drifted from %q to %q", i, id, attachedIDs[i])
 			}
 		}
 		second, err = attached[2].AsAssistantItem()
-		if err != nil || second.ToolCalls[0].Status == nil || *second.ToolCalls[0].Status != protocol.ToolCallStatusSuccess ||
-			second.ToolCalls[0].Content == nil || *second.ToolCalls[0].Content != "second" ||
-			second.ToolCalls[0].Metadata == nil || string(*second.ToolCalls[0].Metadata) != `{"late":true}` {
-			t.Fatalf("late-attached call = %+v err %v, want the second outcome under the same item", second, err)
-		}
+		testassert.Require(t, err == nil && second.ToolCalls[0].Status != nil && *second.ToolCalls[0].Status == protocol.ToolCallStatusSuccess && second.ToolCalls[0].Content != nil && *second.ToolCalls[0].Content == "second" && second.ToolCalls[0].Metadata != nil && string(*second.ToolCalls[0].Metadata) == `{"late":true}`, "late-attached call = %+v err %v, want the second outcome under the same item", second, err)
 		pair, err := attached[3].AsAssistantItem()
-		if err != nil || len(pair.ToolCalls) != 2 ||
-			pair.ToolCalls[0].Id != "call-3" || pair.ToolCalls[1].Id != "call-4" ||
-			pair.ToolCalls[0].Status == nil || pair.ToolCalls[1].Status == nil {
-			t.Fatalf("multi-call assistant = %+v err %v, want both calls attached in published order", pair, err)
-		}
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, err == nil && len(pair.ToolCalls) == 2 && pair.ToolCalls[0].Id == "call-3" && pair.ToolCalls[1].Id == "call-4" && pair.ToolCalls[0].Status != nil && pair.ToolCalls[1].Status != nil, "multi-call assistant = %+v err %v, want both calls attached in published order", pair, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -724,9 +547,7 @@ func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.
 	t.Helper()
 	snap := sessionViewThroughRuntime(t, r, sessionID)
 	items, err := projectConversation(sessionID, historyFactsOf(snap.History))
-	if err != nil {
-		t.Fatalf("projectConversation: %v", err)
-	}
+	testassert.NoError(t, err)
 	return items
 }
 
@@ -738,27 +559,12 @@ func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.
 // so the one-rule check repeats here; awaitOperation owns the convergence.
 func submitConvergedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string, want harness.OperationState) {
 	t.Helper()
-	var disposition harness.SubmitDisposition
-	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		res, submitErr := h.Submit(ctx, harness.SubmitRequest{
-			SessionID:   sessionID,
-			OperationID: operationID,
-			Origin:      harness.InputOriginUser,
-			Content:     []model.ContentPart{{Kind: model.PartText, Text: text}},
-			Mode:        harness.MessageModeRegular,
-		})
-		if submitErr == nil {
-			disposition = res.Disposition
-		}
-		return submitErr
-	})
-	if err != nil {
-		t.Fatalf("Submit(%q): %v", operationID, err)
-	}
-	switch disposition {
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
+	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
+	switch res.Disposition {
 	case harness.DispositionAdmitted, harness.DispositionSteering, harness.DispositionQueued:
 	default:
-		t.Fatalf("Submit(%q) = %+v, want an admitted or buffered disposition", operationID, disposition)
+		t.Fatalf("Submit(%q) = %+v, want an admitted or buffered disposition", operationID, res.Disposition)
 	}
 	awaitOperation(t, r, sessionID, operationID, want)
 }
@@ -775,27 +581,14 @@ func itemIDs(t *testing.T, items []protocol.ConversationItem) []string {
 // itemIdentity reads one item's kind and identity member.
 func itemIdentity(t *testing.T, item protocol.ConversationItem) string {
 	t.Helper()
-	data, err := json.Marshal(item)
-	if err != nil {
-		t.Fatalf("marshal item: %v", err)
-	}
-	var probe struct {
-		Kind   string `json:"kind"`
-		ItemID string `json:"item_id"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		t.Fatalf("decode item identity: %v", err)
-	}
-	return probe.Kind + ":" + probe.ItemID
+	return itemKind(t, item) + ":" + wireItemID(t, item)
 }
 
 // itemKind reports one projected item's discriminator kind.
 func itemKind(t *testing.T, item protocol.ConversationItem) string {
 	t.Helper()
 	kind, err := item.Discriminator()
-	if err != nil {
-		t.Fatalf("item discriminator: %v", err)
-	}
+	testassert.NoError(t, err)
 	return kind
 }
 
@@ -824,19 +617,11 @@ func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
 
 		items := projectSessionItems(t, bg.r, session)
-		if len(items) != 4 { // input, assistant with the synthetic result, closing assistant, end
-			t.Fatalf("items = %d, want the complete conversation", len(items))
-		}
+		// input, assistant with the synthetic result, closing assistant, end
+		testassert.Equal(t, len(items), 4)
 		assistant, err := items[1].AsAssistantItem()
-		if err != nil || len(assistant.ToolCalls) != 1 ||
-			assistant.ToolCalls[0].Status == nil || *assistant.ToolCalls[0].Status != protocol.ToolCallStatusError ||
-			assistant.ToolCalls[0].Content == nil || *assistant.ToolCalls[0].Content != "no concrete tools yet" ||
-			assistant.ToolCalls[0].Metadata != nil {
-			t.Fatalf("synthetic result call = %+v err %v, want the error outcome and no metadata", assistant.ToolCalls, err)
-		}
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusError && assistant.ToolCalls[0].Content != nil && *assistant.ToolCalls[0].Content == "no concrete tools yet" && assistant.ToolCalls[0].Metadata == nil, "synthetic result call = %+v err %v, want the error outcome and no metadata", assistant.ToolCalls, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -913,11 +698,7 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the first call never started")
 		}
-		if err := bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, session)
-		}); err != nil {
-			t.Fatalf("Interrupt: %v", err)
-		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -926,27 +707,15 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 			t.Fatalf("items = %d (%s), want the complete interrupted conversation", len(items), itemKinds(t, items))
 		}
 		assistant, err := items[1].AsAssistantItem()
-		if err != nil || len(assistant.ToolCalls) != 2 {
-			t.Fatalf("assistant = %+v err %v, want both published calls indivisible", assistant, err)
-		}
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 2, "assistant = %+v err %v, want both published calls indivisible", assistant, err)
 		started := assistant.ToolCalls[0]
-		if started.Id != "call-1" || started.Status == nil || *started.Status != protocol.ToolCallStatusSuccess ||
-			started.Content == nil || *started.Content != "first ran" || started.Metadata != nil {
-			t.Fatalf("started call = %+v, want the real returned outcome", started)
-		}
+		testassert.Require(t, started.Id == "call-1" && started.Status != nil && *started.Status == protocol.ToolCallStatusSuccess && started.Content != nil && *started.Content == "first ran" && started.Metadata == nil, "started call = %+v, want the real returned outcome", started)
 		unstarted := assistant.ToolCalls[1]
-		if unstarted.Id != "call-2" || unstarted.Status == nil || *unstarted.Status != protocol.ToolCallStatusInterrupted ||
-			unstarted.Content == nil || *unstarted.Content != "Tool call interrupted." || unstarted.Metadata != nil {
-			t.Fatalf("unstarted call = %+v, want the synthetic interrupted result and no metadata", unstarted)
-		}
+		testassert.Require(t, unstarted.Id == "call-2" && unstarted.Status != nil && *unstarted.Status == protocol.ToolCallStatusInterrupted && unstarted.Content != nil && *unstarted.Content == "Tool call interrupted." && unstarted.Metadata == nil, "unstarted call = %+v, want the synthetic interrupted result and no metadata", unstarted)
 		signal, err := items[2].AsSignalItem()
-		if err != nil || signal.Subtype != protocol.SignalItemSubtypeInterruption {
-			t.Fatalf("signal = %+v err %v, want the typed interruption", signal, err)
-		}
+		testassert.Require(t, err == nil && signal.Subtype == protocol.SignalItemSubtypeInterruption, "signal = %+v err %v, want the typed interruption", signal, err)
 		end, err := items[3].AsOperationEndItem()
-		if err != nil || end.Status != protocol.OperationEndItemStatusInterruption || end.Detail == "" {
-			t.Fatalf("end = %+v err %v, want the interruption detail", end, err)
-		}
+		testassert.Require(t, err == nil && end.Status == protocol.OperationEndItemStatusInterruption && end.Detail != "", "end = %+v err %v, want the interruption detail", end, err)
 	})
 }
 
@@ -987,22 +756,13 @@ func TestConversationProjectionErroredPartialAssistant(t *testing.T) {
 			t.Fatalf("items = %d (%s), want the committed order input, assistant, signal, end", len(items), itemKinds(t, items))
 		}
 		partial, err := items[1].AsAssistantItem()
-		if err != nil || partial.Status != protocol.AssistantItemStatusErrored {
-			t.Fatalf("partial assistant = %+v err %v, want the errored status", partial, err)
-		}
+		testassert.Require(t, err == nil && partial.Status == protocol.AssistantItemStatusErrored, "partial assistant = %+v err %v, want the errored status", partial, err)
 		textPart, err := partial.Content[0].AsTextPart()
-		if err != nil || textPart.Text != "partial answer" {
-			t.Fatalf("partial content = %+v, want the retained fragment", partial.Content)
-		}
+		testassert.Require(t, err == nil && textPart.Text == "partial answer", "partial content = %+v, want the retained fragment", partial.Content)
 		continuation, err := items[2].AsSignalItem()
-		if err != nil || continuation.Subtype != protocol.SignalItemSubtypeModelFailureContinuation ||
-			continuation.Content != "The previous model response failed after partial output. Continue from the retained response." {
-			t.Fatalf("continuation signal = %+v err %v, want the typed signal with its required content", continuation, err)
-		}
+		testassert.Require(t, err == nil && continuation.Subtype == protocol.SignalItemSubtypeModelFailureContinuation && continuation.Content == "The previous model response failed after partial output. Continue from the retained response.", "continuation signal = %+v err %v, want the typed signal with its required content", continuation, err)
 		end, err := items[3].AsOperationEndItem()
-		if err != nil || end.Status != protocol.OperationEndItemStatusFailure || !strings.Contains(end.Detail, "model down") {
-			t.Fatalf("end = %+v err %v, want the failure detail", end, err)
-		}
+		testassert.Require(t, err == nil && end.Status == protocol.OperationEndItemStatusFailure && strings.Contains(end.Detail, "model down"), "end = %+v err %v, want the failure detail", end, err)
 	})
 }
 
@@ -1028,13 +788,12 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 		// The real provider serves this row through the owning configuration:
 		// the endpoint change publishes before any admission runs.
 		writeServiceFile(t, bg.e.configPath, backgroundLifecycleConfigDocument(stream.URL))
-		if _, err := bg.r.Reload(context.Background()); err != nil {
-			t.Fatalf("Reload: %v", err)
+		{
+			_, err := bg.r.Reload(context.Background())
+			testassert.NoError(t, err)
 		}
 		sub, err := bg.r.Subscribe(256)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer sub.Close()
 		session := bg.session("interrupted")
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
@@ -1046,36 +805,22 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 		for !sawFragment {
 			select {
 			case event, ok := <-sub.Events():
-				if !ok {
-					t.Fatal("the subscription closed before the fragment's progress arrived")
-				}
+				testassert.Require(t, ok, "the subscription closed before the fragment's progress arrived")
 				if eventKind(t, event) != "text_delta" {
 					continue
 				}
 				delta, err := event.AsTextDeltaEvent()
-				if err != nil {
-					t.Fatalf("delta event body: %v", err)
-				}
+				testassert.NoError(t, err)
 				scope, err := delta.Scope.AsOperationScope()
-				if err != nil {
-					t.Fatalf("progress scope: %v", err)
-				}
-				if scope.SessionId != session || scope.OperationId != "op-1" {
-					t.Fatalf("progress scope = %+v, want this session's operation", delta.Scope)
-				}
-				if delta.Content != "partial answer" {
-					t.Fatalf("progress content = %q, want the flushed fragment", delta.Content)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, scope.SessionId == session && scope.OperationId == "op-1", "progress scope = %+v, want this session's operation", delta.Scope)
+				testassert.Equal(t, delta.Content, "partial answer")
 				sawFragment = true
 			case <-deadline:
 				t.Fatal("the partial fragment never became published progress")
 			}
 		}
-		if err := bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, session)
-		}); err != nil {
-			t.Fatalf("Interrupt: %v", err)
-		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -1084,43 +829,25 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 			switch itemKind(t, item) {
 			case "assistant":
 				assistant, err := item.AsAssistantItem()
-				if err != nil {
-					t.Fatalf("AsAssistantItem: %v", err)
-				}
-				if assistant.Status != protocol.AssistantItemStatusInterrupted {
-					t.Fatalf("assistant status = %q, want the interrupted partial", assistant.Status)
-				}
+				testassert.NoError(t, err)
+				testassert.Equal(t, assistant.Status, protocol.AssistantItemStatusInterrupted)
 				textPart, err := assistant.Content[0].AsTextPart()
-				if err != nil || textPart.Text != "partial answer" {
-					t.Fatalf("partial content = %+v, want the retained fragment", assistant.Content)
-				}
+				testassert.Require(t, err == nil && textPart.Text == "partial answer", "partial content = %+v, want the retained fragment", assistant.Content)
 				sawAssistant = true
 			case "signal":
 				signal, err := item.AsSignalItem()
-				if err != nil {
-					t.Fatalf("AsSignalItem: %v", err)
-				}
-				if signal.Subtype != protocol.SignalItemSubtypeInterruption || signal.Content != "Operation interrupted." {
-					t.Fatalf("signal item = %+v, want the typed interruption", signal)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, signal.Subtype == protocol.SignalItemSubtypeInterruption && signal.Content == "Operation interrupted.", "signal item = %+v, want the typed interruption", signal)
 				sawSignal = true
 			case "operation_end":
 				end, err := item.AsOperationEndItem()
-				if err != nil {
-					t.Fatalf("AsOperationEndItem: %v", err)
-				}
-				if end.Status != protocol.OperationEndItemStatusInterruption || end.Detail == "" {
-					t.Fatalf("end item = %+v, want the interruption detail", end)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, end.Status == protocol.OperationEndItemStatusInterruption && end.Detail != "", "end item = %+v, want the interruption detail", end)
 				sawEnd = true
 			}
 		}
-		if !sawAssistant || !sawSignal || !sawEnd {
-			t.Fatalf("interrupted conversation = %d items (assistant %v signal %v end %v), want all three", len(items), sawAssistant, sawSignal, sawEnd)
-		}
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, sawAssistant && sawSignal && sawEnd, "interrupted conversation = %d items (assistant %v signal %v end %v), want all three", len(items), sawAssistant, sawSignal, sawEnd)
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -1179,27 +906,17 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 		for _, item := range sourceItems {
 			sourceIDs[itemIdentity(t, item)] = true
 			data, err := json.Marshal(item)
-			if err != nil {
-				t.Fatalf("marshal source item: %v", err)
-			}
-			if strings.Contains(string(data), forked) {
-				t.Fatalf("source item wire = %s, want no fork identity", data)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), forked), "source item wire = %s, want no fork identity", data)
 		}
 		for i, item := range forkItems[:3] {
 			data, err := json.Marshal(item)
-			if err != nil {
-				t.Fatalf("marshal fork item: %v", err)
-			}
-			if strings.Contains(string(data), root) {
-				t.Fatalf("fork prefix item wire = %s, want no source identity", data)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), root), "fork prefix item wire = %s, want no source identity", data)
 			if sourceIDs[itemIdentity(t, item)] {
 				t.Fatalf("fork prefix item %d shares the source identity %q", i, itemIdentity(t, item))
 			}
-			if strings.Contains(string(data), `"operation_id"`) {
-				t.Fatalf("fork prefix item wire = %s, want no Operation ownership", data)
-			}
+			testassert.Require(t, !strings.Contains(string(data), `"operation_id"`), "fork prefix item wire = %s, want no Operation ownership", data)
 		}
 
 		// The copied assistant's call is a real completed tool turn: the
@@ -1208,9 +925,7 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 		// arguments, and terminal outcome inside the assistant — under a
 		// destination-namespace identity.
 		copiedAssistant, err := forkItems[1].AsAssistantItem()
-		if err != nil {
-			t.Fatalf("AsAssistantItem: %v", err)
-		}
+		testassert.NoError(t, err)
 		copiedAssistantEntry := ""
 		forkSnap := sessionViewThroughRuntime(t, bg.r, forked)
 		for _, fact := range historyFactsOf(forkSnap.History) {
@@ -1222,32 +937,15 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 				break
 			}
 		}
-		if copiedAssistantEntry == "" {
-			t.Fatal("the fork copied no assistant entry")
-		}
-		if copiedAssistant.ItemId != projectItemID(forked, copiedAssistantEntry) {
-			t.Fatalf("copied assistant item_id = %q, want the destination namespace identity", copiedAssistant.ItemId)
-		}
-		if copiedAssistant.OperationId != nil {
-			t.Fatalf("copied assistant operation_id = %v, want the cleared source attribution", copiedAssistant.OperationId)
-		}
+		testassert.Require(t, copiedAssistantEntry != "", "the fork copied no assistant entry")
+		testassert.Require(t, copiedAssistant.ItemId == projectItemID(forked, copiedAssistantEntry) && copiedAssistant.OperationId == nil, "copied assistant item_id = %q, want the destination namespace identity; copied assistant operation_id = %v, want the cleared source attribution", copiedAssistant.ItemId, copiedAssistant.OperationId)
 		call := copiedAssistant.ToolCalls[0]
-		if call.Id != "call-1" || call.Arguments != `{"n":9007199254740993}` ||
-			call.NormalizedArguments == nil || string((*call.NormalizedArguments)["n"]) != `9007199254740993` ||
-			call.Status == nil || *call.Status != protocol.ToolCallStatusSuccess ||
-			call.Content == nil || *call.Content != "first" ||
-			call.Metadata == nil || string(*call.Metadata) != `{"n":9007199254740993}` {
-			t.Fatalf("copied tool call = %+v, want the attached copied result with its fidelity", call)
-		}
+		testassert.Require(t, call.Id == "call-1" && call.Arguments == `{"n":9007199254740993}` && call.NormalizedArguments != nil && string((*call.NormalizedArguments)["n"]) == `9007199254740993` && call.Status != nil && *call.Status == protocol.ToolCallStatusSuccess && call.Content != nil && *call.Content == "first" && call.Metadata != nil && string(*call.Metadata) == `{"n":9007199254740993}`, "copied tool call = %+v, want the attached copied result with its fidelity", call)
 
 		// The fork's own admission keeps its Operation attribution.
 		forkInput, err := forkItems[3].AsInputItem()
-		if err != nil || forkInput.Origin != protocol.InputOriginUser || forkInput.OperationId == nil || *forkInput.OperationId != "fork-op-1" {
-			t.Fatalf("fork input = %+v err %v, want the fork operation's own input", forkInput, err)
-		}
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Require(t, err == nil && forkInput.Origin == protocol.InputOriginUser && forkInput.OperationId != nil && *forkInput.OperationId == "fork-op-1", "fork input = %+v err %v, want the fork operation's own input", forkInput, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -1273,9 +971,7 @@ func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 
 		completionID := bg.startJob(child, "cc000003")
 		stopper.addDelivery(child, completionID, "job report")
-		if err := bg.stop(child); err != nil {
-			t.Fatalf("Stop(child): %v", err)
-		}
+		testassert.NoError(t, bg.r.stopSession(context.Background(), child))
 
 		// The child's conversation: its own turn plus the typed completion
 		// signal naming the job member.
@@ -1286,13 +982,8 @@ func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 				continue
 			}
 			signal, err := item.AsSignalItem()
-			if err != nil {
-				t.Fatalf("AsSignalItem: %v", err)
-			}
-			if signal.Subtype != protocol.SignalItemSubtypeBackgroundCompletion || signal.Content != "job report" ||
-				signal.RelatedMember == nil || signal.RelatedMember.Kind != protocol.BackgroundMemberKindJob || signal.RelatedMember.Id != "cc000003" {
-				t.Fatalf("completion signal = %+v, want the job member's typed record", signal)
-			}
+			testassert.NoError(t, err)
+			testassert.Require(t, signal.Subtype == protocol.SignalItemSubtypeBackgroundCompletion && signal.Content == "job report" && signal.RelatedMember != nil && signal.RelatedMember.Kind == protocol.BackgroundMemberKindJob && signal.RelatedMember.Id == "cc000003", "completion signal = %+v, want the job member's typed record", signal)
 			sawSignal = true
 		}
 		if !sawSignal {
@@ -1314,9 +1005,7 @@ func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -1329,9 +1018,7 @@ func hasRuntimeOriginInput(t *testing.T, items []protocol.ConversationItem, want
 			continue
 		}
 		input, err := item.AsInputItem()
-		if err != nil {
-			t.Fatalf("AsInputItem: %v", err)
-		}
+		testassert.NoError(t, err)
 		if input.Origin != protocol.InputOriginRuntime || len(input.Content) == 0 {
 			continue
 		}
@@ -1379,22 +1066,14 @@ func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) 
 			switch itemKind(t, item) {
 			case "compaction":
 				compaction, err := item.AsCompactionItem()
-				if err != nil {
-					t.Fatalf("AsCompactionItem: %v", err)
-				}
+				testassert.NoError(t, err)
 				compactions++
-				if compaction.Summary == "" || compaction.Model != "prov/m" {
-					t.Fatalf("compaction item = %+v, want the summary and model", compaction)
-				}
+				testassert.Require(t, compaction.Summary != "" && compaction.Model == "prov/m", "compaction item = %+v, want the summary and model", compaction)
 			case "input":
 				input, err := item.AsInputItem()
-				if err != nil {
-					t.Fatalf("AsInputItem: %v", err)
-				}
+				testassert.NoError(t, err)
 				textPart, err := input.Content[0].AsTextPart()
-				if err != nil {
-					t.Fatalf("input part: %v", err)
-				}
+				testassert.NoError(t, err)
 				switch textPart.Text {
 				case "hello first":
 					sawFirstInput = true
@@ -1403,13 +1082,9 @@ func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) 
 				}
 			case "assistant":
 				assistant, err := item.AsAssistantItem()
-				if err != nil {
-					t.Fatalf("AsAssistantItem: %v", err)
-				}
+				testassert.NoError(t, err)
 				textPart, err := assistant.Content[0].AsTextPart()
-				if err != nil {
-					t.Fatalf("assistant part: %v", err)
-				}
+				testassert.NoError(t, err)
 				if textPart.Text == "done" {
 					if !sawFirstAssistant && !sawSecondAssistant {
 						sawFirstAssistant = true
@@ -1419,25 +1094,14 @@ func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) 
 				}
 			case "operation_end":
 				end, err := item.AsOperationEndItem()
-				if err != nil {
-					t.Fatalf("AsOperationEndItem: %v", err)
-				}
-				if end.Status != protocol.OperationEndItemStatusSuccess {
-					t.Fatalf("end item = %+v, want the settled success", end)
-				}
+				testassert.NoError(t, err)
+				testassert.Require(t, end.Status == protocol.OperationEndItemStatusSuccess, "end item = %+v, want the settled success", end)
 				sawEnds++
 			}
 		}
-		if compactions != 2 {
-			t.Fatalf("compaction items = %d, want both compactions visible", compactions)
-		}
-		if !sawFirstInput || !sawFirstAssistant || !sawSecondInput || !sawSecondAssistant || sawEnds != 4 {
-			t.Fatalf("retained items = (input %v/%v assistant %v/%v ends %d), want every earlier item and all four ends",
-				sawFirstInput, sawSecondInput, sawFirstAssistant, sawSecondAssistant, sawEnds)
-		}
-		if err := f.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.Equal(t, compactions, 2)
+		testassert.Require(t, sawFirstInput && sawFirstAssistant && sawSecondInput && sawSecondAssistant && sawEnds == 4, "retained items = (input %v/%v assistant %v/%v ends %d), want every earlier item and all four ends", sawFirstInput, sawSecondInput, sawFirstAssistant, sawSecondAssistant, sawEnds)
+		testassert.NoError(t, f.r.Close(context.Background()))
 	})
 }
 
@@ -1476,13 +1140,9 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 			t.Fatalf("first turn items = %d (%s), want input, assistant, end", len(items), itemKinds(t, items))
 		}
 		literal, err := items[0].AsInputItem()
-		if err != nil {
-			t.Fatalf("first item: %v", err)
-		}
+		testassert.NoError(t, err)
 		textPart, err := literal.Content[0].AsTextPart()
-		if err != nil || textPart.Text != "Operation interrupted." {
-			t.Fatalf("first item = %+v, want the literal input", literal)
-		}
+		testassert.Require(t, err == nil && textPart.Text == "Operation interrupted.", "first item = %+v, want the literal input", literal)
 
 		submitConvergedThroughRuntime(t, bg.r, session, "op-2", "again", harness.OperationFailure)
 
@@ -1491,17 +1151,10 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 			t.Fatalf("items = %d (%s), want the prefix plus input and failure end", len(items), itemKinds(t, items))
 		}
 		failureEnd, err := items[4].AsOperationEndItem()
-		if err != nil {
-			t.Fatalf("last item: %v", err)
-		}
+		testassert.NoError(t, err)
 		failingInput, err := items[3].AsInputItem()
-		if err != nil {
-			t.Fatalf("fourth item: %v", err)
-		}
-		if failureEnd.Status != protocol.OperationEndItemStatusFailure ||
-			!strings.Contains(failureEnd.Detail, "model down") || failingInput.OperationId == nil || *failingInput.OperationId != "op-2" {
-			t.Fatalf("failure projection = (end %+v, input %+v), want the failed op-2 end with its detail", failureEnd, failingInput)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, failureEnd.Status == protocol.OperationEndItemStatusFailure && strings.Contains(failureEnd.Detail, "model down") && failingInput.OperationId != nil && *failingInput.OperationId == "op-2", "failure projection = (end %+v, input %+v), want the failed op-2 end with its detail", failureEnd, failingInput)
 
 		// The no-output interruption on a fresh Session: the model effect
 		// arrives and cooperatively parks without yielding any content, the
@@ -1516,11 +1169,7 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the model effect never arrived")
 		}
-		if err := bg.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-			return h.Interrupt(ctx, interrupted)
-		}); err != nil {
-			t.Fatalf("Interrupt: %v", err)
-		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), interrupted))
 		awaitOperation(t, bg.r, interrupted, "op-int", harness.OperationInterruption)
 
 		items = projectSessionItems(t, bg.r, interrupted)
@@ -1538,35 +1187,19 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 				wantEntries[fact.Kind] = fact.EntryID
 			}
 		}
-		if len(wantEntries) != 3 {
-			t.Fatalf("committed facts = %v, want exactly input, signal, settlement", wantEntries)
-		}
+		testassert.Require(t, len(wantEntries) == 3, "committed facts = %v, want exactly input, signal, settlement", wantEntries)
 		interruptionInput, err := items[0].AsInputItem()
-		if err != nil || interruptionInput.Origin != protocol.InputOriginUser ||
-			interruptionInput.OperationId == nil || *interruptionInput.OperationId != "op-int" ||
-			interruptionInput.ItemId != projectItemID(interrupted, wantEntries[harness.EntryInput]) {
-			t.Fatalf("interruption input = %+v err %v, want the op-int input at its fact identity", interruptionInput, err)
-		}
+		testassert.Require(t, err == nil && interruptionInput.Origin == protocol.InputOriginUser && interruptionInput.OperationId != nil && *interruptionInput.OperationId == "op-int" && interruptionInput.ItemId == projectItemID(interrupted, wantEntries[harness.EntryInput]), "interruption input = %+v err %v, want the op-int input at its fact identity", interruptionInput, err)
 		interruptionSignal, err := items[1].AsSignalItem()
-		if err != nil || interruptionSignal.Subtype != protocol.SignalItemSubtypeInterruption ||
-			interruptionSignal.Content != "Operation interrupted." ||
-			interruptionSignal.ItemId != projectItemID(interrupted, wantEntries[harness.EntrySignal]) {
-			t.Fatalf("interruption signal = %+v err %v, want the typed signal at its fact identity", interruptionSignal, err)
-		}
+		testassert.Require(t, err == nil && interruptionSignal.Subtype == protocol.SignalItemSubtypeInterruption && interruptionSignal.Content == "Operation interrupted." && interruptionSignal.ItemId == projectItemID(interrupted, wantEntries[harness.EntrySignal]), "interruption signal = %+v err %v, want the typed signal at its fact identity", interruptionSignal, err)
 		interruptedEnd, err := items[2].AsOperationEndItem()
-		if err != nil || interruptedEnd.Status != protocol.OperationEndItemStatusInterruption ||
-			interruptedEnd.Detail == "" ||
-			interruptedEnd.ItemId != projectItemID(interrupted, wantEntries[harness.EntryOperationSettlement]) {
-			t.Fatalf("interruption end = %+v err %v, want the interruption detail at its fact identity", interruptedEnd, err)
-		}
+		testassert.Require(t, err == nil && interruptedEnd.Status == protocol.OperationEndItemStatusInterruption && interruptedEnd.Detail != "" && interruptedEnd.ItemId == projectItemID(interrupted, wantEntries[harness.EntryOperationSettlement]), "interruption end = %+v err %v, want the interruption detail at its fact identity", interruptedEnd, err)
 		// The identities are stable across an immediate second read.
 		if again := itemIDs(t, projectSessionItems(t, bg.r, interrupted)); !reflect.DeepEqual(again, itemIDs(t, items)) {
 			t.Fatalf("re-read identities = %v, want the stable %v", again, itemIDs(t, items))
 		}
 
-		if err := bg.r.Close(context.Background()); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		testassert.NoError(t, bg.r.Close(context.Background()))
 	})
 }
 
@@ -1577,7 +1210,5 @@ func TestConversationProjectionOverEmptySession(t *testing.T) {
 	defer closeProjectionRuntime(r)
 	session := projectionSession(t, r, "/tmp/conv-empty", "solo").Identity.SessionID
 	items := projectSessionItems(t, r, session)
-	if items == nil || len(items) != 0 {
-		t.Fatalf("items = %v, want the present empty list", items)
-	}
+	testassert.Require(t, items != nil && len(items) == 0, "items = %v, want the present empty list", items)
 }

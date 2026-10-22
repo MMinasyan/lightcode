@@ -12,6 +12,7 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -32,32 +33,30 @@ func schema(t *testing.T) *openapi3.T {
 			schemaErr = schemaDoc.Validate(context.Background())
 		}
 	})
-	if schemaErr != nil {
-		t.Fatalf("loading/validating protocol/openapi.yaml: %v", schemaErr)
-	}
+	testassert.Require(t, schemaErr == nil, "loading/validating protocol/openapi.yaml: %v", schemaErr)
 	return schemaDoc
 }
 
 func componentSchema(t *testing.T, name string) *openapi3.Schema {
 	t.Helper()
 	component := schema(t).Components.Schemas[name]
-	if component == nil {
-		t.Fatalf("schema component %q is missing", name)
-	}
+	testassert.Require(t, component != nil, "schema component %q is missing", name)
 	return component.Value
 }
 
 func acceptJSON(t *testing.T, s *openapi3.Schema, value string) {
 	t.Helper()
-	if err := s.VisitJSON(decodeSchemaJSON(t, value)); err != nil {
-		t.Fatalf("schema rejected valid value %s: %v", value, err)
+	{
+		err := s.VisitJSON(decodeSchemaJSON(t, value))
+		testassert.Require(t, err == nil, "schema rejected valid value %s: %v", value, err)
 	}
 }
 
 func rejectJSON(t *testing.T, s *openapi3.Schema, value string) {
 	t.Helper()
-	if err := s.VisitJSON(decodeSchemaJSON(t, value)); err == nil {
-		t.Fatalf("schema accepted invalid value %s", value)
+	{
+		err := s.VisitJSON(decodeSchemaJSON(t, value))
+		testassert.Require(t, err != nil, "schema accepted invalid value %s", value)
 	}
 }
 
@@ -68,9 +67,7 @@ func decodeSchemaJSON(t *testing.T, value string) any {
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.UseNumber()
 	var decoded any
-	if err := decoder.Decode(&decoded); err != nil {
-		t.Fatalf("decoding test value: %v", err)
-	}
+	testassert.NoError(t, decoder.Decode(&decoded))
 	return decoded
 }
 
@@ -84,16 +81,13 @@ const (
 // documents and fails here.
 func TestPluginsSettingsDocumentsStayNamedOpaqueStrings(t *testing.T) {
 	plugins := componentSchema(t, "PluginsSettings")
-	if ref := plugins.AdditionalProperties.Schema; ref == nil || ref.Ref != "#/components/schemas/PluginConfigDocument" {
-		t.Fatalf("PluginsSettings additionalProperties = %+v, want the named PluginConfigDocument scalar", ref)
+	{
+		ref := plugins.AdditionalProperties.Schema
+		testassert.Require(t, ref != nil && ref.Ref == "#/components/schemas/PluginConfigDocument", "PluginsSettings additionalProperties = %+v, want the named PluginConfigDocument scalar", ref)
 	}
-	if len(plugins.Properties) != 0 {
-		t.Fatalf("PluginsSettings declares named members %v, want the opaque map only", plugins.Properties)
-	}
+	testassert.Require(t, len(plugins.Properties) == 0, "PluginsSettings declares named members %v, want the opaque map only", plugins.Properties)
 	document := componentSchema(t, "PluginConfigDocument")
-	if document.Type == nil || !document.Type.Is("string") {
-		t.Fatalf("PluginConfigDocument type = %v, want string", document.Type)
-	}
+	testassert.Require(t, document.Type != nil && document.Type.Is("string"), "PluginConfigDocument type = %v, want string", document.Type)
 }
 
 // TestScopeEventSharedPayload keeps the scope_opened and scope_closed kinds
@@ -107,12 +101,11 @@ func TestScopeEventSharedPayload(t *testing.T) {
 	rejectJSON(t, event, `{"kind": "scope_opened", "scope": {"kind": "runtime"}, "extra": 1}`)
 
 	discriminator := event.Discriminator
-	if discriminator == nil || discriminator.PropertyName != "kind" {
-		t.Fatal("Event discriminator is missing")
-	}
+	testassert.Require(t, discriminator != nil && discriminator.PropertyName == "kind", "Event discriminator is missing")
 	for _, kind := range []string{"scope_opened", "scope_closed"} {
-		if got := discriminator.Mapping[kind].Ref; got != "#/components/schemas/ScopeEvent" {
-			t.Fatalf("Event discriminator mapping %q = %q, want the shared ScopeEvent component", kind, got)
+		{
+			got := discriminator.Mapping[kind].Ref
+			testassert.Require(t, got == "#/components/schemas/ScopeEvent", "Event discriminator mapping %q = %q, want the shared ScopeEvent component", kind, got)
 		}
 	}
 	scopeEventRefs := 0
@@ -121,9 +114,7 @@ func TestScopeEventSharedPayload(t *testing.T) {
 			scopeEventRefs++
 		}
 	}
-	if scopeEventRefs != 1 {
-		t.Fatalf("Event oneOf references ScopeEvent %d times, want exactly once", scopeEventRefs)
-	}
+	testassert.Equal(t, scopeEventRefs, 1)
 }
 
 func TestGeneratedScopeEventRoundTripsBothKinds(t *testing.T) {
@@ -135,19 +126,14 @@ func TestGeneratedScopeEventRoundTripsBothKinds(t *testing.T) {
 		{protocol.ScopeClosed, "scope_closed"},
 	} {
 		var event protocol.ScopeEvent
-		if err := json.Unmarshal([]byte(`{"kind": "`+tc.wire+`", "scope": {"kind": "runtime"}}`), &event); err != nil {
-			t.Fatalf("decoding generated ScopeEvent %s: %v", tc.wire, err)
+		{
+			err := json.Unmarshal([]byte(`{"kind": "`+tc.wire+`", "scope": {"kind": "runtime"}}`), &event)
+			testassert.Require(t, err == nil, "decoding generated ScopeEvent %s: %v", tc.wire, err)
 		}
-		if event.Kind != tc.kind {
-			t.Fatalf("decoded ScopeEvent kind = %q, want %q", event.Kind, tc.wire)
-		}
+		testassert.Require(t, event.Kind == tc.kind, "decoded ScopeEvent kind = %q, want %q", event.Kind, tc.wire)
 		data, err := json.Marshal(event)
-		if err != nil {
-			t.Fatalf("marshaling generated ScopeEvent: %v", err)
-		}
-		if !strings.Contains(string(data), `"`+tc.wire+`"`) {
-			t.Fatalf("generated ScopeEvent JSON = %s, want the %s kind preserved", data, tc.wire)
-		}
+		testassert.NoError(t, err)
+		testassert.Require(t, strings.Contains(string(data), `"`+tc.wire+`"`), "generated ScopeEvent JSON = %s, want the %s kind preserved", data, tc.wire)
 	}
 }
 
@@ -162,16 +148,13 @@ func TestRevertDefaultsShareTheCodeRevertErrorContract(t *testing.T) {
 		{"/v1/retained-code-snapshots/revert"},
 	} {
 		item := doc.Paths.Find(row.path)
-		if item == nil || item.Post == nil {
-			t.Fatalf("%s has no POST operation", row.path)
-		}
+		testassert.Require(t, item != nil && item.Post != nil, "%s has no POST operation", row.path)
 		defaultResponse := item.Post.Responses.Default()
-		if defaultResponse == nil || defaultResponse.Value == nil {
-			t.Fatalf("%s POST has no default response", row.path)
-		}
+		testassert.Require(t, defaultResponse != nil && defaultResponse.Value != nil, "%s POST has no default response", row.path)
 		ref := defaultResponse.Value.Content.Get("application/json").Schema.Ref
-		if want := "#/components/schemas/CodeRevertError"; ref != want {
-			t.Fatalf("%s default schema ref = %q, want %q", row.path, ref, want)
+		{
+			want := "#/components/schemas/CodeRevertError"
+			testassert.Require(t, ref == want, "%s default schema ref = %q, want %q", row.path, ref, want)
 		}
 	}
 
@@ -189,12 +172,8 @@ func TestRevertDefaultsShareTheCodeRevertErrorContract(t *testing.T) {
 // api_key_env member keeps its gosec-safe generated identifier.
 func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
 	field := protocol.ProviderFieldEnvironmentVariable
-	if !field.Valid() || field != "api_key_env" {
-		t.Fatalf("generated identifier %q is not the valid api_key_env member", field)
-	}
-	if !protocol.ProviderFieldHidden.Valid() || !protocol.ModelFieldHidden.Valid() {
-		t.Fatal("the shared field enums dropped the hidden member")
-	}
+	testassert.Require(t, field.Valid() && field == "api_key_env", "generated identifier %q is not the valid api_key_env member", field)
+	testassert.Require(t, protocol.ProviderFieldHidden.Valid() && protocol.ModelFieldHidden.Valid(), "the shared field enums dropped the hidden member")
 
 	doc := schema(t)
 	for _, row := range []struct {
@@ -212,9 +191,7 @@ func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
 		}},
 	} {
 		item := doc.Paths.Find(row.path)
-		if item == nil || item.Delete == nil {
-			t.Fatalf("%s has no DELETE operation", row.path)
-		}
+		testassert.Require(t, item != nil && item.Delete != nil, "%s has no DELETE operation", row.path)
 		var param *openapi3.Parameter
 		for _, p := range item.Delete.Parameters {
 			if p.Value != nil && p.Value.Name == "field" {
@@ -222,20 +199,15 @@ func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
 				break
 			}
 		}
-		if param == nil {
-			t.Fatalf("%s field path parameter is missing", row.path)
-		}
-		if ref := param.Schema.Ref; ref != "#/components/schemas/"+row.component {
-			t.Fatalf("%s field parameter ref = %q, want the shared %s component", row.path, ref, row.component)
+		testassert.Require(t, param != nil, "%s field path parameter is missing", row.path)
+		{
+			ref := param.Schema.Ref
+			testassert.Require(t, ref == "#/components/schemas/"+row.component, "%s field parameter ref = %q, want the shared %s component", row.path, ref, row.component)
 		}
 		component := componentSchema(t, row.component)
-		if len(component.Enum) != len(row.wantEnum) {
-			t.Fatalf("%s enum holds %d values, want %d", row.component, len(component.Enum), len(row.wantEnum))
-		}
+		testassert.Require(t, len(component.Enum) == len(row.wantEnum), "%s enum holds %d values, want %d", row.component, len(component.Enum), len(row.wantEnum))
 		for i, v := range row.wantEnum {
-			if component.Enum[i] != v {
-				t.Fatalf("%s enum[%d] = %v, want %q", row.component, i, component.Enum[i], v)
-			}
+			testassert.Require(t, component.Enum[i] == v, "%s enum[%d] = %v, want %q", row.component, i, component.Enum[i], v)
 		}
 		// The edit request's property names are exactly the field enum: one
 		// vocabulary shared by both paths.
@@ -248,9 +220,7 @@ func TestProviderAndModelFieldSetsShareEditAndResetPaths(t *testing.T) {
 		sort.Strings(properties)
 		want := append([]string(nil), row.wantEnum...)
 		sort.Strings(want)
-		if strings.Join(properties, ",") != strings.Join(want, ",") {
-			t.Fatalf("%s properties %v, want exactly the %s enum %v", editName, properties, row.component, want)
-		}
+		testassert.Require(t, strings.Join(properties, ",") == strings.Join(want, ","), "%s properties %v, want exactly the %s enum %v", editName, properties, row.component, want)
 	}
 }
 
@@ -263,11 +233,7 @@ func TestGeneratedSystemRoleSharedAcrossEditsAndViews(t *testing.T) {
 	modelEdit := protocol.ModelEdit{SystemRole: &role}
 	modelView := protocol.ModelView{SystemRole: role}
 	provider := protocol.Provider{SystemRole: role}
-	if providerEdit.SystemRole == nil || modelEdit.SystemRole == nil ||
-		modelView.SystemRole != protocol.SystemRoleDeveloper ||
-		provider.SystemRole != protocol.SystemRoleDeveloper {
-		t.Fatal("generated SystemRole is not shared across provider/model edits and views")
-	}
+	testassert.Require(t, providerEdit.SystemRole != nil && modelEdit.SystemRole != nil && modelView.SystemRole == protocol.SystemRoleDeveloper && provider.SystemRole == protocol.SystemRoleDeveloper, "generated SystemRole is not shared across provider/model edits and views")
 }
 
 // TestConversationRawObjectFieldsShareOneComponent keeps the conversation
@@ -297,9 +263,7 @@ func TestConversationRawObjectFieldsShareOneComponent(t *testing.T) {
 		"ToolCallView.metadata=ToolMetadata",
 		"ToolCallView.normalized_arguments=JSONObject",
 	}
-	if !reflect.DeepEqual(refs, want) {
-		t.Fatalf("shared raw-object component references = %v, want exactly %v", refs, want)
-	}
+	testassert.Require(t, reflect.DeepEqual(refs, want), "shared raw-object component references = %v, want exactly %v", refs, want)
 }
 
 // TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors proves the
@@ -309,9 +273,7 @@ func TestConversationRawObjectFieldsShareOneComponent(t *testing.T) {
 func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.T) {
 	raw := contractComponentFixture(t, loadContractCorpus(t), "JSONObject", "raw-numbers")
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &members); err != nil {
-		t.Fatalf("decoding the raw JSONObject fixture: %v", err)
-	}
+	testassert.NoError(t, json.Unmarshal([]byte(raw), &members))
 	normalized := protocol.JSONObject(members)
 	metadata := protocol.ToolMetadata(raw)
 	item := protocol.AssistantItem{
@@ -331,29 +293,17 @@ func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.
 		}},
 	}
 	var wire protocol.ConversationItem
-	if err := wire.FromAssistantItem(item); err != nil {
-		t.Fatalf("FromAssistantItem: %v", err)
-	}
+	testassert.NoError(t, wire.FromAssistantItem(item))
 	data, err := json.Marshal(wire)
-	if err != nil {
-		t.Fatalf("marshaling generated ConversationItem: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, want := range []string{string(members["n"]), string(members["big"])} {
-		if !strings.Contains(string(data), want) {
-			t.Fatalf("wire JSON = %s, want %q preserved", data, want)
-		}
+		testassert.Require(t, strings.Contains(string(data), want), "wire JSON = %s, want %q preserved", data, want)
 	}
 	decoded, err := wire.AsAssistantItem()
-	if err != nil {
-		t.Fatalf("AsAssistantItem: %v", err)
-	}
-	if decoded.ToolCalls[0].NormalizedArguments == nil || string((*decoded.ToolCalls[0].NormalizedArguments)["n"]) != string(members["n"]) {
-		t.Fatalf("decoded normalized arguments = %v, want the raw number preserved", decoded.ToolCalls[0].NormalizedArguments)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, decoded.ToolCalls[0].NormalizedArguments != nil && string((*decoded.ToolCalls[0].NormalizedArguments)["n"]) == string(members["n"]), "decoded normalized arguments = %v, want the raw number preserved", decoded.ToolCalls[0].NormalizedArguments)
 	// A raw-valued object re-encodes canonically (sorted members) while every
 	// value stays byte-exact: the fixture's opaque numbers survive untouched.
 	want := "{\"big\":" + string(members["big"]) + ",\"n\":" + string(members["n"]) + "}"
-	if decoded.ToolCalls[0].Metadata == nil || string(*decoded.ToolCalls[0].Metadata) != want {
-		t.Fatalf("decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
-	}
+	testassert.Require(t, decoded.ToolCalls[0].Metadata != nil && string(*decoded.ToolCalls[0].Metadata) == want, "decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
 }

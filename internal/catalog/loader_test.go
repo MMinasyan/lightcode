@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
@@ -40,14 +41,11 @@ func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
 	}`)
 
 	catalog, warnings, err := NewLoader(home, bundledFS).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if hasNonDiscoveryWarning(warnings) {
-		t.Fatalf("Load warnings = %#v, want no non-discovery warnings", warnings)
-	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"}); err != nil {
-		t.Fatalf("bundled openai model missing after Load: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, !hasNonDiscoveryWarning(warnings), "Load warnings = %#v, want no non-discovery warnings", warnings)
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"})
+		testassert.NoError(t, err)
 	}
 	if _, model, err := catalog.Lookup(ModelRef{Provider: "local", Model: "known"}); err != nil {
 		t.Fatalf("user-config model missing after Load: %v", err)
@@ -56,8 +54,9 @@ func TestLoaderReadsBundledUserConfigAndDiscoveryCache(t *testing.T) {
 	} else if model.Cost == nil || model.Cost.Input == nil || *model.Cost.Input != 0.2 {
 		t.Fatalf("user-config model cost = %#v, want discovery price", model.Cost)
 	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "local", Model: "qwen3"}); err == nil {
-		t.Fatalf("config-only provider gained discovered model")
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "local", Model: "qwen3"})
+		testassert.Require(t, err != nil, "config-only provider gained discovered model")
 	}
 }
 
@@ -66,17 +65,15 @@ func TestLoaderCreatesEmptyConfigAndFallsBackToBundled(t *testing.T) {
 	home := t.TempDir()
 
 	catalog, warnings, err := NewLoader(home, bundledFS).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, !hasNonDiscoveryWarning(warnings), "Load warnings = %#v, want no non-discovery warnings", warnings)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		testassert.NoError(t, err)
 	}
-	if hasNonDiscoveryWarning(warnings) {
-		t.Fatalf("Load warnings = %#v, want no non-discovery warnings", warnings)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "config.json")); err != nil {
-		t.Fatalf("config skeleton was not created: %v", err)
-	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"}); err != nil {
-		t.Fatalf("bundled openai model missing after missing config fallback: %v", err)
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -86,14 +83,11 @@ func TestLoaderMalformedConfigFallsBackToBundledWithWarning(t *testing.T) {
 	writeLoaderFile(t, filepath.Join(home, ".lightcode", "config.json"), `{not json`)
 
 	catalog, warnings, err := NewLoader(home, bundledFS).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if !hasWarning(warnings, "user_config_skip") {
-		t.Fatalf("Load warnings = %#v, want user_config_skip", warnings)
-	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"}); err != nil {
-		t.Fatalf("bundled openai model missing after malformed config fallback: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, hasWarning(warnings, "user_config_skip"), "Load warnings = %#v, want user_config_skip", warnings)
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "openai", Model: "gpt-5-mini"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -111,14 +105,11 @@ func TestLoaderSkipsMalformedDiscoveryCacheWithWarning(t *testing.T) {
 	writeLoaderFile(t, filepath.Join(home, ".lightcode", "cache", "discovery", "local.json"), `{not json`)
 
 	catalog, warnings, err := NewLoader(home, bundledFS).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if !hasWarning(warnings, "discovery_failure") {
-		t.Fatalf("Load warnings = %#v, want discovery_failure", warnings)
-	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "local", Model: "qwen3"}); err == nil || !strings.Contains(err.Error(), "unknown") {
-		t.Fatalf("Lookup local/qwen3 error = %v, want unknown model/provider", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, hasWarning(warnings, "discovery_failure"), "Load warnings = %#v, want discovery_failure", warnings)
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "local", Model: "qwen3"})
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "unknown"), "Lookup local/qwen3 error = %v, want unknown model/provider", err)
 	}
 }
 
@@ -136,17 +127,15 @@ func TestLoaderMalformedTransportKeepsValidSibling(t *testing.T) {
       "discovery": false,
       "models": {}
     }`)}}).Load()
-	if err != nil {
-		t.Fatal(err)
+	testassert.NoError(t, err)
+	testassert.Require(t, hasWarningForProvider(warnings, "user_config_skip", "invalid"), "warnings = %#v, want user_config_skip for invalid malformed transport", warnings)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "invalid", Model: "m"})
+		testassert.Require(t, err != nil, "malformed transport provider was retained")
 	}
-	if !hasWarningForProvider(warnings, "user_config_skip", "invalid") {
-		t.Fatalf("warnings = %#v, want user_config_skip for invalid malformed transport", warnings)
-	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "invalid", Model: "m"}); err == nil {
-		t.Fatal("malformed transport provider was retained")
-	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "valid", Model: "m"}); err != nil {
-		t.Fatalf("valid sibling missing: %v", err)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "valid", Model: "m"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -174,31 +163,28 @@ func TestLoaderTransportBoundRecentFailedAndLegacyRows(t *testing.T) {
 		serverA, callsA := newServer(t, "a-model")
 		serverB, callsB := newServer(t, "b-model")
 		transportA := Transport{BaseURL: serverA.URL + "/v1"}
-		if err := WriteDiscoveryCache(home, "remote", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a-cached": {ContextWindow: 4096}}}, time.Now().UTC()); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, WriteDiscoveryCache(home, "remote", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a-cached": {ContextWindow: 4096}}}, time.Now().UTC()))
 		catA, _, err := NewLoader(home, providerFS(transportA.BaseURL)).Load()
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		if *callsA != 0 {
 			t.Fatalf("recent A discovery calls = %d, want 0", *callsA)
 		}
-		if _, _, err := catA.Lookup(ModelRef{Provider: "remote", Model: "a-cached"}); err != nil {
-			t.Fatalf("matching A cache model missing: %v", err)
+		{
+			_, _, err := catA.Lookup(ModelRef{Provider: "remote", Model: "a-cached"})
+			testassert.NoError(t, err)
 		}
 		catB, _, err := NewLoader(home, providerFS(serverB.URL+"/v1")).Load()
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		if *callsB != 1 {
 			t.Fatalf("B discovery calls = %d, want 1 after foreign recent A", *callsB)
 		}
-		if _, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "b-model"}); err != nil {
-			t.Fatalf("B discovery model missing: %v", err)
+		{
+			_, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "b-model"})
+			testassert.NoError(t, err)
 		}
-		if _, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "a-cached"}); err == nil {
-			t.Fatal("foreign A model survived the B rebuild")
+		{
+			_, _, err := catB.Lookup(ModelRef{Provider: "remote", Model: "a-cached"})
+			testassert.Require(t, err != nil, "foreign A model survived the B rebuild")
 		}
 	})
 	t.Run("failed A then B", func(t *testing.T) {
@@ -206,11 +192,10 @@ func TestLoaderTransportBoundRecentFailedAndLegacyRows(t *testing.T) {
 		serverA, _ := newServer(t, "unused-a")
 		serverB, callsB := newServer(t, "b-model")
 		transportA := Transport{BaseURL: serverA.URL + "/v1"}
-		if err := WriteDiscoveryAttempt(home, "remote", transportA, time.Now().UTC()); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := NewLoader(home, providerFS(serverB.URL+"/v1")).Load(); err != nil {
-			t.Fatal(err)
+		testassert.NoError(t, WriteDiscoveryAttempt(home, "remote", transportA, time.Now().UTC()))
+		{
+			_, _, err := NewLoader(home, providerFS(serverB.URL+"/v1")).Load()
+			testassert.NoError(t, err)
 		}
 		if *callsB != 1 {
 			t.Fatalf("B discovery calls after failed A = %d, want 1", *callsB)
@@ -224,14 +209,13 @@ func TestLoaderTransportBoundRecentFailedAndLegacyRows(t *testing.T) {
   "models": {"legacy": {"context_window": 4096}}
 }`)
 		cat, _, err := NewLoader(home, providerFS(server.URL+"/v1")).Load()
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		if *calls != 1 {
 			t.Fatalf("legacy cache discovery calls = %d, want 1", *calls)
 		}
-		if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "legacy"}); err == nil {
-			t.Fatal("legacy model was used as bound discovery")
+		{
+			_, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "legacy"})
+			testassert.Require(t, err != nil, "legacy model was used as bound discovery")
 		}
 	})
 }
@@ -241,9 +225,7 @@ func TestLoaderFetchesDiscoveryWhenAttemptDueForBundledProvider(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.URL.Path != "/v1/models" {
-			t.Fatalf("unexpected discovery path %s", r.URL.Path)
-		}
+		testassert.Equal(t, r.URL.Path, "/v1/models")
 		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","name":"Remote Model","context_window":16384,"max_output_tokens":2048}]}`))
 	}))
 	t.Cleanup(server.Close)
@@ -259,22 +241,17 @@ func TestLoaderFetchesDiscoveryWhenAttemptDueForBundledProvider(t *testing.T) {
 	}
 
 	catalog, warnings, err := NewLoader(home, fsys).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if hasNonDiscoveryWarning(warnings) {
-		t.Fatalf("Load warnings = %#v, want no non-discovery warnings", warnings)
-	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want 1", calls)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, !hasNonDiscoveryWarning(warnings), "Load warnings = %#v, want no non-discovery warnings", warnings)
+	testassert.Equal(t, calls, 1)
 	if _, model, err := catalog.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err != nil {
 		t.Fatalf("discovered model missing after live Load discovery: %v", err)
 	} else if model.Name != "Remote Model" || model.ContextWindow != 16384 || model.MaxOutputTokens != 2048 {
 		t.Fatalf("discovered model = %#v", model)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); err != nil {
-		t.Fatalf("discovery cache was not written: %v", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.NoError(t, err)
 	}
 }
 
@@ -302,17 +279,12 @@ func TestLoaderSkipsDiscoveryWhenAttemptRecent(t *testing.T) {
 	}
 
 	catalog, warnings, err := NewLoader(home, fsys).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if hasNonDiscoveryWarning(warnings) {
-		t.Fatalf("Load warnings = %#v, want no non-discovery warnings", warnings)
-	}
-	if calls != 0 {
-		t.Fatalf("discovery calls = %d, want 0", calls)
-	}
-	if _, _, err := catalog.Lookup(ModelRef{Provider: "remote", Model: "known"}); err != nil {
-		t.Fatalf("known model missing: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, !hasNonDiscoveryWarning(warnings), "Load warnings = %#v, want no non-discovery warnings", warnings)
+	testassert.Equal(t, calls, 0)
+	{
+		_, _, err := catalog.Lookup(ModelRef{Provider: "remote", Model: "known"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -334,8 +306,9 @@ func TestLoaderSkipsMissingAPIKeySilently(t *testing.T) {
 	} else if len(warnings) != 0 {
 		t.Fatalf("Load warnings = %#v, want none", warnings)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); !os.IsNotExist(err) {
-		t.Fatalf("discovery cache stat = %v, want missing cache", err)
+	{
+		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.Require(t, os.IsNotExist(err), "discovery cache stat = %v, want missing cache", err)
 	}
 }
 
@@ -358,19 +331,11 @@ func TestLoaderDiscoveryFailureWarnsAndDoesNotBlockStartup(t *testing.T) {
 	}`)
 
 	catalog, warnings, err := NewLoader(home, bundledFS).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if catalog == nil {
-		t.Fatal("Load returned nil catalog after discovery failure")
-	}
-	if !hasWarning(warnings, "discovery_failure") {
-		t.Fatalf("Load warnings = %#v, want discovery_failure", warnings)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, catalog != nil, "Load returned nil catalog after discovery failure")
+	testassert.Require(t, hasWarning(warnings, "discovery_failure"), "Load warnings = %#v, want discovery_failure", warnings)
 	_, err = os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "local.json"))
-	if err != nil {
-		t.Fatalf("discovery attempt cache was not written: %v", err)
-	}
+	testassert.NoError(t, err)
 }
 
 func TestLoaderFailedDiscoveryAttemptDoesNotRetryWithinTTL(t *testing.T) {
@@ -403,9 +368,7 @@ func TestLoaderFailedDiscoveryAttemptDoesNotRetryWithinTTL(t *testing.T) {
 	} else if hasWarning(warnings, "discovery_failure") {
 		t.Fatalf("second Load warnings = %#v, want no retry failure", warnings)
 	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want 1", calls)
-	}
+	testassert.Equal(t, calls, 1)
 }
 
 func writeLoaderFile(t *testing.T, path, content string) {
@@ -413,8 +376,9 @@ func writeLoaderFile(t *testing.T, path, content string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("MkdirAll(%s): %v", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile(%s): %v", path, err)
+	{
+		err := os.WriteFile(path, []byte(content), 0o600)
+		testassert.Require(t, err == nil, "WriteFile(%s): %v", path, err)
 	}
 }
 
@@ -479,14 +443,11 @@ func TestLoaderAllowRefreshGateExcludesUnconnected(t *testing.T) {
 	loader := NewLoader(home, fsys)
 	loader.AllowRefresh = func(_ string, _ *Provider) bool { return false }
 	cat, _, err := loader.Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if calls != 0 {
-		t.Fatalf("discovery calls = %d, want 0 (gate rejected unconnected)", calls)
-	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err == nil {
-		t.Fatal("discovered model appeared despite AllowRefresh=false")
+	testassert.NoError(t, err)
+	testassert.Equal(t, calls, 0)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"})
+		testassert.Require(t, err != nil, "discovered model appeared despite AllowRefresh=false")
 	}
 }
 
@@ -517,14 +478,11 @@ func TestLoaderAllowRefreshGateIncludesConnected(t *testing.T) {
 	loader := NewLoader(home, fsys)
 	loader.AllowRefresh = func(_ string, _ *Provider) bool { return true }
 	cat, _, err := loader.Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want 1 (gate allowed connected)", calls)
-	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err != nil {
-		t.Fatalf("discovered model missing after allowed refresh: %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, calls, 1)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -554,14 +512,11 @@ func TestLoaderNoAllowRefreshRefreshesAllCandidates(t *testing.T) {
 
 	// No AllowRefresh set — should behave as before and refresh all candidates.
 	cat, _, err := NewLoader(home, fsys).Load()
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("discovery calls = %d, want 1 (no gate = refresh all)", calls)
-	}
-	if _, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"}); err != nil {
-		t.Fatalf("discovered model missing: %v", err)
+	testassert.NoError(t, err)
+	testassert.Equal(t, calls, 1)
+	{
+		_, _, err := cat.Lookup(ModelRef{Provider: "remote", Model: "remote-model"})
+		testassert.NoError(t, err)
 	}
 }
 
@@ -596,13 +551,9 @@ func TestDiscoveryRefreshCandidatesIsMechanical(t *testing.T) {
 		got[id] = true
 	}
 	for id := range want {
-		if !got[id] {
-			t.Fatalf("candidate %q missing; got %v", id, candidates)
-		}
+		testassert.Require(t, got[id], "candidate %q missing; got %v", id, candidates)
 	}
-	if got["no-discovery"] {
-		t.Fatalf("no-discovery provider should not be a candidate; got %v", candidates)
-	}
+	testassert.Require(t, !got["no-discovery"], "no-discovery provider should not be a candidate; got %v", candidates)
 }
 
 // TestLoaderLoadTryContentionWarnsAndDoesNotHang proves the Try Loader routes
@@ -622,9 +573,7 @@ func TestLoaderLoadTryContentionWarnsAndDoesNotHang(t *testing.T) {
 		}
 	}`)
 	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "local"))
-	if err != nil || !ok {
-		t.Fatalf("seed TryAcquire: (%v, %v)", ok, err)
-	}
+	testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
 	defer holder.Release()
 
 	done := make(chan struct {
@@ -642,15 +591,9 @@ func TestLoaderLoadTryContentionWarnsAndDoesNotHang(t *testing.T) {
 	}()
 	select {
 	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("LoadTry under discovery contention = %v, want a catalog plus warnings", res.err)
-		}
-		if res.cat == nil {
-			t.Fatal("LoadTry returned a nil catalog under discovery contention")
-		}
-		if !hasWarning(res.warnings, "discovery_failure") {
-			t.Fatalf("LoadTry warnings = %#v, want a discovery_failure warning", res.warnings)
-		}
+		testassert.Require(t, res.err == nil, "LoadTry under discovery contention = %v, want a catalog plus warnings", res.err)
+		testassert.Require(t, res.cat != nil, "LoadTry returned a nil catalog under discovery contention")
+		testassert.Require(t, hasWarning(res.warnings, "discovery_failure"), "LoadTry warnings = %#v, want a discovery_failure warning", res.warnings)
 	case <-time.After(5 * time.Second):
 		t.Fatal("LoadTry hung on the foreign discovery lock; Try publication must not block shutdown")
 	}
@@ -676,16 +619,14 @@ func TestLoaderLoadTrySucceedsLikeLoad(t *testing.T) {
 		}`)},
 	}
 	cat, warnings, err := NewLoader(home, fsys).LoadTry()
-	if err != nil {
-		t.Fatalf("LoadTry: %v", err)
+	testassert.NoError(t, err)
+	testassert.Require(t, !hasWarning(warnings, "discovery_failure"), "LoadTry warnings = %#v, want no discovery_failure", warnings)
+	{
+		_, ok := cat.Providers["remote"].Models["remote-model"]
+		testassert.Require(t, ok, "LoadTry did not merge the fetched model: %#v", cat.Providers["remote"].Models)
 	}
-	if hasWarning(warnings, "discovery_failure") {
-		t.Fatalf("LoadTry warnings = %#v, want no discovery_failure", warnings)
-	}
-	if _, ok := cat.Providers["remote"].Models["remote-model"]; !ok {
-		t.Fatalf("LoadTry did not merge the fetched model: %#v", cat.Providers["remote"].Models)
-	}
-	if _, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json")); statErr != nil {
-		t.Fatalf("LoadTry did not write the discovery cache: %v", statErr)
+	{
+		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		testassert.Require(t, statErr == nil, "LoadTry did not write the discovery cache: %v", statErr)
 	}
 }

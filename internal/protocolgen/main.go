@@ -1,25 +1,31 @@
-// Command protocolgen generates the native invocation bindings and their
-// test-only invocation contract from the protocol schema. It is a private
-// build command: it runs during generation, imports the pinned schema loader
-// and the standard library, and never enters a shipped Runtime, Harness,
-// client or plugin path.
+// Command protocolgen generates the SDK, the native invocation bindings and
+// their test-only invocation contract from one protocol schema. It is a
+// private build command: it imports the pinned SDK generator and schema loader
+// and never enters a shipped Runtime, Harness, client or plugin path.
 //
 //	go run ./internal/protocolgen \
 //	  -schema protocol/openapi.yaml \
+//	  -config protocol/oapi-codegen.yaml \
+//	  -sdk-out protocol/protocol.gen.go \
 //	  -out internal/clientops/operations.gen.go \
 //	  -native-contract-out frontend/src/generated/native-invocations.json
 //
-// Both artifacts are resolved, validated and formatted in memory before
-// either destination is written, so an unsupported schema shape fails the
-// command with both outputs untouched.
+// The schema is loaded and validated once. The SDK generator owns every
+// schema/reference/type/name derivation; this command only projects its
+// resolved operation records into the native envelope limits before writing.
+// All three artifacts are resolved and formatted in memory before any
+// destination is written, so an unsupported schema shape or a failed SDK
+// generation leaves all three untouched.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"go/format"
+	"go/token"
 	"os"
 	"sort"
 	"strconv"
@@ -27,6 +33,8 @@ import (
 	"text/template"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/oapi-codegen/oapi-codegen/v2/pkg/codegen"
+	"gopkg.in/yaml.v3"
 )
 
 // The three envelope member modes the schema declares for one operation.
@@ -54,37 +62,45 @@ type queryMember struct {
 	kind     string
 }
 
-// operation is one schema-declared native operation in its generated form.
+// operation is one SDK-resolved native operation in its projected form.
 type operation struct {
-	id           string
-	session      string
-	field        string
-	fieldType    string
-	query        string
-	body         string
-	queryMembers []queryMember
-	status       int
+	id            string
+	method        string
+	session       string
+	sessionType   string
+	field         string
+	fieldType     string
+	query         string
+	queryRequired []string
+	queryMembers  []queryMember
+	body          string
+	status        int
 }
 
-// main parses the three explicit paths and runs the generator.
+// main parses the explicit paths and runs the generator.
 func main() {
 	schema := flag.String("schema", "", "path to the protocol OpenAPI schema")
+	config := flag.String("config", "", "path to the SDK generator configuration")
+	sdkOut := flag.String("sdk-out", "", "path of the generated SDK")
 	out := flag.String("out", "", "path of the generated Go operation bindings")
 	nativeContractOut := flag.String("native-contract-out", "", "path of the generated native invocation contract")
 	flag.Parse()
-	if err := run(*schema, *out, *nativeContractOut); err != nil {
+	if err := run(*schema, *config, *sdkOut, *out, *nativeContractOut); err != nil {
 		fmt.Fprintln(os.Stderr, "protocolgen:", err)
 		os.Exit(1)
 	}
 }
 
-// run writes the two artifacts generated from one schema. A schema or shape
-// failure writes neither destination; an ordinary destination I/O failure
-// fails the command after the other destination may already exist.
-func run(schemaPath, outPath, contractPath string) error {
-	source, contract, err := generateFiles(schemaPath)
+// run writes the three artifacts generated from one schema. A schema, SDK or
+// shape failure writes none of the destinations; an ordinary destination I/O
+// failure fails the command after the earlier destinations may already exist.
+func run(schemaPath, configPath, sdkPath, outPath, contractPath string) error {
+	sdk, source, contract, err := generateFiles(schemaPath, configPath)
 	if err != nil {
 		return err
+	}
+	if err := os.WriteFile(sdkPath, sdk, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", sdkPath, err)
 	}
 	if err := os.WriteFile(outPath, source, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", outPath, err)
@@ -95,69 +111,92 @@ func run(schemaPath, outPath, contractPath string) error {
 	return nil
 }
 
-// generateFiles loads the schema and returns both artifacts, fully formatted,
-// without touching either destination.
-func generateFiles(schemaPath string) ([]byte, []byte, error) {
+// loadConfiguration reads one SDK generator configuration with unknown members
+// rejected, applies its defaults and validates it.
+func loadConfiguration(path string) (codegen.Configuration, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return codegen.Configuration{}, fmt.Errorf("reading %s: %w", path, err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	var configuration codegen.Configuration
+	if err := decoder.Decode(&configuration); err != nil {
+		return codegen.Configuration{}, fmt.Errorf("decoding %s: %w", path, err)
+	}
+	configuration = configuration.UpdateDefaults()
+	if err := configuration.Validate(); err != nil {
+		return codegen.Configuration{}, fmt.Errorf("validating %s: %w", path, err)
+	}
+	return configuration, nil
+}
+
+// generateFiles loads the schema, generates its SDK and projects the SDK's
+// resolved operation records into both native artifacts. Nothing is written.
+// Generate runs first because OperationDefinitions' schema/type mapping
+// depends on the global state Generate initializes; the two calls are
+// sequential over the same document.
+func generateFiles(schemaPath, configPath string) ([]byte, []byte, []byte, error) {
+	configuration, err := loadConfiguration(configPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	loader := openapi3.NewLoader()
+	// Source origins feed OperationDefinition.SpecOrder; without them the SDK
+	// producer would lose the schema's declaration order.
+	loader.IncludeOrigin = true
 	doc, err := loader.LoadFromFile(schemaPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("loading %s: %w", schemaPath, err)
+		return nil, nil, nil, fmt.Errorf("loading %s: %w", schemaPath, err)
 	}
 	if err := doc.Validate(context.Background()); err != nil {
-		return nil, nil, fmt.Errorf("validating %s: %w", schemaPath, err)
+		return nil, nil, nil, fmt.Errorf("validating %s: %w", schemaPath, err)
 	}
-	operations, err := collectOperations(doc)
+	sdk, err := codegen.Generate(doc, configuration)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, fmt.Errorf("generating the SDK: %w", err)
+	}
+	definitions, err := codegen.OperationDefinitions(doc)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolving the SDK operation records: %w", err)
+	}
+	operations, err := projectOperations(definitions)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	source, err := renderSource(operations)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	contract, err := renderContract(operations)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return source, contract, nil
+	return []byte(sdk), source, contract, nil
 }
 
-// collectOperations derives every native operation from the validated schema:
-// its addressing, its declared query members, its request body and its one
-// success status. The one declared event stream is excluded — exactly one must
-// exist — and any shape the envelope cannot address fails the command. Duplicate
-// operation IDs are already rejected by the mandatory schema validation before
-// this pass runs, so no second identity check is kept here.
-func collectOperations(doc *openapi3.T) ([]operation, error) {
-	paths := doc.Paths.Map()
-	var (
-		operations []operation
-		streamed   []string
-	)
-	for _, pathKey := range sortedKeys(paths) {
-		item := paths[pathKey]
-		methods := item.Operations()
-		for _, method := range sortedKeys(methods) {
-			declared := methods[method]
-			if !generatedName(declared.OperationID) {
-				return nil, fmt.Errorf("%s %s: operationId %q is not a generated Go name", strings.ToUpper(method), pathKey, declared.OperationID)
-			}
-			status, stream, err := successResponse(declared)
-			if err != nil {
-				return nil, fmt.Errorf("operation %s: %w", declared.OperationID, err)
-			}
-			if stream {
-				streamed = append(streamed, declared.OperationID)
-				continue
-			}
-			op, err := nativeOperation(doc, item, declared, status)
-			if err != nil {
-				return nil, fmt.Errorf("operation %s: %w", declared.OperationID, err)
-			}
-			operations = append(operations, op)
+// projectOperations projects every SDK-resolved operation into the native
+// envelope: stream operations are classified first and excluded whole, then
+// the envelope's addressing limits are checked against the SDK records.
+func projectOperations(definitions []codegen.OperationDefinition) ([]operation, error) {
+	var operations []operation
+	for _, definition := range definitions {
+		name := definition.SpecOperationId
+		if name == "" {
+			return nil, fmt.Errorf("operation %s %s has no source operationId", definition.Method, definition.Path)
 		}
-	}
-	if len(streamed) != 1 {
-		return nil, fmt.Errorf("declares %d event streams, want exactly one", len(streamed))
+		status, stream, err := successResponse(definition.Responses)
+		if err != nil {
+			return nil, fmt.Errorf("operation %s: %w", name, err)
+		}
+		if stream {
+			continue
+		}
+		op, err := projectOperation(definition, name, status)
+		if err != nil {
+			return nil, fmt.Errorf("operation %s: %w", name, err)
+		}
+		operations = append(operations, op)
 	}
 	sort.Slice(operations, func(i, j int) bool { return operations[i].id < operations[j].id })
 	return operations, nil
@@ -169,10 +208,10 @@ func collectOperations(doc *openapi3.T) ([]operation, error) {
 // content set that is not exactly one of the two declared media types, and a
 // non-204 success without content are all refused; every non-success
 // alternative, including the default error response, is ignored.
-func successResponse(declared *openapi3.Operation) (int, bool, error) {
-	responses := declared.Responses.Map()
+func successResponse(responses []codegen.ResponseDefinition) (int, bool, error) {
 	var statuses []string
-	for key := range responses {
+	for _, response := range responses {
+		key := response.StatusCode
 		if !strings.HasPrefix(key, "2") {
 			continue
 		}
@@ -181,38 +220,46 @@ func successResponse(declared *openapi3.Operation) (int, bool, error) {
 		}
 		statuses = append(statuses, key)
 	}
-	sort.Strings(statuses)
 	if len(statuses) != 1 {
 		return 0, false, fmt.Errorf("declares %d success statuses, want exactly one", len(statuses))
 	}
-	status, err := strconv.Atoi(statuses[0])
-	if err != nil {
-		return 0, false, fmt.Errorf("success status %q is not a number", statuses[0])
+	status, _ := strconv.Atoi(statuses[0])
+	var contents []codegen.ResponseContentDefinition
+	for _, response := range responses {
+		if response.StatusCode == statuses[0] {
+			contents = response.Contents
+			break
+		}
 	}
-	response := responses[statuses[0]]
-	if response.Value == nil {
-		return 0, false, fmt.Errorf("success status %d is unresolved", status)
-	}
-	content := response.Value.Content
 	// A 204 success is the empty success the retained response owner reads as
 	// no body at all: it must declare no content, before any media
 	// classification.
 	if status == noContentStatus {
-		if len(content) != 0 {
-			return 0, false, fmt.Errorf("success status %d declares media types %v, want no content", status, sortedKeys(content))
+		if len(contents) != 0 {
+			return 0, false, fmt.Errorf("success status %d declares media types %v, want no content", status, contentTypes(contents))
 		}
 		return status, false, nil
 	}
 	switch {
-	case len(content) == 1 && content[jsonMediaType] != nil:
+	case len(contents) == 1 && contents[0].ContentType == jsonMediaType:
 		return status, false, nil
-	case len(content) == 1 && content[sseMediaType] != nil:
+	case len(contents) == 1 && contents[0].ContentType == sseMediaType:
 		return status, true, nil
-	case len(content) == 0:
+	case len(contents) == 0:
 		return 0, false, fmt.Errorf("success status %d declares no content", status)
 	default:
-		return 0, false, fmt.Errorf("success status %d declares media types %v, want exactly one of %s or %s", status, sortedKeys(content), jsonMediaType, sseMediaType)
+		return 0, false, fmt.Errorf("success status %d declares media types %v, want exactly one of %s or %s", status, contentTypes(contents), jsonMediaType, sseMediaType)
 	}
+}
+
+// contentTypes returns one response's declared media types in sorted order.
+func contentTypes(contents []codegen.ResponseContentDefinition) []string {
+	types := make([]string, 0, len(contents))
+	for _, content := range contents {
+		types = append(types, content.ContentType)
+	}
+	sort.Strings(types)
+	return types
 }
 
 // isDigits reports whether every byte of one string is an ASCII decimal digit.
@@ -225,286 +272,242 @@ func isDigits(value string) bool {
 	return true
 }
 
-// nativeOperation derives one native operation's addressing from its declared
-// path parameters, query parameters and request body.
-func nativeOperation(doc *openapi3.T, item *openapi3.PathItem, declared *openapi3.Operation, status int) (operation, error) {
+// projectOperation derives one native operation's addressing from its SDK
+// combined path/query parameter records and its resolved request body. A
+// referenced path-parameter schema binds the envelope's field member; an
+// inline string parameter named id binds session_id. Both must resolve to the
+// string type. All query parameters must be string or boolean primitives, and
+// a body must be exactly one required application/json object.
+func projectOperation(definition codegen.OperationDefinition, name string, status int) (operation, error) {
 	op := operation{
-		id:      declared.OperationID,
+		id:      name,
+		method:  definition.OperationId,
 		status:  status,
 		session: modeForbidden,
 		field:   modeForbidden,
 		query:   modeForbidden,
 		body:    modeForbidden,
 	}
-	var pathParameters int
-	for _, parameter := range append(append(openapi3.Parameters{}, item.Parameters...), declared.Parameters...) {
-		value := parameter.Value
-		if value == nil {
-			return operation{}, fmt.Errorf("parameter is unresolved")
-		}
-		switch value.In {
-		case openapi3.ParameterInPath:
-			pathParameters++
-			if pathParameters > 1 {
-				return operation{}, fmt.Errorf("declares %d path parameters, want at most one", pathParameters)
-			}
-			if value.Schema == nil || value.Schema.Value == nil {
-				return operation{}, fmt.Errorf("path parameter %q has no schema", value.Name)
-			}
-			if ref := value.Schema.Ref; ref != "" {
-				name, err := enumTypeName(doc, ref)
-				if err != nil {
-					return operation{}, fmt.Errorf("path parameter %q: %w", value.Name, err)
-				}
-				op.field = modeRequired
-				op.fieldType = name
-				continue
-			}
-			if value.Name != "id" || !isStringSchema(value.Schema.Value) {
-				return operation{}, fmt.Errorf("path parameter %q has no supported addressing", value.Name)
-			}
-			op.session = modeRequired
-		case openapi3.ParameterInQuery:
-			member, err := queryParameter(value)
-			if err != nil {
-				return operation{}, err
-			}
-			for _, existing := range op.queryMembers {
-				if existing.name == member.name {
-					return operation{}, fmt.Errorf("query parameter %q is declared twice", member.name)
-				}
-			}
-			op.queryMembers = append(op.queryMembers, member)
-		default:
-			return operation{}, fmt.Errorf("parameter %q is declared in unsupported location %q", value.Name, value.In)
-		}
+	if len(definition.HeaderParams) != 0 {
+		return operation{}, fmt.Errorf("declares %d header parameters, want none", len(definition.HeaderParams))
 	}
-	op.query = modeForbidden
-	if len(op.queryMembers) > 0 {
+	if len(definition.CookieParams) != 0 {
+		return operation{}, fmt.Errorf("declares %d cookie parameters, want none", len(definition.CookieParams))
+	}
+	switch len(definition.PathParams) {
+	case 0:
+	case 1:
+		parameter := definition.PathParams[0]
+		schema := parameter.Schema.OAPISchema
+		if schema == nil || schema.Type == nil || !schema.Type.Is("string") {
+			return operation{}, fmt.Errorf("path parameter %q is not the string type", parameter.ParamName)
+		}
+		emitted, err := pathType(parameter.Schema.TypeDecl())
+		if err != nil {
+			return operation{}, fmt.Errorf("path parameter %q: %w", parameter.ParamName, err)
+		}
+		if parameter.Spec != nil && parameter.Spec.Schema != nil && parameter.Spec.Schema.Ref != "" {
+			op.field = modeRequired
+			op.fieldType = emitted
+		} else if parameter.ParamName == "id" {
+			op.session = modeRequired
+			op.sessionType = emitted
+		} else {
+			return operation{}, fmt.Errorf("path parameter %q has no supported addressing", parameter.ParamName)
+		}
+	default:
+		return operation{}, fmt.Errorf("declares %d path parameters, want at most one", len(definition.PathParams))
+	}
+	for _, parameter := range definition.QueryParams {
+		schema := parameter.Schema.OAPISchema
+		if schema == nil || schema.Type == nil {
+			return operation{}, fmt.Errorf("query parameter %q has an unsupported primitive type", parameter.ParamName)
+		}
+		member := queryMember{name: parameter.ParamName, required: parameter.Required}
+		switch {
+		case schema.Type.Is("string"):
+			member.kind = "string"
+		case schema.Type.Is("boolean"):
+			member.kind = "boolean"
+		default:
+			return operation{}, fmt.Errorf("query parameter %q has an unsupported primitive type", parameter.ParamName)
+		}
+		op.queryMembers = append(op.queryMembers, member)
+	}
+	if len(op.queryMembers) != 0 {
 		op.query = modeOptional
 		for _, member := range op.queryMembers {
 			if member.required {
 				op.query = modeRequired
+				op.queryRequired = append(op.queryRequired, member.name)
 			}
 		}
 	}
-	if declared.RequestBody != nil && declared.RequestBody.Value != nil {
-		content := declared.RequestBody.Value.Content
-		if len(content) != 1 || content[jsonMediaType] == nil {
-			return operation{}, fmt.Errorf("request body declares media types %v, want exactly %s", sortedKeys(content), jsonMediaType)
+	if len(definition.Bodies) != 0 {
+		if len(definition.Bodies) != 1 || definition.Bodies[0].ContentType != jsonMediaType {
+			types := make([]string, 0, len(definition.Bodies))
+			for _, body := range definition.Bodies {
+				types = append(types, body.ContentType)
+			}
+			sort.Strings(types)
+			return operation{}, fmt.Errorf("request body declares media types %v, want exactly %s", types, jsonMediaType)
 		}
-		schema := content[jsonMediaType].Schema
-		if schema == nil || schema.Value == nil {
-			return operation{}, fmt.Errorf("request body schema is unresolved")
-		}
-		if schema.Value.Type == nil || !schema.Value.Type.Is("object") {
-			return operation{}, fmt.Errorf("request body schema is not one explicit object")
-		}
-		if !declared.RequestBody.Value.Required {
+		body := definition.Bodies[0]
+		if !body.Required {
 			return operation{}, fmt.Errorf("request body is optional, want required")
+		}
+		schema := body.Schema.OAPISchema
+		if schema == nil || schema.Type == nil || !schema.Type.Is("object") {
+			return operation{}, fmt.Errorf("request body schema is not one explicit object")
 		}
 		op.body = modeRequired
 	}
 	return op, nil
 }
 
-// enumTypeName resolves one referenced path-parameter schema to the generated
-// protocol type the binder casts the envelope's field member to: an internal
-// component reference to a resolved string schema with a nonempty all-string
-// enum and a component name the generated client uses unchanged.
-func enumTypeName(doc *openapi3.T, ref string) (string, error) {
-	const prefix = "#/components/schemas/"
-	if !strings.HasPrefix(ref, prefix) {
-		return "", fmt.Errorf("reference %q is not an internal #/components/schemas/ reference", ref)
+// pathType maps one SDK path-parameter type declaration to the Go type the
+// generated call binds: the builtin string or an exported package-local
+// identifier qualified with the protocol package. Any other type expression is
+// an unsupported native shape.
+func pathType(declaration string) (string, error) {
+	if declaration == "string" {
+		return "string", nil
 	}
-	name := strings.TrimPrefix(ref, prefix)
-	if !generatedName(name) {
-		return "", fmt.Errorf("referenced component name %q is not a generated Go name", name)
+	if token.IsIdentifier(declaration) && token.IsExported(declaration) {
+		return "protocol." + declaration, nil
 	}
-	component := doc.Components.Schemas[name]
-	if component == nil || component.Value == nil {
-		return "", fmt.Errorf("referenced component %q is unresolved", name)
-	}
-	schema := component.Value
-	if !isStringSchema(schema) {
-		return "", fmt.Errorf("referenced component %q is not the string type", name)
-	}
-	if len(schema.Enum) == 0 {
-		return "", fmt.Errorf("referenced component %q declares no enum values", name)
-	}
-	for _, value := range schema.Enum {
-		if _, ok := value.(string); !ok {
-			return "", fmt.Errorf("referenced component %q declares the non-string enum value %v", name, value)
-		}
-	}
-	return name, nil
+	return "", fmt.Errorf("type %q is not a supported native path type", declaration)
 }
 
-// generatedName reports whether one schema identifier is already the exact
-// generated Go name the pinned generator uses: nonempty, an ASCII uppercase
-// initial and only ASCII letters and digits after it. An identifier that would
-// need normalization — a lowercase initial, an underscore or other separator,
-// a leading digit — is refused explicitly instead of being silently mapped or
-// left to fail as generated Go.
-func generatedName(name string) bool {
-	if name == "" || name[0] < 'A' || name[0] > 'Z' {
-		return false
-	}
-	for index := 1; index < len(name); index++ {
-		character := name[index]
-		switch {
-		case character >= 'A' && character <= 'Z',
-			character >= 'a' && character <= 'z',
-			character >= '0' && character <= '9':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// queryParameter resolves one declared query parameter's primitive type: only
-// the string and boolean primitives the generated Params types bind are
-// supported.
-func queryParameter(value *openapi3.Parameter) (queryMember, error) {
-	if value.Schema == nil || value.Schema.Value == nil {
-		return queryMember{}, fmt.Errorf("query parameter %q has no schema", value.Name)
-	}
-	schema := value.Schema.Value
-	switch {
-	case isStringSchema(schema):
-		return queryMember{name: value.Name, required: value.Required, kind: "string"}, nil
-	case schema.Type != nil && schema.Type.Is("boolean"):
-		return queryMember{name: value.Name, required: value.Required, kind: "boolean"}, nil
-	default:
-		return queryMember{}, fmt.Errorf("query parameter %q has an unsupported primitive type", value.Name)
-	}
-}
-
-// isStringSchema reports whether one schema is the string primitive.
-func isStringSchema(schema *openapi3.Schema) bool {
-	return schema.Type != nil && schema.Type.Is("string")
-}
-
-// sortedKeys returns one string-keyed map's keys in sorted order, so every
-// derived artifact is deterministic.
-func sortedKeys[V any](values map[string]V) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-// sourceTemplate renders the generated Go bindings. go/format normalizes the
-// result, so the template only has to emit valid, complete Go.
+// sourceTemplate renders the generated native operation table. go/format
+// normalizes the result, so the template only has to emit valid, complete Go.
 const sourceTemplate = `// Code generated by internal/protocolgen from protocol/openapi.yaml; DO NOT EDIT.
 //
-// The native operation table and its dispatch are derived from the schema:
-// operationNames is the sorted set of declared native operations and
-// invokeGenerated binds each one's declared addressing before calling the
-// matching generated client method.
+// The native operation table is the SDK-resolved projection of the schema: each
+// descriptor carries one operation's envelope member rules, its one numeric
+// success status and the generated client call for its bound envelope.
 package clientops
 
+{{- if .Imports}}
 import (
 {{- if .NeedsBytes}}
 	"bytes"
 {{- end}}
 	"context"
-	"encoding/json"
 	"net/http"
 
-	"github.com/MMinasyan/lightcode/client"
-{{- if .NeedsProtocol}}
 	"github.com/MMinasyan/lightcode/protocol"
-{{- end}}
 )
+{{- end}}
 
-// operationNames is the schema's native operation set in sorted order: every
-// declared operation whose success response is not the event stream. It is the
-// sole authority for the initialize advertisement and for Call's own admission.
-var operationNames = []string{
-{{- range .Names}}
-	{{printf "%q" .}},
+// operationDescriptors is the schema's native operation set keyed by its source
+// operationId. Each call binds the operation's generated path and query
+// arguments from the already-bound envelope and performs exactly one generated
+// SDK request; the shared invoker in bind.go applies the envelope rules and the
+// one response owner interprets the result.
+var operationDescriptors = map[string]descriptor{
+{{- range .Operations}}
+	{{printf "%q" .ID}}: {
+{{- if .Session}}
+		session: memberRequired,
 {{- end}}
-}
-
-// invokeGenerated binds one invocation envelope to the generated client
-// method the named operation declares and returns that call's raw response
-// beside the operation's declared success status. A local binding failure or a
-// failure to obtain an HTTP response returns a nil response and the zero
-// status; the caller owns response interpretation.
-func invokeGenerated(ctx context.Context, c *client.Client, operation string, params json.RawMessage) (*http.Response, int, error) {
-	switch operation {
-{{- range .Arms}}
-{{template "arm" .}}
+{{- if .Field}}
+		field: memberRequired,
 {{- end}}
-	default:
-		return nil, 0, invalidParams("unknown operation %q", operation)
-	}
-}
-{{define "arm"}}	case {{printf "%q" .ID}}:
-{{- if .NeedEnv}}
-		env, err := bindEnvelope({{.Envelope}})
-		if err != nil {
-			return nil, 0, err
-		}
-{{- else}}
-		if _, err := bindEnvelope({{.Envelope}}); err != nil {
-			return nil, 0, err
-		}
+{{- if .Query}}
+		query: member{{if .QueryOptional}}Optional{{else}}Required{{end}},
 {{- end}}
-{{- if .QueryType}}
-		var query protocol.{{.QueryType}}
-{{- if .QueryOptional}}
-		if env.query != nil {
-			if err := bindQuery(env.query, nil, &query); err != nil {
-				return nil, 0, err
+{{- if .Body}}
+		body: memberRequired,
+{{- end}}
+		status: {{.Status}},
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+{{- if .Session}}
+			var pathValue {{.SessionType}}
+			if err := bindPath(env.session, &pathValue); err != nil {
+				return nil, err
 			}
-		}
+{{- end}}
+{{- if .Field}}
+			var pathValue {{.FieldType}}
+			if err := bindPath(env.field, &pathValue); err != nil {
+				return nil, err
+			}
+{{- end}}
+{{- if .Query}}
+			var query protocol.{{.QueryType}}
+{{- if .QueryOptional}}
+			if env.query != nil {
+				if err := bindQuery(env.query, nil, &query); err != nil {
+					return nil, err
+				}
+			}
 {{- else}}
-		if err := bindQuery(env.query, {{.QueryRequired}}, &query); err != nil {
-			return nil, 0, err
-		}
+			if err := bindQuery(env.query, {{.QueryRequired}}, &query); err != nil {
+				return nil, err
+			}
 {{- end}}
 {{- end}}
-		response, callErr := {{.Call}}
-		return response, {{.Expected}}, callErr
-{{end}}`
+			return {{.Call}}
+		},
+	},
+{{- end}}
+}
+`
 
-// armView is one generated dispatch arm.
+// armView is one generated descriptor literal.
 type armView struct {
 	ID            string
-	Envelope      string
-	NeedEnv       bool
-	QueryType     string
-	QueryRequired string
+	Session       bool
+	SessionType   string
+	Field         bool
+	FieldType     string
+	Query         bool
 	QueryOptional bool
+	QueryRequired string
+	QueryType     string
+	Body          bool
 	Call          string
-	Expected      string
+	Status        int
 }
 
 // sourceData is the whole generated file's template data.
 type sourceData struct {
-	Names         []string
-	Arms          []armView
-	NeedsBytes    bool
-	NeedsProtocol bool
+	Operations []armView
+	Imports    bool
+	NeedsBytes bool
 }
 
-// renderSource renders and formats the generated Go bindings in memory.
+// renderSource renders and formats the generated native bindings in memory.
 func renderSource(operations []operation) ([]byte, error) {
-	data := sourceData{}
+	data := sourceData{Imports: len(operations) != 0}
 	for _, op := range operations {
-		data.Names = append(data.Names, op.id)
-		data.Arms = append(data.Arms, arm(op))
-		if op.body != modeForbidden {
+		view := armView{
+			ID:          op.id,
+			Session:     op.session != modeForbidden,
+			SessionType: op.sessionType,
+			Field:       op.field != modeForbidden,
+			FieldType:   op.fieldType,
+			Query:       op.query != modeForbidden,
+			QueryType:   op.method + "Params",
+			Body:        op.body != modeForbidden,
+			Status:      op.status,
+			Call:        callExpression(op),
+		}
+		view.QueryOptional = op.query == modeOptional
+		if len(op.queryRequired) != 0 {
+			quoted := make([]string, 0, len(op.queryRequired))
+			for _, name := range op.queryRequired {
+				quoted = append(quoted, strconv.Quote(name))
+			}
+			view.QueryRequired = "[]string{" + strings.Join(quoted, ", ") + "}"
+		} else {
+			view.QueryRequired = "nil"
+		}
+		if view.Body {
 			data.NeedsBytes = true
 		}
-		if op.session != modeForbidden || op.field != modeForbidden || op.query != modeForbidden {
-			data.NeedsProtocol = true
-		}
+		data.Operations = append(data.Operations, view)
 	}
 	parsed, err := template.New("source").Parse(sourceTemplate)
 	if err != nil {
@@ -521,63 +524,23 @@ func renderSource(operations []operation) ([]byte, error) {
 	return formatted, nil
 }
 
-// arm derives one dispatch arm: the envelope's declared member rules, the
-// query binding and the exact generated client call for the operation. The
-// declared success status is emitted as the schema's own number, so any single
-// numeric 2xx is supported without a named standard-library constant.
-func arm(op operation) armView {
-	view := armView{
-		ID: op.id,
-		Envelope: fmt.Sprintf("params, %s, %s, %s, %s",
-			goMode(op.session), goMode(op.field), goMode(op.query), goMode(op.body)),
-		Expected: strconv.Itoa(op.status),
-	}
-	view.NeedEnv = op.session != modeForbidden || op.field != modeForbidden || op.query != modeForbidden || op.body != modeForbidden
-	if op.query != modeForbidden {
-		view.QueryType = op.id + "Params"
-		view.QueryOptional = op.query == modeOptional
-		var required []string
-		for _, member := range op.queryMembers {
-			if member.required {
-				required = append(required, strconv.Quote(member.name))
-			}
-		}
-		if len(required) == 0 {
-			view.QueryRequired = "nil"
-		} else {
-			view.QueryRequired = "[]string{" + strings.Join(required, ", ") + "}"
-		}
-	}
+// callExpression renders one descriptor's generated SDK call: the bound path
+// value, the bound query Params and the raw body reader in the SDK's declared
+// argument order.
+func callExpression(op operation) string {
 	arguments := []string{"ctx"}
-	if op.session != modeForbidden {
-		arguments = append(arguments, "protocol.SessionID(env.session)")
-	}
-	if op.fieldType != "" {
-		arguments = append(arguments, "protocol."+op.fieldType+"(env.field)")
+	if op.session != modeForbidden || op.field != modeForbidden {
+		arguments = append(arguments, "pathValue")
 	}
 	if op.query != modeForbidden {
 		arguments = append(arguments, "&query")
 	}
-	name := "c." + op.id
+	name := "c." + op.method
 	if op.body != modeForbidden {
 		name += "WithBody"
 		arguments = append(arguments, "contentTypeJSON", "bytes.NewReader(env.body)")
 	}
-	view.Call = name + "(" + strings.Join(arguments, ", ") + ")"
-	return view
-}
-
-// goMode maps one declared envelope mode to the handwritten member rule
-// constant the generated bindings use.
-func goMode(mode string) string {
-	switch mode {
-	case modeRequired:
-		return "memberRequired"
-	case modeOptional:
-		return "memberOptional"
-	default:
-		return "memberForbidden"
-	}
+	return name + "(" + strings.Join(arguments, ", ") + ")"
 }
 
 // contractMember is one query member's published contract.
@@ -596,8 +559,8 @@ type contractOperation struct {
 }
 
 // renderContract renders the test-only native invocation contract in memory:
-// one entry per native operation, keyed by operation ID, with sorted keys and
-// no stream entry.
+// one entry per native operation, keyed by native operation ID, with sorted
+// keys and no stream entry.
 func renderContract(operations []operation) ([]byte, error) {
 	doc := make(map[string]contractOperation, len(operations))
 	for _, op := range operations {

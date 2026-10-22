@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/agent"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
 
@@ -53,9 +54,7 @@ func TestFoundationCompositionOverRealTransport(t *testing.T) {
 	defer srv.Close()
 
 	transport, err := model.NewTransport(model.ResolvedTransport{Model: ref, BaseURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewTransport: %v", err)
-	}
+	testassert.NoError(t, err)
 
 	base := []model.Message{mustMessage(t, model.Message{
 		Role:    model.RoleUser,
@@ -110,58 +109,34 @@ func TestFoundationCompositionOverRealTransport(t *testing.T) {
 		ModelEffect:   modelEffect,
 		ToolEffect:    toolEffect,
 	})
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
+	testassert.NoError(t, err)
 
-	if res.Status != agent.TerminalSuccess || res.Detail != "" {
-		t.Fatalf("terminal = %+v, want success with empty detail", res)
-	}
-	if res.LastOutput == nil || res.LastOutput.Status != model.OutputCompleted {
-		t.Fatalf("last output = %+v, want a completed output", res.LastOutput)
-	}
-	if res.LastOutput.Source != ref {
-		t.Errorf("output source = %v, want %v", res.LastOutput.Source, ref)
-	}
-	if got := res.LastOutput.Message.TextContent(); got != "all done" {
-		t.Errorf("final text = %q, want %q", got, "all done")
+	testassert.Require(t, res.Status == agent.TerminalSuccess && res.Detail == "" && (res.LastOutput != nil && res.LastOutput.Status == model.OutputCompleted), "terminal = %+v, want success with empty detail; last output = %+v, want a completed output", res, res.LastOutput)
+	testassert.Check(t, res.LastOutput.Source == ref, "output source = %v, want %v", res.LastOutput.Source, ref)
+	{
+		got := res.LastOutput.Message.TextContent()
+		testassert.Check(t, got == "all done", "final text = %q, want %q", got, "all done")
 	}
 
 	// The complete loop: fresh context before each of the two model effects, changed snapshot reaching the second request.
-	if sourceCalls != 2 || len(reqs) != 2 {
-		t.Fatalf("loop ran %d context calls and %d model effects, want 2 and 2", sourceCalls, len(reqs))
-	}
-	if len(reqs[0].Messages) != 1 || len(reqs[1].Messages) != 3 {
-		t.Errorf("context snapshots carried %d then %d messages, want 1 then 3", len(reqs[0].Messages), len(reqs[1].Messages))
-	}
+	testassert.Require(t, sourceCalls == 2 && len(reqs) == 2, "loop ran %d context calls and %d model effects, want 2 and 2", sourceCalls, len(reqs))
+	testassert.Check(t, len(reqs[0].Messages) == 1 && len(reqs[1].Messages) == 3, "context snapshots carried %d then %d messages, want 1 then 3", len(reqs[0].Messages), len(reqs[1].Messages))
 
 	// The tool call assembled from the live stream arrives at the caller's tool boundary with its raw arguments intact.
-	if len(dispatched) != 1 {
-		t.Fatalf("tool boundary saw %d calls, want 1", len(dispatched))
-	}
-	if dispatched[0].ID != "call-1" || dispatched[0].Name != "echo" || string(dispatched[0].Arguments) != `{"x":1}` {
-		t.Errorf("dispatched call = %+v, want call-1/echo with raw arguments {\"x\":1}", dispatched[0])
-	}
+	testassert.Equal(t, len(dispatched), 1)
+	testassert.Check(t, dispatched[0].ID == "call-1" && dispatched[0].Name == "echo" && string(dispatched[0].Arguments) == `{"x":1}`, "dispatched call = %+v, want call-1/echo with raw arguments {\"x\":1}", dispatched[0])
 
 	// The real transport dialed once per effect and carried the changed context onto the wire.
-	if len(bodies) != 2 {
-		t.Fatalf("provider saw %d requests, want 2", len(bodies))
-	}
+	testassert.Equal(t, len(bodies), 2)
 	for _, want := range []string{`"model":"m-1"`, `"name":"echo"`} {
-		if !strings.Contains(bodies[0], want) {
-			t.Errorf("first request body lacks %s: %s", want, bodies[0])
-		}
+		testassert.Check(t, strings.Contains(bodies[0], want), "first request body lacks %s: %s", want, bodies[0])
 	}
-	if !strings.Contains(bodies[1], `"role":"tool"`) {
-		t.Errorf("second request body does not carry the tool round trip: %s", bodies[1])
-	}
+	testassert.Check(t, strings.Contains(bodies[1], `"role":"tool"`), "second request body does not carry the tool round trip: %s", bodies[1])
 }
 
 func mustMessage(t *testing.T, m model.Message) model.Message {
 	t.Helper()
 	out, err := model.NewMessage(m)
-	if err != nil {
-		t.Fatalf("NewMessage(role %s): %v", m.Role, err)
-	}
+	testassert.Require(t, err == nil, "NewMessage(role %s): %v", m.Role, err)
 	return out
 }

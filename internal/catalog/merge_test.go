@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 func TestDeepMergeCatalogMergesObjectsAndReplacesArrays(t *testing.T) {
 	bundled := map[string]any{
@@ -42,26 +45,18 @@ func TestDeepMergeCatalogMergesObjectsAndReplacesArrays(t *testing.T) {
 	merged := DeepMergeCatalog(bundled, user)
 
 	headers := merged["transport"].(map[string]any)["headers"].(map[string]any)
-	if headers["OpenAI-Beta"] != "assistants=v2" {
-		t.Fatalf("bundled header missing after merge: %#v", headers)
-	}
-	if headers["HTTP-Referer"] != "https://lightcode.local" {
-		t.Fatalf("user header missing after merge: %#v", headers)
-	}
+	testassert.Require(t, headers["OpenAI-Beta"] == "assistants=v2" && headers["HTTP-Referer"] == "https://lightcode.local", "bundled header missing after merge: %#v; user header missing after merge: %#v", headers, headers)
 
 	model := merged["models"].(map[string]any)["gpt-5.4-mini"].(map[string]any)
 	extra := model["extra_body"].(map[string]any)
-	if extra["reasoning_effort"] != "high" {
-		t.Fatalf("reasoning_effort = %v, want high", extra["reasoning_effort"])
-	}
-	if _, ok := extra["thinking"].(map[string]any); !ok {
-		t.Fatalf("thinking sidecar missing after merge: %#v", extra)
+	testassert.Equal(t, extra["reasoning_effort"], "high")
+	{
+		_, ok := extra["thinking"].(map[string]any)
+		testassert.Require(t, ok, "thinking sidecar missing after merge: %#v", extra)
 	}
 
 	modalities := model["input_modalities"].([]any)
-	if len(modalities) != 1 || modalities[0] != "text" {
-		t.Fatalf("input_modalities = %#v, want replacement with [text]", modalities)
-	}
+	testassert.Require(t, len(modalities) == 1 && modalities[0] == "text", "input_modalities = %#v, want replacement with [text]", modalities)
 }
 
 func TestDeepMergeCatalogDoesNotMutateInputs(t *testing.T) {
@@ -71,10 +66,7 @@ func TestDeepMergeCatalogDoesNotMutateInputs(t *testing.T) {
 	merged := DeepMergeCatalog(bundled, user)
 	merged["transport"].(map[string]any)["headers"].(map[string]any)["A"] = "changed"
 
-	got := bundled["transport"].(map[string]any)["headers"].(map[string]any)["A"]
-	if got != "b" {
-		t.Fatalf("bundled input mutated: %v", got)
-	}
+	testassert.Equal(t, bundled["transport"].(map[string]any)["headers"].(map[string]any)["A"], "b")
 }
 
 func TestDeepMergeCatalogPreservesNullValues(t *testing.T) {
@@ -93,15 +85,9 @@ func TestDeepMergeCatalogPreservesNullValues(t *testing.T) {
 	merged := DeepMergeCatalog(bundled, user)
 	extra := merged["extra_body"].(map[string]any)
 	value, ok := extra["nullable"]
-	if !ok {
-		t.Fatalf("nullable key missing after merge: %#v", extra)
-	}
-	if value != nil {
-		t.Fatalf("nullable = %#v, want nil passthrough", value)
-	}
-	if extra["keep"] != "bundled" {
-		t.Fatalf("lower-layer sibling key missing after null passthrough: %#v", extra)
-	}
+	testassert.Require(t, ok, "nullable key missing after merge: %#v", extra)
+	testassert.Require(t, value == nil, "nullable = %#v, want nil passthrough", value)
+	testassert.Require(t, extra["keep"] == "bundled", "lower-layer sibling key missing after null passthrough: %#v", extra)
 }
 
 func TestShallowMergeBodyMergesTopLevelOnly(t *testing.T) {
@@ -121,16 +107,13 @@ func TestShallowMergeBodyMergesTopLevelOnly(t *testing.T) {
 	runtime := map[string]any{"reasoning_effort": "low"}
 
 	merged := ShallowMergeBody(provider, model, runtime)
-	if merged["reasoning_effort"] != "low" {
-		t.Fatalf("reasoning_effort = %v, want runtime override", merged["reasoning_effort"])
-	}
-	if _, ok := merged["transforms"]; !ok {
-		t.Fatalf("provider key missing: %#v", merged)
+	testassert.Equal(t, merged["reasoning_effort"], "low")
+	{
+		_, ok := merged["transforms"]
+		testassert.Require(t, ok, "provider key missing: %#v", merged)
 	}
 	thinking := merged["thinking"].(map[string]any)
-	if len(thinking) != 1 || thinking["budget_tokens"] != float64(4000) {
-		t.Fatalf("thinking = %#v, want shallow replacement", thinking)
-	}
+	testassert.Require(t, len(thinking) == 1 && thinking["budget_tokens"] == float64(4000), "thinking = %#v, want shallow replacement", thinking)
 }
 
 func TestShallowMergeBodyPreservesNullValues(t *testing.T) {
@@ -144,13 +127,7 @@ func TestShallowMergeBodyPreservesNullValues(t *testing.T) {
 
 	merged := ShallowMergeBody(provider, model)
 	value, ok := merged["nullable"]
-	if !ok {
-		t.Fatalf("nullable key missing after merge: %#v", merged)
-	}
-	if value != nil {
-		t.Fatalf("nullable = %#v, want nil passthrough", value)
-	}
-	if merged["keep"] != "provider" {
-		t.Fatalf("lower-layer sibling key missing after null passthrough: %#v", merged)
-	}
+	testassert.Require(t, ok, "nullable key missing after merge: %#v", merged)
+	testassert.Require(t, value == nil, "nullable = %#v, want nil passthrough", value)
+	testassert.Require(t, merged["keep"] == "provider", "lower-layer sibling key missing after null passthrough: %#v", merged)
 }

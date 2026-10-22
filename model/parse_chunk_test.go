@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // TestParseStreamChunkRaw pins the fixed parser contract row by row: top-level chunk shape typing, usage normalization arithmetic with its single floor at zero, first-choice-only selection, raw pass-through of role/finish reasons and tool-call name/argument pieces, strict typing for every present non-null canonical field while null stays absent at each scope, closed content-kind classification with byte-for-byte extra retention under the retained denylists, per-event lowest-unused-index normalization for omitted tool indexes (with supplied duplicates tolerated), and protocol errors naming their exact offending shape for any wrong type.
@@ -21,9 +23,8 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		// --- top-level shape and choice selection -----------------------------------------
 
 		{name: "emptyObjectIsZeroDelta", raw: json.RawMessage(`{}`), check: func(t *testing.T, d StreamDelta) { // the most degenerate valid chunk: nothing present at all must produce a fully-zero delta rather than any error or invented data.
-			if d.HasChoice || d.Usage != nil || len(d.ContentFragments) > 0 || len(d.ToolFragments) > 0 || len(d.MessageExtra) > 0 {
-				t.Fatalf("zero-payload delta = %#v; want every field at its zero value", d) // full rendering so any single invented byte is visible immediately.
-			}
+			// full rendering so any single invented byte is visible immediately.
+			testassert.Require(t, !d.HasChoice && d.Usage == nil && len(d.ContentFragments) <= 0 && len(d.ToolFragments) <= 0 && len(d.MessageExtra) <= 0, "zero-payload delta = %#v; want every field at its zero value", d)
 		}},
 
 		{name: "choicelessUsageEventHasNoChoiceMarker", raw: json.RawMessage(`{"usage":{"prompt_tokens":10,"completion_tokens":4}}`), check: func(t *testing.T, d StreamDelta) { // a trailing usage-only chunk carries no choice at all — HasChoice must stay false so assemblers can distinguish "no delta data" from an empty-but-present one.
@@ -35,9 +36,8 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		}},
 
 		{name: "usageNullStaysAbsent", raw: json.RawMessage(`{"choices":[],"usage":null}`), check: func(t *testing.T, d StreamDelta) { // explicit null usage is indistinguishable from absence per the fixed rule — inventing a zero Usage pointer here would make callers unable to tell "reported nothing" from "not reported at all".
-			if d.Usage != nil || d.HasChoice {
-				t.Fatalf("null-usage delta = %#v; want no usage and no choice marker", d) // full shape rendered for immediate triage.
-			}
+			// full shape rendered for immediate triage.
+			testassert.Require(t, d.Usage == nil && !d.HasChoice, "null-usage delta = %#v; want no usage and no choice marker", d)
 		}},
 
 		{name: "topLevelScalarRejectedAsProtocolError", raw: json.RawMessage(`123`), errSub: "did not decode into the OpenAI-compatible chunk shape"},
@@ -65,35 +65,31 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		}},
 
 		{name: "usageDetailsAbsentMeansZeroCache", raw: json.RawMessage(`{"usage":{"prompt_tokens":8,"completion_tokens":2}}`), check: func(t *testing.T, d StreamDelta) { // absent details object normalizes to zero cached — the retained producer rule that a missing sub-object is NOT an error and contributes nothing.
-			if !d.UsageMatches(8, 0, 2) {
-				t.Fatalf("no-details usage = %+v; want input=8 (full prompt), cached=0, output=2", d.Usage) // full rendering for immediate triage of any arithmetic drift in this direction too.
-			}
+			// full rendering for immediate triage of any arithmetic drift in this direction too.
+			testassert.Require(t, d.UsageMatches(8, 0, 2), "no-details usage = %+v; want input=8 (full prompt), cached=0, output=2", d.Usage)
 		}},
 
 		{name: "negativeCachedAndOutputPassThroughUnchanged", raw: json.RawMessage(`{"usage":{"prompt_tokens":5,"completion_tokens":-2,"prompt_tokens_details":{"cached_tokens":-3}}}`), check: func(t *testing.T, d StreamDelta) { // the retained signed-int producer clamps ONLY the uncached derivation: cached and output keep every bit of their as-reported value, negative included (no range or clamping policy may be invented on either).
-			if !d.UsageMatches(8, -3, -2) { // input = 5 - (-3) = 8 by signed arithmetic; the two negative fields must survive byte-for-byte as ints.
-				t.Fatalf("signed usage = %+v; want input=8 while cached=-3 and output=-2 pass through unchanged", d.Usage) // all three values rendered so a clamp added to either negative field — or removed from the uncached one — is visible at a glance.
-			}
+			// input = 5 - (-3) = 8 by signed arithmetic; the two negative fields must survive byte-for-byte as ints.
+			// all three values rendered so a clamp added to either negative field — or removed from the uncached one — is visible at a glance.
+			testassert.Require(t, d.UsageMatches(8, -3, -2), "signed usage = %+v; want input=8 while cached=-3 and output=-2 pass through unchanged", d.Usage)
 		}},
 
 		{name: "floorAppliesToUncachedInputOnlyWhileOtherFieldsStayNegative", raw: json.RawMessage(`{"usage":{"prompt_tokens":1,"completion_tokens":-6,"prompt_tokens_details":{"cached_tokens":4}}}`), check: func(t *testing.T, d StreamDelta) { // the single max(prompt-cached, 0) floor fires here (1-4 → 0) while cached=4 and output=-6 remain untouched — proving the clamp's reach is exactly one field even when every other value on the same object is out of the nonnegative range.
-			if !d.UsageMatches(0, 4, -6) {
-				t.Fatalf("floored usage = %+v; want input=0 (floored from -3) with cached=4 and output=-6 untouched by any clamp", d.Usage) // full rendering pins each field's exact survival, so an over-reaching clamp trips this row on whichever field it touched.
-			}
+			// full rendering pins each field's exact survival, so an over-reaching clamp trips this row on whichever field it touched.
+			testassert.Require(t, d.UsageMatches(0, 4, -6), "floored usage = %+v; want input=0 (floored from -3) with cached=4 and output=-6 untouched by any clamp", d.Usage)
 		}},
 
 		// --- raw pass-through fields --------------------------------------------------------
 
 		{name: "roleAndFinishReasonPassThroughVerbatim", raw: json.RawMessage(`{"choices":[{"delta":{"role":"assistant","content":"x"},"finish_reason":"stop"}]}`), check: func(t *testing.T, d StreamDelta) { // both values are RAW wire strings — normalization (developer→system etc.) is assembler work and must never happen at parse time or downstream replay would double-normalize.
-			if !d.HasChoice || d.Role != "assistant" || d.FinishReason != "stop" {
-				t.Fatalf("pass-through delta = %#v; want role=assistant finish_reason=stop verbatim", d) // full shape rendered so any accidental transformation is visible in one line of output.
-			}
+			// full shape rendered so any accidental transformation is visible in one line of output.
+			testassert.Require(t, d.HasChoice && d.Role == "assistant" && d.FinishReason == "stop", "pass-through delta = %#v; want role=assistant finish_reason=stop verbatim", d)
 		}},
 
 		{name: "nullRoleRefusalAndFinishReasonStayAbsent", raw: json.RawMessage(`{"choices":[{"delta":{"role":null,"refusal":null},"finish_reason":null}]}`), check: func(t *testing.T, d StreamDelta) { // null means absent at every string-typed canonical field — a present-null coerced to "" would be indistinguishable from genuinely-supplied empty values in later assembly.
-			if !d.HasChoice || d.Role != "" || d.RefusalFragment != "" || d.FinishReason != "" {
-				t.Fatalf("null-fields delta = %#v; want all three string fields at their absent-empty value", d) // full rendering so any single null→value coercion is attributable to its exact field.
-			}
+			// full rendering so any single null→value coercion is attributable to its exact field.
+			testassert.Require(t, d.HasChoice && d.Role == "" && d.RefusalFragment == "" && d.FinishReason == "", "null-fields delta = %#v; want all three string fields at their absent-empty value", d)
 		}},
 
 		{name: "wrongTypedFinishReasonRejectedNamingItsField", raw: json.RawMessage(`{"choices":[{"delta":{"content":"x"},"finish_reason":3}]}`), errSub: `choice.finish_reason has the wrong type (want string)`}, // present non-null values must carry their OpenAI-compatible JSON-string type — numbers are malformed input, never silent drops.
@@ -131,9 +127,8 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		}},
 
 		{name: "presentEmptyStringContentStillProducesAFragment", raw: json.RawMessage(`{"choices":[{"delta":{"content":""}}]}`), check: func(t *testing.T, d StreamDelta) { // present-but-empty string content is NOT absent — it still yields one empty text fragment at position zero (the distinction matters for providers that signal stream phases via deliberate empty pieces).
-			if len(d.ContentFragments) != 1 || !d.FragIsText(0, "") {
-				t.Fatalf("empty-string-form fragments = %#v; want exactly ONE fragment with an EMPTY text piece at position zero", d.ContentFragments) // full rendering so "dropped entirely" vs "wrong kind/position" failures are distinguishable without re-running under verbose mode.
-			}
+			// full rendering so "dropped entirely" vs "wrong kind/position" failures are distinguishable without re-running under verbose mode.
+			testassert.Require(t, len(d.ContentFragments) == 1 && d.FragIsText(0, ""), "empty-string-form fragments = %#v; want exactly ONE fragment with an EMPTY text piece at position zero", d.ContentFragments)
 		}},
 
 		{name: "arrayFormUsesWireIndicesAsPositionsWithClosedKindsAndExtras", raw: json.RawMessage(`{"choices":[{"delta":{"content":[{"type":"text","text":"visible"},{"type":"image_url","image_url":{"url":"http://x/y.png"}},{"type":"thinking","thoughts":"hidden","signature":"sig"}]}}]}`), check: func(t *testing.T, d StreamDelta) { // THE polymorphic content row: three parts in wire order exercising all three closed kinds plus opaque extra retention — positions are exactly the array indices and nothing else.
@@ -175,9 +170,8 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 		{name: "imageUrlMustBeAnObjectWhenPresent", raw: json.RawMessage(`{"choices":[{"delta":{"content":[{"type":"image_url","image_url":"http://direct"}]}}]}`), errSub: `field "image_url" has a wrong type (want JSON object)`}, // the OpenAI shape nests url inside an object — a bare string is malformed input at this scope and fails before any subfield reading happens.
 
 		{name: "nullImageUrlLeavesAnEmptyURLFragment", raw: json.RawMessage(`{"choices":[{"delta":{"content":[{"type":"image_url","image_url":null}]}}]}`), check: func(t *testing.T, d StreamDelta) { // null image_url is absent-by-rule and yields an empty-URL fragment rather than inventing a value or erroring — same tolerance as every other optional subfield in this parser.
-			if len(d.ContentFragments) != 1 || !d.FragIsImageURL(0, "") {
-				t.Fatalf("null-image-url fragments = %#v; want one image_url fragment at position zero with an EMPTY url value", d.ContentFragments) // full rendering so the empty-vs-missing distinction is visible in output rather than requiring a debugger session to confirm which branch produced what.
-			}
+			// full rendering so the empty-vs-missing distinction is visible in output rather than requiring a debugger session to confirm which branch produced what.
+			testassert.Require(t, len(d.ContentFragments) == 1 && d.FragIsImageURL(0, ""), "null-image-url fragments = %#v; want one image_url fragment at position zero with an EMPTY url value", d.ContentFragments)
 		}},
 
 		{name: "textPartNonCanonicalFieldsBecomeExtrasVerbatim", raw: json.RawMessage(`{"choices":[{"delta":{"content":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]}}]}`), check: func(t *testing.T, d StreamDelta) { // non-canonical part-scope keys (denylist is exactly type/text/image_url) are retained byte-for-byte — provider-specific annotations like cache control must survive round-trips for replay fidelity.
@@ -291,15 +285,17 @@ func TestParseStreamChunkRaw(t *testing.T) { // one table because every row exer
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("parse failed unexpectedly: %v", err) // success rows must stay silent — any failure here means the strictness rules over-reached beyond their documented scope.
-			}
+			// success rows must stay silent — any failure here means the strictness rules over-reached beyond their documented scope.
+			testassert.NoError(t, err)
 			r.check(t, d)
 		})
 	}
 
-	if _, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}}); !errors.Is(err, ErrInvalidModelRef) { // closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this table was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
-		t.Fatalf("premise broken: incomplete model identity no longer rejected at NewTransport") // same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	// closing sanity anchor mirroring sibling files' convention — construction-time validation surface unchanged since this table was written... (kept deliberately cheap and local rather than extracted into a shared helper because each call site's context makes its failure message most useful when phrased for THAT row set specifically).
+	// same explicit framing as equivalent anchors elsewhere so grep finds every such guard consistently across the suite.
+	{
+		_, err := NewTransport(ResolvedTransport{Model: ModelRef{Provider: "openai"}})
+		testassert.Require(t, errors.Is(err, ErrInvalidModelRef), "premise broken: incomplete model identity no longer rejected at NewTransport")
 	}
 }
 

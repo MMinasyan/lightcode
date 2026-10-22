@@ -14,7 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +21,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +31,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -51,64 +50,30 @@ func chainAgentsDocument(body string) string {
 // configured provider pointed at the scenario's server, the hook tag the
 // hookPlugin requires, and no sessions section.
 func chainPlainConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
-      "discovery": false,
-      "models": {"gpt-5.5": {"name": "G", "context_window": 262144}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "T1"}}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY",
+		`{"gpt-5.5":{"name":"G","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
 }
 
 // chainCommandConfigDocument is the readonly-git row's provider document: no
 // plugins section, since its composition declares no configured plugin.
 func chainCommandConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": "PRODUCTION_TEST_KEY"},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 262144}}
-    }
-  }
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY",
+		`{"m":{"name":"M","context_window":262144}}`) + `}}`
 }
 
 // chainSweepConfigDocument adds the explicit sweep thresholds and the hook
 // tag to one provider document for the public-Open initial-sweep row.
 func chainSweepConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
-      "discovery": false,
-      "models": {"m": {"name": "M", "context_window": 4096}}
-    }
-  },
-  "plugins": {"hooks": {"tag": "T1"}},
-  "sessions": {"archive_after_days": 1, "delete_after_archive_days": 1}
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
+		`{"m":{"name":"M","context_window":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":{"archive_after_days":1,"delete_after_archive_days":1}}`
 }
 
 // chainModelsConfigDocument declares the two models the capability-ID row
 // composes: one matching the bundled GPT-family adaptation pattern, one
 // matching nothing.
 func chainModelsConfigDocument(endpoint string) string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "` + endpoint + `", "api_key_env": ""},
-      "discovery": false,
-      "models": {
-        "gpt-5.5": {"name": "G", "context_window": 262144},
-        "vanilla": {"name": "V", "context_window": 262144}
-      }
-    }
-  }
-}`
+	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
+		`{"gpt-5.5":{"name":"G","context_window":262144},"vanilla":{"name":"V","context_window":262144}}`) + `}}`
 }
 
 // rewriteWriteHook is the combined scenario's ToolArgumentsHook: it replaces
@@ -602,9 +567,7 @@ func (s *chainServer) awaitRequests(t *testing.T, n int) {
 		if got >= n {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("chain server: request %d never arrived (received %d)", n, got)
-		}
+		testassert.Require(t, !time.Now().After(deadline), "chain server: request %d never arrived (received %d)", n, got)
 		time.Sleep(5 * time.Millisecond)
 	}
 }
@@ -615,23 +578,12 @@ func (s *chainServer) bodyAt(i int) string {
 	return s.bodies[i]
 }
 
-// chainToolCallTurn writes one completed assistant turn publishing one tool
-// call with an explicit call identity.
-func chainToolCallTurn(w http.ResponseWriter, id, name, args string) {
-	writeSSE(w,
-		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"`+id+`","type":"function","function":{"name":"`+name+`","arguments":`+strconv.Quote(args)+`}}]},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
-	)
-}
-
 // chainCodeGroupDirs lists one session's code-group directory names under the
 // owner data root.
 func chainCodeGroupDirs(t *testing.T, dataDir, sessionID string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(dataDir, "code", sessionID))
-	if err != nil {
-		t.Fatalf("read code dir: %v", err)
-	}
+	testassert.NoError(t, err)
 	var names []string
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -650,9 +602,7 @@ func chainToolResults(t *testing.T, store harness.Storage, sessionID string) map
 } {
 	t.Helper()
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	results := make(map[string]struct {
 		Status   model.ToolResultStatus
 		Content  string
@@ -668,9 +618,7 @@ func chainToolResults(t *testing.T, store harness.Storage, sessionID string) map
 			Content    string                 `json:"content"`
 			Metadata   json.RawMessage        `json:"metadata"`
 		}
-		if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-			t.Fatalf("decode tool_result payload: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 		results[wire.ToolCallID] = struct {
 			Status   model.ToolResultStatus
 			Content  string
@@ -687,9 +635,7 @@ func chainSessionSignals(t *testing.T, store harness.Storage, sessionID string) 
 } {
 	t.Helper()
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	var signals []struct {
 		Signal  string
 		Content string
@@ -702,9 +648,7 @@ func chainSessionSignals(t *testing.T, store harness.Storage, sessionID string) 
 			Signal  string `json:"signal"`
 			Content string `json:"content"`
 		}
-		if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-			t.Fatalf("decode signal payload: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 		signals = append(signals, struct {
 			Signal  string
 			Content string
@@ -735,25 +679,21 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 			originalNotesTxt = "alpha\nbeta\ngamma\n"
 		)
 		deniedPatch, err := json.Marshal(map[string]any{"input": "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: .env\n@@\n-alpha\n+ALPHA\n*** End Patch"})
-		if err != nil {
-			t.Fatalf("marshal denied patch: %v", err)
-		}
+		testassert.NoError(t, err)
 		allowedPatch, err := json.Marshal(map[string]any{"input": "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: renamed.txt\n@@\n-alpha\n+ALPHA\n*** End Patch"})
-		if err != nil {
-			t.Fatalf("marshal allowed patch: %v", err)
-		}
+		testassert.NoError(t, err)
 		writeTurn := func(id string) func(http.ResponseWriter) {
-			return func(w http.ResponseWriter) { chainToolCallTurn(w, id, "prod_write", modelWriteArgs) }
+			return func(w http.ResponseWriter) { writeToolCallTurn(w, id, "prod_write", modelWriteArgs) }
 		}
 		release2 := make(chan struct{})
 		release3 := make(chan struct{})
 		parked := make(chan struct{}) // the canceled operation parks until the owner cancels
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-1", "prod_write", modelWriteArgs) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "prod_write", modelWriteArgs) }},
 			chainTurn{hold: release2, respond: writeTurn("call-2")},
 			chainTurn{hold: release3, respond: writeTurn("call-3")},
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-4", "apply_patch", string(deniedPatch)) }},
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-5", "apply_patch", string(allowedPatch)) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-4", "apply_patch", string(deniedPatch)) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-5", "apply_patch", string(allowedPatch)) }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 			chainTurn{hold: parked, respond: func(w http.ResponseWriter) { writeTextTurn(w, "unreachable") }},
@@ -772,12 +712,8 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		writeServiceFile(t, agents.PathForConfig(configPath), chainAgentsDocument("first body"))
 
 		workspace := filepath.Join(home, "chain-ws")
-		if err := os.MkdirAll(workspace, 0o700); err != nil {
-			t.Fatalf("mkdir workspace: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte(originalNotesTxt), 0o600); err != nil {
-			t.Fatalf("write notes.txt: %v", err)
-		}
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte(originalNotesTxt), 0o600))
 
 		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
 			c.SystemPrompt += "|hooked"
@@ -793,14 +729,10 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		owner, ownerCancel := context.WithCancel(ctx)
 		defer ownerCancel()
 		r, err := openChained(owner, hook, argHook)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 
 		session, err := r.createSession(ctx, workspace, "chained")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		sessionID := session.Identity.SessionID
 		submitThroughRuntime(t, r, sessionID, "op-1", "start")
 		server.awaitRequests(t, 2) // turn 1 answered, turn 2 parked at the server
@@ -809,48 +741,36 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// executed, the model's original arguments never reached disk, and
 		// the hook observed exactly the original arguments.
 		data, err := os.ReadFile(filepath.Join(workspace, "rewritten.txt"))
-		if err != nil || string(data) != "hook replacement" {
-			t.Fatalf("rewritten.txt = (%q, %v), want the hook's replacement content", data, err)
+		testassert.Require(t, err == nil && string(data) == "hook replacement", "rewritten.txt = (%q, %v), want the hook's replacement content", data, err)
+		{
+			_, err := os.Stat(filepath.Join(workspace, "hook.txt"))
+			testassert.Require(t, errors.Is(err, os.ErrNotExist), "hook.txt = err %v, want absent: the model's original arguments must never execute", err)
 		}
-		if _, err := os.Stat(filepath.Join(workspace, "hook.txt")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("hook.txt = err %v, want absent: the model's original arguments must never execute", err)
-		}
-		if seen := argHook.received(); !slices.Equal(seen, []string{"prod_write " + modelWriteArgs}) {
-			t.Fatalf("argument hook observations = %v, want exactly the original call arguments", seen)
+		{
+			seen := argHook.received()
+			testassert.Require(t, slices.Equal(seen, []string{"prod_write " + modelWriteArgs}), "argument hook observations = %v, want exactly the original call arguments", seen)
 		}
 		admitted := readOperation(t, r, sessionID, "op-1").Admission.AdmittedEntry.EntryID
 
 		// 2. The reload publishes a changed prompt while the operation runs.
 		writeServiceFile(t, agents.PathForConfig(configPath), chainAgentsDocument("reloaded body"))
-		if revision, err := r.Reload(ctx); err != nil || revision != "2" {
-			t.Fatalf("Reload = (%q, %v), want 2", revision, err)
+		{
+			revision, err := r.Reload(ctx)
+			testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 		}
 
 		// 3. The steering submit buffers over the active operation: no
 		// committed input and no new code-group directory while it sits
 		// buffered.
-		if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Submit(ctx, harness.SubmitRequest{
-				SessionID: sessionID, OperationID: "op-1-steer", Origin: harness.InputOriginUser,
-				Content: []model.ContentPart{{Kind: model.PartText, Text: steeringText}}, Mode: harness.MessageModeRegular,
-			})
-			if err != nil {
-				return err
-			}
-			if res.Disposition != harness.DispositionSteering {
-				return fmt.Errorf("steering submit = %+v, want buffered steering", res.Disposition)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("steering submit: %v", err)
-		}
-		if got := chainCodeGroupDirs(t, dataDir, sessionID); !slices.Equal(got, []string{admitted}) {
-			t.Fatalf("code groups while the steering input is buffered = %v, want only the admitted operation's group %q", got, admitted)
+		steering, err := submitRawThroughRuntime(ctx, r, sessionID, "op-1-steer", steeringText, harness.MessageModeRegular)
+		testassert.NoError(t, err)
+		testassert.Require(t, steering.Disposition == harness.DispositionSteering, "steering submit = %+v, want buffered steering", steering.Disposition)
+		{
+			got := chainCodeGroupDirs(t, dataDir, sessionID)
+			testassert.Require(t, slices.Equal(got, []string{admitted}), "code groups while the steering input is buffered = %v, want only the admitted operation's group %q", got, admitted)
 		}
 		for _, entry := range mustChainEntries(t, e.store, sessionID) {
-			if entry.Kind == harness.EntryInput && strings.Contains(string(entry.Payload), steeringText) {
-				t.Fatal("the buffered steering input committed a durable entry")
-			}
+			testassert.Require(t, entry.Kind != harness.EntryInput || !strings.Contains(string(entry.Payload), steeringText), "the buffered steering input committed a durable entry")
 		}
 
 		// The turn parked before the steering submit carries no steering
@@ -866,23 +786,21 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		close(release3)
 		server.awaitRequests(t, 4)
 		steerAdmitted := readOperation(t, r, sessionID, "op-1-steer").Admission.AdmittedEntry.EntryID
-		if got := chainCodeGroupDirs(t, dataDir, sessionID); len(got) != 2 || !slices.Contains(got, admitted) || !slices.Contains(got, steerAdmitted) {
-			t.Fatalf("code groups after the delivered steering's mutating call = %v, want the predecessor's %q and the steering head's own %q", got, admitted, steerAdmitted)
+		{
+			got := chainCodeGroupDirs(t, dataDir, sessionID)
+			testassert.Require(t, len(got) == 2 && slices.Contains(got, admitted) && slices.Contains(got, steerAdmitted), "code groups after the delivered steering's mutating call = %v, want the predecessor's %q and the steering head's own %q", got, admitted, steerAdmitted)
 		}
 
 		// 4+5. The denied multi-target move settles only its call; the later
 		// allowed call in the subsequent turn succeeds. The steering head's
 		// Operation runs out on its scripted tail.
 		rec := awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
-		if rec.Admission.Execution.ConfigurationRevision != "1" {
-			t.Fatalf("capture revision = %q, want the admitted 1", rec.Admission.Execution.ConfigurationRevision)
-		}
+		testassert.Equal(t, rec.Admission.Execution.ConfigurationRevision, "1")
 		steerRec := awaitOperation(t, r, sessionID, "op-1-steer", harness.OperationSuccess)
-		if steerRec.Admission.Execution.ConfigurationRevision != "2" {
-			t.Fatalf("steering head capture revision = %q, want the current reloaded 2", steerRec.Admission.Execution.ConfigurationRevision)
-		}
-		if _, err := os.Stat(filepath.Join(workspace, ".env")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf(".env = err %v, want absent: the denied move's destination must never be written", err)
+		testassert.Equal(t, steerRec.Admission.Execution.ConfigurationRevision, "2")
+		{
+			_, err := os.Stat(filepath.Join(workspace, ".env"))
+			testassert.Require(t, errors.Is(err, os.ErrNotExist), ".env = err %v, want absent: the denied move's destination must never be written", err)
 		}
 
 		// The steering input's delivery is durable evidence now: a committed
@@ -893,48 +811,35 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 				steeringCommitted = true
 			}
 		}
-		if !steeringCommitted {
-			t.Fatal("the delivered steering input left no committed input entry")
-		}
+		testassert.Require(t, steeringCommitted, "the delivered steering input left no committed input entry")
 
 		// 6. The allowed apply_patch turn's retained preview evidence: the
 		// durable tool_result entry carries the edit_preview_files metadata
 		// with the move's file/op shape.
 		results := chainToolResults(t, e.store, sessionID)
 		denied, ok := results["call-4"]
-		if !ok || denied.Status != model.ResultDenied || denied.Content != "Permission denied." {
-			t.Fatalf("denied move result = %+v (ok %v), want the fixed policy denial", denied, ok)
-		}
-		if denied.Metadata != nil {
-			t.Fatalf("denied move metadata = %s, want none", denied.Metadata)
-		}
+		testassert.Require(t, ok && denied.Status == model.ResultDenied && denied.Content == "Permission denied.", "denied move result = %+v (ok %v), want the fixed policy denial", denied, ok)
+		testassert.Require(t, denied.Metadata == nil, "denied move metadata = %s, want none", denied.Metadata)
 		allowed, ok := results["call-5"]
-		if !ok || allowed.Status != model.ResultSuccess {
-			t.Fatalf("allowed patch result = %+v (ok %v), want success after the denial settled only its own call", allowed, ok)
-		}
+		testassert.Require(t, ok && allowed.Status == model.ResultSuccess, "allowed patch result = %+v (ok %v), want success after the denial settled only its own call", allowed, ok)
 		var preview struct {
 			EditPreviewFiles []struct {
 				Path string `json:"path"`
 				Op   string `json:"op"`
 			} `json:"edit_preview_files"`
 		}
-		if err := json.Unmarshal(allowed.Metadata, &preview); err != nil {
-			t.Fatalf("decode allowed patch metadata %s: %v", allowed.Metadata, err)
+		{
+			err := json.Unmarshal(allowed.Metadata, &preview)
+			testassert.Require(t, err == nil, "decode allowed patch metadata %s: %v", allowed.Metadata, err)
 		}
-		if len(preview.EditPreviewFiles) != 2 ||
-			preview.EditPreviewFiles[0].Path != "renamed.txt" || preview.EditPreviewFiles[0].Op != "M" ||
-			preview.EditPreviewFiles[1].Path != "notes.txt" || preview.EditPreviewFiles[1].Op != "D" {
-			t.Fatalf("edit_preview_files = %s, want the move's two entries: the M destination then the D source", allowed.Metadata)
-		}
+		testassert.Require(t, len(preview.EditPreviewFiles) == 2 && preview.EditPreviewFiles[0].Path == "renamed.txt" && preview.EditPreviewFiles[0].Op == "M" && preview.EditPreviewFiles[1].Path == "notes.txt" && preview.EditPreviewFiles[1].Op == "D", "edit_preview_files = %s, want the move's two entries: the M destination then the D source", allowed.Metadata)
 
 		// 7. The retained snapshot evidence: the moved file's preimage in the
 		// steering head's own code group carries the original bytes.
 		found := false
 		turnDir := filepath.Join(dataDir, "code", sessionID, steerAdmitted, "snapshots", "1")
 		entries, err := os.ReadDir(turnDir)
-		if err != nil {
-			t.Fatalf("read group turn dir: %v", err)
-		}
+		testassert.NoError(t, err)
 		for _, entry := range entries {
 			metaData, err := os.ReadFile(filepath.Join(turnDir, entry.Name(), "meta.json"))
 			if err != nil {
@@ -948,21 +853,16 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 				continue
 			}
 			original, err := os.ReadFile(filepath.Join(turnDir, entry.Name(), "original"))
-			if err != nil || string(original) != originalNotesTxt {
-				t.Fatalf("notes.txt preimage = (%q, %v), want the original bytes", original, err)
-			}
+			testassert.Require(t, err == nil && string(original) == originalNotesTxt, "notes.txt preimage = (%q, %v), want the original bytes", original, err)
 			found = true
 		}
-		if !found {
-			t.Fatalf("no notes.txt preimage entry in %s, want the retained snapshot evidence", turnDir)
-		}
+		testassert.Require(t, found, "no notes.txt preimage entry in %s, want the retained snapshot evidence", turnDir)
 
 		// The hook observed every call's original arguments exactly once per
 		// call: three rewritten writes and two pass-through patch calls.
-		if seen := argHook.received(); len(seen) != 5 ||
-			seen[0] != "prod_write "+modelWriteArgs || seen[1] != "prod_write "+modelWriteArgs || seen[2] != "prod_write "+modelWriteArgs ||
-			seen[3] != "apply_patch "+string(deniedPatch) || seen[4] != "apply_patch "+string(allowedPatch) {
-			t.Fatalf("argument hook observations = %v, want each call's original arguments exactly once", seen)
+		{
+			seen := argHook.received()
+			testassert.Require(t, len(seen) == 5 && seen[0] == "prod_write "+modelWriteArgs && seen[1] == "prod_write "+modelWriteArgs && seen[2] == "prod_write "+modelWriteArgs && seen[3] == "apply_patch "+string(deniedPatch) && seen[4] == "apply_patch "+string(allowedPatch), "argument hook observations = %v, want each call's original arguments exactly once", seen)
 		}
 
 		// The predecessor's own requests carry its immutable old capture, and
@@ -970,18 +870,16 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// capture with the delivered steering input in its history.
 		oldPrompt := rec.Admission.Execution.SystemPrompt
 		wire := decodeWireChatBody(t, server.bodyAt(1))
-		if len(wire.Messages) == 0 || wire.Messages[0].Role != "system" {
-			t.Fatalf("pre-steering request messages = %+v, want the captured system prompt first", wire.Messages)
-		}
-		if want, _ := json.Marshal(oldPrompt); string(wire.Messages[0].Content) != string(want) {
-			t.Fatalf("pre-steering system message = %.120s, want the old captured prompt %.120s", wire.Messages[0].Content, want)
+		testassert.Require(t, len(wire.Messages) != 0 && wire.Messages[0].Role == "system", "pre-steering request messages = %+v, want the captured system prompt first", wire.Messages)
+		{
+			want, _ := json.Marshal(oldPrompt)
+			testassert.Require(t, string(wire.Messages[0].Content) == string(want), "pre-steering system message = %.120s, want the old captured prompt %.120s", wire.Messages[0].Content, want)
 		}
 		steerWire := decodeWireChatBody(t, server.bodyAt(2))
-		if len(steerWire.Messages) == 0 || steerWire.Messages[0].Role != "system" {
-			t.Fatalf("steering-continued request messages = %+v, want the successor system prompt first", steerWire.Messages)
-		}
-		if want, _ := json.Marshal(steerRec.Admission.Execution.SystemPrompt); string(steerWire.Messages[0].Content) != string(want) {
-			t.Fatalf("steering-continued system message = %.120s, want the successor's current captured prompt %.120s", steerWire.Messages[0].Content, want)
+		testassert.Require(t, len(steerWire.Messages) != 0 && steerWire.Messages[0].Role == "system", "steering-continued request messages = %+v, want the successor system prompt first", steerWire.Messages)
+		{
+			want, _ := json.Marshal(steerRec.Admission.Execution.SystemPrompt)
+			testassert.Require(t, string(steerWire.Messages[0].Content) == string(want), "steering-continued system message = %.120s, want the successor's current captured prompt %.120s", steerWire.Messages[0].Content, want)
 		}
 		if !strings.Contains(server.bodyAt(2), steeringText) {
 			t.Fatalf("steering-continued request = %s, want the delivered steering input in its history", server.bodyAt(2))
@@ -994,58 +892,37 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// revision: a fresh Session rules out the post-terminal drain racing
 		// the submit into a steering buffer.
 		next, err := r.createSession(ctx, filepath.Join(home, "chain-ws-2"), "chained")
-		if err != nil {
-			t.Fatalf("createSession(next): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-2", "after reload")
 		nextRec := awaitOperation(t, r, next.Identity.SessionID, "op-2", harness.OperationSuccess)
-		if nextRec.Admission.Execution.ConfigurationRevision != "2" ||
-			nextRec.Admission.Execution.SystemPrompt == oldPrompt ||
-			!strings.Contains(nextRec.Admission.Execution.SystemPrompt, "reloaded body") ||
-			strings.Contains(nextRec.Admission.Execution.SystemPrompt, "first body") ||
-			!strings.HasSuffix(nextRec.Admission.Execution.SystemPrompt, "|hooked") {
-			t.Fatalf("next capture = (%q, %.120s), want revision 2 with the reloaded hooked prompt",
-				nextRec.Admission.Execution.ConfigurationRevision, nextRec.Admission.Execution.SystemPrompt)
-		}
+		testassert.Require(t, nextRec.Admission.Execution.ConfigurationRevision == "2" && nextRec.Admission.Execution.SystemPrompt != oldPrompt && strings.Contains(nextRec.Admission.Execution.SystemPrompt, "reloaded body") && !strings.Contains(nextRec.Admission.Execution.SystemPrompt, "first body") && strings.HasSuffix(nextRec.Admission.Execution.SystemPrompt, "|hooked"), "next capture = (%q, %.120s), want revision 2 with the reloaded hooked prompt", nextRec.Admission.Execution.ConfigurationRevision, nextRec.Admission.Execution.SystemPrompt)
 
 		// 8. The production-reachable cancellation act: the owner context
 		// cancels while an operation is active, and the operation settles
 		// interrupted with the standard model-visible signal.
 		cxl, err := r.createSession(ctx, filepath.Join(home, "chain-ws-3"), "chained")
-		if err != nil {
-			t.Fatalf("createSession(cxl): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, cxl.Identity.SessionID, "op-3", "parked")
 		server.awaitRequests(t, 8)
 		ownerCancel()
-		if err := r.Close(ctx); err != nil {
-			t.Fatalf("Close after the owner cancellation: %v", err)
-		}
+		testassert.NoError(t, r.Close(ctx))
 		status, detail := operationRegisterTerminal(t, e.store, cxl.Identity.SessionID, "op-3")
-		if status != harness.OperationInterruption || detail != "agent interrupted" {
-			t.Fatalf("canceled operation = (%q, %q), want the committed interruption with the standard detail", status, detail)
-		}
+		testassert.Require(t, status == harness.OperationInterruption && detail == "agent interrupted", "canceled operation = (%q, %q), want the committed interruption with the standard detail", status, detail)
 		signals := chainSessionSignals(t, e.store, cxl.Identity.SessionID)
-		if len(signals) != 1 || signals[0].Signal != "interruption" || signals[0].Content != "Operation interrupted." {
-			t.Fatalf("canceled operation signals = %+v, want exactly the standard interruption signal", signals)
-		}
+		testassert.Require(t, len(signals) == 1 && signals[0].Signal == "interruption" && signals[0].Content == "Operation interrupted.", "canceled operation signals = %+v, want exactly the standard interruption signal", signals)
 
 		// 9. Restart: a fresh Open over the same data root runs recovery over
 		// the committed interruption evidence and a post-repair admitted
 		// operation works.
 		r2, err := openChained(ctx, e.hookedHook(), &rewriteWriteHook{replace: hookRewriteArgs})
-		if err != nil {
-			t.Fatalf("reopen: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r2.Close(ctx)
-		if rec := readOperation(t, r2, cxl.Identity.SessionID, "op-3"); rec.State.Status != harness.OperationInterruption ||
-			rec.State.Terminal == nil || rec.State.Terminal.Detail != "agent interrupted" {
-			t.Fatalf("restarted operation state = %+v, want the committed interruption intact", rec.State)
+		{
+			rec := readOperation(t, r2, cxl.Identity.SessionID, "op-3")
+			testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent interrupted", "restarted operation state = %+v, want the committed interruption intact", rec.State)
 		}
 		repaired, err := r2.createSession(ctx, filepath.Join(home, "chain-ws-4"), "chained")
-		if err != nil {
-			t.Fatalf("createSession after repair: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r2, repaired.Identity.SessionID, "op-4", "continue")
 		awaitOperation(t, r2, repaired.Identity.SessionID, "op-4", harness.OperationSuccess)
 	})
@@ -1055,9 +932,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 func mustChainEntries(t *testing.T, store harness.Storage, sessionID string) []harness.Entry {
 	t.Helper()
 	entries, err := store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	return entries
 }
 
@@ -1073,18 +948,15 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 
 		// A real temporary git workspace with one untracked file.
 		workspace := e.workspace("git-ws")
-		if err := os.MkdirAll(workspace, 0o700); err != nil {
-			t.Fatalf("mkdir workspace: %v", err)
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		{
+			out, err := exec.Command("git", "init", workspace).CombinedOutput()
+			testassert.Require(t, err == nil, "git init: %v (%s)", err, out)
 		}
-		if out, err := exec.Command("git", "init", workspace).CombinedOutput(); err != nil {
-			t.Fatalf("git init: %v (%s)", err, out)
-		}
-		if err := os.WriteFile(filepath.Join(workspace, "ro-note.txt"), []byte("untracked\n"), 0o600); err != nil {
-			t.Fatalf("write untracked file: %v", err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "ro-note.txt"), []byte("untracked\n"), 0o600))
 
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { chainToolCallTurn(w, "call-1", "run_command", `{"command":"git status"}`) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "run_command", `{"command":"git status"}`) }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		writeServiceFile(t, e.configPath, chainCommandConfigDocument(server.URL))
@@ -1092,27 +964,20 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 			`{"rogit": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"], "readonly": true, "capabilities": ["arg.noop"]}}`)
 
 		hook := &noopArgumentHook{}
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
-			coreStoragePlugin(e.store), chainCommandPlugin(), argumentHookPlugin("arg.noop", hook),
-		}})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), chainCommandPlugin(), argumentHookPlugin("arg.noop", hook))
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
 		session, err := r.createSession(ctx, workspace, "rogit")
-		if err != nil {
-			t.Fatalf("createSession: %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "status")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		if !rec.Admission.Execution.Readonly {
-			t.Fatalf("capture readonly = %v, want the agent's constraint", rec.Admission.Execution.Readonly)
-		}
+		testassert.Require(t, rec.Admission.Execution.Readonly, "capture readonly = %v, want the agent's constraint", rec.Admission.Execution.Readonly)
 
 		// The hook saw the call exactly once, with the original arguments.
-		if seen := hook.received(); !slices.Equal(seen, []string{`run_command {"command":"git status"}`}) {
-			t.Fatalf("argument hook observations = %v, want exactly one original-argument observation", seen)
+		{
+			seen := hook.received()
+			testassert.Require(t, slices.Equal(seen, []string{`run_command {"command":"git status"}`}), "argument hook observations = %v, want exactly one original-argument observation", seen)
 		}
 
 		// The command settled with real git status output in this workspace
@@ -1123,15 +988,8 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 		// owns that row).
 		results := chainToolResults(t, e.store, session.Identity.SessionID)
 		settled, ok := results["call-1"]
-		if !ok || settled.Status != model.ResultSuccess {
-			t.Fatalf("run_command result = %+v (ok %v), want success", settled, ok)
-		}
-		if strings.TrimSpace(settled.Content) == "" {
-			t.Fatalf("settled run_command content = %q, want real git status output", settled.Content)
-		}
-		if !strings.Contains(settled.Content, "ro-note.txt") {
-			t.Fatalf("settled run_command content = %q, want the workspace's real untracked file listed", settled.Content)
-		}
+		testassert.Require(t, ok && settled.Status == model.ResultSuccess, "run_command result = %+v (ok %v), want success", settled, ok)
+		testassert.Require(t, strings.TrimSpace(settled.Content) != "" && strings.Contains(settled.Content, "ro-note.txt"), "settled run_command content = %q, want real git status output; settled run_command content = %q, want the workspace's real untracked file listed", settled.Content, settled.Content)
 	})
 }
 
@@ -1153,58 +1011,36 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
 
-		r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: []Plugin{
-			coreStoragePlugin(e.store), inertToolsPlugin(), bundledAdaptationPlugin(),
-		}})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), inertToolsPlugin(), bundledAdaptationPlugin())
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
 		gpt, err := r.createSession(ctx, e.workspace("adapt-gpt"), "gptagent")
-		if err != nil {
-			t.Fatalf("createSession(gpt): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, gpt.Identity.SessionID, "op-gpt", "hello")
 		gptRec := awaitOperation(t, r, gpt.Identity.SessionID, "op-gpt", harness.OperationSuccess)
 
 		van, err := r.createSession(ctx, e.workspace("adapt-van"), "vanillaagent")
-		if err != nil {
-			t.Fatalf("createSession(van): %v", err)
-		}
+		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, van.Identity.SessionID, "op-van", "hello")
 		vanRec := awaitOperation(t, r, van.Identity.SessionID, "op-van", harness.OperationSuccess)
 
 		// Identical capability ID lists, from identical configured
 		// capabilities.
-		if !slices.Equal(gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities) {
-			t.Fatalf("capability IDs = %q vs %q, want identical lists across the model switch",
-				gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities)
-		}
-		if !slices.Equal(gptRec.Admission.Execution.Capabilities, []string{"model_adaptation"}) {
-			t.Fatalf("capability IDs = %q, want exactly the agents' configured selection", gptRec.Admission.Execution.Capabilities)
-		}
+		testassert.Require(t, slices.Equal(gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities) && slices.Equal(gptRec.Admission.Execution.Capabilities, []string{"model_adaptation"}), "capability IDs = %q vs %q, want identical lists across the model switch; capability IDs = %q, want exactly the agents' configured selection", gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities, gptRec.Admission.Execution.Capabilities)
 
 		// The advertisements differ exactly as the bundled adaptations
 		// resolve: the GPT-family match swaps write/edit for apply_patch,
 		// the unmatched model keeps the default-hidden patch tool out.
 		gptTools := toolNames(gptRec.Admission.Execution.Tools)
 		vanTools := toolNames(vanRec.Admission.Execution.Tools)
-		if !slices.Equal(gptTools, []string{"read_file", "apply_patch"}) {
-			t.Fatalf("adapted advertisement = %v, want write/edit excluded and apply_patch included", gptTools)
-		}
-		if !slices.Equal(vanTools, []string{"read_file", "write_file", "edit_file"}) {
-			t.Fatalf("baseline advertisement = %v, want the untouched list with the hidden patch tool out", vanTools)
-		}
+		testassert.Require(t, slices.Equal(gptTools, []string{"read_file", "apply_patch"}), "adapted advertisement = %v, want write/edit excluded and apply_patch included", gptTools)
+		testassert.Require(t, slices.Equal(vanTools, []string{"read_file", "write_file", "edit_file"}), "baseline advertisement = %v, want the untouched list with the hidden patch tool out", vanTools)
 
 		// The prompts differ too: the adapted model's task_execution
 		// addition renders in the full prompt.
-		if !strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response") {
-			t.Fatalf("adapted prompt = %.200s, want the adaptation's task_execution addition", gptRec.Admission.Execution.SystemPrompt)
-		}
-		if strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response") {
-			t.Fatalf("baseline prompt = %.200s, want no adaptation addition", vanRec.Admission.Execution.SystemPrompt)
-		}
+		testassert.Require(t, strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "adapted prompt = %.200s, want the adaptation's task_execution addition", gptRec.Admission.Execution.SystemPrompt)
+		testassert.Require(t, !strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "baseline prompt = %.200s, want no adaptation addition", vanRec.Admission.Execution.SystemPrompt)
 	})
 }
 
@@ -1224,23 +1060,20 @@ func TestProductionOpenInitialSweepCleansArtifacts(t *testing.T) {
 		youngCode := plantSessionCode(t, e.dataDir, young)
 
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
 		// The initial pass deleted the aged session and removed its artifact
 		// tree before the owner was published.
-		if _, err := readSweptSession(t, r, deletable); !errors.Is(err, harness.ErrNotFound) {
-			t.Fatalf("aged session after the initial sweep = err %v, want it deleted", err)
+		{
+			err := headerErrorThroughRuntime(context.Background(), r, deletable)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "aged session after the initial sweep = err %v, want it deleted", err)
 		}
 		mustNotExist(t, deletableCode, "the deleted session's artifact tree")
 
 		// The stale-but-not-yet-deletable session survives with its tree.
-		rec, err := readSweptSession(t, r, young)
-		if err != nil || rec.Lifecycle != harness.LifecycleArchived {
-			t.Fatalf("young session after the initial sweep = %+v err %v, want it archived and intact", rec, err)
-		}
+		rec := headerThroughRuntime(t, r, young)
+		testassert.Require(t, rec.Lifecycle == harness.LifecycleArchived, "young session after the initial sweep = %+v, want it archived and intact", rec)
 		mustExist(t, youngCode, "the surviving session's artifact tree")
 	})
 }

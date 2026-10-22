@@ -13,6 +13,7 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/plugins/jobs"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -106,9 +107,7 @@ func lastMessageRole(req model.Request) model.Role {
 func lifecycleFindRuntimeInput(t *testing.T, th *toolsHarness, sessionID, want string) string {
 	t.Helper()
 	entries, err := th.store.ReadEntries(context.Background(), sessionID, 0)
-	if err != nil {
-		t.Fatalf("ReadEntries: %v", err)
-	}
+	testassert.NoError(t, err)
 	for _, entry := range entries {
 		if entry.Kind != harness.EntryInput {
 			continue
@@ -121,9 +120,7 @@ func lifecycleFindRuntimeInput(t *testing.T, th *toolsHarness, sessionID, want s
 				Text string `json:"text"`
 			} `json:"content"`
 		}
-		if err := json.Unmarshal(entry.Payload, &wire); err != nil {
-			t.Fatalf("decode input payload: %v", err)
-		}
+		testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 		if wire.Origin != "runtime" {
 			continue
 		}
@@ -161,9 +158,7 @@ func TestBackgroundLifecycleJobsAcrossSessions(t *testing.T) {
 // external key is present.
 func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	t.Setenv("LIGHTCODE_BG_EXTERNAL", "external-value")
-	if err := os.Unsetenv("LIGHTCODE_BG_MANAGED"); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Unsetenv("LIGHTCODE_BG_MANAGED"))
 	background := &harnessBackground{}
 	// The managed key connects through a real manager AFTER the tools
 	// plugin opened: the call-time subprocess-environment producer, not any
@@ -219,9 +214,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 		}
 	}
 	invocation, err := runtime.ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_background_processes":1}`})
-	if err != nil {
-		t.Fatalf("ConfiguredInvocationForTest: %v", err)
-	}
+	testassert.NoError(t, err)
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
 		jobsPlugin:    jobs.Plugin(),
 		advertise:     []string{"run_command", "process"},
@@ -232,34 +225,27 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	})
 	// The connect happens after the plugin scope opened, before any command
 	// starts.
-	if err := managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"); err != nil {
-		t.Fatalf("managed TrySet: %v", err)
-	}
+	testassert.NoError(t, managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"))
 	sessionA := th.createSession()
 	sessionB := th.createSession()
 
 	// Session A starts one real background process and is rejected at the
 	// per-Session limit on the second start.
 	th.submit(sessionA, "op-a1", "start a")
-	if rec := th.awaitSettled(sessionA, "op-a1"); rec.State.Status != harness.OperationSuccess {
-		t.Fatalf("op-a1 settled %q: %+v", rec.State.Status, rec.State.Terminal)
+	{
+		rec := th.awaitSettled(sessionA, "op-a1")
+		testassert.Require(t, rec.State.Status == harness.OperationSuccess, "op-a1 settled %q: %+v", rec.State.Status, rec.State.Terminal)
 	}
 	resultsA := th.readToolResults(sessionA)
 	immediate := resultsA["call-a-start"].Content
-	if !strings.HasPrefix(immediate, "Command running in the background with ID: `") {
-		t.Fatalf("A immediate result = %q, want the retained background template", immediate)
-	}
+	testassert.Require(t, strings.HasPrefix(immediate, "Command running in the background with ID: `"), "A immediate result = %q, want the retained background template", immediate)
 	jobA := backgroundJobID(immediate)
-	if jobA == "" {
-		t.Fatalf("A immediate result = %q carries no job identity", immediate)
-	}
+	testassert.Require(t, jobA != "", "A immediate result = %q carries no job identity", immediate)
 	th.submitAllowBuffered(sessionA, "op-a2", "limit a")
 	th.awaitSettled(sessionA, "op-a2")
 	resultsA = th.readToolResults(sessionA)
 	wantLimit := "run_command: background start: process: background process limit reached (1/1). Kill existing processes or wait for them to exit"
-	if got := resultsA["call-a-limit"].Content; got != wantLimit {
-		t.Fatalf("A limit result = %q, want %q", got, wantLimit)
-	}
+	testassert.Equal(t, resultsA["call-a-limit"].Content, wantLimit)
 
 	// Session B's own start succeeds: the limit is per-Session.
 	th.submit(sessionB, "op-b1", "start b")
@@ -267,24 +253,15 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	resultsB := th.readToolResults(sessionB)
 	immediateB := resultsB["call-b-start"].Content
 	jobB := backgroundJobID(immediateB)
-	if jobB == "" || jobB == jobA {
-		t.Fatalf("B immediate result = %q carries no distinct job identity", immediateB)
-	}
+	testassert.Require(t, jobB != "" && jobB != jobA, "B immediate result = %q carries no distinct job identity", immediateB)
 	th.submitAllowBuffered(sessionB, "op-b2", "list b")
 	th.awaitSettled(sessionB, "op-b2")
 	resultsB = th.readToolResults(sessionB)
 	listB := resultsB["call-b-list"].Content
-	if !strings.Contains(listB, jobB) || !strings.Contains(listB, "(running for") {
-		t.Fatalf("B list = %q, want the running line of B's own job %s", listB, jobB)
-	}
-	if strings.Contains(listB, jobA) {
-		t.Fatalf("B list = %q leaks A's job %s", listB, jobA)
-	}
+	testassert.Require(t, strings.Contains(listB, jobB) && strings.Contains(listB, "(running for") && !strings.Contains(listB, jobA), "B list = %q, want the running line of B's own job %s; B list = %q leaks A's job %s", listB, jobB, listB, jobA)
 
 	// Stopping Session A kills only A's job; B's job stays live.
-	if err := th.h.Stop(context.Background(), sessionA); err != nil {
-		t.Fatalf("Stop(A): %v", err)
-	}
+	testassert.NoError(t, th.h.Stop(context.Background(), sessionA))
 	completionOp := lifecycleFindRuntimeInput(t, th, sessionA, "Background process "+jobA)
 	th.awaitSettled(sessionA, completionOp)
 
@@ -292,29 +269,24 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	th.submit(sessionB, "op-b3", "list b again")
 	th.awaitSettled(sessionB, "op-b3")
 	resultsB = th.readToolResults(sessionB)
-	if listAfter := resultsB["call-b-list-again"].Content; !strings.Contains(listAfter, jobB) || !strings.Contains(listAfter, "(running for") {
-		t.Fatalf("B list after A's stop = %q, want B's job %s still running", listAfter, jobB)
+	{
+		listAfter := resultsB["call-b-list-again"].Content
+		testassert.Require(t, strings.Contains(listAfter, jobB) && strings.Contains(listAfter, "(running for"), "B list after A's stop = %q, want B's job %s still running", listAfter, jobB)
 	}
 	th.submitAllowBuffered(sessionB, "op-b4", "read b")
 	rec := th.awaitSettled(sessionB, "op-b4")
-	if rec.State.Status != harness.OperationSuccess {
-		t.Fatalf("op-b4 settled %q: %+v", rec.State.Status, rec.State)
-	}
+	testassert.Require(t, rec.State.Status == harness.OperationSuccess, "op-b4 settled %q: %+v", rec.State.Status, rec.State)
 	resultsB = th.readToolResults(sessionB)
 	// The read loop terminated only after its final call observed the real
 	// output, so the last call's result is the readiness proof.
 	got := resultsB[readCallID].Content
-	if !strings.Contains(got, "b-out|external-value|") || strings.Contains(got, "managed-secret") {
-		t.Fatalf("%s = %q, want the live job's output with the external key present and the managed key absent", readCallID, got)
-	}
+	testassert.Require(t, strings.Contains(got, "b-out|external-value|") && !strings.Contains(got, "managed-secret"), "%s = %q, want the live job's output with the external key present and the managed key absent", readCallID, got)
 
 	// A's killed job left no records behind.
 	th.submitAllowBuffered(sessionA, "op-a3", "list a")
 	th.awaitSettled(sessionA, "op-a3")
 	resultsA = th.readToolResults(sessionA)
-	if got := resultsA["call-a-list"].Content; got != "No background processes." {
-		t.Fatalf("A list after the stop = %q, want the retained empty text", got)
-	}
+	testassert.Equal(t, resultsA["call-a-list"].Content, "No background processes.")
 
 	// The managed shutdown kills B's stray job through the capability's own
 	// scope close (the test's composed-scope cleanup), so the suite leaves no

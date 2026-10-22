@@ -338,21 +338,29 @@ func (v HistoryReadView) HistoryFacts(entryIDs []string) []HistoryFact {
 }
 
 // LatestContextUsage returns the newest owned usage measurement of the
-// captured context: scanning backwards from the newest entry, the first
-// usage-bearing assistant or settlement entry before the captured current
-// compaction boundary. It returns nil when no measurement follows the
-// boundary; compaction usage stays totals-only.
+// captured context through the shared conversation-usage selector.
 func (v HistoryReadView) LatestContextUsage() *UsageCount {
-	for i := len(v.prefix) - 1; i >= 0; i-- {
-		entry := v.prefix[i]
-		if v.compactionEntryID != "" && entry.Envelope.ID == v.compactionEntryID {
+	return latestContextUsage(v.prefix, v.compactionEntryID)
+}
+
+// latestContextUsage scans backwards from the newest entry for the newest
+// reported conversation usage: a usage-bearing assistant entry, or a
+// usage-bearing settlement entry whose CompactionUsage marker is false. A
+// settlement marked as summary usage and a compaction entry's usage are never
+// eligible — the scan skips them and keeps going. The scan stops at the
+// current compaction boundary and returns nil there and on exhaustion;
+// a returned measurement is an owned copy.
+func latestContextUsage(entries []graphEntry, compactionEntryID string) *UsageCount {
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if compactionEntryID != "" && entry.Envelope.ID == compactionEntryID {
 			return nil
 		}
 		var usage *UsageCount
 		switch {
 		case entry.Assistant != nil:
 			usage = entry.Assistant.Usage
-		case entry.Settlement != nil:
+		case entry.Settlement != nil && !entry.Settlement.CompactionUsage:
 			usage = entry.Settlement.Usage
 		}
 		if usage != nil {

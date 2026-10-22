@@ -3,6 +3,8 @@ package harness
 import (
 	"context"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 // leaseCoordinator acquires one Session's coordinator through the production
@@ -23,8 +25,6 @@ func leaseCoordinator(t *testing.T, h *Harness, sessionID string) *coordinator {
 func leaseCoordinatorNow(t *testing.T, h *Harness, sessionID string) (*coordinator, func()) {
 	t.Helper()
 	c, release, err := h.acquireCoordinator(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("lease session %q: %v", sessionID, err)
-	}
+	testassert.Require(t, err == nil, "lease session %q: %v", sessionID, err)
 	return c, release
 }

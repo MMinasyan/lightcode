@@ -24,6 +24,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/lsp"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -160,18 +161,14 @@ func fakeServerHome(t *testing.T, initDelay float64) (home, requests string) {
 func plantServer(t *testing.T, home, dirName, binaryName string, initDelay float64, crash, badSymbol, emptySymbol string) string {
 	t.Helper()
 	cacheDir := filepath.Join(home, ".cache", "lightcode", "lsp", dirName)
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(cacheDir, 0o755))
 	requests := filepath.Join(t.TempDir(), "requests.log")
 	script := strings.ReplaceAll(fakeServerTemplate, "{{LOG}}", requests)
 	script = strings.ReplaceAll(script, "{{DELAY}}", fmt.Sprintf("%g", initDelay))
 	script = strings.ReplaceAll(script, "{{CRASH}}", crash)
 	script = strings.ReplaceAll(script, "{{BAD_SYMBOL}}", badSymbol)
 	script = strings.ReplaceAll(script, "{{EMPTY_SYMBOL}}", emptySymbol)
-	if err := os.WriteFile(filepath.Join(cacheDir, binaryName), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(cacheDir, binaryName), []byte(script), 0o755))
 	return requests
 }
 
@@ -194,12 +191,22 @@ func pluginUnderTest(t *testing.T, dataDir string) (runtime.Tool, runtime.Tool) 
 	return openPlugin(t, Plugin(), dataDir)
 }
 
+// newPluginWorkspace installs the manager spy over fakeHome, opens the plugin
+// over dataDir, and builds a marked workspace. Each case keeps its own data
+// root, seeds, request log and query expectations.
+func newPluginWorkspace(t *testing.T, fakeHome, dataDir string) (spy *managerSpy, diag, symbol runtime.Tool, workspace string) {
+	t.Helper()
+	spy = &managerSpy{}
+	spy.install(t, fakeHome)
+	diag, symbol = pluginUnderTest(t, dataDir)
+	workspace = markerWorkspace(t)
+	return spy, diag, symbol, workspace
+}
+
 func openPlugin(t *testing.T, plugin runtime.Plugin, dataDir string) (runtime.Tool, runtime.Tool) {
 	t.Helper()
 	inst, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("plugin Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { _ = inst.Close() })
 	return inst.Values["diagnostics"].(runtime.Tool), inst.Values["workspace_symbol"].(runtime.Tool)
 }
@@ -208,9 +215,7 @@ func openPlugin(t *testing.T, plugin runtime.Plugin, dataDir string) (runtime.To
 func markerWorkspace(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"), []byte("module w\n"), 0o600))
 	return root
 }
 
@@ -227,13 +232,9 @@ func seedGroup(t *testing.T, dataDir, sessionID, groupID, canonical string) {
 func seedEntry(t *testing.T, dataDir, sessionID, groupID, entryName, canonical string) {
 	t.Helper()
 	entry := filepath.Join(dataDir, "code", sessionID, groupID, "snapshots", "1", entryName)
-	if err := os.MkdirAll(entry, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.MkdirAll(entry, 0o755))
 	meta := "{\"original_path\":\"" + filepath.Base(canonical) + "\",\"canonical_path\":\"" + canonical + "\",\"existed\":true}"
-	if err := os.WriteFile(filepath.Join(entry, "meta.json"), []byte(meta), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(entry, "meta.json"), []byte(meta), 0o600))
 }
 
 func logCount(t *testing.T, log, needle string) int {
@@ -293,16 +294,15 @@ func TestPluginOpenStartsNothingAndResolvesHome(t *testing.T) {
 	spy := &managerSpy{}
 	spy.install(t, fakeHome)
 	pluginUnderTest(t, t.TempDir())
-	if spy.count() != 0 {
-		t.Fatal("plugin Open constructed a workspace manager; detection must start only in authorized execution")
-	}
+	testassert.Require(t, spy.count() == 0, "plugin Open constructed a workspace manager; detection must start only in authorized execution")
 }
 
 func TestPluginOpenHomeFailureFailsConstruction(t *testing.T) {
 	t.Setenv("HOME", "")
 	plugin := Plugin()
-	if _, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{}); err == nil {
-		t.Fatal("plugin Open without a resolvable home = nil error, want ordinary failed construction")
+	{
+		_, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
+		testassert.Require(t, err != nil, "plugin Open without a resolvable home = nil error, want ordinary failed construction")
 	}
 }
 
@@ -312,20 +312,13 @@ func TestPluginCacheStaysHomeBased(t *testing.T) {
 	// ever reached.
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c1", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No files have been modified." {
-		t.Fatalf("diagnostics = %+v, want the no-files success", outcome.Result)
-	}
-	if n := spy.count(); n != 1 {
-		t.Fatalf("workspace managers constructed = %d, want 1", n)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == "No files have been modified.", "diagnostics = %+v, want the no-files success", outcome.Result)
+	testassert.Equal(t, spy.count(), 1)
 	if spy.root() != workspace {
 		t.Fatalf("manager root = %q, want the canonical workspace %q", spy.root(), workspace)
 	}
@@ -333,14 +326,13 @@ func TestPluginCacheStaysHomeBased(t *testing.T) {
 	// the retained cache root stays home-based, under it, independently of
 	// DataDir.
 	resolved, err := os.UserHomeDir()
-	if err != nil || resolved != fakeHome {
-		t.Fatalf("os.UserHomeDir under the faked HOME = (%q, %v), want %q", resolved, err, fakeHome)
-	}
+	testassert.Require(t, err == nil && resolved == fakeHome, "os.UserHomeDir under the faked HOME = (%q, %v), want %q", resolved, err, fakeHome)
 	if spy.home() != resolved {
 		t.Fatalf("manager home = %q, want the plugin-resolved %q", spy.home(), resolved)
 	}
-	if cache := filepath.Join(spy.home(), ".cache", "lightcode", "lsp"); !strings.HasPrefix(cache, fakeHome+string(filepath.Separator)) {
-		t.Fatalf("cache root %q is not under the resolved home %q", cache, fakeHome)
+	{
+		cache := filepath.Join(spy.home(), ".cache", "lightcode", "lsp")
+		testassert.Require(t, strings.HasPrefix(cache, fakeHome+string(filepath.Separator)), "cache root %q is not under the resolved home %q", cache, fakeHome)
 	}
 }
 
@@ -351,11 +343,8 @@ func TestPluginCacheStaysHomeBased(t *testing.T) {
 func TestConcurrentFirstUsesJoinOneDetect(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
@@ -369,13 +358,9 @@ func TestConcurrentFirstUsesJoinOneDetect(t *testing.T) {
 	}
 	wg.Wait()
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("caller %d: %v", i, err)
-		}
+		testassert.Check(t, err == nil, "caller %d: %v", i, err)
 	}
-	if n := spy.count(); n != 1 {
-		t.Fatalf("workspace managers constructed = %d, want 1 shared detection", n)
-	}
+	testassert.Equal(t, spy.count(), 1)
 }
 
 func outcomeError(outcome harness.ToolOutcome) error {
@@ -400,13 +385,9 @@ func TestDetectionOnceIncludingEmptyMap(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"x"}`))
 		outcome := prepared.Execute(context.Background())
-		if outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available." {
-			t.Fatalf("call %d = %+v, want the zero-instance unavailability error", i+1, outcome.Result)
-		}
+		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content == "No language servers available.", "call %d = %+v, want the zero-instance unavailability error", i+1, outcome.Result)
 	}
-	if n := spy.count(); n != 1 {
-		t.Fatalf("workspace managers constructed = %d, want 1: failed detection is not retried", n)
-	}
+	testassert.Equal(t, spy.count(), 1)
 }
 
 // TestCanceledWaiterDoesNotCancelDetection: a caller canceled during the
@@ -414,11 +395,8 @@ func TestDetectionOnceIncludingEmptyMap(t *testing.T) {
 // a second caller succeeds against the started server.
 func TestCanceledWaiterDoesNotCancelDetection(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0.4)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, _, symbol, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	first, cancelFirst := context.WithCancel(context.Background())
 	prepared := symbol.Prepare(first, runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c1", "workspace_symbol", `{"query":"x"}`))
@@ -429,12 +407,8 @@ func TestCanceledWaiterDoesNotCancelDetection(t *testing.T) {
 
 	select {
 	case outcome := <-done:
-		if outcome.Result.Status != model.ResultInterrupted {
-			t.Fatalf("canceled waiter = %+v, want interrupted", outcome.Result)
-		}
-		if outcome.Result.Content == "" {
-			t.Fatal("interrupted result carries empty content")
-		}
+		testassert.Require(t, outcome.Result.Status == model.ResultInterrupted, "canceled waiter = %+v, want interrupted", outcome.Result)
+		testassert.Require(t, outcome.Result.Content != "", "interrupted result carries empty content")
 	case <-time.After(10 * time.Second):
 		t.Fatal("canceled waiter never settled")
 	}
@@ -443,12 +417,8 @@ func TestCanceledWaiterDoesNotCancelDetection(t *testing.T) {
 	// started server.
 	second := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c2", "workspace_symbol", `{"query":"x"}`))
 	outcome := second.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("second caller = %+v, want success against the started server", outcome.Result)
-	}
-	if n := spy.count(); n != 1 {
-		t.Fatalf("workspace managers constructed = %d, want 1", n)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "second caller = %+v, want success against the started server", outcome.Result)
+	testassert.Equal(t, spy.count(), 1)
 	waitForLog(t, requests, "initialize", 1)
 }
 
@@ -464,15 +434,11 @@ func TestDetectionUnderCanceledRuntimeYieldsNoUsableServers(t *testing.T) {
 	dataDir := t.TempDir()
 	workspace := markerWorkspace(t)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
-	if err := os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600))
 
 	lifetime, cancel := context.WithCancel(context.Background())
 	inst, err := Plugin().Open(lifetime, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("plugin Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { _ = inst.Close() })
 	diag := inst.Values["diagnostics"].(runtime.Tool)
 	// The lifetime is canceled after Open but before the first authorized
@@ -484,26 +450,18 @@ func TestDetectionUnderCanceledRuntimeYieldsNoUsableServers(t *testing.T) {
 		prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 		outcome := prepared.Execute(context.Background())
 		refused := filepath.Join(workspace, "a.go") + ": no language server for this file (could not check)"
-		if outcome.Result.Status != model.ResultError || outcome.Result.Content != refused {
-			t.Fatalf("call %d under the canceled lifetime = %+v, want the per-path could-not-check error", i+1, outcome.Result)
-		}
+		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content == refused, "call %d under the canceled lifetime = %+v, want the per-path could-not-check error", i+1, outcome.Result)
 	}
-	if n := logCount(t, requests, "textDocument/didOpen"); n != 0 {
-		t.Fatalf("document sync observed under the canceled lifetime: %d occurrences", n)
-	}
+	testassert.Equal(t, logCount(t, requests, "textDocument/didOpen"), 0)
 
 	// The live-lifetime sibling: the same fixtures start the server and the
 	// query reaches it.
 	diagLive, _ := openPlugin(t, Plugin(), dataDir)
 	prepared := diagLive.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("live-lifetime diagnostics = %+v, want success", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "live-lifetime diagnostics = %+v, want success", outcome.Result)
 	waitForQuery(t, requests, fileURI(workspace, "a.go"), 1)
-	if n := spy.count(); n != 2 {
-		t.Fatalf("workspace managers constructed = %d, want one per instance", n)
-	}
+	testassert.Equal(t, spy.count(), 2)
 }
 
 // TestCloseJoinsInFlightDetection: Close waits for the shared detection to
@@ -518,9 +476,7 @@ func TestCloseJoinsInFlightDetection(t *testing.T) {
 
 	plugin := Plugin()
 	inst, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("plugin Open: %v", err)
-	}
+	testassert.NoError(t, err)
 	symbol := inst.Values["workspace_symbol"].(runtime.Tool)
 
 	// Start detection as a first authorized use and wait until its server
@@ -534,15 +490,12 @@ func TestCloseJoinsInFlightDetection(t *testing.T) {
 
 	// Close while detection is in flight: it must join before returning.
 	start := time.Now()
-	if err := inst.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	testassert.NoError(t, inst.Close())
+	{
+		elapsed := time.Since(start)
+		testassert.Require(t, elapsed >= 300*time.Millisecond, "Close returned after %s; it must join the in-flight detection (init delay 0.4s)", elapsed)
 	}
-	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
-		t.Fatalf("Close returned after %s; it must join the in-flight detection (init delay 0.4s)", elapsed)
-	}
-	if n := spy.count(); n != 1 {
-		t.Fatalf("workspace managers constructed = %d, want 1", n)
-	}
+	testassert.Equal(t, spy.count(), 1)
 	waitForLog(t, requests, "initialize", 1)
 }
 
@@ -566,29 +519,17 @@ func TestDeniedAndPreparedCallsStartNothing(t *testing.T) {
 	// preparation is denied without any manager construction.
 	loopA := filepath.Join(t.TempDir(), "loop-a")
 	loopB := filepath.Join(t.TempDir(), "loop-b")
-	if err := os.Symlink(loopB, loopA); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(loopA, loopB); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(loopB, loopA))
+	testassert.NoError(t, os.Symlink(loopA, loopB))
 
 	for _, tool := range []runtime.Tool{diag, symbol} {
 		prepared := tool.Prepare(context.Background(), runtime.ToolContext{Workspace: loopA, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"x"}`))
-		if prepared.Immediate == nil {
-			t.Fatalf("symlink-loop workspace preparation = %+v, want an immediate denied outcome", prepared)
-		}
-		if prepared.Immediate.Result.Status != model.ResultDenied || prepared.Immediate.Result.Content != "Permission denied." {
-			t.Fatalf("symlink-loop workspace preparation = %+v, want the fixed denial", prepared.Immediate.Result)
-		}
-		if prepared.Execute != nil {
-			t.Fatal("the denied preparation carries an executor")
-		}
+		testassert.Require(t, prepared.Immediate != nil, "symlink-loop workspace preparation = %+v, want an immediate denied outcome", prepared)
+		testassert.Require(t, prepared.Immediate.Result.Status == model.ResultDenied && prepared.Immediate.Result.Content == "Permission denied.", "symlink-loop workspace preparation = %+v, want the fixed denial", prepared.Immediate.Result)
+		testassert.Require(t, prepared.Execute == nil, "the denied preparation carries an executor")
 	}
 
-	if n := spy.count(); n != 0 {
-		t.Fatalf("workspace managers constructed = %d, want 0: denied calls start nothing", n)
-	}
+	testassert.Equal(t, spy.count(), 0)
 }
 
 // TestDiagnosticsNoCursorAcrossCalls: two seeded groups from two "operations"
@@ -596,29 +537,19 @@ func TestDeniedAndPreparedCallsStartNothing(t *testing.T) {
 // checked-group set.
 func TestDiagnosticsNoCursorAcrossCalls(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	seedGroup(t, dataDir, pluginSessionID, groupTwo, filepath.Join(workspace, "b.go"))
 	for _, name := range []string{"a.go", "b.go"} {
-		if err := os.WriteFile(filepath.Join(workspace, name), []byte("package w\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, name), []byte("package w\n"), 0o600))
 	}
 	uriA, uriB := fileURI(workspace, "a.go"), fileURI(workspace, "b.go")
 
 	for call := 1; call <= 2; call++ {
 		prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 		outcome := prepared.Execute(context.Background())
-		if outcome.Result.Status != model.ResultSuccess {
-			t.Fatalf("call %d = %+v, want success", call, outcome.Result)
-		}
-		if outcome.Result.Content != "No errors found." {
-			t.Fatalf("call %d content = %q, want the clean no-error text", call, outcome.Result.Content)
-		}
+		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == "No errors found.", "call %d = %+v, want success; call %d content = %q, want the clean no-error text", call, outcome.Result, call, outcome.Result.Content)
 		waitForQuery(t, requests, uriA, call)
 		waitForQuery(t, requests, uriB, call)
 	}
@@ -628,57 +559,40 @@ func TestDiagnosticsNoCursorAcrossCalls(t *testing.T) {
 // read.
 func TestDiagnosticsExcludesOtherSessions(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	seedGroup(t, dataDir, otherSessionID, groupTwo, filepath.Join(workspace, "b.go"))
 	for _, name := range []string{"a.go", "b.go"} {
-		if err := os.WriteFile(filepath.Join(workspace, name), []byte("package w\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, name), []byte("package w\n"), 0o600))
 	}
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("diagnostics = %+v, want success", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "diagnostics = %+v, want success", outcome.Result)
 	waitForQuery(t, requests, fileURI(workspace, "a.go"), 1)
-	if n := logCount(t, requests, fileURI(workspace, "b.go")); n != 0 {
-		t.Fatalf("the other session's file was synced: %d occurrences", n)
-	}
+	testassert.Equal(t, logCount(t, requests, fileURI(workspace, "b.go")), 0)
 }
 
 // TestDiagnosticsDropsOutsideRootPaths: an outside-root canonical path is
 // dropped un-read.
 func TestDiagnosticsDropsOutsideRootPaths(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(workspace, "a.go"))
 	outside := filepath.Join(t.TempDir(), "outside.go")
 	seedGroup(t, dataDir, pluginSessionID, groupTwo, outside)
-	if err := os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(outside, []byte("package outside\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "a.go"), []byte("package w\n"), 0o600))
+	testassert.NoError(t, os.WriteFile(outside, []byte("package outside\n"), 0o600))
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("diagnostics = %+v, want success", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "diagnostics = %+v, want success", outcome.Result)
 	waitForQuery(t, requests, fileURI(workspace, "a.go"), 1)
-	if n := logCount(t, requests, "outside.go"); n != 0 {
-		t.Fatal("the outside-root path was read despite being dropped")
+	{
+		n := logCount(t, requests, "outside.go")
+		testassert.Require(t, n == 0, "the outside-root path was read despite being dropped")
 	}
 }
 
@@ -686,28 +600,17 @@ func TestDiagnosticsDropsOutsideRootPaths(t *testing.T) {
 // to the real root and the tool succeeds against it.
 func TestSymlinkedWorkspaceBindsToRealRoot(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	realRoot := markerWorkspace(t)
-	if err := os.WriteFile(filepath.Join(realRoot, "a.go"), []byte("package w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	spy, diag, _, realRoot := newPluginWorkspace(t, fakeHome, dataDir)
+	testassert.NoError(t, os.WriteFile(filepath.Join(realRoot, "a.go"), []byte("package w\n"), 0o600))
 	seedGroup(t, dataDir, pluginSessionID, groupOne, filepath.Join(realRoot, "a.go"))
 	link := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink(realRoot, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(realRoot, link))
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: link, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
-	if prepared.CanonicalWorkspace != realRoot {
-		t.Fatalf("CanonicalWorkspace = %q, want the real root %q", prepared.CanonicalWorkspace, realRoot)
-	}
+	testassert.Equal(t, prepared.CanonicalWorkspace, realRoot)
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("diagnostics = %+v, want success through the symlinked lexical workspace", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "diagnostics = %+v, want success through the symlinked lexical workspace", outcome.Result)
 	waitForQuery(t, requests, fileURI(realRoot, "a.go"), 1)
 	if spy.root() != realRoot {
 		t.Fatalf("manager root = %q, want the canonical real root", spy.root())
@@ -720,40 +623,22 @@ func TestSymlinkedWorkspaceBindsToRealRoot(t *testing.T) {
 func TestPostAuthorizationBindingChangeFailsWithoutStart(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
 	t.Setenv("HOME", fakeHome)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	realRoot := markerWorkspace(t)
+	spy, diag, _, realRoot := newPluginWorkspace(t, fakeHome, dataDir)
 	link := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink(realRoot, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(realRoot, link))
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: link, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
-	if prepared.CanonicalWorkspace != realRoot {
-		t.Fatalf("CanonicalWorkspace = %q, want %q", prepared.CanonicalWorkspace, realRoot)
-	}
+	testassert.Equal(t, prepared.CanonicalWorkspace, realRoot)
 
 	// Repoint the lexical workspace at a different root after authorization.
 	otherRoot := t.TempDir()
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(otherRoot, link); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Remove(link))
+	testassert.NoError(t, os.Symlink(otherRoot, link))
 
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError {
-		t.Fatalf("changed binding = %+v, want an error outcome", outcome.Result)
-	}
-	if !strings.Contains(outcome.Result.Content, "binding changed") {
-		t.Fatalf("changed binding content = %q", outcome.Result.Content)
-	}
-	if n := spy.count(); n != 0 {
-		t.Fatalf("workspace managers constructed = %d, want 0: a changed binding starts nothing", n)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultError && strings.Contains(outcome.Result.Content, "binding changed"), "changed binding = %+v, want an error outcome; changed binding content = %q", outcome.Result, outcome.Result.Content)
+	testassert.Equal(t, spy.count(), 0)
 }
 
 // TestCallerCancellationDuringQueryIsInterrupted: cancellation during the
@@ -761,34 +646,21 @@ func TestPostAuthorizationBindingChangeFailsWithoutStart(t *testing.T) {
 // content.
 func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 	fakeHome, requests := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	// One healthy file (its sync proves the opens completed) and one
 	// replaced-symlink leaf (its canonical read fails, so partial
 	// could-not-check content accumulates before the sync wait).
 	healthy := filepath.Join(workspace, "a.go")
-	if err := os.WriteFile(healthy, []byte("package w\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(healthy, []byte("package w\n"), 0o600))
 	seedGroup(t, dataDir, pluginSessionID, groupOne, healthy)
 	target := filepath.Join(t.TempDir(), "target.go")
-	if err := os.WriteFile(target, []byte("package target\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(target, []byte("package target\n"), 0o600))
 	swapped := filepath.Join(workspace, "swapped.go")
-	if err := os.WriteFile(swapped, []byte("placeholder\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(swapped); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, swapped); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(swapped, []byte("placeholder\n"), 0o600))
+	testassert.NoError(t, os.Remove(swapped))
+	testassert.NoError(t, os.Symlink(target, swapped))
 	seedGroup(t, dataDir, pluginSessionID, groupTwo, swapped)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -802,15 +674,9 @@ func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 
 	select {
 	case outcome := <-done:
-		if outcome.Result.Status != model.ResultInterrupted {
-			t.Fatalf("canceled query = %+v, want interrupted", outcome.Result)
-		}
-		if !strings.Contains(outcome.Result.Content, "(could not check)") {
-			t.Fatalf("interrupted content = %q, want the bounded partial could-not-check line", outcome.Result.Content)
-		}
-		if len(outcome.Result.Content) > 15360 {
-			t.Fatalf("interrupted content = %d bytes, want the bounded partial", len(outcome.Result.Content))
-		}
+		testassert.Require(t, outcome.Result.Status == model.ResultInterrupted, "canceled query = %+v, want interrupted", outcome.Result)
+		testassert.Require(t, strings.Contains(outcome.Result.Content, "(could not check)"), "interrupted content = %q, want the bounded partial could-not-check line", outcome.Result.Content)
+		testassert.Require(t, len(outcome.Result.Content) <= 15360, "interrupted content = %d bytes, want the bounded partial", len(outcome.Result.Content))
 	case <-time.After(10 * time.Second):
 		t.Fatal("canceled query never settled")
 	}
@@ -821,45 +687,28 @@ func TestCallerCancellationDuringQueryIsInterrupted(t *testing.T) {
 // a successful text line that reads as a clean query.
 func TestDiagnosticsListingFailureIsError(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
 	// The valid Session identity's session path is a regular file: the
 	// enumeration fails for real.
-	if err := os.MkdirAll(filepath.Join(dataDir, "code"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "code", pluginSessionID), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	testassert.NoError(t, os.MkdirAll(filepath.Join(dataDir, "code"), 0o755))
+	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "code", pluginSessionID), []byte("x"), 0o600))
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError {
-		t.Fatalf("listing failure = %+v, want an error outcome carrying the enumeration failure", outcome.Result)
-	}
-	if !strings.Contains(outcome.Result.Content, "not a directory") {
-		t.Fatalf("listing failure content = %q, want the actual enumeration error", outcome.Result.Content)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultError && strings.Contains(outcome.Result.Content, "not a directory"), "listing failure = %+v, want an error outcome carrying the enumeration failure; listing failure content = %q, want the actual enumeration error", outcome.Result, outcome.Result.Content)
 }
 
 // TestDiagnosticsNoFiles: an empty data root settles as the retained no-files
 // content.
 func TestDiagnosticsNoFiles(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess || outcome.Result.Content != "No files have been modified." {
-		t.Fatalf("no files = %+v, want the retained no-files content", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == "No files have been modified.", "no files = %+v, want the retained no-files content", outcome.Result)
 }
 
 // TestWorkspaceSymbolEmptyQueryRejected: a present empty query is an
@@ -867,27 +716,19 @@ func TestDiagnosticsNoFiles(t *testing.T) {
 // input is the immediate validation error before any service start.
 func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
 	symbol := workspaceSymbolTool{inst: &instance{}}
-	if _, err := symbol.Normalize(runtime.ToolContext{}, toolCall("c", "workspace_symbol", `{"query":""}`)); err == nil {
-		t.Fatal("workspace_symbol Normalize(empty query) = nil error, want an argument-validation error")
+	{
+		_, err := symbol.Normalize(runtime.ToolContext{}, toolCall("c", "workspace_symbol", `{"query":""}`))
+		testassert.Require(t, err != nil, "workspace_symbol Normalize(empty query) = nil error, want an argument-validation error")
 	}
 
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	_, symbolTool := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	spy, _, symbolTool, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	prepared := symbolTool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":""}`))
-	if prepared.Immediate == nil || prepared.Immediate.Result.Status != model.ResultError {
-		t.Fatalf("empty-query preparation = %+v, want the immediate validation error", prepared)
-	}
-	if prepared.Execute != nil {
-		t.Fatal("the invalid-query preparation carries an executor")
-	}
-	if n := spy.count(); n != 0 {
-		t.Fatalf("workspace managers constructed = %d, want 0: an invalid query starts nothing", n)
-	}
+	testassert.Require(t, prepared.Immediate != nil && prepared.Immediate.Result.Status == model.ResultError, "empty-query preparation = %+v, want the immediate validation error", prepared)
+	testassert.Require(t, prepared.Execute == nil, "the invalid-query preparation carries an executor")
+	testassert.Equal(t, spy.count(), 0)
 }
 
 // TestWorkspaceSymbolAllFailedIsError: a server whose workspace/symbol reply
@@ -897,17 +738,12 @@ func TestWorkspaceSymbolEmptyQueryRejected(t *testing.T) {
 func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 	home := t.TempDir()
 	plantServer(t, home, "gopls", "gopls", 0, "", "1", "")
-	spy := &managerSpy{}
-	spy.install(t, home)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, _, symbol, workspace := newPluginWorkspace(t, home, dataDir)
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available for the symbol query." {
-		t.Fatalf("undecodable symbol reply = %+v, want the fixed unavailability error", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content == "No language servers available for the symbol query.", "undecodable symbol reply = %+v, want the fixed unavailability error", outcome.Result)
 }
 
 // TestWorkspaceSymbolEmptyReplyIsSuccessful: a valid empty symbol list is a
@@ -916,20 +752,12 @@ func TestWorkspaceSymbolAllFailedIsError(t *testing.T) {
 func TestWorkspaceSymbolEmptyReplyIsSuccessful(t *testing.T) {
 	home := t.TempDir()
 	plantServer(t, home, "gopls", "gopls", 0, "", "", "1")
-	spy := &managerSpy{}
-	spy.install(t, home)
 	dataDir := t.TempDir()
-	_, symbol := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, _, symbol, workspace := newPluginWorkspace(t, home, dataDir)
 
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultSuccess {
-		t.Fatalf("empty symbol reply = %+v, want the success outcome for a responding server", outcome.Result)
-	}
-	if !strings.Contains(outcome.Result.Content, "No symbols were reported by the responding language servers.") {
-		t.Fatalf("empty symbol reply content = %q, want the responding-servers text", outcome.Result.Content)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "No symbols were reported by the responding language servers."), "empty symbol reply = %+v, want the success outcome for a responding server; empty symbol reply content = %q, want the responding-servers text", outcome.Result, outcome.Result.Content)
 }
 
 // TestNormalizeContracts: the strict decode, the private-field stripping,
@@ -940,28 +768,22 @@ func TestNormalizeContracts(t *testing.T) {
 	tc := runtime.ToolContext{}
 
 	got, err := diag.Normalize(tc, toolCall("c", "diagnostics", `{"_lightcode_receipt":"forged","unrelated":1}`))
-	if err != nil {
-		t.Fatalf("diagnostics Normalize: %v", err)
-	}
-	if string(got) != `{"unrelated":1}` {
-		t.Fatalf("diagnostics normalized = %s, want the stripped retained members", got)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, string(got) == `{"unrelated":1}`, "diagnostics normalized = %s, want the stripped retained members", got)
 	for _, bad := range []string{`null`, `[1]`, `{`, `{} trailing`} {
-		if _, err := diag.Normalize(tc, toolCall("c", "diagnostics", bad)); err == nil {
-			t.Errorf("diagnostics Normalize(%q) = nil error, want an argument-validation error", bad)
+		{
+			_, err := diag.Normalize(tc, toolCall("c", "diagnostics", bad))
+			testassert.Check(t, err != nil, "diagnostics Normalize(%q) = nil error, want an argument-validation error", bad)
 		}
 	}
 
 	got, err = symbol.Normalize(tc, toolCall("c", "workspace_symbol", `{"query":"x","_lightcode_receipt":"forged","other":"kept"}`))
-	if err != nil {
-		t.Fatalf("workspace_symbol Normalize: %v", err)
-	}
-	if !strings.Contains(string(got), `"query":"x"`) || !strings.Contains(string(got), `"other":"kept"`) || strings.Contains(string(got), "_lightcode_") {
-		t.Fatalf("workspace_symbol normalized = %s", got)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(got), `"query":"x"`) && strings.Contains(string(got), `"other":"kept"`) && !strings.Contains(string(got), "_lightcode_"), "workspace_symbol normalized = %s", got)
 	for _, bad := range []string{`{}`, `{"query":null}`, `{"query":5}`, `{"query":["x"]}`, `{"query":""}`} {
-		if _, err := symbol.Normalize(tc, toolCall("c", "workspace_symbol", bad)); err == nil {
-			t.Errorf("workspace_symbol Normalize(%q) = nil error, want an argument-validation error", bad)
+		{
+			_, err := symbol.Normalize(tc, toolCall("c", "workspace_symbol", bad))
+			testassert.Check(t, err != nil, "workspace_symbol Normalize(%q) = nil error, want an argument-validation error", bad)
 		}
 	}
 }
@@ -970,32 +792,20 @@ func TestNormalizeContracts(t *testing.T) {
 // verbatim workspace_symbol schema, and the one workspace.inspect pair.
 func TestDescriptionsAndPreparationShape(t *testing.T) {
 	diagDesc, err := diagnosticsTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("diagnostics describe: %v", err)
-	}
-	if diagDesc.Definition.Description != "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)." {
-		t.Fatalf("diagnostics description = %q", diagDesc.Definition.Description)
-	}
-	if diagDesc.Definition.Name != "diagnostics" || !diagDesc.Available {
-		t.Fatalf("diagnostics definition = %+v", diagDesc.Definition)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, diagDesc.Definition.Description == "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings)." && diagDesc.Definition.Name == "diagnostics" && diagDesc.Available, "got %v, want %v; diagnostics definition = %+v", diagDesc.Definition.Description, "Check for compilation errors in the files this Session has changed. Call after editing to verify correctness. Returns errors only (not warnings).", diagDesc.Definition)
 
 	symbolDesc, err := workspaceSymbolTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
-	if err != nil {
-		t.Fatalf("workspace_symbol describe: %v", err)
-	}
-	if symbolDesc.Definition.Description != "Search for symbols by name across the project. Returns matching functions, types, variables, etc. with their file locations." {
-		t.Fatalf("workspace_symbol description = %q", symbolDesc.Definition.Description)
-	}
+	testassert.NoError(t, err)
+	testassert.Equal(t, symbolDesc.Definition.Description, "Search for symbols by name across the project. Returns matching functions, types, variables, etc. with their file locations.")
 	var schema struct {
 		Properties map[string]any `json:"properties"`
 		Required   []string       `json:"required"`
 	}
-	if err := json.Unmarshal(symbolDesc.Definition.Parameters, &schema); err != nil {
-		t.Fatalf("workspace_symbol schema: %v", err)
-	}
-	if _, ok := schema.Properties["query"]; !ok || len(schema.Required) != 1 || schema.Required[0] != "query" {
-		t.Fatalf("workspace_symbol schema = %s", symbolDesc.Definition.Parameters)
+	testassert.NoError(t, json.Unmarshal(symbolDesc.Definition.Parameters, &schema))
+	{
+		_, ok := schema.Properties["query"]
+		testassert.Require(t, ok && len(schema.Required) == 1 && schema.Required[0] == "query", "workspace_symbol schema = %s", symbolDesc.Definition.Parameters)
 	}
 
 	dataDir := t.TempDir()
@@ -1008,33 +818,24 @@ func TestDescriptionsAndPreparationShape(t *testing.T) {
 			args = `{"query":"x"}`
 		}
 		prepared := tool.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", args))
-		if len(prepared.Permissions) != 1 {
-			t.Fatalf("permissions = %+v, want exactly one pair", prepared.Permissions)
-		}
+		testassert.Require(t, len(prepared.Permissions) == 1, "permissions = %+v, want exactly one pair", prepared.Permissions)
 		pair := prepared.Permissions[0]
-		if pair.Permission != "workspace.inspect" || pair.Target != workspace {
-			t.Fatalf("permission pair = %+v, want workspace.inspect on the canonical root", pair)
-		}
-		if prepared.CanonicalWorkspace != workspace || prepared.CanonicalWriteDir != "" {
-			t.Fatalf("canonical binding = %q/%q, want the root and no write dir", prepared.CanonicalWorkspace, prepared.CanonicalWriteDir)
-		}
+		testassert.Require(t, pair.Permission == "workspace.inspect" && pair.Target == workspace, "permission pair = %+v, want workspace.inspect on the canonical root", pair)
+		testassert.Require(t, prepared.CanonicalWorkspace == workspace && prepared.CanonicalWriteDir == "", "canonical binding = %q/%q, want the root and no write dir", prepared.CanonicalWorkspace, prepared.CanonicalWriteDir)
 	}
 }
 
 // TestContentCap: the at-limit and over-limit rows, the multi-byte character
 // straddling the boundary, and the cap on error content.
 func TestContentCap(t *testing.T) {
-	if got := capModelContent(strings.Repeat("a", 15360)); got != strings.Repeat("a", 15360) {
-		t.Fatal("at-limit content must be unchanged")
+	{
+		got := capModelContent(strings.Repeat("a", 15360))
+		testassert.Require(t, got == strings.Repeat("a", 15360), "at-limit content must be unchanged")
 	}
 	over := strings.Repeat("a", 15361)
 	got := capModelContent(over)
-	if len(got) != 15360 || !strings.HasSuffix(got, "\n[Output truncated]") {
-		t.Fatalf("over-limit cap = %d bytes, want 15360 with the marker", len(got))
-	}
-	if !strings.HasPrefix(got, over[:15360-len("\n[Output truncated]")]) {
-		t.Fatal("cap did not keep the longest fitting prefix")
-	}
+	testassert.Require(t, len(got) == 15360 && strings.HasSuffix(got, "\n[Output truncated]"), "over-limit cap = %d bytes, want 15360 with the marker", len(got))
+	testassert.Require(t, strings.HasPrefix(got, over[:15360-len("\n[Output truncated]")]), "cap did not keep the longest fitting prefix")
 
 	// A multi-byte character straddling the boundary: the cut backs off to
 	// the rune boundary and the result stays valid UTF-8. The first € starts
@@ -1043,27 +844,17 @@ func TestContentCap(t *testing.T) {
 	prefix := strings.Repeat("a", 15360-len(truncationMarker)-2)
 	straddled := prefix + "€€€€€€€€€€" // each € is three bytes
 	got = capModelContent(straddled)
-	if len(got) > 15360 || !strings.HasSuffix(got, "\n[Output truncated]") {
-		t.Fatalf("straddled cap = %d bytes, want the marker within 15360", len(got))
-	}
-	if !utf8.ValidString(got) {
-		t.Fatal("cap produced invalid UTF-8")
-	}
-	if !strings.HasPrefix(got, prefix) {
-		t.Fatal("cap lost the complete prefix")
-	}
+	testassert.Require(t, len(got) <= 15360 && strings.HasSuffix(got, "\n[Output truncated]"), "straddled cap = %d bytes, want the marker within 15360", len(got))
+	testassert.Require(t, utf8.ValidString(got), "cap produced invalid UTF-8")
+	testassert.Require(t, strings.HasPrefix(got, prefix), "cap lost the complete prefix")
 
 	// Error content is capped by the same rule.
 	outcome := toolOutcome("c", context.Background(), "", errors.New(strings.Repeat("e", 20000)))
-	if outcome.Result.Status != model.ResultError || len(outcome.Result.Content) != 15360 {
-		t.Fatalf("error cap = %+v (%d bytes), want the capped error content", outcome.Result, len(outcome.Result.Content))
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultError && len(outcome.Result.Content) == 15360, "error cap = %+v (%d bytes), want the capped error content", outcome.Result, len(outcome.Result.Content))
 
 	// Success content is capped by the same rule.
 	outcome = toolOutcome("c", context.Background(), strings.Repeat("s", 20000), nil)
-	if outcome.Result.Status != model.ResultSuccess || len(outcome.Result.Content) != 15360 {
-		t.Fatalf("success cap = %+v (%d bytes), want the capped content", outcome.Result, len(outcome.Result.Content))
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultSuccess && len(outcome.Result.Content) == 15360, "success cap = %+v (%d bytes), want the capped content", outcome.Result, len(outcome.Result.Content))
 }
 
 // TestDiagnosticsBulkReadFailuresStayBounded proves the bulk-failure row: a
@@ -1073,36 +864,25 @@ func TestContentCap(t *testing.T) {
 // by the truncation marker — bounded content through the all-failed error path.
 func TestDiagnosticsBulkReadFailuresStayBounded(t *testing.T) {
 	fakeHome, _ := fakeServerHome(t, 0)
-	spy := &managerSpy{}
-	spy.install(t, fakeHome)
 	dataDir := t.TempDir()
-	diag, _ := pluginUnderTest(t, dataDir)
-	workspace := markerWorkspace(t)
+	_, diag, _, workspace := newPluginWorkspace(t, fakeHome, dataDir)
 
 	const count = 1000
 	for i := 0; i < count; i++ {
 		leaf := filepath.Join(workspace, fmt.Sprintf("leaf%04d.go", i))
-		if err := os.Symlink(filepath.Join(workspace, "missing-target.go"), leaf); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.Symlink(filepath.Join(workspace, "missing-target.go"), leaf))
 		seedEntry(t, dataDir, pluginSessionID, groupOne, fmt.Sprintf("e%04d", i), leaf)
 	}
 
 	prepared := diag.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "diagnostics", `{}`))
 	outcome := prepared.Execute(context.Background())
-	if outcome.Result.Status != model.ResultError {
-		t.Fatalf("bulk-failure diagnostics = %+v, want the all-failed error outcome", outcome.Result)
-	}
+	testassert.Require(t, outcome.Result.Status == model.ResultError, "bulk-failure diagnostics = %+v, want the all-failed error outcome", outcome.Result)
 	content := outcome.Result.Content
-	if len(content) > 15360 {
-		t.Fatalf("bulk-failure content = %d bytes, want the 15360 cap", len(content))
-	}
+	testassert.Require(t, len(content) <= 15360, "bulk-failure content = %d bytes, want the 15360 cap", len(content))
 	if !strings.HasSuffix(content, "\n[Output truncated]") {
 		t.Fatalf("bulk-failure content tail = %q, want the truncation marker", content[len(content)-60:])
 	}
-	if !strings.Contains(content, "(could not check)") {
-		t.Fatalf("bulk-failure content = %.120s, want could-not-check lines", content)
-	}
+	testassert.Require(t, strings.Contains(content, "(could not check)"), "bulk-failure content = %.120s, want could-not-check lines", content)
 }
 
 // TestPluginInstallsReportWarningBeforeDetect proves the plugin captures the
@@ -1117,9 +897,7 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // cold LSP cache: nothing planted
 	t.Setenv("PATH", t.TempDir()) // no resolvable server anywhere
 	workspace := markerWorkspace(t)
-	if err := os.WriteFile(filepath.Join(workspace, "CMakeLists.txt"), []byte("cmake_minimum_required(VERSION 3.10)\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "CMakeLists.txt"), []byte("cmake_minimum_required(VERSION 3.10)\n"), 0o600))
 
 	var mu sync.Mutex
 	var reported []string
@@ -1131,9 +909,7 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 	// The real plugin Open captures the Runtime's closure from its scope
 	// identity — the only path the report below can arrive through.
 	instance, err := Plugin().Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir(), ReportWarning: report}, runtime.Bindings{})
-	if err != nil {
-		t.Fatalf("Open with the reporter: %v", err)
-	}
+	testassert.NoError(t, err)
 	t.Cleanup(func() { _ = instance.Close() })
 	symbol := instance.Values["workspace_symbol"].(runtime.Tool)
 
@@ -1143,8 +919,9 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 	// the installed callback — the zero-instance error proves detection
 	// completed, so the reports are not racing a later goroutine.
 	prepared := symbol.Prepare(context.Background(), runtime.ToolContext{Workspace: workspace, AdmittedEntry: harness.EntryRef{SessionID: pluginSessionID}}, toolCall("c", "workspace_symbol", `{"query":"Foo"}`))
-	if outcome := prepared.Execute(context.Background()); outcome.Result.Status != model.ResultError || outcome.Result.Content != "No language servers available." {
-		t.Fatalf("missing-server query = %+v, want the cold no-server error after detection", outcome.Result)
+	{
+		outcome := prepared.Execute(context.Background())
+		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content == "No language servers available.", "missing-server query = %+v, want the cold no-server error after detection", outcome.Result)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -1154,9 +931,7 @@ func TestPluginInstallsReportWarningBeforeDetect(t *testing.T) {
 		if count > 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the manager's detection warning never reached the Runtime closure")
-		}
+		testassert.Require(t, !time.Now().After(deadline), "the manager's detection warning never reached the Runtime closure")
 		time.Sleep(5 * time.Millisecond)
 	}
 	mu.Lock()

@@ -134,8 +134,8 @@ type UsageTotals struct {
 // model identity, the system prompt, the advertised tool definitions in
 // preserved order, the selected capability names in preserved order, the
 // Agent definition's permission capability constraints, and the compaction
-// configuration — the conversation context window, the output reserve, and
-// the effective compact model's selection. Readonly and WriteDir
+// configuration — the effective compact model's selection and its prompt.
+// Readonly and WriteDir
 // are the configured lexical constraint copied from the one Harness-selected
 // definition; WriteDir is already trimmed at projection and stays unchanged in
 // the capture. The captured ConfigurationRevision also identifies the
@@ -157,14 +157,11 @@ type ExecutionCapture struct {
 }
 
 // CompactCapture is the effective compaction configuration of one capture:
-// the model the compaction summarizer runs on, its context window and output
-// reserve under the same fallback rules as the conversation model, and the
-// compact type's system prompt. Fully comparable.
+// the model the compaction summarizer runs on and the compact type's system
+// prompt. Fully comparable.
 type CompactCapture struct {
-	Model         model.ModelRef `json:"model"`
-	ContextWindow int            `json:"context_window"`
-	OutputReserve int            `json:"output_reserve"`
-	SystemPrompt  string         `json:"system_prompt"`
+	Model        model.ModelRef `json:"model"`
+	SystemPrompt string         `json:"system_prompt"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.
@@ -374,20 +371,25 @@ type signalEntry struct {
 
 // operationSettlementEntry publishes one terminal Operation outcome. It is
 // never operationless; the model identity is present exactly when the
-// settlement carries usage.
+// settlement carries usage. CompactionUsage marks that carried usage as the
+// compaction summarizer's own: omitted or false identifies conversation usage,
+// true identifies summary usage, and with no usage carried the marker is
+// inert.
 type operationSettlementEntry struct {
-	SessionID   string          `json:"session_id"`
-	EntryID     string          `json:"entry_id"`
-	OperationID string          `json:"operation_id"`
-	Status      OperationState  `json:"status"`
-	Detail      string          `json:"detail,omitempty"`
-	Model       *model.ModelRef `json:"model,omitempty"`
-	Usage       *UsageCount     `json:"usage,omitempty"`
+	SessionID       string          `json:"session_id"`
+	EntryID         string          `json:"entry_id"`
+	OperationID     string          `json:"operation_id"`
+	Status          OperationState  `json:"status"`
+	Detail          string          `json:"detail,omitempty"`
+	Model           *model.ModelRef `json:"model,omitempty"`
+	Usage           *UsageCount     `json:"usage,omitempty"`
+	CompactionUsage bool            `json:"compaction_usage,omitempty"`
 }
 
-// compactionEntry is one immutable compaction commit: the rolling summary of
-// everything up to its boundary entry, the compact model identity that
-// produced it, the governing configuration revision, and the commit's
+// compactionEntry is one immutable compaction commit: the single-request
+// summary of the frozen conversation up to its boundary entry, the compact
+// model identity that produced it, the governing configuration revision, and
+// the commit's
 // reported usage when present. Independently copied fork-prefix entries omit
 // the owning Operation identity and carry no source usage.
 type compactionEntry struct {
