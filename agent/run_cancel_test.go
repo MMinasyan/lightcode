@@ -259,24 +259,21 @@ func TestRunInfraErrorsWinOverCancellation(t *testing.T) {
 	})
 }
 
-// TestRunCancellationDominatesCap pins the cap-vs-cancellation order: when the run context is done at the exact point the cap would otherwise fire, the result is an interruption, not the cap failure.
-func TestRunCancellationDominatesCap(t *testing.T) {
+// TestRunCancelledAfterManyContinuations proves a long run still stops before the next effect.
+func TestRunCancelledAfterManyContinuations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	f := &runFakes{}
-	sets := make([]ModelSettlement, maxModelEffects)
-	for i := range sets[:maxModelEffects-1] {
-		sets[i] = erroredContinue(i)
-	}
 	f.modelSet = func(call int, req model.Request, cb AssemblyCallback) (ModelSettlement, error) {
-		if call == maxModelEffects {
-			return cancelThen(cancel, erroredContinue(call))
+		if call == 30 {
+			cancel()
 		}
-		return setScript(sets...)(call, req, cb)
+		return erroredContinue(call), nil
 	}
 
 	res, err := Run(ctx, f.invocation())
 	requireRunInterrupted(t, res, err, "agent interrupted")
 	// the last settlement was errored, which no interruption terminal may carry.
 	testassert.Require(t, res.LastOutput == nil, "interruption carried %#v, want no output", res.LastOutput)
-	testassert.Require(t, f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "model=%d source=%d, want 25/25", f.modelCalls, f.sourceCalls)
+	testassert.Require(t, f.modelCalls == 30 && f.sourceCalls == 30, "model=%d source=%d, want 30/30", f.modelCalls, f.sourceCalls)
 }

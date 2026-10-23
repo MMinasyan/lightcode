@@ -114,61 +114,66 @@ func TestRunDeniedAndErrorResultsNeverStopTheBatch(t *testing.T) {
 	testassert.Require(t, f.toolCalls == 3 && f.modelCalls == 2, "tool=%d model=%d, want 3/2", f.toolCalls, f.modelCalls)
 }
 
-// TestRunCapExhaustedAfterContinue pins the cap failure shape: after 25 continues, Agent fails with the last errored output and the fixed detail before a 26th request — and before another snapshot fetch.
-func TestRunCapExhaustedAfterContinue(t *testing.T) {
+// TestRunContinuesPast25ModelEffects proves continuation length cannot fail a run.
+func TestRunContinuesPast25ModelEffects(t *testing.T) {
 	f := &runFakes{}
-	sets := make([]ModelSettlement, maxModelEffects)
-	for i := range sets {
+	sets := make([]ModelSettlement, 51)
+	for i := range sets[:50] {
 		sets[i] = erroredContinue(i)
 	}
+	sets[50] = ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)}
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
 	testassert.NoError(t, err)
-	testassert.Require(t, res.Status == TerminalFailure && res.Detail == "agent exceeded 25 model effects", "terminal = %s/%q, want failure with the cap detail", res.Status, res.Detail)
-	testassert.Equal(t, res.LastOutput, sets[maxModelEffects-1].Output)
-	testassert.Require(t, f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "model=%d source=%d, want 25/25 — the cap ends the run before a 26th request", f.modelCalls, f.sourceCalls)
+	testassert.Require(t, res.Status == TerminalSuccess, "terminal = %s/%q, want success after 50 continuations", res.Status, res.Detail)
+	testassert.Equal(t, res.LastOutput, sets[50].Output)
+	testassert.Require(t, f.modelCalls == 51 && f.sourceCalls == 51, "model=%d source=%d, want 51/51", f.modelCalls, f.sourceCalls)
 }
 
-// TestRunFinalTextFromEffect25Succeeds pins that the 25th logical model effect may still finish the run cleanly: its call-free completed output succeeds instead of tripping the cap.
+// TestRunFinalTextFromEffect25Succeeds pins success at the former request boundary.
 func TestRunFinalTextFromEffect25Succeeds(t *testing.T) {
 	f := &runFakes{}
-	sets := make([]ModelSettlement, maxModelEffects)
-	for i := range sets[:maxModelEffects-1] {
+	sets := make([]ModelSettlement, 25)
+	for i := range sets[:24] {
 		sets[i] = erroredContinue(i)
 	}
-	sets[maxModelEffects-1] = ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)}
+	sets[24] = ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)}
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
 	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success from the 25th effect", res, err)
-	testassert.Equal(t, f.modelCalls, maxModelEffects)
+	testassert.Equal(t, f.modelCalls, 25)
 }
 
-// TestRunEffect25SettlesBatchBeforeCapFailure pins that a completed tool batch from the 25th effect fully settles — every call dispatched — and only then fails with that last completed output under the cap detail.
-func TestRunEffect25SettlesBatchBeforeCapFailure(t *testing.T) {
+// TestRunToolBatchesContinuePast25ModelEffects proves ordered tool dispatch continues until final text.
+func TestRunToolBatchesContinuePast25ModelEffects(t *testing.T) {
 	f := &runFakes{}
-	sets := make([]ModelSettlement, maxModelEffects)
-	for i := range sets[:maxModelEffects-1] {
-		sets[i] = erroredContinue(i)
-	}
+	sets := make([]ModelSettlement, 31)
 	callsOut := mkCallsTerminalOutput()
-	sets[maxModelEffects-1] = ModelSettlement{Disposition: DispoReady, Output: callsOut}
+	for i := range sets[:30] {
+		sets[i] = ModelSettlement{Disposition: DispoReady, Output: callsOut}
+	}
+	final := mkOutput(model.OutputCompleted, "", nil)
+	sets[30] = ModelSettlement{Disposition: DispoReady, Output: final}
 	f.modelSet = setScript(sets...)
 
 	res, err := Run(context.Background(), f.invocation())
 	testassert.NoError(t, err)
-	testassert.Require(t, res.Status == TerminalFailure && res.Detail == "agent exceeded 25 model effects" && res.LastOutput == callsOut, "terminal = %s/%q, want cap failure; got %v, want %v", res.Status, res.Detail, res.LastOutput, callsOut)
-	testassert.Require(t, f.toolCalls == 3 && f.modelCalls == maxModelEffects && f.sourceCalls == maxModelEffects, "tool=%d model=%d source=%d, want 3/25/25 — the batch settles before the cap ends the run", f.toolCalls, f.modelCalls, f.sourceCalls)
+	testassert.Require(t, res.Status == TerminalSuccess && res.LastOutput == final, "terminal = %s/%q, want success with final text", res.Status, res.Detail)
+	testassert.Require(t, f.toolCalls == 90 && f.modelCalls == 31 && f.sourceCalls == 31, "tool=%d model=%d source=%d, want 90/31/31", f.toolCalls, f.modelCalls, f.sourceCalls)
+	for i, call := range f.calls {
+		testassert.Equal(t, call.ID, callsOut.Message.ToolCalls[i%3].ID)
+	}
 }
 
-// TestRunToolEffectsDoNotConsumeModelCap pins that tool calls beyond the numeric model cap are irrelevant to it: one batch of 30 calls followed by a final text response still succeeds.
-func TestRunToolEffectsDoNotConsumeModelCap(t *testing.T) {
+// TestRunLargeToolBatchSucceeds pins that every call in a large batch settles.
+func TestRunLargeToolBatchSucceeds(t *testing.T) {
 	f := &runFakes{}
-	bigOut := mkOutput(model.OutputCompleted, "", callArgs(maxModelEffects+5, json.RawMessage(`{}`)))
+	bigOut := mkOutput(model.OutputCompleted, "", callArgs(30, json.RawMessage(`{}`)))
 	f.modelSet = readyOutputs(bigOut, mkOutput(model.OutputCompleted, "", nil))
 
 	res, err := Run(context.Background(), f.invocation())
 	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
-	testassert.Require(t, f.toolCalls == maxModelEffects+5 && f.modelCalls == 2, "tool=%d model=%d, want 30/2", f.toolCalls, f.modelCalls)
+	testassert.Require(t, f.toolCalls == 30 && f.modelCalls == 2, "tool=%d model=%d, want 30/2", f.toolCalls, f.modelCalls)
 }

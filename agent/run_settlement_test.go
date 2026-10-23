@@ -130,8 +130,8 @@ func TestRunDetailMismatchDispositionsRejectedThroughRun(t *testing.T) {
 func TestRunInfraErrorAfterPriorContinuationVerbatim(t *testing.T) {
 	f := &runFakes{}
 	f.modelSet = func(call int, req model.Request, cb AssemblyCallback) (ModelSettlement, error) {
-		if call == 1 {
-			return erroredContinue(1), nil
+		if call <= 30 {
+			return erroredContinue(call), nil
 		}
 		return ModelSettlement{}, errInfra
 	}
@@ -139,7 +139,7 @@ func TestRunInfraErrorAfterPriorContinuationVerbatim(t *testing.T) {
 	res, err := Run(context.Background(), f.invocation())
 	requireZeroTerminal(t, res)
 	testassert.Require(t, errors.Is(err, errInfra), "error = %v, want the infrastructure error verbatim", err)
-	testassert.Require(t, f.modelCalls == 2 && f.sourceCalls == 2 && f.toolCalls == 0, "model=%d source=%d tool=%d, want 2/2/0", f.modelCalls, f.sourceCalls, f.toolCalls)
+	testassert.Require(t, f.modelCalls == 31 && f.sourceCalls == 31 && f.toolCalls == 0, "model=%d source=%d tool=%d, want 31/31/0", f.modelCalls, f.sourceCalls, f.toolCalls)
 }
 
 // TestDuplicateCallIDSharedValidator pins the one identity rule under both shared validators: a completed output whose tool calls repeat an ID is rejected naming the "model" boundary from the settlement validator and the "agent" boundary from the terminal validator, while distinct IDs pass both — the nearest allowed sibling.

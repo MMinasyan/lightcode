@@ -2155,26 +2155,25 @@ func TestExecuteBetweenEffectCancellationSettlesInterruption(t *testing.T) {
 	}
 }
 
-// TestExecuteCapSettlesFailure proves the model-effect cap exhausts through
-// the outer path: the Operation settles failure with the Agent's cap detail
-// after the last settled continuation.
-func TestExecuteCapSettlesFailure(t *testing.T) {
+// TestExecutePast25ModelEffectsSettlesSuccessAndDrainsSteering proves a long
+// Operation commits its continuations, then succeeds and drains buffered input.
+func TestExecutePast25ModelEffectsSettlesSuccessAndDrainsSteering(t *testing.T) {
 	var (
 		mu        sync.Mutex
 		modelRuns int
-		arrived25 = make(chan struct{})
-		gate25    = make(chan struct{})
+		arrived30 = make(chan struct{})
+		gate30    = make(chan struct{})
 	)
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		mu.Lock()
 		modelRuns++
 		n := modelRuns
 		mu.Unlock()
-		if n == 25 { // pending steering arrives at the last effect, before the cap check
-			close(arrived25)
-			<-gate25
+		if n == 30 {
+			close(arrived30)
+			<-gate30
 		}
-		if n > 25 {
+		if n > 30 {
 			return completedTurnStream(), nil // the drained successor's own turn
 		}
 		return erroredTurnStream(), nil
@@ -2184,19 +2183,19 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 	})
 	done := make(chan error, 1)
 	go func() { done <- executeDirect(h, c, h.ctx, testOpID, prepared) }()
-	receiveBounded(t, arrived25, "the 25th model effect")
+	receiveBounded(t, arrived30, "the 30th model effect")
 	{
 		_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "s1")
 		testassert.NoError(t, err)
 	}
-	close(gate25)
+	close(gate30)
 	{
 		err := <-done
 		testassert.NoError(t, err)
 	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent exceeded 25 model effects", "operation state = %+v, want terminal failure at the cap", rec.State)
+	testassert.Require(t, rec.State.Status == OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.Detail == "", "operation state = %+v, want terminal success without a synthetic failure", rec.State)
 	awaitOperationTerminal(t, store, sessionID, "op-2", OperationSuccess) // the pending head drains as its own Operation
 	awaitHarnessQuiet(t, h, sessionID)
 	graph, err := validateFixture(t, store, sessionID)
@@ -2210,7 +2209,7 @@ func TestExecuteCapSettlesFailure(t *testing.T) {
 			signals++
 		}
 	}
-	testassert.Require(t, assistants == 25 && signals == 25, "%d assistants and %d signals committed, want 25 of each", assistants, signals)
+	testassert.Require(t, assistants == 30 && signals == 30, "%d assistants and %d signals committed, want 30 of each", assistants, signals)
 	{
 		owner, _ := steeringInputOwner(t, store, sessionID, "s1")
 		testassert.Equal(t, owner, "op-2")
