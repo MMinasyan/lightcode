@@ -8,16 +8,10 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// maxModelEffects is the fixed cap on logical model-effect invocations per run; tool effects never consume it.
-const maxModelEffects = 25
+// Agent-observed run-context cancellation and interrupted tool results share this detail.
+const detailInterrupted = "agent interrupted"
 
-// The two contract-fixed terminal details: Agent-observed run-context cancellation and interrupted tool results interrupt under detailInterrupted, and model-effect cap exhaustion fails under detailCap. Every other diagnostic wording stays free.
-const (
-	detailInterrupted = "agent interrupted"
-	detailCap         = "agent exceeded 25 model effects"
-)
-
-// Run performs one caller-driven Agent invocation over the three supplied boundaries: it validates every entry value before anything runs, then repeatedly obtains a fresh context snapshot, invokes one counted model effect under per-effect callback discipline (expected identity before assembly, exactly one accepted callback behind every settled output and none behind an outputless settlement, with any callback failure remembered and never ignorable), and dispatches the resulting tool batch sequentially in assembled order until a terminal result settles. One cancellation invariant governs the whole loop: the run context is checked before every caller effect starts, observed cancellation returns an interruption that never discards an already-settled authoritative value, and a non-nil caller error comes back verbatim with no terminal result (a cancellation-shaped error out of an active effect is instead a boundary-protocol violation, because active effects settle cancellation through their settlement). Agent retains no state after the invocation returns and owns no retry, persistence, events, signals, adaptation, tool-lookup, or history behavior.
+// Run performs one caller-driven Agent invocation over the three supplied boundaries: it validates every entry value before anything runs, then repeatedly obtains a fresh context snapshot, invokes one model effect under per-effect callback discipline (expected identity before assembly, exactly one accepted callback behind every settled output and none behind an outputless settlement, with any callback failure remembered and never ignorable), and dispatches the resulting tool batch sequentially in assembled order until a terminal result settles. One cancellation invariant governs the whole loop: the run context is checked before every caller effect starts, observed cancellation returns an interruption that never discards an already-settled authoritative value, and a non-nil caller error comes back verbatim with no terminal result (a cancellation-shaped error out of an active effect is instead a boundary-protocol violation, because active effects settle cancellation through their settlement). Agent retains no state after the invocation returns and owns no retry, persistence, events, signals, adaptation, tool-lookup, or history behavior.
 func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 	if ctx == nil { // rejected outright: a nil run context is never normalized to any other context.
 		return TerminalResult{}, newBoundaryViolation("agent", "run requires a non-nil run context")
@@ -34,14 +28,10 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 	}
 
 	var lastSettled *model.Output // the most recent authoritative model settlement; only a completed one may be carried by a later interruption.
-	effects := 0                  // logical model effects already run, counted against the fixed cap.
 
 	for {
-		if ctx.Err() != nil { // cancellation dominates every other loop-top outcome, the cap included.
+		if ctx.Err() != nil {
 			return retainedInterruption(lastSettled, nil)
-		}
-		if effects == maxModelEffects { // a settlement would otherwise continue: fail before a 26th request is ever constructed.
-			return finishTerminal(TerminalResult{Status: TerminalFailure, LastOutput: lastSettled, Detail: detailCap})
 		}
 
 		msgs, err := inv.Context(ctx)
@@ -66,7 +56,6 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 		}
 		cb := &callbackProtocol{ctx: ctx, expected: inv.ExpectedModel} // one observation scope per logical model effect; its callback closes over the run context so no caller can substitute another cancellation channel.
 		set, err := inv.ModelEffect(ctx, req, cb.assemble)
-		effects++
 		if err != nil {
 			if isCancellation(err) { // an active model effect settles cancellation through an interruption disposition, never through a Go error.
 				return TerminalResult{}, newBoundaryViolation("model", "model effect reported cancellation as an error instead of an interruption settlement")

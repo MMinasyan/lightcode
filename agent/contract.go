@@ -3,7 +3,7 @@
 // later Harness layer supplies plain functions for context, model effects, and
 // tool effects; this package owns turning an accepted model.Stream into exactly
 // one finalized model.Output, sequencing those caller boundaries under one
-// cancellation invariant and a fixed model-effect cap, and validating what those
+// cancellation invariant, and validating what those
 // caller boundaries return. It imports only the standard library and
 // lightcode/model; transport, retry policy, persistence, events, and adaptation
 // all belong to layers above these contracts.
