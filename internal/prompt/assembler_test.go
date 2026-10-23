@@ -150,16 +150,11 @@ func TestAssembledBaselinePromptDoesNotAdvertiseMemoryTools(t *testing.T) {
 	}
 }
 
-func TestReadRulesFilePrefersAgentsThenClaude(t *testing.T) {
+func TestReadRulesFileAgentsOnly(t *testing.T) {
 	dir := t.TempDir()
 	{
 		got, err := readRulesFile(dir)
 		testassert.Require(t, err == nil && got == "", "empty readRulesFile = %q, %v", got, err)
-	}
-	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("claude"), 0o600))
-	{
-		got, err := readRulesFile(dir)
-		testassert.Require(t, err == nil && got == "claude", "CLAUDE readRulesFile = %q, %v", got, err)
 	}
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("agents"), 0o600))
 	{
