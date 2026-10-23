@@ -1,6 +1,6 @@
 ## Rules File Guide
 
-AGENTS.md is always present in your context (if AGENTS.md is missing, CLAUDE.md is used instead). It is where project-specific knowledge lives.
+AGENTS.md is where project-specific knowledge lives. Its contents are included in your context when the file is present.
 
 What belongs in it:
 

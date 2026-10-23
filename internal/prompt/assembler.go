@@ -280,17 +280,12 @@ func osDescription() string {
 }
 
 func readRulesFile(dir string) (string, error) {
-	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
-		path := filepath.Join(dir, name)
-		data, err := os.ReadFile(path)
-		if err == nil {
-			return string(data), nil
-		}
-		if !os.IsNotExist(err) {
-			return "", fmt.Errorf("read %s: %w", path, err)
-		}
+	path := filepath.Join(dir, "AGENTS.md")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("read %s: %w", path, err)
 	}
-	return "", nil
+	return string(data), nil
 }
 
 func detectOverrides(rulesContent string) map[string]bool {
