@@ -8,6 +8,9 @@
 // Messages have no general JSON wire or persistence contract: provider wire
 // encoding is produced by the OpenAI-compatible encoder in this package's
 // transport layer, not by these values.
+//
+// This package's Transport composed with the agent package's Run loop and
+// ordinary adapters is the independently usable engine surface (melta-engine).
 package model
 
 import (

@@ -1,12 +1,15 @@
 // Package agent defines the caller-driven model/tool effect contracts of the
-// fixed Lightcode Agent, its one stream assembler, and its execution loop. A
-// later Harness layer supplies plain functions for requests, model effects, and
-// tool effects; this package owns turning an accepted model.Stream into exactly
-// one finalized model.Output, sequencing those caller boundaries under one
-// cancellation invariant, and validating what those
-// caller boundaries return. It imports only the standard library and
-// lightcode/model; transport, retry policy, persistence, events, and adaptation
-// all belong to layers above these contracts.
+// fixed Lightcode Agent, its one stream assembler, its execution loop, and the
+// ordinary standalone adapters — AdaptModelEffect over a model.Transport and
+// AdaptTools over a registered tool map — that make the model client plus loop
+// independently usable on their own (the melta-engine surface) without private
+// wiring. A later Harness layer supplies its own durable request, model-effect,
+// and tool-effect functions instead of these adapters; this package owns turning
+// an accepted model.Stream into exactly one finalized model.Output, sequencing
+// those caller boundaries under one cancellation invariant, validating what
+// those caller boundaries return, and the adapters' lookup and settlement
+// mapping. Retry policy, persistence, and events belong to layers above these
+// contracts. It imports only the standard library and lightcode/model.
 package agent
 
 import (
