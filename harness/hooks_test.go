@@ -142,7 +142,7 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 	publishHookCalls(t, h, c, exec, model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(` {"x": 1} `)})
 
 	te := h.toolEffect(c, testOpID, exec, testCapture())
-	got, err := te(context.Background(), testToolCall("call-1"))
+	got, err := te(context.Background(), testToolCall("call-1"), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"}))
 	// Callback counts: one normalization for the valid original at the
@@ -182,7 +182,7 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
 	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 0, "operation state = %+v, want a quiet running Operation with the call settled", rec.State)
-	messages, err := h.contextSource(c, testOpID)(context.Background())
+	messages, err := fixtureProjection(h, c)(context.Background())
 	testassert.NoError(t, err)
 	for _, msg := range messages {
 		for _, part := range msg.Content {
@@ -207,7 +207,7 @@ func TestToolArgumentHookInterruptionRules(t *testing.T) {
 			return nil, ctx.Err()
 		}}
 		exec.ToolHooks = []ToolArgumentsHook{hook}
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}))
 		committed := hookGraphHookResults(t, store, sessionID)
@@ -240,7 +240,7 @@ func TestToolArgumentHookInterruptionRules(t *testing.T) {
 			return nil
 		}
 		baselineReplaces = replaces
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, ran, 0)
 		testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}))
@@ -268,7 +268,7 @@ func TestToolArgumentHookInterruptionRules(t *testing.T) {
 				return json.RawMessage(`{}`), nil
 			}},
 		}
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultInterrupted, Content: interruptedToolResultContent}))
 		testassert.Equal(t, secondRan, 0)
@@ -287,7 +287,7 @@ func TestToolArgumentHookInterruptionRules(t *testing.T) {
 		exec := Execution{Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: []ToolArgumentsHook{hook}}
 		h, store, c, sessionID := newHookHarness(t, exec)
 		publishHookCalls(t, h, c, exec, testToolCall("call-1"))
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, got.Status == model.ResultError && got.Content == "context canceled", "tool result = %+v, want the validation error with the hook's diagnostic", got)
 		committed := hookGraphHookResults(t, store, sessionID)
@@ -308,7 +308,7 @@ func TestToolArgumentHookInterruptionRules(t *testing.T) {
 			return json.RawMessage(`{"fixed":true}`), nil
 		}}
 		exec.ToolHooks = []ToolArgumentsHook{hook}
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(ctx, testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		// The successful replacement committed as a real result; the
 		// interruption appears at the next boundary (the tool intent).
@@ -404,7 +404,7 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 			h, store, c, sessionID := newHookHarness(t, exec)
 			publishHookCalls(t, h, c, exec, testToolCall("call-1"), testToolCall("call-2"))
 
-			got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+			got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 			testassert.NoError(t, err)
 			testassert.Equal(t, got, tc.want)
 			testassert.Equal(t, later, 0)
@@ -412,7 +412,7 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 			testassert.Require(t, len(committed) == 1 && committed[0].Status == tc.wantStatus && committed[0].HookID == "cap.hook.one" && len(committed[0].Arguments) == 0 && committed[0].Error != "", "hook results = %+v, want one %s result with a non-empty diagnostic", committed, tc.wantStatus)
 			testassert.Require(t, tc.wantError == "" || committed[0].Error == tc.wantError, "hook result error = %q, want %q", committed[0].Error, tc.wantError)
 			// Later calls still run: call-2 executes after the failed chain.
-			got, err = h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-2"))
+			got, err = h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-2"), nil)
 			testassert.NoError(t, err)
 			testassert.Require(t, got.Status == model.ResultSuccess, "later call result = %+v, want success", got)
 			prepareCalls := spy.received()
@@ -464,7 +464,7 @@ func TestToolArgumentHookFailedResultCommitLeavesRecovery(t *testing.T) {
 		return nil
 	}
 	{
-		_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.Require(t, errors.Is(err, ErrStorage), "tool effect = %v, want the injected storage failure", err)
 	}
 	mu.Lock()
@@ -543,7 +543,7 @@ func TestToolArgumentHookDenialSettlesAfterHooks(t *testing.T) {
 		})
 		h, store, c, sessionID := newHookHarness(t, exec)
 		publishHookCalls(t, h, c, exec, testToolCall("call-1"))
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultDenied, Content: PermissionDeniedContent}))
 		testassert.Equal(t, executed, 0)
@@ -556,7 +556,7 @@ func TestToolArgumentHookDenialSettlesAfterHooks(t *testing.T) {
 		exec := buildExec(spy.tool)
 		h, _, c, _ := newHookHarness(t, exec)
 		publishHookCalls(t, h, c, exec, testToolCall("call-1"))
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, got.Status == model.ResultSuccess, "tool result = %+v, want success", got)
 		prepared := spy.received()
@@ -566,21 +566,37 @@ func TestToolArgumentHookDenialSettlesAfterHooks(t *testing.T) {
 
 // TestToolArgumentHookAdvertisementGate proves the one advertisement gate
 // precedes every hook: a committed call whose tool name is outside the
-// advertised set settles the unavailable-tool error and never runs a hook.
+// producing request's advertised set settles the unavailable-tool error and
+// never runs a hook — neither a later capture advertising that name nor a
+// forged names argument grants the committed call retroactive authority.
 func TestToolArgumentHookAdvertisementGate(t *testing.T) {
 	ran := 0
 	hook := ToolArgumentsHook{ID: "cap.hook.one", Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
 		ran++
 		return json.RawMessage(`{}`), nil
 	}}
-	exec := Execution{Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: []ToolArgumentsHook{hook}}
+	prepared := 0
+	exec := Execution{Tool: func(context.Context, model.ToolCall) PreparedTool { prepared++; return PreparedTool{} }, NormalizeTool: objectNormalize, ToolHooks: []ToolArgumentsHook{hook}}
 	h, store, c, sessionID := newHookHarness(t, exec)
-	publishHookCalls(t, h, c, exec, model.ToolCall{ID: "call-1", Name: "ghost", Arguments: json.RawMessage(`{}`)})
+	publishHookCalls(t, h, c, exec,
+		model.ToolCall{ID: "call-1", Name: "ghost", Arguments: json.RawMessage(`{}`)},
+		model.ToolCall{ID: "call-2", Name: "ghost", Arguments: json.RawMessage(`{}`)},
+	)
 
-	got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), model.ToolCall{ID: "call-1", Name: "ghost"})
+	got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), model.ToolCall{ID: "call-1", Name: "ghost"}, nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, got, (model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: `Tool "ghost" is not available.`}))
 	testassert.Equal(t, ran, 0)
+	testassert.Equal(t, prepared, 0)
+	{
+		ghostCapture := testCapture()
+		ghostCapture.Tools = append(ghostCapture.Tools, model.ToolDefinition{Name: "ghost", Description: "ghost tool", Parameters: json.RawMessage(`{"type":"object"}`)})
+		got, err := h.toolEffect(c, testOpID, exec, ghostCapture)(context.Background(), model.ToolCall{ID: "call-2", Name: "ghost"}, []string{"ghost"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.CallID == "call-2" && got.Status == model.ResultError && got.Content == `Tool "ghost" is not available.`, "gate under a retroactive capture and forged names = %+v, want the ordinary unavailable-tool error", got)
+	}
+	testassert.Equal(t, ran, 0)
+	testassert.Equal(t, prepared, 0)
 	{
 		got := hookGraphHookResults(t, store, sessionID)
 		testassert.Require(t, len(got) == 0, "hook results = %+v, want none", got)
@@ -654,7 +670,7 @@ func TestToolArgumentHookIntentFailureLeavesRecovery(t *testing.T) {
 		return nil
 	}
 	{
-		_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.Require(t, errors.Is(err, ErrStorage), "tool effect = %v, want the injected storage failure", err)
 	}
 	testassert.Equal(t, ran, 0)

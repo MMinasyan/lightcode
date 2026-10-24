@@ -446,7 +446,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 
 	t.Run("running model effect", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), RequestID: hexID(99)}
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.Operations[0].State.ActiveEffect != nil && view.Operations[0].State.ActiveEffect.Kind == EffectModel, "typed view lost the active model effect")
@@ -668,6 +668,15 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			raw, err := encodeInputEntry(*fixture.entries[0].input)
 			testassert.NoError(t, err)
 			fixture.entries[0].rawOverride = setKey(raw, "bogus", json.RawMessage(`1`))
+		}},
+		{"assistant payload without its request id", func(t *testing.T, fixture *testGraph) {
+			raw, err := encodeAssistantEntry(*fixture.entries[1].assistant)
+			testassert.NoError(t, err)
+			obj := wireObject(t, raw)
+			delete(obj, "request_id")
+			patched, err := json.Marshal(obj)
+			testassert.NoError(t, err)
+			fixture.entries[1].rawOverride = patched
 		}},
 		{"corrupt session register payload", func(t *testing.T, fixture *testGraph) {
 			raw, err := encodeSessionRegister(fixture.session)
@@ -1044,7 +1053,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			}
 		}},
 		{"model effect reserves a committed entry", func(t *testing.T, fixture *testGraph) {
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(1)}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(1), RequestID: hexID(99)}
 		}},
 		{"model effect reserves a tool call reservation", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
@@ -1058,7 +1067,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), RequestID: hexID(99)}
 		}},
 		{"terminal op carries a second settlement entry", func(t *testing.T, fixture *testGraph) {
 			fixture.session.State.CurrentOperationID = ""

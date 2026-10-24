@@ -260,8 +260,8 @@ func compactRawOperationRegister(admission, state string) string {
 
 func compactRawRunningModelState(now, reserved string) string {
 	return fmt.Sprintf(
-		`{"status":"running","started_at":%q,"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}`,
-		now, reserved)
+		`{"status":"running","started_at":%q,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"req-%s"},"pending_tool_calls":[],"usage":{"by_model":[]}}`,
+		now, reserved, reserved)
 }
 
 func compactRawSuccessState(now, settlementEntry, sessionID, usage string) string {
@@ -278,9 +278,9 @@ func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) 
 
 func compactRawAssistantEntry(sessionID, entryID, operationID, text string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"request_id":"req-%s","status":"completed",`+
 			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
-		sessionID, entryID, operationID, text)
+		sessionID, entryID, operationID, operationID, text)
 }
 
 func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) string {

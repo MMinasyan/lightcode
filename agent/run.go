@@ -11,7 +11,7 @@ import (
 // Agent-observed run-context cancellation and interrupted tool results share this detail.
 const detailInterrupted = "agent interrupted"
 
-// Run performs one caller-driven Agent invocation over the three supplied boundaries: it validates every entry value before anything runs, then repeatedly obtains a fresh context snapshot, invokes one model effect under per-effect callback discipline (expected identity before assembly, exactly one accepted callback behind every settled output and none behind an outputless settlement, with any callback failure remembered and never ignorable), and dispatches the resulting tool batch sequentially in assembled order until a terminal result settles. One cancellation invariant governs the whole loop: the run context is checked before every caller effect starts, observed cancellation returns an interruption that never discards an already-settled authoritative value, and a non-nil caller error comes back verbatim with no terminal result (a cancellation-shaped error out of an active effect is instead a boundary-protocol violation, because active effects settle cancellation through their settlement). Agent retains no state after the invocation returns and owns no retry, persistence, events, signals, adaptation, tool-lookup, or history behavior.
+// Run performs one caller-driven Agent invocation over the three supplied boundaries: it validates every entry value before anything runs, then repeatedly obtains a fresh request from the caller's request source, validates and owns it, extracts the request's advertised tool names before handing the owned request to one model effect under per-effect callback discipline (expected identity before assembly, exactly one accepted callback behind every settled output and none behind an outputless settlement, with any callback failure remembered and never ignorable), and dispatches the resulting tool batch sequentially in assembled order against that request's names until a terminal result settles. One cancellation invariant governs the whole loop: the run context is checked before every caller effect starts, observed cancellation returns an interruption that never discards an already-settled authoritative value, and a non-nil caller error comes back verbatim with no terminal result (a cancellation-shaped error out of an active effect is instead a boundary-protocol violation, because active effects settle cancellation through their settlement). Agent retains no state after the invocation returns and owns no retry, persistence, events, signals, adaptation, tool-lookup, or history behavior.
 func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 	if ctx == nil { // rejected outright: a nil run context is never normalized to any other context.
 		return TerminalResult{}, newBoundaryViolation("agent", "run requires a non-nil run context")
@@ -19,12 +19,8 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 	if !nonzeroSource(inv.ExpectedModel) {
 		return TerminalResult{}, newBoundaryViolation("agent", "run requires a nonzero expected model identity")
 	}
-	if inv.Context == nil || inv.ModelEffect == nil || inv.ToolEffect == nil {
-		return TerminalResult{}, newBoundaryViolation("agent", "run requires non-nil context, model and tool effect functions")
-	}
-	advertised, err := model.NewRequest(model.Request{Tools: inv.Tools}) // non-empty unique names and object-shaped schemas are exactly what the landed request constructor enforces; its owned deep copy is the immutable advertised list for every later request.
-	if err != nil {
-		return TerminalResult{}, fmt.Errorf("%w: %v", newBoundaryViolation("agent", "advertised tools are invalid"), err)
+	if inv.Request == nil || inv.ModelEffect == nil || inv.ToolEffect == nil {
+		return TerminalResult{}, newBoundaryViolation("agent", "run requires non-nil request, model and tool effect functions")
 	}
 
 	var lastSettled *model.Output // the most recent authoritative model settlement; only a completed one may be carried by a later interruption.
@@ -34,28 +30,27 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 			return retainedInterruption(lastSettled, nil)
 		}
 
-		msgs, err := inv.Context(ctx)
+		req, err := inv.Request(ctx)
 		if err != nil {
 			if isCancellation(err) && ctx.Err() != nil { // a cancellation report maps to interruption only under a genuinely done run context.
 				return retainedInterruption(lastSettled, nil)
 			}
 			return TerminalResult{}, err // any other non-nil source error is infrastructure and wins over concurrent cancellation: returned with no terminal result.
 		}
-		req, err := model.NewRequest(model.Request{Messages: msgs}) // fresh context messages validate and own at this trust boundary; the advertised tools were entry-validated once and attach below without repeating schema validation.
+		owned, err := model.NewRequest(req) // one validation point per round covering the supplied messages and tools; the owned deep copy is independent of everything the source retains.
 		if err != nil {
-			return TerminalResult{}, fmt.Errorf("%w: %v", newBoundaryViolation("agent", "context snapshot is invalid"), err)
+			return TerminalResult{}, fmt.Errorf("%w: %v", newBoundaryViolation("agent", "request is invalid"), err)
 		}
-		req.Tools = make([]model.ToolDefinition, len(advertised.Tools)) // one fresh deep copy of the entry-validated tool list per request: model-effect callbacks never gain an alias to the immutable advertised baseline, so their mutations cannot reach later requests or the invocation input.
-		for i, def := range advertised.Tools {
-			def.Parameters = model.CloneRaw(def.Parameters)
-			req.Tools[i] = def
+		names := make([]string, len(owned.Tools)) // the round's advertised names, copied out of the owned request before the model effect may mutate it.
+		for i, def := range owned.Tools {
+			names[i] = def.Name
 		}
 
 		if ctx.Err() != nil {
 			return retainedInterruption(lastSettled, nil)
 		}
 		cb := &callbackProtocol{ctx: ctx, expected: inv.ExpectedModel} // one observation scope per logical model effect; its callback closes over the run context so no caller can substitute another cancellation channel.
-		set, err := inv.ModelEffect(ctx, req, cb.assemble)
+		set, err := inv.ModelEffect(ctx, owned, cb.assemble)
 		if err != nil {
 			if isCancellation(err) { // an active model effect settles cancellation through an interruption disposition, never through a Go error.
 				return TerminalResult{}, newBoundaryViolation("model", "model effect reported cancellation as an error instead of an interruption settlement")
@@ -96,7 +91,9 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 			if ctx.Err() != nil { // no later effect starts: this call and everything after it remain unstarted.
 				return interruptionTerminal(detailInterrupted, set.Output, calls[i:])
 			}
-			res, err := inv.ToolEffect(ctx, call)
+			call.Arguments = model.CloneRaw(call.Arguments) // the tool boundary receives owned containers cloned from the retained settled output, so its mutations cannot rewrite it.
+			call.Extra = call.Extra.Clone()
+			res, err := inv.ToolEffect(ctx, call, names)
 			if err != nil {
 				if isCancellation(err) { // an active tool effect settles cancellation through an interrupted result, never through a Go error.
 					return TerminalResult{}, newBoundaryViolation("tool", "tool effect reported cancellation as an error instead of an interrupted result")

@@ -36,7 +36,7 @@ data: [DONE]
 
 `
 
-// TestFoundationCompositionOverRealTransport composes the two public packages exactly as a future caller will own them, from outside both packages and with no production adapter or test-only production API: a real model.Transport speaking to an httptest OpenAI-compatible SSE server, the normal Agent assembly callback invoked from inside a test model effect, a fake tool effect, a context source whose snapshot changes between the two model requests, and the complete Agent run loop over one tool round and a final text response.
+// TestFoundationCompositionOverRealTransport composes the two public packages exactly as a future caller will own them, from outside both packages and with no production adapter or test-only production API: a real model.Transport speaking to an httptest OpenAI-compatible SSE server, the normal Agent assembly callback invoked from inside a test model effect, a fake tool effect, a request source whose snapshot changes between the two model requests, and the complete Agent run loop over one tool round and a final text response.
 func TestFoundationCompositionOverRealTransport(t *testing.T) {
 	ref := model.ModelRef{Provider: "acme", Model: "m-1"}
 
@@ -71,15 +71,16 @@ func TestFoundationCompositionOverRealTransport(t *testing.T) {
 			ToolCallID: "call-1",
 			Content:    []model.ContentPart{{Kind: model.PartText, Text: "echoed"}},
 		}))
-	snapshots := [][]model.Message{base, roundTrip}
+	requests := [][]model.Message{base, roundTrip}
+	advertised := []model.ToolDefinition{{Name: "echo", Description: "echo its argument", Parameters: json.RawMessage(`{"type":"object"}`)}}
 
 	sourceCalls := 0
-	contextSource := func(context.Context) ([]model.Message, error) {
+	requestSource := func(context.Context) (model.Request, error) {
 		sourceCalls++
-		if sourceCalls > len(snapshots) {
-			return nil, fmt.Errorf("context source ran out of snapshots after %d calls", sourceCalls)
+		if sourceCalls > len(requests) {
+			return model.Request{}, fmt.Errorf("request source ran out of snapshots after %d calls", sourceCalls)
 		}
-		return snapshots[sourceCalls-1], nil
+		return model.Request{Messages: requests[sourceCalls-1], Tools: advertised}, nil
 	}
 
 	var reqs []model.Request
@@ -97,15 +98,17 @@ func TestFoundationCompositionOverRealTransport(t *testing.T) {
 	}
 
 	var dispatched []model.ToolCall
-	toolEffect := func(_ context.Context, call model.ToolCall) (model.ToolResult, error) {
+	toolEffect := func(_ context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
 		dispatched = append(dispatched, call)
+		if len(names) != 1 || names[0] != "echo" {
+			return model.ToolResult{}, fmt.Errorf("dispatch names = %v, want the producing request's [echo]", names)
+		}
 		return model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "echoed"}, nil
 	}
 
 	res, err := agent.Run(context.Background(), agent.Invocation{
 		ExpectedModel: ref,
-		Tools:         []model.ToolDefinition{{Name: "echo", Description: "echo its argument", Parameters: json.RawMessage(`{"type":"object"}`)}},
-		Context:       contextSource,
+		Request:       requestSource,
 		ModelEffect:   modelEffect,
 		ToolEffect:    toolEffect,
 	})

@@ -408,13 +408,14 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		SessionID   string                   `json:"session_id"`
 		EntryID     string                   `json:"entry_id"`
 		OperationID string                   `json:"operation_id"`
+		RequestID   string                   `json:"request_id"`
 		Status      string                   `json:"status"`
 		Source      usageWireRef             `json:"source"`
 		Content     json.RawMessage          `json:"content"`
 		ToolCalls   []harness.ToolCallRecord `json:"tool_calls"`
 		Usage       *harness.UsageCount      `json:"usage,omitempty"`
 	}{
-		SessionID: sessionID, EntryID: assistantID, OperationID: operationID,
+		SessionID: sessionID, EntryID: assistantID, OperationID: operationID, RequestID: "req-" + operationID,
 		Status: "completed", Source: usageWireRef{Provider: "prov", Model: "m"},
 		Content:   json.RawMessage(`[{"kind":"text","text":"answer ` + operationID + `"}]`),
 		ToolCalls: []harness.ToolCallRecord{},

@@ -1,6 +1,6 @@
 // Package agent defines the caller-driven model/tool effect contracts of the
 // fixed Lightcode Agent, its one stream assembler, and its execution loop. A
-// later Harness layer supplies plain functions for context, model effects, and
+// later Harness layer supplies plain functions for requests, model effects, and
 // tool effects; this package owns turning an accepted model.Stream into exactly
 // one finalized model.Output, sequencing those caller boundaries under one
 // cancellation invariant, and validating what those
@@ -18,13 +18,18 @@ import (
 )
 
 type (
-	ContextSource func(context.Context) ([]model.Message, error)
+	// RequestSource supplies one complete logical request per Engine round;
+	// the Engine validates it and owns the validated copy from that point on.
+	RequestSource func(context.Context) (model.Request, error)
 
 	AssemblyCallback func(model.ModelRef, model.Stream) (model.Output, error)
 
 	ModelEffect func(context.Context, model.Request, AssemblyCallback) (ModelSettlement, error)
 
-	ToolEffect func(context.Context, model.ToolCall) (model.ToolResult, error)
+	// ToolEffect runs one started call. The names are an owned copy of the
+	// producing request's advertised tool names, independent of the mutable
+	// request handed to the model effect.
+	ToolEffect func(context.Context, model.ToolCall, []string) (model.ToolResult, error)
 )
 
 type ModelDisposition string
@@ -64,11 +69,10 @@ func newBoundaryViolation(boundary, detail string) *ProtocolError {
 }
 
 type Invocation struct {
-	ExpectedModel model.ModelRef         // complete identity every callback-produced source must equal for the whole run.
-	Tools         []model.ToolDefinition // owned immutable advertised tools; names unique, parameters object-shaped as validated at their own accepting boundary.
-	Context       ContextSource          // nil is a protocol violation at invocation entry — never normalized to any other context.
-	ModelEffect   ModelEffect            // exactly one per invocation; its settlements are validated against the closed disposition table before anything proceeds from them.
-	ToolEffect    ToolEffect             // invoked once per started call in assembled order; nil is likewise rejected at entry.
+	ExpectedModel model.ModelRef // complete identity every callback-produced source must equal for the whole run.
+	Request       RequestSource  // supplies one complete request per round; nil is a protocol violation at invocation entry — never normalized to any other request.
+	ModelEffect   ModelEffect    // exactly one per invocation; its settlements are validated against the closed disposition table before anything proceeds from them.
+	ToolEffect    ToolEffect     // invoked once per started call in assembled order, carrying the producing request's advertised names; nil is likewise rejected at entry.
 }
 
 type ModelSettlement struct {

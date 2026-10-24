@@ -401,7 +401,7 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil, "operation state = %+v, want running with the effect cleared", rec.State)
 	// Partial continuation: the next context projection reads the committed
 	// partial from history.
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
+	msgs, err := fixtureProjection(h, c)(context.Background())
 	testassert.NoError(t, err)
 	// system, input, committed partial, continuation signal
 	testassert.Equal(t, len(msgs), 4)

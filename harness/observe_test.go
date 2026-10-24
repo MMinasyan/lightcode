@@ -120,7 +120,7 @@ func TestObserveFactKinds(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	{
-		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"))
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.NoError(t, err)
 	}
 
@@ -733,7 +733,7 @@ func TestObserveIntentOnly(t *testing.T) {
 		go func() {
 			defer close(done)
 			{
-				_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"))
+				_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), nil)
 				testassert.Check(t, err == nil, "tool effect: %v", err)
 			}
 		}()
@@ -1333,7 +1333,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 					cancel()
 					ctx = canceled
 				}
-				got, err := h.toolEffect(c, testOpID, effectExecution(nil, tc.plan), testCapture())(ctx, testToolCall("call-1"))
+				got, err := h.toolEffect(c, testOpID, effectExecution(nil, tc.plan), testCapture())(ctx, testToolCall("call-1"), nil)
 				testassert.NoError(t, err)
 				testassert.Equal(t, got.Status, tc.status)
 				facts := col.snapshot()
@@ -1374,7 +1374,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 		}, usageDelta(model.Usage{InputTokens: 1, OutputTokens: 1}))
 		publishStream(t, h, c, stream)
 		col := observeHarness(h)
-		got, err := h.toolEffect(c, testOpID, effectExecution(nil, nil), testCapture())(context.Background(), testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, effectExecution(nil, nil), testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.Require(t, err == nil && got.Status == model.ResultError, "unavailable tool = %+v err %v, want the error result", got, err)
 		facts := col.snapshot()
 		testassert.Require(t, len(facts) == 3 && facts[0].Kind == FactToolStarted && facts[1].Kind == FactInvalidation && facts[2].Kind == FactToolFinished, "advertisement-gate facts = %+v, want started, the result commit, then finished", facts)
@@ -1387,7 +1387,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		{
-			_, err := h.toolEffect(c, testOpID, effectExecution(nil, successPlan), testCapture())(context.Background(), testToolCall("call-1"))
+			_, err := h.toolEffect(c, testOpID, effectExecution(nil, successPlan), testCapture())(context.Background(), testToolCall("call-1"), nil)
 			testassert.NoError(t, err)
 		}
 		col := observeHarness(h)
@@ -1419,7 +1419,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 			return nil, errors.New("hook boom")
 		}}}
 		col := observeHarness(h)
-		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"))
+		got, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), nil)
 		testassert.Require(t, err == nil && got.Status == model.ResultError, "hook-settled tool = %+v err %v, want the error result", got, err)
 		var started, finished, invalidations int
 		for _, fact := range col.snapshot() {
