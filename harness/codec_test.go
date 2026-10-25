@@ -120,8 +120,6 @@ func validAssistantEntry(operationID string) assistantEntry {
 		SessionID:   testSessionID,
 		EntryID:     testEntryID,
 		OperationID: operationID,
-		RequestID:   hexID(7),
-		Advertised:  []string{"echo"},
 		Status:      model.OutputCompleted,
 		Source:      testModelRef(),
 		Content:     []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
@@ -282,19 +280,9 @@ func TestEntryPayloadRoundTrip(t *testing.T) {
 			encode: func() (json.RawMessage, error) {
 				v := validAssistantEntry(testOpID)
 				v.Usage = testUsage(3)
-				v.Advertised = []string{"echo", "extra"}
 				return encodeAssistantEntry(v)
 			},
-			decode: func(env Entry) error {
-				v, err := decodeAssistantEntry(env)
-				if err != nil {
-					return err
-				}
-				if v.RequestID != hexID(7) || len(v.Advertised) != 2 || v.Advertised[0] != "echo" || v.Advertised[1] != "extra" {
-					return fmt.Errorf("request_id/advertised round-trip lost: %q %v", v.RequestID, v.Advertised)
-				}
-				return nil
-			},
+			decode: func(env Entry) error { _, err := decodeAssistantEntry(env); return err },
 		},
 		{
 			name: "assistant operationless fork copy",
@@ -610,8 +598,7 @@ func TestHookResultStatusRules(t *testing.T) {
 
 // TestHookActiveEffectCodecRules proves the active-effect codec rules: a hook
 // effect requires its hook ID and the matching first pending call, while the
-// model and tool effects forbid a hook ID; the request id rule is closed by
-// kind — a model effect requires one, tool and hook effects forbid it.
+// model and tool effects forbid a hook ID.
 func TestHookActiveEffectCodecRules(t *testing.T) {
 	op := validOperationRecord()
 	assistant := validAssistantEntry(testOpID)
@@ -639,10 +626,7 @@ func TestHookActiveEffectCodecRules(t *testing.T) {
 		{"hook effect without a hook id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1"}, "hook active effect requires its hook id"},
 		{"hook effect without a tool call id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "hook active effect requires its tool call id"},
 		{"hook effect on a non-pending call", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-9", HookID: "cap.hook.one"}, "hook active effect must address the matching first pending call"},
-		{"hook effect with a request id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), RequestID: hexID(8), ToolCallID: "call-1", HookID: "cap.hook.one"}, "hook active effect omits the request id"},
-		{"model effect without a request id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9)}, "model active effect requires its request id"},
-		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), RequestID: hexID(8), HookID: "cap.hook.one"}, "model active effect omits the hook id"},
-		{"tool effect with a request id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, RequestID: hexID(8), ToolCallID: "call-1"}, "tool active effect omits the request id"},
+		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "model active effect omits the hook id"},
 		{"tool effect with a hook id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, ToolCallID: "call-1", HookID: "cap.hook.one"}, "tool active effect omits the hook id"},
 		{"unknown kind", ActiveEffect{Kind: "widget", ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}, `active effect kind "widget" is not one of model, tool or hook`},
 	} {
@@ -724,7 +708,7 @@ func TestOperationStateEncodingShape(t *testing.T) {
 	}
 
 	effect := validOperationRecord()
-	effect.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), RequestID: hexID(8)} // model effect: carries its request id, no tool call id
+	effect.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)} // model effect: no tool call id
 	raw, err = encodeOperationRegister(effect)
 	testassert.NoError(t, err)
 	stateObj, err = objectMember(wireObject(t, raw), "state", true)
@@ -734,10 +718,6 @@ func TestOperationStateEncodingShape(t *testing.T) {
 	{
 		_, present := effectObj["tool_call_id"]
 		testassert.Require(t, !present, "model active effect carries tool_call_id: %s", raw)
-	}
-	{
-		requestID, err := stringMember(effectObj, "request_id", true)
-		testassert.Require(t, err == nil && requestID == hexID(8), "model active effect request_id = %q (%v), want %s", requestID, err, hexID(8))
 	}
 }
 
@@ -1133,24 +1113,6 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 			_, err := encodeAssistantEntry(v)
 			return err
 		}},
-		{"assistant missing request id", func() error {
-			v := validAssistantEntry(testOpID)
-			v.RequestID = ""
-			_, err := encodeAssistantEntry(v)
-			return err
-		}},
-		{"assistant duplicate advertised names", func() error {
-			v := validAssistantEntry(testOpID)
-			v.Advertised = []string{"echo", "echo"}
-			_, err := encodeAssistantEntry(v)
-			return err
-		}},
-		{"assistant empty advertised name", func() error {
-			v := validAssistantEntry(testOpID)
-			v.Advertised = []string{""}
-			_, err := encodeAssistantEntry(v)
-			return err
-		}},
 		{"tool result denied without content", func() error {
 			v := validToolResultEntry(testOpID)
 			v.Status = model.ResultDenied
@@ -1244,7 +1206,7 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 		}},
 		{"operation model effect with call id", func() error {
 			v := validOperationRecord()
-			v.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), RequestID: hexID(8), ToolCallID: "call-1"}
+			v.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), ToolCallID: "call-1"}
 			_, err := encodeOperationRegister(v)
 			return err
 		}},

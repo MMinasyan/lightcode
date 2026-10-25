@@ -340,8 +340,6 @@ func encodeAssistantEntry(v assistantEntry) (json.RawMessage, error) {
 		SessionID   string            `json:"session_id"`
 		EntryID     string            `json:"entry_id"`
 		OperationID string            `json:"operation_id,omitempty"`
-		RequestID   string            `json:"request_id"`
-		Advertised  []string          `json:"advertised,omitempty"`
 		Status      string            `json:"status"`
 		Source      json.RawMessage   `json:"source"`
 		Content     []json.RawMessage `json:"content"`
@@ -353,8 +351,6 @@ func encodeAssistantEntry(v assistantEntry) (json.RawMessage, error) {
 		SessionID:   v.SessionID,
 		EntryID:     v.EntryID,
 		OperationID: v.OperationID,
-		RequestID:   v.RequestID,
-		Advertised:  v.Advertised,
 		Status:      string(v.Status),
 		Source:      source,
 		Content:     content,
@@ -380,7 +376,7 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 	if err != nil {
 		return assistantEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "request_id", "advertised", "status", "source", "content", "refusal", "extra", "tool_calls", "usage"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "status", "source", "content", "refusal", "extra", "tool_calls", "usage"); err != nil {
 		return assistantEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -392,10 +388,6 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 		return assistantEntry{}, err
 	}
 	operationID, err := optionalNonEmptyString(obj, "operation_id")
-	if err != nil {
-		return assistantEntry{}, err
-	}
-	requestID, err := stringMember(obj, "request_id", true)
 	if err != nil {
 		return assistantEntry{}, err
 	}
@@ -452,25 +444,11 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 		SessionID:   sessionID,
 		EntryID:     entryID,
 		OperationID: operationID,
-		RequestID:   requestID,
 		Status:      model.OutputStatus(status),
 		Source:      source,
 		Refusal:     refusal,
 		Extra:       extra,
 		Usage:       usage,
-	}
-	if _, present := obj["advertised"]; present {
-		advertisedRaw, err := arrayMember(obj, "advertised", true)
-		if err != nil {
-			return assistantEntry{}, err
-		}
-		for i, raw := range advertisedRaw {
-			var name string
-			if err := json.Unmarshal(raw, &name); err != nil {
-				return assistantEntry{}, fmt.Errorf("advertised[%d]: must be a JSON string: %w", i, err)
-			}
-			v.Advertised = append(v.Advertised, name)
-		}
 	}
 	for i, raw := range contentRaw {
 		part, err := decodeContentPart(raw)
@@ -496,10 +474,9 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 }
 
 // validateAssistantEntry enforces the closed assistant-entry shape: closed
-// output status, complete source identity, the producing request's non-empty
-// identity with unique non-empty advertised tool names, unique tool calls with
-// zero-based ordinals and unique reserved results, no calls on errored or
-// interrupted output, and an eligible model-visible payload.
+// output status, complete source identity, unique tool calls with zero-based
+// ordinals and unique reserved results, no calls on errored or interrupted
+// output, and an eligible model-visible payload.
 func validateAssistantEntry(v assistantEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -513,19 +490,6 @@ func validateAssistantEntry(v assistantEntry) error {
 		}
 	} else if v.Usage != nil {
 		return errors.New("independently copied fork-prefix assistant entry carries no source usage")
-	}
-	if v.RequestID == "" {
-		return errors.New("assistant entry requires its producing request id")
-	}
-	seenAdvertised := make(map[string]bool, len(v.Advertised))
-	for i, name := range v.Advertised {
-		if name == "" {
-			return fmt.Errorf("advertised[%d]: tool name must be non-empty", i)
-		}
-		if seenAdvertised[name] {
-			return fmt.Errorf("advertised[%d]: tool name %q is not unique", i, name)
-		}
-		seenAdvertised[name] = true
 	}
 	if !validOutputStatus(v.Status) {
 		return fmt.Errorf("assistant status %q is not one of completed, errored or interrupted", v.Status)
@@ -2324,7 +2288,7 @@ func decodeOperationState(obj map[string]json.RawMessage) (OperationCurrentState
 
 // decodeActiveEffect reads one active effect with exact keys.
 func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
-	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "request_id", "tool_call_id", "hook_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id", "hook_id"); err != nil {
 		return ActiveEffect{}, err
 	}
 	kind, err := stringMember(obj, "kind", true)
@@ -2332,10 +2296,6 @@ func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
 		return ActiveEffect{}, err
 	}
 	resultEntryID, err := stringMember(obj, "result_entry_id", true)
-	if err != nil {
-		return ActiveEffect{}, err
-	}
-	requestID, err := optionalNonEmptyString(obj, "request_id")
 	if err != nil {
 		return ActiveEffect{}, err
 	}
@@ -2347,7 +2307,7 @@ func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
 	if err != nil {
 		return ActiveEffect{}, err
 	}
-	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, RequestID: requestID, ToolCallID: toolCallID, HookID: hookID}
+	v := ActiveEffect{Kind: EffectKind(kind), ResultEntryID: resultEntryID, ToolCallID: toolCallID, HookID: hookID}
 	if err := validateHexID(v.ResultEntryID, "active effect result entry id"); err != nil {
 		return ActiveEffect{}, err
 	}
@@ -2414,9 +2374,8 @@ func decodeOperationTerminal(obj map[string]json.RawMessage) (OperationTerminal,
 // active and pending effects, carry the contract detail rule, and name a
 // durable settlement entry; a tool active effect addresses the matching first
 // pending call under its reserved result identity; active effects carry
-// durable result identities and the request id rule is closed by kind — model
-// requires one, tool and hook forbid it; pending calls have unique identities
-// and reserved results.
+// durable result identities; pending calls have unique identities and
+// reserved results.
 func validateOperationState(v OperationCurrentState) error {
 	switch v.Status {
 	case OperationRunning, OperationSuccess, OperationFailure, OperationInterruption:
@@ -2466,9 +2425,6 @@ func validateOperationState(v OperationCurrentState) error {
 		}
 		switch v.ActiveEffect.Kind {
 		case EffectModel:
-			if v.ActiveEffect.RequestID == "" {
-				return errors.New("model active effect requires its request id")
-			}
 			if v.ActiveEffect.ToolCallID != "" {
 				return errors.New("model active effect omits the tool call id")
 			}
@@ -2476,9 +2432,6 @@ func validateOperationState(v OperationCurrentState) error {
 				return errors.New("model active effect omits the hook id")
 			}
 		case EffectTool:
-			if v.ActiveEffect.RequestID != "" {
-				return errors.New("tool active effect omits the request id")
-			}
 			if v.ActiveEffect.ToolCallID == "" {
 				return errors.New("tool active effect requires its tool call id")
 			}
@@ -2492,9 +2445,6 @@ func validateOperationState(v OperationCurrentState) error {
 				return errors.New("tool active effect must reserve the first pending call's result identity")
 			}
 		case EffectHook:
-			if v.ActiveEffect.RequestID != "" {
-				return errors.New("hook active effect omits the request id")
-			}
 			if v.ActiveEffect.ToolCallID == "" {
 				return errors.New("hook active effect requires its tool call id")
 			}

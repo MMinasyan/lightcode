@@ -91,12 +91,12 @@ func TestAdaptToolsUnavailableGate(t *testing.T) {
 	}
 }
 
-// TestAdaptToolsNilRegisteredFunc pins that a selected nil ToolFunc is a typed boundary-protocol violation naming the "tool" boundary with a zero result, reported before any invocation instead of panicking.
+// TestAdaptToolsNilRegisteredFunc pins that a selected nil ToolFunc is answered by the ordinary unavailable-tool error result under the same one gate rule as an unadvertised or unregistered name: no implementation is ever invoked.
 func TestAdaptToolsNilRegisteredFunc(t *testing.T) {
 	effect := agent.AdaptTools(map[string]agent.ToolFunc{"x": nil})
 	res, err := effect(context.Background(), echoCall("c1", "x"), []string{"x"})
-	requireBoundaryViolation(t, err, "tool")
-	testassert.Equal(t, res, model.ToolResult{})
+	testassert.NoError(t, err)
+	testassert.Equal(t, res, unavailableResult(echoCall("c1", "x")))
 }
 
 // TestAdaptToolsForwardsUnchanged pins that an invoked implementation's result and error come back verbatim: the adapter validates and reinterprets nothing on either value.
@@ -109,6 +109,83 @@ func TestAdaptToolsForwardsUnchanged(t *testing.T) {
 	res, err := effect(context.Background(), echoCall("c1", "x"), []string{"x"})
 	testassert.Equal(t, res, want)
 	testassert.Check(t, err == errBoom, "error = %v, want the implementation error forwarded verbatim", err)
+}
+
+// twoToolCallSSE is a streaming body publishing two completed tool calls in one turn: the first name the fixture advertises, the second a registered name the request never advertised.
+const twoToolCallSSE = `data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"working"}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}},{"index":1,"id":"c2","type":"function","function":{"name":"ghost","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+
+// TestRunToolEffectNamesArePerCallOwned proves the loop's per-call ownership of the advertised names: a wrapper ToolEffect that mutates the names slice it received in place after the first sibling's dispatch cannot hand the next sibling a different advertisement — the unadvertised registered name stays gated out, its implementation never runs, the unavailable settlement keeps the batch eligible, and the run still settles successfully.
+func TestRunToolEffectNamesArePerCallOwned(t *testing.T) {
+	ref := model.ModelRef{Provider: "acme", Model: "m-1"}
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			fmt.Fprint(w, twoToolCallSSE)
+		} else {
+			fmt.Fprint(w, finalTextSSE)
+		}
+	}))
+	defer srv.Close()
+	transport, err := model.NewTransport(model.ResolvedTransport{Model: ref, BaseURL: srv.URL})
+	testassert.NoError(t, err)
+
+	echoRan, ghostRan := 0, 0
+	inner := agent.AdaptTools(map[string]agent.ToolFunc{
+		"echo": func(_ context.Context, c model.ToolCall) (model.ToolResult, error) {
+			echoRan++
+			return model.ToolResult{CallID: c.ID, Status: model.ResultSuccess, Content: "echoed"}, nil
+		},
+		"ghost": func(_ context.Context, c model.ToolCall) (model.ToolResult, error) {
+			ghostRan++
+			return model.ToolResult{CallID: c.ID, Status: model.ResultSuccess, Content: "ghost implementation ran"}, nil
+		},
+	})
+	var secondCallNames []string
+	var secondCallResult model.ToolResult
+	mutatedTo := ""
+	toolEffect := func(ctx context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
+		res, err := inner(ctx, call, names)    // the adapter gate consults the names exactly as handed.
+		if call.ID == "c1" && len(names) > 0 { // after the first sibling settles, mutate the received names slice in place.
+			names[0] = "ghost"
+			mutatedTo = names[0]
+		}
+		if call.ID == "c2" {
+			secondCallNames = append([]string(nil), names...)
+			secondCallResult = res
+		}
+		return res, err
+	}
+
+	res, err := agent.Run(context.Background(), agent.Invocation{
+		ExpectedModel: ref,
+		Request: func(context.Context) (model.Request, error) {
+			return model.Request{Messages: []model.Message{mustMessage(t, model.Message{
+				Role:    model.RoleUser,
+				Content: []model.ContentPart{{Kind: model.PartText, Text: "run the tools"}},
+			})}, Tools: []model.ToolDefinition{{Name: "echo", Description: "echo", Parameters: json.RawMessage(`{"type":"object"}`)}}}, nil
+		},
+		ModelEffect: agent.AdaptModelEffect(ref, transport),
+		ToolEffect:  toolEffect,
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, res.Status == agent.TerminalSuccess, "terminal = %+v, want success: the unavailable settlement never stops the batch", res)
+	testassert.Require(t, mutatedTo == "ghost", "the wrapper's in-place mutation of the received names did not happen: %q", mutatedTo)
+	testassert.Require(t, echoRan == 1, "echo ran %d times, want the advertised call dispatched once", echoRan)
+	testassert.Require(t, ghostRan == 0, "the unadvertised registered tool ran %d times, want 0: a sibling's names mutation granted it no authority", ghostRan)
+	testassert.Require(t, len(secondCallNames) == 1 && secondCallNames[0] == "echo", "second call names = %v, want its own pristine [echo] copy", secondCallNames)
+	testassert.Require(t, secondCallResult.Status == model.ResultError && secondCallResult.CallID == "c2" && secondCallResult.Content == `Tool "ghost" is not available.`, "second call settled %+v, want the ordinary unavailable-tool error", secondCallResult)
+	testassert.Require(t, res.LastOutput != nil && res.LastOutput.Message.TextContent() == "all done", "last output = %+v, want the final text after the continued batch", res.LastOutput)
+	testassert.Require(t, attempts == 2, "transport attempts = %d, want the batch to continue to a second model round", attempts)
 }
 
 // TestAdaptToolsEmptyMapZeroToolRun pins that an empty (here nil) tool map is a valid effect for a run whose request advertises no tools and whose response carries none: the composition reaches terminal success without any dispatch.

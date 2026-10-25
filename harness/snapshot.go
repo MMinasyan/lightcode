@@ -543,9 +543,6 @@ func ownInputPayload(v inputEntry) *inputEntry {
 
 func ownAssistantPayload(v assistantEntry) *assistantEntry {
 	out := v
-	if len(v.Advertised) > 0 {
-		out.Advertised = append([]string(nil), v.Advertised...)
-	}
 	out.Content = ownContentParts(v.Content)
 	out.Extra = v.Extra.Clone()
 	if len(v.ToolCalls) == 0 {

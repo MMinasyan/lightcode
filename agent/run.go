@@ -91,9 +91,9 @@ func Run(ctx context.Context, inv Invocation) (TerminalResult, error) {
 			if ctx.Err() != nil { // no later effect starts: this call and everything after it remain unstarted.
 				return interruptionTerminal(detailInterrupted, set.Output, calls[i:])
 			}
-			call.Arguments = model.CloneRaw(call.Arguments) // the tool boundary receives owned containers cloned from the retained settled output, so its mutations cannot rewrite it.
+			call.Arguments = model.CloneRaw(call.Arguments) // per dispatched call the tool boundary receives owned argument bytes, extras, and advertised names, all cloned from the retained settled output and the round's advertisement: one call's mutations cannot alter what a later sibling call or the retained output sees.
 			call.Extra = call.Extra.Clone()
-			res, err := inv.ToolEffect(ctx, call, names)
+			res, err := inv.ToolEffect(ctx, call, append([]string(nil), names...))
 			if err != nil {
 				if isCancellation(err) { // an active tool effect settles cancellation through an interrupted result, never through a Go error.
 					return TerminalResult{}, newBoundaryViolation("tool", "tool effect reported cancellation as an error instead of an interrupted result")

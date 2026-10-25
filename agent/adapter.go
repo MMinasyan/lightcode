@@ -10,7 +10,7 @@ import (
 // ToolFunc is one tool implementation in its plain standalone shape: the started call goes in, its settled result and error come out. AdaptTools is the only route a ToolFunc reaches a run through; the loop itself never sees this type.
 type ToolFunc func(context.Context, model.ToolCall) (model.ToolResult, error)
 
-// AdaptTools builds the ordinary standalone ToolEffect over a name-registered tool map. The map is copied at construction, so later caller mutations of the input map cannot reach the adapter; a nil or empty map is valid for a zero-tool run. Per started call the adapted effect consults, in order, the owned advertised-name copy of the producing request that Run hands it, then the copied registry. A call whose name is unadvertised or unregistered settles the ordinary unavailable-tool error result — the call never reaches any implementation, and that error settlement leaves every later call of the batch eligible. A registered nil ToolFunc returns the typed boundary-protocol violation naming the "tool" boundary before anything is invoked, never a panic. Every other call forwards the registered function's result and error unchanged: settled-result validation belongs to Run's existing validator, not to the adapter.
+// AdaptTools builds the ordinary standalone ToolEffect over a name-registered tool map. The map is copied at construction, so later caller mutations of the input map cannot reach the adapter; a nil or empty map is valid for a zero-tool run. Per started call the adapted effect consults, in order, the owned per-call advertised-name copy of the producing request that Run hands it, then the copied registry. One rule covers every miss: a call whose name is unadvertised, absent from the registry, or registered as a nil ToolFunc settles the ordinary unavailable-tool error result — the call never reaches any implementation, no nil function is ever invoked, and that error settlement leaves every later call of the batch eligible. Every other call forwards the registered function's result and error unchanged: settled-result validation belongs to Run's existing validator, not to the adapter.
 func AdaptTools(tools map[string]ToolFunc) ToolEffect {
 	registered := make(map[string]ToolFunc, len(tools))
 	for name, fn := range tools {
@@ -25,11 +25,8 @@ func AdaptTools(tools map[string]ToolFunc) ToolEffect {
 			}
 		}
 		fn, ok := registered[call.Name]
-		if !advertised || !ok { // one gate covers both halves: the call never reaches an implementation, and the ordinary unavailable settlement answers it.
+		if !advertised || !ok || fn == nil { // one gate covers every miss — unadvertised, unregistered, or a nil registration: the call never reaches an implementation, and the ordinary unavailable settlement answers it.
 			return model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: fmt.Sprintf("Tool %q is not available.", call.Name)}, nil
-		}
-		if fn == nil { // a registered nil function is a caller protocol breach, reported before any invocation instead of panicking.
-			return model.ToolResult{}, newBoundaryViolation("tool", fmt.Sprintf("registered tool %q is a nil function", call.Name))
 		}
 		return fn(ctx, call) // result and error travel verbatim to Run's validator.
 	}

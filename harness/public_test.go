@@ -3124,7 +3124,7 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2
 			call[0], i, args, call[1]))
 	}
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"request_id":"raw-request-1","status":"completed",`+
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
 			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
 		sessionID, entryID, operationID, strings.Join(parts, ","))
 }
@@ -3153,7 +3153,7 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 	switch activeEffect {
 	case "model":
 		modelReserved = newRawSessionID(t)
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"raw-request-1"}`, modelReserved)
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q}`, modelReserved)
 	case "tool":
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q}`, reserved[0], calls[0])
 	case "hook":
@@ -3502,7 +3502,7 @@ func rawCopiedAssistantPayload(sessionID, entryID string, calls [][2]string) str
 			call[0], i, args, call[1]))
 	}
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"request_id":"raw-request-1","status":"completed",`+
+		`{"session_id":%q,"entry_id":%q,"status":"completed",`+
 			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
 		sessionID, entryID, strings.Join(parts, ","))
 }
@@ -4352,7 +4352,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"raw-request-1"}`, input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q}`, input.ID))
 				})
 			},
 		},
@@ -4363,7 +4363,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				reserved := snapReservedResultID(t, snap)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"raw-request-1"}`, reserved))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q}`, reserved))
 				})
 			},
 		},
@@ -4958,9 +4958,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 		testassert.Equal(t, copiedInput.Origin, "user")
 		var copiedAssistant struct {
-			RequestID  string   `json:"request_id"`
-			Advertised []string `json:"advertised"`
-			ToolCalls  []struct {
+			ToolCalls []struct {
 				ID                  string          `json:"id"`
 				ResultEntryID       string          `json:"result_entry_id"`
 				NormalizedArguments json.RawMessage `json:"normalized_arguments"`
@@ -4974,24 +4972,6 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		testassert.Require(t, copiedAssistant.Usage == nil, "copied assistant carries source usage")
 		testassert.Require(t, len(copiedAssistant.ToolCalls) == 1 && copiedAssistant.ToolCalls[0].ID == "call-1" && copiedAssistant.ToolCalls[0].ResultEntryID == entries[2].ID, "copied call reservation = %+v, want it rewritten to the copied result entry %s", copiedAssistant.ToolCalls, entries[2].ID)
 		testassert.Require(t, string(copiedAssistant.ToolCalls[0].NormalizedArguments) == `{"x":1}`, "copied assistant normalized arguments = %s, want the source's committed normalization preserved verbatim", copiedAssistant.ToolCalls[0].NormalizedArguments)
-		sourceAssistant := snapEntryOf(&before, harness.EntryAssistant)
-		testassert.Require(t, sourceAssistant != nil, "the source snapshot carries no assistant entry")
-		var sourceAssistantWire struct {
-			RequestID  string   `json:"request_id"`
-			Advertised []string `json:"advertised"`
-			ToolCalls  []struct {
-				ID                  string          `json:"id"`
-				ResultEntryID       string          `json:"result_entry_id"`
-				NormalizedArguments json.RawMessage `json:"normalized_arguments"`
-			} `json:"tool_calls"`
-			Usage *struct{} `json:"usage"`
-		}
-		{
-			err := json.Unmarshal(sourceAssistant.Payload, &sourceAssistantWire)
-			testassert.NoError(t, err)
-		}
-		testassert.Require(t, copiedAssistant.RequestID != "" && copiedAssistant.RequestID == sourceAssistantWire.RequestID, "copied assistant request id = %q, want the source assistant's %q", copiedAssistant.RequestID, sourceAssistantWire.RequestID)
-		testassert.Require(t, reflect.DeepEqual(copiedAssistant.Advertised, sourceAssistantWire.Advertised) && reflect.DeepEqual(copiedAssistant.Advertised, []string{"echo"}), "copied assistant advertised = %v, want the source's advertised set [echo] (source: %v)", copiedAssistant.Advertised, sourceAssistantWire.Advertised)
 		var copiedResult struct {
 			AssistantEntry struct {
 				SessionID string `json:"session_id"`
@@ -6030,7 +6010,7 @@ func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":"user","content":[{"kind":"text","text":%q}]}`,
 			sessionID, inputID, operationID, inputText))
 	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
-		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"request_id":"raw-request-1","status":"completed",`+
+		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
 			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
 			sessionID, assistantID, operationID, assistantText))
 	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
@@ -6065,7 +6045,7 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "compact-op"},
 			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
-				`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"raw-request-1"},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				`"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
 				rawCompactAdmission(sessionID, "compact-op"), now, reserved))
 
 		// The seeded shape: a running compact request with a live model intent.

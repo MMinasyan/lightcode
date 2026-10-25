@@ -29,9 +29,9 @@ type (
 
 	ModelEffect func(context.Context, model.Request, AssemblyCallback) (ModelSettlement, error)
 
-	// ToolEffect runs one started call. The names are an owned copy of the
-	// producing request's advertised tool names, independent of the mutable
-	// request handed to the model effect.
+	// ToolEffect runs one started call. The names argument is an owned
+	// per-call copy of the producing request's advertised tool names,
+	// independent of the mutable request handed to the model effect.
 	ToolEffect func(context.Context, model.ToolCall, []string) (model.ToolResult, error)
 )
 
@@ -75,7 +75,7 @@ type Invocation struct {
 	ExpectedModel model.ModelRef // complete identity every callback-produced source must equal for the whole run.
 	Request       RequestSource  // supplies one complete request per round; nil is a protocol violation at invocation entry — never normalized to any other request.
 	ModelEffect   ModelEffect    // exactly one per invocation; its settlements are validated against the closed disposition table before anything proceeds from them.
-	ToolEffect    ToolEffect     // invoked once per started call in assembled order, carrying the producing request's advertised names; nil is likewise rejected at entry.
+	ToolEffect    ToolEffect     // invoked once per started call in assembled order, carrying an owned per-call copy of the producing request's advertised names; nil is likewise rejected at entry.
 }
 
 type ModelSettlement struct {

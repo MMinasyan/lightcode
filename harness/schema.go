@@ -213,16 +213,13 @@ type OperationAdmission struct {
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the
-// entry reserved for its result. A model effect carries the request identity
-// its intent consumed and omits the tool-call and hook IDs; a tool effect
-// requires the tool-call ID, addresses the matching first pending call, and
-// carries no request identity; a hook effect requires both the hook ID and the
-// tool-call ID of the first pending call it runs for and carries no request
-// identity.
+// entry reserved for its result. A model effect omits the tool-call and hook
+// IDs; a tool effect requires the tool-call ID and addresses the matching
+// first pending call; a hook effect requires both the hook ID and the
+// tool-call ID of the first pending call it runs for.
 type ActiveEffect struct {
 	Kind          EffectKind `json:"kind"`
 	ResultEntryID string     `json:"result_entry_id"`
-	RequestID     string     `json:"request_id,omitempty"`
 	ToolCallID    string     `json:"tool_call_id,omitempty"`
 	HookID        string     `json:"hook_id,omitempty"`
 }
@@ -295,14 +292,11 @@ type toolCallRecord struct {
 }
 
 // assistantEntry is one finalized model output: status, complete source
-// identity, the producing request's identity and ordered advertised tool
-// names, eligible model-visible payload, and reported usage when present.
+// identity, eligible model-visible payload, and reported usage when present.
 type assistantEntry struct {
 	SessionID   string              `json:"session_id"`
 	EntryID     string              `json:"entry_id"`
 	OperationID string              `json:"operation_id,omitempty"`
-	RequestID   string              `json:"request_id"`
-	Advertised  []string            `json:"advertised,omitempty"`
 	Status      model.OutputStatus  `json:"status"`
 	Source      model.ModelRef      `json:"source"`
 	Content     []model.ContentPart `json:"content"`
