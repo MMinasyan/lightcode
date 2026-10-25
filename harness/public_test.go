@@ -64,18 +64,36 @@ func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
 	return json.Marshal(obj)
 }
 
-// publicExecution is the suite's ordinary opened execution: the two actual
-// model callbacks, the suite's required normalizer, and the immediate
-// "no tools" result plan.
+// publicExecution is the suite's ordinary opened execution: an opener whose
+// invocations carry the two actual model callbacks selected by purpose, the
+// suite's required normalizer, and the immediate "no tools" result plan.
 func publicExecution(conversation, compact func(context.Context, model.Request) (model.Stream, error)) harness.Execution {
-	return harness.Execution{
-		Model:         conversation,
-		CompactModel:  compact,
-		NormalizeTool: publicNormalize,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-		},
-	}
+	return harness.Execution{OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+		modelFn := conversation
+		if request.Purpose == harness.InvocationPurposeMaintenance {
+			modelFn = compact
+		}
+		return harness.InvocationExecution{
+			Model:         modelFn,
+			NormalizeTool: publicNormalize,
+			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+			},
+		}, nil
+	}}
+}
+
+// publicExecutionOver is the suite's opened execution shape over a caller's
+// tool-plan function: its invocations carry the purpose-selected model
+// callbacks, the suite's required normalizer, and the given plan.
+func publicExecutionOver(conversation, compact func(context.Context, model.Request) (model.Stream, error), tool func(context.Context, model.ToolCall) harness.PreparedTool) harness.Execution {
+	return harness.Execution{OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+		modelFn := conversation
+		if request.Purpose == harness.InvocationPurposeMaintenance {
+			modelFn = compact
+		}
+		return harness.InvocationExecution{Model: modelFn, NormalizeTool: publicNormalize, Tool: tool}, nil
+	}}
 }
 
 // publicPermission is one built-in-allowed declaration for the suite's
@@ -311,6 +329,37 @@ func (f *publicFixture) preparationCalls() []harness.PreparationRequest {
 	f.prepMu.Lock()
 	defer f.prepMu.Unlock()
 	return append([]harness.PreparationRequest(nil), f.preps...)
+}
+
+// newObservingPublicFixture is the scripted fixture with a passive observer
+// installed: the callback receives every fact the Harness emits, so a row can
+// park one emission on a gate it owns.
+func newObservingPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, observe func(harness.HarnessFact)) *publicFixture {
+	t.Helper()
+	f := &publicFixture{store: store, cancel: func() {}, prepare: make(chan struct{}, 16), model: script}
+	f.defaultPrep = harness.PreparedExecution{
+		Capture: publicCapture(),
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return publicExecution(script.effect, script.effect), nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancel = cancel
+	h, err := harness.New(ctx, harness.Dependencies{Storage: store, Observe: observe, Prepare: func(_ context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+		f.prepMu.Lock()
+		call := len(f.preps)
+		f.preps = append(f.preps, req)
+		hook := f.prepareHook
+		f.prepMu.Unlock()
+		f.prepare <- struct{}{}
+		if hook != nil {
+			return hook(call, req)
+		}
+		return f.defaultPrep, nil
+	}})
+	testassert.NoError(t, err)
+	f.h = h
+	return f
 }
 
 func (f *publicFixture) close() { f.cancel() }
@@ -1286,11 +1335,14 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 								adm.Execution.Capabilities[0] = "dropped"
 							}
 							return harness.Execution{
-								Model:         script.effect,
-								CompactModel:  script.effect,
-								NormalizeTool: publicNormalize,
-								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+								OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+									return harness.InvocationExecution{
+										Model:         script.effect,
+										NormalizeTool: publicNormalize,
+										Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+											return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+										},
+									}, nil
 								},
 								Close: func() error { // runs after the terminal settlement commits
 									select {
@@ -1633,33 +1685,28 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		prepared := harness.PreparedExecution{
 			Capture: publicCapture(),
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-				return harness.Execution{
-					Model:         script.effect,
-					CompactModel:  script.effect,
-					NormalizeTool: publicNormalize,
-					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-						toolMu.Lock()
-						toolOrder = append(toolOrder, call.ID)
-						toolMu.Unlock()
-						if call.ID == "call-1" { // executor-backed: intent before execution, one result after
-							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
-								reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
-								if err != nil {
-									t.Errorf("read operation register during execution: %v", err)
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								}
-								var wire opRegisterWire
-								if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-									t.Errorf("decode operation register during execution: %v", err)
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								}
-								testassert.Check(t, wire.State.ActiveEffect != nil && wire.State.ActiveEffect.Kind == "tool" && wire.State.ActiveEffect.ToolCallID == "call-1" && wire.State.ActiveEffect.ResultEntryID != "", "tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
+				return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					toolMu.Lock()
+					toolOrder = append(toolOrder, call.ID)
+					toolMu.Unlock()
+					if call.ID == "call-1" { // executor-backed: intent before execution, one result after
+						return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
+							reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
+							if err != nil {
+								t.Errorf("read operation register during execution: %v", err)
 								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-							}}
-						}
-						return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
-					},
-				}, nil
+							}
+							var wire opRegisterWire
+							if err := json.Unmarshal(reg.Payload, &wire); err != nil {
+								t.Errorf("decode operation register during execution: %v", err)
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							}
+							testassert.Check(t, wire.State.ActiveEffect != nil && wire.State.ActiveEffect.Kind == "tool" && wire.State.ActiveEffect.ToolCallID == "call-1" && wire.State.ActiveEffect.ResultEntryID != "", "tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
+							return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+						}}
+					}
+					return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
+				}), nil
 			},
 		}
 		f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) { return prepared, nil }
@@ -1732,31 +1779,26 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							switch call.ID {
-							case "call-2": // malformed metadata: dropped, the result still commits
-								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
-									Metadata: json.RawMessage(`{broken`),
-								}}
-							case "call-3": // durable-oversized after escaping: dropped, no transaction failure
-								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
-									Metadata: expanded,
-								}}
-							}
-							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
-								return harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-									Metadata: rawOverBound,
-								}
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						switch call.ID {
+						case "call-2": // malformed metadata: dropped, the result still commits
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
+								Metadata: json.RawMessage(`{broken`),
 							}}
-						},
-					}, nil
+						case "call-3": // durable-oversized after escaping: dropped, no transaction failure
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
+								Metadata: expanded,
+							}}
+						}
+						return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
+							return harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+								Metadata: rawOverBound,
+							}
+						}}
+					}), nil
 				},
 			}, nil
 		}
@@ -1847,27 +1889,22 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: capture,
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							if call.ID == "call-2" { // the exit-condition omission through the public path
-								return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
-									Metadata: json.RawMessage(`{"would":"leak"}`),
-								}}
-							}
-							return harness.PreparedTool{
-								Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}},
-								Execute: func(context.Context) harness.ToolOutcome {
-									executions++
-									consumed = call.Arguments
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								},
-							}
-						},
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						if call.ID == "call-2" { // the exit-condition omission through the public path
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
+								Metadata: json.RawMessage(`{"would":"leak"}`),
+							}}
+						}
+						return harness.PreparedTool{
+							Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}},
+							Execute: func(context.Context) harness.ToolOutcome {
+								executions++
+								consumed = call.Arguments
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							},
+						}
+					}), nil
 				},
 			}, nil
 		}
@@ -2029,6 +2066,115 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			}
 			drained, err := f.h.ReadOperation(ctx, session, "op-2")
 			testassert.Require(t, err == nil && drained.State.Terminal != nil, "buffered item after rejected archive = %+v err %v, want it delivered and settled", drained, err)
+		})
+
+		t.Run("archive and sweep leave buffered input to the retiring execution", func(t *testing.T) {
+			script := newScriptModel(publicFail("terminal-to-retirement window boom"))
+			sessionID := ""
+			parked := make(chan struct{})
+			release := make(chan struct{})
+			var closeRelease sync.Once
+			var parkOnce atomic.Bool
+			var h *harness.Harness // the fixture's Harness, installed before any emission the latch reads
+			f := newObservingPublicFixture(t, store, script, func(fact harness.HarnessFact) {
+				if fact.Kind != harness.FactInvalidation || fact.SessionID != sessionID {
+					return
+				}
+				// Park the first invalidation that rides a committed terminal: the
+				// emission runs after the settlement transaction released the
+				// coordinator and before the completion owner takes its reservation.
+				rec, err := h.ReadOperation(context.Background(), sessionID, "window-1")
+				if err != nil || rec.State.Terminal == nil {
+					return
+				}
+				if !parkOnce.CompareAndSwap(false, true) {
+					return
+				}
+				close(parked)
+				select {
+				case <-release:
+				case <-time.After(60 * time.Second):
+				}
+			})
+			defer closeRelease.Do(func() { close(release) }) // the latch releases in every outcome
+			defer f.close()
+			h = f.h
+			session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+			testassert.NoError(t, err)
+			sessionID = session.Identity.SessionID
+
+			{
+				_, err := submit(t, f.h, sessionID, "window-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
+			}
+			<-f.prepare // the admission prepared; the scripted attempt fails and settles the terminal
+			select {
+			case <-parked:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the post-terminal invalidation never parked the execution")
+			}
+			{
+				rec, err := f.h.ReadOperation(ctx, sessionID, "window-1")
+				testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "terminal-to-retirement window boom", "parked operation = %+v err %v, want the scripted failed terminal", rec, err)
+			}
+			{
+				res, err := submit(t, f.h, sessionID, "window-2", harness.MessageModeRegular, "steer-window")
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionSteering, "steering submit while the run retires = %+v err %v, want it buffered", res, err)
+			}
+			{
+				res, err := submit(t, f.h, sessionID, "window-3", harness.MessageModeQueued, "queue-window")
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionQueued, "queued submit while the run retires = %+v err %v, want it buffered", res, err)
+			}
+			before := sessionRegister(t, store, sessionID)
+
+			{
+				_, err := f.h.ArchiveSession(ctx, sessionID)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive during the terminal-to-retirement window = err %v, want ErrInvalid", err)
+			}
+			{
+				deleted, err := f.h.SweepSession(ctx, sessionID, harness.SweepPolicy{ArchiveAfter: time.Second}, time.Now().Add(time.Hour))
+				testassert.Require(t, err == nil && !deleted, "sweep during the terminal-to-retirement window = deleted %v err %v, want the busy Session skipped", deleted, err)
+			}
+			after := sessionRegister(t, store, sessionID)
+			testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "rejected archive or skipped sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
+
+			closeRelease.Do(func() { close(release) }) // the parked emission returns; the execution completes and its drain delivers both items
+
+			// awaitDelivery polls until the ordinary drain admits the item and
+			// it settles: the delivery is the completion owner's deferred act.
+			awaitDelivery := func(operationID string) harness.OperationRecord {
+				t.Helper()
+				deadline := time.Now().Add(30 * time.Second)
+				for {
+					rec, err := f.h.ReadOperation(ctx, sessionID, operationID)
+					if err == nil && rec.State.Terminal != nil {
+						return rec
+					}
+					testassert.Require(t, !time.Now().After(deadline), "buffered item %s was never delivered and settled", operationID)
+					time.Sleep(time.Millisecond)
+				}
+			}
+			{
+				rec := awaitDelivery("window-2")
+				testassert.Require(t, rec.State.Status == harness.OperationSuccess, "buffered steering item = %+v, want the ordinary successor delivery", rec)
+			}
+			{
+				rec := awaitDelivery("window-3")
+				testassert.Require(t, rec.State.Status == harness.OperationSuccess, "buffered queued item = %+v, want the ordinary successor delivery", rec)
+			}
+			archived := harness.SessionRecord{}
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				var err error
+				archived, err = f.h.ArchiveSession(ctx, sessionID)
+				if err == nil {
+					break
+				}
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive after the deliveries = err %v, want the quiescence rejection until retirement", err)
+				testassert.Require(t, time.Now().Before(deadline), "the Session never became quiescent after the buffered deliveries")
+				time.Sleep(time.Millisecond)
+			}
+			testassert.Require(t, archived.State.Lifecycle == harness.LifecycleArchived && archived.State.ArchivedAt != nil, "archived Session = %+v, want the archived lifecycle after convergence", archived.State)
 		})
 
 		t.Run("delete requires archived and invalidates the coordinator", func(t *testing.T) {
@@ -4840,20 +4986,15 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							// the copied tool result carries tool-owned
-							// formatted metadata that the fork must preserve
-							// in its encoded durable form
-							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-								Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
-							}}
-						},
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						// the copied tool result carries tool-owned
+						// formatted metadata that the fork must preserve
+						// in its encoded durable form
+						return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+							Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
+						}}
+					}), nil
 				},
 			}, nil
 		}
@@ -5602,16 +5743,18 @@ func TestPublicCompositionProductionIsolation(t *testing.T) {
 // resource lifetime rows through public operations on both stores: each
 // admitted execution — root, queued-drain, and Fork alike — opens its effects
 // exactly once after its commit over the committed admission carrying the
-// prepared capture, closes them exactly once after its terminal settlement,
-// and closes before the successor opens; a plain successful turn's closer
-// observes its own durable terminal.
+// prepared capture, opens exactly one fresh conversation invocation, closes
+// that invocation after its effects settle, closes the execution exactly once
+// after its terminal settlement, and closes before the successor opens; a
+// plain successful turn's closer observes its own durable terminal.
 func TestPublicExecutionResourceLifetime(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		events := make(chan string, 32)
 		var (
-			openMu sync.Mutex
-			opens  []harness.OperationAdmission
+			openMu   sync.Mutex
+			opens    []harness.OperationAdmission
+			requests []harness.InvocationRequest
 		)
 		script := newScriptModel() // every turn completes with the default ready settlement
 		f := newPublicFixture(t, store, script, nil)
@@ -5625,11 +5768,22 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 					openMu.Unlock()
 					events <- "open:" + adm.OperationID
 					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+						OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+							openMu.Lock()
+							requests = append(requests, request)
+							openMu.Unlock()
+							events <- fmt.Sprintf("invocation:%s:%s", adm.OperationID, request.Purpose)
+							return harness.InvocationExecution{
+								Model:         script.effect,
+								NormalizeTool: publicNormalize,
+								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+								},
+								Close: func() error {
+									events <- fmt.Sprintf("invocation-close:%s:%s", adm.OperationID, request.Purpose)
+									return nil
+								},
+							}, nil
 						},
 						Close: func() error {
 							rec, err := f.h.ReadOperation(ctx, adm.SessionID, adm.OperationID)
@@ -5663,12 +5817,16 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		nextEvent("open:op-1") // the root execution opens after its commit
+		nextEvent("invocation:op-1:conversation")
 		{
 			_, err := submit(t, f.h, source, "op-2", harness.MessageModeQueued, "queued")
 			testassert.NoError(t, err)
 		}
-		nextEvent("close:op-1:success") // closed once, with its own terminal settlement already durable
-		nextEvent("open:op-2")          // the drain's successor opens only after that close
+		nextEvent("invocation-close:op-1:conversation") // the invocation closes after its effects settle
+		nextEvent("close:op-1:success")                 // closed once, with its own terminal settlement already durable
+		nextEvent("open:op-2")                          // the drain's successor opens only after that close
+		nextEvent("invocation:op-2:conversation")
+		nextEvent("invocation-close:op-2:conversation")
 		nextEvent("close:op-2:success")
 
 		// Fork shares the same lifetime: the destination execution opens
@@ -5682,6 +5840,8 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		})
 		testassert.NoError(t, err)
 		nextEvent("open:fork-op")
+		nextEvent("invocation:fork-op:conversation")
+		nextEvent("invocation-close:fork-op:conversation")
 		nextEvent("close:fork-op:success")
 		{
 			err := converge(t, f)
@@ -5696,6 +5856,15 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		}
 		testassert.Require(t, opens[0].SessionID == source && opens[1].SessionID == source, "root/queued opens name sessions %q and %q, want the source", opens[0].SessionID, opens[1].SessionID)
 		testassert.Equal(t, opens[2].SessionID, res.Session.Identity.SessionID)
+		testassert.Equal(t, len(requests), 3) // one conversation invocation per opened execution
+		seenIDs := map[string]bool{}
+		for i, request := range requests {
+			testassert.Require(t, request.ID != "", "invocation %d carries an empty identity", i)
+			testassert.Require(t, !seenIDs[request.ID], "invocation %d repeats identity %q", i, request.ID)
+			seenIDs[request.ID] = true
+			testassert.Equal(t, request.Purpose, harness.InvocationPurposeConversation)
+			testassert.Require(t, reflect.DeepEqual(request.Model, publicModelRef), "invocation %d model = %+v, want the captured conversation model", i, request.Model)
+		}
 	})
 }
 

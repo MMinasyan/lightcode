@@ -137,7 +137,7 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 		}
 		out := make(chan outcome, 1)
 		go func() {
-			rec, _, _, err := h.admitReserved(context.Background(), c, admissionRequest{
+			rec, prepared, disposition, err := h.admitReserved(context.Background(), c, admissionRequest{
 				SessionID:   testSessionID,
 				OperationID: testOpID,
 				Kind:        kind,
@@ -145,6 +145,9 @@ func TestCompactAdmissionConflictKindCheck(t *testing.T) {
 				Content:     admissionContent("raced"),
 			})
 			if err == nil {
+				if disposition == DispositionAdmitted {
+					h.releasePrepared(prepared) // the race fixture never installs this execution
+				}
 				out <- outcome{rec: &rec}
 				return
 			}

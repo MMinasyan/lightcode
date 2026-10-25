@@ -89,9 +89,7 @@ func newObservedPublicHarnessWithTool(t *testing.T, store harness.Storage, scrip
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					exec := publicExecution(script.effect, script.effect)
-					exec.Tool = tool
-					return exec, nil
+					return publicExecutionOver(script.effect, script.effect, tool), nil
 				},
 			}, nil
 		},
@@ -167,36 +165,45 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 				return harness.PreparedExecution{
 					Capture: ownedCapture,
 					Open: func(_ context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+						conversationAttempt := func(_ context.Context, req model.Request) (model.Stream, error) {
+							mu.Lock()
+							requests = append(requests, requestObservation{admission.SessionID, admission.OperationID, req})
+							mu.Unlock()
+							if admission.SessionID == root {
+								parentRequest <- admission.OperationID
+								return summaryTurnStream("parent complete", model.Usage{}), nil
+							}
+							if admission.OperationID == "child-op-1" {
+								// The report that will overflow the
+								// checkpoint: window 4096 minus reserve
+								// 2048.
+								return summaryTurnStream("child answer", model.Usage{InputTokens: 5000, CachedInputTokens: 100, OutputTokens: 50}), nil
+							}
+							return summaryTurnStream("child answer", model.Usage{}), nil
+						}
+						compactAttempt := func(_ context.Context, req model.Request) (model.Stream, error) {
+							mu.Lock()
+							compactRequests = append(compactRequests, req)
+							first := len(compactRequests) == 1
+							mu.Unlock()
+							if first {
+								close(compactArrived) // the actual compact request parks inside the frozen checkpoint
+								<-compactGate
+							}
+							return summaryTurnStream("child summary", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
+						}
 						return harness.Execution{
-							Model: func(_ context.Context, req model.Request) (model.Stream, error) {
-								mu.Lock()
-								requests = append(requests, requestObservation{admission.SessionID, admission.OperationID, req})
-								mu.Unlock()
-								if admission.SessionID == root {
-									parentRequest <- admission.OperationID
-									return summaryTurnStream("parent complete", model.Usage{}), nil
+							OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+								attempt := conversationAttempt
+								if request.Purpose == harness.InvocationPurposeMaintenance {
+									attempt = compactAttempt
 								}
-								if admission.OperationID == "child-op-1" {
-									// The report that will overflow the
-									// checkpoint: window 4096 minus reserve
-									// 2048.
-									return summaryTurnStream("child answer", model.Usage{InputTokens: 5000, CachedInputTokens: 100, OutputTokens: 50}), nil
-								}
-								return summaryTurnStream("child answer", model.Usage{}), nil
+								return harness.InvocationExecution{
+									Model:         attempt,
+									Tool:          publicImmediateTool,
+									NormalizeTool: publicNormalize,
+								}, nil
 							},
-							CompactModel: func(_ context.Context, req model.Request) (model.Stream, error) {
-								mu.Lock()
-								compactRequests = append(compactRequests, req)
-								first := len(compactRequests) == 1
-								mu.Unlock()
-								if first {
-									close(compactArrived) // the actual compact request parks inside the frozen checkpoint
-									<-compactGate
-								}
-								return summaryTurnStream("child summary", model.Usage{InputTokens: 1, OutputTokens: 1}), nil
-							},
-							Tool:          publicImmediateTool,
-							NormalizeTool: publicNormalize,
 							Close: func() error {
 								if admission.SessionID == root {
 									parentClose <- admission.OperationID

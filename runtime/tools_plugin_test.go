@@ -468,18 +468,21 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						SubprocessEnv: opts.subprocessEnv,
 					}
 					return harness.Execution{
-						Model:        modelFn,
-						CompactModel: modelFn,
-						Permissions:  opts.permissions,
-						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
-							tool, ok := byID[call.Name]
-							if !ok {
-								return nil, fmt.Errorf("unknown tool %q", call.Name)
-							}
-							return tool.Normalize(tc, call)
-						},
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return byID[call.Name].Prepare(ctx, tc, call)
+						Permissions: opts.permissions,
+						OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+							return harness.InvocationExecution{
+								Model: modelFn,
+								NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+									tool, ok := byID[call.Name]
+									if !ok {
+										return nil, fmt.Errorf("unknown tool %q", call.Name)
+									}
+									return tool.Normalize(tc, call)
+								},
+								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+									return byID[call.Name].Prepare(ctx, tc, call)
+								},
+							}, nil
 						},
 					}, nil
 				},

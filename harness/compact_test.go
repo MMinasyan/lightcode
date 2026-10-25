@@ -35,6 +35,38 @@ func summaryStream(text string, usage model.Usage) *scriptStream {
 	return streamOf(turnDelta("stop", text), usageDelta(usage))
 }
 
+// compactionExecution returns the compaction fixtures' execution: its opener
+// answers maintenance Engine requests with the given summarizer callback under
+// the Operation's retry classifier, and answers a conversation request with
+// the forbidden-model tripwire — compaction never wires a conversation
+// invocation.
+func compactionExecution(t *testing.T, compact func(context.Context, model.Request) (model.Stream, error), retry RetryPolicy) Execution {
+	noop := func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }
+	return Execution{
+		Retry: retry,
+		OpenInvocation: func(_ context.Context, request InvocationRequest) (InvocationExecution, error) {
+			if request.Purpose == InvocationPurposeConversation {
+				return invocationExecution(forbiddenConversationModel(t), noop), nil
+			}
+			return invocationExecution(compact, noop), nil
+		},
+	}
+}
+
+// maintenanceInvocationOf opens the given execution's maintenance invocation
+// for the captured compact model — the opened-invocation shape the direct
+// compact effect fixtures drive.
+func maintenanceInvocationOf(t *testing.T, exec Execution) InvocationExecution {
+	t.Helper()
+	inv, err := exec.OpenInvocation(context.Background(), InvocationRequest{
+		ID:      "inv-compaction",
+		Purpose: InvocationPurposeMaintenance,
+		Model:   testCapture().Compact.Model,
+	})
+	testassert.NoError(t, err)
+	return inv
+}
+
 // compactSnapshotMessages returns the fixture two-message conversation
 // snapshot.
 func compactSnapshotMessages() []model.Message {
@@ -109,9 +141,10 @@ func TestRunCompactionReadyPathRunsOneRequest(t *testing.T) {
 		reservedID = op.State.ActiveEffect.ResultEntryID
 		return summaryStream("summary one", model.Usage{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
+	exec := compactionExecution(t, compact, nil)
 
-	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "summary one")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "usage = %+v, want the one request's reported counts", usage)
@@ -176,8 +209,9 @@ func TestRunCompactionFullInputRunsOneRequest(t *testing.T) {
 		requests = append(requests, req)
 		return summaryStream("S1", model.Usage{InputTokens: 5, OutputTokens: 3}), nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
+	exec := compactionExecution(t, compact, nil)
+	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "S1")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 5, OutputTokens: 3}), "usage = %+v, want the one request's reported counts", usage)
@@ -211,9 +245,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			}
 			return summaryStream("summary one", model.Usage{}), nil
 		}
-		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: spy.retry, NormalizeTool: objectNormalize}
+		exec := compactionExecution(t, compact, spy.retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -235,9 +269,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return failStream(errors.New("provider failure"),
 				turnDelta("", "partial"), usageDelta(model.Usage{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5})), nil
 		}
-		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: (&retrySpy{limit: 0}).retry, NormalizeTool: objectNormalize}
+		exec := compactionExecution(t, compact, (&retrySpy{limit: 0}).retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -264,9 +298,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			t.Errorf("no attempt may start under a canceled execution context")
 			return nil, errors.New("unreachable")
 		}
-		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
+		exec := compactionExecution(t, compact, nil)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -297,9 +331,9 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			calls++
 			return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 		}
-		exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: spy.retry, NormalizeTool: objectNormalize}
+		exec := compactionExecution(t, compact, spy.retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, exec, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -320,10 +354,11 @@ func TestRunCompactionCanceledBeforeRunSettlesInterruption(t *testing.T) {
 		t.Errorf("no request may run under a canceled execution context")
 		return nil, errors.New("unreachable")
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
+	exec := compactionExecution(t, compact, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	summary, usage, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	summary, usage, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
 	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
 	graph, err := validateFixture(t, store, sessionID)
@@ -357,8 +392,9 @@ func TestRunCompactionCanceledAfterSummarySettlesInterruption(t *testing.T) {
 		requests++
 		return &cancelOnCloseStream{scriptStream: summaryStream("S1", model.Usage{InputTokens: 4, OutputTokens: 2}), cancel: cancel}, nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	summary, usage, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot)
+	exec := compactionExecution(t, compact, nil)
+	summary, usage, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot)
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
 	testassert.Equal(t, summary, "")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 4, OutputTokens: 2}), "usage = %+v, want the summary's reported counts", usage)
@@ -516,8 +552,9 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 		requests = append(requests, req)
 		return summaryStream("S1", model.Usage{}), nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	summary, _, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	exec := compactionExecution(t, compact, nil)
+	summary, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "S1")
 	testassert.Equal(t, len(requests), 1)
@@ -539,9 +576,10 @@ func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 		requests = append(requests, req)
 		return summaryStream("S1", model.Usage{}), nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
+	exec := compactionExecution(t, compact, nil)
 	{
-		_, _, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+		_, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+		defer closeInvocation() // the fixture joins the opened maintenance stage
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, len(requests), 1)
@@ -558,8 +596,9 @@ func TestRunCompactionEmptySnapshotFailsNothingToCompact(t *testing.T) {
 		t.Errorf("no request may run for an empty snapshot")
 		return nil, errors.New("unreachable")
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), nil)
+	exec := compactionExecution(t, compact, nil)
+	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), nil)
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == "nothing to compact", "error %v, want the retained nothing-to-compact failure", err)
 	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
 	graph, err := validateFixture(t, store, sessionID)
@@ -582,8 +621,9 @@ func TestRunCompactionErroredSummaryCarriesOutputThroughTheRun(t *testing.T) {
 	compact := func(ctx context.Context, req model.Request) (model.Stream, error) {
 		return erroredTurnStream(), nil // text "partial" with usage, then the read failure
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, Retry: (&retrySpy{limit: 0}).retry, NormalizeTool: objectNormalize}
-	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	exec := compactionExecution(t, compact, (&retrySpy{limit: 0}).retry)
+	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "provider failure"), "error %v, want the summary's own failure detail, not a settlement-shape boundary violation", err)
 	testassert.Equal(t, summary, "")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 5, OutputTokens: 7}), "usage = %+v, want the errored summary's reported counts", usage)
@@ -612,8 +652,9 @@ func TestRunCompactionEmptySummaryFailsWithTheRetainedDetail(t *testing.T) {
 		calls++
 		return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 	}
-	exec := Execution{Model: forbiddenConversationModel(t), CompactModel: compact, NormalizeTool: objectNormalize}
-	summary, usage, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	exec := compactionExecution(t, compact, nil)
+	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == "compaction summary is empty", "error %v, want the retained empty-summary detail", err)
 	testassert.Equal(t, summary, "")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 2, OutputTokens: 1}), "usage = %+v, want the summary's reported counts", usage)

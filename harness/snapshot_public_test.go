@@ -49,14 +49,12 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			exec := publicExecution(script.effect, script.effect)
-			exec.Tool = func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
 				}}
-			}
-			return exec, nil
+			}), nil
 		},
 	}
 }
@@ -567,6 +565,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		}
 		testassert.Require(t, found, "the compact Operation is missing from the read")
 
+		awaitQuiet(t, f.h, session) // the retiring compact run drains and releases before the lifecycle transitions
 		{
 			_, err := f.h.ArchiveSession(ctx, session)
 			testassert.NoError(t, err)
@@ -1358,12 +1357,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: capture,
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool:          tool,
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, tool), nil
 				},
 			}, nil
 		}

@@ -22,8 +22,8 @@ import (
 // shape over the two actual production functions with a constructed run.
 func executeDirect(h *Harness, c *coordinator, execCtx context.Context, operationID string, prepared PreparedExecution) error {
 	run := &activeExecution{execCtx: execCtx, cancel: func() {}}
-	res, closeExecution, err := h.execute(c, operationID, prepared, execCtx)
-	return h.finishExecution(c, run, operationID, res, err, closeExecution)
+	res, closeInvocation, closeExecution, err := h.execute(c, operationID, prepared, execCtx)
+	return h.finishExecution(c, run, operationID, prepared, res, err, closeInvocation, closeExecution)
 }
 
 // newAdmittedHarness admits one running Operation ("op-1") over a fresh empty
@@ -107,9 +107,49 @@ func objectNormalize(call model.ToolCall) (json.RawMessage, error) {
 // result through the permission boundary.
 var fixturePermission = []PermissionRequest{{Permission: PermissionCommandRun, Target: "fixture"}}
 
-// effectExecution supplies the normalizer every opened execution requires.
+// invocationExecution supplies the fixtures' opened invocation: the given
+// model and tool callbacks over the required pure normalizer.
+func invocationExecution(modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) InvocationExecution {
+	return InvocationExecution{Model: modelFn, Tool: toolFn, NormalizeTool: objectNormalize}
+}
+
+// effectExecution supplies the normalizer every opened invocation requires,
+// answering every Engine request with the same model and tool callbacks; a
+// nil tool callback answers with the empty plan.
 func effectExecution(modelFn func(context.Context, model.Request) (model.Stream, error), toolFn func(context.Context, model.ToolCall) PreparedTool) Execution {
-	return Execution{Model: modelFn, CompactModel: modelFn, Tool: toolFn, NormalizeTool: objectNormalize}
+	if toolFn == nil {
+		toolFn = func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }
+	}
+	return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
+		return invocationExecution(modelFn, toolFn), nil
+	}}
+}
+
+// purposeExecution returns the effect-driven fixtures' execution: its opener
+// answers conversation Engine requests with the conversation callback and
+// maintenance requests with the maintenance callback, both over an empty-plan
+// tool function and the required normalizer.
+func purposeExecution(conversation, maintenance func(context.Context, model.Request) (model.Stream, error)) Execution {
+	return Execution{OpenInvocation: func(_ context.Context, request InvocationRequest) (InvocationExecution, error) {
+		modelFn := conversation
+		if request.Purpose == InvocationPurposeMaintenance {
+			modelFn = maintenance
+		}
+		return invocationExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
+	}}
+}
+
+// openedConversation opens the given execution's conversation invocation with
+// the fixture model — the opened shape the direct effect fixtures drive.
+func openedConversation(t *testing.T, exec Execution) InvocationExecution {
+	t.Helper()
+	inv, err := exec.OpenInvocation(context.Background(), InvocationRequest{
+		ID:      "inv-conversation",
+		Purpose: InvocationPurposeConversation,
+		Model:   testCapture().Model,
+	})
+	testassert.NoError(t, err)
+	return inv
 }
 
 // scriptStream is one fake accepted model stream: it yields the scripted
@@ -231,7 +271,7 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	store, sessionID = st, sid
 
 	calls := 0
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
 	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		calls++
 		return agent.Assemble(context.Background(), source, stream)
@@ -288,7 +328,7 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoContinue)
 	graph, err := validateFixture(t, store, sessionID)
@@ -338,7 +378,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), ctx, defaultModelRequest(t), nil)
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, set.Disposition, agent.DispoInterruption)
 		graph, err := validateFixture(t, store, sessionID)
@@ -368,7 +408,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail == "model failure", "settlement = %+v, want the committed failure with its diagnostic", set)
 		graph, err := validateFixture(t, store, sessionID)
@@ -388,7 +428,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // the execution context dies before any attempt could start
-		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
 		set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
@@ -429,7 +469,7 @@ func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
 		return s, nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
 	{
 		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
@@ -461,7 +501,7 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -538,7 +578,7 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 				return nil
 			}
 			{
-				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 				testassert.Require(t, err != nil, "model effect succeeded past an injected %s failure", fail.step)
 			}
 			graph, err := validateFixture(t, store, sessionID)
@@ -619,11 +659,11 @@ func TestRequestSourceProjectsFullHistory(t *testing.T) {
 		t.Helper()
 		exec := effectExecution(modelFn, plan)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, invocationExecution(modelFn, plan), testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := h.toolEffect(c, testOpID, exec, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+			_, err := h.toolEffect(c, testOpID, exec, invocationExecution(modelFn, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
 		}
 	}
@@ -746,7 +786,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -766,7 +806,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "result over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -818,7 +858,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(), nil
 		}
-		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
 		{
 			_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "intent over a foreign terminal operation = %v, want ErrInvalid", err)
@@ -836,7 +876,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "result over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -919,7 +959,7 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 		}
 		return nil
 	}
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
 	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, invoked, 0)
@@ -1032,13 +1072,10 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		openErr := errors.New("open broke")
 		modelRuns := 0
 		h, store, c, sessionID, prepared, _ := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
-			return Execution{
-				Model: func(context.Context, model.Request) (model.Stream, error) {
-					modelRuns++
-					return nil, nil
-				},
-				Tool: func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
-			}, openErr
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				modelRuns++
+				return nil, nil
+			}, nil), openErr
 		})
 		{
 			err := executeDirect(h, c, h.ctx, testOpID, prepared)
@@ -1074,15 +1111,18 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 }
 
 // TestExecuteInvalidOpenedExecutionClosesBeforeRejection proves the
-// invalid-success row: a successful Open with a nil Model, Tool, or
-// NormalizeTool has its non-nil Close invoked exactly once before the
-// rejection — while the Operation is still running — never runs the Agent,
-// and settles failure through the ordinary terminal settlement.
+// invalid-success rows: a successful Open with a nil invocation opener has
+// its execution Close invoked exactly once inline before the rejection, and a
+// successful Open whose opened conversation invocation has a nil Model, Tool,
+// or NormalizeTool has the invocation's non-nil Close invoked exactly once
+// before the rejection and the execution's Close once through completion —
+// while the Operation is still running — never runs the Agent, and settles
+// failure through the ordinary terminal settlement.
 func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
-	for _, name := range []string{"nil model", "nil tool", "nil normalization"} {
+	for _, name := range []string{"nil opener", "nil model", "nil tool", "nil normalization"} {
 		t.Run(name, func(t *testing.T) {
 			var h *Harness
-			closes := 0
+			invCloses, execCloses := 0, 0
 			var statusDuringClose OperationState
 			modelRuns := 0
 			open := func(_ context.Context, adm OperationAdmission) (Execution, error) {
@@ -1090,21 +1130,33 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 					modelRuns++
 					return completedTurnStream(), nil
 				}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
-				switch name {
-				case "nil model":
-					exec.Model = nil
-				case "nil tool":
-					exec.Tool = nil
-				case "nil normalization":
-					exec.NormalizeTool = nil
+				if name == "nil opener" {
+					exec.OpenInvocation = nil
+				} else {
+					exec.OpenInvocation = func(_ context.Context, request InvocationRequest) (InvocationExecution, error) {
+						inv := invocationExecution(func(context.Context, model.Request) (model.Stream, error) {
+							modelRuns++
+							return completedTurnStream(), nil
+						}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
+						switch name {
+						case "nil model":
+							inv.Model = nil
+						case "nil tool":
+							inv.Tool = nil
+						case "nil normalization":
+							inv.NormalizeTool = nil
+						}
+						inv.Close = func() error {
+							invCloses++
+							rec, err := h.ReadOperation(context.Background(), adm.SessionID, adm.OperationID)
+							testassert.Check(t, err == nil, "read operation from the rejection closer: %v", err)
+							statusDuringClose = rec.State.Status
+							return nil
+						}
+						return inv, nil
+					}
 				}
-				exec.Close = func() error {
-					closes++
-					rec, err := h.ReadOperation(context.Background(), adm.SessionID, adm.OperationID)
-					testassert.Check(t, err == nil, "read operation from the rejection closer: %v", err)
-					statusDuringClose = rec.State.Status
-					return nil
-				}
+				exec.Close = func() error { execCloses++; return nil }
 				return exec, nil
 			}
 			var store *graphStorage
@@ -1115,8 +1167,13 @@ func TestExecuteInvalidOpenedExecutionClosesBeforeRejection(t *testing.T) {
 			err := executeDirect(h, c, h.ctx, testOpID, prepared)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "execute = %v, want the invalid-execution rejection", err)
 			testassert.Equal(t, modelRuns, 0)
-			testassert.Equal(t, closes, 1)
-			testassert.Equal(t, statusDuringClose, OperationRunning)
+			if name == "nil opener" {
+				testassert.Equal(t, execCloses, 1) // only the execution closes; no invocation was ever opened
+			} else {
+				testassert.Equal(t, invCloses, 1)
+				testassert.Equal(t, execCloses, 1)
+				testassert.Equal(t, statusDuringClose, OperationRunning)
+			}
 			settled, readErr := h.ReadOperation(context.Background(), sessionID, testOpID)
 			testassert.NoError(t, readErr)
 			testassert.Require(t, settled.State.Status == OperationFailure && settled.State.Terminal != nil && settled.State.Terminal.Detail == err.Error(), "operation state = %+v, want terminal failure with the rejection text %q", settled.State, err)
@@ -1144,7 +1201,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			return completedTurnStream(testToolCall("call-1")), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1297,7 +1354,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 				}
 				return inner
 			}
-			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
 			testassert.Equal(t, got, tc.want)
 			testassert.Equal(t, executions, tc.wantExecutions)
@@ -1576,7 +1633,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 				}
 				return inner
 			}
-			got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: objectNormalize, Permissions: tc.policy}, capture)(context.Background(), testToolCall("call-1"), []string{"echo"})
+			got, err := h.toolEffect(c, testOpID, Execution{Permissions: tc.policy}, InvocationExecution{Tool: plan, NormalizeTool: objectNormalize}, capture)(context.Background(), testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
 			wantStatus := model.ResultSuccess
 			if tc.wantDenied {
@@ -1622,7 +1679,7 @@ func TestToolEffectDeniedSettlesOnlyItsCall(t *testing.T) {
 		}
 		return nil
 	}
-	got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+	got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 	testassert.NoError(t, err)
 	testassert.Require(t, got.Status == model.ResultDenied && got.Content == PermissionDeniedContent, "call-1 result = %+v, want the fixed denial", got)
 	testassert.Equal(t, executions, 0)
@@ -1632,7 +1689,7 @@ func TestToolEffectDeniedSettlesOnlyItsCall(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && (len(rec.State.PendingToolCalls) == 1 && rec.State.PendingToolCalls[0].CallID == "call-2"), "operation after the denial = %+v, want running with no active effect; pending calls = %+v, want the later call untouched", rec.State, rec.State.PendingToolCalls)
 	{
-		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, executions, 1)
@@ -1678,7 +1735,7 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 		), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 2)
@@ -1692,18 +1749,18 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 	// advertises ghost — the capture grants it no retroactive authority.
 	ghostCapture := testCapture()
 	ghostCapture.Tools = append(ghostCapture.Tools, model.ToolDefinition{Name: "ghost", Description: "ghost tool", Parameters: json.RawMessage(`{"type":"object"}`)})
-	got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, ghostCapture)(context.Background(), testToolCall("call-1"), []string{"echo"})
+	got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, ghostCapture)(context.Background(), testToolCall("call-1"), []string{"echo"})
 	testassert.NoError(t, err)
 	testassert.Require(t, got.Status == model.ResultError && got.Content == `Tool "ghost" is not available.`, "names-absent result = %+v, want the ordinary unavailable-tool error", got)
 	testassert.Equal(t, normalized, 2)
 	testassert.Equal(t, prepared, 0)
 	{
-		_, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
+		_, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, prepared, 1)
 	// A captured, registered name the names omit is gated out too.
-	got, err = h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-3"), nil)
+	got, err = h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-3"), nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, got.Status == model.ResultError && got.Content == `Tool "echo" is not available.`, "names-omitted result = %+v, want the ordinary unavailable-tool error for the captured echo name", got)
 	testassert.Equal(t, prepared, 1)
@@ -1727,7 +1784,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return completedTurnStream(calls...), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1774,7 +1831,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		// preparer the committed record's name and normalized bytes. A forged
 		// unadvertised name would trip the advertisement gate if it were used.
 		forged := model.ToolCall{ID: "call-1", Name: "forged", Arguments: json.RawMessage(`{"y":99}`)}
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), forged, []string{"echo"})
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), forged, []string{"echo"})
 		testassert.NoError(t, err)
 		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "done", "result = %+v, want the committed call to execute, not a forged-name rejection", got)
 		testassert.Equal(t, normalized, 1)
@@ -1811,7 +1868,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			}
 			return nil
 		}
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 		testassert.NoError(t, err)
 		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "ran", "result = %+v, want the executed outcome", got)
 		// Operation + Session + the tool intent
@@ -1845,7 +1902,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			prepared++
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"}}}
 		}
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 		testassert.NoError(t, err)
 		testassert.Equal(t, normalized, 2)
 		testassert.Require(t, got.Status == model.ResultError && got.Content == "arguments must be one non-null JSON object", "result = %+v, want the callback's useful validation diagnostic", got)
@@ -1866,7 +1923,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return streamOf(d, usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
@@ -1876,7 +1933,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		for i := range producer { // ownership oracle: clobber the producer's buffer after the commit
 			producer[i] = ' '
 		}
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: func(context.Context, model.ToolCall) PreparedTool {
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: func(context.Context, model.ToolCall) PreparedTool {
 			t.Fatalf("preparer must not run for the invalid original")
 			return PreparedTool{}
 		}, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
@@ -1892,7 +1949,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return nil, errors.New(diagnostic)
 		}
 		publishWithNormalize(t, h, c, normalize, model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`not json`)})
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: func(context.Context, model.ToolCall) PreparedTool {
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: func(context.Context, model.ToolCall) PreparedTool {
 			t.Fatalf("preparer must not run for an invalid original")
 			return PreparedTool{}
 		}, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
@@ -1912,7 +1969,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			normalized++
 			return json.RawMessage(`[1,2]`), nil // valid JSON, not one object
 		}
-		got, err := h.toolEffect(c, testOpID, Execution{Tool: func(context.Context, model.ToolCall) PreparedTool {
+		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: func(context.Context, model.ToolCall) PreparedTool {
 			t.Fatalf("preparer must not run for a malformed callback outcome")
 			return PreparedTool{}
 		}, NormalizeTool: boundaryNormalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
@@ -1965,7 +2022,7 @@ func TestToolOutcomeMetadataRules(t *testing.T) {
 				}
 				return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome { return outcome }}
 			}
-			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+			got, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
 			want := model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}
 			testassert.Equal(t, got, want)
@@ -2271,7 +2328,7 @@ func TestToolResultAdoptsIntoView(t *testing.T) {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran " + call.ID}}}
 	}
 	{
-		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), invocationExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 		testassert.NoError(t, err)
 	}
 	msgs, err := source(context.Background())
@@ -2281,7 +2338,7 @@ func TestToolResultAdoptsIntoView(t *testing.T) {
 	tool := msgs[len(msgs)-1]
 	testassert.Require(t, tool.Role == model.RoleTool && tool.ToolCallID == "call-1" && tool.TextContent() == "ran call-1", "projected tool message = %+v, want the committed call-1 result", tool)
 	{
-		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
+		_, err := h.toolEffect(c, testOpID, effectExecution(nil, immediate), invocationExecution(nil, immediate), testCapture())(context.Background(), testToolCall("call-2"), []string{"echo"})
 		testassert.NoError(t, err)
 	}
 	msgs, err = source(context.Background())
@@ -2299,7 +2356,7 @@ func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, ca
 		return completedTurnStream(calls...), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 }
@@ -2432,7 +2489,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			return nil
 		}
 		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
-		err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+		err := h.finishExecution(c, run, testOpID, PreparedExecution{}, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil, nil)
 		testassert.Require(t, errors.Is(err, ErrStorage) && err.Error() == injected.Error(), "finishExecution = %v, want the original injected error", err)
 		store.txHook = nil
 		testassert.Equal(t, attempts, 1)
@@ -2474,7 +2531,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				harnessCancel() // the Harness context dies: the acquisition is canceled
 				closes := 0
 				run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
-				got := h.finishExecution(c, run, testOpID, tc.res, tc.runErr, func() error {
+				got := h.finishExecution(c, run, testOpID, PreparedExecution{}, tc.res, tc.runErr, nil, func() error {
 					closes++
 					return nil
 				})
@@ -2551,7 +2608,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				h, store, c, sessionID := newEffectHarness(t, nil)
 				tc.foreign(t, h, store, c, sessionID)
 				run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
-				err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+				err := h.finishExecution(c, run, testOpID, PreparedExecution{}, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil, nil)
 				testassert.Require(t, tc.name != "quiet running state" || errors.Is(err, ErrConflict), "finishExecution = %v, want the revision race's original error", err)
 				testassert.Require(t, tc.name != "retained active effect" || err == nil, "finishExecution = %v, want the guarded skip's cleared value", err)
 				graph, err := validateFixture(t, store, sessionID)
@@ -2605,7 +2662,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 		}
 		run := &activeExecution{execCtx: context.Background(), cancel: func() {}}
 		{
-			err := h.finishExecution(c, run, testOpID, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil)
+			err := h.finishExecution(c, run, testOpID, PreparedExecution{}, &agent.TerminalResult{Status: agent.TerminalSuccess}, nil, nil, nil)
 			testassert.NoError(t, err)
 		}
 		rec := settledOperation(t, store, sessionID, testOpID)
@@ -2635,7 +2692,7 @@ func TestToolEffectGateBeforePreparation(t *testing.T) {
 		}
 		return nil
 	}
-	got, err := h.toolEffect(c, testOpID, effectExecution(nil, spy.tool), testCapture())(ctx, testToolCall("call-1"), []string{"echo"})
+	got, err := h.toolEffect(c, testOpID, effectExecution(nil, spy.tool), invocationExecution(nil, spy.tool), testCapture())(ctx, testToolCall("call-1"), []string{"echo"})
 	testassert.NoError(t, err)
 	{
 		dispatched := spy.dispatched()
@@ -2697,7 +2754,7 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 3)

@@ -299,11 +299,9 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	openerArrived := make(chan struct{})
 	openerGate := make(chan struct{})
 	var once sync.Once
-	exec := validExecution()
-	exec.Model = script.model
-	exec.Tool = func(_ context.Context, call model.ToolCall) PreparedTool {
+	exec := effectExecution(script.model, func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
-	}
+	})
 	prepared := PreparedExecution{
 		Capture: testCapture(),
 		Open: func(context.Context, OperationAdmission) (Execution, error) {
@@ -899,15 +897,13 @@ func TestWaitConvergence(t *testing.T) {
 		script.gate = modelGate
 		toolGate := make(chan struct{})
 		toolArrived := make(chan struct{}, 1)
-		exec := validExecution()
-		exec.Model = script.model
-		exec.Tool = func(context.Context, model.ToolCall) PreparedTool {
+		exec := effectExecution(script.model, func(context.Context, model.ToolCall) PreparedTool {
 			toolArrived <- struct{}{}
 			<-toolGate
 			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
 			}}
-		}
+		})
 		prepared := preparedExecuting(exec)
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		session := createSession(t, h)
@@ -993,8 +989,7 @@ func TestWaitConvergence(t *testing.T) {
 		closedA := make(chan struct{}, 1)
 		closedB := make(chan struct{}, 1)
 		open := func(_ context.Context, adm OperationAdmission) (Execution, error) {
-			exec := validExecution()
-			exec.Model = script.model
+			exec := effectExecution(script.model, nil)
 			if adm.OperationID == "op-a" {
 				exec.Close = func() error { closedA <- struct{}{}; return cleanupErr }
 			} else {
@@ -1312,15 +1307,14 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 	firstGate := make(chan struct{})
 	first.gate = firstGate
 	second := newModelScript()
-	exec := validExecution()
 	firstModel, secondModel := first.model, second.model
-	exec.Model = func(ctx context.Context, req model.Request) (model.Stream, error) {
+	exec := effectExecution(func(ctx context.Context, req model.Request) (model.Stream, error) {
 		texts := textsOf(req)
 		if texts[len(texts)-1] == "first" {
 			return firstModel(ctx, req)
 		}
 		return secondModel(ctx, req)
-	}
+	}, nil)
 	prepared := preparedExecuting(exec)
 	h, cancel := newCancelableHarness(t, store, prepared, nil)
 	defer cancel()

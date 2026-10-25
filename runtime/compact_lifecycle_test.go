@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,6 +179,54 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			}
 		}
 		testassert.Require(t, sawInvalidation && sawDelta, "observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
+	})
+}
+
+// TestCompactLifecycleNativeCompactionAgentScopeCount counts the Agent-tier
+// scope constructions during one pressure-triggered submission on the native
+// pipeline: the conversation Engine call and the automatic summary Engine
+// call each open their own Agent-tier scope under one Operation.
+func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
+		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		var agOpens atomic.Int64
+		r, err := e.open(context.Background(), e.storagePlugin(store),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
+		testassert.NoError(t, err)
+		ctx := context.Background()
+
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
+				if lastUserText(body) == "first question" {
+					// The seed report: {5000,10} overflows the window 8192
+					// minus the reserve 4096.
+					return append(textTurnEvents("seeded answer"),
+						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
+				}
+				return nil // conversation turns: the default completed text turn
+			}
+			return append(textTurnEvents("native summary one"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+		})
+
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+
+		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
+		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess) // the seed turn commits the overflowing report
+
+		before := agOpens.Load()
+		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
+		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
+		testassert.Require(t, op2.State.Status == harness.OperationSuccess, "overflowing operation = %+v, want the compacted success", op2.State)
+		after := agOpens.Load()
+		testassert.Require(t, after-before == 2, "Agent-tier scope openings during the pressure-triggered submission = %d, want the conversation Engine call and the summary Engine call each open one", after-before)
+
+		submitConvergedThroughRuntime(t, r, sessionID, "op-3", "second question", harness.OperationSuccess)
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 

@@ -87,6 +87,13 @@ func transportExecution(srv *httptest.Server, retry RetryPolicy) Execution {
 	return exec
 }
 
+// modelEffectOver returns the model effect over the given execution and its
+// opened conversation invocation — the direct effect fixtures' shape.
+func modelEffectOver(t *testing.T, h *Harness, c *coordinator, exec Execution, capture ExecutionCapture) agent.ModelEffect {
+	t.Helper()
+	return h.modelEffect(c, testOpID, exec, openedConversation(t, exec), capture)
+}
+
 // retrySpy is the fixtures' captured retry policy: up to limit retries of any
 // failure with zero delay, recording every observed failure and 1-based
 // attempt number.
@@ -152,7 +159,7 @@ func TestModelEffectRetriesTransportFailures(t *testing.T) {
 	)
 	spy := &retrySpy{limit: 2}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := h.modelEffect(c, testOpID, transportExecution(srv, spy.retry), testCapture())
+	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
 	assemblies := 0
 	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		assemblies++
@@ -190,7 +197,7 @@ func TestModelEffectExhaustedRetriesSettleFailure(t *testing.T) {
 	srv, hits, _ := sseChatServer(t, scriptedResponses{status: http.StatusTooManyRequests})
 	spy := &retrySpy{limit: 2}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := h.modelEffect(c, testOpID, transportExecution(srv, spy.retry), testCapture())
+	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
 	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(model.ModelRef, model.Stream) (model.Output, error) {
 		t.Fatalf("assembly callback ran for a never-accepted attempt")
 		return model.Output{}, nil
@@ -217,7 +224,7 @@ func TestModelEffectConnectionFailureRetries(t *testing.T) {
 	t.Run("retryable connection failure exhausts through the policy", func(t *testing.T) {
 		spy := &retrySpy{limit: 1}
 		h, store, c, sessionID := newEffectHarness(t, nil)
-		me := h.modelEffect(c, testOpID, transportExecution(srv, spy.retry), testCapture())
+		me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
 		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
@@ -230,7 +237,7 @@ func TestModelEffectConnectionFailureRetries(t *testing.T) {
 	t.Run("unretryable connection failure stops at the first attempt", func(t *testing.T) {
 		spy := &retrySpy{limit: 0}
 		h, _, c, _ := newEffectHarness(t, nil)
-		me := h.modelEffect(c, testOpID, transportExecution(srv, spy.retry), testCapture())
+		me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
 		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
@@ -244,7 +251,7 @@ func TestModelEffectConnectionFailureRetries(t *testing.T) {
 			return -time.Second, true
 		}
 		h, _, c, _ := newEffectHarness(t, nil)
-		me := h.modelEffect(c, testOpID, transportExecution(srv, policy), testCapture())
+		me := modelEffectOver(t, h, c, transportExecution(srv, policy), testCapture())
 		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
@@ -273,7 +280,7 @@ func TestModelEffectAttemptFailureUnderCancellationSettlesInterruption(t *testin
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	exec := effectExecution(modelFn, nil)
 	exec.Retry = policy
-	me := h.modelEffect(c, testOpID, exec, testCapture())
+	me := modelEffectOver(t, h, c, exec, testCapture())
 	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
@@ -298,7 +305,7 @@ func TestModelEffectNilRetryCancelsDuringStandardBackoff(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		cancel() // observed execution cancellation during the Harness-owned wait
 	}()
-	me := h.modelEffect(c, testOpID, transportExecution(srv, nil), testCapture())
+	me := modelEffectOver(t, h, c, transportExecution(srv, nil), testCapture())
 	started := time.Now()
 	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 	elapsed := time.Since(started)
@@ -373,7 +380,7 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 	})
 	spy := &retrySpy{limit: 5}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := h.modelEffect(c, testOpID, transportExecution(srv, spy.retry), testCapture())
+	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
 	set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoContinue)
@@ -418,7 +425,7 @@ func TestModelEffectOneAssemblyAndClose(t *testing.T) {
 		return stream, nil
 	}, nil)
 	assemblies := 0
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, testCapture()), defaultModelRequest(t), func(source model.ModelRef, s model.Stream) (model.Output, error) {
+	set, err := invokeModelEffect(t, modelEffectOver(t, h, c, exec, testCapture()), defaultModelRequest(t), func(source model.ModelRef, s model.Stream) (model.Output, error) {
 		assemblies++
 		return agent.Assemble(context.Background(), source, s)
 	})
@@ -439,7 +446,7 @@ func TestModelEffectInvalidAttemptOutcomeSettlesBoundaryFailure(t *testing.T) {
 		exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 			return stream, errors.New("ambiguous outcome")
 		}, nil)
-		me := h.modelEffect(c, testOpID, exec, testCapture())
+		me := modelEffectOver(t, h, c, exec, testCapture())
 		_, boundaryErr := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.Require(t, boundaryErr != nil, "model effect settled, want the boundary failure")
 		testassert.Equal(t, stream.closes, 1)
@@ -454,7 +461,7 @@ func TestModelEffectInvalidAttemptOutcomeSettlesBoundaryFailure(t *testing.T) {
 		exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 			return nil, nil
 		}, nil)
-		me := h.modelEffect(c, testOpID, exec, testCapture())
+		me := modelEffectOver(t, h, c, exec, testCapture())
 		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.Require(t, err != nil, "model effect settled, want the boundary failure")
 		requireIntentAndResultCounts(t, h, store, sessionID, false)

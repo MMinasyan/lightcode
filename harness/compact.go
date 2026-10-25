@@ -68,8 +68,10 @@ func serializeCompactionMessages(messages []model.Message) ([]string, error) {
 // effect's own shape, and the run's callback gate requires it whenever the
 // assembly callback ran — while pre-assembly failures and cancellations
 // return no output.
-func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture, reported **UsageCount) agent.ModelEffect {
-	attempt := exec.CompactModel
+// no output. The invocation's callbacks come from the opened maintenance
+// invocation; its retry classifier is the enclosing Operation's.
+func (h *Harness) compactModelEffect(c *coordinator, operationID string, inv InvocationExecution, retry RetryPolicy, capture ExecutionCapture, reported **UsageCount) agent.ModelEffect {
+	attempt := inv.Model
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -118,7 +120,7 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 		// identical to the conversation model effect's but running through the
 		// compact transport.
 		var output model.Output
-		switch res := runModelAttempts(ctx, req, attempt, exec.Retry); res.kind {
+		switch res := runModelAttempts(ctx, req, attempt, retry); res.kind {
 		case attemptAccepted:
 			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
 			if attemptErr != nil {
@@ -188,32 +190,65 @@ func (h *Harness) compactModelEffect(c *coordinator, operationID string, exec Ex
 // conversation minus the leading system message, supplied by the caller — is
 // serialized into inert transcript lines and joined whole into one user
 // message: the complete input is sent as one logical full-input request,
-// never split. The fixed no-Session Agent runs once: the captured compact
+// never split. The orchestration opens one maintenance invocation for the
+// strategy model request it sends, with a fresh per-call identity, the
+// maintenance purpose, and the captured compact model; an invocation the
+// opener rejects cleans its own provisional resources. The always-returned
+// non-nil closer disposes the opened maintenance invocation exactly once on
+// the retained cleanup path: for a final maintenance stage the caller runs it
+// only after the checkpoint/terminal transaction has committed — for a failure
+// whose terminal already settled inside the orchestration the caller runs it
+// immediately. The fixed no-Session Agent runs once: the captured compact
 // prompt as the system message, the serialized conversation as the user
-// message, the compact model effect over the compact transport, and a tool
-// boundary that rejects any hallucinated dispatch. The orchestration's
-// reported-usage slot is set by the effect from the assembled output before
-// that output settles and read after the run returns: a nil slot means the
-// summary reported no usage, and a reported zero stays known zero. The
-// summary candidate and that usage are returned to the caller — the commit is
-// the caller's. A textless completed summary fails the orchestration after
-// its ready settlement. A summary failure or interruption settles durably
-// inside its own effect; a run-level terminal or any other failure — a
+// message, the compact model effect over the opened invocation's model
+// callback, and a tool boundary that rejects any hallucinated dispatch. The
+// orchestration's reported-usage slot is set by the effect from the assembled
+// output before that output settles and read after the run returns: a nil
+// slot means the summary reported no usage, and a reported zero stays known
+// zero. The summary candidate and that usage are returned to the caller — the
+// commit is the caller's. A textless completed summary fails the orchestration
+// after its ready settlement. A summary failure or interruption settles
+// durably inside its own effect; a run-level terminal or any other failure — a
 // pre-run cancellation, a cancellation observed after the settled summary
 // result, an empty snapshot, an empty summary, an error after the settled
 // result — settles directly on the quiet running Operation with the slot's
 // usage keyed by the compact model. No compaction entry is written on any
 // failure path.
-func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operationID string, exec Execution, capture ExecutionCapture, snapshot []model.Message) (string, *UsageCount, error) {
+func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operationID string, exec Execution, capture ExecutionCapture, snapshot []model.Message) (string, *UsageCount, func() error, error) {
+	closeInvocation := func() error { return nil } // a stage that opened no invocation disposes nothing
 	if len(snapshot) == 0 {
-		return "", nil, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("nothing to compact"), capture, nil)
+		return "", nil, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("nothing to compact"), capture, nil)
 	}
 	lines, err := serializeCompactionMessages(snapshot)
 	if err != nil {
-		return "", nil, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, nil)
+		return "", nil, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, nil)
+	}
+	invocationID, err := newHexID() // the maintenance Engine call's fresh per-invocation identity
+	if err != nil {
+		return "", nil, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, fmt.Errorf("%w: %v", ErrStorage, err), capture, nil)
+	}
+	inv, err := exec.OpenInvocation(execCtx, InvocationRequest{
+		ID:      invocationID,
+		Purpose: InvocationPurposeMaintenance,
+		Model:   capture.Compact.Model,
+	})
+	if err != nil {
+		return "", nil, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, nil)
+	}
+	if err := validateOpenedInvocation(inv); err != nil {
+		if inv.Close != nil {
+			h.recordCleanupFailure(inv.Close()) // an invalid invocation cleans its own opened resources
+		}
+		return "", nil, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, nil)
+	}
+	closeInvocation = func() error { // the opened maintenance invocation disposes on the retained cleanup path
+		if inv.Close != nil {
+			h.recordCleanupFailure(inv.Close())
+		}
+		return nil
 	}
 	var reported *UsageCount
-	effect := h.compactModelEffect(c, operationID, exec, capture, &reported)
+	effect := h.compactModelEffect(c, operationID, inv, exec.Retry, capture, &reported)
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: capture.Compact.Model,
 		Request: func(context.Context) (model.Request, error) {
@@ -228,7 +263,7 @@ func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operati
 		},
 	})
 	if runErr != nil {
-		return "", reported, h.settleCompactionFailure(c, operationID, OperationFailure, runErr, capture, reported)
+		return "", reported, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, runErr, capture, reported)
 	}
 	switch res.Status {
 	case agent.TerminalSuccess:
@@ -238,9 +273,9 @@ func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operati
 			// fails the orchestration after its ready settlement: no
 			// retry, the direct settlement carrying the retained detail
 			// and the reported usage.
-			return "", reported, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("compaction summary is empty"), capture, reported)
+			return "", reported, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, errors.New("compaction summary is empty"), capture, reported)
 		}
-		return summary, reported, nil
+		return summary, reported, closeInvocation, nil
 	default:
 		// A run-level terminal — a pre-run cancellation, or a cancellation
 		// observed after the settled summary result before the run's
@@ -252,7 +287,7 @@ func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operati
 		if res.Status == agent.TerminalInterruption {
 			terminal = OperationInterruption
 		}
-		return "", reported, h.settleCompactionFailure(c, operationID, terminal, errors.New(res.Detail), capture, reported)
+		return "", reported, closeInvocation, h.settleCompactionFailure(c, operationID, terminal, errors.New(res.Detail), capture, reported)
 	}
 }
 

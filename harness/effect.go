@@ -73,18 +73,21 @@ type modelResult struct {
 	successContext context.Context
 }
 
-// modelEffect encloses one complete invocation of the prepared model function
-// in one logical model-effect intent/result pair: it commits the active-effect
-// intent, makes the physical attempts with their retry classification and
-// backoff, invokes the assembly callback exactly once after a stream is
-// accepted, derives the settlement from the assembled output, validates it,
-// and commits the result and complete next Operation state before returning
-// the committed settlement. Before the assistant entry commits, every
-// advertised completed call is normalized through the execution's pure
-// callback outside storage transactions and owning locks.
-func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ModelEffect {
-	attempt := exec.Model
-	normalize := exec.NormalizeTool
+// modelEffect encloses one complete invocation of the opened conversation
+// invocation's model function in one logical model-effect intent/result pair:
+// it commits the active-effect intent, makes the physical attempts with their
+// retry classification and backoff, invokes the assembly callback exactly once
+// after a stream is accepted, derives the settlement from the assembled
+// output, validates it, and commits the result and complete next Operation
+// state before returning the committed settlement. Before the assistant entry
+// commits, every advertised completed call is normalized through the
+// invocation's pure callback outside storage transactions and owning locks.
+// The automatic compaction trigger opens and closes its own maintenance
+// invocation per summary request over the execution opener; the retry
+// classifier and the maintenance factory belong to the enclosing Execution.
+func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution, inv InvocationExecution, capture ExecutionCapture) agent.ModelEffect {
+	attempt := inv.Model
+	normalize := inv.NormalizeTool
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		// The compaction trigger sits before every model boundary, before any
 		// intent commits: the newest reported conversation usage after the
@@ -116,13 +119,16 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
 				snapshot = snapshot[1:]
 			}
-			summary, usage, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot)
+			summary, usage, closeMaintenance, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot)
 			if err != nil {
+				closeMaintenance() // the failure terminal already settled inside the orchestration: dispose now
 				return compactionFailureSettlement(c, operationID, err)
 			}
 			if err := h.commitCompaction(c, operationID, capture, summary, len(snapshot), usage, false); err != nil {
+				closeMaintenance()
 				return compactionFailureSettlement(c, operationID, err)
 			}
+			closeMaintenance() // the committed checkpoint precedes the maintenance stage's disposal
 			messages, err := h.projectContext(c, operationID)
 			if err != nil {
 				return compactionFailureSettlement(c, operationID, err)
@@ -1128,9 +1134,11 @@ func boundedToolDiagnostic(cause error) string {
 // denied and no metadata, no concrete effect and no tool active intent; later
 // calls still run. An allowed executor commits intent, executes once behind
 // the cancellation-before-start gate, and commits one validated outcome — a
-// returned real outcome wins a cancellation race.
-func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ToolEffect {
-	prepared := exec.Tool
+// returned real outcome wins a cancellation race. The preparation and
+// normalization callbacks come from the opened conversation invocation; the
+// permission policy from the enclosing Execution.
+func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution, inv InvocationExecution, capture ExecutionCapture) agent.ToolEffect {
+	prepared := inv.Tool
 	return func(ctx context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
 		pending, record, err := pendingToolCallRecord(c, operationID, call.ID)
 		if err != nil {
@@ -1165,8 +1173,8 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 		// unhooked original is normalized again, solely to obtain its useful
 		// validation diagnostic.
 		selected := record.NormalizedArguments
-		if len(exec.ToolHooks) > 0 {
-			final, settled, herr := h.runArgumentHooks(ctx, settleCtx, c, operationID, pending, record, exec)
+		if len(inv.ToolHooks) > 0 {
+			final, settled, herr := h.runArgumentHooks(ctx, settleCtx, c, operationID, pending, record, inv)
 			if herr != nil {
 				return model.ToolResult{}, herr
 			}
@@ -1179,7 +1187,7 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 			if derr != nil { // a non-canonical durable record is corruption, not empty arguments
 				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
 			}
-			normalized, nerr := normalizeCallArguments(exec.NormalizeTool, model.ToolCall{ID: record.ID, Name: record.Name, Arguments: raw, Extra: record.Extra})
+			normalized, nerr := normalizeCallArguments(inv.NormalizeTool, model.ToolCall{ID: record.ID, Name: record.Name, Arguments: raw, Extra: record.Extra})
 			if nerr != nil {
 				if errors.Is(nerr, errMalformedNormalization) { // a malformed callback outcome stays the internal-validation error
 					return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, false)
@@ -1470,15 +1478,15 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 // the final committed value, or the committed tool result when the chain
 // settled the call, or the error a failed intent/result transaction leaves
 // for normal recovery.
-func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, exec Execution) (json.RawMessage, *model.ToolResult, error) {
+func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, inv InvocationExecution) (json.RawMessage, *model.ToolResult, error) {
 	raw, err := base64.StdEncoding.DecodeString(record.ArgumentsBase64)
 	if err != nil { // a non-canonical durable record is corruption, not empty arguments
 		settled, serr := h.settleHooklessInvalid(settleCtx, c, operationID, pending)
 		return nil, settled, serr
 	}
 	current := raw
-	for _, hook := range exec.ToolHooks {
-		committed, settled, hookErr := h.runOneHook(ctx, settleCtx, c, operationID, pending, record, hook, exec.NormalizeTool, current)
+	for _, hook := range inv.ToolHooks {
+		committed, settled, hookErr := h.runOneHook(ctx, settleCtx, c, operationID, pending, record, hook, inv.NormalizeTool, current)
 		if hookErr != nil || settled != nil {
 			return nil, settled, hookErr
 		}
@@ -1737,15 +1745,19 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 // admission. An opener error resolves through the ordinary outer terminal
 // settlement: cancellation interrupts, a storage failure retains the running
 // state for recovery, and any other error fails. A canceled execution skips
-// an unstarted opener. A cleanup failure never rewrites the terminal
-// Operation; it is retained for Wait alongside the first storage failure.
-func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) (*agent.TerminalResult, func() error, error) {
+// an unstarted opener. The conversation Engine call opens exactly one
+// invocation immediately before its run, and every opened invocation is
+// validated as its own contract. A cleanup failure never rewrites the terminal
+// Operation; it is retained for Wait alongside the first storage failure. The
+// returned closers run in order: the opened conversation invocation first,
+// then the opened execution.
+func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedExecution, execCtx context.Context) (*agent.TerminalResult, func() error, func() error, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return nil, nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return nil, nil, nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
 	admission := ownOperationRecord(op).Admission
 	agentCapture := ownCapture(admission.Execution)
@@ -1759,61 +1771,90 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		if err == nil {
 			err = context.Canceled
 		}
-		return &agent.TerminalResult{}, nil, err
+		return &agent.TerminalResult{}, nil, nil, err
 	}
 	exec, err := prepared.Open(execCtx, admission)
 	if err != nil {
-		return &agent.TerminalResult{}, nil, err
+		return &agent.TerminalResult{}, nil, nil, err
 	}
-	if exec.Model == nil || exec.CompactModel == nil || exec.Tool == nil || exec.NormalizeTool == nil {
+	if exec.OpenInvocation == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
 		}
-		return &agent.TerminalResult{}, nil,
-			invalidInput("opened execution requires non-nil model, compact model, tool and normalization functions")
-	}
-	seenHooks := make(map[string]bool, len(exec.ToolHooks))
-	for _, hook := range exec.ToolHooks {
-		if hook.ID == "" || hook.Run == nil || seenHooks[hook.ID] {
-			if exec.Close != nil {
-				h.recordCleanupFailure(exec.Close())
-			}
-			return &agent.TerminalResult{}, nil,
-				invalidInput("opened execution requires a non-empty unique ID and a non-nil run function for every argument hook")
-		}
-		seenHooks[hook.ID] = true
+		return &agent.TerminalResult{}, nil, nil,
+			invalidInput("opened execution requires a non-nil invocation opener")
 	}
 	// A compact Operation wires no conversation Agent invocation: it projects
 	// the pure conversation snapshot — the projected messages minus the
 	// leading system message, with no compact input to exclude — runs the
 	// orchestration over it, and commits the manual compaction whose one
-	// transaction also settles the Operation's success. Every orchestration
-	// failure or interruption has already settled the terminal durably with
-	// the reported usage (a summary failure inside its own effect, any other
-	// failure through the direct terminal settlement), and only an actually
-	// empty conversation fails with the retained detail.
+	// transaction also settles the Operation's success. The orchestration
+	// opens its own maintenance invocations; every orchestration failure or
+	// interruption has already settled the terminal durably with the reported
+	// usage (a summary failure inside its own effect, any other failure
+	// through the direct terminal settlement), and only an actually empty
+	// conversation fails with the retained detail.
 	if admission.RequestKind == RequestKindCompact {
 		messages, err := h.projectContext(c, operationID)
 		if err != nil {
-			return nil, exec.Close, err
+			return nil, nil, exec.Close, err
 		}
 		snapshot := messages
 		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
 			snapshot = snapshot[1:]
 		}
-		summary, usage, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
+		summary, usage, closeMaintenance, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot)
 		if err != nil {
-			return nil, exec.Close, err
+			return nil, closeMaintenance, exec.Close, err
 		}
-		return nil, exec.Close, h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
+		// The completion owner closes the maintenance invocation only after
+		// this returned transaction — the manual compaction's commit is also
+		// its terminal settlement — so the checkpoint precedes the disposal.
+		return nil, closeMaintenance, exec.Close, h.commitCompaction(c, operationID, agentCapture, summary, len(snapshot), usage, true)
+	}
+	invocationID, err := newHexID() // the Engine call's fresh per-invocation identity
+	if err != nil {
+		return &agent.TerminalResult{}, nil, exec.Close, fmt.Errorf("%w: %v", ErrStorage, err)
+	}
+	inv, err := exec.OpenInvocation(execCtx, InvocationRequest{
+		ID:      invocationID,
+		Purpose: InvocationPurposeConversation,
+		Model:   agentCapture.Model,
+	})
+	if err != nil {
+		return &agent.TerminalResult{}, nil, exec.Close, err
+	}
+	if err := validateOpenedInvocation(inv); err != nil {
+		if inv.Close != nil {
+			h.recordCleanupFailure(inv.Close())
+		}
+		return &agent.TerminalResult{}, nil, exec.Close, err
 	}
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Request:       h.requestSource(c, operationID, agentCapture),
-		ModelEffect:   h.modelEffect(c, operationID, exec, agentCapture),
-		ToolEffect:    h.toolEffect(c, operationID, exec, agentCapture),
+		ModelEffect:   h.modelEffect(c, operationID, exec, inv, agentCapture),
+		ToolEffect:    h.toolEffect(c, operationID, exec, inv, agentCapture),
 	})
-	return &res, exec.Close, runErr
+	return &res, inv.Close, exec.Close, runErr
+}
+
+// validateOpenedInvocation is the opened invocation's contract: a successful
+// Model, Tool and NormalizeTool must be non-nil, and every ToolHooks entry
+// requires a non-empty unique ID and a non-nil Run. An invalid invocation
+// closes its own opened resources before the rejection returns.
+func validateOpenedInvocation(inv InvocationExecution) error {
+	if inv.Model == nil || inv.Tool == nil || inv.NormalizeTool == nil {
+		return invalidInput("opened invocation requires non-nil model, tool and normalization functions")
+	}
+	seenHooks := make(map[string]bool, len(inv.ToolHooks))
+	for _, hook := range inv.ToolHooks {
+		if hook.ID == "" || hook.Run == nil || seenHooks[hook.ID] {
+			return invalidInput("opened invocation requires a non-empty unique ID and a non-nil run function for every argument hook")
+		}
+		seenHooks[hook.ID] = true
+	}
+	return nil
 }
 
 // finishExecution is the one completion owner of a finished execution: it
@@ -1821,12 +1862,13 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 // terminal settlement and releases it as a local deferred call, settles a
 // non-nil terminal exactly once through the shared publisher (a nil terminal
 // preserves the already-owned compact/lookup outcome without another
-// attempt), records the resulting storage-class error once, invokes a
-// non-nil Close once and records its cleanup error, and invokes the ordinary
-// drain while the reservation is held so a successor installs before the
-// release. A canceled contended acquisition skips only the drain. Cleanup
-// errors keep their existing Wait owner.
-func (h *Harness) finishExecution(c *coordinator, run *activeExecution, operationID string, res *agent.TerminalResult, runErr error, closeExecution func() error) error {
+// attempt), records the resulting storage-class error once, closes a
+// non-nil opened invocation once, then a non-nil execution Close once, then
+// releases the adopted preparation reservation once — every retained cleanup
+// error keeps its existing Wait owner — and invokes the ordinary drain while
+// the reservation is held so a successor installs before the release. A
+// canceled contended acquisition skips only the drain.
+func (h *Harness) finishExecution(c *coordinator, run *activeExecution, operationID string, prepared PreparedExecution, res *agent.TerminalResult, runErr error, closeInvocation, closeExecution func() error) error {
 	release, reserveErr := h.reserve(h.ctx, c)
 	if reserveErr == nil {
 		defer release()
@@ -1836,9 +1878,13 @@ func (h *Harness) finishExecution(c *coordinator, run *activeExecution, operatio
 		err = h.settleAgentTerminal(c, operationID, *res, runErr, run.execCtx)
 	}
 	h.recordStorageFailure(err) // the sole storage-class recorder, including nil-terminal outcomes
+	if closeInvocation != nil {
+		h.recordCleanupFailure(closeInvocation())
+	}
 	if closeExecution != nil {
 		h.recordCleanupFailure(closeExecution())
 	}
+	h.releasePrepared(&prepared) // the adopted reservation releases after the execution's Close, on every completion path
 	if reserveErr == nil {
 		h.drainBuffers(c, run)
 	}

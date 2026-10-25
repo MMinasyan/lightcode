@@ -252,10 +252,10 @@ func newCompactRecordingServer(t *testing.T) *compactRecordingServer {
 	return s
 }
 
-// TestConcreteOpenerCompactModel proves the opener's CompactModel callback
-// reaches the compact model's transport — its catalog model and resolved
-// credential — and that when the effective compact model is the conversation
-// model the closure is built identically over the same transport.
+// TestConcreteOpenerCompactModel proves the invocation factory's maintenance
+// Model callback reaches the compact model's transport — its catalog model and
+// resolved credential — and that when the effective compact model is the
+// conversation model the closure is built identically over the same transport.
 func TestConcreteOpenerCompactModel(t *testing.T) {
 	conversationRef := model.ModelRef{Provider: "prov", Model: "m"}
 	cases := []struct {
@@ -273,33 +273,44 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 			sel := compactPrepSelection(t, captured, "solo")
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			testassert.NoError(t, err)
-			exec, err := opener(context.Background(), harness.OperationAdmission{
+			admission := harness.OperationAdmission{
 				SessionID:   "000000000000000000000000000000aa",
 				OperationID: "op-1",
 				AgentType:   "solo",
 				Execution:   capture,
 				AdmittedAt:  time.Now(),
-			}, sel)
+			}
+			inv, err := opener(context.Background(), admission, sel, harness.InvocationRequest{
+				ID:      "inv-maintenance",
+				Purpose: harness.InvocationPurposeMaintenance,
+				Model:   capture.Compact.Model,
+			})
 			testassert.NoError(t, err)
-			testassert.Require(t, exec.CompactModel != nil, "opened execution carries no CompactModel callback")
+			testassert.Require(t, inv.Model != nil, "opened maintenance invocation carries no Model callback")
 			req, err := model.NewRequest(model.Request{Messages: []model.Message{{
 				Role:    "user",
 				Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}},
 			}}})
 			testassert.NoError(t, err)
-			stream, err := exec.CompactModel(context.Background(), req)
+			stream, err := inv.Model(context.Background(), req)
 			testassert.NoError(t, err)
 			stream.Close()
-			testassert.Require(t, len(server.models) == 1 && server.models[0] == tc.wantCompactOn && len(server.auths) == 1 && server.auths[0] == "Bearer compact-secret", "CompactModel wire models = %v, want exactly one request on %q; CompactModel authorization = %v, want the compact transport's resolved credential", server.models, tc.wantCompactOn, server.auths)
+			testassert.Require(t, len(server.models) == 1 && server.models[0] == tc.wantCompactOn && len(server.auths) == 1 && server.auths[0] == "Bearer compact-secret", "maintenance Model wire models = %v, want exactly one request on %q; maintenance Model authorization = %v, want the compact transport's resolved credential", server.models, tc.wantCompactOn, server.auths)
 
-			// The conversation callback rides its own transport in the same
-			// execution; when the compact model is the conversation model the
-			// two closures are built identically over the one shared
-			// transport, so both hit the same wire model and credential.
-			stream, err = exec.Model(context.Background(), req)
+			// The conversation invocation's callback rides its own transport;
+			// when the compact model is the conversation model the two closures
+			// are built identically over the one shared transport, so both hit
+			// the same wire model and credential.
+			conv, err := opener(context.Background(), admission, sel, harness.InvocationRequest{
+				ID:      "inv-conversation",
+				Purpose: harness.InvocationPurposeConversation,
+				Model:   capture.Model,
+			})
+			testassert.NoError(t, err)
+			stream, err = conv.Model(context.Background(), req)
 			testassert.NoError(t, err)
 			stream.Close()
-			testassert.Require(t, len(server.models) == 2 && server.models[1] == "m", "Model wire models = %v, want the conversation model second", server.models)
+			testassert.Require(t, len(server.models) == 2 && server.models[1] == "m", "conversation Model wire models = %v, want the conversation model second", server.models)
 			testassert.Require(t, capture.Compact.Model != conversationRef || server.auths[1] == server.auths[0], "conversation authorization = %q differs from the compact one %q on the shared-model case", server.auths[1], server.auths[0])
 		})
 	}

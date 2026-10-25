@@ -66,20 +66,21 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: hookNormalize,
-						ToolHooks:     hooks,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							mu.Lock()
-							prepared = append(prepared, string(call.Arguments))
-							mu.Unlock()
-							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-								Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-							}}
-						},
-					}, nil
+					return harness.Execution{OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+						return harness.InvocationExecution{
+							Model:         script.effect,
+							NormalizeTool: hookNormalize,
+							ToolHooks:     hooks,
+							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+								mu.Lock()
+								prepared = append(prepared, string(call.Arguments))
+								mu.Unlock()
+								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+									Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+								}}
+							},
+						}, nil
+					}}, nil
 				},
 			}, nil
 		}

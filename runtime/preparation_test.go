@@ -1327,6 +1327,7 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 			e.admit(session, "op-1", "one")
 			rec := e.awaitTerminal(session, "op-1", harness.OperationFailure)
 			testassert.Require(t, rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, errOpen.Error()), "operation state = %+v, want the failure carrying the opening error", rec.State)
+			e.awaitEvent("op-close") // the execution's own Close unwinds the opened Operation scope after the settlement
 			events := e.events.all()
 			testassert.Require(t, slices.Contains(events, "op-open:op-1") && !slices.Contains(events, "ag-open") && !slices.Contains(events, "ag-close") && slices.Contains(events, "op-close"), "events = %v, want the Operation scope constructed before the failure; events = %v, want no Agent scope constructed through the failed opening; events = %v, want the owned Operation scope unwound", events, events, events)
 			testassert.Equal(t, e.agOpens.Load(), 0)

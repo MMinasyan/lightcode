@@ -101,6 +101,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return h.forkTransaction(tx, destID, view, req, content, capture, &commit)
 	})
 	if txErr != nil {
+		h.releasePrepared(&prepared) // the fork never adopts: its transaction failed or resolved to an existing destination
 		h.markCorrupt(req.SourceSessionID, txErr)
 		if errors.Is(txErr, ErrConflict) {
 			// first-writer resolution: the same exact lookup runs once; the

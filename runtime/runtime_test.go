@@ -426,14 +426,15 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 						<-release
 						return nil, errors.New("seeded execution released after the test converged")
 					}
-					return harness.Execution{
-						NormalizeTool: runtimeNormalize,
-						Model:         modelFn,
-						CompactModel:  modelFn,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
-						},
-					}, nil
+					return harness.Execution{OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+						return harness.InvocationExecution{
+							NormalizeTool: runtimeNormalize,
+							Model:         modelFn,
+							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
+							},
+						}, nil
+					}}, nil
 				},
 			}, nil
 		},

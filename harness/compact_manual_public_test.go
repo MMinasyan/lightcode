@@ -681,21 +681,26 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 				return harness.PreparedExecution{
 					Capture: compactManualCapture(),
 					Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-						return harness.Execution{
-							Model: conversation.effect,
-							CompactModel: func(ctx context.Context, _ model.Request) (model.Stream, error) {
-								select {
-								case summaryStarted <- struct{}{}:
-								default:
+						return harness.Execution{OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+							attempt := conversation.effect
+							if request.Purpose == harness.InvocationPurposeMaintenance {
+								attempt = func(ctx context.Context, _ model.Request) (model.Stream, error) {
+									select {
+									case summaryStarted <- struct{}{}:
+									default:
+									}
+									<-ctx.Done() // the interrupt ends the parked summary request
+									return nil, ctx.Err()
 								}
-								<-ctx.Done() // the interrupt ends the parked summary request
-								return nil, ctx.Err()
-							},
-							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-								return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-							},
-							NormalizeTool: publicNormalize,
-						}, nil
+							}
+							return harness.InvocationExecution{
+								Model: attempt,
+								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+								},
+								NormalizeTool: publicNormalize,
+							}, nil
+						}}, nil
 					},
 				}, nil
 			}

@@ -22,11 +22,12 @@ import (
 // request bodies and SSE chunks dump under the home-based private directory.
 const debugWireEnv = "LIGHTCODE_DEBUG_WIRE"
 
-// openExecution turns one committed admission and the opened execution scope
-// view into the execution the Harness runs. The opener is the preparation's
-// only associated continuation: there is no intermediate execution-plan type
-// and no independently configured opener.
-type openExecution func(context.Context, harness.OperationAdmission, selection) (harness.Execution, error)
+// openInvocation turns one committed admission's execution-view selection and
+// one Harness-issued Engine-call request into that invocation's opened
+// callback contracts. It is the preparation's only associated continuation:
+// there is no intermediate execution-plan type and no independently
+// configured opener.
+type openInvocation func(context.Context, harness.OperationAdmission, selection, harness.InvocationRequest) (harness.InvocationExecution, error)
 
 // selection is one immutable preparation or execution input set: owned Agent
 // data, the selected capability bindings currently supplied by the scopes
@@ -266,19 +267,22 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 
 // open turns the committed admission into the execution: it first acquires
 // the Session's whole artifact interval — before any scope, plugin, model,
-// tool or hook effect — then opens the Operation then the Agent scope, enters
-// the Agent-scope guard, creates the execution selection from the same
-// snapshot, and hands that new value with the actual committed admission to
-// this preparation's opener, so hooks' final prompt and tools can never be
-// replaced by stale pre-hook values. The guard covers opening, every
-// Harness-driven effect callback and terminal settlement until the returned
-// Close releases it and closes the Agent then the Operation scope; the
-// artifact token releases last, after that scoped cleanup, and an opening
-// failure releases it before returning. Only after the opener succeeds does
-// the collected prompt presentation publish, so a failed fork or admission
-// never creates warnings for an unpublished Session and a successful opener
-// publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openExecution) (harness.Execution, error) {
+// tool or hook effect — then opens only the Operation scope and enters its
+// guard. The returned Execution carries the invocation factory: every Engine
+// call — the conversation run and each maintenance model request — opens its
+// own Agent-tier scope over the same Operation, enters its guard, selects the
+// Agent's capabilities over the four scopes, and hands the new selection with
+// the actual committed admission and the Harness-issued request to this
+// preparation's opener, so hooks' final prompt and tools can never be replaced
+// by stale pre-hook values. The Operation guard covers opening and every
+// nested invocation until the returned Close releases it and closes the
+// Operation scope; each invocation's own Close releases its guard and closes
+// its Agent scope before that; the artifact token releases last, after all
+// scoped cleanup, and an opening failure releases it before returning. Only
+// after the opening succeeds does the collected prompt presentation publish,
+// so a failed fork or admission never creates warnings for an unpublished
+// Session and a successful opener publishes before any progress.
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openInvocation) (harness.Execution, error) {
 	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(p.runtime.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
@@ -291,54 +295,56 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		releaseArtifacts()
 		return harness.Execution{}, err
 	}
-	agentInfo := base
-	agentInfo.Kind = ScopeAgent
-	agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
+	_, releaseOperation, err := operation.enter(ctx)
 	if err != nil {
 		err = errors.Join(err, operation.close())
-		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
+		releaseArtifacts() // the opened scope unwind finishes before the ownership releases
 		return harness.Execution{}, err
 	}
-	unwind := func(cause error, release func()) (harness.Execution, error) {
-		if release != nil {
-			release()
+	agentInfo := base
+	agentInfo.Kind = ScopeAgent
+	openInvocation := func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+		agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
+		if err != nil {
+			return harness.InvocationExecution{}, err
 		}
-		err := errors.Join(cause, agentScope.close(), operation.close())
-		releaseArtifacts() // the existing scope unwind finishes before the ownership releases
-		return harness.Execution{}, err
-	}
-	callCtx, release, err := agentScope.enter(ctx)
-	if err != nil {
-		return unwind(err, nil)
-	}
-	// The opener binds the Agent's declared tool exports — separately from
-	// the explicitly selected non-tool capability IDs.
-	bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, slices.Concat(agent.Capabilities, agent.Tools))
-	if err != nil {
-		return unwind(err, release)
-	}
-	hooks, err := bindToolArgumentHooks(agent.Capabilities, bindings, Invocation{snapshot: snapshot})
-	if err != nil {
-		return unwind(err, release)
-	}
-	execution, err := opener(callCtx, admission, selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}})
-	if err != nil {
-		return unwind(err, release)
+		unwind := func(cause error, release func()) (harness.InvocationExecution, error) {
+			if release != nil {
+				release()
+			}
+			return harness.InvocationExecution{}, errors.Join(cause, agentScope.close())
+		}
+		callCtx, releaseAgent, err := agentScope.enter(ctx)
+		if err != nil {
+			return unwind(err, nil)
+		}
+		// The invocation view binds the Agent's declared tool exports —
+		// separately from the explicitly selected non-tool capability IDs —
+		// over the freshly opened Agent tier.
+		bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, slices.Concat(agent.Capabilities, agent.Tools))
+		if err != nil {
+			return unwind(err, releaseAgent)
+		}
+		invocation, err := opener(callCtx, admission, selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}}, request)
+		if err != nil {
+			return unwind(err, releaseAgent)
+		}
+		invocation.Close = func() error {
+			releaseAgent()
+			return agentScope.close()
+		}
+		return invocation, nil
 	}
 	// The committed opener owns the collected presentation: the successful
 	// execution publishes its Session's prompt group before any model or tool
 	// progress.
 	warnings.publish(p.passive, admission.SessionID)
 	return harness.Execution{
-		Model:         execution.Model,
-		CompactModel:  execution.CompactModel,
-		Tool:          execution.Tool,
-		Permissions:   execution.Permissions,
-		NormalizeTool: execution.NormalizeTool,
-		ToolHooks:     hooks,
+		OpenInvocation: openInvocation,
+		Permissions:    snapshot.permissionPolicy(workspace),
 		Close: func() error {
-			release()
-			err := errors.Join(agentScope.close(), operation.close())
+			releaseOperation()
+			err := operation.close()
 			releaseArtifacts() // the token releases last, after the scoped cleanup
 			return err
 		},
@@ -391,13 +397,13 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 }
 
 // concretePrepare is the one production preparation. It consumes only the captured snapshot's inputs — the
-// catalog entry, the once-resolved credential, the effective permission
-// policy, and the composed prompt/tool surface — and returns the durable
-// capture plus the opener carrying the one constructed transport, the policy,
-// and the prepared workspace. Later configuration reloads and environment
-// changes never reach a prepared execution, and no transport input, secret,
-// or warning is stored beyond the durable capture fields.
-func (p *preparation) concretePrepare(_ context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openExecution, error) {
+// catalog entry, the once-resolved credential, and the composed prompt/tool
+// surface — and returns the durable capture plus the invocation factory
+// carrying the two constructed transports and the prepared workspace. Later
+// configuration reloads and environment changes never reach a prepared
+// execution, and no transport input, secret, or warning is stored beyond the
+// durable capture fields.
+func (p *preparation) concretePrepare(_ context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openInvocation, error) {
 	snapshot := sel.invocation.snapshot
 	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: sel.agent.Model.Provider, Model: sel.agent.Model.Model})
 	if err != nil {
@@ -494,7 +500,6 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		},
 	}
 	workspace := req.Session.Identity.Workspace
-	policy := snapshot.permissionPolicy(workspace)
 	// The prepared opener carries only the preparation-time credential
 	// names, never their values: the ToolContext's fixed callback filters
 	// those names from the live producer's snapshot, so a binding renamed or
@@ -503,7 +508,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	for name := range sel.credentials {
 		credentialNames = append(credentialNames, name)
 	}
-	return capture, p.concreteOpener(transport, compactTransport, policy, workspace, tools, credentialNames), nil
+	return capture, p.concreteOpener(transport, compactTransport, workspace, tools, credentialNames), nil
 }
 
 // outputReserve applies the retained reserve rule: the catalog entry's
@@ -646,30 +651,35 @@ func wireDebugDir(home string) string {
 	return dir
 }
 
-// concreteOpener returns the production opener: it binds every advertised
-// tool name from the execution-view bindings over all four scopes, owns one
-// ToolContext carrying the prepare-time Workspace, the calling Operation's
-// admitted-input identity, the captured Invocation and the validated hard
-// constraints, and returns the execution whose model callbacks each make
-// exactly one physical attempt — Model over the conversation transport and
-// CompactModel over the effective compact transport, the same construction
-// over the one shared transport when the compact model is the conversation
-// model. The ToolContext's environment callback is the preparation's fixed
-// wrapper over the Runtime's live producer: it filters the captured
-// credential names from every snapshot it returns, never rereads the
-// selected execution policy, and keeps the nil producer and nil snapshot
-// fail-closed shapes unchanged. The shared advertisement
-// gate rejects unknown names before dispatch; retry classification, selected
-// argument hooks, and scope disposal belong to the shared machinery.
-func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, policy harness.PermissionPolicy, workspace string, advertised []model.ToolDefinition, credentialNames []string) openExecution {
-	return func(_ context.Context, admission harness.OperationAdmission, sel selection) (harness.Execution, error) {
+// concreteOpener returns the production invocation factory: per Engine call
+// it binds every advertised tool name from that invocation's view over all
+// four scopes, binds the selected argument hooks, owns one ToolContext
+// carrying the prepare-time Workspace, the calling Operation's admitted-input
+// identity, the captured Invocation and the validated hard constraints, and
+// answers with the invocation whose model callback makes exactly one physical
+// attempt over the transport its request purpose selects — the conversation
+// transport for a conversation request and the effective compact transport for
+// a maintenance request, the same construction over the one shared transport
+// when the compact model is the conversation model. The ToolContext's
+// environment callback is the preparation's fixed wrapper over the Runtime's
+// live producer: it filters the captured credential names from every snapshot
+// it returns, never rereads the selected execution policy, and keeps the nil
+// producer and nil snapshot fail-closed shapes unchanged. The shared
+// advertisement gate rejects unknown names before dispatch; retry
+// classification and scope disposal belong to the shared machinery.
+func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, workspace string, advertised []model.ToolDefinition, credentialNames []string) openInvocation {
+	return func(_ context.Context, admission harness.OperationAdmission, sel selection, request harness.InvocationRequest) (harness.InvocationExecution, error) {
 		table := make(map[string]Tool, len(advertised))
 		for _, definition := range advertised {
 			tool, err := Bind[Tool](sel.bindings, definition.Name)
 			if err != nil {
-				return harness.Execution{}, err
+				return harness.InvocationExecution{}, err
 			}
 			table[definition.Name] = tool
+		}
+		hooks, err := bindToolArgumentHooks(sel.agent.Capabilities, sel.bindings, sel.invocation)
+		if err != nil {
+			return harness.InvocationExecution{}, err
 		}
 		subprocessEnv := p.subprocessEnv
 		if subprocessEnv != nil {
@@ -690,28 +700,26 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			Background:    p.background,
 			SubprocessEnv: subprocessEnv,
 		}
-		return harness.Execution{
+		attemptTransport := transport
+		if request.Purpose == harness.InvocationPurposeMaintenance {
+			attemptTransport = compactTransport
+		}
+		return harness.InvocationExecution{
 			Model: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, warnings, err := transport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
+				stream, warnings, err := attemptTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
 				// The attempt's diagnostics are recorded under the admitted
 				// Session identity even when the physical request failed after
 				// encoding succeeded — a diagnostic is presentation only.
 				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
 				return stream, err
 			},
-			CompactModel: func(ctx context.Context, req model.Request) (model.Stream, error) {
-				stream, warnings, err := compactTransport.Stream(ctx, req, nil) // runtime extras are a later phase's channel
-				p.passive.replaceProtocolWarnings(admission.SessionID, protocolWarnings(admission.SessionID, warnings))
-				return stream, err
-			},
-			// A nil Retry selects the standard classifier.
 			Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return table[call.Name].Prepare(ctx, tc, call)
 			},
-			Permissions: policy,
 			NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 				return table[call.Name].Normalize(tc, call)
 			},
+			ToolHooks: hooks,
 		}, nil
 	}
 }
