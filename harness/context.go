@@ -12,36 +12,40 @@ import (
 )
 
 // errSteeringBoundary is the one package-private non-cancellation context
-// token: a conversation boundary returns it instead of projecting another
+// token: a conversation boundary returns it instead of supplying another
 // request while steering waits. Agent.Run hands a non-cancellation context
 // error back verbatim with a zero terminal, and the outer terminal settlement
 // consumes this token by exact identity before its guards. It is produced
-// only by the contextSource closure and is never persisted, returned
+// only by the requestSource closure and is never persisted, returned
 // publicly, or latched in Wait.
 var errSteeringBoundary = errors.New("harness: steering boundary")
 
-// contextSource returns the Agent context boundary of one Operation: the
+// requestSource returns the Agent request boundary of one Operation: the
 // first call projects the newly admitted input only (first-request
 // protection), and every later call selects the conversation boundary —
-// when steering waits it returns errSteeringBoundary instead of projecting
+// when steering waits it returns errSteeringBoundary instead of supplying
 // another request, leaving every head buffered for the ordinary post-terminal
-// drain — otherwise it projects the fresh model.Message history. Selection
-// consumes no head and performs no storage, reservation, cancellation or
-// observation. Physical retries and the compact Agent's own context callback
-// never reach this boundary.
-func (h *Harness) contextSource(c *coordinator, operationID string) agent.ContextSource {
+// drain — otherwise it supplies the fresh model.Message history together with
+// the captured tools. Selection consumes no head and performs no storage,
+// reservation, cancellation or observation. Physical retries and the compact
+// Agent's own request callback never reach this boundary.
+func (h *Harness) requestSource(c *coordinator, operationID string, capture ExecutionCapture) agent.RequestSource {
 	firstRequest := true
-	return func(ctx context.Context) ([]model.Message, error) {
+	return func(ctx context.Context) (model.Request, error) {
 		if !firstRequest {
 			c.mu.Lock()
 			waiting := len(c.steering) > 0
 			c.mu.Unlock()
 			if waiting {
-				return nil, errSteeringBoundary
+				return model.Request{}, errSteeringBoundary
 			}
 		}
 		firstRequest = false
-		return h.projectContext(c, operationID)
+		messages, err := h.projectContext(c, operationID)
+		if err != nil {
+			return model.Request{}, err
+		}
+		return model.Request{Messages: messages, Tools: capture.Tools}, nil
 	}
 }
 

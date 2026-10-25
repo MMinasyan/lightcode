@@ -75,7 +75,7 @@ func projectionFollowUp(entryID, operationID, text, settlementID string, sequenc
 // boundary token is ever returned.
 func projectionMessages(t *testing.T, h *Harness, c *coordinator) []model.Message {
 	t.Helper()
-	msgs, err := h.contextSource(c, testOpID)(context.Background())
+	msgs, err := fixtureProjection(h, c)(context.Background())
 	testassert.NoError(t, err)
 	return msgs
 }
@@ -101,12 +101,12 @@ func assertProjectionEqual(t *testing.T, got, want []model.Message) {
 	testassert.Require(t, reflect.DeepEqual(got, want), "projected messages = %+v, want %+v", got, want)
 }
 
-// TestContextSourceSummarizedProjection proves the summarized projection: with
+// TestRequestSourceSummarizedProjection proves the summarized projection: with
 // the Session register's CompactionEntryID set, the projected messages are
 // exactly the system message, one summary message carrying the payload's
 // verbatim framing and model identity, and the post-boundary entries in
 // sequence order — nothing at or before the boundary projects.
-func TestContextSourceSummarizedProjection(t *testing.T) {
+func TestRequestSourceSummarizedProjection(t *testing.T) {
 	fixture := validTestGraph()
 	fixture.entries = append(fixture.entries, projectionCompaction(hexID(3), hexID(2), 3))
 	followInput, followSettlement, followOp := projectionFollowUp(hexID(4), "op-2", "second", hexID(6), 4, 6)
@@ -128,11 +128,11 @@ func TestContextSourceSummarizedProjection(t *testing.T) {
 	assertProjectionEqual(t, got, want)
 }
 
-// TestContextSourceUncompactedProjectionGolden proves the empty-field
+// TestRequestSourceUncompactedProjectionGolden proves the empty-field
 // projection is byte-identical to the pre-change behavior: the full history
 // projects and the committed compaction entry (present in the graph, unnamed
 // by the register) still projects no message.
-func TestContextSourceUncompactedProjectionGolden(t *testing.T) {
+func TestRequestSourceUncompactedProjectionGolden(t *testing.T) {
 	fixture := validTestGraph()
 	fixture.entries = append(fixture.entries, projectionCompaction(hexID(3), hexID(2), 3))
 	h, c := newProjectionFixture(t, fixture)
@@ -146,11 +146,11 @@ func TestContextSourceUncompactedProjectionGolden(t *testing.T) {
 	assertProjectionEqual(t, got, want)
 }
 
-// TestContextSourceTwoSequentialCompactions proves two sequential compaction
+// TestRequestSourceTwoSequentialCompactions proves two sequential compaction
 // entries: only the register-named entry's summary projects — the earlier
 // compaction entry produces no second summary — and the entries after the
 // named boundary alone project.
-func TestContextSourceTwoSequentialCompactions(t *testing.T) {
+func TestRequestSourceTwoSequentialCompactions(t *testing.T) {
 	fixture := validTestGraph()
 	fixture.entries = append(fixture.entries, projectionCompaction(hexID(3), hexID(2), 3))
 	secondInput, secondSettlement, secondOp := projectionFollowUp(hexID(4), "op-2", "second", hexID(7), 4, 7)
@@ -186,13 +186,13 @@ func projectionSignal(entryID string, sequence int64) testEntry {
 	}
 }
 
-// TestContextSourceProjectsEntriesAfterTheBoundary proves the frozen-boundary
+// TestRequestSourceProjectsEntriesAfterTheBoundary proves the frozen-boundary
 // projection rule: the named compaction entry's summary projects, then exactly
 // the entries after the sequence of the boundary entry its payload records —
 // an entry committed between the boundary target and the compaction entry
 // still projects — and a compaction-kind boundary target hides every message
 // kind, leaving the summary alone.
-func TestContextSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
+func TestRequestSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
 	t.Run("the entry between the boundary target and the compaction projects", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.entries = append(fixture.entries, projectionSignal(hexID(3), 3), projectionCompaction(hexID(4), hexID(2), 4))

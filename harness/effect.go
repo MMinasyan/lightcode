@@ -85,7 +85,6 @@ type modelResult struct {
 func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ModelEffect {
 	attempt := exec.Model
 	normalize := exec.NormalizeTool
-	advertised := advertisedToolNames(capture)
 	return func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
 		// The compaction trigger sits before every model boundary, before any
 		// intent commits: the newest reported conversation usage after the
@@ -129,6 +128,13 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 				return compactionFailureSettlement(c, operationID, err)
 			}
 			req.Messages = messages
+		}
+		// The advertisement of this logical effect is the validated request's
+		// own ordered tool names: the Engine derives them from it before the
+		// effect runs and hands the dispatch gate a per-call copy.
+		names := make([]string, len(req.Tools))
+		for i, def := range req.Tools {
+			names[i] = def.Name
 		}
 		intent, err := h.beginModelEffect(ctx, c, operationID)
 		if err != nil {
@@ -206,7 +212,7 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 				}
 			}
 		}
-		assistant, reported, err := newAssistantEntry(intent.sessionID, operationID, intent.resultID, owned.Output, normalize, advertised)
+		assistant, reported, err := newAssistantEntry(intent.sessionID, operationID, intent.resultID, owned.Output, normalize, names)
 		if err != nil {
 			return agent.ModelSettlement{}, err
 		}
@@ -855,17 +861,6 @@ func newSignalEntry(tx Transaction, sessionID, operationID string, kind SignalKi
 	return &adopted, nil
 }
 
-// advertisedToolNames returns the committed advertised tool-name set of one
-// capture: the single advertisement authority of the model and tool
-// boundaries.
-func advertisedToolNames(capture ExecutionCapture) map[string]bool {
-	names := make(map[string]bool, len(capture.Tools))
-	for _, tool := range capture.Tools {
-		names[tool.Name] = true
-	}
-	return names
-}
-
 // normalizeCallArguments runs one NormalizeTool invocation at the Harness
 // boundary: the callback receives an owned copy of the completed call and
 // must return exactly one complete JSON object, whose bytes the Harness
@@ -895,13 +890,13 @@ var errMalformedNormalization = errors.New("malformed normalization")
 // output under the given entry identity, reserving one result identity per
 // completed call. An output without an eligible model-visible payload writes
 // no assistant entry and returns its reported usage for the consuming
-// settlement entry instead. Before the entry commits, every advertised
-// completed call is normalized through the execution's pure callback: its
-// successful owned object populates the nested call's normalized_arguments
-// member; a failed or malformed normalization, and every unknown or
-// unadvertised name, leave the member absent while the original raw argument
-// bytes are always retained.
-func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output, normalize func(model.ToolCall) (json.RawMessage, error), advertised map[string]bool) (*assistantEntry, *UsageCount, error) {
+// settlement entry instead. Before the entry commits, every completed call
+// whose name is in the producing request's ordered advertised names is
+// normalized through the execution's pure callback: its successful owned
+// object populates the nested call's normalized_arguments member; a failed or
+// malformed normalization, and every unknown or unadvertised name, leave the
+// member absent while the original raw argument bytes are always retained.
+func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output, normalize func(model.ToolCall) (json.RawMessage, error), advertised []string) (*assistantEntry, *UsageCount, error) {
 	if out == nil {
 		return nil, nil, nil
 	}
@@ -911,6 +906,10 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 		OperationID: operationID,
 		Status:      out.Status,
 		Source:      out.Source,
+	}
+	advertisedNames := make(map[string]bool, len(advertised))
+	for _, name := range advertised {
+		advertisedNames[name] = true
 	}
 	var usage *UsageCount
 	if out.Usage != nil {
@@ -932,7 +931,7 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 				ArgumentsBase64: base64.StdEncoding.EncodeToString(call.Arguments),
 				Extra:           call.Extra,
 			}
-			if advertised[call.Name] {
+			if advertisedNames[call.Name] {
 				if normalized, err := normalizeCallArguments(normalize, call); err == nil {
 					record.NormalizedArguments = normalized
 				}
@@ -1075,7 +1074,8 @@ func pendingToolCallRecord(c *coordinator, operationID, callID string) (PendingT
 }
 
 // unavailableToolResult is the ordinary unavailable-tool error result the
-// advertisement gate settles for a name outside the committed advertised set.
+// advertisement gate settles for a name outside the producing request's
+// advertised set.
 func unavailableToolResult(callID, name string) model.ToolResult {
 	return model.ToolResult{CallID: callID, Status: model.ResultError, Content: fmt.Sprintf("Tool %q is not available.", name)}
 }
@@ -1111,9 +1111,12 @@ func boundedToolDiagnostic(cause error) string {
 // toolEffect encloses one concrete tool execution in the shared Harness tool
 // boundary. In order: it resolves the call's pending reservation and committed
 // assistant record, and pre-start cancellation wins before anything else; the
-// advertisement gate rejects names outside the committed advertised tool set
-// with the ordinary unavailable-tool error before any hook or preparer runs;
-// the selected argument hooks then run in configured order, each as its own
+// advertisement gate rejects names outside the engine-supplied advertisement
+// of the producing request — the per-call owned copy the Engine derived from
+// the validated request before its model effect — with the ordinary
+// unavailable-tool error before any hook or preparer runs, while the canonical
+// pending-call record stays the authority for the call's own data; the
+// selected argument hooks then run in configured order, each as its own
 // settled effect, and a settled hook chain hands the final committed value on;
 // without hooks (or for an unhooked call) the original assistant's committed
 // normalized arguments are the selected input, and only an invalid unhooked
@@ -1121,15 +1124,14 @@ func boundedToolDiagnostic(cause error) string {
 // then prepares the plan outside locks, rejects invalid plan shapes with the
 // existing internal-validation error, and evaluates every declaration through
 // the fixed boundary — including immediate-success plans — before
-// beginPendingCallEffect. A denial settles only that original call with status denied
-// and no metadata, no concrete effect and no tool active intent; later calls
-// still run. An allowed executor commits intent, executes once behind the
-// cancellation-before-start gate, and commits one validated outcome — a
+// beginPendingCallEffect. A denial settles only that original call with status
+// denied and no metadata, no concrete effect and no tool active intent; later
+// calls still run. An allowed executor commits intent, executes once behind
+// the cancellation-before-start gate, and commits one validated outcome — a
 // returned real outcome wins a cancellation race.
 func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution, capture ExecutionCapture) agent.ToolEffect {
 	prepared := exec.Tool
-	advertised := advertisedToolNames(capture)
-	return func(ctx context.Context, call model.ToolCall) (model.ToolResult, error) {
+	return func(ctx context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
 		pending, record, err := pendingToolCallRecord(c, operationID, call.ID)
 		if err != nil {
 			return model.ToolResult{}, err
@@ -1149,7 +1151,11 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 		if ctx.Err() != nil { // execution cancellation prevents later preparation: interrupted-before-execution
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, false)
 		}
-		if !advertised[record.Name] { // the one advertisement gate, ahead of every hook and preparer
+		advertised := make(map[string]bool, len(names))
+		for _, name := range names {
+			advertised[name] = true
+		}
+		if !advertised[record.Name] { // the one advertisement gate, ahead of every hook and preparer: the engine-supplied per-call advertisement of the producing request is the authority
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: unavailableToolResult(call.ID, record.Name)}, false)
 		}
 		// The selected normalized value feeding preparation: the final
@@ -1803,8 +1809,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	}
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
-		Tools:         agentCapture.Tools,
-		Context:       h.contextSource(c, operationID),
+		Request:       h.requestSource(c, operationID, agentCapture),
 		ModelEffect:   h.modelEffect(c, operationID, exec, agentCapture),
 		ToolEffect:    h.toolEffect(c, operationID, exec, agentCapture),
 	})

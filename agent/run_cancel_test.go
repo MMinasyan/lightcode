@@ -61,8 +61,8 @@ func TestRunCancelledDuringSnapshot(t *testing.T) {
 	testassert.Require(t, f.sourceCalls == 1 && f.modelCalls == 0 && f.toolCalls == 0, "source=%d model=%d tool=%d, want 1/0/0", f.sourceCalls, f.modelCalls, f.toolCalls)
 }
 
-// TestRunContextSourceCancellationRouting pins both halves of the source rule: a cancellation report under a genuinely done run context maps to Agent interruption, while the same-shaped report under a live context is an ordinary infrastructure error returned verbatim with no terminal.
-func TestRunContextSourceCancellationRouting(t *testing.T) {
+// TestRunRequestSourceCancellationRouting pins both halves of the source rule: a cancellation report under a genuinely done run context maps to Agent interruption, while the same-shaped report under a live context is an ordinary infrastructure error returned verbatim with no terminal.
+func TestRunRequestSourceCancellationRouting(t *testing.T) {
 	wrapped := func() error { return fmt.Errorf("snapshot read: %w", context.Canceled) }
 
 	t.Run("done-context-interruption", func(t *testing.T) {

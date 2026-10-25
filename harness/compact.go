@@ -216,15 +216,14 @@ func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operati
 	effect := h.compactModelEffect(c, operationID, exec, capture, &reported)
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: capture.Compact.Model,
-		Tools:         nil,
-		Context: func(context.Context) ([]model.Message, error) {
-			return []model.Message{
+		Request: func(context.Context) (model.Request, error) {
+			return model.Request{Messages: []model.Message{
 				{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: capture.Compact.SystemPrompt}}},
 				{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: strings.Join(lines, "\n")}}},
-			}, nil
+			}}, nil
 		},
 		ModelEffect: effect,
-		ToolEffect: func(context.Context, model.ToolCall) (model.ToolResult, error) {
+		ToolEffect: func(context.Context, model.ToolCall, []string) (model.ToolResult, error) {
 			return model.ToolResult{}, &agent.ProtocolError{Boundary: "tool", Detail: "compact agent has no tools"}
 		},
 	})

@@ -44,41 +44,62 @@ func TestRunContinuationUsesFreshSnapshotPerEffect(t *testing.T) {
 	testassert.Require(t, res.LastOutput != nil && res.LastOutput.Status == model.OutputCompleted, "last output = %#v, want the final completed settlement", res.LastOutput)
 }
 
-// TestRunRequestToolsAreFreshCopiesPerEffect pins the per-request tool ownership rule: every model effect receives its own deep copy of the entry-validated advertised list — slice and Parameters bytes — so a model-effect callback mutating the handed request's tool slice and bytes in place cannot reach the immutable advertised baseline, any later request, or the invocation input.
+// TestRunRequestToolsAreFreshCopiesPerEffect pins the per-request ownership rule: every model effect receives its own validated owned copy — tool slice and Parameters bytes, and messages alike — and the round's advertised dispatch names are extracted from that copy before the effect runs, so a model effect mutating the handed request's tool definitions and message text in place cannot alter the names its own round dispatches, any later round's request, or the data the request source itself retains. Different rounds advertise different subsets.
 func TestRunRequestToolsAreFreshCopiesPerEffect(t *testing.T) {
 	f := &runFakes{}
-	advertised := advTools()
-	inv := f.invocation()
-	inv.Tools = advertised
-	var handed []model.ToolDefinition // what each request carried before the callback corrupted it
-	f.modelSet = func(call int, req model.Request, cb AssemblyCallback) (ModelSettlement, error) {
-		handed = append(handed, model.ToolDefinition{Name: req.Tools[0].Name, Parameters: append([]byte(nil), req.Tools[0].Parameters...)})
-		if len(req.Tools) > 0 { // corrupt the handed request's tool entry in place: element fields and Parameters bytes.
-			req.Tools[0].Name = "mutated"
-			if len(req.Tools[0].Parameters) > 0 {
-				req.Tools[0].Parameters[0] = 'X'
-			}
+	roundTools := [][]model.ToolDefinition{
+		{
+			{Name: "t", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "u", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
+		{{Name: "t", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}},
+	}
+	f.tools = func(call int) ([]model.ToolDefinition, error) {
+		if call > len(roundTools) {
+			return nil, errScriptExhausted
 		}
-		return setScript(
-			ModelSettlement{Disposition: DispoContinue, Output: mkOutput(model.OutputErrored, "boom", nil)},
-			ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)},
-		)(call, req, cb)
+		return roundTools[call-1], nil
+	}
+	sourceMsgs := userSnapshot("go") // one snapshot shared by every round: an alias from a handed request back into it would reach every later round and this baseline.
+	f.snapshot = func(int) ([]model.Message, error) { return sourceMsgs, nil }
+
+	callsOut := mkCallsTerminalOutput() // the first round settles a dispatched batch; the second ends with final text.
+	f.modelSet = func(call int, req model.Request, _ AssemblyCallback) (ModelSettlement, error) {
+		if call == 1 { // corrupt the handed round-1 request in place: tool name, Parameters bytes, and message text.
+			req.Tools[0].Name = "mutated"
+			req.Tools[0].Parameters[0] = 'X'
+			req.Messages[0].Content[0].Text = "mutated"
+			return ModelSettlement{Disposition: DispoReady, Output: callsOut}, nil
+		}
+		return ModelSettlement{Disposition: DispoReady, Output: mkOutput(model.OutputCompleted, "", nil)}, nil
 	}
 
-	res, err := Run(context.Background(), inv)
+	res, err := Run(context.Background(), f.invocation())
 	testassert.Require(t, err == nil && res.Status == TerminalSuccess, "run = %#v, %v; want success", res, err)
-	testassert.Equal(t, f.modelCalls, 2)
-	// Every request started from the pristine advertised values.
-	for i, got := range handed {
-		testassert.Require(t, got.Name == "t" && string(got.Parameters) == `{"type":"object"}`, "request %d carried a mutated tool: %#v", i+1, got)
+	testassert.Require(t, f.sourceCalls == 2 && f.modelCalls == 2 && f.toolCalls == 3, "source=%d model=%d tool=%d, want 2/2/3", f.sourceCalls, f.modelCalls, f.toolCalls)
+
+	// The round-1 mutation landed in the handed request — every pristine assertion below is not vacuous.
+	testassert.Require(t, f.reqs[0].Tools[0].Name == "mutated" && f.reqs[0].Tools[0].Parameters[0] == 'X' && f.reqs[0].Messages[0].TextContent() == "mutated", "recorded round-1 request shows no mutation: %#v", f.reqs[0])
+	// Round 1's dispatch names are the request's advertisement as extracted before its model effect ran.
+	testassert.Require(t, len(f.ads) == 3 && len(f.ads[0]) == 2 && f.ads[0][0] == "t" && f.ads[0][1] == "u", "round-1 dispatch names = %v, want the pristine [t u] advertisement", f.ads[0])
+	// Round 2 carries its own pristine single-name subset and an intact snapshot.
+	testassert.Require(t, len(f.reqs[1].Tools) == 1 && f.reqs[1].Tools[0].Name == "t" && string(f.reqs[1].Tools[0].Parameters) == `{"type":"object"}`, "round-2 tools = %#v, want the pristine subset", f.reqs[1].Tools)
+	testassert.Require(t, f.reqs[1].Messages[0].TextContent() == "go", "round-2 message = %q, want the intact snapshot", f.reqs[1].Messages[0].TextContent())
+	// The source's own data keeps exactly its entry values.
+	testassert.Require(t, sourceMsgs[0].Content[0].Text == "go", "the source's snapshot was mutated through a handed request: %q", sourceMsgs[0].Content[0].Text)
+	for i, want := range []model.ToolDefinition{{Name: "t", Parameters: json.RawMessage(`{"type":"object"}`)}, {Name: "u", Parameters: json.RawMessage(`{"type":"object"}`)}} {
+		if i >= len(roundTools[0]) {
+			break
+		}
+		testassert.Require(t, roundTools[0][i].Name == want.Name && string(roundTools[0][i].Parameters) == string(want.Parameters), "source round-1 tool %d mutated: %#v", i, roundTools[0][i])
 	}
-	// The mutation actually landed in the recorded requests — the check above is not vacuous.
-	testassert.Require(t, f.reqs[0].Tools[0].Name == "mutated" && f.reqs[1].Tools[0].Name == "mutated", "recorded requests show %q/%q, want the callback's in-place mutations", f.reqs[0].Tools[0].Name, f.reqs[1].Tools[0].Name)
-	// The invocation input keeps exactly its own entry values.
-	testassert.Require(t, advertised[0].Name == "t" && string(advertised[0].Parameters) == `{"type":"object"}`, "advertised baseline mutated through a request alias: %#v", advertised[0])
-	// Each request owns independent storage: no request aliases the advertised bytes, and successive requests share nothing.
-	testassert.Require(t, &f.reqs[0].Tools[0].Parameters[0] != &advertised[0].Parameters[0], "%v", "a request gained an alias to the advertised baseline bytes")
+
+	// No alias from a callback into source data or a later request: every round owns independent storage.
+	testassert.Require(t, &f.reqs[0].Tools[0].Parameters[0] != &roundTools[0][0].Parameters[0], "%v", "a request gained an alias to the source's tool bytes")
+	testassert.Require(t, &f.reqs[0].Tools[1].Parameters[0] != &roundTools[0][1].Parameters[0], "%v", "a request gained an alias to the source's tool bytes")
+	testassert.Require(t, &f.reqs[1].Tools[0].Parameters[0] != &roundTools[1][0].Parameters[0], "%v", "a request gained an alias to the source's tool bytes")
 	testassert.Require(t, &f.reqs[0].Tools[0].Parameters[0] != &f.reqs[1].Tools[0].Parameters[0], "%v", "successive requests share tool Parameters backing")
+	testassert.Require(t, &f.reqs[0].Messages[0].Content[0] != &sourceMsgs[0].Content[0], "%v", "a request gained an alias to the source's message content")
 }
 
 // TestRunToolBatchSettlesInOrderThenContinues pins sequential in-order dispatch with a settled complete non-interrupted batch feeding the next fresh-context effect, which then ends the run.
