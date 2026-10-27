@@ -176,7 +176,7 @@
       {/each}
       {#if activity.truncated}<div class="truncation">… earlier activity truncated</div>{/if}
       {#each activity.tools as tool (tool.callID)}
-        <div class="activity-tool"><span class="activity-tool-name">{tool.name || 'tool'}</span>{tool.status ? ` · ${tool.status}` : ' · running'}</div>
+        <div class="activity-tool"><span class="activity-tool-name">{tool.name || 'tool'}</span>{tool.evidence === 'unknown' ? ' · outcome unknown' : tool.status ? ` · ${tool.status}` : ' · running'}</div>
       {/each}
     </div>
   {:else if busy}

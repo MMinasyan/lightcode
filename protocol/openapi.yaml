@@ -801,6 +801,16 @@ components:
         - error
         - denied
         - interrupted
+    ExecutionEvidence:
+      description: >-
+        One settled tool call's execution knowledge, independent of its
+        status: proven unstarted work, a produced terminal outcome, or a
+        possibly-executed-but-unverified external outcome.
+      type: string
+      enum:
+        - not_started
+        - observed
+        - unknown
     SystemRole:
       type: string
       enum:
@@ -878,7 +888,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "2"
+            - "3"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1328,6 +1338,8 @@ components:
           $ref: "#/components/schemas/ToolCallStatus"
         content:
           type: string
+        evidence:
+          $ref: "#/components/schemas/ExecutionEvidence"
         metadata:
           $ref: "#/components/schemas/ToolMetadata"
         extra:
@@ -2547,6 +2559,8 @@ components:
           type: string
         status:
           $ref: "#/components/schemas/ToolCallStatus"
+        evidence:
+          $ref: "#/components/schemas/ExecutionEvidence"
     Event:
       oneOf:
         - $ref: "#/components/schemas/ConfigurationChangedEvent"

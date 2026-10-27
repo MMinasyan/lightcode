@@ -334,14 +334,20 @@ type inputEntry struct {
 
 // toolCallRecord is one published assistant tool call: opaque call identity,
 // zero-based ordinal, raw base64 arguments, and the reserved result entry.
+// Exactly one of NormalizedArguments and NormalizationFailure is present for
+// an advertised call and neither for an unadvertised one: the successful
+// normalization of the original, or the bounded failure diagnostic its one
+// normalization produced, both committed by the producer. Later dispatch
+// consumes the committed member and never normalizes the original again.
 type toolCallRecord struct {
-	ID                  string          `json:"id"`
-	Ordinal             int64           `json:"ordinal"`
-	Name                string          `json:"name"`
-	ArgumentsBase64     string          `json:"arguments_base64"`
-	Extra               model.Extra     `json:"extra,omitempty"`
-	NormalizedArguments json.RawMessage `json:"normalized_arguments,omitempty"`
-	ResultEntryID       string          `json:"result_entry_id"`
+	ID                   string          `json:"id"`
+	Ordinal              int64           `json:"ordinal"`
+	Name                 string          `json:"name"`
+	ArgumentsBase64      string          `json:"arguments_base64"`
+	Extra                model.Extra     `json:"extra,omitempty"`
+	NormalizedArguments  json.RawMessage `json:"normalized_arguments,omitempty"`
+	NormalizationFailure string          `json:"normalization_failure,omitempty"`
+	ResultEntryID        string          `json:"result_entry_id"`
 }
 
 // assistantEntry is one finalized model output: status, complete source
@@ -371,6 +377,11 @@ type assistantEntry struct {
 // NormalizedArguments and HookIDs carry the final effective argument selection
 // and its contributing ordered hook provenance actually consumed by that
 // call's settlement; results that never accepted a value carry neither.
+// Evidence is the producer-assigned execution knowledge of the settled call,
+// independent of status: proven unstarted work is not_started, a produced
+// terminal outcome is observed, and a possibly-executed-but-unverified
+// external outcome is unknown. The uncertainty its value warrants is baked
+// into Content once by the shared result producer.
 type toolResultEntry struct {
 	SessionID           string                 `json:"session_id"`
 	EntryID             string                 `json:"entry_id"`
@@ -379,6 +390,7 @@ type toolResultEntry struct {
 	ToolCallID          string                 `json:"tool_call_id"`
 	Status              model.ToolResultStatus `json:"status"`
 	Content             string                 `json:"content"`
+	Evidence            ExecutionEvidence      `json:"evidence"`
 	Metadata            json.RawMessage        `json:"metadata,omitempty"`
 	NormalizedArguments json.RawMessage        `json:"normalized_arguments,omitempty"`
 	HookIDs             []HookIdentity         `json:"hook_ids,omitempty"`

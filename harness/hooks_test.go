@@ -1231,6 +1231,8 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 			assistant := compositionAssistant(t, store, sessionID)
 			testassert.Require(t, len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].NormalizedArguments == nil,
 				"assistant call record = %+v, want no committed normalization before the repair", assistant.ToolCalls)
+			testassert.Require(t, assistant.ToolCalls[0].NormalizationFailure != "",
+				"assistant call record = %+v, want the saved normalization-failure diagnostic on the invalid original", assistant.ToolCalls)
 			raw, derr := base64.StdEncoding.DecodeString(assistant.ToolCalls[0].ArgumentsBase64)
 			testassert.Require(t, derr == nil && string(raw) == "not json", "assistant raw bytes = %q, want the source arguments preserved verbatim", raw)
 		}
@@ -1262,9 +1264,12 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 					continue
 				}
 				settled++
+				// The repaired value wins: the saved failure diagnostic never
+				// overrides the accepted replacement or its executed outcome.
 				testassert.Require(t, string(entry.ToolResult.NormalizedArguments) == `{"x":2}` &&
-					len(entry.ToolResult.HookIDs) == 1 && entry.ToolResult.HookIDs[0].HookID == "cap.pure.repair",
-					"tool result provenance = %+v %s, want the repaired value and the pure contributor identity", entry.ToolResult.NormalizedArguments, entry.ToolResult.HookIDs)
+					len(entry.ToolResult.HookIDs) == 1 && entry.ToolResult.HookIDs[0].HookID == "cap.pure.repair" &&
+					entry.ToolResult.Content == "done" && entry.ToolResult.Evidence == ExecutionObserved,
+					"tool result = %+v, want the repaired value and the pure contributor identity over the executed outcome", entry.ToolResult)
 			}
 			testassert.Equal(t, settled, 1)
 		}
@@ -1315,6 +1320,22 @@ func TestArgumentHookDeclaredKnowledgeRows(t *testing.T) {
 			committed := hookGraphHookResults(t, store, sessionID)
 			testassert.Require(t, len(committed) == 1 && committed[0].Status == hookFailed && committed[0].Evidence == knowledge,
 				"hook results = %+v, want the declared %s knowledge unchanged", committed, knowledge)
+			// The concrete tool call is proven unstarted; a declared unknown
+			// hook outcome leaves its final content uncertain while the hook
+			// result keeps its own evidence.
+			wantContent, wantEvidence := "argument binding broke", ExecutionNotStarted
+			if knowledge == ExecutionUnknown {
+				wantContent = "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nargument binding broke"
+			}
+			graph, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
+			for _, entry := range graph.Entries {
+				if entry.ToolResult == nil {
+					continue
+				}
+				testassert.Require(t, entry.ToolResult.Status == model.ResultError && entry.ToolResult.Content == wantContent && entry.ToolResult.Evidence == wantEvidence,
+					"tool result = %+v, want the %s hook knowledge rendered into content %q with concrete %s evidence", entry.ToolResult, knowledge, wantContent, wantEvidence)
+			}
 		})
 	}
 	t.Run("invalid declaration retains the intent for recovery", func(t *testing.T) {

@@ -561,6 +561,7 @@ var contractGeneratedTypes = map[string]func() any{
 	"DiscoveryRequest":            func() any { return new(protocol.DiscoveryRequest) },
 	"Error":                       func() any { return new(protocol.Error) },
 	"Event":                       func() any { return new(protocol.Event) },
+	"ExecutionEvidence":           func() any { return new(protocol.ExecutionEvidence) },
 	"ForkRequest":                 func() any { return new(protocol.ForkRequest) },
 	"ForkResult":                  func() any { return new(protocol.ForkResult) },
 	"Health":                      func() any { return new(protocol.Health) },

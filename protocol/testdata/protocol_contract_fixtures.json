@@ -490,6 +490,21 @@
    ]
   },
   {
+   "schema": "ExecutionEvidence",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "\"observed\""
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-evidence",
+     "json": "\"pending\""
+    }
+   ]
+  },
+  {
    "schema": "ForkRequest",
    "accept": [
     {
@@ -514,7 +529,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"3\"}"
     }
    ],
    "reject": [
@@ -524,16 +539,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"2\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"3\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"2\"}"
+     "json": "{\"protocol_version\":\"3\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"2\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"3\",\"extra\":true}"
     }
    ]
   },
@@ -1735,7 +1750,7 @@
     },
     {
      "name": "full",
-     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"evidence\":\"observed\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
     },
     {
      "name": "second-call",
@@ -1751,6 +1766,10 @@
     {
      "name": "unknown-status",
      "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"status\":\"maybe\"}"
+    },
+    {
+     "name": "unknown-evidence",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"evidence\":\"pending\"}"
     },
     {
      "name": "missing-arguments",
@@ -1771,7 +1790,7 @@
     },
     {
      "name": "progress",
-     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"denied\"}"
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"denied\",\"evidence\":\"observed\"}"
     }
    ],
    "reject": [
@@ -1782,6 +1801,10 @@
     {
      "name": "unknown-status",
      "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"maybe\"}"
+    },
+    {
+     "name": "unknown-evidence",
+     "json": "{\"kind\":\"tool_finished\",\"scope\":{\"kind\":\"session\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"},\"call_id\":\"call-1\",\"status\":\"denied\",\"evidence\":\"pending\"}"
     }
    ]
   },

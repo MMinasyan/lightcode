@@ -158,15 +158,36 @@ func (e ErrorCode) Valid() bool {
 	}
 }
 
+// Defines values for ExecutionEvidence.
+const (
+	NotStarted ExecutionEvidence = "not_started"
+	Observed   ExecutionEvidence = "observed"
+	Unknown    ExecutionEvidence = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the ExecutionEvidence enum.
+func (e ExecutionEvidence) Valid() bool {
+	switch e {
+	case NotStarted:
+		return true
+	case Observed:
+		return true
+	case Unknown:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for HealthProtocolVersion.
 const (
-	N2 HealthProtocolVersion = "2"
+	N3 HealthProtocolVersion = "3"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N2:
+	case N3:
 		return true
 	default:
 		return false
@@ -1015,6 +1036,9 @@ type Event struct {
 	union json.RawMessage
 }
 
+// ExecutionEvidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+type ExecutionEvidence string
+
 // ForkRequest defines model for ForkRequest.
 type ForkRequest struct {
 	BoundaryItemId string        `json:"boundary_item_id"`
@@ -1582,6 +1606,9 @@ type ToolCallView struct {
 	Arguments string  `json:"arguments"`
 	Content   *string `json:"content,omitempty"`
 
+	// Evidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+	Evidence *ExecutionEvidence `json:"evidence,omitempty"`
+
 	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
 	Extra *JSONObject `json:"extra,omitempty"`
 	Id    string      `json:"id"`
@@ -1597,8 +1624,11 @@ type ToolCallView struct {
 
 // ToolFinishedEvent defines model for ToolFinishedEvent.
 type ToolFinishedEvent struct {
-	CallId string                `json:"call_id"`
-	Kind   ToolFinishedEventKind `json:"kind"`
+	CallId string `json:"call_id"`
+
+	// Evidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+	Evidence *ExecutionEvidence    `json:"evidence,omitempty"`
+	Kind     ToolFinishedEventKind `json:"kind"`
 
 	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope  Scope          `json:"scope"`

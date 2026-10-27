@@ -22,7 +22,7 @@ test('configured bearer credential reaches health and events', async () => {
         headers: { 'content-type': 'text/event-stream' },
       });
     }
-    return Response.json({ instance_id: instanceID, protocol_version: '2' });
+    return Response.json({ instance_id: instanceID, protocol_version: '3' });
   });
   const client = createClient({
     baseUrl: 'http://127.0.0.1:1',
@@ -31,7 +31,7 @@ test('configured bearer credential reaches health and events', async () => {
   });
 
   const health = await getHealth({ client });
-  expect(health.data).toEqual({ instance_id: instanceID, protocol_version: '2' });
+  expect(health.data).toEqual({ instance_id: instanceID, protocol_version: '3' });
 
   const events = await getEvents({ client, sseMaxRetryAttempts: 1 });
   const received = [];
@@ -49,7 +49,7 @@ test('configured bearer credential reaches health and events', async () => {
 });
 
 test('absent auth does not invent a bearer header', async () => {
-  const fetchFn = vi.fn(async () => Response.json({ instance_id: instanceID, protocol_version: '2' }));
+  const fetchFn = vi.fn(async () => Response.json({ instance_id: instanceID, protocol_version: '3' }));
   const client = createClient({ baseUrl: 'http://127.0.0.1:1', fetch: fetchFn });
 
   await getHealth({ client });

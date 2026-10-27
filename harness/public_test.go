@@ -3383,14 +3383,35 @@ func harnessOver(t *testing.T, store harness.Storage) *harness.Harness {
 	return h
 }
 
+// recoveredToolResult is one expected recovery-settled interrupted tool
+// result: its reserved identity, its stored final model-facing content, and
+// its stored execution evidence.
+type recoveredToolResult struct {
+	ID       string
+	Content  string
+	Evidence string
+}
+
+// plainInterruptedResults renders the expected settled results of calls that
+// recovery proves unstarted: the ordinary interrupted content and no
+// uncertainty.
+func plainInterruptedResults(ids ...string) []recoveredToolResult {
+	out := make([]recoveredToolResult, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, recoveredToolResult{ID: id, Content: "Tool call interrupted.", Evidence: "not_started"})
+	}
+	return out
+}
+
 // assertRecoveredOperation verifies the complete recovery outcome on one
 // Session's durable state: the terminal interruption with the exact detail,
 // no active or pending effects, the cleared Session current Operation, and
 // the exact committed tail — one interrupted tool result under each reserved
-// identity in order, exactly one signal, and the one settlement entry under
-// wantSettlementID (or a fresh identity when it is empty). Every pre-recovery
-// entry stays byte-identical: no replay, repair, or truncation.
-func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, operationID string, preEntries []harness.Entry, wantSettlementID string, wantInterruptedResultIDs []string) {
+// identity in order with its expected stored content and evidence, exactly
+// one signal, and the one settlement entry under wantSettlementID (or a fresh
+// identity when it is empty). Every pre-recovery entry stays byte-identical:
+// no replay, repair, or truncation.
+func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, operationID string, preEntries []harness.Entry, wantSettlementID string, wantResults []recoveredToolResult) {
 	t.Helper()
 	state := recoverOpStateAt(t, store, sessionID, operationID)
 	testassert.Require(t, state.Status == "interruption" && state.ActiveEffect == nil && len(state.PendingToolCalls) == 0 && state.Terminal != nil, "recovered operation = %+v, want terminal interruption with no active or pending effects", state)
@@ -3403,8 +3424,8 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		for _, e := range preEntries {
 			seen[e.ID] = true
 		}
-		for _, id := range wantInterruptedResultIDs {
-			seen[id] = true
+		for _, want := range wantResults {
+			seen[want.ID] = true
 		}
 		testassert.Require(t, len(settlementID) == 32 && !seen[settlementID], "settlement entry = %q, want a fresh identity unused by the pre-recovery state", settlementID)
 	}
@@ -3412,8 +3433,8 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		current := recoverSessionCurrent(t, store, sessionID)
 		testassert.Equal(t, current, "")
 	}
-	wantTail := make([]harness.EntryKind, 0, len(wantInterruptedResultIDs)+2)
-	for range wantInterruptedResultIDs {
+	wantTail := make([]harness.EntryKind, 0, len(wantResults)+2)
+	for range wantResults {
 		wantTail = append(wantTail, harness.EntryToolResult)
 	}
 	wantTail = append(wantTail, harness.EntrySignal, harness.EntryOperationSettlement)
@@ -3427,15 +3448,19 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		testassert.Require(t, entry.Kind == kind, "recovery commit %d is a %s entry, want %s", i, entry.Kind, kind)
 		switch kind {
 		case harness.EntryToolResult:
-			testassert.Require(t, entry.ID == wantInterruptedResultIDs[i], "interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
+			want := wantResults[i]
+			testassert.Require(t, entry.ID == want.ID, "interrupted result %d = %s, want the reserved identity %s", i, entry.ID, want.ID)
 			var wire struct {
-				Status  model.ToolResultStatus `json:"status"`
-				Content string                 `json:"content"`
+				Status   model.ToolResultStatus `json:"status"`
+				Content  string                 `json:"content"`
+				Evidence string                 `json:"evidence"`
 			}
 			{
 				err := json.Unmarshal(entry.Payload, &wire)
-				testassert.Require(t, err == nil && wire.Status == model.ResultInterrupted && wire.Content == "Tool call interrupted.", "interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
+				testassert.Require(t, err == nil && wire.Status == model.ResultInterrupted, "interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
 			}
+			testassert.Require(t, wire.Content == want.Content, "interrupted result %s content = %q, want %q", want.ID, wire.Content, want.Content)
+			testassert.Require(t, wire.Evidence == want.Evidence, "interrupted result %s evidence = %q, want %q", want.ID, wire.Evidence, want.Evidence)
 		case harness.EntryOperationSettlement:
 			testassert.Equal(t, entry.ID, settlementID)
 			var wire struct {
@@ -3475,13 +3500,17 @@ func assertRecoverIdempotent(t *testing.T, store harness.Storage, sessionID, ope
 
 // TestPublicRecoverRunningOperationShapes proves the recovery row: every
 // running effect/pending shape — a quiet Operation with no calls, an active
-// model effect, an active tool effect, and a quiet Operation with pending
-// calls — is seeded directly into storage, settled by Recover (which runs
-// before any Harness exists) in one transaction as terminal interruption
-// through the regular result/signal/terminal helpers, with the settlement
-// consuming an active model effect's reserved identity or a fresh identity
-// otherwise; a second run writes nothing, and one Harness constructed only
-// afterwards materializes the repaired state.
+// model effect, an active tool effect alone and with a later unstarted
+// sibling, and a quiet Operation with pending calls — is seeded directly into
+// storage, settled by Recover (which runs before any Harness exists) in one
+// transaction as terminal interruption through the regular
+// result/signal/terminal helpers, with the settlement consuming an active
+// model effect's reserved identity or a fresh identity otherwise. Only the
+// active tool action carries conservative unknown evidence and its
+// uncertainty prefix; every unstarted sibling stays plain. A second run
+// writes nothing, one Harness constructed only afterwards materializes the
+// repaired state, and the next explicitly submitted request carries exactly
+// the stored final contents with zero replayed executions.
 func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 	shapes := []struct {
 		name         string
@@ -3491,6 +3520,7 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 		{"quiet running operation without calls", "", 0},
 		{"active model effect settles under its reserved identity", "model", 0},
 		{"active tool effect interrupts its pending call", "tool", 1},
+		{"active tool effect leaves its later sibling unstarted", "tool", 2},
 		{"quiet running operation with pending calls", "", 2},
 	}
 	for _, shape := range shapes {
@@ -3503,6 +3533,20 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 					calls[i] = fmt.Sprintf("call-%d", i+1)
 				}
 				sessionID, modelReserved, pendingResultIDs := seedRunningOperationShape(t, store, shape.activeEffect, "op-1", calls)
+
+				// The closed settled expectation per call: only the active
+				// tool action is possibly-executed-but-unverified.
+				wantResults := make([]recoveredToolResult, 0, len(calls))
+				wantTexts := map[string]string{}
+				for i, callID := range calls {
+					content, evidence := "Tool call interrupted.", "not_started"
+					if i == 0 && shape.activeEffect == "tool" {
+						content = "Execution outcome unknown; the action may have occurred.\n\n" + content
+						evidence = "unknown"
+					}
+					wantResults = append(wantResults, recoveredToolResult{ID: pendingResultIDs[i], Content: content, Evidence: evidence})
+					wantTexts[callID] = content
+				}
 
 				state := recoverOpStateAt(t, store, sessionID, "op-1")
 				testassert.Require(t, state.Status == "running" && len(state.PendingToolCalls) == shape.calls, "seeded operation = %+v, want running with %d pending call(s)", state, shape.calls)
@@ -3521,7 +3565,7 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 					err := harness.Recover(ctx, store)
 					testassert.NoError(t, err)
 				}
-				assertRecoveredOperation(t, store, sessionID, "op-1", pre, modelReserved, pendingResultIDs)
+				assertRecoveredOperation(t, store, sessionID, "op-1", pre, modelReserved, wantResults)
 				assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 				h := harnessOver(t, store) // one Harness after recovery: materialization verification only
@@ -3529,8 +3573,51 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 				testassert.Require(t, err == nil && sess.CurrentOperationID == "", "repaired session = %+v err %v, want open with the current Operation cleared", sess, err)
 				rec, err := h.ReadOperation(ctx, sessionID, "op-1")
 				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired operation = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
+
+				assertNextRequestAfterColdRecovery(t, store, sessionID, wantTexts)
 			})
 		})
+	}
+}
+
+// assertNextRequestAfterColdRecovery submits the next message on a recovered
+// Session through a freshly constructed Harness and proves the recovered
+// uncertainty reaches the first model request exactly as stored: each call's
+// projected tool message carries its stored final content, and no recovered
+// call is ever replayed — zero preparation/execution callbacks ran.
+func assertNextRequestAfterColdRecovery(t *testing.T, store harness.Storage, sessionID string, wantTexts map[string]string) {
+	t.Helper()
+	script := newScriptModel(publicTurn())
+	executed := 0
+	f := newPublicFixtureWithJobs(t, store, nil, script, nil, nil)
+	defer f.close()
+	f.defaultPrep = harness.PreparedExecution{
+		Capture: publicCapture(),
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				executed++
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}}
+			}), nil
+		},
+	}
+	{
+		_, err := submit(t, f.h, sessionID, "op-2", harness.MessageModeRegular, "next question")
+		testassert.NoError(t, err)
+	}
+	awaitTerminal(t, f.h, sessionID, "op-2")
+	testassert.Equal(t, executed, 0)
+	seen := script.seen()
+	testassert.Require(t, len(seen) == 1, "captured %d model requests, want exactly the first request after cold recovery", len(seen))
+	byCall := map[string]string{}
+	for _, msg := range seen[0].Messages {
+		if msg.Role == model.RoleTool {
+			byCall[msg.ToolCallID] = msg.TextContent()
+		}
+	}
+	testassert.Equal(t, len(byCall), len(wantTexts))
+	for callID, wantText := range wantTexts {
+		got, ok := byCall[callID]
+		testassert.Require(t, ok && got == wantText, "tool message for %s = %q (present %v), want %q", callID, got, ok, wantText)
 	}
 }
 
@@ -3578,7 +3665,7 @@ const (
 // answering the given assistant entry's call under the reserved identity.
 func rawToolResultPayload(sessionID, entryID, operationID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done"}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","evidence":"observed"}`,
 		sessionID, entryID, operationID, sessionID, assistantEntryID, callID)
 }
 
@@ -3599,11 +3686,12 @@ func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string
 }
 
 // rawFailedHookResultPayload builds one settled failed or interrupted
-// hook-result entry payload carrying a non-empty error and no arguments.
-func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, errText string) string {
+// hook-result entry payload carrying the given execution evidence, a
+// non-empty error and no arguments.
+func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, evidence, errText string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":%q,"evidence":"observed","input_arguments_base64":"","error":%q}`,
-		sessionID, entryID, operationID, hookID, callID, status, errText)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":%q,"evidence":%q,"input_arguments_base64":"","error":%q}`,
+		sessionID, entryID, operationID, hookID, callID, status, evidence, errText)
 }
 
 // rawSettlementPayload builds one successful settlement entry payload.
@@ -3670,7 +3758,7 @@ func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2
 // payload answering the given copied assistant entry's call.
 func rawCopiedResultPayload(sessionID, entryID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done"}`,
+		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","evidence":"observed"}`,
 		sessionID, entryID, sessionID, assistantEntryID, callID)
 }
 
@@ -3756,7 +3844,7 @@ func seedCorruptSiblingFailedHook(t *testing.T, store harness.Storage) string {
 		if entry.Kind == harness.EntryAssistant {
 			hookID := newRawSessionID(t)
 			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
-				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "observed", "hook broke"))
 			return sessionID
 		}
 	}
@@ -6075,7 +6163,13 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			testassert.Require(t, hookWire.HookID == "cap.hook.one" && hookWire.ToolCallID == "call-1" && hookWire.Status == "interrupted" && hookWire.Error == recoveredInterruptionDetail, "interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
-			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", pending)
+			// The call under the active hook effect is proven unstarted but
+			// uncertain: the hook may have taken effect.
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", []recoveredToolResult{{
+				ID:       pending[0],
+				Content:  "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.",
+				Evidence: "not_started",
+			}})
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
@@ -6086,20 +6180,52 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 		})
 	})
 
-	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+	t.Run("active hook effect with a later unstarted sibling", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			ctx := context.Background()
-			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
-			hookID := newRawSessionID(t)
-			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
-				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+			sessionID, hookReserved, pending := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1", "call-2"})
+			state := recoverOpStateAt(t, store, sessionID, "op-1")
+			testassert.Require(t, state.ActiveEffect != nil && state.ActiveEffect.Kind == "hook" && state.ActiveEffect.ResultEntryID == hookReserved && state.ActiveEffect.ToolCallID == "call-1", "seeded operation = %+v, want the committed hook effect intent on call-1", state)
 
 			pre := recoverEntries(t, store, sessionID)
 			{
 				err := harness.Recover(ctx, store)
 				testassert.NoError(t, err)
 			}
-			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", pending)
+			entries := recoverEntries(t, store, sessionID)
+			testassert.Require(t, len(entries) > len(pre), "%v", "recovery committed no hook result")
+			hook := entries[len(pre)]
+			testassert.Require(t, hook.Kind == harness.EntryHookResult && hook.ID == hookReserved, "recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
+			// The hooked call's concrete tool never executed, and the later
+			// sibling is plainly unstarted: distinct stored contents and
+			// evidence.
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", []recoveredToolResult{
+				{ID: pending[0], Content: "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.", Evidence: "not_started"},
+				{ID: pending[1], Content: "Tool call interrupted.", Evidence: "not_started"},
+			})
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			assertNextRequestAfterColdRecovery(t, store, sessionID, map[string]string{
+				"call-1": "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.",
+				"call-2": "Tool call interrupted.",
+			})
+		})
+	})
+
+	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "observed", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", plainInterruptedResults(pending...))
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
@@ -6107,6 +6233,33 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 				_, err := h.ReadOperation(ctx, sessionID, "op-1")
 				testassert.NoError(t, err)
 			}
+		})
+	})
+
+	t.Run("quiet gap preserves an unknown hook outcome's uncertainty", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "unknown", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
+			}
+			// The committed unknown hook outcome leaves the concrete call
+			// proven unstarted but uncertain: the hook may have taken effect.
+			uncertain := "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted."
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", []recoveredToolResult{{
+				ID:       pending[0],
+				Content:  uncertain,
+				Evidence: "not_started",
+			}})
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			assertNextRequestAfterColdRecovery(t, store, sessionID, map[string]string{"call-1": uncertain})
 		})
 	})
 

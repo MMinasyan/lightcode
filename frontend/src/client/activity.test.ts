@@ -28,8 +28,8 @@ function toolStarted(operationID: string, callID: string, name: string): ToolSta
   return { kind: 'tool_started', scope: { kind: 'operation', session_id: 's1', operation_id: operationID }, call_id: callID, ordinal: 0, name };
 }
 
-function toolFinished(operationID: string, callID: string, status: 'success'): ToolFinishedEvent {
-  return { kind: 'tool_finished', scope: { kind: 'operation', session_id: 's1', operation_id: operationID }, call_id: callID, status };
+function toolFinished(operationID: string, callID: string, status: ToolFinishedEvent['status'], evidence?: ToolFinishedEvent['evidence']): ToolFinishedEvent {
+  return { kind: 'tool_finished', scope: { kind: 'operation', session_id: 's1', operation_id: operationID }, call_id: callID, status, evidence };
 }
 
 function totalBytes(state: { pieces: { content: string }[] } | null): number {
@@ -131,17 +131,18 @@ describe('ProvisionalActivity', () => {
     expect(activity.getState()?.tools).toEqual([]);
   });
 
-  it('keys tool activity by call ID with name and status only', () => {
+  it('keys tool activity by call ID with name, status and evidence only', () => {
     const activity = new ProvisionalActivity();
     activity.accept(OP, toolStarted(OP, 'c1', 'read_file'));
     activity.accept(OP, toolStarted(OP, 'c2', 'write_file'));
-    activity.accept(OP, toolFinished(OP, 'c1', 'success'));
+    activity.accept(OP, toolFinished(OP, 'c1', 'success', 'observed'));
     expect(activity.getState()?.tools).toEqual([
-      { callID: 'c1', name: 'read_file', status: 'success' },
-      { callID: 'c2', name: 'write_file', status: null },
+      { callID: 'c1', name: 'read_file', status: 'success', evidence: 'observed' },
+      { callID: 'c2', name: 'write_file', status: null, evidence: null },
     ]);
-    activity.accept(OP, toolFinished(OP, 'c3', 'success'));
+    activity.accept(OP, toolFinished(OP, 'c3', 'interrupted', 'unknown'));
     expect(activity.getState()?.tools).toHaveLength(3);
+    expect(activity.getState()?.tools[2]).toEqual({ callID: 'c3', name: '', status: 'interrupted', evidence: 'unknown' });
   });
 
   it('resets its buffer when the Operation changes', () => {

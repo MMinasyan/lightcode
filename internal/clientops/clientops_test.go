@@ -102,7 +102,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"3"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -430,7 +430,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"2"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"3"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		testassert.Require(t, err == nil, "Call(GetHealth, %q) = %v", params, err)

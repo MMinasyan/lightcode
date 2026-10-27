@@ -16,6 +16,11 @@ export type InputOrigin = 'user' | 'runtime' | 'plugin';
 
 export type ToolCallStatus = 'success' | 'error' | 'denied' | 'interrupted';
 
+/**
+ * One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+ */
+export type ExecutionEvidence = 'not_started' | 'observed' | 'unknown';
+
 export type SystemRole = 'system' | 'user' | 'developer';
 
 export type ModelSource = 'bundled' | 'discovered' | 'user';
@@ -46,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '2';
+    protocol_version: '3';
 };
 
 /**
@@ -232,6 +237,7 @@ export type ToolCallView = {
     normalized_arguments?: JsonObject;
     status?: ToolCallStatus;
     content?: string;
+    evidence?: ExecutionEvidence;
     metadata?: ToolMetadata;
     extra?: JsonObject;
 };
@@ -731,6 +737,7 @@ export type ToolFinishedEvent = {
     scope: Scope;
     call_id: string;
     status: ToolCallStatus;
+    evidence?: ExecutionEvidence;
 };
 
 export type Event = ({

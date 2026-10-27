@@ -202,8 +202,12 @@ func writeToolChangeSummary(b *strings.Builder, counts toolChangeCounts) {
 	}
 }
 
-// RenderToolResult renders a tool call result.
-func RenderToolResult(name, args, result string, success bool, expanded bool, width int, metadata map[string]any) string {
+// RenderToolResult renders a tool call result. An unknown execution outcome
+// renders as uncertain: its own "outcome unknown" marker in the warning
+// color above the result preview, never as the plain result of a clean, safe
+// cancellation; every observed or proven-unstarted result renders exactly as
+// before.
+func RenderToolResult(name, args, result string, success, unknown bool, expanded bool, width int, metadata map[string]any) string {
 	if width < 20 {
 		width = 20
 	}
@@ -211,6 +215,16 @@ func RenderToolResult(name, args, result string, success bool, expanded bool, wi
 	inner := width - 5
 
 	var b strings.Builder
+
+	if unknown {
+		b.WriteString(colorYellow)
+		b.WriteString(indent)
+		b.WriteString("outcome unknown")
+		b.WriteString(colorReset)
+		b.WriteString(nl)
+		b.WriteString(renderOutputPreview(result, indent, inner, colorYellow, expanded))
+		return b.String()
+	}
 
 	if !success {
 		return renderOutputPreview(result, indent, inner, colorRed, expanded)

@@ -25,7 +25,9 @@
   $: editFiles = recognizeEditFiles(call.metadata && call.metadata.edit_preview_files);
   $: extraText = serializeExtra(call.extra);
   $: metadataText = serializeExtra(call.metadata);
-  $: statusLabel = call.status ? ` · ${call.status}` : '';
+  // An unknown execution outcome is rendered uncertain — never as the plain
+  // status label that presents a clean, safe cancellation.
+  $: statusLabel = call.status ? (call.evidence === 'unknown' ? ' · outcome unknown' : ` · ${call.status}`) : '';
 
   let filesExpanded = {};
   function toggleFile(index) { filesExpanded = { ...filesExpanded, [index]: filesExpanded[index] !== true }; }

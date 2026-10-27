@@ -48,11 +48,12 @@ type SessionRevision struct {
 // nonempty Content; a refusal delta carries SessionID, OperationID, and the
 // nonempty Content and no Position; a tool start carries SessionID,
 // OperationID, CallID, Ordinal, and Name; a tool finish carries SessionID,
-// OperationID, CallID, and the closed Status. Every field a kind does not
-// require stays zero. A fact grants no authority: it can never alter an
-// admission, an effect, a settlement, or a lifecycle transition. A fact
-// carries no revision pair: no producer sample can become notification
-// authority; passive publishers read the current pair at publication time.
+// OperationID, CallID, the closed Status, and the committed execution
+// Evidence. Every field a kind does not require stays zero. A fact grants no
+// authority: it can never alter an admission, an effect, a settlement, or a
+// lifecycle transition. A fact carries no revision pair: no producer sample
+// can become notification authority; passive publishers read the current pair
+// at publication time.
 type HarnessFact struct {
 	Kind        HarnessFactKind
 	SessionID   string
@@ -64,6 +65,7 @@ type HarnessFact struct {
 	Ordinal     int64
 	Name        string
 	Status      model.ToolResultStatus
+	Evidence    ExecutionEvidence
 }
 
 // emitFact delivers one passive fact to the optional observer. A nil observer
@@ -172,6 +174,7 @@ func (h *Harness) emitToolResultFacts(entries []graphEntry, sessionID, operation
 			OperationID: operationID,
 			CallID:      entry.ToolResult.ToolCallID,
 			Status:      entry.ToolResult.Status,
+			Evidence:    entry.ToolResult.Evidence,
 		})
 	}
 }

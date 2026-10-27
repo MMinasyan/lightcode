@@ -69,6 +69,7 @@ func factFixtureGraph() *testGraph {
 
 	assistant1 := validAssistantEntry(testOpID)
 	assistant1.EntryID = hexID(2)
+	assistant1.AdvertisedNames = []string{"echo"}
 	assistant1.Extra = model.Extra{"reasoning": json.RawMessage(`{"deep":[1]}`)}
 	call := validToolCallRecord()
 	call.ResultEntryID = testResultID
@@ -699,6 +700,7 @@ func TestHistoryViewRetainedCaptureStable(t *testing.T) {
 				EntryID: futureResultID, OperationID: "op-future", ToolCallID: "call-future",
 				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: futureAssistantID},
 				Status:         model.ResultSuccess,
+				Evidence:       ExecutionObserved,
 			},
 		},
 	)

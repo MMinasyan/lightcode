@@ -197,7 +197,7 @@ func renderItems(items []protocol.ConversationItem, width int) string {
 					if call.Content != nil {
 						content = *call.Content
 					}
-					b.WriteString(terminal.RenderToolResult(call.Name, call.Arguments, content, *call.Status == protocol.ToolCallStatusSuccess, false, width, metadata))
+					b.WriteString(terminal.RenderToolResult(call.Name, call.Arguments, content, *call.Status == protocol.ToolCallStatusSuccess, call.Evidence != nil && *call.Evidence == protocol.Unknown, false, width, metadata))
 				}
 			}
 		case "signal":
@@ -424,7 +424,11 @@ func (c *CLI) acceptEvent(delivery eventDelivery) {
 	case "tool_finished":
 		e, err := event.AsToolFinishedEvent()
 		if err == nil {
-			c.progressLocked(e.Scope, "\nTool activity "+e.CallId+": "+string(e.Status)+"\n")
+			label := string(e.Status)
+			if e.Evidence != nil && *e.Evidence == protocol.Unknown { // an unknown outcome is never shown as a clean, safe cancellation
+				label = "outcome unknown"
+			}
+			c.progressLocked(e.Scope, "\nTool activity "+e.CallId+": "+label+"\n")
 		}
 	case "session_changed":
 		e, err := event.AsSessionChangedEvent()

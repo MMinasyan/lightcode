@@ -212,7 +212,11 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	c, transport := fixture(t)
 	r := settledReader(t, c, transport)
 	metadata := json.RawMessage(`{"edit_preview":{"hunks":[{"rows":[{"kind":"remove","oldLine":1,"text":"old metadata"},{"kind":"add","newLine":1,"text":"new metadata"}]}]}}`)
-	a := protocol.AssistantItem{Kind: "assistant", ItemId: "edit", Status: "completed", Source: "provider/model", Content: append(textParts("canonical first"), textParts("canonical second")...), ToolCalls: []protocol.ToolCallView{{Id: "call", Name: "edit_file", Arguments: `{"path":"raw.go"}`, NormalizedArguments: pointer(protocol.JSONObject{"path": json.RawMessage(`"normalized.go"`)}), Metadata: &metadata, Status: pointer(protocol.ToolCallStatusSuccess), Content: pointer("not a preview")}}}
+	a := protocol.AssistantItem{Kind: "assistant", ItemId: "edit", Status: "completed", Source: "provider/model", Content: append(textParts("canonical first"), textParts("canonical second")...), ToolCalls: []protocol.ToolCallView{
+		{Id: "call", Name: "edit_file", Arguments: `{"path":"raw.go"}`, NormalizedArguments: pointer(protocol.JSONObject{"path": json.RawMessage(`"normalized.go"`)}), Metadata: &metadata, Status: pointer(protocol.ToolCallStatusSuccess), Content: pointer("not a preview")},
+		{Id: "uncertain", Name: "echo", Arguments: "{}", Status: pointer(protocol.ToolCallStatusInterrupted), Content: pointer("Tool call interrupted."), Evidence: pointer(protocol.Unknown)},
+		{Id: "clean", Name: "echo", Arguments: "{}", Status: pointer(protocol.ToolCallStatusInterrupted), Content: pointer("Tool call interrupted."), Evidence: pointer(protocol.NotStarted)},
+	}}
 	var item protocol.ConversationItem
 	_ = item.FromAssistantItem(a)
 	done := c.refreshReader(r)
@@ -228,6 +232,11 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	frameContaining(t, screen, "new metadata")
 	result := screen.text()
 	testassert.Require(t, strings.Contains(result, "raw.go") && !strings.Contains(result, "normalized.go") && strings.Contains(result, "old metadata"), "tool display used wrong arguments/metadata: %s", result)
+	// The unknown outcome renders uncertain — its own "outcome unknown"
+	// marker — while the proven-unstarted clean cancellation renders exactly
+	// as before: both stored contents appear, only the uncertain call gains
+	// the marker.
+	testassert.Require(t, strings.Count(result, "outcome unknown") == 1 && strings.Count(result, "Tool call interrupted.") == 2, "unknown-vs-clean cancellation rendering: %s", result)
 	c.command("/copy")
 	osc := frameContaining(t, screen, "\x1b]52;")
 	encoded := base64.StdEncoding.EncodeToString([]byte("canonical first\ncanonical second"))
@@ -413,7 +422,18 @@ func TestProgressTupleUnmatchedOperationRepairsWithoutReplay(t *testing.T) {
 	testassert.Require(t, r.chain == nil && c.provisional == "", "foreign Session tool hint dirtied selected Session")
 	c.mu.Unlock()
 	c.acceptEvent(eventDelivery{c.conn, tool(rootA, "second")})
+	// A finished unknown outcome's transient label is uncertain — never the
+	// plain status of a clean, safe cancellation.
+	var finished protocol.Event
+	{
+		var scope protocol.Scope
+		_ = scope.FromOperationScope(protocol.OperationScope{Kind: "operation", SessionId: rootA, OperationId: "second"})
+		unknownEvidence := protocol.Unknown
+		_ = finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{Kind: protocol.ToolFinished, CallId: "same-call", Status: protocol.ToolCallStatusInterrupted, Scope: scope, Evidence: &unknownEvidence})
+	}
+	c.acceptEvent(eventDelivery{c.conn, finished})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	testassert.Require(t, strings.Contains(c.provisional, "same-call"), "same call ID under current Operation was suppressed")
+	testassert.Require(t, strings.Contains(c.provisional, "same-call: outcome unknown") && !strings.Contains(c.provisional, "same-call: interrupted"), "unknown tool outcome transient label = %q, want the uncertain wording, not a clean cancellation", c.provisional)
 }

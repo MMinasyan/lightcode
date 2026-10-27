@@ -292,6 +292,9 @@ func decodeNotification(raw []byte, instance string) (protocol.Event, error) {
 		if !event.Status.Valid() {
 			return protocol.Event{}, fmt.Errorf("tool_finished status %q is outside the closed set", event.Status)
 		}
+		if event.Evidence != nil && !event.Evidence.Valid() {
+			return protocol.Event{}, fmt.Errorf("tool_finished evidence %q is outside the closed set", *event.Evidence)
+		}
 		var out protocol.Event
 		if err := out.FromToolFinishedEvent(event); err != nil {
 			return protocol.Event{}, err

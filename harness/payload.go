@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -252,7 +253,7 @@ func decodeToolCallRecord(raw json.RawMessage) (toolCallRecord, error) {
 	if err != nil {
 		return toolCallRecord{}, fmt.Errorf("tool call: %w", err)
 	}
-	if err := rejectUnknownMembers(obj, "id", "ordinal", "name", "arguments_base64", "extra", "normalized_arguments", "result_entry_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "id", "ordinal", "name", "arguments_base64", "extra", "normalized_arguments", "normalization_failure", "result_entry_id"); err != nil {
 		return toolCallRecord{}, err
 	}
 	var c toolCallRecord
@@ -274,6 +275,9 @@ func decodeToolCallRecord(raw json.RawMessage) (toolCallRecord, error) {
 	if c.NormalizedArguments, err = rawJSONMember(obj, "normalized_arguments", false); err != nil {
 		return toolCallRecord{}, err
 	}
+	if c.NormalizationFailure, err = optionalNonEmptyString(obj, "normalization_failure"); err != nil {
+		return toolCallRecord{}, err
+	}
 	if c.ResultEntryID, err = stringMember(obj, "result_entry_id", true); err != nil {
 		return toolCallRecord{}, err
 	}
@@ -283,7 +287,9 @@ func decodeToolCallRecord(raw json.RawMessage) (toolCallRecord, error) {
 // validateToolCallRecord enforces the closed tool-call shape: non-empty
 // opaque call identity and name, strictly base64-encoded raw arguments, and a
 // durable reserved result identity. Ordinal agreement with the array position
-// is enforced by the owning assistant entry.
+// is enforced by the owning assistant entry. A normalization failure is
+// mutually exclusive with a successful normalization: when present it is a
+// non-empty valid-UTF-8 diagnostic within the durable diagnostic bound.
 func validateToolCallRecord(c toolCallRecord) error {
 	if err := validateOperationIdentity(c.ID, "tool call id"); err != nil {
 		return err
@@ -300,6 +306,14 @@ func validateToolCallRecord(c toolCallRecord) error {
 	if len(c.NormalizedArguments) > 0 {
 		if _, err := decodePayloadObject(c.NormalizedArguments); err != nil {
 			return fmt.Errorf("tool call normalized_arguments must be one complete JSON object: %v", err)
+		}
+	}
+	if c.NormalizationFailure != "" {
+		if len(c.NormalizedArguments) > 0 {
+			return errors.New("tool call carries both normalized_arguments and normalization_failure")
+		}
+		if !utf8.ValidString(c.NormalizationFailure) || len(c.NormalizationFailure) > maxToolDiagnosticBytes {
+			return fmt.Errorf("tool call normalization_failure must be valid UTF-8 within the %d byte durable diagnostic bound", maxToolDiagnosticBytes)
 		}
 	}
 	return validateHexID(c.ResultEntryID, "tool call reserved result entry id")
@@ -508,7 +522,8 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 // validateAssistantEntry enforces the closed assistant-entry shape: closed
 // output status, complete source identity, unique tool calls with zero-based
 // ordinals and unique reserved results, no calls on errored or interrupted
-// output, and an eligible model-visible payload.
+// output, the closed per-call normalization rule over the advertised names,
+// and an eligible model-visible payload.
 func validateAssistantEntry(v assistantEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -567,6 +582,21 @@ func validateAssistantEntry(v assistantEntry) error {
 			return fmt.Errorf("assistant advertised_names has duplicate name %q", name)
 		}
 		seenNames[name] = true
+	}
+	// One closed normalization rule over the producing request's advertised
+	// names: an advertised call carries exactly one of the successful
+	// normalization or its bounded failure diagnostic, and an unadvertised
+	// call carries neither.
+	for i, call := range v.ToolCalls {
+		normalized, failed := len(call.NormalizedArguments) > 0, call.NormalizationFailure != ""
+		switch {
+		case seenNames[call.Name]:
+			if normalized == failed {
+				return fmt.Errorf("tool_calls[%d]: advertised call %q must carry exactly one of normalized_arguments or normalization_failure", i, call.ID)
+			}
+		case normalized || failed:
+			return fmt.Errorf("tool_calls[%d]: unadvertised call %q must carry neither normalized_arguments nor normalization_failure", i, call.ID)
+		}
 	}
 	if v.Evidence == nil {
 		return errors.New("assistant entry requires its effective request evidence")
@@ -648,6 +678,7 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID          string          `json:"tool_call_id"`
 		Status              string          `json:"status"`
 		Content             string          `json:"content"`
+		Evidence            string          `json:"evidence"`
 		Metadata            json.RawMessage `json:"metadata,omitempty"`
 		NormalizedArguments json.RawMessage `json:"normalized_arguments,omitempty"`
 		HookIDs             json.RawMessage `json:"hook_ids,omitempty"`
@@ -659,6 +690,7 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID:          v.ToolCallID,
 		Status:              string(v.Status),
 		Content:             v.Content,
+		Evidence:            string(v.Evidence),
 		Metadata:            v.Metadata,
 		NormalizedArguments: normalized,
 		HookIDs:             hookIDs,
@@ -679,7 +711,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "metadata", "normalized_arguments", "hook_ids"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "evidence", "metadata", "normalized_arguments", "hook_ids"); err != nil {
 		return toolResultEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -718,6 +750,10 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
+	evidence, err := stringMember(obj, "evidence", true)
+	if err != nil {
+		return toolResultEntry{}, err
+	}
 	normalizedArguments, err := rawJSONMember(obj, "normalized_arguments", false)
 	if err != nil {
 		return toolResultEntry{}, err
@@ -743,6 +779,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 		ToolCallID:          toolCallID,
 		Status:              model.ToolResultStatus(status),
 		Content:             content,
+		Evidence:            ExecutionEvidence(evidence),
 		Metadata:            metadata,
 		NormalizedArguments: normalizedArguments,
 		HookIDs:             hookIDs,
@@ -755,8 +792,9 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 
 // validateToolResultEntry enforces the closed tool-result shape: durable
 // identities, non-empty original call id, the landed Agent result rules
-// re-enforced through the landed constructor, and a present metadata member
-// accepted by the one shared owning helper; omitted metadata stays valid.
+// re-enforced through the landed constructor, one closed execution-evidence
+// value with no status coupling, and a present metadata member accepted by
+// the one shared owning helper; omitted metadata stays valid.
 func validateToolResultEntry(v toolResultEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -771,6 +809,9 @@ func validateToolResultEntry(v toolResultEntry) error {
 	}
 	if _, err := model.NewToolResult(model.ToolResult{CallID: v.ToolCallID, Status: v.Status, Content: v.Content}); err != nil {
 		return err
+	}
+	if !validExecutionEvidence(v.Evidence) {
+		return fmt.Errorf("tool result evidence %q is not one of not_started, observed or unknown", v.Evidence)
 	}
 	if len(v.Metadata) > 0 && len(ownedToolMetadata(v.Metadata)) == 0 {
 		return fmt.Errorf("tool result metadata must be one well-formed non-null JSON value within the %d byte durable bound", maxToolMetadataBytes)
