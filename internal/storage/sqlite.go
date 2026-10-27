@@ -30,9 +30,9 @@ const (
 
 	// sqliteSchemaVersion is the only accepted schema version; it is stamped
 	// into PRAGMA user_version at initialization and checked at open. Version
-	// 9 is the tool-result evidence member and the nested tool-call
-	// normalization-failure payload members; the SQL tables are unchanged.
-	sqliteSchemaVersion = 9
+	// 10 is the tool-result original-content and shaping-failure payload
+	// members; the SQL tables are unchanged.
+	sqliteSchemaVersion = 10
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate

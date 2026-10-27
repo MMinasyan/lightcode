@@ -42,7 +42,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   // 0600 mode; these are the record-shape checks it does not duplicate.
   expect(discovery.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   expect(discovery.instance_id).toMatch(/^[0-9a-f]{32}$/);
-  expect(discovery.protocol_version).toBe('3');
+  expect(discovery.protocol_version).toBe('4');
   // The credential is validated without an assertion diff: a mismatch must
   // never print the value this check exists to protect.
   if (typeof discovery.credential !== 'string' || !/^[0-9a-f]{64}$/.test(discovery.credential)) {
@@ -52,7 +52,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const client = createClient({ baseUrl: discovery.endpoint, auth: discovery.credential });
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
-  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '3' });
+  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '4' });
 
   // The open warning source crosses the generated TypeScript boundary: the
   // mounted owner's real Runtime-scoped reporter plugin attributes its report

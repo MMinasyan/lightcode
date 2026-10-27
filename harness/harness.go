@@ -170,6 +170,28 @@ type RequestHook struct {
 	Run         func(context.Context, RequestHookInput) (RequestConsequence, error)
 }
 
+// ToolOutputInput is one output hook's owned input: the settled tool outcome
+// and the current model-facing content text. Outcome is an owned copy for
+// every hook invocation — the hook can never reach the stored value — and
+// Content is the producer's original content for the first hook and each
+// preceding hook's return for every later one.
+type ToolOutputInput struct {
+	Outcome ToolOutcome
+	Content string
+}
+
+// ToolOutputHook is one selected after-tool output hook: pure model-facing
+// output shaping over one settled tool outcome. Run receives owned values and
+// returns the shaped content text; a hook error or a return that fails the
+// unchanged result-shape rule aborts the chain and the call settles with its
+// original content. Shaping is text only: it can never change the settled
+// status, evidence, usage or metadata.
+type ToolOutputHook struct {
+	ID          string
+	ExtensionID string
+	Run         func(context.Context, ToolOutputInput) (string, error)
+}
+
 // RetryPolicy decides one failed physical model attempt: it receives the
 // attempt's failure and the 1-based number of the attempt that just failed
 // (1 for the initial attempt), and returns the nonnegative delay before the
@@ -198,12 +220,13 @@ type InvocationRequest struct {
 // InvocationExecution is one opened Engine invocation: the physical
 // model-request callback the Harness retries and assembles, the tool effect
 // function, the required pure argument-normalization callback, the selected
-// argument hooks, plus the cleanup of the external resources backing them —
-// the existing callback contracts bound to that invocation. A successful
-// Model, Tool and NormalizeTool must be non-nil, and every ToolHooks entry
-// requires a non-empty unique ID and a non-nil Run. Close is optional; the
-// opened invocation's resources are released exactly once after its effects
-// settle and their result is consumed, before the owning execution closes.
+// argument hooks, the selected output-shaping hooks, plus the cleanup of the
+// external resources backing them — the existing callback contracts bound to
+// that invocation. A successful Model, Tool and NormalizeTool must be
+// non-nil, and every ToolHooks and ToolOutputHooks entry requires a
+// non-empty unique ID and a non-nil Run. Close is optional; the opened
+// invocation's resources are released exactly once after its effects settle
+// and their result is consumed, before the owning execution closes.
 type InvocationExecution struct {
 	// Model is the one physical model-request callback. Each invocation of
 	// it makes exactly one physical attempt and returns its accepted stream
@@ -221,6 +244,12 @@ type InvocationExecution struct {
 	// first receives the original raw call arguments, every later one the
 	// preceding committed value.
 	ToolHooks []ToolArgumentsHook
+	// ToolOutputHooks are the selected output-shaping hooks in configured
+	// order. They run over one settled tool outcome before its result
+	// commits: the first receives the producer's original content, every
+	// later one the preceding hook's return. They are pure and can never
+	// change the settled status, evidence, usage or metadata.
+	ToolOutputHooks []ToolOutputHook
 	// RequestHooks are the selected request-boundary hooks in configured
 	// order. They run inside the Operation's request source, after steering
 	// and before the automatic-maintenance orchestration and any model

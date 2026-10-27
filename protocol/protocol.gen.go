@@ -181,13 +181,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N3 HealthProtocolVersion = "3"
+	N4 HealthProtocolVersion = "4"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N3:
+	case N4:
 		return true
 	default:
 		return false
@@ -1618,8 +1618,14 @@ type ToolCallView struct {
 	Name     string        `json:"name"`
 
 	// NormalizedArguments One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
-	NormalizedArguments *JSONObject     `json:"normalized_arguments,omitempty"`
-	Status              *ToolCallStatus `json:"status,omitempty"`
+	NormalizedArguments *JSONObject `json:"normalized_arguments,omitempty"`
+
+	// OriginalContent The producer's original unshaped result content behind the model-facing content: carried beside content for client inspection and never sent to the model.
+	OriginalContent *string `json:"original_content,omitempty"`
+
+	// ShapingFailure The bounded processing-failure diagnostic of an aborted pure output-shaping chain, present only beside a settled result whose shaping failed; the stored content then carries the original outcome.
+	ShapingFailure *string         `json:"shaping_failure,omitempty"`
+	Status         *ToolCallStatus `json:"status,omitempty"`
 }
 
 // ToolFinishedEvent defines model for ToolFinishedEvent.

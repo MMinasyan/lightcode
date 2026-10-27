@@ -2484,6 +2484,361 @@ func TestToolResultEvidenceByProducer(t *testing.T) {
 	}
 }
 
+// newShapingFixture admits one running Operation with a single pending
+// "call-1", for the output-shaping rows.
+func newShapingFixture(t *testing.T) (*Harness, *graphStorage, *coordinator, string) {
+	t.Helper()
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	publishCalls(t, h, c, sessionID, testToolCall("call-1"))
+	return h, store, c, sessionID
+}
+
+// shapingExecutor returns a prepared executor plan producing one outcome.
+func shapingExecutor(status model.ToolResultStatus, content string, metadata json.RawMessage) func(context.Context, model.ToolCall) PreparedTool {
+	return func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+			return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: status, Content: content}, Metadata: metadata}
+		}}
+	}
+}
+
+// shapingHook builds one output hook.
+func shapingHook(id string, run func(context.Context, ToolOutputInput) (string, error)) ToolOutputHook {
+	return ToolOutputHook{ID: id, ExtensionID: "ext.shaper", Run: run}
+}
+
+// storedShapingResult returns the single committed tool result after the
+// store round trip (the codec re-validating decode) and requires that pure
+// output hooks left no hook_result evidence.
+func storedShapingResult(t *testing.T, store *graphStorage, sessionID string) toolResultEntry {
+	t.Helper()
+	graph, err := validateFixture(t, store, sessionID)
+	testassert.NoError(t, err)
+	found := 0
+	var stored toolResultEntry
+	for _, entry := range graph.Entries {
+		testassert.Require(t, entry.HookResult == nil, "entry %s carries hook evidence; output hooks are pure", entry.Envelope.ID)
+		if entry.ToolResult == nil {
+			continue
+		}
+		found++
+		stored = *entry.ToolResult
+	}
+	testassert.Equal(t, found, 1)
+	return stored
+}
+
+// captureNextModelRequest runs one more model effect over the committed
+// history and returns the physical request its model callback received.
+func captureNextModelRequest(t *testing.T, h *Harness, c *coordinator) model.Request {
+	t.Helper()
+	var captured model.Request
+	modelFn := func(_ context.Context, req model.Request) (model.Stream, error) {
+		captured = req
+		return completedTurnStream(), nil
+	}
+	{
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
+		testassert.NoError(t, err)
+	}
+	return captured
+}
+
+// toolMessageText returns the projected tool message text of one call from a
+// captured request.
+func toolMessageText(t *testing.T, req model.Request, callID string) string {
+	t.Helper()
+	for _, msg := range req.Messages {
+		if msg.Role == model.RoleTool && msg.ToolCallID == callID {
+			return msg.TextContent()
+		}
+	}
+	t.Fatalf("captured request %+v carries no tool message for %s", req, callID)
+	return ""
+}
+
+// TestToolOutputShaping proves the D4 pure output-shaping rows at the tool
+// boundary: a successful chain replaces the model-facing content while the
+// producer's original content stays durable beside it and the shaped text
+// reaches the model, a hook error or an invalid shaped return aborts the
+// whole chain with the original content and one bounded processing failure —
+// the real outcome, status, evidence and metadata survive untouched — hooks
+// chain in configured order over owned outcome copies, and both members
+// survive the store round trip. Pure output hooks leave no hook_result entry.
+func TestToolOutputShaping(t *testing.T) {
+	t.Run("successful shaping replaces content and keeps the original", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultSuccess, "raw output", json.RawMessage(`{"n":1}`)),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.one", func(_ context.Context, in ToolOutputInput) (string, error) {
+				testassert.Equal(t, in.Content, "raw output")
+				testassert.Equal(t, string(in.Outcome.Metadata), `{"n":1}`)
+				return "shaped output", nil
+			})},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "shaped output", "result = %+v, want the shaped content and unchanged status", got)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == "shaped output" && stored.OriginalContent == "raw output" && stored.ShapingFailure == "" && stored.Evidence == ExecutionObserved && string(stored.Metadata) == `{"n":1}`,
+			"stored result = %+v, want the shaped content beside the durable original with no failure and unchanged evidence/metadata", stored)
+		// The shaped text reaches the model; the original stays durable.
+		msgs, err := fixtureProjection(h, c)(context.Background())
+		testassert.NoError(t, err)
+		tool := msgs[len(msgs)-1]
+		testassert.Require(t, tool.Role == model.RoleTool && tool.TextContent() == "shaped output", "projected tool message = %+v, want the shaped text", tool)
+	})
+
+	t.Run("failing shaper preserves the real outcome", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultSuccess, "raw output", json.RawMessage(`{"n":1}`)),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.boom", func(context.Context, ToolOutputInput) (string, error) {
+				return "", errors.New("shaper broke")
+			})},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "raw output", "result = %+v, want the original content and unchanged status", got)
+		stored := storedShapingResult(t, store, sessionID)
+		// The forbidden sibling fails here: a formatter failure can neither
+		// erase the successful mutation nor change evidence or status.
+		testassert.Require(t, stored.Content == "raw output" && stored.OriginalContent == "raw output" && stored.ShapingFailure == "shaper broke" &&
+			stored.Status == model.ResultSuccess && stored.Evidence == ExecutionObserved && string(stored.Metadata) == `{"n":1}`,
+			"stored result = %+v, want the rendered original with the bounded failure and untouched status/evidence/metadata", stored)
+	})
+
+	t.Run("invalid shaped output aborts with the rule diagnostic", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultError, "real failure", nil),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.empty", func(context.Context, ToolOutputInput) (string, error) {
+				return "", nil // empty content is not a valid shape for a non-success status
+			})},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultError && got.Content == "real failure", "result = %+v, want the original failure content and unchanged status", got)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == "real failure" && stored.OriginalContent == "real failure" && stored.Status == model.ResultError && stored.Evidence == ExecutionObserved,
+			"stored result = %+v, want the rendered original with untouched status/evidence", stored)
+		testassert.Require(t, strings.Contains(stored.ShapingFailure, "unchanged status content rule") && len(stored.ShapingFailure) <= maxToolDiagnosticBytes,
+			"shaping failure = %q, want the synthesized rule diagnostic within %d bytes", stored.ShapingFailure, maxToolDiagnosticBytes)
+	})
+
+	// A failed shaper always publishes its processing failure: a cause whose
+	// bounded diagnostic is empty (an empty error or only invalid UTF-8) falls
+	// back to the fixed internal-validation content, non-empty and present on
+	// the wire.
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"empty shaper error still publishes its failure", errors.New("")},
+		{"invalid-UTF-8 shaper error still publishes its failure", errors.New(string([]byte{0xff, 0xfe}))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, store, c, sessionID := newShapingFixture(t)
+			inv := InvocationExecution{
+				Tool:          shapingExecutor(model.ResultSuccess, "raw output", nil),
+				NormalizeTool: objectNormalize,
+				ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.boom", func(context.Context, ToolOutputInput) (string, error) {
+					return "", tc.err
+				})},
+			}
+			got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+			testassert.NoError(t, err)
+			testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "raw output", "result = %+v, want the original content and unchanged status", got)
+			stored := storedShapingResult(t, store, sessionID)
+			testassert.Require(t, stored.Content == "raw output" && stored.OriginalContent == "raw output" && stored.ShapingFailure == invalidToolResultContent &&
+				stored.Status == model.ResultSuccess && stored.Evidence == ExecutionObserved,
+				"stored result = %+v, want the rendered original with the fixed fallback failure and untouched status/evidence", stored)
+			raw, err := encodeToolResultEntry(stored)
+			testassert.NoError(t, err)
+			_, present := wireObject(t, raw)["shaping_failure"]
+			testassert.Require(t, present, "encoded result %s carries no shaping_failure member, want the failure present on the wire", raw)
+		})
+	}
+
+	t.Run("a later failure abandons partial shaping", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultSuccess, "raw output", nil),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{
+				shapingHook("shaper.one", func(_ context.Context, in ToolOutputInput) (string, error) {
+					return "partial " + in.Content, nil // succeeds with changed content
+				}),
+				shapingHook("shaper.boom", func(context.Context, ToolOutputInput) (string, error) {
+					return "", errors.New("shaper broke")
+				}),
+			},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "raw output", "result = %+v, want the rendered ORIGINAL, not the abandoned partial output", got)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == "raw output" && stored.OriginalContent == "raw output" && stored.ShapingFailure == "shaper broke" && stored.Evidence == ExecutionObserved,
+			"stored result = %+v, want the rendered original with exactly the one failing hook's diagnostic and unchanged evidence", stored)
+	})
+
+	t.Run("hooks chain in configured order", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		seen := []string{}
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultSuccess, "raw output", nil),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{
+				shapingHook("shaper.one", func(_ context.Context, in ToolOutputInput) (string, error) {
+					seen = append(seen, in.Content)
+					return "one(" + in.Content + ")", nil
+				}),
+				shapingHook("shaper.two", func(_ context.Context, in ToolOutputInput) (string, error) {
+					seen = append(seen, in.Content)
+					return "two(" + in.Content + ")", nil
+				}),
+			},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(seen) == 2 && seen[0] == "raw output" && seen[1] == "one(raw output)", "hook inputs = %v, want the original then the first return", seen)
+		testassert.Equal(t, got.Content, "two(one(raw output))")
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == "two(one(raw output))" && stored.OriginalContent == "raw output" && stored.ShapingFailure == "",
+			"stored result = %+v, want the chained content beside the original", stored)
+	})
+
+	t.Run("hook outcome input is an owned copy", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		var second ToolOutputInput
+		inv := InvocationExecution{
+			Tool:          shapingExecutor(model.ResultSuccess, "raw output", json.RawMessage(`{"n":1}`)),
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{
+				shapingHook("shaper.mutate", func(_ context.Context, in ToolOutputInput) (string, error) {
+					copy(in.Outcome.Metadata, "XXXXXXXX") // mutate the owned copy's bytes in place
+					in.Outcome.Result.Content = "clobbered"
+					in.Content = "clobbered"
+					return "shaped output", nil
+				}),
+				shapingHook("shaper.observe", func(_ context.Context, in ToolOutputInput) (string, error) {
+					second = in
+					return in.Content, nil
+				}),
+			},
+		}
+		_, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, string(second.Outcome.Metadata) == `{"n":1}` && second.Outcome.Result.Content == "raw output" && second.Content == "shaped output",
+			"second hook input = %+v, want the untouched owned outcome beside the chained content", second)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, string(stored.Metadata) == `{"n":1}` && stored.OriginalContent == "raw output" && stored.Content == "shaped output",
+			"stored result = %+v, want the stored metadata and contents immune to hook mutation", stored)
+	})
+
+	t.Run("immediate outcomes shape from their replacement content", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
+				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: "wrong-call", Status: model.ResultSuccess, Content: "done"}}}
+			},
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.one", func(_ context.Context, in ToolOutputInput) (string, error) {
+				testassert.Equal(t, in.Content, invalidToolResultContent) // the invalid replacement is the base
+				return "shaped " + in.Content, nil
+			})},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		testassert.Require(t, got.Status == model.ResultError && got.Content == "shaped "+invalidToolResultContent, "result = %+v, want the shaped replacement content", got)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == "shaped "+invalidToolResultContent && stored.OriginalContent == invalidToolResultContent && stored.Evidence == ExecutionNotStarted,
+			"stored result = %+v, want the shaped replacement beside its original", stored)
+	})
+}
+
+// TestToolShapingPreservesUnknownOutcomeNotice proves the D3 captured-request
+// rows: an executor that acted but answered invalidly settles unknown, and
+// whether a shaper successfully returns innocuous cancellation text or fails,
+// the next model request's tool message keeps the fixed unknown notice at the
+// top above the shaped or original text.
+func TestToolShapingPreservesUnknownOutcomeNotice(t *testing.T) {
+	invalidExecutor := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+			return ToolOutcome{Result: model.ToolResult{CallID: "wrong-call", Status: model.ResultSuccess, Content: "ran"}} // acted but answered for another call
+		}}
+	}
+	t.Run("successful shaper cannot erase the unknown notice", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          invalidExecutor,
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.cancel", func(context.Context, ToolOutputInput) (string, error) {
+				return interruptedToolResultContent, nil // innocuous cancellation text
+			})},
+		}
+		_, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		want := unknownToolResultPrefix + "\n\n" + interruptedToolResultContent
+		text := toolMessageText(t, captureNextModelRequest(t, h, c), "call-1")
+		testassert.Require(t, text == want, "next request tool message = %q, want %q", text, want)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == want && stored.OriginalContent == invalidToolResultContent && stored.Evidence == ExecutionUnknown && stored.ShapingFailure == "",
+			"stored result = %+v, want the shaped text under the preserved notice with the durable original and unknown evidence", stored)
+	})
+	t.Run("failing shaper cannot erase the unknown notice", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool:          invalidExecutor,
+			NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.boom", func(context.Context, ToolOutputInput) (string, error) {
+				return "", errors.New("shaper broke")
+			})},
+		}
+		_, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		want := unknownToolResultPrefix + "\n\n" + invalidToolResultContent
+		text := toolMessageText(t, captureNextModelRequest(t, h, c), "call-1")
+		testassert.Require(t, text == want, "next request tool message = %q, want %q", text, want)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, stored.Content == want && stored.OriginalContent == invalidToolResultContent && stored.Evidence == ExecutionUnknown && stored.ShapingFailure == "shaper broke",
+			"stored result = %+v, want the original under the preserved notice with the bounded failure and unknown evidence", stored)
+	})
+}
+
+// TestOpenedInvocationOutputHookRules proves the output-hook contract at
+// invocation validation: every hook requires a non-empty unique ID, a
+// non-empty extension identity and a non-nil Run, and carries no mode.
+func TestOpenedInvocationOutputHookRules(t *testing.T) {
+	modelFn := func(context.Context, model.Request) (model.Stream, error) { return completedTurnStream(), nil }
+	toolFn := func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }
+	good := shapingHook("shaper.one", func(context.Context, ToolOutputInput) (string, error) { return "", nil })
+	for _, tc := range []struct {
+		name  string
+		hooks []ToolOutputHook
+	}{
+		{"empty id", []ToolOutputHook{{ID: "", ExtensionID: "ext.shaper", Run: good.Run}}},
+		{"empty extension id", []ToolOutputHook{{ID: "shaper.one", ExtensionID: "", Run: good.Run}}},
+		{"nil run", []ToolOutputHook{{ID: "shaper.one", ExtensionID: "ext.shaper"}}},
+		{"duplicate id", []ToolOutputHook{good, good}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := invocationExecution(modelFn, toolFn)
+			inv.ToolOutputHooks = tc.hooks
+			err := validateOpenedInvocation(inv)
+			testassert.Require(t, errors.Is(err, ErrInvalid), "validate = %v, want the invalid-input rejection", err)
+		})
+	}
+	{
+		inv := invocationExecution(modelFn, toolFn)
+		inv.ToolOutputHooks = []ToolOutputHook{good, shapingHook("shaper.two", good.Run)}
+		testassert.NoError(t, validateOpenedInvocation(inv))
+	}
+}
+
 // publishCalls drives one ready model effect publishing the given calls as
 // pending, for direct tool-effect fixtures.
 func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, calls ...model.ToolCall) {

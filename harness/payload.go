@@ -678,6 +678,8 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID          string          `json:"tool_call_id"`
 		Status              string          `json:"status"`
 		Content             string          `json:"content"`
+		OriginalContent     string          `json:"original_content"`
+		ShapingFailure      string          `json:"shaping_failure,omitempty"`
 		Evidence            string          `json:"evidence"`
 		Metadata            json.RawMessage `json:"metadata,omitempty"`
 		NormalizedArguments json.RawMessage `json:"normalized_arguments,omitempty"`
@@ -690,6 +692,8 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		ToolCallID:          v.ToolCallID,
 		Status:              string(v.Status),
 		Content:             v.Content,
+		OriginalContent:     v.OriginalContent,
+		ShapingFailure:      v.ShapingFailure,
 		Evidence:            string(v.Evidence),
 		Metadata:            v.Metadata,
 		NormalizedArguments: normalized,
@@ -711,7 +715,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "evidence", "metadata", "normalized_arguments", "hook_ids"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "original_content", "shaping_failure", "evidence", "metadata", "normalized_arguments", "hook_ids"); err != nil {
 		return toolResultEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -750,6 +754,14 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
+	originalContent, err := stringMember(obj, "original_content", true)
+	if err != nil {
+		return toolResultEntry{}, err
+	}
+	shapingFailure, err := optionalNonEmptyString(obj, "shaping_failure")
+	if err != nil {
+		return toolResultEntry{}, err
+	}
 	evidence, err := stringMember(obj, "evidence", true)
 	if err != nil {
 		return toolResultEntry{}, err
@@ -779,6 +791,8 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 		ToolCallID:          toolCallID,
 		Status:              model.ToolResultStatus(status),
 		Content:             content,
+		OriginalContent:     originalContent,
+		ShapingFailure:      shapingFailure,
 		Evidence:            ExecutionEvidence(evidence),
 		Metadata:            metadata,
 		NormalizedArguments: normalizedArguments,
@@ -792,9 +806,11 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 
 // validateToolResultEntry enforces the closed tool-result shape: durable
 // identities, non-empty original call id, the landed Agent result rules
-// re-enforced through the landed constructor, one closed execution-evidence
-// value with no status coupling, and a present metadata member accepted by
-// the one shared owning helper; omitted metadata stays valid.
+// re-enforced through the landed constructor for the final content and the
+// original content alike, one closed execution-evidence value with no status
+// coupling, a bounded valid-UTF-8 shaping failure when present, and a present
+// metadata member accepted by the one shared owning helper; omitted metadata
+// stays valid.
 func validateToolResultEntry(v toolResultEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -809,6 +825,14 @@ func validateToolResultEntry(v toolResultEntry) error {
 	}
 	if _, err := model.NewToolResult(model.ToolResult{CallID: v.ToolCallID, Status: v.Status, Content: v.Content}); err != nil {
 		return err
+	}
+	if _, err := model.NewToolResult(model.ToolResult{CallID: v.ToolCallID, Status: v.Status, Content: v.OriginalContent}); err != nil {
+		return err
+	}
+	if v.ShapingFailure != "" {
+		if !utf8.ValidString(v.ShapingFailure) || len(v.ShapingFailure) > maxToolDiagnosticBytes {
+			return fmt.Errorf("tool result shaping_failure must be valid UTF-8 within the %d byte durable diagnostic bound", maxToolDiagnosticBytes)
+		}
 	}
 	if !validExecutionEvidence(v.Evidence) {
 		return fmt.Errorf("tool result evidence %q is not one of not_started, observed or unknown", v.Evidence)

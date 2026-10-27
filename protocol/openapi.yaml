@@ -888,7 +888,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "3"
+            - "4"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1338,6 +1338,19 @@ components:
           $ref: "#/components/schemas/ToolCallStatus"
         content:
           type: string
+        original_content:
+          type: string
+          description: >-
+            The producer's original unshaped result content behind the
+            model-facing content: carried beside content for client
+            inspection and never sent to the model.
+        shaping_failure:
+          type: string
+          description: >-
+            The bounded processing-failure diagnostic of an aborted pure
+            output-shaping chain, present only beside a settled result whose
+            shaping failed; the stored content then carries the original
+            outcome.
         evidence:
           $ref: "#/components/schemas/ExecutionEvidence"
         metadata:

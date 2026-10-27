@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '3';
+    protocol_version: '4';
 };
 
 /**
@@ -237,6 +237,14 @@ export type ToolCallView = {
     normalized_arguments?: JsonObject;
     status?: ToolCallStatus;
     content?: string;
+    /**
+     * The producer's original unshaped result content behind the model-facing content: carried beside content for client inspection and never sent to the model.
+     */
+    original_content?: string;
+    /**
+     * The bounded processing-failure diagnostic of an aborted pure output-shaping chain, present only beside a settled result whose shaping failed; the stored content then carries the original outcome.
+     */
+    shaping_failure?: string;
     evidence?: ExecutionEvidence;
     metadata?: ToolMetadata;
     extra?: JsonObject;

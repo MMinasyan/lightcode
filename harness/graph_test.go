@@ -546,6 +546,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
 		result.Status = model.ResultInterrupted
 		result.Content = "agent interrupted"
+		result.OriginalContent = "agent interrupted"
 		result.NormalizedArguments = json.RawMessage(`{"x":1}`)
 		result.HookIDs = []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}
 		fixture.entries = append(fixture.entries,
@@ -566,6 +567,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
 		result.Status = model.ResultInterrupted
 		result.Content = "agent interrupted"
+		result.OriginalContent = "agent interrupted"
 		fixture.entries = append(fixture.entries,
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook},
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result},
@@ -1580,6 +1582,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
 			result.Status = model.ResultError
 			result.Content = "hook broke"
+			result.OriginalContent = "hook broke"
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result,
 			})

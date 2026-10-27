@@ -349,9 +349,10 @@ func projectAssistantItem(id string, fact harness.HistoryFact, results map[strin
 // the native JSON string encoding supplies the UTF-8 replacement. A terminal
 // result matched by the call's reserved result identity contributes its
 // status, its model-visible content (an empty success content stays present),
-// its preserved tool-owned metadata for every terminal status alike, and its
-// committed execution evidence; a pending call omits all four and never gains
-// a fabricated outcome.
+// its original unshaped content beside it, its bounded shaping failure when a
+// pure output-shaping chain aborted, its preserved tool-owned metadata for
+// every terminal status alike, and its committed execution evidence; a
+// pending call omits them all and never gains a fabricated outcome.
 func projectToolCall(call harness.ToolCallRecord, results map[string]harness.ToolResultEntry) (protocol.ToolCallView, error) {
 	arguments, err := base64.StdEncoding.Strict().DecodeString(call.ArgumentsBase64)
 	if err != nil {
@@ -380,6 +381,12 @@ func projectToolCall(call harness.ToolCallRecord, results map[string]harness.Too
 	view.Status = &status
 	view.Content = &content
 	view.Evidence = &evidence
+	original := result.OriginalContent
+	view.OriginalContent = &original
+	if result.ShapingFailure != "" {
+		failure := result.ShapingFailure
+		view.ShapingFailure = &failure
+	}
 	if len(result.Metadata) > 0 {
 		metadata := protocol.ToolMetadata(result.Metadata)
 		view.Metadata = &metadata

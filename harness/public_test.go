@@ -3665,7 +3665,7 @@ const (
 // answering the given assistant entry's call under the reserved identity.
 func rawToolResultPayload(sessionID, entryID, operationID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","evidence":"observed"}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","original_content":"done","evidence":"observed"}`,
 		sessionID, entryID, operationID, sessionID, assistantEntryID, callID)
 }
 
@@ -3758,7 +3758,7 @@ func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2
 // payload answering the given copied assistant entry's call.
 func rawCopiedResultPayload(sessionID, entryID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","evidence":"observed"}`,
+		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","original_content":"done","evidence":"observed"}`,
 		sessionID, entryID, sessionID, assistantEntryID, callID)
 }
 

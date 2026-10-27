@@ -1108,6 +1108,114 @@ func TestToolResultEvidenceRules(t *testing.T) {
 	}
 }
 
+// TestToolResultShapingMembers proves the durable output-shaping members of
+// one tool-result payload: original_content is a required member mirroring
+// content's member semantics — an empty original is valid beside an empty
+// success and both contents satisfy the unchanged status rule — while
+// shaping_failure encodes by omission, rejects an empty present member, and
+// bounds its diagnostic to valid UTF-8 within the durable bound on both
+// codec sides.
+func TestToolResultShapingMembers(t *testing.T) {
+	roundTrip := func(t *testing.T, v toolResultEntry) toolResultEntry {
+		t.Helper()
+		raw, err := encodeToolResultEntry(v)
+		testassert.NoError(t, err)
+		decoded, err := decodeToolResultEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: raw})
+		testassert.NoError(t, err)
+		return decoded
+	}
+
+	// Both members round-trip verbatim; a missing optional member decodes to
+	// the zero value and encodes by omission.
+	withBoth := validToolResultEntry(testOpID)
+	withBoth.OriginalContent = "raw output"
+	withBoth.ShapingFailure = "shaping aborted"
+	{
+		decoded := roundTrip(t, withBoth)
+		testassert.Equal(t, decoded.OriginalContent, "raw output")
+		testassert.Equal(t, decoded.ShapingFailure, "shaping aborted")
+	}
+	{
+		bare := roundTrip(t, validToolResultEntry(testOpID))
+		testassert.Equal(t, bare.OriginalContent, "")
+		testassert.Equal(t, bare.ShapingFailure, "")
+		raw, err := encodeToolResultEntry(validToolResultEntry(testOpID))
+		testassert.NoError(t, err)
+		obj := wireObject(t, raw)
+		_, present := obj["original_content"]
+		testassert.Require(t, present, "encoded result %s carries no original_content member", raw)
+		_, present = obj["shaping_failure"]
+		testassert.Require(t, !present, "encoded result %s carries an absent shaping_failure member", raw)
+	}
+	// An empty original content round-trips beside an empty success.
+	{
+		empty := validToolResultEntry(testOpID)
+		empty.Content = ""
+		decoded := roundTrip(t, empty)
+		testassert.Equal(t, decoded.OriginalContent, "")
+	}
+
+	// The membership and status-shape rules: original_content is required and
+	// satisfies the status rule like content, and a present shaping_failure
+	// must be non-empty.
+	failure := validToolResultEntry(testOpID)
+	failure.Status = model.ResultError
+	failure.Content = "real failure"
+	failure.OriginalContent = "real failure"
+	failureRaw, err := encodeToolResultEntry(failure)
+	testassert.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{"missing original_content", dropKey(failureRaw, "original_content")},
+		{"null original_content", setKey(failureRaw, "original_content", json.RawMessage(`null`))},
+		{"empty original content on a non-success status", setKey(failureRaw, "original_content", json.RawMessage(`""`))},
+		{"empty present shaping_failure", setKey(failureRaw, "shaping_failure", json.RawMessage(`""`))},
+	} {
+		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: tc.payload}
+		{
+			_, err := decodeToolResultEntry(env)
+			testassert.Require(t, err != nil, "decode %s must fail", tc.name)
+		}
+	}
+	{
+		bad := validToolResultEntry(testOpID)
+		bad.Status = model.ResultError
+		bad.Content = "real failure"
+		_, err := encodeToolResultEntry(bad) // empty original beside a non-success status
+		testassert.Require(t, errors.Is(err, ErrInvalid), "encode empty original on a non-success status = %v, want the ErrInvalid class", err)
+	}
+
+	// The bounded rule: oversized and invalid-UTF-8 diagnostics are rejected
+	// by both codec sides; the exact bound round-trips.
+	v := withBoth
+	v.ShapingFailure = strings.Repeat("x", maxToolDiagnosticBytes+1)
+	{
+		_, err := encodeToolResultEntry(v)
+		testassert.Require(t, errors.Is(err, ErrInvalid), "encode oversized failure = %v, want the ErrInvalid class", err)
+	}
+	v.ShapingFailure = string([]byte{0xff, 0xfe})
+	{
+		_, err := encodeToolResultEntry(v)
+		testassert.Require(t, errors.Is(err, ErrInvalid), "encode invalid-UTF-8 failure = %v, want the ErrInvalid class", err)
+	}
+	v.ShapingFailure = strings.Repeat("x", maxToolDiagnosticBytes)
+	{
+		decoded := roundTrip(t, v)
+		testassert.Equal(t, decoded.ShapingFailure, v.ShapingFailure)
+	}
+	{
+		raw, err := encodeToolResultEntry(v)
+		testassert.NoError(t, err)
+		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: setKey(raw, "shaping_failure", json.RawMessage(`"`+strings.Repeat("x", maxToolDiagnosticBytes+1)+`"`))}
+		{
+			_, err := decodeToolResultEntry(env)
+			testassert.Require(t, err != nil, "decode oversized persisted failure must fail")
+		}
+	}
+}
+
 // TestToolCallNormalizationFailureRules proves the nested normalization-
 // failure member: its bounded valid-UTF-8 diagnostic round-trips verbatim,
 // absence encodes by omission, and it is mutually exclusive with
@@ -1659,6 +1767,8 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		v.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: assistantID}
 		v.Evidence = ExecutionUnknown
 		v.Metadata = freshRaw(nestedMetadata)
+		v.OriginalContent = "raw output"
+		v.ShapingFailure = "shaping aborted"
 		return v
 	}
 	// Ownership oracle: clobber the producer's raw buffers in place.
@@ -1690,6 +1800,7 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		testassert.Require(t, got != nil, "%v", "adopted tool result entry is missing")
 		testassert.Require(t, string(got.Metadata) == nestedMetadata, "adopted metadata = %q, want the nested form with exact lexemes unchanged", got.Metadata)
 		testassert.Equal(t, string(got.Evidence), string(ExecutionUnknown))
+		testassert.Require(t, got.OriginalContent == "raw output" && got.ShapingFailure == "shaping aborted", "adopted shaping members = %q/%q, want the producer's values verbatim", got.OriginalContent, got.ShapingFailure)
 	}
 
 	t.Run("decode after insert", func(t *testing.T) {

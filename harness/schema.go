@@ -380,8 +380,10 @@ type assistantEntry struct {
 // Evidence is the producer-assigned execution knowledge of the settled call,
 // independent of status: proven unstarted work is not_started, a produced
 // terminal outcome is observed, and a possibly-executed-but-unverified
-// external outcome is unknown. The uncertainty its value warrants is baked
-// into Content once by the shared result producer.
+// external outcome is unknown. Content is the final model-facing string built
+// once by the shared result producer after pure output shaping and evidence
+// rendering; OriginalContent is that producer's unshaped content, and
+// ShapingFailure the bounded processing failure of an aborted shaping chain.
 type toolResultEntry struct {
 	SessionID           string                 `json:"session_id"`
 	EntryID             string                 `json:"entry_id"`
@@ -390,6 +392,8 @@ type toolResultEntry struct {
 	ToolCallID          string                 `json:"tool_call_id"`
 	Status              model.ToolResultStatus `json:"status"`
 	Content             string                 `json:"content"`
+	OriginalContent     string                 `json:"original_content"`
+	ShapingFailure      string                 `json:"shaping_failure,omitempty"`
 	Evidence            ExecutionEvidence      `json:"evidence"`
 	Metadata            json.RawMessage        `json:"metadata,omitempty"`
 	NormalizedArguments json.RawMessage        `json:"normalized_arguments,omitempty"`

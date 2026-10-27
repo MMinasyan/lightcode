@@ -529,7 +529,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"3\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"4\"}"
     }
    ],
    "reject": [
@@ -539,16 +539,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"3\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"4\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"3\"}"
+     "json": "{\"protocol_version\":\"4\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"3\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"4\",\"extra\":true}"
     }
    ]
   },
@@ -1750,7 +1750,11 @@
     },
     {
      "name": "full",
-     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"evidence\":\"observed\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"original_content\":\"raw output\",\"evidence\":\"observed\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}"
+    },
+    {
+     "name": "shaping-failure",
+     "json": "{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\",\"status\":\"error\",\"content\":\"real failure\",\"original_content\":\"real failure\",\"shaping_failure\":\"output shaping aborted\",\"evidence\":\"observed\"}"
     },
     {
      "name": "second-call",
