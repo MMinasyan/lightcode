@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -361,6 +362,35 @@ func (g *testGraph) storage(t testing.TB) *graphStorage {
 	return out
 }
 
+// conversationModelEffect returns a coherent request-bound conversation
+// model active effect over the given result reservation with its published
+// running request state, matching the validTestGraph canonical references.
+func conversationModelEffect(resultID string) (*ActiveEffect, *RunningRequest) {
+	evidence := &RequestEvidence{BoundaryEntryID: hexID(1)}
+	effect := &ActiveEffect{
+		Kind:          EffectModel,
+		ResultEntryID: resultID,
+		RequestID:     "request-active",
+		Model:         &model.ModelRef{Provider: "prov", Model: "gpt-x"},
+		Purpose:       InvocationPurposeConversation,
+		Evidence:      evidence,
+	}
+	return effect, &RunningRequest{RequestID: "request-active", BoundaryEntryID: hexID(1)}
+}
+
+// toolBoundHookEffect returns a coherent tool-bound hook active effect for
+// the fixture pending call "call-1".
+func toolBoundHookEffect(resultID, hookID string) *ActiveEffect {
+	return &ActiveEffect{
+		Kind:                 EffectHook,
+		ResultEntryID:        resultID,
+		ToolCallID:           "call-1",
+		HookID:               hookID,
+		ExtensionID:          "cap-a",
+		InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":1}`)),
+	}
+}
+
 // validTestGraph returns a coherent open Session with one running Operation:
 // the admitted input entry, a completed assistant entry, and no outstanding
 // effects.
@@ -373,6 +403,7 @@ func validTestGraph() *testGraph {
 	op.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(1)}
 	assistant := validAssistantEntry(testOpID)
 	assistant.EntryID = hexID(2)
+	assistant.RequestID = hexID(2)
 	return &testGraph{
 		session: session,
 		ops:     []OperationRecord{op},
@@ -418,6 +449,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture := validTestGraph()
 		assistant := validAssistantEntry(testOpID)
 		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
 		call := validToolCallRecord()
 		call.ResultEntryID = resultEntryID
 		assistant.ToolCalls = []toolCallRecord{call}
@@ -444,9 +476,167 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		testassert.Require(t, view.Entries[0].Envelope.ID == hexID(1) && view.Entries[1].Envelope.ID == hexID(2), "view entries are not in committed order: %+v", view.Entries)
 	})
 
+	t.Run("request hook provenance with interleaved entry-less pure identities", func(t *testing.T) { // Entry-less pure identities are the informational exception to the
+		// complete-order rule: they may interleave with the result-backed
+		// effectful identities at the hook's consumed boundary and at the
+		// answering assistant.
+		fixture := validTestGraph()
+		hook := validRequestBoundHookResult(hookSucceeded)
+		hook.EntryID = hexID(3)
+		hook.RequestID = "request-one"
+		hook.InputEvidence = &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.pure", HookID: "cap.pure.one"}}}
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		assistant.RequestID = "request-one"
+		assistant.Evidence.HookIDs = []HookIdentity{{ExtensionID: "ext.pure", HookID: "cap.pure.one"}, {ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+		assistantRow := fixture.entries[1]
+		assistantRow.assistant = &assistant
+		assistantRow.env.Sequence = 3
+		fixture.entries = []testEntry{
+			fixture.entries[0],
+			{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook},
+			assistantRow,
+		}
+		view, err := validateFixture(t, fixture.storage(t), testSessionID)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Entries) == 3 && view.Entries[1].HookResult != nil, "view entries = %+v, want the committed hook before its answering assistant", view.Entries)
+	})
+
+	// The accepted tool-selection reconciliation keeps three valid shapes:
+	// interleaved entry-less pure identities, an interrupted chain whose
+	// settled result keeps its prior successful contributors, and a quiet-gap
+	// recovery settlement that invents neither arguments nor provenance.
+	toolProvenanceGraph := func(t *testing.T) *testGraph {
+		fixture := validTestGraph()
+		assistant := validAssistantEntry(testOpID)
+		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
+		call := validToolCallRecord()
+		call.ResultEntryID = hexID(3)
+		assistant.ToolCalls = []toolCallRecord{call}
+		fixture.entries[1].assistant = &assistant
+		return fixture
+	}
+	t.Run("accepted tool selection with interleaved entry-less pure identities", func(t *testing.T) {
+		fixture := toolProvenanceGraph(t)
+		hook := validHookResultEntry(hookSucceeded)
+		hook.EntryID = hexID(5)
+		result := validToolResultEntry(testOpID)
+		result.EntryID = hexID(3)
+		result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+		result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+		result.HookIDs = []HookIdentity{{ExtensionID: "ext.pure", HookID: "cap.pure.one"}, {ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result},
+		)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("accepted selection with interleaved pure identities: %v", err)
+		}
+	})
+	t.Run("interrupted hook chain keeps prior successful contributors", func(t *testing.T) {
+		fixture := toolProvenanceGraph(t)
+		first := validHookResultEntry(hookSucceeded)
+		first.EntryID = hexID(5)
+		second := validHookResultEntry(hookInterrupted)
+		second.EntryID = hexID(6)
+		second.HookID = "cap.hook.two"
+		result := validToolResultEntry(testOpID)
+		result.EntryID = hexID(3)
+		result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+		result.Status = model.ResultInterrupted
+		result.Content = "agent interrupted"
+		result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+		result.HookIDs = []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &second},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result},
+		)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("interrupted chain keeping prior successful contributors: %v", err)
+		}
+	})
+	t.Run("quiet-gap settlement without accepted selection", func(t *testing.T) {
+		fixture := toolProvenanceGraph(t)
+		hook := validHookResultEntry(hookSucceeded)
+		hook.EntryID = hexID(5)
+		result := validToolResultEntry(testOpID)
+		result.EntryID = hexID(3)
+		result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+		result.Status = model.ResultInterrupted
+		result.Content = "agent interrupted"
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result},
+		)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("quiet-gap settlement without accepted selection: %v", err)
+		}
+	})
+
+	t.Run("running request summary-only boundary equal to its checkpoint", func(t *testing.T) {
+		comp := validCompactionEntry(testOpID)
+		comp.EntryID = hexID(5)
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries, testEntry{
+			env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
+		})
+		fixture.session.State.CompactionEntryID = hexID(5)
+		fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(5)}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("summary-only running request boundary: %v", err)
+		}
+	})
+
+	t.Run("running request names a later canonical tail", func(t *testing.T) {
+		comp := validCompactionEntry(testOpID)
+		comp.EntryID = hexID(5)
+		signal := validSignalEntry(testOpID)
+		signal.EntryID = hexID(6)
+		fixture := validTestGraph()
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntrySignal, Sequence: 4, CommittedAt: testTime}, signal: &signal},
+		)
+		fixture.session.State.CompactionEntryID = hexID(5)
+		fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(6)}
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("later canonical tail boundary: %v", err)
+		}
+	})
+
+	t.Run("manual maintenance record needs no consumed source", func(t *testing.T) {
+		fixture := validTestGraph()
+		stamped := testTime
+		second := validOperationRecord()
+		second.Admission.OperationID = "op-2"
+		second.Admission.RequestKind = RequestKindCompact
+		second.Admission.AdmittedEntry = EntryRef{} // a compact Operation admits no message entry of its own
+		second.State.Status = OperationSuccess
+		second.State.SettledAt = &stamped
+		second.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(4)}}
+		fixture.ops = append(fixture.ops, second)
+		comp := validCompactionEntry("op-2")
+		comp.EntryID = hexID(3)
+		comp.ConsumedRequestID = "" // the dedicated compact Operation's own maintenance carries no conversation source
+		settlement := validSettlementEntry()
+		settlement.EntryID = hexID(4)
+		settlement.OperationID = "op-2"
+		fixture.entries = append(fixture.entries,
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: "op-2", Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp},
+			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: "op-2", Kind: EntryOperationSettlement, Sequence: 4, CommittedAt: testTime}, settlement: &settlement},
+		)
+		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
+			t.Fatalf("manual compaction record without a consumed source: %v", err)
+		}
+	})
+
 	t.Run("running model effect", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+		effect, request := conversationModelEffect(hexID(3))
+		fixture.ops[0].State.ActiveEffect = effect
+		fixture.ops[0].State.Request = request
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.Operations[0].State.ActiveEffect != nil && view.Operations[0].State.ActiveEffect.Kind == EffectModel, "typed view lost the active model effect")
@@ -463,6 +653,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture := validTestGraph()
 		assistant := validAssistantEntry(testOpID)
 		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
 		call := validToolCallRecord()
 		call.ResultEntryID = hexID(3)
 		assistant.ToolCalls = []toolCallRecord{call}
@@ -519,6 +710,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		copiedInput.EntryID = hexID(1)
 		copiedAssistant := validAssistantEntry("")
 		copiedAssistant.EntryID = hexID(2)
+		copiedAssistant.RequestID = hexID(2)
 		copiedCall := validToolCallRecord()
 		copiedCall.ResultEntryID = hexID(3)
 		copiedAssistant.ToolCalls = []toolCallRecord{copiedCall}
@@ -544,13 +736,13 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture := singleCallGraph(hexID(4))
 		first := hookResultEntry{
 			SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID,
-			HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded,
-			Arguments: json.RawMessage(`{"x":1}`),
+			HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded,
+			Evidence: ExecutionObserved, Arguments: json.RawMessage(`{"x":1}`),
 		}
 		second := hookResultEntry{
 			SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID,
-			HookID: "cap.hook.two", ToolCallID: "call-1", Status: hookFailed,
-			Error: "hook broke",
+			HookID: "cap.hook.two", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookFailed,
+			Evidence: ExecutionObserved, Error: "hook broke",
 		}
 		fixture.entries = append(fixture.entries,
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
@@ -563,7 +755,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 
 	t.Run("running hook effect", func(t *testing.T) {
 		fixture := singleCallGraph(hexID(3))
-		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+		fixture.ops[0].State.ActiveEffect = toolBoundHookEffect(hexID(9), "cap.hook.one")
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.Operations[0].State.ActiveEffect != nil && view.Operations[0].State.ActiveEffect.Kind == EffectHook, "typed view lost the active hook effect")
@@ -573,6 +765,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture := validTestGraph()
 		assistant := validAssistantEntry(testOpID)
 		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
 		callOne, callTwo := validToolCallRecord(), validToolCallRecord()
 		callOne.ID, callTwo.ID = "c", "b\x00c"
 		callOne.Ordinal, callTwo.Ordinal = 0, 1
@@ -584,8 +777,8 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture.ops[0].State.PendingToolCalls = []PendingToolCall{
 			{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "b\x00c", ResultEntryID: hexID(5)},
 		}
-		one := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "a\x00b", ToolCallID: "c", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
-		two := hookResultEntry{SessionID: testSessionID, EntryID: hexID(6), OperationID: testOpID, HookID: "a", ToolCallID: "b\x00c", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+		one := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "a\x00b", ExtensionID: "ext.one", ToolCallID: "c", Status: hookSucceeded, Evidence: ExecutionObserved, Arguments: json.RawMessage(`{}`)}
+		two := hookResultEntry{SessionID: testSessionID, EntryID: hexID(6), OperationID: testOpID, HookID: "a", ExtensionID: "ext.one", ToolCallID: "b\x00c", Status: hookSucceeded, Evidence: ExecutionObserved, Arguments: json.RawMessage(`{}`)}
 		firstResult := validToolResultEntry(testOpID)
 		firstResult.EntryID = hexID(4)
 		firstResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
@@ -768,6 +961,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"published call neither pending nor result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -776,6 +970,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"pending call with terminal result too", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -796,6 +991,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"second result breaks reservation identity", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -857,12 +1053,14 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"operation usage disagrees with entries", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			assistant.Usage = testUsage(4)
 			fixture.entries[1].assistant = &assistant
 		}},
 		{"session usage disagrees with entries", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			assistant.Usage = testUsage(4)
 			fixture.entries[1].assistant = &assistant
 			totals := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: *testUsage(4)}}}
@@ -875,6 +1073,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries[1].assistant = &first
 			second := validAssistantEntry(testOpID)
 			second.EntryID = hexID(3)
+			second.RequestID = "request-two"
 			second.Usage = &UsageCount{InputTokens: 1}
 			fixture.entries = append(fixture.entries, testEntry{
 				env:       Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryAssistant, Sequence: 3, CommittedAt: testTime},
@@ -947,6 +1146,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"duplicate reservation across two operations", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(6)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -960,6 +1160,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			secondInput.EntryID = hexID(4)
 			secondAssistant := validAssistantEntry("op-2")
 			secondAssistant.EntryID = hexID(5)
+			secondAssistant.RequestID = hexID(5)
 			secondCall := validToolCallRecord()
 			secondCall.ID = "call-9"
 			secondCall.ResultEntryID = hexID(6)
@@ -992,6 +1193,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"reservation id names a committed input entry", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(1)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1012,6 +1214,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			copiedInput.EntryID = hexID(1)
 			copiedAssistant := validAssistantEntry("")
 			copiedAssistant.EntryID = hexID(2)
+			copiedAssistant.RequestID = hexID(2)
 			copiedResult := validToolResultEntry("")
 			copiedResult.EntryID = hexID(3)
 			copiedResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
@@ -1031,6 +1234,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			copiedInput.EntryID = hexID(1)
 			copiedAssistant := validAssistantEntry("")
 			copiedAssistant.EntryID = hexID(2)
+			copiedAssistant.RequestID = hexID(2)
 			copiedCall := validToolCallRecord()
 			copiedCall.ResultEntryID = hexID(9)
 			copiedAssistant.ToolCalls = []toolCallRecord{copiedCall}
@@ -1044,11 +1248,14 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			}
 		}},
 		{"model effect reserves a committed entry", func(t *testing.T, fixture *testGraph) {
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(1)}
+			effect, request := conversationModelEffect(hexID(1))
+			fixture.ops[0].State.ActiveEffect = effect
+			fixture.ops[0].State.Request = request
 		}},
 		{"model effect reserves a tool call reservation", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1058,7 +1265,9 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+			effect, request := conversationModelEffect(hexID(3))
+			fixture.ops[0].State.ActiveEffect = effect
+			fixture.ops[0].State.Request = request
 		}},
 		{"terminal op carries a second settlement entry", func(t *testing.T, fixture *testGraph) {
 			fixture.session.State.CurrentOperationID = ""
@@ -1089,6 +1298,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			copiedInput.EntryID = hexID(1)
 			copiedAssistant := validAssistantEntry("")
 			copiedAssistant.EntryID = hexID(2)
+			copiedAssistant.RequestID = hexID(2)
 			copiedCall := validToolCallRecord()
 			copiedCall.ResultEntryID = hexID(9)
 			copiedAssistant.ToolCalls = []toolCallRecord{copiedCall}
@@ -1130,6 +1340,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"hook result before its publishing assistant", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(4)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1139,7 +1350,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(4),
 			}}
-			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook,
 			})
@@ -1147,6 +1358,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"hook result after its call's terminal tool result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1162,7 +1374,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result,
 			})
-			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &hook,
 			})
@@ -1170,6 +1382,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"duplicate hook result for one call", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(4)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1179,8 +1392,8 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(4),
 			}}
-			first := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
-			second := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			first := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
+			second := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries,
 				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
 				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &second},
@@ -1189,6 +1402,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"active hook effect repeats a settled hook", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1198,14 +1412,21 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &hook,
 			})
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind:                 EffectHook,
+				ResultEntryID:        hexID(9),
+				ToolCallID:           "call-1",
+				HookID:               "cap.hook.one",
+				ExtensionID:          "ext.one", // the same full HookIdentity as the settled hook result
+				InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":1}`)),
+			}
 		}},
 		{"hook result answers unpublished call", func(t *testing.T, fixture *testGraph) {
-			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-9", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-9", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook,
 			})
@@ -1213,6 +1434,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"hook for a later call while an earlier call is unresolved", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			callOne, callTwo := validToolCallRecord(), validToolCallRecord()
 			callOne.ID, callTwo.ID = "call-1", "call-2"
 			callOne.Ordinal, callTwo.Ordinal = 0, 1
@@ -1223,7 +1445,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-1", ResultEntryID: hexID(4)},
 				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-2", ResultEntryID: hexID(5)},
 			}
-			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-2", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-2", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &later,
 			})
@@ -1231,6 +1453,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"hook for a later call before the earlier call's result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			callOne, callTwo := validToolCallRecord(), validToolCallRecord()
 			callOne.ID, callTwo.ID = "call-1", "call-2"
 			callOne.Ordinal, callTwo.Ordinal = 0, 1
@@ -1243,7 +1466,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{
 				{AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)}, CallID: "call-2", ResultEntryID: hexID(5)},
 			}
-			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-2", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-2", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			lateResult := validToolResultEntry(testOpID)
 			lateResult.EntryID = hexID(4)
 			lateResult.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
@@ -1255,6 +1478,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"hook active effect reserves a committed entry", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1264,11 +1488,12 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(1), ToolCallID: "call-1", HookID: "cap.hook.one"}
+			fixture.ops[0].State.ActiveEffect = toolBoundHookEffect(hexID(1), "cap.hook.one")
 		}},
 		{"hook active effect reserves a tool call reservation", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1278,11 +1503,12 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(3), ToolCallID: "call-1", HookID: "cap.hook.one"}
+			fixture.ops[0].State.ActiveEffect = toolBoundHookEffect(hexID(3), "cap.hook.one")
 		}},
 		{"hook result after a failed hook for the same call", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(4)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1292,8 +1518,8 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(4),
 			}}
-			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
-			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.two", ToolCallID: "call-1", Status: hookSucceeded, Arguments: json.RawMessage(`{}`)}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookFailed, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Error: "hook broke"}
+			later := hookResultEntry{SessionID: testSessionID, EntryID: hexID(5), OperationID: testOpID, HookID: "cap.hook.two", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
 			fixture.entries = append(fixture.entries,
 				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &failed},
 				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &later},
@@ -1302,6 +1528,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"active hook effect after a failed hook", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1311,15 +1538,16 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookFailed, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Error: "hook broke"}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
 			})
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.two"}
+			fixture.ops[0].State.ActiveEffect = toolBoundHookEffect(hexID(9), "cap.hook.two")
 		}},
 		{"active tool effect after a failed hook", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
@@ -1329,20 +1557,21 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 				CallID:         "call-1",
 				ResultEntryID:  hexID(3),
 			}}
-			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookFailed, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Error: "hook broke"}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
 			})
-			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1"}
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1", FinalArguments: json.RawMessage(`{"x":1}`)}
 		}},
 		{"interrupted hook with an error tool result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
 			fixture.entries[1].assistant = &assistant
-			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookInterrupted, Error: "agent interrupted"}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookInterrupted, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Error: "agent interrupted"}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &hook,
 			})
@@ -1358,11 +1587,12 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		{"error hook with a success tool result", func(t *testing.T, fixture *testGraph) {
 			assistant := validAssistantEntry(testOpID)
 			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
 			call := validToolCallRecord()
 			call.ResultEntryID = hexID(3)
 			assistant.ToolCalls = []toolCallRecord{call}
 			fixture.entries[1].assistant = &assistant
-			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ToolCallID: "call-1", Status: hookFailed, Error: "hook broke"}
+			failed := hookResultEntry{SessionID: testSessionID, EntryID: hexID(4), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookFailed, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Error: "hook broke"}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &failed,
 			})
@@ -1371,6 +1601,351 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result,
+			})
+		}},
+		{"assistant evidence names its own entry", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			assistant.Evidence.BoundaryEntryID = hexID(2)
+			fixture.entries[1].assistant = &assistant
+		}},
+		{"assistant evidence names a hook result as its boundary", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(4)
+			assistant.ToolCalls = []toolCallRecord{call}
+			assistant.Evidence.BoundaryEntryID = hexID(3)
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(4),
+			}}
+			hook := hookResultEntry{SessionID: testSessionID, EntryID: hexID(3), OperationID: testOpID, HookID: "cap.hook.one", ExtensionID: "ext.one", ToolCallID: "call-1", Status: hookSucceeded, Evidence: ExecutionObserved, InputArgumentsBase64: "e30=", Arguments: json.RawMessage(`{}`)}
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook,
+			})
+		}},
+		{"assistant evidence names a settlement entry as its boundary", func(t *testing.T, fixture *testGraph) {
+			// The settlement belongs to a coherently settled second Operation;
+			// the corruption is exclusively the reference kind.
+			assistant := fixture.entries[1].assistant
+			assistant.Evidence.BoundaryEntryID = hexID(7)
+			secondInput := validInputEntry("op-2")
+			secondInput.EntryID = hexID(5)
+			stamped := testTime
+			second := validOperationRecord()
+			second.Admission.OperationID = "op-2"
+			second.Admission.AdmittedEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(5)}
+			second.State.Status = OperationSuccess
+			second.State.SettledAt = &stamped
+			second.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(7)}}
+			fixture.session.State.CurrentOperationID = ""
+			fixture.ops[0].State.Status = OperationSuccess
+			fixture.ops[0].State.SettledAt = &stamped
+			fixture.ops[0].State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(6)}}
+			own := validSettlementEntry()
+			own.EntryID = hexID(6)
+			own.OperationID = testOpID
+			settlement := validSettlementEntry()
+			settlement.EntryID = hexID(7)
+			settlement.OperationID = "op-2"
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: "op-2", Kind: EntryInput, Sequence: 3, CommittedAt: testTime}, input: &secondInput},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 4, CommittedAt: testTime}, settlement: &own},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(7), OperationID: "op-2", Kind: EntryOperationSettlement, Sequence: 5, CommittedAt: testTime}, settlement: &settlement},
+			)
+			fixture.ops = append(fixture.ops, second)
+		}},
+		{"assistant evidence names a later entry as its boundary", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			assistant.Evidence.BoundaryEntryID = hexID(3) // a projectable entry committed after the assistant
+			fixture.entries[1].assistant = &assistant
+			signal := validSignalEntry(testOpID)
+			signal.EntryID = hexID(3)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntrySignal, Sequence: 3, CommittedAt: testTime}, signal: &signal,
+			})
+		}},
+		{"assistant evidence names a foreign boundary entry", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			assistant.Evidence.BoundaryEntryID = hexID(7)
+			fixture.entries[1].assistant = &assistant
+		}},
+		{"assistant evidence checkpoint names a non-compaction entry", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			assistant.Evidence.CheckpointEntryID = hexID(1)
+			fixture.entries[1].assistant = &assistant
+		}},
+		{"active effect evidence references outside the Session", func(t *testing.T, fixture *testGraph) {
+			effect, request := conversationModelEffect(hexID(3))
+			effect.Evidence.BoundaryEntryID = hexID(7)
+			request.BoundaryEntryID = hexID(7)
+			fixture.ops[0].State.ActiveEffect = effect
+			fixture.ops[0].State.Request = request
+		}},
+		{"maintenance producer settles on two checkpoint entries", func(t *testing.T, fixture *testGraph) {
+			one := validCompactionEntry(testOpID)
+			one.EntryID = hexID(3)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &one,
+			})
+			two := validCompactionEntry(testOpID)
+			two.EntryID = hexID(4)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryCompaction, Sequence: 4, CommittedAt: testTime}, compaction: &two,
+			})
+			fixture.session.State.CompactionEntryID = hexID(4)
+		}},
+		{"assistant provenance omits a committed request hook", func(t *testing.T, fixture *testGraph) {
+			hook := validRequestBoundHookResult(hookSucceeded)
+			hook.EntryID = hexID(3)
+			hook.RequestID = "request-one"
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = "request-one"
+			assistantRow := fixture.entries[1]
+			assistantRow.assistant = &assistant
+			assistantRow.env.Sequence = 3
+			fixture.entries = []testEntry{
+				fixture.entries[0],
+				{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook},
+				assistantRow,
+			}
+		}},
+		{"assistant provenance names committed request hooks out of order", func(t *testing.T, fixture *testGraph) {
+			first := validRequestBoundHookResult(hookSucceeded)
+			first.EntryID = hexID(3)
+			first.RequestID = "request-one"
+			second := validRequestBoundHookResult(hookSucceeded)
+			second.EntryID = hexID(4)
+			second.RequestID = "request-one"
+			second.HookID = "cap.hook.two"
+			second.InputEvidence = &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}}
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = "request-one"
+			assistant.Evidence.HookIDs = []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.two"}, {ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+			assistantRow := fixture.entries[1]
+			assistantRow.assistant = &assistant
+			assistantRow.env.Sequence = 4
+			fixture.entries = []testEntry{
+				fixture.entries[0],
+				{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &first},
+				{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &second},
+				assistantRow,
+			}
+		}},
+		{"active request hook names itself in its consumed provenance", func(t *testing.T, fixture *testGraph) {
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.two", ExtensionID: "ext.two", RequestID: "request-active",
+				Evidence: &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.two", HookID: "cap.hook.two"}}},
+			}
+			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", BoundaryEntryID: hexID(1)}
+		}},
+		{"active request hook provenance omits a committed request hook", func(t *testing.T, fixture *testGraph) {
+			hook := validRequestBoundHookResult(hookSucceeded)
+			hook.EntryID = hexID(3)
+			hook.RequestID = "request-one"
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook,
+			})
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.two", ExtensionID: "ext.two", RequestID: "request-one",
+				Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)},
+			}
+			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-one", BoundaryEntryID: hexID(1), HookResults: []EntryRef{{SessionID: testSessionID, EntryID: hexID(3)}}}
+		}},
+		{"running request hook results reference committed hooks out of order", func(t *testing.T, fixture *testGraph) {
+			first := validRequestBoundHookResult(hookSucceeded)
+			first.EntryID = hexID(3)
+			first.RequestID = "request-one"
+			second := validRequestBoundHookResult(hookSucceeded)
+			second.EntryID = hexID(4)
+			second.RequestID = "request-one"
+			second.HookID = "cap.hook.two"
+			second.InputEvidence = &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &first},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &second},
+			)
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.three", ExtensionID: "ext.three", RequestID: "request-one",
+				Evidence: &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}, {ExtensionID: "ext.one", HookID: "cap.hook.two"}}},
+			}
+			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-one", BoundaryEntryID: hexID(1), HookResults: []EntryRef{{SessionID: testSessionID, EntryID: hexID(4)}, {SessionID: testSessionID, EntryID: hexID(3)}}}
+		}},
+		{"settled request evidence names a hook result committed later", func(t *testing.T, fixture *testGraph) {
+			stamped := testTime
+			hook := validRequestBoundHookResult(hookSucceeded)
+			hook.EntryID = hexID(4)
+			hook.RequestID = "request-one"
+			settlement := validSettlementEntry()
+			settlement.EntryID = hexID(3)
+			settlement.OperationID = testOpID
+			settlement.Status = OperationSuccess
+			settlement.RequestID = "request-one"
+			settlement.Evidence = &RequestEvidence{BoundaryEntryID: hexID(1), HookIDs: []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 4, CommittedAt: testTime}, settlement: &settlement},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &hook},
+			)
+			fixture.ops[0].State.Status = OperationSuccess
+			fixture.ops[0].State.SettledAt = &stamped
+			fixture.ops[0].State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}}
+			fixture.session.State.CurrentOperationID = "" // a settled Operation is no longer the Session's current one
+		}},
+		{"tool result provenance omits a committed successful hook effect", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			hook := validHookResultEntry(hookSucceeded)
+			hook.EntryID = hexID(5)
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result},
+			)
+		}},
+		{"tool result provenance names its hook effects out of order", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			first := validHookResultEntry(hookSucceeded)
+			first.EntryID = hexID(5)
+			second := validHookResultEntry(hookSucceeded)
+			second.EntryID = hexID(6)
+			second.HookID = "cap.hook.two"
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+			result.HookIDs = []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.two"}, {ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &second},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 5, CommittedAt: testTime}, toolResult: &result},
+			)
+		}},
+		{"active tool effect provenance omits committed hook effects", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			hook := validHookResultEntry(hookSucceeded)
+			hook.EntryID = hexID(5)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &hook,
+			})
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1",
+				FinalArguments: json.RawMessage(`{"x":1}`),
+			}
+		}},
+		{"tool result provenance names a hook effect committed after the result", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			result := validToolResultEntry(testOpID)
+			result.EntryID = hexID(3)
+			result.AssistantEntry = EntryRef{SessionID: testSessionID, EntryID: hexID(2)}
+			result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+			result.HookIDs = []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.one"}}
+			hook := validHookResultEntry(hookSucceeded)
+			hook.EntryID = hexID(5)
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryToolResult, Sequence: 4, CommittedAt: testTime}, toolResult: &result},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 5, CommittedAt: testTime}, hookResult: &hook},
+			)
+		}},
+		{"active tool effect provenance names its hook effects out of order", func(t *testing.T, fixture *testGraph) {
+			assistant := validAssistantEntry(testOpID)
+			assistant.EntryID = hexID(2)
+			assistant.RequestID = hexID(2)
+			call := validToolCallRecord()
+			call.ResultEntryID = hexID(3)
+			assistant.ToolCalls = []toolCallRecord{call}
+			fixture.entries[1].assistant = &assistant
+			fixture.ops[0].State.PendingToolCalls = []PendingToolCall{{
+				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
+				CallID:         "call-1",
+				ResultEntryID:  hexID(3),
+			}}
+			first := validHookResultEntry(hookSucceeded)
+			first.EntryID = hexID(5)
+			second := validHookResultEntry(hookSucceeded)
+			second.EntryID = hexID(6)
+			second.HookID = "cap.hook.two"
+			fixture.entries = append(fixture.entries,
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryHookResult, Sequence: 3, CommittedAt: testTime}, hookResult: &first},
+				testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntryHookResult, Sequence: 4, CommittedAt: testTime}, hookResult: &second},
+			)
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1",
+				FinalArguments:  json.RawMessage(`{"x":1}`),
+				ContributionIDs: []HookIdentity{{ExtensionID: "ext.one", HookID: "cap.hook.two"}, {ExtensionID: "ext.one", HookID: "cap.hook.one"}},
+			}
+		}},
+		{"running request state names a boundary its checkpoint covered", func(t *testing.T, fixture *testGraph) {
+			comp := validCompactionEntry(testOpID)
+			comp.EntryID = hexID(5)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
+			})
+			fixture.session.State.CompactionEntryID = hexID(5)
+			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(1)}
+		}},
+		{"active request hook effect references a boundary its checkpoint covered", func(t *testing.T, fixture *testGraph) {
+			comp := validCompactionEntry(testOpID)
+			comp.EntryID = hexID(5)
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
+			})
+			fixture.session.State.CompactionEntryID = hexID(5)
+			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
+				Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one", ExtensionID: "ext.one", RequestID: "request-active",
+				Evidence: &RequestEvidence{CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(1)},
+			}
+			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(1)}
+		}},
+		{"automatic maintenance record names no consumed conversation request", func(t *testing.T, fixture *testGraph) {
+			comp := validCompactionEntry(testOpID)
+			comp.EntryID = hexID(3)
+			comp.ConsumedRequestID = ""
+			fixture.entries = append(fixture.entries, testEntry{
+				env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
 			})
 		}},
 	}
@@ -1388,6 +1963,32 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 	usageOverflowDetail := map[string]string{
 		"usage accumulation overflows": fmt.Sprintf("usage of operation %q overflows: harness: storage failure: input token count overflows int64", testOpID),
 	}
+	// The evidence-reference rows pin the exact reference rule each mutation
+	// targets, so an incidental earlier corruption is a regression.
+	evidenceDetail := map[string]string{
+		"assistant evidence names its own entry":                                  fmt.Sprintf("references boundary entry %s at or after its own sequence", hexID(2)),
+		"assistant evidence names a hook result as its boundary":                  "of non-canonical kind hook_result",
+		"assistant evidence names a settlement entry as its boundary":             "of non-canonical kind operation_settlement",
+		"assistant evidence names a later entry as its boundary":                  "at or after its own sequence",
+		"assistant evidence names a foreign boundary entry":                       "outside the Session",
+		"assistant evidence checkpoint names a non-compaction entry":              "names no in-session compaction entry",
+		"active effect evidence references outside the Session":                   "outside the Session",
+		"maintenance producer settles on two checkpoint entries":                  "settles maintenance producer",
+		"assistant provenance omits a committed request hook":                     "omits committed hook result",
+		"assistant provenance names committed request hooks out of order":         "out of order",
+		"active request hook names itself in its consumed provenance":             "names itself in its consumed provenance",
+		"active request hook provenance omits a committed request hook":           "omits committed hook result",
+		"running request hook results reference committed hooks out of order":     "out of committed entry order",
+		"settled request evidence names a hook result committed later":            "at or after its own sequence",
+		"tool result provenance omits a committed successful hook effect":         "omits committed hook result",
+		"tool result provenance names its hook effects out of order":              "out of order",
+		"active tool effect provenance omits committed hook effects":              "omits committed hook result",
+		"tool result provenance names a hook effect committed after the result":   "follows that call's terminal tool result",
+		"active tool effect provenance names its hook effects out of order":       "out of order",
+		"running request state names a boundary its checkpoint covered":           "before its checkpoint entry",
+		"active request hook effect references a boundary its checkpoint covered": "before its checkpoint entry",
+		"automatic maintenance record names no consumed conversation request":     "names no consumed conversation request",
+	}
 	for _, tc := range corruptions {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := validTestGraph()
@@ -1401,6 +2002,10 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			{
 				want, ok := usageOverflowDetail[tc.name]
 				testassert.Require(t, !ok || corrupt.Detail == want, "overflow corruption detail = %q, want %q", corrupt.Detail, want)
+			}
+			{
+				want, ok := evidenceDetail[tc.name]
+				testassert.Require(t, !ok || strings.Contains(corrupt.Detail, want), "evidence corruption detail = %q, want the %q rule", corrupt.Detail, want)
 			}
 		})
 	}
@@ -1501,6 +2106,7 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 		copiedInput.EntryID = hexID(1)
 		copiedAssistant := validAssistantEntry("")
 		copiedAssistant.EntryID = hexID(2)
+		copiedAssistant.RequestID = hexID(2)
 		copiedSignal := validSignalEntry("")
 		copiedSignal.EntryID = hexID(3)
 		copiedSignal.RelatedOperation = &operationRef{SessionID: otherSession(), OperationID: "source-op"}
@@ -1516,6 +2122,7 @@ func TestGraphValidatorForkReferenceRules(t *testing.T) {
 		fork := buildFork(t)
 		copiedAssistant := validAssistantEntry("")
 		copiedAssistant.EntryID = hexID(2)
+		copiedAssistant.RequestID = hexID(2)
 		call := validToolCallRecord()
 		call.ResultEntryID = hexID(4)
 		copiedAssistant.ToolCalls = []toolCallRecord{call}
@@ -1672,6 +2279,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	compactionAt := func(entryID, boundaryID, operationID string, sequence int64) testEntry {
 		v := validCompactionEntry(operationID)
 		v.EntryID = entryID
+		v.RequestID = "maintenance-" + entryID
 		v.BoundaryEntryID = boundaryID
 		return testEntry{
 			env:        Entry{SessionID: testSessionID, ID: entryID, OperationID: operationID, Kind: EntryCompaction, Sequence: sequence, CommittedAt: testTime},
@@ -1766,6 +2374,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 		input.EntryID = hexID(1)
 		assistant := validAssistantEntry(testOpID)
 		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
 		settlement := validSettlementEntry()
 		settlement.EntryID = hexID(4)
 		secondInput := validInputEntry("op-2")
@@ -1790,6 +2399,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 		fixture.session.Identity.SourceBoundaryEntryID = otherEntry()
 		copiedAssistant := validAssistantEntry("")
 		copiedAssistant.EntryID = hexID(2)
+		copiedAssistant.RequestID = hexID(2)
 		fixture.entries = []testEntry{
 			{env: Entry{SessionID: testSessionID, ID: hexID(1), Kind: EntryInput, Sequence: 1, CommittedAt: testTime}, input: func() *inputEntry { v := validInputEntry(""); v.EntryID = hexID(1); return &v }()},
 			{env: Entry{SessionID: testSessionID, ID: hexID(2), Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &copiedAssistant},
@@ -1828,6 +2438,7 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 				compactionUsage := UsageCount{InputTokens: 4, CachedInputTokens: 5, OutputTokens: 6}
 				assistant := validAssistantEntry(testOpID)
 				assistant.EntryID = hexID(2)
+				assistant.RequestID = hexID(2)
 				assistant.Usage = &assistantUsage
 				fixture.entries[1].assistant = &assistant
 				compaction.Usage = &compactionUsage
@@ -1947,6 +2558,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 		testassert.Require(t, copiedCompactionIDs[0] != hexID(3) && copiedCompactionIDs[1] != hexID(4), "copied compaction identities %v are not both fresh", copiedCompactionIDs)
 		for i, v := range copiedCompactions {
 			testassert.Require(t, v.SessionID == destID && v.EntryID == copiedCompactionIDs[i], "copied compaction identity %s/%s, want destination identities", v.SessionID, v.EntryID)
+			testassert.Require(t, v.ConsumedRequestID == "request-two", "copied compaction %s consumed source = %q, want the source identity carried unchanged and informational", v.EntryID, v.ConsumedRequestID)
 			testassert.Equal(t, v.OperationID, "")
 			if v.Usage != nil {
 				t.Fatalf("copied compaction carries source usage %+v", *v.Usage)
@@ -2016,16 +2628,19 @@ func TestGraphValidatorGroupsEntriesByOperation(t *testing.T) {
 	inputB.EntryID = hexID(2)
 	assistantA1 := validAssistantEntry(testOpID)
 	assistantA1.EntryID = hexID(3)
+	assistantA1.RequestID = hexID(3)
 	callA1 := validToolCallRecord()
 	callA1.ID, callA1.ResultEntryID = "a1", hexID(9)
 	assistantA1.ToolCalls = []toolCallRecord{callA1}
 	assistantA2 := validAssistantEntry(testOpID)
 	assistantA2.EntryID = hexID(6)
+	assistantA2.RequestID = hexID(6)
 	callA2 := validToolCallRecord()
 	callA2.ID, callA2.ResultEntryID = "a2", hexID(10)
 	assistantA2.ToolCalls = []toolCallRecord{callA2}
 	assistantB := validAssistantEntry("op-2")
 	assistantB.EntryID = hexID(4)
+	assistantB.RequestID = hexID(4)
 	callB := validToolCallRecord()
 	callB.ID, callB.ResultEntryID = "b1", hexID(7)
 	assistantB.ToolCalls = []toolCallRecord{callB}

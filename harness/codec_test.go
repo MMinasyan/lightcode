@@ -117,13 +117,16 @@ func validToolCallRecord() toolCallRecord {
 
 func validAssistantEntry(operationID string) assistantEntry {
 	return assistantEntry{
-		SessionID:   testSessionID,
-		EntryID:     testEntryID,
-		OperationID: operationID,
-		Status:      model.OutputCompleted,
-		Source:      testModelRef(),
-		Content:     []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
-		ToolCalls:   []toolCallRecord{},
+		SessionID:       testSessionID,
+		EntryID:         testEntryID,
+		OperationID:     operationID,
+		Status:          model.OutputCompleted,
+		Source:          testModelRef(),
+		Content:         []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
+		ToolCalls:       []toolCallRecord{},
+		RequestID:       "request-one",
+		AdvertisedNames: []string{},
+		Evidence:        &RequestEvidence{BoundaryEntryID: hexID(1)},
 	}
 }
 
@@ -180,21 +183,56 @@ func validCompactionEntry(operationID string) compactionEntry {
 		BoundaryEntryID:       hexID(2),
 		Model:                 testModelRef(),
 		ConfigurationRevision: "rev-1",
+		RequestID:             "maintenance-one",
+		ConsumedRequestID:     "request-two",
+		Input: []model.Message{
+			{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "compact prompt"}}},
+			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
+		},
+		Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)},
 	}
 }
 
 func validHookResultEntry(status hookResultStatus) hookResultEntry {
 	v := hookResultEntry{
-		SessionID:   testSessionID,
-		EntryID:     testEntryID,
-		OperationID: testOpID,
-		HookID:      "cap.hook.one",
-		ToolCallID:  "call-1",
-		Status:      status,
+		SessionID:            testSessionID,
+		EntryID:              testEntryID,
+		OperationID:          testOpID,
+		HookID:               "cap.hook.one",
+		ExtensionID:          "ext.one",
+		ToolCallID:           "call-1",
+		Status:               status,
+		Evidence:             ExecutionObserved,
+		InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":0}`)),
 	}
 	switch status {
 	case hookSucceeded:
 		v.Arguments = json.RawMessage(`{"x":1}`)
+	default:
+		v.Error = "hook broke"
+	}
+	return v
+}
+
+// validRequestBoundHookResult returns one valid request-bound hook result: its
+// consumed input is the closed evidence record and its binding is a request
+// identity, never a tool call.
+func validRequestBoundHookResult(status hookResultStatus) hookResultEntry {
+	v := hookResultEntry{
+		SessionID:     testSessionID,
+		EntryID:       testEntryID,
+		OperationID:   testOpID,
+		HookID:        "cap.hook.one",
+		ExtensionID:   "ext.one",
+		RequestID:     "request-one",
+		Status:        status,
+		Evidence:      ExecutionObserved,
+		InputEvidence: &RequestEvidence{BoundaryEntryID: hexID(1)},
+	}
+	switch status {
+	case hookSucceeded:
+		consequence := RequestConsequence{}
+		v.Consequence = &consequence
 	default:
 		v.Error = "hook broke"
 	}
@@ -612,7 +650,7 @@ func TestHookActiveEffectCodecRules(t *testing.T) {
 	}}
 
 	valid := op
-	valid.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}
+	valid.State.ActiveEffect = &ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one", ExtensionID: "cap-a", InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))}
 	{
 		_, err := encodeOperationRegister(valid)
 		testassert.NoError(t, err)
@@ -623,11 +661,11 @@ func TestHookActiveEffectCodecRules(t *testing.T) {
 		effect  ActiveEffect
 		wantErr string
 	}{
-		{"hook effect without a hook id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1"}, "hook active effect requires its hook id"},
-		{"hook effect without a tool call id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "hook active effect requires its tool call id"},
-		{"hook effect on a non-pending call", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-9", HookID: "cap.hook.one"}, "hook active effect must address the matching first pending call"},
-		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "model active effect omits the hook id"},
-		{"tool effect with a hook id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, ToolCallID: "call-1", HookID: "cap.hook.one"}, "tool active effect omits the hook id"},
+		{"hook effect without a hook id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", ExtensionID: "cap-a", InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))}, "hook active effect requires its hook id"},
+		{"hook effect without a tool call id", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one", ExtensionID: "cap-a"}, "hook active effect requires its request or tool call binding"},
+		{"hook effect on a non-pending call", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-9", HookID: "cap.hook.one", ExtensionID: "cap-a", InputArgumentsBase64: base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))}, "tool-bound hook active effect must address the matching first pending call"},
+		{"model effect with a hook id", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), HookID: "cap.hook.one"}, "model active effect carries no call, hook, or extension identity"},
+		{"tool effect with a hook id", ActiveEffect{Kind: EffectTool, ResultEntryID: testResultID, ToolCallID: "call-1", HookID: "cap.hook.one"}, "tool active effect carries no hook identity"},
 		{"unknown kind", ActiveEffect{Kind: "widget", ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one"}, `active effect kind "widget" is not one of model, tool or hook`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -645,17 +683,72 @@ func TestHookActiveEffectCodecRules(t *testing.T) {
 			effectJSON, merr := json.Marshal(tc.effect)
 			testassert.NoError(t, merr)
 			if tc.name == "hook effect without a hook id" {
-				effectJSON = json.RawMessage(`{"kind":"hook","result_entry_id":"` + hexID(9) + `","tool_call_id":"call-1","hook_id":null}`)
+				effectJSON = json.RawMessage(`{"kind":"hook","result_entry_id":"` + hexID(9) + `","tool_call_id":"call-1","hook_id":null,"hook_extension_id":"cap-a","input_arguments_base64":"eyJ4IjoxfQ=="}`)
 			}
 			stateObj := mustState(t, raw)
 			patchedState := setKey(stateObj, "active_effect", effectJSON)
 			full := setKey(raw, "state", patchedState)
 			{
 				_, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: full})
-				testassert.Require(t, err != nil, "expected rejection of %s", tc.name)
+				wantDecode := tc.wantErr
+				if tc.name == "hook effect without a hook id" {
+					// The persisted null member is rejected by name at the strict
+					// member codec before the value rule — the same targeted rule.
+					wantDecode = `member "hook_id" must not be null`
+				}
+				testassert.Require(t, err != nil && strings.Contains(err.Error(), wantDecode), "decode = %v, want the %q rule to reject %s", err, wantDecode, tc.name)
 			}
 		})
 	}
+	t.Run("non-tool bindings forbid the input_arguments_base64 member outright", func(t *testing.T) {
+		effects := []struct {
+			name   string
+			effect ActiveEffect
+		}{
+			{"request-bound hook intent", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), RequestID: "request-one", HookID: "cap.hook.one", ExtensionID: "cap-a", Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)}}},
+			{"conversation model intent", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), RequestID: "request-one", Model: &model.ModelRef{Provider: "prov", Model: "m"}, Purpose: InvocationPurposeConversation, Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)}}},
+			{"maintenance model intent", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), RequestID: "maintenance-one", Model: &model.ModelRef{Provider: "prov", Model: "compact"}, Purpose: InvocationPurposeMaintenance}},
+			{"concrete tool intent", ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(9), ToolCallID: "call-1", FinalArguments: json.RawMessage(`{}`)}},
+		}
+		for _, tc := range effects {
+			raw, err := encodeActiveEffect(tc.effect)
+			testassert.NoError(t, err)
+			obj := wireObject(t, raw)
+			for _, mutation := range []struct {
+				name  string
+				value json.RawMessage
+			}{
+				{"present-empty", json.RawMessage(`""`)},
+				{"null", json.RawMessage(`null`)},
+				{"wrong type", json.RawMessage(`5`)},
+				{"canonical base64 bytes", json.RawMessage(`"eyJ4IjoxfQ=="`)},
+			} {
+				obj["input_arguments_base64"] = mutation.value
+				_, derr := decodeActiveEffect(obj)
+				testassert.Require(t, derr != nil && strings.Contains(derr.Error(), `forbids the "input_arguments_base64" member`),
+					"%s wire %s member decode = %v, want the membership rejection", tc.name, mutation.name, derr)
+			}
+		}
+		// Nearest positive siblings: the tool-bound hook intent keeps its
+		// required member, present-empty and opaque malformed-JSON bytes
+		// included.
+		empty := ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), ToolCallID: "call-1", HookID: "cap.hook.one", ExtensionID: "cap-a"}
+		raw, err := encodeActiveEffect(empty)
+		testassert.NoError(t, err)
+		testassert.Require(t, strings.Contains(string(raw), `"input_arguments_base64":""`), "tool-bound empty consumed bytes must stay an encoded required member: %s", raw)
+		{
+			decoded, derr := decodeActiveEffect(wireObject(t, raw))
+			testassert.Require(t, derr == nil && decoded.InputArgumentsBase64 == "", "tool-bound present-empty decode: %v", derr)
+		}
+		opaque := empty
+		opaque.InputArgumentsBase64 = base64.StdEncoding.EncodeToString([]byte("not json"))
+		raw, err = encodeActiveEffect(opaque)
+		testassert.NoError(t, err)
+		{
+			decoded, derr := decodeActiveEffect(wireObject(t, raw))
+			testassert.Require(t, derr == nil && decoded.InputArgumentsBase64 == opaque.InputArgumentsBase64, "tool-bound opaque malformed-JSON bytes decode: %v", derr)
+		}
+	})
 }
 
 // TestRegisterPayloadRoundTrip proves both register payloads round-trip and
@@ -708,7 +801,9 @@ func TestOperationStateEncodingShape(t *testing.T) {
 	}
 
 	effect := validOperationRecord()
-	effect.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)} // model effect: no tool call id
+	mdl := testModelRef()
+	effect.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3), RequestID: "request-one", Model: &mdl, Purpose: InvocationPurposeConversation, Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)}} // model effect: no tool call id
+	effect.State.Request = &RunningRequest{RequestID: "request-one", BoundaryEntryID: hexID(1)}
 	raw, err = encodeOperationRegister(effect)
 	testassert.NoError(t, err)
 	stateObj, err = objectMember(wireObject(t, raw), "state", true)
@@ -1257,7 +1352,7 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 		}},
 		{"tool active effect with mismatched reservation", func() error {
 			v := validOperationRecord()
-			v.State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1"}
+			v.State.ActiveEffect = &ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(3), ToolCallID: "call-1", FinalArguments: json.RawMessage(`{"x":1}`)}
 			v.State.PendingToolCalls = []PendingToolCall{{
 				AssistantEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(2)},
 				CallID:         "call-1",
@@ -2095,7 +2190,9 @@ func TestCompactionEntryPayloadRules(t *testing.T) {
 				t.Fatalf("decoded usage %+v, want %+v", *got.Usage, *v.Usage)
 			}
 			got.Usage = v.Usage // pointer identity is irrelevant; the counts compared above
-			testassert.Equal(t, got, v)
+			if !reflect.DeepEqual(got, v) {
+				t.Fatalf("decoded compaction entry %+v, want %+v", got, v)
+			}
 			again, err := encodeCompactionEntry(got)
 			testassert.Require(t, err == nil, "re-encode (usage %v): %v", withUsage, err)
 			testassert.Require(t, string(again) == string(raw), "re-encoded bytes %s, want %s", again, raw)
@@ -2257,4 +2354,413 @@ func TestSessionStateCompactionEntryIDRules(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrInvalid), "error %v, want ErrInvalid", err)
 		}
 	})
+}
+
+// TestHookResultKnowledgeAndBindingDomains proves the shared hook-knowledge
+// and binding-input codec rules over both hook families: failure and
+// interruption settle with any of the three knowledge values, success requires
+// observed, absence and an invalid enum reject on both codec sides; a tool
+// binding carries only its opaque consumed bytes (canonical-strict, valid
+// empty allowed), a request binding carries only its consumed evidence record,
+// and every cross-binding member rejects.
+func TestHookResultKnowledgeAndBindingDomains(t *testing.T) {
+	t.Run("knowledge values settle on failure and interruption", func(t *testing.T) {
+		for _, knowledge := range []ExecutionEvidence{ExecutionNotStarted, ExecutionObserved, ExecutionUnknown} {
+			for _, status := range []hookResultStatus{hookFailed, hookInterrupted} {
+				v := validHookResultEntry(status)
+				v.Evidence = knowledge
+				{
+					raw, err := encodeHookResultEntry(v)
+					testassert.Require(t, err == nil, "encode %s with %s: %v", status, knowledge, err)
+					decoded, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: v.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: raw})
+					testassert.Require(t, derr == nil && decoded.Evidence == knowledge, "round-trip %s: %v", knowledge, derr)
+				}
+			}
+		}
+	})
+	t.Run("success requires observed; invalid and absent knowledge reject", func(t *testing.T) {
+		for _, knowledge := range []ExecutionEvidence{ExecutionNotStarted, ExecutionUnknown, ExecutionEvidence("all"), ""} {
+			v := validHookResultEntry(hookSucceeded)
+			v.Evidence = knowledge
+			{
+				_, err := encodeHookResultEntry(v)
+				testassert.Require(t, err != nil, "success with knowledge %q must reject", knowledge)
+			}
+		}
+		bad := validHookResultEntry(hookFailed)
+		bad.Evidence = ExecutionEvidence("all")
+		{
+			raw, err := encodeHookResultEntry(bad)
+			testassert.Require(t, err != nil && raw == nil, "invalid enum must reject at encode")
+		}
+		failed := validHookResultEntry(hookFailed)
+		failedRaw, err := encodeHookResultEntry(failed)
+		testassert.NoError(t, err)
+		{
+			_, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: failed.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(failedRaw, "evidence", json.RawMessage(`"all"`))})
+			testassert.Require(t, derr != nil, "decode-side invalid knowledge enum must reject")
+		}
+		{
+			_, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: failed.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(failedRaw, "evidence", nil)})
+			testassert.Require(t, derr != nil, "decode-side absent knowledge must reject")
+		}
+		{
+			decoded, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: failed.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(failedRaw, "evidence", json.RawMessage(`"unknown"`))})
+			testassert.Require(t, derr == nil && decoded.Evidence == ExecutionUnknown, "decode-side unknown: %v", derr)
+		}
+	})
+	t.Run("tool binding carries only opaque consumed bytes", func(t *testing.T) {
+		empty := validHookResultEntry(hookFailed)
+		empty.InputArgumentsBase64 = "" // a valid empty opaque input survives
+		{
+			raw, err := encodeHookResultEntry(empty)
+			testassert.NoError(t, err)
+			decoded, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: empty.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: raw})
+			testassert.Require(t, derr == nil && decoded.InputArgumentsBase64 == "", "empty consumed bytes round-trip: %v", derr)
+		}
+		{
+			_, err := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: empty.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(func() json.RawMessage {
+				raw, err := encodeHookResultEntry(empty)
+				testassert.NoError(t, err)
+				return raw
+			}(), "input_arguments_base64", json.RawMessage(`"!!!"`))})
+			testassert.Require(t, err != nil, "non-canonical consumed bytes must reject")
+		}
+		crossed := validHookResultEntry(hookSucceeded)
+		crossed.InputEvidence = &RequestEvidence{BoundaryEntryID: hexID(1)}
+		{
+			_, err := encodeHookResultEntry(crossed)
+			testassert.Require(t, err != nil, "a tool-bound result carrying consumed evidence must reject")
+		}
+	})
+	t.Run("request binding carries only consumed evidence", func(t *testing.T) {
+		{
+			_, err := encodeHookResultEntry(validRequestBoundHookResult(hookSucceeded))
+			testassert.NoError(t, err)
+		}
+		missing := validRequestBoundHookResult(hookFailed)
+		missing.InputEvidence = nil
+		{
+			_, err := encodeHookResultEntry(missing)
+			testassert.Require(t, err != nil, "a request-bound result without consumed evidence must reject")
+		}
+		bytes := validRequestBoundHookResult(hookFailed)
+		bytes.InputArgumentsBase64 = base64.StdEncoding.EncodeToString([]byte(`{}`))
+		{
+			_, err := encodeHookResultEntry(bytes)
+			testassert.Require(t, err != nil, "a request-bound result carrying argument bytes must reject")
+		}
+		// Wire level: the member is forbidden outright for a non-tool
+		// binding. The check runs on raw membership before the base64 codec,
+		// so every present value — including the string that decodes to the
+		// struct's zero — rejects through the same membership rule.
+		reqRaw, rerr := encodeHookResultEntry(validRequestBoundHookResult(hookFailed))
+		testassert.NoError(t, rerr)
+		for _, tc := range []struct {
+			name  string
+			value json.RawMessage
+		}{
+			{"present-empty", json.RawMessage(`""`)},
+			{"null", json.RawMessage(`null`)},
+			{"wrong type", json.RawMessage(`5`)},
+			{"canonical base64 bytes", json.RawMessage(`"eyJ4IjoxfQ=="`)},
+		} {
+			_, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(reqRaw, "input_arguments_base64", tc.value)})
+			testassert.Require(t, derr != nil && strings.Contains(derr.Error(), `forbids the "input_arguments_base64" member`),
+				"request-bound %s member decode = %v, want the membership rejection", tc.name, derr)
+		}
+		{
+			// Nearest positive sibling: a tool-bound result keeps its opaque
+			// malformed-JSON consumed bytes exactly.
+			opaque := validHookResultEntry(hookFailed)
+			opaque.InputArgumentsBase64 = base64.StdEncoding.EncodeToString([]byte("not json"))
+			raw, err := encodeHookResultEntry(opaque)
+			testassert.NoError(t, err)
+			decoded, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: opaque.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: raw})
+			testassert.Require(t, derr == nil && decoded.InputArgumentsBase64 == opaque.InputArgumentsBase64,
+				"tool-bound opaque malformed-JSON bytes round-trip: %v", derr)
+		}
+		args := validRequestBoundHookResult(hookSucceeded)
+		args.Arguments = json.RawMessage(`{}`)
+		{
+			_, err := encodeHookResultEntry(args)
+			testassert.Require(t, err != nil, "a request-bound result carrying arguments must reject")
+		}
+		both := validHookResultEntry(hookSucceeded)
+		both.RequestID = "request-one"
+		{
+			_, err := encodeHookResultEntry(both)
+			testassert.Require(t, err != nil, "a result binding both a call and a request must reject")
+		}
+		neither := validHookResultEntry(hookSucceeded)
+		neither.ToolCallID = ""
+		{
+			_, err := encodeHookResultEntry(neither)
+			testassert.Require(t, err != nil, "a result binding neither must reject")
+		}
+	})
+	t.Run("declared knowledge reaches the validator unchanged and is never coerced", func(t *testing.T) {
+		declared := &EffectError{Evidence: ExecutionEvidence("all"), Err: errors.New("binding broke")}
+		testassert.Equal(t, declaredExecutionKnowledge(declared), ExecutionEvidence("all"))
+		unknown := &EffectError{Evidence: ExecutionUnknown, Err: errors.New("binding broke")}
+		testassert.Equal(t, declaredExecutionKnowledge(unknown), ExecutionUnknown)
+		testassert.Equal(t, declaredExecutionKnowledge(errors.New("native failure")), ExecutionObserved)
+	})
+}
+
+// TestAssistantEntryRequestEvidenceRequiredMembers proves the assistant
+// payload's required ownership members on both codec sides: the producing
+// request identity, the advertised view (present-empty included; null and
+// absence reject), and the final effective request evidence with its required
+// canonical boundary; decoded values stay deep-owned from the payload bytes.
+func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
+	raw, err := encodeAssistantEntry(validAssistantEntry(testOpID))
+	testassert.NoError(t, err)
+	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw}
+	decoded, err := decodeAssistantEntry(env)
+	testassert.NoError(t, err)
+	testassert.Require(t, decoded.RequestID != "" && decoded.AdvertisedNames != nil && len(decoded.AdvertisedNames) == 0 &&
+		decoded.Evidence != nil && decoded.Evidence.BoundaryEntryID == hexID(1), "decoded assistant = %+v, want the request identity, the present-empty view, and the consumed evidence", decoded)
+	for _, name := range []string{"request_id", "advertised_names", "evidence"} {
+		{
+			_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, name, nil)})
+			testassert.Require(t, derr != nil, "absence of %s must reject", name)
+		}
+	}
+	{
+		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "advertised_names", json.RawMessage(`null`))})
+		testassert.Require(t, derr != nil, "a null advertised_names must reject")
+	}
+	{
+		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "evidence", json.RawMessage(`{"checkpoint_entry_id":""}`))})
+		testassert.Require(t, derr != nil, "evidence without its required canonical boundary must reject")
+	}
+	// Present-empty prompt contribution survives the wire as present.
+	v := validAssistantEntry(testOpID)
+	empty := ""
+	v.Evidence.Prompt = &empty
+	v.Evidence.ToolNames = []string{}
+	raw, err = encodeAssistantEntry(v)
+	testassert.NoError(t, err)
+	decoded, err = decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw})
+	testassert.NoError(t, err)
+	testassert.Require(t, decoded.Evidence.Prompt != nil && *decoded.Evidence.Prompt == "", "prompt contribution = %+v, want the present-empty prompt retained", decoded.Evidence.Prompt)
+	testassert.Require(t, decoded.Evidence.ToolNames != nil && len(decoded.Evidence.ToolNames) == 0, "tool view = %+v, want the present-empty view retained", decoded.Evidence.ToolNames)
+	// Decoded evidence is deep-owned: mutating it cannot reach a later decode.
+	decoded.Evidence.BoundaryEntryID = hexID(9)
+	if len(decoded.Evidence.HookIDs) > 0 {
+		decoded.Evidence.HookIDs[0].HookID = "mutated"
+	}
+	again, err := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw})
+	testassert.NoError(t, err)
+	testassert.Require(t, again.Evidence.BoundaryEntryID == hexID(1) && again.Evidence.Prompt != nil && *again.Evidence.Prompt == "", "payload bytes changed by a decoded mutation")
+}
+
+// TestRequestEvidenceContributionMessageDomain proves the shared message gate
+// at the evidence boundary: a contribution carrying every permitted shared
+// message field round-trips byte-faithfully through the evidence codec, and
+// tool execution members reject outright on both codec sides — contributions
+// never become historical tool execution.
+func TestRequestEvidenceContributionMessageDomain(t *testing.T) {
+	owned, err := model.NewMessage(model.Message{
+		Role:    model.RoleAssistant,
+		Content: []model.ContentPart{{Kind: model.PartText, Text: "carried"}},
+		Refusal: "declined part",
+		Name:    "contributor",
+		Source:  testModelRef(),
+		Extra:   model.Extra{"note": json.RawMessage(`{"kept":1}`)},
+	})
+	testassert.NoError(t, err)
+	v := RequestEvidence{
+		BoundaryEntryID:   hexID(1),
+		CheckpointEntryID: hexID(2),
+		Messages:          []model.Message{owned},
+		HookIDs:           []HookIdentity{{ExtensionID: "ext.one", HookID: "hook.one"}},
+	}
+	raw, err := encodeRequestEvidence(v)
+	testassert.NoError(t, err)
+	decoded, err := decodeRequestEvidence(raw)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(decoded.Messages) == 1, "decoded messages = %+v, want the recorded contribution", decoded.Messages)
+	m := decoded.Messages[0]
+	testassert.Require(t, m.Role == model.RoleAssistant && m.TextContent() == "carried" && m.Refusal == "declined part" &&
+		m.Name == "contributor" && m.Source == testModelRef() && string(m.Extra["note"]) == `{"kept":1}`,
+		"decoded contribution = %+v, want every permitted shared field retained", m)
+	withCalls, cerr := model.NewMessage(model.Message{
+		Role:      model.RoleAssistant,
+		Content:   []model.ContentPart{{Kind: model.PartText, Text: "sneaky"}},
+		Source:    testModelRef(),
+		ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}},
+	})
+	testassert.Require(t, cerr == nil, "constructor: %v", cerr)
+	bad := v
+	bad.Messages = []model.Message{withCalls}
+	{
+		_, err := encodeRequestEvidence(bad)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "tool calls"), "encode-side tool-call contribution: %v", err)
+	}
+	withCallID, cerr := model.NewMessage(model.Message{Role: model.RoleTool, Content: []model.ContentPart{{Kind: model.PartText, Text: "x"}}, ToolCallID: "call-1"})
+	testassert.Require(t, cerr == nil, "constructor: %v", cerr)
+	bad2 := v
+	bad2.Messages = []model.Message{withCallID}
+	{
+		_, err := encodeRequestEvidence(bad2)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "call id"), "encode-side tool-result call id: %v", err)
+	}
+	{
+		badRaw := setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","content":[{"kind":"text","text":"wire"}],"tool_calls":[{"id":"c","name":"echo","arguments":"{}"}]}]`))
+		_, err := decodeRequestEvidence(badRaw)
+		testassert.Require(t, err != nil, "decode-side tool-call contribution must reject")
+	}
+}
+
+// TestRequestConsequencePresenceDomain proves the consequence codec's presence
+// semantics: a present-empty prompt and a present-empty or full tool selection
+// survive the wire exactly, absent members stay absent, a success result
+// missing its consequence rejects, and failure states never carry one.
+func TestRequestConsequencePresenceDomain(t *testing.T) {
+	empty := ""
+	v := validRequestBoundHookResult(hookSucceeded)
+	v.Consequence = &RequestConsequence{Prompt: &empty, ToolNames: []string{}}
+	raw, err := encodeHookResultEntry(v)
+	testassert.NoError(t, err)
+	decoded, err := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: v.EntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: raw})
+	testassert.NoError(t, err)
+	testassert.Require(t, decoded.Consequence != nil && decoded.Consequence.Prompt != nil && *decoded.Consequence.Prompt == "" &&
+		decoded.Consequence.ToolNames != nil && len(decoded.Consequence.ToolNames) == 0 && decoded.Consequence.Messages == nil,
+		"decoded consequence = %+v, want present-empty prompt and present-empty selection retained", decoded.Consequence)
+	missing := v
+	missing.Consequence = nil
+	{
+		_, err := encodeHookResultEntry(missing)
+		testassert.Require(t, err != nil, "a success result without its consequence must reject")
+	}
+	carrying := validRequestBoundHookResult(hookInterrupted)
+	consequence := RequestConsequence{}
+	carrying.Consequence = &consequence
+	{
+		_, err := encodeHookResultEntry(carrying)
+		testassert.Require(t, err != nil, "an interrupted result carrying a consequence must reject")
+	}
+}
+
+// TestMaintenanceConsumedRequestIdentityDomain proves the consumed source's
+// codec domain on both record families: absence is the valid manual shape, a
+// present value must be a non-empty identity (empty and null reject on the
+// wire, and a value set on the Go side encodes), and a present identity
+// round-trips unchanged.
+func TestMaintenanceConsumedRequestIdentityDomain(t *testing.T) {
+	t.Run("compaction", func(t *testing.T) {
+		absent := validCompactionEntry(testOpID)
+		absent.ConsumedRequestID = ""
+		raw, err := encodeCompactionEntry(absent)
+		testassert.NoError(t, err)
+		testassert.Require(t, !strings.Contains(string(raw), "consumed_request_id"), "encode-side absence: %s", raw)
+		decoded, err := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: absent.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
+		testassert.NoError(t, err)
+		testassert.Equal(t, decoded.ConsumedRequestID, "")
+		source := validCompactionEntry(testOpID)
+		source.ConsumedRequestID = "request-source"
+		raw, err = encodeCompactionEntry(source)
+		testassert.NoError(t, err)
+		decoded, err = decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
+		testassert.NoError(t, err)
+		testassert.Equal(t, decoded.ConsumedRequestID, "request-source")
+		{
+			_, derr := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`""`))})
+			testassert.Require(t, derr != nil, "a present-empty consumed source must reject")
+		}
+		{
+			_, derr := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`null`))})
+			testassert.Require(t, derr != nil, "a null consumed source must reject")
+		}
+	})
+	t.Run("settlement", func(t *testing.T) {
+		base := validSettlementEntry()
+		base.RequestID = "request-producer"
+		base.ConsumedRequestID = "request-source"
+		base.Evidence = &RequestEvidence{BoundaryEntryID: hexID(1)}
+		base.CompactionUsage = true // the maintenance provenance the consumed identity belongs to
+		raw, err := encodeOperationSettlementEntry(base)
+		testassert.NoError(t, err)
+		{
+			// Forbidden siblings: a consumed source attached to no evidence,
+			// or to an unmarked (non-maintenance) settlement.
+			noEvidence := base
+			noEvidence.Evidence = nil
+			_, cerr := encodeOperationSettlementEntry(noEvidence)
+			testassert.Require(t, cerr != nil && strings.Contains(cerr.Error(), "maintenance evidence provenance"), "encode = %v, want the source-evidence relation to reject", cerr)
+			unmarked := base
+			unmarked.CompactionUsage = false
+			_, cerr = encodeOperationSettlementEntry(unmarked)
+			testassert.Require(t, cerr != nil && strings.Contains(cerr.Error(), "maintenance evidence provenance"), "encode = %v, want the unmarked settlement to reject a consumed source", cerr)
+			valid := base
+			valid.ConsumedRequestID = ""
+			_, verr := encodeOperationSettlementEntry(valid)
+			testassert.NoError(t, verr) // the ordinary evidence-only maintenance settlement stays valid
+		}
+		env := Entry{SessionID: testSessionID, ID: base.EntryID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: raw}
+		decoded, err := decodeOperationSettlementEntry(env)
+		testassert.NoError(t, err)
+		testassert.Equal(t, decoded.ConsumedRequestID, "request-source")
+		{
+			_, derr := decodeOperationSettlementEntry(Entry{SessionID: testSessionID, ID: base.EntryID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`""`))})
+			testassert.Require(t, derr != nil, "a present-empty consumed source must reject")
+		}
+		{
+			_, derr := decodeOperationSettlementEntry(Entry{SessionID: testSessionID, ID: base.EntryID, OperationID: testOpID, Kind: EntryOperationSettlement, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`null`))})
+			testassert.Require(t, derr != nil, "a null consumed source must reject")
+		}
+		{
+			plain := base
+			plain.ConsumedRequestID = ""
+			plainRaw, err := encodeOperationSettlementEntry(plain)
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(plainRaw), "consumed_request_id"), "encode-side absence: %s", plainRaw)
+		}
+	})
+}
+
+// TestForbiddenInputArgumentsMembershipReasonUniformity pins the correction's
+// axis at the owner: for every binding that forbids the input_arguments_base64
+// member, every present value — present-empty, null, a wrong type, or even
+// canonical base64 — rejects through the same membership rule, never through
+// base64 validation or a later field-value rule.
+func TestForbiddenInputArgumentsMembershipReasonUniformity(t *testing.T) {
+	values := []struct {
+		name  string
+		value json.RawMessage
+	}{
+		{"present-empty", json.RawMessage(`""`)},
+		{"null", json.RawMessage(`null`)},
+		{"wrong type", json.RawMessage(`5`)},
+		{"canonical base64 bytes", json.RawMessage(`"eyJ4IjoxfQ=="`)},
+	}
+	{
+		raw, err := encodeHookResultEntry(validRequestBoundHookResult(hookFailed))
+		testassert.NoError(t, err)
+		for _, c := range values {
+			_, derr := decodeHookResultEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: setKey(raw, "input_arguments_base64", c.value)})
+			testassert.Require(t, derr != nil && strings.Contains(derr.Error(), `hook result binding forbids the "input_arguments_base64" member`),
+				"request-bound hook result %s member = %v, want the membership rule", c.name, derr)
+		}
+	}
+	bases := []struct {
+		name   string
+		effect ActiveEffect
+	}{
+		{"request-bound hook intent", ActiveEffect{Kind: EffectHook, ResultEntryID: hexID(9), RequestID: "request-one", HookID: "cap.hook.one", ExtensionID: "cap-a", Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)}}},
+		{"conversation model intent", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), RequestID: "request-one", Model: &model.ModelRef{Provider: "prov", Model: "m"}, Purpose: InvocationPurposeConversation, Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)}}},
+		{"maintenance model intent", ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(9), RequestID: "maintenance-one", Model: &model.ModelRef{Provider: "prov", Model: "compact"}, Purpose: InvocationPurposeMaintenance}},
+		{"concrete tool intent", ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(9), ToolCallID: "call-1", FinalArguments: json.RawMessage(`{}`)}},
+	}
+	for _, b := range bases {
+		raw, err := encodeActiveEffect(b.effect)
+		testassert.NoError(t, err)
+		for _, c := range values {
+			_, derr := decodeActiveEffect(wireObject(t, setKey(raw, "input_arguments_base64", c.value)))
+			testassert.Require(t, derr != nil && strings.Contains(derr.Error(), `active effect binding forbids the "input_arguments_base64" member`),
+				"%s %s member = %v, want the membership rule", b.name, c.name, derr)
+		}
+	}
 }

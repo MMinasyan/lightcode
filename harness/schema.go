@@ -100,6 +100,40 @@ type EntryRef struct {
 	EntryID   string `json:"entry_id"`
 }
 
+// HookIdentity is one recorded extension hook contribution: the owning
+// extension identity and the hook identity selected from it.
+type HookIdentity struct {
+	ExtensionID string `json:"extension_id"`
+	HookID      string `json:"hook_id"`
+}
+
+// RequestEvidence is the one closed request-evidence value: the canonical
+// boundary/checkpoint references of the projection actually consumed at that
+// boundary, the effective prompt/context/tool-view deltas against the frozen
+// capture (absent members mean unchanged), and the contributing hook
+// identities in contribution order. It records changes plus canonical input
+// references, never a copy of unchanged conversation history.
+type RequestEvidence struct {
+	CheckpointEntryID string          `json:"checkpoint_entry_id,omitempty"`
+	BoundaryEntryID   string          `json:"boundary_entry_id"`
+	Prompt            *string         `json:"prompt,omitempty"`
+	Messages          []model.Message `json:"messages,omitempty"`
+	ToolNames         []string        `json:"tool_names,omitempty"`
+	HookIDs           []HookIdentity  `json:"hook_ids,omitempty"`
+}
+
+// RunningRequest is the one suspended conversation request state: the request
+// identity bound before contributions, the frozen canonical
+// boundary/checkpoint references, and the committed effectful request-hook
+// result references in commit order. It is published and advanced only inside
+// existing effect/checkpoint transactions.
+type RunningRequest struct {
+	RequestID         string     `json:"request_id"`
+	CheckpointEntryID string     `json:"checkpoint_entry_id,omitempty"`
+	BoundaryEntryID   string     `json:"boundary_entry_id"`
+	HookResults       []EntryRef `json:"hook_results,omitempty"`
+}
+
 // operationRef addresses one Operation of one Session. It is a codec value
 // exposed to callers through the OperationRef alias.
 type operationRef struct {
@@ -213,15 +247,29 @@ type OperationAdmission struct {
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the
-// entry reserved for its result. A model effect omits the tool-call and hook
-// IDs; a tool effect requires the tool-call ID and addresses the matching
-// first pending call; a hook effect requires both the hook ID and the
-// tool-call ID of the first pending call it runs for.
+// entry reserved for its result. A model effect carries its request identity,
+// actual model, and purpose; a conversation model effect also carries the
+// effective request evidence it consumes, a maintenance effect never does. A
+// tool effect requires the tool-call ID, addresses the matching first pending
+// call, and carries the accepted normalized selection plus the contributing
+// argument-hook provenance. A hook effect carries its extension and hook
+// identities plus its consumed input under exactly one binding: the tool-call
+// ID of the first pending call it runs for, or the request identity of a
+// request-bound hook.
 type ActiveEffect struct {
 	Kind          EffectKind `json:"kind"`
 	ResultEntryID string     `json:"result_entry_id"`
 	ToolCallID    string     `json:"tool_call_id,omitempty"`
 	HookID        string     `json:"hook_id,omitempty"`
+
+	RequestID            string            `json:"request_id,omitempty"`
+	Model                *model.ModelRef   `json:"model,omitempty"`
+	Purpose              InvocationPurpose `json:"purpose,omitempty"`
+	Evidence             *RequestEvidence  `json:"evidence,omitempty"`
+	ExtensionID          string            `json:"hook_extension_id,omitempty"`
+	InputArgumentsBase64 string            `json:"input_arguments_base64,omitempty"`
+	FinalArguments       json.RawMessage   `json:"final_arguments,omitempty"`
+	ContributionIDs      []HookIdentity    `json:"hook_ids,omitempty"`
 }
 
 // PendingToolCall is one unresolved published tool call: the assistant entry
@@ -244,11 +292,16 @@ type OperationTerminal struct {
 // OperationCurrentState is the mutable state section of one Operation
 // register. Running forbids the settlement time and terminal section;
 // terminal states require both and forbid active and pending effects.
+// Request, when present, is the one suspended conversation request state
+// published with the first existing effect/checkpoint transition and cleared
+// at the conversation result without a pending batch, the final pending tool
+// result, or the terminal settlement.
 type OperationCurrentState struct {
 	Status           OperationState     `json:"status"`
 	StartedAt        time.Time          `json:"started_at"`
 	SettledAt        *time.Time         `json:"settled_at,omitempty"`
 	ActiveEffect     *ActiveEffect      `json:"active_effect,omitempty"`
+	Request          *RunningRequest    `json:"running_request,omitempty"`
 	PendingToolCalls []PendingToolCall  `json:"pending_tool_calls"`
 	Usage            UsageTotals        `json:"usage"`
 	Terminal         *OperationTerminal `json:"terminal,omitempty"`
@@ -292,36 +345,46 @@ type toolCallRecord struct {
 }
 
 // assistantEntry is one finalized model output: status, complete source
-// identity, eligible model-visible payload, and reported usage when present.
+// identity, eligible model-visible payload, reported usage when present, and
+// the producing request identity with its final effective request evidence
+// and advertised names. The evidence is not conversation text.
 type assistantEntry struct {
-	SessionID   string              `json:"session_id"`
-	EntryID     string              `json:"entry_id"`
-	OperationID string              `json:"operation_id,omitempty"`
-	Status      model.OutputStatus  `json:"status"`
-	Source      model.ModelRef      `json:"source"`
-	Content     []model.ContentPart `json:"content"`
-	Refusal     string              `json:"refusal,omitempty"`
-	Extra       model.Extra         `json:"extra,omitempty"`
-	ToolCalls   []toolCallRecord    `json:"tool_calls"`
-	Usage       *UsageCount         `json:"usage,omitempty"`
+	SessionID       string              `json:"session_id"`
+	EntryID         string              `json:"entry_id"`
+	OperationID     string              `json:"operation_id,omitempty"`
+	Status          model.OutputStatus  `json:"status"`
+	Source          model.ModelRef      `json:"source"`
+	Content         []model.ContentPart `json:"content"`
+	Refusal         string              `json:"refusal,omitempty"`
+	Extra           model.Extra         `json:"extra,omitempty"`
+	ToolCalls       []toolCallRecord    `json:"tool_calls"`
+	Usage           *UsageCount         `json:"usage,omitempty"`
+	RequestID       string              `json:"request_id"`
+	AdvertisedNames []string            `json:"advertised_names"`
+	Evidence        *RequestEvidence    `json:"evidence"`
 }
 
 // toolResultEntry is one settled tool result answering a published call by
 // its reserved identity. Metadata is the tool-owned raw-JSON member the
 // Harness preserves opaquely within its well-formedness and size bound; it is
 // absent on synthetic results and never reaches the model-visible result.
+// NormalizedArguments and HookIDs carry the final effective argument selection
+// and its contributing ordered hook provenance actually consumed by that
+// call's settlement; results that never accepted a value carry neither.
 type toolResultEntry struct {
-	SessionID      string                 `json:"session_id"`
-	EntryID        string                 `json:"entry_id"`
-	OperationID    string                 `json:"operation_id,omitempty"`
-	AssistantEntry EntryRef               `json:"assistant_entry"`
-	ToolCallID     string                 `json:"tool_call_id"`
-	Status         model.ToolResultStatus `json:"status"`
-	Content        string                 `json:"content"`
-	Metadata       json.RawMessage        `json:"metadata,omitempty"`
+	SessionID           string                 `json:"session_id"`
+	EntryID             string                 `json:"entry_id"`
+	OperationID         string                 `json:"operation_id,omitempty"`
+	AssistantEntry      EntryRef               `json:"assistant_entry"`
+	ToolCallID          string                 `json:"tool_call_id"`
+	Status              model.ToolResultStatus `json:"status"`
+	Content             string                 `json:"content"`
+	Metadata            json.RawMessage        `json:"metadata,omitempty"`
+	NormalizedArguments json.RawMessage        `json:"normalized_arguments,omitempty"`
+	HookIDs             []HookIdentity         `json:"hook_ids,omitempty"`
 }
 
-// hookResultStatus is the closed status of one settled argument-hook
+// hookResultStatus is the closed status of one settled effectful hook
 // execution.
 type hookResultStatus string
 
@@ -331,20 +394,32 @@ const (
 	hookInterrupted hookResultStatus = "interrupted"
 )
 
-// hookResultEntry is one settled argument-hook execution: the independent
-// immutable historical evidence of one hook's outcome for one tool call,
-// under the executing effect's own reserved identity — never a conversation
-// message. Success carries the one normalized replacement object and no
-// error; every other status carries a non-empty error and no arguments.
+// hookResultEntry is one settled effectful-hook execution: the independent
+// immutable historical evidence of one hook's outcome under the executing
+// effect's own reserved identity — never a conversation message. Its binding
+// is exactly one of a tool call (argument hook) or a request (request hook),
+// never both. Every entry carries the extension and hook identities, the
+// consumed input evidence the hook actually received before I/O, and the
+// execution knowledge independently of status. A successful tool-bound result
+// carries the one normalized replacement object; a successful request-bound
+// result carries the closed consequence (an empty consequence is a valid
+// no-op); every other status carries a non-empty error and no consequence.
 type hookResultEntry struct {
-	SessionID   string           `json:"session_id"`
-	EntryID     string           `json:"entry_id"`
-	OperationID string           `json:"operation_id"`
-	HookID      string           `json:"hook_id"`
-	ToolCallID  string           `json:"tool_call_id"`
-	Status      hookResultStatus `json:"status"`
-	Arguments   json.RawMessage  `json:"arguments,omitempty"`
-	Error       string           `json:"error,omitempty"`
+	SessionID   string            `json:"session_id"`
+	EntryID     string            `json:"entry_id"`
+	OperationID string            `json:"operation_id"`
+	HookID      string            `json:"hook_id"`
+	ExtensionID string            `json:"extension_id"`
+	ToolCallID  string            `json:"tool_call_id,omitempty"`
+	RequestID   string            `json:"request_id,omitempty"`
+	Status      hookResultStatus  `json:"status"`
+	Evidence    ExecutionEvidence `json:"evidence"`
+	Arguments   json.RawMessage   `json:"arguments,omitempty"`
+	Error       string            `json:"error,omitempty"`
+
+	InputArgumentsBase64 string              `json:"input_arguments_base64,omitempty"`
+	InputEvidence        *RequestEvidence    `json:"input_evidence,omitempty"`
+	Consequence          *RequestConsequence `json:"consequence,omitempty"`
 }
 
 // relatedMember addresses the background member whose completion one
@@ -371,36 +446,59 @@ type signalEntry struct {
 
 // operationSettlementEntry publishes one terminal Operation outcome. It is
 // never operationless; the model identity is present exactly when the
-// settlement carries usage. CompactionUsage marks that carried usage as the
-// compaction summarizer's own: omitted or false identifies conversation usage,
-// true identifies summary usage, and with no usage carried the marker is
-// inert.
+// settlement carries usage. CompactionUsage marks one settlement as the
+// maintenance procedure's own provenance: with summary usage carried it marks
+// that usage as the compaction summarizer's own, and with no usage carried the
+// marker identifies the maintenance family directly. RequestID is the
+// settlement's own request witness — the answered conversation request, a live
+// model intent's identity, or a maintenance settlement's producer identity;
+// ConsumedRequestID names the conversation request whose frozen view an
+// automatic maintenance settlement consumed, present only beside maintenance
+// evidence and distinct from that producer. Evidence is the final effective
+// request evidence owned by a no-output settlement, and Input is the actual
+// tool-free logical maintenance request a maintenance settlement retains when
+// the procedure reached its request. Maintenance facts settle once on the
+// successful checkpoint or on the terminal settlement, never both.
 type operationSettlementEntry struct {
-	SessionID       string          `json:"session_id"`
-	EntryID         string          `json:"entry_id"`
-	OperationID     string          `json:"operation_id"`
-	Status          OperationState  `json:"status"`
-	Detail          string          `json:"detail,omitempty"`
-	Model           *model.ModelRef `json:"model,omitempty"`
-	Usage           *UsageCount     `json:"usage,omitempty"`
-	CompactionUsage bool            `json:"compaction_usage,omitempty"`
+	SessionID         string           `json:"session_id"`
+	EntryID           string           `json:"entry_id"`
+	OperationID       string           `json:"operation_id"`
+	Status            OperationState   `json:"status"`
+	Detail            string           `json:"detail,omitempty"`
+	Model             *model.ModelRef  `json:"model,omitempty"`
+	Usage             *UsageCount      `json:"usage,omitempty"`
+	CompactionUsage   bool             `json:"compaction_usage,omitempty"`
+	RequestID         string           `json:"request_id,omitempty"`
+	ConsumedRequestID string           `json:"consumed_request_id,omitempty"`
+	Evidence          *RequestEvidence `json:"evidence,omitempty"`
+	Input             []model.Message  `json:"input,omitempty"`
 }
 
 // compactionEntry is one immutable compaction commit: the single-request
 // summary of the frozen conversation up to its boundary entry, the compact
 // model identity that produced it, the governing configuration revision, and
 // the commit's
-// reported usage when present. Independently copied fork-prefix entries omit
-// the owning Operation identity and carry no source usage.
+// reported usage when present. RequestID is the maintenance producer's own
+// request identity, ConsumedRequestID the conversation request whose frozen
+// contribution view the automatic procedure consumed (manual compaction omits
+// it), Input the actual tool-free logical maintenance request the procedure
+// reached, and Evidence the effective contribution evidence consumed at that
+// frozen canonical boundary.
+// Independently copied fork-prefix entries omit the owning Operation identity
+// and carry no source usage.
 type compactionEntry struct {
-	SessionID             string         `json:"session_id"`
-	EntryID               string         `json:"entry_id"`
-	OperationID           string         `json:"operation_id,omitempty"`
-	Summary               string         `json:"summary"`
-	BoundaryEntryID       string         `json:"boundary_entry_id"`
-	Model                 model.ModelRef `json:"model"`
-	ConfigurationRevision string         `json:"configuration_revision"`
-	Usage                 *UsageCount    `json:"usage,omitempty"`
+	SessionID             string           `json:"session_id"`
+	EntryID               string           `json:"entry_id"`
+	OperationID           string           `json:"operation_id,omitempty"`
+	Summary               string           `json:"summary"`
+	BoundaryEntryID       string           `json:"boundary_entry_id"`
+	Model                 model.ModelRef   `json:"model"`
+	ConfigurationRevision string           `json:"configuration_revision"`
+	Usage                 *UsageCount      `json:"usage,omitempty"`
+	RequestID             string           `json:"request_id"`
+	ConsumedRequestID     string           `json:"consumed_request_id,omitempty"`
+	Input                 []model.Message  `json:"input"`
+	Evidence              *RequestEvidence `json:"evidence"`
 }
 
 // Exported aliases of the validated entry payloads: the HistoryFact union

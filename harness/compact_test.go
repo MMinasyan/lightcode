@@ -56,6 +56,20 @@ func compactionExecution(t *testing.T, compact func(context.Context, model.Reque
 // maintenanceInvocationOf opens the given execution's maintenance invocation
 // for the captured compact model — the opened-invocation shape the direct
 // compact effect fixtures drive.
+// newMaintenanceFacts returns the fixtures' maintenance facts carrier with a
+// valid tool-free logical Request input; the consumed-evidence reference stays
+// zero so the commit derives it from the covered boundary.
+func newMaintenanceFacts(sourceRequestID, consumedBoundary string) *maintenanceFacts {
+	facts := &maintenanceFacts{sourceRequestID: sourceRequestID, input: []model.Message{
+		{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
+		{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
+	}}
+	if consumedBoundary != "" { // automatic maintenance facts always carry the consumed contribution view alongside the source
+		facts.consumed = RequestEvidence{BoundaryEntryID: consumedBoundary}
+	}
+	return facts
+}
+
 func maintenanceInvocationOf(t *testing.T, exec Execution) InvocationExecution {
 	t.Helper()
 	inv, err := exec.OpenInvocation(context.Background(), InvocationRequest{
@@ -143,7 +157,7 @@ func TestRunCompactionReadyPathRunsOneRequest(t *testing.T) {
 	}
 	exec := compactionExecution(t, compact, nil)
 
-	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "summary one")
@@ -210,7 +224,7 @@ func TestRunCompactionFullInputRunsOneRequest(t *testing.T) {
 		return summaryStream("S1", model.Usage{InputTokens: 5, OutputTokens: 3}), nil
 	}
 	exec := compactionExecution(t, compact, nil)
-	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot)
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, snapshot, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "S1")
@@ -247,7 +261,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		}
 		exec := compactionExecution(t, compact, spy.retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -271,7 +285,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		}
 		exec := compactionExecution(t, compact, (&retrySpy{limit: 0}).retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -300,7 +314,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		}
 		exec := compactionExecution(t, compact, nil)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -333,7 +347,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		}
 		exec := compactionExecution(t, compact, spy.retry)
 		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -357,7 +371,7 @@ func TestRunCompactionCanceledBeforeRunSettlesInterruption(t *testing.T) {
 	exec := compactionExecution(t, compact, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	summary, usage, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages(), nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
 	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
@@ -393,7 +407,7 @@ func TestRunCompactionCanceledAfterSummarySettlesInterruption(t *testing.T) {
 		return &cancelOnCloseStream{scriptStream: summaryStream("S1", model.Usage{InputTokens: 4, OutputTokens: 2}), cancel: cancel}, nil
 	}
 	exec := compactionExecution(t, compact, nil)
-	summary, usage, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot)
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
 	testassert.Equal(t, summary, "")
@@ -553,7 +567,7 @@ func TestRunCompactionExistingSummaryAndNewMessages(t *testing.T) {
 		return summaryStream("S1", model.Usage{}), nil
 	}
 	exec := compactionExecution(t, compact, nil)
-	summary, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+	summary, _, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.NoError(t, err)
 	testassert.Equal(t, summary, "S1")
@@ -578,7 +592,7 @@ func TestRunCompactionSummaryOnlySessionSuppliesSummary(t *testing.T) {
 	}
 	exec := compactionExecution(t, compact, nil)
 	{
-		_, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot)
+		_, _, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), snapshot, nil, nil)
 		defer closeInvocation() // the fixture joins the opened maintenance stage
 		testassert.NoError(t, err)
 	}
@@ -597,7 +611,7 @@ func TestRunCompactionEmptySnapshotFailsNothingToCompact(t *testing.T) {
 		return nil, errors.New("unreachable")
 	}
 	exec := compactionExecution(t, compact, nil)
-	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), nil)
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), nil, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == "nothing to compact", "error %v, want the retained nothing-to-compact failure", err)
 	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
@@ -622,7 +636,7 @@ func TestRunCompactionErroredSummaryCarriesOutputThroughTheRun(t *testing.T) {
 		return erroredTurnStream(), nil // text "partial" with usage, then the read failure
 	}
 	exec := compactionExecution(t, compact, (&retrySpy{limit: 0}).retry)
-	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages(), nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "provider failure"), "error %v, want the summary's own failure detail, not a settlement-shape boundary violation", err)
 	testassert.Equal(t, summary, "")
@@ -653,7 +667,7 @@ func TestRunCompactionEmptySummaryFailsWithTheRetainedDetail(t *testing.T) {
 		return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 	}
 	exec := compactionExecution(t, compact, nil)
-	summary, usage, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages())
+	summary, usage, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, testCapture(), compactSnapshotMessages(), nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
 	testassert.Require(t, err != nil && err.Error() == "compaction summary is empty", "error %v, want the retained empty-summary detail", err)
 	testassert.Equal(t, summary, "")
@@ -768,7 +782,8 @@ func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
 	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
 	// admitted input message.
 	{
-		err := h.commitCompaction(c, testOpID, testCapture(), "summary one", 1, usage, false)
+		inputID := fixtureInputEntryID(c)
+		err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary one", 1, usage, false)
 		testassert.NoError(t, err)
 	}
 
@@ -835,7 +850,7 @@ func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
 	// admitted input message.
 	{
-		err := h.commitCompaction(c, testOpID, testCapture(), "manual summary", 1, usage, true)
+		err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", ""), "manual summary", 1, usage, true)
 		testassert.NoError(t, err)
 	}
 
@@ -894,7 +909,8 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		store.txHook = func(string) error { return errors.New("injected storage failure") }
 
 		{
-			err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false)
+			inputID := fixtureInputEntryID(c)
+			err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, nil, false)
 			testassert.Require(t, err != nil, "commitCompaction succeeded past an injected failure")
 		}
 
@@ -933,7 +949,8 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		}
 		usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
 
-		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, usage, false)
+		inputID := fixtureInputEntryID(c)
+		err = h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, usage, false)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected commit failure"), "error %v, want the injected commit failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
@@ -967,7 +984,8 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 			return nil
 		}
 
-		err = h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, true)
+		inputID := fixtureInputEntryID(c)
+		err = h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, nil, true)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected settlement failure"), "error %v, want the injected settlement failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
@@ -983,4 +1001,16 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
 	})
+}
+
+// fixtureInputEntryID returns the admitted input entry identity of the
+// fixture Operation's cached graph — the canonical boundary an automatic
+// maintenance procedure freezes its consumed view at.
+func fixtureInputEntryID(c *coordinator) string {
+	for _, entry := range c.graph.Entries {
+		if entry.Input != nil {
+			return entry.Envelope.ID
+		}
+	}
+	return ""
 }

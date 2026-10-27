@@ -91,7 +91,7 @@ func transportExecution(srv *httptest.Server, retry RetryPolicy) Execution {
 // opened conversation invocation — the direct effect fixtures' shape.
 func modelEffectOver(t *testing.T, h *Harness, c *coordinator, exec Execution, capture ExecutionCapture) agent.ModelEffect {
 	t.Helper()
-	return h.modelEffect(c, testOpID, exec, openedConversation(t, exec), capture)
+	return h.modelEffect(c, testOpID, exec, openedConversation(t, exec), capture, fixtureRound(h, c))
 }
 
 // retrySpy is the fixtures' captured retry policy: up to limit retries of any

@@ -413,12 +413,16 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		Content     json.RawMessage          `json:"content"`
 		ToolCalls   []harness.ToolCallRecord `json:"tool_calls"`
 		Usage       *harness.UsageCount      `json:"usage,omitempty"`
+		RequestID   string                   `json:"request_id"`
+		Advertised  []string                 `json:"advertised_names"`
+		Evidence    json.RawMessage          `json:"evidence"`
 	}{
 		SessionID: sessionID, EntryID: assistantID, OperationID: operationID,
 		Status: "completed", Source: usageWireRef{Provider: "prov", Model: "m"},
 		Content:   json.RawMessage(`[{"kind":"text","text":"answer ` + operationID + `"}]`),
 		ToolCalls: []harness.ToolCallRecord{},
 		Usage:     assistantUsage,
+		RequestID: "request-a-" + assistantID, Advertised: []string{}, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `"}`),
 	})
 	testassert.NoError(t, err)
 	settlementExtra := ""
@@ -1036,7 +1040,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		lifecycleInsertEntry(t, store, busy, busyInput, "b-op-1", harness.EntryInput,
 			compactRawInputEntry(busy, busyInput, "b-op-1", "user", "running"))
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: busy, Kind: harness.RegisterOperation, OperationID: "b-op-1"},
-			compactRawOperationRegister(compactRawMessageAdmission(busy, "b-op-1", busyInput), compactRawRunningModelState(time.Now().UTC().Format(time.RFC3339Nano), newLifecycleID(t))))
+			compactRawOperationRegister(compactRawMessageAdmission(busy, "b-op-1", busyInput), compactRawRunningModelState(time.Now().UTC().Format(time.RFC3339Nano), newLifecycleID(t), busyInput)))
 
 		// A modelless Session: the Agent type resolves but selects no model.
 		modelless := newLifecycleID(t)

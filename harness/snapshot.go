@@ -559,12 +559,20 @@ func ownAssistantPayload(v assistantEntry) *assistantEntry {
 		usage := *v.Usage
 		out.Usage = &usage
 	}
+	if v.AdvertisedNames != nil {
+		out.AdvertisedNames = append([]string(nil), v.AdvertisedNames...)
+	}
+	out.Evidence = copyRequestEvidencePointer(v.Evidence)
 	return &out
 }
 
 func ownToolResultPayload(v toolResultEntry) *toolResultEntry {
 	out := v
 	out.Metadata = model.CloneRaw(v.Metadata)
+	out.NormalizedArguments = model.CloneRaw(v.NormalizedArguments)
+	if v.HookIDs != nil {
+		out.HookIDs = append([]HookIdentity(nil), v.HookIDs...)
+	}
 	return &out
 }
 
@@ -591,6 +599,8 @@ func ownSettlementPayload(v operationSettlementEntry) *operationSettlementEntry 
 		usage := *v.Usage
 		out.Usage = &usage
 	}
+	out.Evidence = copyRequestEvidencePointer(v.Evidence)
+	out.Input = cloneRequestMessages(v.Input)
 	return &out
 }
 
@@ -600,5 +610,7 @@ func ownCompactionPayload(v compactionEntry) *compactionEntry {
 		usage := *v.Usage
 		out.Usage = &usage
 	}
+	out.Input = cloneRequestMessages(v.Input)
+	out.Evidence = copyRequestEvidencePointer(v.Evidence)
 	return &out
 }

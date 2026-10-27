@@ -35,6 +35,7 @@ func projectionAssistant(entryID, text string, sequence int64) testEntry {
 func projectionCompaction(entryID, boundaryID string, sequence int64) testEntry {
 	v := validCompactionEntry(testOpID)
 	v.EntryID = entryID
+	v.RequestID = "maintenance-" + entryID
 	v.BoundaryEntryID = boundaryID
 	return testEntry{
 		env:        Entry{SessionID: testSessionID, ID: entryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: sequence, CommittedAt: testTime},

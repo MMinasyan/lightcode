@@ -85,6 +85,8 @@ func factFixtureGraph() *testGraph {
 	result.Metadata = json.RawMessage(`{"n":1}`)
 
 	assistant2 := validAssistantEntry(testOpID)
+	assistant2.RequestID = "request-two"
+	assistant2.Evidence = &RequestEvidence{BoundaryEntryID: testResultID}
 	assistant2.EntryID = hexID(5)
 	assistant2.ToolCalls = nil
 	assistant2.Usage = &UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}
@@ -419,6 +421,7 @@ func TestHistoryViewFactUnionAndOwnership(t *testing.T) {
 		copiedInput.OperationID = ""
 		copiedAssistant := validAssistantEntry("")
 		copiedAssistant.EntryID = hexID(2)
+		copiedAssistant.RequestID = hexID(2)
 		copiedAssistant.OperationID = ""
 		call := validToolCallRecord()
 		call.ResultEntryID = hexID(3)

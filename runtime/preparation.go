@@ -354,7 +354,9 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 // bindToolArgumentHooks binds, in the Agent's selected capability order and
 // only after all execution scopes opened, every selected binding whose
 // declared type implements ToolArgumentsHook — from any supplying scope. IDs
-// are the capability IDs, and each hook receives the same captured Invocation.
+// are the capability IDs, each hook's extension identity is the supplying
+// plugin's, and every Runtime-declared argument hook participates as an
+// effectful boundary. Each hook receives the same captured Invocation.
 func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
 	var hooks []harness.ToolArgumentsHook
 	for _, id := range selected {
@@ -367,7 +369,9 @@ func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invo
 			return nil, err
 		}
 		hooks = append(hooks, harness.ToolArgumentsHook{
-			ID: id,
+			ID:          id,
+			ExtensionID: entry.plugin,
+			Mode:        harness.HookModeEffectful,
 			Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 				return hook.BeforeTool(ctx, invocation, call)
 			},

@@ -74,11 +74,12 @@ func invokeModelEffect(t *testing.T, me agent.ModelEffect, req model.Request, as
 	return invokeModelEffectCtx(t, me, context.Background(), req, assemble)
 }
 
-// fixtureProjection wraps one Operation's request source with the test
-// capture, exposing only the projected messages for fixtures that read the
-// boundary directly.
+// fixtureProjection wraps one Operation's pipeline request source with the
+// test capture and a frozen round, exposing only the projected messages for
+// fixtures that read the boundary directly. The source is built once, so its
+// steering-boundary selection across calls is the production behavior.
 func fixtureProjection(h *Harness, c *coordinator) func(context.Context) ([]model.Message, error) {
-	source := h.requestSource(c, testOpID, testCapture())
+	source := h.requestSource(c, testOpID, testCapture(), Execution{}, InvocationExecution{}, fixtureRound(h, c))
 	return func(ctx context.Context) ([]model.Message, error) {
 		req, err := source(ctx)
 		if err != nil {
@@ -86,6 +87,17 @@ func fixtureProjection(h *Harness, c *coordinator) func(context.Context) ([]mode
 		}
 		return req.Messages, nil
 	}
+}
+
+// fixtureRound freezes the current durable conversation state into a
+// conversationRound through one run of the pipeline request source: the
+// frozen-request shape the direct-drive fixtures dispatch under.
+func fixtureRound(h *Harness, c *coordinator) *conversationRound {
+	round := &conversationRound{}
+	if _, err := h.requestSource(c, testOpID, testCapture(), Execution{}, InvocationExecution{}, round)(context.Background()); err != nil {
+		panic(err)
+	}
+	return round
 }
 
 func testToolCall(id string) model.ToolCall {
@@ -271,7 +283,7 @@ func TestModelEffectReadyRemainsRunning(t *testing.T) {
 	store, sessionID = st, sid
 
 	calls := 0
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c))
 	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
 		calls++
 		return agent.Assemble(context.Background(), source, stream)
@@ -328,7 +340,7 @@ func TestModelEffectContinueRemainsRunning(t *testing.T) {
 		return erroredTurnStream(), nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoContinue)
 	graph, err := validateFixture(t, store, sessionID)
@@ -378,7 +390,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), ctx, defaultModelRequest(t), nil)
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, set.Disposition, agent.DispoInterruption)
 		graph, err := validateFixture(t, store, sessionID)
@@ -408,7 +420,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		}
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail == "model failure", "settlement = %+v, want the committed failure with its diagnostic", set)
 		graph, err := validateFixture(t, store, sessionID)
@@ -428,7 +440,7 @@ func TestModelEffectTerminalSettlement(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // the execution context dies before any attempt could start
-		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c))
 		set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
@@ -469,7 +481,7 @@ func TestModelEffectRepeatedCallIDSettlesFailure(t *testing.T) {
 		return s, nil
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c))
 	{
 		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
@@ -501,7 +513,7 @@ func TestModelEffectTerminalNoOutputUsageOnSettlement(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	graph, err := validateFixture(t, store, sessionID)
@@ -578,7 +590,7 @@ func TestModelEffectPublicationFailureLeavesIntentState(t *testing.T) {
 				return nil
 			}
 			{
-				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 				testassert.Require(t, err != nil, "model effect succeeded past an injected %s failure", fail.step)
 			}
 			graph, err := validateFixture(t, store, sessionID)
@@ -659,7 +671,7 @@ func TestRequestSourceProjectsFullHistory(t *testing.T) {
 		t.Helper()
 		exec := effectExecution(modelFn, plan)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, invocationExecution(modelFn, plan), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, invocationExecution(modelFn, plan), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
@@ -786,7 +798,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, modelFn)
 		foreignEffectRace(t, store, sessionID, testOpID, "foreign")
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "intent over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -806,7 +818,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrConflict), "result over a foreign revision = %v, want the revision-race conflict", err)
 		}
 		{
@@ -835,6 +847,7 @@ func foreignTerminalSettle(t *testing.T, store *graphStorage, sessionID, operati
 		op.State.Status = OperationFailure
 		op.State.SettledAt = &stamped
 		op.State.ActiveEffect = nil
+		op.State.Request = nil
 		op.State.PendingToolCalls = []PendingToolCall{}
 		op.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: sessionID, EntryID: hexID(9)}, Detail: "foreign"}
 		payload, err := encodeOperationRegister(op)
@@ -858,7 +871,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(), nil
 		}
-		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
+		me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c))
 		{
 			_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "intent over a foreign terminal operation = %v, want ErrInvalid", err)
@@ -876,7 +889,7 @@ func TestEffectTransactionsPreconditionsOutrankRevisionRace(t *testing.T) {
 		h, st, c, sid := newEffectHarness(t, modelFn)
 		store, sessionID = st, sid
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "result over a foreign terminal operation = %v, want ErrInvalid", err)
 		}
 	})
@@ -959,7 +972,7 @@ func TestModelEffectGateSkipsCallbackOnCancellation(t *testing.T) {
 		}
 		return nil
 	}
-	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture())
+	me := h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c))
 	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, invoked, 0)
@@ -1049,7 +1062,7 @@ func TestExecuteCanceledBeforeOpenSkipsOpener(t *testing.T) {
 	cancel() // the execution context is lost before the opener could start
 	{
 		err := executeDirect(h, c, h.ctx, testOpID, prepared)
-		testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the context error", err)
+		testassert.Require(t, err == nil, "execute = %v, want the entry interruption settled with no run error", err)
 	}
 	testassert.Equal(t, opens, 0)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
@@ -1201,7 +1214,7 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 			return completedTurnStream(testToolCall("call-1")), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1735,7 +1748,7 @@ func TestToolEffectAdvertisementGate(t *testing.T) {
 		), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 2)
@@ -1784,7 +1797,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return completedTurnStream(calls...), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1923,7 +1936,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 			return streamOf(d, usageDelta(model.Usage{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2})), nil
 		}
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		{
@@ -2356,7 +2369,7 @@ func publishCalls(t *testing.T, h *Harness, c *coordinator, sessionID string, ca
 		return completedTurnStream(calls...), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 }
@@ -2394,21 +2407,25 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 			testassert.Require(t, entry.Settlement == nil, "settlement entry %s published over a storage failure", entry.Envelope.ID)
 		}
 	})
-	t.Run("execution-context error settles the fixed interruption detail", func(t *testing.T) {
-		for _, runErr := range []error{context.Canceled, context.DeadlineExceeded} {
-			h, store, c, sessionID := newEffectHarness(t, nil)
-			publishCalls(t, h, c, sessionID, testToolCall("call-1"))
-			{
-				err := h.settleAgentTerminal(c, testOpID, agent.TerminalResult{}, runErr, context.Background())
-				testassert.Require(t, errors.Is(err, runErr), "settleAgentTerminal(%v) = %v, want the run error back", runErr, err)
-			}
-			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	t.Run("typed interruption terminal settles the fixed interruption detail", func(t *testing.T) {
+		// A cancellation-shaped run error never reaches this settlement: the
+		// Engine converts it to the typed interruption terminal (the
+		// interruption-shape rows under the effect and gate fixtures cover
+		// that conversion), and the settlement consumes exactly the typed
+		// result with no run error.
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		publishCalls(t, h, c, sessionID, testToolCall("call-1"))
+		{
+			res := agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}
+			err := h.settleAgentTerminal(c, testOpID, res, nil, context.Background())
 			testassert.NoError(t, err)
-			testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
-			{
-				_, err := validateFixture(t, store, sessionID)
-				testassert.NoError(t, err)
-			}
+		}
+		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+		{
+			_, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
 		}
 	})
 	t.Run("non-storage protocol error still settles failure", func(t *testing.T) {
@@ -2588,7 +2605,15 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 						if err != nil {
 							return err
 						}
-						op.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(7)}
+						consumedBoundary := ""
+						for _, entry := range store.entries[sessionID] { // the transaction callback already holds the fake's lock
+							if entry.Kind == EntryInput {
+								consumedBoundary = entry.ID
+							}
+						}
+						mdl := testModelRef()
+						op.State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(7), RequestID: "request-active", Model: &mdl, Purpose: InvocationPurposeConversation, Evidence: &RequestEvidence{BoundaryEntryID: consumedBoundary}}
+						op.State.Request = &RunningRequest{RequestID: "request-active", BoundaryEntryID: consumedBoundary}
 						payload, err := encodeOperationRegister(op)
 						if err != nil {
 							return err
@@ -2647,7 +2672,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil, false)
+				committed, _, _, err := commitTerminalSettlement(tx, sessionID, testOpID, session, op, sreg.Revision, oreg.Revision, OperationSuccess, "", nil, model.ModelRef{}, nil, false, nil, "")
 				if err != nil {
 					return err
 				}
@@ -2754,7 +2779,7 @@ func TestAssistantEntryOriginalNormalizationCommitsAtProducer(t *testing.T) {
 	}
 	h, store, c, sessionID := newEffectHarness(t, modelFn)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, Execution{}, InvocationExecution{Model: modelFn, NormalizeTool: normalize}, testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, normalized, 3)

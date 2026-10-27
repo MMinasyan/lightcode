@@ -137,6 +137,7 @@ type bindingEntry struct {
 	declared reflect.Type
 	value    any
 	from     *scope
+	plugin   string // the supplying plugin's identity: the extension identity durable hook evidence records
 }
 
 // Bind returns the native value bound to id, checking that it is assignable
@@ -518,7 +519,7 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 			if !ok {
 				return fail(fmt.Errorf("plugin %q: dependency %q unresolved in scope %s: %w", p.ID, req.id, info.Kind, ErrComposition))
 			}
-			deps[req.id] = bindingEntry{declared: req.typ, value: source.value, from: source.from}
+			deps[req.id] = bindingEntry{declared: req.typ, value: source.value, from: source.from, plugin: source.plugin}
 		}
 		// Every factory receives its own copied ScopeInfo. Only a
 		// Runtime-scoped factory receives the existing warning ingress, bound
@@ -584,7 +585,7 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		} else if spec.typ == jobStopperType {
 			sc.jobStoppers[id] = value
 		} else {
-			entry := bindingEntry{declared: spec.typ, value: value, from: sc}
+			entry := bindingEntry{declared: spec.typ, value: value, from: sc, plugin: p.ID}
 			own[id] = entry
 			resolved[id] = entry
 		}

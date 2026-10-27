@@ -3261,7 +3261,7 @@ func rawInputEntryPayload(sessionID, entryID, operationID string) string {
 
 // rawAssistantEntryPayload builds one completed assistant entry publishing the
 // given (call ID, reserved result ID) pairs in publication order.
-func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2]string) string {
+func rawAssistantEntryPayload(sessionID, entryID, operationID, boundaryID string, calls [][2]string) string {
 	parts := make([]string, 0, len(calls))
 	args := base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))
 	for i, call := range calls {
@@ -3271,8 +3271,8 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
-		sessionID, entryID, operationID, strings.Join(parts, ","))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
 // seedRunningOperationShape inserts one quiescent open Session with one
@@ -3296,15 +3296,17 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		reserved[i] = newRawSessionID(t)
 	}
 	activeEffectJSON := ""
+	requestJSON := ""
 	switch activeEffect {
 	case "model":
 		modelReserved = newRawSessionID(t)
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q}`, modelReserved)
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live","model":{"provider":"prov","model":"gpt-x"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}}`, modelReserved, entryID)
+		requestJSON = fmt.Sprintf(`,"running_request":{"request_id":"request-live","boundary_entry_id":%q,"hook_results":[]}`, entryID)
 	case "tool":
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q}`, reserved[0], calls[0])
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q,"final_arguments":{"x":1}}`, reserved[0], calls[0])
 	case "hook":
 		modelReserved = newRawSessionID(t) // the hook effect's own reserved result identity
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one"}`, modelReserved, calls[0])
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, modelReserved, calls[0])
 	}
 	pendingJSON := `,"pending_tool_calls":[]` // required member; empty arrays are non-null
 	if len(calls) > 0 {
@@ -3321,8 +3323,8 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		pendingJSON = fmt.Sprintf(`,"pending_tool_calls":[%s]`, strings.Join(parts, ","))
 	}
 	operationPayload := fmt.Sprintf(
-		`{"admission":%s,"state":{"status":"running","started_at":%q%s%s,"usage":{"by_model":[]}}}`,
-		rawAdmission(sessionID, operationID, entryID), now, activeEffectJSON, pendingJSON)
+		`{"admission":%s,"state":{"status":"running","started_at":%q%s%s%s,"usage":{"by_model":[]}}}`,
+		rawAdmission(sessionID, operationID, entryID), now, activeEffectJSON, requestJSON, pendingJSON)
 
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, operationID))
 	insertRawEntry(t, store, sessionID, entryID, operationID, harness.EntryInput, rawInputEntryPayload(sessionID, entryID, operationID))
@@ -3331,7 +3333,7 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		for i := range calls {
 			pairs[i] = [2]string{calls[i], reserved[i]}
 		}
-		insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, operationID, pairs))
+		insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, operationID, entryID, pairs))
 	}
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID}, operationPayload)
 	return sessionID, modelReserved, reserved
@@ -3592,7 +3594,7 @@ func rawSignalPayload(sessionID, entryID, operationID string) string {
 // for one hook execution of the given call.
 func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":"success","arguments":{"x":1}}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":"success","evidence":"observed","input_arguments_base64":"eyJ4IjoxfQ==","arguments":{"x":1}}`,
 		sessionID, entryID, operationID, hookID, callID)
 }
 
@@ -3600,7 +3602,7 @@ func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string
 // hook-result entry payload carrying a non-empty error and no arguments.
 func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, errText string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":%q,"error":%q}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":%q,"evidence":"observed","input_arguments_base64":"","error":%q}`,
 		sessionID, entryID, operationID, hookID, callID, status, errText)
 }
 
@@ -3637,9 +3639,20 @@ func rawCopiedInputPayload(sessionID, entryID string) string {
 		sessionID, entryID)
 }
 
+// corruptSiblingBoundaryFor names an existing entry of the mutated snapshot
+// to serve as a copied assistant's evidence boundary, so a mutation corrupts
+// on its intended axis rather than through an incidental dangling reference.
+func corruptSiblingBoundaryFor(t *testing.T, snap *sessionSnapshot) string {
+	t.Helper()
+	if len(snap.entries) > 0 {
+		return snap.entries[len(snap.entries)-1].ID
+	}
+	return corruptSiblingOtherEntry
+}
+
 // rawCopiedAssistantPayload builds one operationless copied assistant entry
 // payload publishing the given (call ID, reserved result ID) pairs.
-func rawCopiedAssistantPayload(sessionID, entryID string, calls [][2]string) string {
+func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2]string) string {
 	parts := make([]string, 0, len(calls))
 	args := base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))
 	for i, call := range calls {
@@ -3649,8 +3662,8 @@ func rawCopiedAssistantPayload(sessionID, entryID string, calls [][2]string) str
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
-		sessionID, entryID, strings.Join(parts, ","))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
 // rawCopiedResultPayload builds one operationless copied tool-result entry
@@ -3685,7 +3698,7 @@ func seedCorruptSiblingWithResult(t *testing.T, store harness.Storage) string {
 	sessionID, entryID, assistantID, resultID := newRawSessionID(t), newRawSessionID(t), newRawSessionID(t), newRawSessionID(t)
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, "op-1"))
 	insertRawEntry(t, store, sessionID, entryID, "op-1", harness.EntryInput, rawInputEntryPayload(sessionID, entryID, "op-1"))
-	insertRawEntry(t, store, sessionID, assistantID, "op-1", harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, "op-1", [][2]string{{"call-1", resultID}}))
+	insertRawEntry(t, store, sessionID, assistantID, "op-1", harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, "op-1", entryID, [][2]string{{"call-1", resultID}}))
 	insertRawEntry(t, store, sessionID, resultID, "op-1", harness.EntryToolResult, rawToolResultPayload(sessionID, resultID, "op-1", assistantID, "call-1"))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-1"}, rawRunningOperationPayload(sessionID, "op-1", entryID))
 	return sessionID
@@ -3949,6 +3962,9 @@ type corruptSiblingRow struct {
 	name   string
 	seed   func(t *testing.T, store harness.Storage) string
 	mutate func(t *testing.T, snap *sessionSnapshot)
+	// detail pins the exact validator rule a row must surface, so a codec
+	// or incidental earlier corruption cannot mask the intended one.
+	detail string
 }
 
 // TestPublicRecoverCorruptSibling proves the recovery-side corruption row with
@@ -4242,12 +4258,13 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: active hook effect repeats a settled hook",
-			seed: seedCorruptSiblingHookResult,
+			name:   "validator: active hook effect repeats a settled hook",
+			seed:   seedCorruptSiblingHookResult,
+			detail: `repeats hook "cap.hook.one"`,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, corruptSiblingOtherEntry))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, corruptSiblingOtherEntry))
 				})
 			},
 		},
@@ -4262,12 +4279,13 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: active hook effect after a failed hook",
-			seed: seedCorruptSiblingFailedHook,
+			name:   "validator: active hook effect after a failed hook",
+			seed:   seedCorruptSiblingFailedHook,
+			detail: `addresses call "call-1" after its failed hook`,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two"}`, corruptSiblingOtherEntry))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two","hook_extension_id":"ext.raw","input_arguments_base64":""}`, corruptSiblingOtherEntry))
 				})
 			},
 		},
@@ -4358,24 +4376,98 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: hook active effect reserves a pending tool-result identity",
-			seed: seedCorruptSiblingPendingCall,
+			name:   "validator: hook active effect reserves a pending tool-result identity",
+			detail: "already reserved by call",
+			seed:   seedCorruptSiblingPendingCall,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reserved := snapReservedResultID(t, snap)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, reserved))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, reserved))
 				})
 			},
 		},
 		{
-			name: "validator: hook active effect reserves an already committed entry",
-			seed: seedCorruptSiblingPendingCall,
+			name:   "validator: hook active effect reserves an already committed entry",
+			detail: "reserves committed entry",
+			seed:   seedCorruptSiblingPendingCall,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active request hook effect provenance omits a committed hook",
+			detail: "omits committed hook result",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				hookEntry := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hookEntry, "op-1", harness.EntryHookResult, fmt.Sprintf(
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{}}`,
+					sessionID, hookEntry, input.ID))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.two","hook_extension_id":"ext.raw2","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q}}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q,"hook_results":[{"session_id":%q,"entry_id":%q}]}`, input.ID, sessionID, hookEntry))
+				})
+			},
+		},
+		{
+			name:   "validator: running request state names a boundary its checkpoint covered",
+			detail: "before its checkpoint entry",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				comp := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
+				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
+				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
+					state["compaction_entry_id"] = json.RawMessage(`"` + comp + `"`)
+				})
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","checkpoint_entry_id":%q,"boundary_entry_id":%q}`, comp, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active request hook effect references a boundary its checkpoint covered",
+			detail: "before its checkpoint entry",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				comp := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
+				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
+				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
+					state["compaction_entry_id"] = json.RawMessage(`"` + comp + `"`)
+				})
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"checkpoint_entry_id":%q}}`, newRawSessionID(t), input.ID, comp))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","checkpoint_entry_id":%q,"boundary_entry_id":%q}`, comp, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active tool effect provenance omits its committed hook effect",
+			detail: "omits committed hook result",
+			seed:   seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{"x":1}}`, snapReservedResultID(t, snap)))
 				})
 			},
 		},
@@ -4440,7 +4532,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapAppendOperation(snap, sessionID, "op-2", rawSettledOperationPayload(sessionID, "op-2", input2, settlement2))
 				snapAppendEntry(snap, sessionID, input2, "op-2", harness.EntryInput, rawInputEntryPayload(sessionID, input2, "op-2"))
 				snapAppendEntry(snap, sessionID, assistant2, "op-2", harness.EntryAssistant,
-					rawAssistantEntryPayload(sessionID, assistant2, "op-2", [][2]string{{"call-9", reserved}}))
+					rawAssistantEntryPayload(sessionID, assistant2, "op-2", input2, [][2]string{{"call-9", reserved}}))
 				snapAppendEntry(snap, sessionID, reserved, "op-2", harness.EntryToolResult,
 					rawToolResultPayload(sessionID, reserved, "op-2", assistant2, "call-9"))
 				snapAppendEntry(snap, sessionID, settlement2, "op-2", harness.EntryOperationSettlement,
@@ -4474,7 +4566,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapMakeFork(t, snap)
 				snapStripOperation(t, snap)
 				assistant, result := newRawSessionID(t), newRawSessionID(t)
-				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant, rawCopiedAssistantPayload(sessionID, assistant, nil))
+				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant, rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), nil))
 				snapAppendEntry(snap, sessionID, result, "", harness.EntryToolResult, rawCopiedResultPayload(sessionID, result, assistant, "call-1"))
 			},
 		},
@@ -4487,7 +4579,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapStripOperation(t, snap)
 				assistant, result := newRawSessionID(t), newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					rawCopiedAssistantPayload(sessionID, assistant, [][2]string{{"call-1", corruptSiblingOtherEntry}}))
+					rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), [][2]string{{"call-1", corruptSiblingOtherEntry}}))
 				snapAppendEntry(snap, sessionID, result, "", harness.EntryToolResult, rawCopiedResultPayload(sessionID, result, assistant, "call-1"))
 			},
 		},
@@ -4532,7 +4624,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapStripOperation(t, snap)
 				assistant := newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					rawCopiedAssistantPayload(sessionID, assistant, [][2]string{{"call-1", corruptSiblingOtherEntry}}))
+					rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), [][2]string{{"call-1", corruptSiblingOtherEntry}}))
 			},
 		},
 		{
@@ -4560,10 +4652,11 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				sessionID := snapSessionID(snap)
 				snapMakeFork(t, snap)
 				snapStripOperation(t, snap)
-				snap.entries = nil // the copied prefix is one assistant entry
-				assistant := newRawSessionID(t)
+				snap.entries = nil // the copied prefix is one input and one assistant entry
+				input, assistant := newRawSessionID(t), newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, input, "", harness.EntryInput, rawCopiedInputPayload(sessionID, input))
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					string(editPayloadObject(t, json.RawMessage(rawCopiedAssistantPayload(sessionID, assistant, nil)), func(obj map[string]json.RawMessage) {
+					string(editPayloadObject(t, json.RawMessage(rawCopiedAssistantPayload(sessionID, assistant, input, nil)), func(obj map[string]json.RawMessage) {
 						obj["usage"] = json.RawMessage(`{"input_tokens":2,"cached_input_tokens":0,"output_tokens":0}`)
 					})))
 			},
@@ -4700,6 +4793,78 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		})
 	}
+
+	// The forbidden input_arguments_base64 membership inventory: a member its
+	// binding never permits corrupts the Session at the shared decode before
+	// recovery copies or settles anything. Each row keeps every other shape
+	// fact consistent, so the membership is the only defect.
+	rows = append(rows,
+		corruptSiblingRow{
+			name:   "codec wire: request-bound hook result carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult, fmt.Sprintf(
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{},"input_arguments_base64":""}`,
+					sessionID, hook, input.ID))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q,"hook_results":[{"session_id":%q,"entry_id":%q}]}`, input.ID, sessionID, hook))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: request-bound hook active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: conversation model active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"request-corrupt","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: maintenance model active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"maintenance-corrupt","model":{"provider":"prov","model":"compact"},"purpose":"maintenance","input_arguments_base64":""}`, newRawSessionID(t)))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: concrete tool active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingPendingCall,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{},"input_arguments_base64":""}`, snapReservedResultID(t, snap)))
+				})
+			},
+		},
+	)
 
 	// The register-wire inventory: rejected session- and operation-register
 	// payload mutations on the plain running graph.
@@ -4843,6 +5008,8 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				{
 					_, err := h.ReadSessionHeader(ctx, targetID)
 					testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt session after recovery = err %v, want the corruption error", err)
+					testassert.Require(t, row.detail == "" || strings.Contains(err.Error(), row.detail),
+						"corrupt session after recovery = err %v, want the %q rule for row %q", err, row.detail, row.name)
 				}
 				rec, err := h.ReadOperation(ctx, siblingID, "op-sib")
 				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired sibling after recovery = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
@@ -6163,8 +6330,8 @@ func rawCompactAdmission(sessionID, operationID string) string {
 func rawCompactionEntryPayload(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1"}`,
-		sessionID, entryID, operationID, summary, boundaryID)
+			`"model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1","request_id":%q,"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}`,
+		sessionID, entryID, operationID, summary, boundaryID, "maintainer-"+entryID, boundaryID)
 }
 
 // rawSettledSuccessOperation seeds one settled success message Operation —
@@ -6180,8 +6347,8 @@ func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 			sessionID, inputID, operationID, inputText))
 	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
-			sessionID, assistantID, operationID, assistantText))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			sessionID, assistantID, operationID, assistantText, "request-a-"+assistantID, inputID))
 	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`, sessionID, settlementID, operationID))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
@@ -6214,7 +6381,7 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "compact-op"},
 			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
-				`"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"maintainer-live","model":{"provider":"prov","model":"compact-x"},"purpose":"maintenance"},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
 				rawCompactAdmission(sessionID, "compact-op"), now, reserved))
 
 		// The seeded shape: a running compact request with a live model intent.

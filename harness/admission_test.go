@@ -1170,7 +1170,9 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 func TestReadOperationReturnsOwnedRecords(t *testing.T) {
 	t.Run("active effect pointer", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+		effect, request := conversationModelEffect(hexID(3))
+		fixture.ops[0].State.ActiveEffect = effect
+		fixture.ops[0].State.Request = request
 		h := newTestHarness(t, fixture.storage(t), nil)
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
 		testassert.NoError(t, err)

@@ -66,15 +66,108 @@ type PreparedExecution struct {
 	Release func() error
 }
 
-// ToolArgumentsHook is one effectful argument hook: before a concrete tool
-// call prepares, it may rewrite the call's raw argument bytes. Its successful
+// HookMode declares one hook's participation contract at its boundary. A pure
+// hook validates and coalesces its changed value in memory with no effect
+// transaction; an effectful hook's execution is its own Harness-settled
+// Operation effect with durable hook_result evidence.
+type HookMode string
+
+const (
+	HookModePure      HookMode = "pure"
+	HookModeEffectful HookMode = "effectful"
+)
+
+func validHookMode(mode HookMode) bool {
+	return mode == HookModePure || mode == HookModeEffectful
+}
+
+// ExecutionEvidence describes one effect execution's knowledge independently
+// of its status: not_started is proven unstarted work, observed is a valid
+// terminal execution response (including cooperative interruption), and
+// unknown is possible execution without a valid terminal response.
+type ExecutionEvidence string
+
+const (
+	ExecutionNotStarted ExecutionEvidence = "not_started"
+	ExecutionObserved   ExecutionEvidence = "observed"
+	ExecutionUnknown    ExecutionEvidence = "unknown"
+)
+
+func validExecutionEvidence(evidence ExecutionEvidence) bool {
+	switch evidence {
+	case ExecutionNotStarted, ExecutionObserved, ExecutionUnknown:
+		return true
+	}
+	return false
+}
+
+// EffectError carries one hook's declared execution knowledge through a
+// binding-infrastructure failure to the Harness: the declared Evidence reaches
+// the shared accepting validator unchanged. Unwrap exposes the underlying
+// cause for classification.
+type EffectError struct {
+	Evidence ExecutionEvidence
+	Err      error
+}
+
+func (e *EffectError) Error() string { return e.Err.Error() }
+func (e *EffectError) Unwrap() error { return e.Err }
+
+// ToolArgumentsHook is one argument hook: before a concrete tool call
+// prepares, it may rewrite the call's raw argument bytes. Its successful
 // replacement must be exactly one JSON object the execution's normalizer
 // accepts; it can never replace the call identity, tool name, or another
-// call's arguments. Every execution is a Harness-settled Operation effect
-// with durable hook_result evidence. Run receives owned call data.
+// call's arguments. An effectful hook's execution is a Harness-settled
+// Operation effect with durable hook_result evidence; a pure hook coalesces
+// in memory. Run receives owned call data.
 type ToolArgumentsHook struct {
-	ID  string
-	Run func(context.Context, model.ToolCall) (json.RawMessage, error)
+	ID          string
+	ExtensionID string
+	Mode        HookMode
+	Run         func(context.Context, model.ToolCall) (json.RawMessage, error)
+}
+
+// RequestHookInput is one request hook's owned input: the bound request
+// identity, the frozen canonical conversation messages and canonical
+// references they were projected from, the captured rendered prompt, and the
+// captured eligible tool catalog. The CanonicalMessages are the round-frozen
+// projection without any request contribution, CapturedPrompt the captured
+// baseline the current Prompt evolved from, and Catalog the full eligible
+// catalog behind whatever Tools are currently visible. Every mutable member is
+// a deep-owned copy; the hook cannot reach the coordinator's state.
+type RequestHookInput struct {
+	RequestID         string
+	CanonicalMessages []model.Message        // the round-frozen canonical view, contributions excluded
+	Messages          []model.Message        // the effective conversation view accepted so far
+	CheckpointEntryID string                 // the named current checkpoint, empty when uncompacted
+	BoundaryEntryID   string                 // the canonical boundary of the consumed projection
+	CapturedPrompt    string                 // the captured baseline prompt text
+	Prompt            string                 // the effective prompt text
+	Catalog           []model.ToolDefinition // the full captured eligible catalog
+	Tools             []model.ToolDefinition // the currently visible tool view
+}
+
+// RequestConsequence is one request hook's closed contribution: absent members
+// mean unchanged. A present Prompt replaces the complete prompt text (a
+// present-empty Prompt removes the prompt); Messages are complete request-only
+// messages appended to the conversation view; a present ToolNames replaces the
+// visible tool view with those names selected from the captured catalog
+// (present-empty advertises none).
+type RequestConsequence struct {
+	Prompt    *string
+	Messages  []model.Message
+	ToolNames []string
+}
+
+// RequestHook is one selected request-boundary hook: it runs after steering
+// and before any model effect, receives the current effective request view,
+// and contributes an optional complete prompt replacement, request-only
+// messages, and tool visibility. Run receives deep-owned values.
+type RequestHook struct {
+	ID          string
+	ExtensionID string
+	Mode        HookMode
+	Run         func(context.Context, RequestHookInput) (RequestConsequence, error)
 }
 
 // RetryPolicy decides one failed physical model attempt: it receives the
@@ -124,11 +217,16 @@ type InvocationExecution struct {
 	// accepted fields; its error is a per-call validation failure.
 	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
 	// ToolHooks are the selected argument hooks in configured order. Each
-	// runs as its own effect after the advertisement gate and before
-	// concrete preparation; the first receives the original raw call
-	// arguments, every later one the preceding committed replacement.
+	// runs after the advertisement gate and before concrete preparation; the
+	// first receives the original raw call arguments, every later one the
+	// preceding committed value.
 	ToolHooks []ToolArgumentsHook
-	Close     func() error
+	// RequestHooks are the selected request-boundary hooks in configured
+	// order. They run inside the Operation's request source, after steering
+	// and before the automatic-maintenance orchestration and any model
+	// effect.
+	RequestHooks []RequestHook
+	Close        func() error
 }
 
 // Execution is one opened execution: the required invocation opener the
@@ -2007,8 +2105,14 @@ func ownOperationRecord(rec OperationRecord) OperationRecord {
 	out.State.PendingToolCalls = make([]PendingToolCall, len(rec.State.PendingToolCalls))
 	copy(out.State.PendingToolCalls, rec.State.PendingToolCalls)
 	if rec.State.ActiveEffect != nil {
-		effect := *rec.State.ActiveEffect
-		out.State.ActiveEffect = &effect
+		out.State.ActiveEffect = ownActiveEffect(rec.State.ActiveEffect)
+	}
+	if rec.State.Request != nil {
+		request := *rec.State.Request
+		if rec.State.Request.HookResults != nil {
+			request.HookResults = append([]EntryRef(nil), rec.State.Request.HookResults...)
+		}
+		out.State.Request = &request
 	}
 	if rec.State.SettledAt != nil {
 		stamped := *rec.State.SettledAt
@@ -2019,4 +2123,23 @@ func ownOperationRecord(rec OperationRecord) OperationRecord {
 		out.State.Terminal = &terminal
 	}
 	return out
+}
+
+// ownActiveEffect returns an independent owned copy of one active effect:
+// nested evidence, model pointee, raw selection bytes, and provenance lists
+// are deep-copied so a public read can never alias the coordinator's state.
+func ownActiveEffect(effect *ActiveEffect) *ActiveEffect {
+	out := *effect
+	if effect.Model != nil {
+		modelRef := *effect.Model
+		out.Model = &modelRef
+	}
+	if effect.Evidence != nil {
+		out.Evidence = copyRequestEvidencePointer(effect.Evidence)
+	}
+	out.FinalArguments = model.CloneRaw(effect.FinalArguments)
+	if effect.ContributionIDs != nil {
+		out.ContributionIDs = append([]HookIdentity(nil), effect.ContributionIDs...)
+	}
+	return &out
 }

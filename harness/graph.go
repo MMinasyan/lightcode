@@ -343,12 +343,15 @@ type publishedReservation struct {
 	operationID      string
 }
 
-// hookExecution is one comparable hook-execution identity: the hook ID and
-// the tool call it executed for. A two-string key keeps legal identifier
-// contents from ever colliding.
+// hookExecution is one comparable hook-execution identity: the extension and
+// hook IDs plus exactly one binding — the tool call it executed for, or the
+// request it executed for. The two binding families stay disjoint even for
+// equal opaque strings and for a capability used at both boundaries.
 type hookExecution struct {
-	hookID string
-	callID string
+	extensionID string
+	hookID      string
+	callID      string
+	requestID   string
 }
 
 // collectReservations builds the one session-wide reservation index from
@@ -481,6 +484,18 @@ func (v *graphValidation) validateEntryReferences() error {
 			if boundary.Envelope.Sequence >= entry.Envelope.Sequence {
 				return v.corrupt("compaction entry %s names boundary entry %s at or after its own sequence", entry.Envelope.ID, boundary.Envelope.ID)
 			}
+			if entry.Envelope.OperationID == "" {
+				// A copied prefix entry's evidence references stay local: the
+				// fork remapped them, and a source-only reference never
+				// resolves here.
+				if err := v.validateEvidenceRefs("copied compaction entry "+entry.Envelope.ID+" evidence", entry.Compaction.Evidence, entry); err != nil {
+					return err
+				}
+			}
+		case entry.Envelope.OperationID == "" && entry.Assistant != nil:
+			if err := v.validateEvidenceRefs("copied assistant entry "+entry.Envelope.ID+" evidence", entry.Assistant.Evidence, entry); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -518,7 +533,7 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 	if err != nil {
 		return err
 	}
-	settledHooks, hookStatus, err := v.collectHookResults(opID, published)
+	settledHooks, hookStatus, successfulByCall, err := v.collectHookResults(opID, published)
 	if err != nil {
 		return err
 	}
@@ -555,16 +570,33 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 					return v.corrupt("active effect of operation %q reserves committed entry %s of kind %s", opID, committed.Envelope.ID, committed.Envelope.Kind)
 				}
 				if op.State.ActiveEffect.Kind == EffectHook {
-					execution := hookExecution{hookID: op.State.ActiveEffect.HookID, callID: op.State.ActiveEffect.ToolCallID}
+					execution := hookExecution{extensionID: op.State.ActiveEffect.ExtensionID, hookID: op.State.ActiveEffect.HookID, callID: op.State.ActiveEffect.ToolCallID, requestID: op.State.ActiveEffect.RequestID}
 					if _, repeat := settledHooks[execution]; repeat {
 						return v.corrupt("active hook effect of operation %q repeats hook %q's settled execution of call %q", opID, execution.hookID, execution.callID)
+					}
+					if execution.callID != "" && execution.requestID != "" {
+						return v.corrupt("active hook effect of operation %q binds both a request and a tool call", opID)
 					}
 				}
 			}
 			if op.State.ActiveEffect.Kind == EffectHook || op.State.ActiveEffect.Kind == EffectTool {
-				if status, ok := hookStatus[op.State.ActiveEffect.ToolCallID]; ok && status != hookSucceeded {
-					return v.corrupt("active %s effect of operation %q addresses call %q after its failed hook", op.State.ActiveEffect.Kind, opID, op.State.ActiveEffect.ToolCallID)
+				if op.State.ActiveEffect.ToolCallID != "" {
+					if status, ok := hookStatus[op.State.ActiveEffect.ToolCallID]; ok && status != hookSucceeded {
+						return v.corrupt("active %s effect of operation %q addresses call %q after its failed hook", op.State.ActiveEffect.Kind, opID, op.State.ActiveEffect.ToolCallID)
+					}
 				}
+			}
+			if op.State.ActiveEffect.Kind == EffectTool {
+				// A committed concrete tool intent names the accepted selection it
+				// will settle under: its contribution identities must reconcile
+				// completely and in entry order with the call's successful hook
+				// effects, entry-less pure identities informational.
+				if err := v.validateEvidenceHookOrder(op.State.ActiveEffect.ContributionIDs, successfulByCall[op.State.ActiveEffect.ToolCallID], graphEntry{}); err != nil {
+					return v.corrupt("active tool effect provenance of operation %q: %v", opID, err)
+				}
+			}
+			if op.State.ActiveEffect.Kind == EffectHook && op.State.ActiveEffect.RequestID == "" && op.State.ActiveEffect.ToolCallID == "" {
+				return v.corrupt("active hook effect of operation %q carries no binding", opID)
 			}
 		}
 	} else {
@@ -603,7 +635,7 @@ func (v *graphValidation) validateOperation(op *OperationRecord) error {
 			return v.corrupt("terminal operation %q terminal detail disagrees with its settlement entry", opID)
 		}
 	}
-	return nil
+	return v.collectRequestDomain(opID)
 }
 
 // collectPublishedCalls gathers the tool calls published by one operation's
@@ -674,30 +706,45 @@ func (v *graphValidation) collectToolResults(opID string, published []publishedC
 // an interrupted hook permits only the interrupted result, while a failed hook
 // permits the error or interrupted result (cancellation or recovery settles
 // the interrupted one); a running quiet gap before tool settlement stays valid
-// and recoverable. It returns the settled hook-execution set and each
-// executed call's last hook status for the active-effect checks.
-func (v *graphValidation) collectHookResults(opID string, published []publishedCall) (map[hookExecution]bool, map[string]hookResultStatus, error) {
+// and recoverable. The accepted tool selection — a settled tool result's
+// normalized arguments with its provenance, or a concrete tool effect's
+// committed contribution identities — reconciles with the call's committed
+// successful tool-bound hook results in entry order through the same
+// shared order rule as request evidence; a settlement without an accepted
+// selection (a quiet-gap recovery) carries nothing to reconcile and stays
+// valid. It returns the settled hook-execution set, each executed call's last
+// hook status, and each call's successful hook results for the active-effect
+// checks.
+func (v *graphValidation) collectHookResults(opID string, published []publishedCall) (map[hookExecution]bool, map[string]hookResultStatus, map[string][]graphEntry, error) {
 	byCall := make(map[string]*publishedCall, len(published))
 	for i := range published {
 		byCall[published[i].callID] = &published[i]
 	}
 	settled := make(map[hookExecution]bool, len(published))
 	lastStatus := make(map[string]hookResultStatus, len(published))
+	successfulByCall := make(map[string][]graphEntry, len(published))
 	for _, i := range v.entriesByOp[opID] {
 		entry := v.graph.Entries[i]
 		if entry.HookResult == nil {
 			continue
 		}
+		if entry.HookResult.RequestID != "" { // the request-bound family binds a request, never a tool call, and is checked in the request-domain pass
+			if _, repeat := settled[hookExecution{extensionID: entry.HookResult.ExtensionID, hookID: entry.HookResult.HookID, requestID: entry.HookResult.RequestID}]; repeat {
+				return nil, nil, nil, v.corrupt("request hook %q of extension %q executed request %q of operation %q twice", entry.HookResult.HookID, entry.HookResult.ExtensionID, entry.HookResult.RequestID, opID)
+			}
+			settled[hookExecution{extensionID: entry.HookResult.ExtensionID, hookID: entry.HookResult.HookID, requestID: entry.HookResult.RequestID}] = true
+			continue
+		}
 		call, ok := byCall[entry.HookResult.ToolCallID]
 		if !ok {
-			return nil, nil, v.corrupt("hook result %s executes unpublished call %q", entry.Envelope.ID, entry.HookResult.ToolCallID)
+			return nil, nil, nil, v.corrupt("hook result %s executes unpublished call %q", entry.Envelope.ID, entry.HookResult.ToolCallID)
 		}
 		publisher, ok := v.entryByID[call.assistantEntryID]
 		if !ok || entry.Envelope.Sequence <= publisher.Envelope.Sequence {
-			return nil, nil, v.corrupt("hook result %s for call %q does not follow its publishing assistant entry %s", entry.Envelope.ID, call.callID, call.assistantEntryID)
+			return nil, nil, nil, v.corrupt("hook result %s for call %q does not follow its publishing assistant entry %s", entry.Envelope.ID, call.callID, call.assistantEntryID)
 		}
 		if committed, ok := v.entryByID[call.reservedResultID]; ok && entry.Envelope.Sequence >= committed.Envelope.Sequence {
-			return nil, nil, v.corrupt("hook result %s for call %q follows that call's terminal tool result %s", entry.Envelope.ID, call.callID, committed.Envelope.ID)
+			return nil, nil, nil, v.corrupt("hook result %s for call %q follows that call's terminal tool result %s", entry.Envelope.ID, call.callID, committed.Envelope.ID)
 		}
 		// Historical first-pending ordering: a hook runs only while its call
 		// is the first pending call, so every earlier published call's
@@ -709,18 +756,36 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 			}
 			committed, ok := v.entryByID[earlier.reservedResultID]
 			if !ok || committed.Envelope.Sequence >= entry.Envelope.Sequence {
-				return nil, nil, v.corrupt("hook result %s for call %q runs before the terminal result of earlier call %q", entry.Envelope.ID, call.callID, earlier.callID)
+				return nil, nil, nil, v.corrupt("hook result %s for call %q runs before the terminal result of earlier call %q", entry.Envelope.ID, call.callID, earlier.callID)
 			}
 		}
 		if failed := lastStatus[call.callID]; failed != "" && failed != hookSucceeded {
-			return nil, nil, v.corrupt("hook result %s executes call %q after that call's %s hook result", entry.Envelope.ID, call.callID, failed)
+			return nil, nil, nil, v.corrupt("hook result %s executes call %q after that call's %s hook result", entry.Envelope.ID, call.callID, failed)
 		}
-		execution := hookExecution{hookID: entry.HookResult.HookID, callID: call.callID}
+		execution := hookExecution{extensionID: entry.HookResult.ExtensionID, hookID: entry.HookResult.HookID, callID: call.callID}
 		if settled[execution] {
-			return nil, nil, v.corrupt("hook %q executed call %q of operation %q twice", execution.hookID, execution.callID, opID)
+			return nil, nil, nil, v.corrupt("hook %q executed call %q of operation %q twice", execution.hookID, execution.callID, opID)
 		}
 		settled[execution] = true
 		lastStatus[call.callID] = entry.HookResult.Status
+		if entry.HookResult.Status == hookSucceeded {
+			successfulByCall[call.callID] = append(successfulByCall[call.callID], entry)
+		}
+	}
+	// The accepted tool selection reconciles with the call's successful hook
+	// effects through the shared complete-order rule: a settled tool result
+	// carrying accepted normalized arguments names them completely and in
+	// entry order, entry-less pure identities stay informational, and the
+	// failed or interrupted hook's own identity is not an accepted
+	// contribution. A settlement without an accepted selection invents none.
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.ToolResult == nil || len(entry.ToolResult.NormalizedArguments) == 0 {
+			continue
+		}
+		if err := v.validateEvidenceHookOrder(entry.ToolResult.HookIDs, successfulByCall[entry.ToolResult.ToolCallID], entry); err != nil {
+			return nil, nil, nil, v.corrupt("tool result %s for call %q: %v", entry.Envelope.ID, entry.ToolResult.ToolCallID, err)
+		}
 	}
 	// The tool result of a call whose hook chain failed must match the settled
 	// hook consequence; its absence is the valid running quiet gap recovery
@@ -736,15 +801,15 @@ func (v *graphValidation) collectHookResults(opID string, published []publishedC
 		switch status {
 		case hookInterrupted:
 			if committed.ToolResult.Status != model.ResultInterrupted {
-				return nil, nil, v.corrupt("call %q of operation %q settled %s after its interrupted hook result", callID, opID, committed.ToolResult.Status)
+				return nil, nil, nil, v.corrupt("call %q of operation %q settled %s after its interrupted hook result", callID, opID, committed.ToolResult.Status)
 			}
 		case hookFailed:
 			if committed.ToolResult.Status != model.ResultError && committed.ToolResult.Status != model.ResultInterrupted {
-				return nil, nil, v.corrupt("call %q of operation %q settled %s after its failed hook result", callID, opID, committed.ToolResult.Status)
+				return nil, nil, nil, v.corrupt("call %q of operation %q settled %s after its failed hook result", callID, opID, committed.ToolResult.Status)
 			}
 		}
 	}
-	return settled, lastStatus, nil
+	return settled, lastStatus, successfulByCall, nil
 }
 
 // validatePendingCalls verifies that a running operation's pending list is
@@ -834,6 +899,330 @@ func (v *graphValidation) validateUsage() error {
 	sortUsageTotals(sessionUsage.ByModel)
 	if !usageTotalsEqual(sessionUsage, v.graph.Session.State.Usage) {
 		return v.corrupt("usage totals of the Session disagree with its usage-bearing entries")
+	}
+	return nil
+}
+
+// requestAccounting is one operation's committed request domain: per request
+// identity, the ordered committed request-hook results and their statuses,
+// and the assistant that answered the request.
+type requestAccounting struct {
+	hookResults []graphEntry
+	hookFailed  bool
+	assistant   *graphEntry
+}
+
+func (r *requestAccounting) orderedResults() []graphEntry {
+	if r == nil {
+		return nil
+	}
+	return r.hookResults
+}
+
+// collectRequestDomain verifies the closed request-evidence rules of one
+// operation: every conversation assistant carries its producing request
+// identity and final effective request evidence with a request identity
+// unique per Operation; every evidence and consumed-input value references
+// the canonical projection actually consumed at its boundary — the checkpoint
+// names an in-session compaction entry and the boundary names a projectable
+// conversation entry (or that compaction entry for a summary-only
+// projection), each strictly before the record that carries it; committed
+// effectful hook identities occur completely and in committed sequence order
+// at each consumed and final boundary while entry-less pure identities stay
+// informational; a request-bound hook result precedes the assistant answering
+// the same request and stops that request's dispatch once it fails or is
+// interrupted; an active request-bound effect may not address an answered or
+// hook-failed request; the maintenance facts settle once on the checkpoint or
+// the settlement, never both, and every automatic maintenance record's
+// consumed evidence reconciles with the committed hook executions of the
+// consumed conversation request rather than the maintenance producer; and
+// the running request state names committed
+// result references of its own request in exact entry order. Recovery
+// validates this same domain before any recovery write copies evidence.
+func (v *graphValidation) collectRequestDomain(opID string) error {
+	requests := make(map[string]*requestAccounting)
+	automatic := false
+	if op, ok := v.opsByID[opID]; ok {
+		automatic = op.Admission.RequestKind == RequestKindMessage
+	}
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		if entry.HookResult == nil || entry.HookResult.RequestID == "" {
+			continue
+		}
+		requestID := entry.HookResult.RequestID
+		if requests[requestID] == nil {
+			requests[requestID] = &requestAccounting{}
+		}
+		requests[requestID].hookResults = append(requests[requestID].hookResults, entry)
+	}
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		switch {
+		case entry.HookResult != nil && entry.HookResult.RequestID != "":
+			result := entry.HookResult
+			req := requests[result.RequestID]
+			if req == nil {
+				req = &requestAccounting{}
+				requests[result.RequestID] = req
+			}
+			if req.assistant != nil {
+				return v.corrupt("hook result %s for request %q follows the assistant entry %s answering that request", entry.Envelope.ID, result.RequestID, req.assistant.Envelope.ID)
+			}
+			if req.hookFailed {
+				return v.corrupt("hook result %s executes request %q after its failed request hook result", entry.Envelope.ID, result.RequestID)
+			}
+			if result.Status != hookSucceeded {
+				req.hookFailed = true
+			}
+			if err := v.validateEvidenceRefs("hook result "+entry.Envelope.ID+" consumed view", result.InputEvidence, entry); err != nil {
+				return err
+			}
+			if err := v.validateEvidenceHookOrder(result.InputEvidence.HookIDs, req.hookResults, entry); err != nil {
+				return v.corrupt("hook result %s for request %q: %v", entry.Envelope.ID, result.RequestID, err)
+			}
+		case entry.Assistant != nil:
+			assistant := entry.Assistant
+			if assistant.RequestID == "" {
+				return v.corrupt("assistant entry %s carries no producing request identity", entry.Envelope.ID)
+			}
+			req := requests[assistant.RequestID]
+			if req == nil {
+				req = &requestAccounting{}
+				requests[assistant.RequestID] = req
+			}
+			if req.hookFailed {
+				return v.corrupt("assistant entry %s answers request %q after its failed request hook result", entry.Envelope.ID, assistant.RequestID)
+			}
+			if req.assistant != nil {
+				return v.corrupt("operation %q answers request %q with a second assistant entry %s", opID, assistant.RequestID, entry.Envelope.ID)
+			}
+			req.assistant = &entry
+			if err := v.validateEvidenceRefs("assistant entry "+entry.Envelope.ID+" evidence", assistant.Evidence, entry); err != nil {
+				return err
+			}
+			if err := v.validateEvidenceHookOrder(assistant.Evidence.HookIDs, req.hookResults, entry); err != nil {
+				return v.corrupt("assistant entry %s: %v", entry.Envelope.ID, err)
+			}
+		case entry.Settlement != nil:
+			settlement := entry.Settlement
+			if settlement.Evidence != nil {
+				if err := v.validateEvidenceRefs("settlement entry "+entry.Envelope.ID+" evidence", settlement.Evidence, entry); err != nil {
+					return err
+				}
+				orderKey := settlement.RequestID
+				if settlement.CompactionUsage {
+					// Any settlement of the maintenance procedure's own
+					// evidence — including an early opener failure that
+					// retained the consumed contribution evidence without
+					// any actual input — is reconciled with the committed
+					// hook executions of the conversation request whose
+					// view was consumed, never with the producer identity.
+					if automatic && settlement.ConsumedRequestID == "" {
+						return v.corrupt("maintenance settlement %s of operation %q names no consumed conversation request", entry.Envelope.ID, opID)
+					}
+					if settlement.ConsumedRequestID != "" {
+						orderKey = settlement.ConsumedRequestID
+					}
+				}
+				if err := v.validateEvidenceHookOrder(settlement.Evidence.HookIDs, requests[orderKey].orderedResults(), entry); err != nil {
+					return v.corrupt("settlement entry %s: %v", entry.Envelope.ID, err)
+				}
+			}
+		case entry.Compaction != nil:
+			if err := v.validateEvidenceRefs("compaction entry "+entry.Envelope.ID+" evidence", entry.Compaction.Evidence, entry); err != nil {
+				return err
+			}
+			orderKey := entry.Compaction.RequestID
+			if entry.Compaction.ConsumedRequestID != "" {
+				orderKey = entry.Compaction.ConsumedRequestID
+			} else if automatic {
+				return v.corrupt("automatic maintenance record %s of operation %q names no consumed conversation request", entry.Envelope.ID, opID)
+			}
+			if err := v.validateEvidenceHookOrder(entry.Compaction.Evidence.HookIDs, requests[orderKey].orderedResults(), entry); err != nil {
+				return v.corrupt("compaction entry %s: %v", entry.Envelope.ID, err)
+			}
+		}
+	}
+	maintenanceProducers := make(map[string]string)
+	for _, i := range v.entriesByOp[opID] {
+		entry := v.graph.Entries[i]
+		producerID := ""
+		if entry.Compaction != nil && entry.Compaction.Input != nil {
+			producerID = entry.Compaction.RequestID
+		} else if entry.Settlement != nil && entry.Settlement.Input != nil {
+			producerID = entry.Settlement.RequestID
+		}
+		if producerID != "" {
+			if previous, exists := maintenanceProducers[producerID]; exists {
+				return v.corrupt("operation %q settles maintenance producer %q on both entries %s and %s", opID, producerID, previous, entry.Envelope.ID)
+			}
+			maintenanceProducers[producerID] = entry.Envelope.ID
+		}
+	}
+	op, ok := v.opsByID[opID]
+	if !ok {
+		return nil
+	}
+	// Request-bound active effects stay inside the same domain: a live request
+	// identity may not already be answered by a committed assistant of this
+	// Operation, and no model or request-hook effect may dispatch for a
+	// request whose hook chain already failed. An undispatched interrupted
+	// request needs no assistant response: its settlement and retained hook
+	// results witness it.
+	if effect := op.State.ActiveEffect; effect != nil && effect.RequestID != "" {
+		req := requests[effect.RequestID]
+		if req != nil && req.assistant != nil {
+			return v.corrupt("active %s effect of operation %q answers request %q already answered by assistant entry %s", effect.Kind, opID, effect.RequestID, req.assistant.Envelope.ID)
+		}
+		if req != nil && req.hookFailed {
+			return v.corrupt("active %s effect of operation %q dispatches request %q after its failed request hook result", effect.Kind, opID, effect.RequestID)
+		}
+		if effect.Evidence != nil {
+			if effect.Kind == EffectHook {
+				for _, identity := range effect.Evidence.HookIDs {
+					if identity.ExtensionID == effect.ExtensionID && identity.HookID == effect.HookID {
+						return v.corrupt("active request hook %q names itself in its consumed provenance", effect.HookID)
+					}
+				}
+			}
+			if err := v.validateActiveEvidenceRefs(effect.Evidence); err != nil {
+				return err
+			}
+			if err := v.validateEvidenceHookOrder(effect.Evidence.HookIDs, req.orderedResults(), graphEntry{}); err != nil {
+				return v.corrupt("active effect evidence of operation %q: %v", opID, err)
+			}
+		}
+	}
+	return v.validateRunningRequestState(op, requests)
+}
+
+// validateActiveEvidenceRefs resolves an active effect's evidence against the
+// committed graph before any recovery copies it: the same reference rules as
+// committed consumers, with the active record's own sequence unknown, so
+// references must resolve to committed entries only.
+func (v *graphValidation) validateActiveEvidenceRefs(evidence *RequestEvidence) error {
+	return v.validateEvidenceRefs("active effect evidence", evidence, graphEntry{})
+}
+
+// validateEvidenceRefs enforces one evidence value's canonical references
+// against the graph: the checkpoint names an in-session compaction entry and
+// the boundary names a projectable conversation entry — never a hook result
+// or settlement — each strictly before the carrying record. The boundary
+// reference is required on every recorded evidence value. A zero-sequence
+// owner (an in-flight active effect) is checked against committed entries
+// only.
+func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvidence, owner graphEntry) error {
+	if evidence == nil {
+		return v.corrupt("%s carries no evidence", what)
+	}
+	if evidence.BoundaryEntryID == "" {
+		return v.corrupt("%s carries no canonical boundary reference", what)
+	}
+	boundary, ok := v.entryByID[evidence.BoundaryEntryID]
+	if !ok {
+		return v.corrupt("%s references boundary entry %q outside the Session", what, evidence.BoundaryEntryID)
+	}
+	if !conversationBearingEntryKind(boundary) {
+		return v.corrupt("%s references boundary entry %s of non-canonical kind %s", what, boundary.Envelope.ID, boundary.Envelope.Kind)
+	}
+	if owner.Envelope.Sequence != 0 && boundary.Envelope.Sequence >= owner.Envelope.Sequence {
+		return v.corrupt("%s references boundary entry %s at or after its own sequence", what, boundary.Envelope.ID)
+	}
+	if evidence.CheckpointEntryID != "" {
+		checkpoint, ok := v.entryByID[evidence.CheckpointEntryID]
+		if !ok || checkpoint.Compaction == nil {
+			return v.corrupt("%s checkpoint reference %q names no in-session compaction entry", what, evidence.CheckpointEntryID)
+		}
+		// A consumed pair names the projection actually frozen for it: the
+		// boundary is the checkpoint itself (a summary-only projection) or a
+		// canonical tail at or after it, never an entry the checkpoint already
+		// covered.
+		if boundary.Envelope.Sequence < checkpoint.Envelope.Sequence {
+			return v.corrupt("%s references boundary entry %s before its checkpoint entry %s", what, boundary.Envelope.ID, checkpoint.Envelope.ID)
+		}
+		if owner.Envelope.Sequence != 0 && checkpoint.Envelope.Sequence >= owner.Envelope.Sequence {
+			return v.corrupt("%s references checkpoint entry %s at or after its own sequence", what, checkpoint.Envelope.ID)
+		}
+	}
+	return nil
+}
+
+// conversationBearingEntryKind reports whether one committed entry projects
+// into the canonical conversation view a request consumes.
+func conversationBearingEntryKind(entry graphEntry) bool {
+	return entry.Input != nil || entry.Assistant != nil || entry.ToolResult != nil || entry.Signal != nil || entry.Compaction != nil
+}
+
+// validateEvidenceHookOrder reconciles one evidence value's recorded hook
+// identities against the committed request-hook results in entry order: every
+// result-backed identity must occur completely and in committed order, and no
+// identity may name a result at or after the consuming record. Entry-less
+// pure identities stay informational: they may interleave or net-disappear.
+func (v *graphValidation) validateEvidenceHookOrder(identities []HookIdentity, committedResults []graphEntry, owner graphEntry) error {
+	limit := len(committedResults)
+	if owner.Envelope.Sequence != 0 {
+		for i, entry := range committedResults {
+			if entry.Envelope.Sequence >= owner.Envelope.Sequence {
+				limit = i
+				break
+			}
+		}
+	}
+	next := 0
+	for _, identity := range identities {
+		for i := range committedResults {
+			result := committedResults[i].HookResult
+			if result.ExtensionID == identity.ExtensionID && result.HookID == identity.HookID {
+				if i >= limit {
+					return fmt.Errorf("names committed hook result %s at or after its own sequence", committedResults[i].Envelope.ID)
+				}
+				if i != next {
+					return fmt.Errorf("names committed hook result %s out of order", committedResults[i].Envelope.ID)
+				}
+				next++
+				break
+			}
+		}
+	}
+	if next != limit {
+		return fmt.Errorf("omits committed hook result %s from consumed provenance", committedResults[next].Envelope.ID)
+	}
+	return nil
+}
+
+// validateRunningRequestState enforces the one suspended conversation request
+// state: its checkpoint reference coheres with the Session's current
+// compaction entry, its boundary reference resolves to a projectable
+// conversation entry of this Session, and its hook-result references equal
+// the request's committed request-hook result entries in exact commit order.
+func (v *graphValidation) validateRunningRequestState(op *OperationRecord, requests map[string]*requestAccounting) error {
+	state := op.State.Request
+	if state == nil {
+		return nil
+	}
+	opID := op.Admission.OperationID
+	if v.graph.Session.State.CompactionEntryID != state.CheckpointEntryID {
+		return v.corrupt("running request state of operation %q carries a checkpoint reference foreign to the Session's current compaction entry", opID)
+	}
+	if err := v.validateEvidenceRefs(fmt.Sprintf("running request state of operation %q", opID), &RequestEvidence{
+		CheckpointEntryID: state.CheckpointEntryID,
+		BoundaryEntryID:   state.BoundaryEntryID,
+	}, graphEntry{}); err != nil {
+		return err
+	}
+	req := requests[state.RequestID]
+	committed := req.orderedResults()
+	if len(committed) != len(state.HookResults) {
+		return v.corrupt("running request state of operation %q records %d hook results for %d committed", opID, len(state.HookResults), len(committed))
+	}
+	for i, ref := range state.HookResults {
+		if ref.SessionID != v.sessionID {
+			return v.corrupt("running request state of operation %q references hook result %s through a foreign session id", opID, ref.EntryID)
+		}
+		if committed[i].Envelope.ID != ref.EntryID {
+			return v.corrupt("running request state of operation %q references hook results out of committed entry order", opID)
+		}
 	}
 	return nil
 }

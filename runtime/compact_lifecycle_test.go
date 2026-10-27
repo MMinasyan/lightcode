@@ -307,10 +307,13 @@ func compactRawOperationRegister(admission, state string) string {
 	return fmt.Sprintf(`{"admission":%s,"state":%s}`, admission, state)
 }
 
-func compactRawRunningModelState(now, reserved string) string {
+func compactRawRunningModelState(now, reserved, boundary string) string {
 	return fmt.Sprintf(
-		`{"status":"running","started_at":%q,"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}`,
-		now, reserved)
+		`{"status":"running","started_at":%q,`+
+			`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live-%s","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}},`+
+			`"running_request":{"request_id":"request-live-%s","boundary_entry_id":%q,"hook_results":[]},`+
+			`"pending_tool_calls":[],"usage":{"by_model":[]}}`,
+		now, reserved, reserved, boundary, reserved, boundary)
 }
 
 func compactRawSuccessState(now, settlementEntry, sessionID, usage string) string {
@@ -325,11 +328,11 @@ func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) 
 		sessionID, entryID, operationID, origin, text)
 }
 
-func compactRawAssistantEntry(sessionID, entryID, operationID, text string) string {
+func compactRawAssistantEntry(sessionID, entryID, operationID, boundaryID, text string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
-		sessionID, entryID, operationID, text)
+			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, text, "request-a-"+entryID, boundaryID)
 }
 
 func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) string {
@@ -341,8 +344,8 @@ func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) st
 func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"m"},"configuration_revision":"rev-1"}`,
-		sessionID, entryID, operationID, summary, boundaryID)
+			`"model":{"provider":"prov","model":"m"},"configuration_revision":"rev-1","request_id":%q,"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}`,
+		sessionID, entryID, operationID, summary, boundaryID, "maintainer-"+entryID, "request-"+operationID, boundaryID)
 }
 
 // compactRawSuccessOperation seeds one settled success message Operation:
@@ -355,7 +358,7 @@ func compactRawSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inputID, assistantID, settlementID := newLifecycleID(t), newLifecycleID(t), newLifecycleID(t)
 	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, "user", inputText))
-	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, assistantText))
+	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, inputID, assistantText))
 	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID, ""))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
 		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID, `{"by_model":[]}`)))

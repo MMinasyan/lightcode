@@ -1518,10 +1518,11 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		entries, err := store.ReadEntries(context.Background(), session, 0)
 		testassert.NoError(t, err)
 		type hookWire struct {
-			HookID     string          `json:"hook_id"`
-			ToolCallID string          `json:"tool_call_id"`
-			Status     string          `json:"status"`
-			Arguments  json.RawMessage `json:"arguments"`
+			HookID      string          `json:"hook_id"`
+			ExtensionID string          `json:"extension_id"`
+			ToolCallID  string          `json:"tool_call_id"`
+			Status      string          `json:"status"`
+			Arguments   json.RawMessage `json:"arguments"`
 		}
 		var hookResults []hookWire
 		for _, entry := range entries {
@@ -1533,10 +1534,11 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 			hookResults = append(hookResults, wire)
 		}
 		wantIDs := []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"}
+		wantExtensions := []string{"hooks", "caps", "ops", "ags"} // the owning plugin identity of each scope's hook
 		testassert.Require(t, len(hookResults) == len(wantIDs), "committed hook results = %+v, want one per argument hook", hookResults)
 		for i, want := range wantIDs {
 			got := hookResults[i]
-			testassert.Require(t, got.HookID == want && got.ToolCallID == "call-1" && got.Status == "success", "hook result %d = %+v, want hook %q succeeding for call-1", i, got, want)
+			testassert.Require(t, got.HookID == want && got.ExtensionID == wantExtensions[i] && got.ToolCallID == "call-1" && got.Status == "success", "hook result %d = %+v, want hook %q from plugin %q succeeding for call-1", i, got, want, wantExtensions[i])
 		}
 		testassert.Require(t, string(hookResults[3].Arguments) == `{"repaired":"arg.agent"}`, "last committed arguments = %s, want the final hook's replacement", hookResults[3].Arguments)
 

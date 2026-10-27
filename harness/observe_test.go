@@ -113,7 +113,7 @@ func TestObserveFactKinds(t *testing.T) {
 	h, _, c, sessionID := newEffectHarness(t, modelFn)
 	col := observeHarness(h)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
@@ -568,7 +568,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		col := observeHarness(h)
 		base := snapshotPair(t, h, sessionID)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		before := snapshotPair(t, h, sessionID)
@@ -581,7 +581,11 @@ func TestObserveDurableAdvances(t *testing.T) {
 		col.reset()
 		compactionBase := snapshotPair(t, h, sessionID)
 		{
-			err := h.commitCompaction(c, testOpID, testCapture(), "summary", 1, nil, false)
+			canonical, _, _, cErr := h.projectCanonical(c, testOpID)
+			testassert.NoError(t, cErr)
+			err := h.commitCompaction(c, testOpID, testCapture(), hexID(8),
+				&maintenanceFacts{input: cloneRequestMessages(canonical), consumed: RequestEvidence{}},
+				"summary", 1, nil, false)
 			testassert.NoError(t, err)
 		}
 		facts := col.invalidations()
@@ -697,7 +701,7 @@ func TestObserveIntentOnly(t *testing.T) {
 		go func() {
 			defer close(done)
 			{
-				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(script.model, nil), invocationExecution(script.model, nil), testCapture()), defaultModelRequest(t), nil)
+				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(script.model, nil), invocationExecution(script.model, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 				testassert.Check(t, err == nil, "model effect: %v", err)
 			}
 		}()
@@ -716,7 +720,7 @@ func TestObserveIntentOnly(t *testing.T) {
 		}
 		h, _, c, _ := newEffectHarness(t, modelFn)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		executeStarted := make(chan struct{})
@@ -1191,7 +1195,7 @@ func TestObserveStreamFilter(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, modelFn)
 		observeHarness(h)
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 		testassert.Equal(t, stream.closes, 1)
@@ -1218,7 +1222,7 @@ func TestObserveCompactAttribution(t *testing.T) {
 	col := observeHarness(h)
 	exec := effectExecution(compactFn, nil)
 	var reported *UsageCount
-	effect := h.compactModelEffect(c, testOpID, invocationExecution(compactFn, nil), exec.Retry, testCapture(), &reported)
+	effect := h.compactModelEffect(c, testOpID, invocationExecution(compactFn, nil), exec.Retry, testCapture(), hexID(8), &maintenanceFacts{}, nil, &reported)
 	{
 		_, err := invokeModelEffect(t, effect, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
@@ -1250,7 +1254,7 @@ func TestObserveRefusalFacts(t *testing.T) {
 	h, _, c, sessionID := newEffectHarness(t, modelFn)
 	col := observeHarness(h)
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
 	}
 	var refusals []HarnessFact
@@ -1289,7 +1293,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 		t.Helper()
 		modelFn := func(context.Context, model.Request) (model.Stream, error) { return stream, nil }
 		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture()), defaultModelRequest(t), nil)
+			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
 			testassert.NoError(t, err)
 		}
 	}
@@ -1414,7 +1418,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 		toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
-		hooks := []ToolArgumentsHook{{ID: "h1", Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
+		hooks := []ToolArgumentsHook{{ID: "h1", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
 			return nil, errors.New("hook boom")
 		}}}
 		exec := Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {

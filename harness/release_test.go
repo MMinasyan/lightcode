@@ -518,7 +518,7 @@ func TestAdoptedReservationReleasesOnceAfterClose(t *testing.T) {
 		cancel() // the execution context is lost before the opener could start
 		{
 			err := executeDirect(h, c, h.ctx, "op-1", adopted)
-			testassert.Require(t, errors.Is(err, context.Canceled), "executeDirect = %v, want the context error", err)
+			testassert.Require(t, err == nil, "executeDirect = %v, want the entry interruption settled with no run error", err)
 		}
 		testassert.Equal(t, opens, 0)
 		testassert.Equal(t, counters.releases.Load(), int64(1)) // skipped Open still releases the adopted reservation
