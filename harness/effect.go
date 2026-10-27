@@ -1275,10 +1275,12 @@ func authorizationRequired(p PreparedTool) bool {
 // file.write pair; any configured write_dir confines every file.write pair to
 // the prepared canonical write directory through Rel containment
 // independently of permission allow, requiring its canonical root as a second
-// required canonical; and only a plan whose every declared pair allows under
-// the fixed evaluator against the prepared canonical Workspace root is
-// allowed.
-func toolCallAllowed(policy PermissionPolicy, capture ExecutionCapture, plan PreparedTool) bool {
+// required canonical. Constraints and target preparation are never
+// delegated. Only then does the evaluator decide the complete prepared
+// action, and the plan is allowed exactly when it returns allow without
+// error: a deny, a decision outside the closed set, or an error denies the
+// call alike. A nil evaluator selects the included built-in policy.
+func toolCallAllowed(ctx context.Context, evaluator PermissionEvaluator, capture ExecutionCapture, plan PreparedTool) bool {
 	if len(plan.Permissions) == 0 {
 		return false
 	}
@@ -1315,7 +1317,15 @@ func toolCallAllowed(policy PermissionPolicy, capture ExecutionCapture, plan Pre
 			}
 		}
 	}
-	return policy.callAllowed(plan.CanonicalWorkspace, plan.Permissions)
+	if evaluator == nil {
+		evaluator = PermissionPolicy{}
+	}
+	decision, err := evaluator.Evaluate(ctx, PreparedAction{
+		CanonicalWorkspace: plan.CanonicalWorkspace,
+		CanonicalWriteDir:  plan.CanonicalWriteDir,
+		Permissions:        append([]PermissionRequest(nil), plan.Permissions...),
+	})
+	return err == nil && decision == PermissionAllow
 }
 
 // canonicalPathValue reports whether one prepared canonical target or root is
@@ -1507,7 +1517,7 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 		if !validToolPlan(plan) {
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: invalidToolResult(call.ID)}, nil, false, selection, ExecutionNotStarted, false)
 		}
-		if authorizationRequired(plan) && !toolCallAllowed(exec.Permissions, capture, plan) {
+		if authorizationRequired(plan) && !toolCallAllowed(ctx, exec.Permissions, capture, plan) {
 			return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: permissionDeniedToolResult(call.ID)}, nil, false, selection, ExecutionNotStarted, false)
 		}
 		if plan.Immediate != nil {

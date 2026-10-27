@@ -260,14 +260,13 @@ type InvocationExecution struct {
 
 // Execution is one opened execution: the required invocation opener the
 // Harness drives once per Engine call, the Operation's retry classifier and
-// resolved automatic permission policy, plus the cleanup of the Operation
-// resources backing them. OpenInvocation must be non-nil; it opens the
-// conversation run's invocation and a distinct maintenance invocation per
-// strategy model request, each with its own opened resources and Close. A nil
-// Retry selects the private standard retry classifier; the zero
-// PermissionPolicy is the built-in policy; Close is optional when the concrete
-// execution needs no external disposal. The opener owns provisional cleanup
-// on error.
+// permission evaluator, plus the cleanup of the Operation resources backing
+// them. OpenInvocation must be non-nil; it opens the conversation run's
+// invocation and a distinct maintenance invocation per strategy model
+// request, each with its own opened resources and Close. A nil Retry selects
+// the private standard retry classifier; a nil Permissions evaluator selects
+// the built-in policy; Close is optional when the concrete execution needs no
+// external disposal. The opener owns provisional cleanup on error.
 type Execution struct {
 	// OpenInvocation opens one Engine invocation's callback contracts over
 	// the Harness-issued request. Successful opening transfers the invoked
@@ -277,10 +276,11 @@ type Execution struct {
 	// Retry classifies one failed physical attempt for the next-attempt
 	// decision. Nil selects the private standard classifier.
 	Retry RetryPolicy
-	// Permissions is the automatic policy resolved for this Operation from the
-	// same immutable configuration revision its capture records. The zero
-	// PermissionPolicy is the built-in policy.
-	Permissions PermissionPolicy
+	// Permissions is the permission evaluator deciding this Operation's
+	// prepared calls, resolved from the same immutable configuration
+	// revision its capture records. Nil selects the included built-in
+	// policy (the zero PermissionPolicy).
+	Permissions PermissionEvaluator
 	Close       func() error
 }
 

@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -38,6 +39,34 @@ type PermissionRequest struct {
 	Target     string
 }
 
+// PermissionDecision is the closed decision of one evaluated prepared
+// action: allow or deny. Any other value is outside the closed set and
+// settles as denial.
+type PermissionDecision string
+
+const (
+	PermissionAllow PermissionDecision = "allow"
+	PermissionDeny  PermissionDecision = "deny"
+)
+
+// PreparedAction is one prepared call handed to a PermissionEvaluator: the
+// actual prepared canonical Workspace root and write root, plus the complete
+// ordered permission/target pairs as an evaluator-owned copy.
+type PreparedAction struct {
+	CanonicalWorkspace string
+	CanonicalWriteDir  string
+	Permissions        []PermissionRequest
+}
+
+// PermissionEvaluator decides one PreparedAction at the Harness permission
+// boundary. Allow runs the call; every other outcome — deny, a decision
+// outside the closed set, or an error — settles the ordinary permission
+// denial without running the effect. Constraint checks and target
+// preparation stay inside the Harness and are never delegated.
+type PermissionEvaluator interface {
+	Evaluate(context.Context, PreparedAction) (PermissionDecision, error)
+}
+
 // permissionRule is one compiled rule of a parsed policy level. The glob is
 // matched against the complete canonical target.
 type permissionRule struct {
@@ -57,8 +86,9 @@ type permissionLevel struct {
 
 // PermissionPolicy is the resolved automatic permission policy: the parsed
 // global and Workspace levels, evaluated against the fixed built-in policy.
-// It has no public mutation, no replaceable evaluator, and no plugin
-// contribution point. The zero PermissionPolicy is the built-in policy.
+// It has no public mutation and no plugin contribution point. The zero
+// PermissionPolicy is the built-in policy; it is the included
+// PermissionEvaluator, and a nil evaluator selects it.
 type PermissionPolicy struct {
 	global    permissionLevel
 	workspace permissionLevel
@@ -104,6 +134,16 @@ func (p PermissionPolicy) callAllowed(canonicalRoot string, requests []Permissio
 		}
 	}
 	return true
+}
+
+// Evaluate adapts the resolved policy to the PermissionEvaluator contract:
+// the prepared action is allowed exactly when every one of its declared
+// permission/target pairs allows. It never errors.
+func (p PermissionPolicy) Evaluate(_ context.Context, action PreparedAction) (PermissionDecision, error) {
+	if p.callAllowed(action.CanonicalWorkspace, action.Permissions) {
+		return PermissionAllow, nil
+	}
+	return PermissionDeny, nil
 }
 
 // decide returns the level's answer for one request and whether the level

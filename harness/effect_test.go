@@ -1398,7 +1398,11 @@ func TestToolEffectPlansAndOutcomes(t *testing.T) {
 // with no write_dir denies every file.write pair, any configured write_dir
 // confines file.write to the prepared canonical write directory
 // independently of permission allow, non-file permissions need no canonical
-// binding, and one denied pair denies the whole call.
+// binding, and one denied pair denies the whole call. A supplied evaluator
+// receives the complete prepared action and allow runs the call while deny,
+// an error and a decision outside the closed set settle the same denial; the
+// constraints are decided before the evaluator and cannot be delegated away;
+// a nil evaluator selects the included built-in policy.
 func TestToolEffectPermissionBoundary(t *testing.T) {
 	allowAllWrites := ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.write","target":"*","access":"allow"}]}`), nil)
 	filePlanRoots := func(workspace, writeDir string, permissions ...PermissionRequest) func(_ context.Context, call model.ToolCall) PreparedTool {
@@ -1424,11 +1428,13 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 	cases := []struct {
 		name         string
 		capture      ExecutionCapture
-		policy       PermissionPolicy
+		evaluator    PermissionEvaluator // nil selects the included built-in policy
 		plan         func(_ context.Context, call model.ToolCall) PreparedTool
 		wantContent  string
 		wantDenied   bool
 		wantExecuted bool
+		wantCalls    int // recorded evaluator calls, asserted for recording evaluators
+		wantAction   *PreparedAction
 	}{
 		{
 			name:        "file.read inside the canonical Workspace is allowed",
@@ -1447,7 +1453,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		},
 		{
 			name:        "an explicit user rule allows a file.read target outside the canonical Workspace",
-			policy:      ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.read","target":"*","access":"allow"}]}`), nil),
+			evaluator:   ResolvePermissionPolicy(json.RawMessage(`{"rules":[{"permission":"file.read","target":"*","access":"allow"}]}`), nil),
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/other/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
@@ -1491,14 +1497,14 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		{
 			name:        "a relative canonical write root is denied",
 			capture:     captureWith("/w/sub", false),
-			policy:      allowAllWrites,
+			evaluator:   allowAllWrites,
 			plan:        filePlanRoots("/w", "sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
 			name:        "a lexically unclean canonical write root is denied",
 			capture:     captureWith("/w/sub", false),
-			policy:      allowAllWrites,
+			evaluator:   allowAllWrites,
 			plan:        filePlanRoots("/w", "/w/sub/../sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
@@ -1523,14 +1529,14 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		{
 			name:        "write_dir denies file.write outside it even when policy allows",
 			capture:     captureWith("/w/sub", false),
-			policy:      allowAllWrites,
+			evaluator:   allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/other.txt"}),
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
 		{
-			name:    "configured write_dir without a canonical prepared write root is denied",
-			capture: captureWith("/w/sub", false),
-			policy:  allowAllWrites,
+			name:      "configured write_dir without a canonical prepared write root is denied",
+			capture:   captureWith("/w/sub", false),
+			evaluator: allowAllWrites,
 			plan: func(_ context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{
 					Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}},
@@ -1545,7 +1551,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		{
 			name:        "readonly with write_dir allows confined writes",
 			capture:     captureWith("/w/sub", true),
-			policy:      allowAllWrites,
+			evaluator:   allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/a.txt"}),
 			wantContent: "ran", wantExecuted: true,
 		},
@@ -1558,7 +1564,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 		{
 			name:        "an explicit user rule overrides the sensitive denial inside write_dir",
 			capture:     captureWith("/w/sub", false),
-			policy:      allowAllWrites,
+			evaluator:   allowAllWrites,
 			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/.env"}),
 			wantContent: "ran", wantExecuted: true,
 		},
@@ -1626,6 +1632,77 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 			},
 			wantContent: PermissionDeniedContent, wantDenied: true,
 		},
+		{
+			name:      "supplied evaluator receives the complete prepared action and allows",
+			evaluator: &recordingEvaluator{decision: PermissionAllow},
+			plan:      filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantAction: &PreparedAction{
+				CanonicalWorkspace: "/w",
+				CanonicalWriteDir:  "/w/sub",
+				Permissions:        []PermissionRequest{{Permission: PermissionFileRead, Target: "/w/a.txt"}},
+			},
+			wantContent: "ran", wantExecuted: true, wantCalls: 1,
+		},
+		{
+			name:        "supplied deny settles the ordinary denial without execution",
+			evaluator:   &recordingEvaluator{decision: PermissionDeny},
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true, wantCalls: 1,
+		},
+		{
+			name:        "evaluator error alongside an allow decision settles the ordinary denial without execution",
+			evaluator:   &recordingEvaluator{decision: PermissionAllow, err: errors.New("evaluator failure")},
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true, wantCalls: 1,
+		},
+		{
+			name:        "decision outside the closed set settles the ordinary denial without execution",
+			evaluator:   &recordingEvaluator{decision: PermissionDecision("maybe")},
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true, wantCalls: 1,
+		},
+		{
+			name:        "always-allow evaluator cannot delegate the readonly constraint",
+			capture:     captureWith("", true),
+			evaluator:   &recordingEvaluator{decision: PermissionAllow},
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileWrite, Target: "/w/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true, wantCalls: 0,
+		},
+		{
+			name:        "always-allow evaluator cannot delegate write_dir confinement",
+			capture:     captureWith("/w/sub", false),
+			evaluator:   &recordingEvaluator{decision: PermissionAllow},
+			plan:        filePlanRoots("/w", "/w/sub", PermissionRequest{Permission: PermissionFileWrite, Target: "/w/other.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true, wantCalls: 0,
+		},
+		{
+			name:      "multi-target plan reaches the evaluator as one complete action",
+			capture:   captureWith("/w/sub", false),
+			evaluator: &recordingEvaluator{decision: PermissionAllow},
+			plan: filePlanRoots("/w", "/w/sub",
+				PermissionRequest{Permission: PermissionFileRead, Target: "/w/src.txt"},
+				PermissionRequest{Permission: PermissionFileWrite, Target: "/w/sub/dst.txt"},
+			),
+			wantAction: &PreparedAction{
+				CanonicalWorkspace: "/w",
+				CanonicalWriteDir:  "/w/sub",
+				Permissions: []PermissionRequest{
+					{Permission: PermissionFileRead, Target: "/w/src.txt"},
+					{Permission: PermissionFileWrite, Target: "/w/sub/dst.txt"},
+				},
+			},
+			wantContent: "ran", wantExecuted: true, wantCalls: 1,
+		},
+		{
+			name:        "nil evaluator allows what the built-in policy allows",
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/w/a.txt"}),
+			wantContent: "ran", wantExecuted: true,
+		},
+		{
+			name:        "nil evaluator denies what the built-in policy denies",
+			plan:        filePlan(PermissionRequest{Permission: PermissionFileRead, Target: "/other/a.txt"}),
+			wantContent: PermissionDeniedContent, wantDenied: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1648,7 +1725,7 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 				}
 				return inner
 			}
-			got, err := h.toolEffect(c, testOpID, Execution{Permissions: tc.policy}, InvocationExecution{Tool: plan, NormalizeTool: objectNormalize}, capture)(context.Background(), testToolCall("call-1"), []string{"echo"})
+			got, err := h.toolEffect(c, testOpID, Execution{Permissions: tc.evaluator}, InvocationExecution{Tool: plan, NormalizeTool: objectNormalize}, capture)(context.Background(), testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
 			wantStatus := model.ResultSuccess
 			if tc.wantDenied {
@@ -1656,6 +1733,12 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 			}
 			testassert.Require(t, got.Status == wantStatus && got.Content == tc.wantContent, "committed result = %+v, want status %s content %q", got, wantStatus, tc.wantContent)
 			testassert.Require(t, tc.wantExecuted == (executions == 1) && executions <= 1, "executor ran %d times, want executed=%v", executions, tc.wantExecuted)
+			if rec, ok := tc.evaluator.(*recordingEvaluator); ok {
+				testassert.Require(t, len(rec.actions) == tc.wantCalls, "evaluator saw %d actions, want %d", len(rec.actions), tc.wantCalls)
+				if tc.wantAction != nil {
+					testassert.Require(t, len(rec.actions) == 1 && reflect.DeepEqual(rec.actions[0], *tc.wantAction), "evaluator action = %+v, want %+v", rec.actions, *tc.wantAction)
+				}
+			}
 			graph, err := validateFixture(t, store, sessionID)
 			testassert.NoError(t, err)
 			for _, entry := range graph.Entries {
@@ -1665,6 +1748,38 @@ func TestToolEffectPermissionBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// recordingEvaluator is one scripted PermissionEvaluator: it records every
+// received PreparedAction in order and answers with its scripted decision and
+// error.
+type recordingEvaluator struct {
+	decision PermissionDecision
+	err      error
+	actions  []PreparedAction
+}
+
+func (r *recordingEvaluator) Evaluate(_ context.Context, action PreparedAction) (PermissionDecision, error) {
+	r.actions = append(r.actions, action)
+	return r.decision, r.err
+}
+
+// TestPermissionPolicyEvaluatorAdapter proves the included evaluator adapter
+// mirrors callAllowed: the zero policy allows an in-Workspace file.read pair
+// and denies a sensitive basename.
+func TestPermissionPolicyEvaluatorAdapter(t *testing.T) {
+	allow, err := PermissionPolicy{}.Evaluate(context.Background(), PreparedAction{
+		CanonicalWorkspace: "/w",
+		Permissions:        []PermissionRequest{{Permission: PermissionFileRead, Target: "/w/a.txt"}},
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, allow == PermissionAllow, "in-Workspace file.read decision = %q, want allow", allow)
+	deny, err := PermissionPolicy{}.Evaluate(context.Background(), PreparedAction{
+		CanonicalWorkspace: "/w",
+		Permissions:        []PermissionRequest{{Permission: PermissionFileWrite, Target: "/w/.env"}},
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, deny == PermissionDeny, "sensitive basename decision = %q, want deny", deny)
 }
 
 // TestToolEffectDeniedSettlesOnlyItsCall proves the denial settlement scope:
