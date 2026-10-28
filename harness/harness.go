@@ -284,8 +284,8 @@ type Execution struct {
 	// Strategy is the selected context strategy binding of this Operation,
 	// resolved from the same immutable configuration revision its capture
 	// records. Nil selects the included summary policy binding.
-	Strategy  *StrategyBinding
-	Close     func() error
+	Strategy *StrategyBinding
+	Close    func() error
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible

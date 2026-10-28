@@ -150,8 +150,8 @@ func TestSessionReadViewCostEstimates(t *testing.T) {
 			// The fixture's first assistant reports no usage: op1 is unknown
 			// even though its second assistant and the compact fact are known,
 			// and the Session sum is never presented as a partial-known total.
-			mutate:  func(*testGraph) {},
-			wantOp:  map[string]*float64{testOpID: nil, "op-compact": ptrUSD(7e-6)},
+			mutate:      func(*testGraph) {},
+			wantOp:      map[string]*float64{testOpID: nil, "op-compact": ptrUSD(7e-6)},
 			wantSession: nil,
 		},
 		{

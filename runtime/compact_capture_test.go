@@ -153,14 +153,14 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 	m2Pricing := &harness.ModelPricing{Input: fpr(0.5), Output: fpr(1), CacheRead: fpr(0.125), CacheWrite: fpr(0.0625)}
 
 	cases := []struct {
-		name              string
-		agentsDoc         string
-		agent             string
-		wantModel         model.ModelRef
-		wantWindow        int
-		wantReserve       int
-		wantCompactRef    model.ModelRef
-		wantPricing       *harness.ModelPricing
+		name               string
+		agentsDoc          string
+		agent              string
+		wantModel          model.ModelRef
+		wantWindow         int
+		wantReserve        int
+		wantCompactRef     model.ModelRef
+		wantPricing        *harness.ModelPricing
 		wantCompactPricing *harness.ModelPricing
 	}{
 		{

@@ -261,9 +261,9 @@ func TestReviewNoneAfterModelWork(t *testing.T) {
 // settlement.
 func TestReviewEarlyFailuresSettleWithProducerWitness(t *testing.T) {
 	rows := []struct {
-		name    string
+		name     string
 		strategy ContextStrategy
-		detail  string
+		detail   string
 	}{
 		{"plan error before any model plan", errStrategy{cause: errors.New("strategy plan exploded")}, "strategy plan exploded"},
 		{"malformed initial plan", malformedStrategy{}, "model plan requires exactly its model variant"},

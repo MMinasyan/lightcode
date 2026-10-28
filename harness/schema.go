@@ -562,17 +562,17 @@ type maintenanceFact struct {
 // producing models and reported usage. Maintenance facts settle once on the
 // successful checkpoint or on the terminal settlement, never both.
 type operationSettlementEntry struct {
-	SessionID         string           `json:"session_id"`
-	EntryID           string           `json:"entry_id"`
-	OperationID       string           `json:"operation_id"`
-	Status            OperationState   `json:"status"`
-	Detail            string           `json:"detail,omitempty"`
-	Model             *model.ModelRef  `json:"model,omitempty"`
-	Usage             *UsageCount      `json:"usage,omitempty"`
-	CompactionUsage   bool             `json:"compaction_usage,omitempty"`
-	RequestID         string           `json:"request_id,omitempty"`
-	ConsumedRequestID string           `json:"consumed_request_id,omitempty"`
-	Evidence          *RequestEvidence `json:"evidence,omitempty"`
+	SessionID         string            `json:"session_id"`
+	EntryID           string            `json:"entry_id"`
+	OperationID       string            `json:"operation_id"`
+	Status            OperationState    `json:"status"`
+	Detail            string            `json:"detail,omitempty"`
+	Model             *model.ModelRef   `json:"model,omitempty"`
+	Usage             *UsageCount       `json:"usage,omitempty"`
+	CompactionUsage   bool              `json:"compaction_usage,omitempty"`
+	RequestID         string            `json:"request_id,omitempty"`
+	ConsumedRequestID string            `json:"consumed_request_id,omitempty"`
+	Evidence          *RequestEvidence  `json:"evidence,omitempty"`
 	Facts             []maintenanceFact `json:"facts,omitempty"`
 }
 

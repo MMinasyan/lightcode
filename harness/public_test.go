@@ -6801,10 +6801,10 @@ func TestPublicRecoverRunningAutomaticMaintenanceWitnessesProducer(t *testing.T)
 // into one checkpoint; every later Plan returns none. publicTouchedStrategy
 // records any dispatch through the rewritten field.
 type publicBindingMutator struct {
-	binding     *harness.StrategyBinding
-	touched     *publicTouchedStrategy
-	plans       atomic.Int64
-	consumes    atomic.Int64
+	binding  *harness.StrategyBinding
+	touched  *publicTouchedStrategy
+	plans    atomic.Int64
+	consumes atomic.Int64
 }
 
 func (s *publicBindingMutator) Plan(in harness.PlanInput) (harness.PlanOutput, error) {

@@ -2790,14 +2790,14 @@ func TestBuildCutSafetyVerdicts(t *testing.T) {
 
 	// Cuts and their verdicts: (boundary entry, offender; empty = safe).
 	rows := []struct{ boundary, offender string }{
-		{hexID(1), ""},        // before any call is published
-		{hexID(2), "call-a"},  // call-a's result sits beyond the cut
-		{hexID(3), "call-a"},  // both published calls resolve beyond the cut
-		{hexID(4), "call-a"},  // call-b resolved, call-a still beyond
-		{hexID(5), ""},        // every published call resolved at or before
-		{hexID(6), "call-c"},  // call-c's result is missing
-		{hexID(7), "call-c"},  // the first checkpoint cut stays unsafe
-		{hexID(8), "call-c"},  // a missing result keeps subsequent cuts unsafe
+		{hexID(1), ""},       // before any call is published
+		{hexID(2), "call-a"}, // call-a's result sits beyond the cut
+		{hexID(3), "call-a"}, // both published calls resolve beyond the cut
+		{hexID(4), "call-a"}, // call-b resolved, call-a still beyond
+		{hexID(5), ""},       // every published call resolved at or before
+		{hexID(6), "call-c"}, // call-c's result is missing
+		{hexID(7), "call-c"}, // the first checkpoint cut stays unsafe
+		{hexID(8), "call-c"}, // a missing result keeps subsequent cuts unsafe
 	}
 	for _, row := range rows {
 		offender, present := unsafe[row.boundary]

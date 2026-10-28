@@ -881,10 +881,10 @@ func TestStrategyContractRepeatedPartialCheckpoints(t *testing.T) {
 // settlement or waiting dispatch follows.
 func TestPublicationHandoffAcrossEngineContract(t *testing.T) {
 	rows := []struct {
-		name   string
+		name    string
 		vehicle string
-		failOn int
-		cause  error
+		failOn  int
+		cause   error
 	}{
 		{"conversation intent under cancellation", "conversation", 1, context.Canceled},
 		{"conversation result under cancellation", "conversation", 2, context.Canceled},

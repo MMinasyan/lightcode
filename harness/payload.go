@@ -1691,16 +1691,16 @@ func encodeContextCheckpointEntry(v contextCheckpointEntry) (json.RawMessage, er
 		messages = append(messages, raw)
 	}
 	return json.Marshal(struct {
-		SessionID             string            `json:"session_id"`
-		EntryID               string            `json:"entry_id"`
-		OperationID           string            `json:"operation_id,omitempty"`
-		StrategyID            string            `json:"strategy_id"`
-		Messages              json.RawMessage   `json:"messages"`
-		BoundaryEntryID       string            `json:"boundary_entry_id"`
-		ConfigurationRevision string            `json:"configuration_revision"`
-		Facts                 json.RawMessage   `json:"facts"`
-		ConsumedRequestID     string            `json:"consumed_request_id,omitempty"`
-		Evidence              json.RawMessage   `json:"evidence"`
+		SessionID             string          `json:"session_id"`
+		EntryID               string          `json:"entry_id"`
+		OperationID           string          `json:"operation_id,omitempty"`
+		StrategyID            string          `json:"strategy_id"`
+		Messages              json.RawMessage `json:"messages"`
+		BoundaryEntryID       string          `json:"boundary_entry_id"`
+		ConfigurationRevision string          `json:"configuration_revision"`
+		Facts                 json.RawMessage `json:"facts"`
+		ConsumedRequestID     string          `json:"consumed_request_id,omitempty"`
+		Evidence              json.RawMessage `json:"evidence"`
 	}{
 		SessionID:             v.SessionID,
 		EntryID:               v.EntryID,

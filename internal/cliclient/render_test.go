@@ -2,12 +2,12 @@ package cliclient
 
 import (
 	"encoding/base64"
-	"time"
 	"encoding/json"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"

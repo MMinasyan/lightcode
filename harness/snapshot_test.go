@@ -58,7 +58,7 @@ func factFixtureGraph() *testGraph {
 				capture.Compact.Pricing = compactPricing()
 				return capture
 			}(),
-			AdmittedAt:  testTime,
+			AdmittedAt: testTime,
 		},
 		State: OperationCurrentState{
 			Status:           OperationSuccess,
@@ -562,7 +562,7 @@ func TestHistoryViewAccessorsPure(t *testing.T) {
 	}
 	compactionAt := func(id string, seq int64) graphEntry {
 		return graphEntry{
-			Envelope:   Entry{ID: id, Sequence: seq, Kind: EntryCompaction, CommittedAt: testTime},
+			Envelope: Entry{ID: id, Sequence: seq, Kind: EntryCompaction, CommittedAt: testTime},
 			Compaction: &contextCheckpointEntry{EntryID: id, Messages: []model.Message{{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: "summary"}}}}, Facts: []maintenanceFact{{
 				RequestID: "maintenance-" + id,
 				Model:     testModelRef(),
