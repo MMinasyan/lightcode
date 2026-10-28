@@ -301,6 +301,8 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 	h := hydration(rootA, "2", inputs(1, 1), nil)
 	h.Usage.Context.UsedTokens = "9007199254740993"
 	h.Usage.Totals.ByModel = []protocol.ModelUsage{{Model: "provider/model", Usage: protocol.UsageCount{InputTokens: "18446744073709551615", OutputTokens: "1", CachedInputTokens: "0"}}}
+	estimate := 0.015
+	h.Usage.Totals.EstimatedCostUsd = &estimate
 	h.Warnings = []protocol.Warning{{Message: "global"}, {SessionId: pointer(rootA), Message: "own"}}
 	done := c.refreshReader(r)
 	receive(t, transport.requests).respond(h)
@@ -320,7 +322,7 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 	c.command("/context")
 	c.command("/warnings")
 	text := outputs(c)
-	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, "18446744073709551615") && strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "usage/warnings lost exact subset")
+	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, "18446744073709551615") && strings.Contains(text, `"estimated_cost_usd":0.015`) && strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "usage/warnings lost exact subset")
 	c.mu.Lock()
 	c.root = nil
 	c.mu.Unlock()

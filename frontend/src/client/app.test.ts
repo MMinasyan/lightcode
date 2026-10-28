@@ -3658,6 +3658,45 @@ describe('usage details and global warnings', () => {
     expect(target.textContent).toContain('123456789012345678901');
     // Exactly one model row plus the header; absence is not displayed as zero.
     expect(target.querySelectorAll('dialog .row')).toHaveLength(2);
+    // An absent estimate is displayed as unknown, never as a zero.
+    expect(target.querySelector('dialog .estimate')?.textContent).toContain('unknown');
+  });
+
+  it('renders a present session cost estimate as an approximate USD value', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
+      usage: {
+        totals: {
+          by_model: [
+            { model: 'p/m', usage: { input_tokens: '10', cached_input_tokens: '2', output_tokens: '3' } },
+          ],
+          estimated_cost_usd: 0.015,
+        },
+        context: { used_tokens: '12', context_window: 100 },
+      },
+    })));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('dialog .estimate')?.textContent).toContain('$0.015');
+  });
+
+  it('renders a known-zero session cost estimate as zero', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
+      usage: {
+        totals: { by_model: [], estimated_cost_usd: 0 },
+        context: { used_tokens: '0', context_window: 0 },
+      },
+    })));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    const estimate = target.querySelector('dialog .estimate')?.textContent ?? '';
+    expect(estimate).toContain('$0');
+    expect(estimate).not.toContain('unknown');
   });
 
   it('falls back to GetWarnings globals when no hydration is displayed', async () => {

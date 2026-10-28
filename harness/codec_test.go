@@ -1520,12 +1520,11 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 			_, err := encodeOperationSettlementEntry(v)
 			return err
 		}},
-		{"settlement model without usage", func() error {
+		{"settlement usage without model", func() error {
 			v := validSettlementEntry()
 			v.Status = OperationFailure
 			v.Detail = "d"
-			ref := testModelRef()
-			v.Model = &ref
+			v.Usage = testUsage(1)
 			_, err := encodeOperationSettlementEntry(v)
 			return err
 		}},

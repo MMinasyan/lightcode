@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"unicode/utf8"
 
@@ -1478,12 +1479,13 @@ func decodeOperationSettlementEntry(env Entry) (operationSettlementEntry, error)
 
 // validateOperationSettlementEntry enforces the closed settlement shape: a
 // non-empty owning Operation identity, terminal status with the contract
-// detail rule (success empty, failure and interruption non-empty), the model
-// identity present exactly when the settlement carries usage, maintenance
-// facts settling beside any ordinary usage on every terminal kind with the
-// maintenance producer witness required beside the maintenance provenance
-// marker, and a consumed source identity present only beside maintenance
-// evidence provenance.
+// detail rule (success empty, failure and interruption non-empty), the
+// usage-requires-model identity relation (a model identity alone marks a
+// no-output terminal model producer whose usage report was absent),
+// maintenance facts settling beside any ordinary usage on every terminal kind
+// with the maintenance producer witness required beside the maintenance
+// provenance marker, and a consumed source identity present only beside
+// maintenance evidence provenance.
 func validateOperationSettlementEntry(v operationSettlementEntry) error {
 	if err := validateHexID(v.SessionID, "session id"); err != nil {
 		return err
@@ -1514,8 +1516,8 @@ func validateOperationSettlementEntry(v operationSettlementEntry) error {
 	default:
 		return fmt.Errorf("settlement status %q is not terminal", v.Status)
 	}
-	if (v.Model == nil) != (v.Usage == nil) {
-		return errors.New("settlement model is present exactly when the settlement carries usage")
+	if v.Model == nil && v.Usage != nil {
+		return errors.New("settlement usage requires its model identity")
 	}
 	if v.Evidence != nil && v.RequestID == "" {
 		return errors.New("settlement evidence requires its request identity")
@@ -2371,16 +2373,30 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	var pricingRaw json.RawMessage
+	if v.Pricing != nil {
+		if pricingRaw, err = encodeModelPricing(*v.Pricing); err != nil {
+			return nil, err
+		}
+	}
 	compactModelRaw, err := encodeModelRef(v.Compact.Model)
 	if err != nil {
 		return nil, err
 	}
+	var compactPricingRaw json.RawMessage
+	if v.Compact.Pricing != nil {
+		if compactPricingRaw, err = encodeModelPricing(*v.Compact.Pricing); err != nil {
+			return nil, err
+		}
+	}
 	compactRaw, err := json.Marshal(struct {
 		Model        json.RawMessage `json:"model"`
 		SystemPrompt string          `json:"system_prompt"`
+		Pricing      json.RawMessage `json:"pricing,omitempty"`
 	}{
 		Model:        compactModelRaw,
 		SystemPrompt: v.Compact.SystemPrompt,
+		Pricing:      compactPricingRaw,
 	})
 	if err != nil {
 		return nil, err
@@ -2407,6 +2423,7 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		Capabilities          []string          `json:"capabilities,omitempty"`
 		Readonly              bool              `json:"readonly"`
 		WriteDir              string            `json:"write_dir"`
+		Pricing               json.RawMessage   `json:"pricing,omitempty"`
 		Compact               json.RawMessage   `json:"compact"`
 		Strategy              json.RawMessage   `json:"strategy"`
 	}{
@@ -2419,6 +2436,7 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		Capabilities:          v.Capabilities,
 		Readonly:              v.Readonly,
 		WriteDir:              v.WriteDir,
+		Pricing:               pricingRaw,
 		Compact:               compactRaw,
 		Strategy:              strategyRaw,
 	})
@@ -2580,7 +2598,7 @@ func validateOperationAdmission(v OperationAdmission) error {
 // tool names, and preserved tool and capability order. The permission
 // capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "compact", "strategy"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "pricing", "compact", "strategy"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -2619,6 +2637,10 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	if err != nil {
 		return ExecutionCapture{}, err
 	}
+	pricing, err := decodeOptionalModelPricing(obj, "pricing")
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
 	compactObj, err := objectMember(obj, "compact", true)
 	if err != nil {
 		return ExecutionCapture{}, err
@@ -2643,6 +2665,7 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 		SystemPrompt:          systemPrompt,
 		Readonly:              readonly,
 		WriteDir:              writeDir,
+		Pricing:               pricing,
 		Compact:               compact,
 		Strategy:              strategy,
 	}
@@ -2674,10 +2697,11 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 }
 
 // decodeCompactCapture reads the durable compaction configuration's exact
-// keys: the durable two-field model identity and the system prompt. Their
-// values are validated by the enclosing capture validation.
+// keys: the durable two-field model identity, the system prompt, and the
+// optional captured pricing. Their values are validated by the enclosing
+// capture validation.
 func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error) {
-	if err := rejectUnknownMembers(obj, "model", "system_prompt"); err != nil {
+	if err := rejectUnknownMembers(obj, "model", "system_prompt", "pricing"); err != nil {
 		return CompactCapture{}, err
 	}
 	modelObj, err := objectMember(obj, "model", true)
@@ -2692,7 +2716,11 @@ func decodeCompactCapture(obj map[string]json.RawMessage) (CompactCapture, error
 	if err != nil {
 		return CompactCapture{}, err
 	}
-	v := CompactCapture{Model: ref, SystemPrompt: systemPrompt}
+	pricing, err := decodeOptionalModelPricing(obj, "pricing")
+	if err != nil {
+		return CompactCapture{}, err
+	}
+	v := CompactCapture{Model: ref, SystemPrompt: systemPrompt, Pricing: pricing}
 	return v, nil
 }
 
@@ -2778,6 +2806,9 @@ func validateExecutionCapture(v ExecutionCapture) error {
 	if err := validateCompactCapture(v.Compact); err != nil {
 		return fmt.Errorf("compact: %w", err)
 	}
+	if err := validateOptionalModelPricing(v.Pricing); err != nil {
+		return fmt.Errorf("pricing: %w", err)
+	}
 	if err := validateStrategyCapture(v.Strategy); err != nil {
 		return fmt.Errorf("strategy: %w", err)
 	}
@@ -2798,13 +2829,99 @@ func validateExecutionCapture(v ExecutionCapture) error {
 }
 
 // validateCompactCapture enforces the compaction configuration's closed
-// shape: a complete model identity and a non-empty compact system prompt.
+// shape: a complete model identity, a non-empty compact system prompt, and
+// present pricing that carries only finite rates.
 func validateCompactCapture(v CompactCapture) error {
 	if v.Model.Provider == "" || v.Model.Model == "" {
 		return fmt.Errorf("model %q must be a complete model identity", v.Model.String())
 	}
 	if v.SystemPrompt == "" {
 		return errors.New("system_prompt must be non-empty")
+	}
+	return validateOptionalModelPricing(v.Pricing)
+}
+
+// encodeModelPricing validates and renders one captured pricing value: each
+// present rate is a JSON number, absence encodes by omission, and a present
+// zero stays present. Validation runs first, so a non-finite Go float rate
+// can never produce invalid JSON.
+func encodeModelPricing(v ModelPricing) (json.RawMessage, error) {
+	if err := validateModelPricing(v); err != nil {
+		return nil, invalidInput("model pricing: %v", err)
+	}
+	return json.Marshal(v)
+}
+
+// decodeOptionalModelPricing reads one optional pricing object member: an
+// omitted member means unknown pricing, and a present object decodes its
+// nullable rates — an omitted rate stays absent, a present zero stays a
+// present zero, and null is rejected like every other codec null.
+func decodeOptionalModelPricing(obj map[string]json.RawMessage, key string) (*ModelPricing, error) {
+	if _, present := obj[key]; !present {
+		return nil, nil
+	}
+	pricingObj, err := objectMember(obj, key, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectUnknownMembers(pricingObj, "input", "output", "cache_read", "cache_write"); err != nil {
+		return nil, fmt.Errorf("member %q: %w", key, err)
+	}
+	v := ModelPricing{}
+	for _, field := range []struct {
+		key  string
+		slot **float64
+	}{
+		{"input", &v.Input},
+		{"output", &v.Output},
+		{"cache_read", &v.CacheRead},
+		{"cache_write", &v.CacheWrite},
+	} {
+		raw, err := member(pricingObj, field.key, false)
+		if err != nil {
+			return nil, fmt.Errorf("member %q: %w", key, err)
+		}
+		if raw == nil {
+			continue
+		}
+		var rate float64
+		if err := json.Unmarshal(raw, &rate); err != nil {
+			return nil, fmt.Errorf("member %q: rate %q must be a JSON number: %w", key, field.key, err)
+		}
+		value := rate
+		*field.slot = &value
+	}
+	if err := validateModelPricing(v); err != nil {
+		return nil, fmt.Errorf("member %q: %w", key, err)
+	}
+	return &v, nil
+}
+
+// validateOptionalModelPricing reports a present pricing value's rate rules;
+// a nil value means unknown pricing and is always valid.
+func validateOptionalModelPricing(v *ModelPricing) error {
+	if v == nil {
+		return nil
+	}
+	return validateModelPricing(*v)
+}
+
+// validateModelPricing enforces the closed rate rules: every present rate is
+// a finite float64. Absent rates mean unknown, and no nonnegativity policy
+// is imposed beyond finiteness.
+func validateModelPricing(v ModelPricing) error {
+	for _, field := range []struct {
+		key  string
+		rate *float64
+	}{
+		{"input", v.Input},
+		{"output", v.Output},
+		{"cache_read", v.CacheRead},
+		{"cache_write", v.CacheWrite},
+	} {
+		if field.rate != nil && (math.IsNaN(*field.rate) || math.IsInf(*field.rate, 0)) {
+			return fmt.Errorf("rate %q must be finite", field.key)
+		}
 	}
 	return nil
 }

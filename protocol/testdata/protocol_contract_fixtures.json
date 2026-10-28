@@ -595,7 +595,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"5\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\"}"
     }
    ],
    "reject": [
@@ -605,16 +605,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"5\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"6\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"5\"}"
+     "json": "{\"protocol_version\":\"6\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"5\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\",\"extra\":true}"
     }
    ]
   },
@@ -2021,9 +2021,22 @@
     {
      "name": "minimal",
      "json": "{\"by_model\":[]}"
+    },
+    {
+     "name": "approximate estimate",
+     "json": "{\"by_model\":[],\"estimated_cost_usd\":0.015}"
+    },
+    {
+     "name": "known-zero estimate",
+     "json": "{\"by_model\":[],\"estimated_cost_usd\":0}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "estimate string",
+     "json": "{\"by_model\":[],\"estimated_cost_usd\":\"0.015\"}"
+    }
+   ]
   },
   {
    "schema": "Warning",

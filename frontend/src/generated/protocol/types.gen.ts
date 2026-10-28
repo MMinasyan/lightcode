@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '5';
+    protocol_version: '6';
 };
 
 /**
@@ -159,6 +159,10 @@ export type ModelUsage = {
 
 export type UsageTotals = {
     by_model: Array<ModelUsage>;
+    /**
+     * Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
+     */
+    estimated_cost_usd?: number;
 };
 
 export type UsageContext = {

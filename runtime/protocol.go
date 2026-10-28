@@ -146,10 +146,14 @@ func projectOperation(record harness.OperationRecord) protocol.Operation {
 	return projectOperationSummary(summary)
 }
 
-// projectOperationSummary maps one value-only Operation summary to its
-// generated header: the same projection rule the full-register adapter
-// consumes.
+// projectOperationSummary maps one value-only summary to its generated
+// header: the same projection rule the full-register adapter consumes, plus
+// the read-only approximate USD estimate the composed view carries. A summary
+// assembled from a raw register carries no estimate, so the optional wire
+// member stays absent there.
 func projectOperationSummary(summary harness.OperationSummary) protocol.Operation {
+	usage := projectUsage(summary.Usage)
+	usage.EstimatedCostUsd = summary.EstimatedCostUSD
 	op := protocol.Operation{
 		AdmittedAt:  summary.AdmittedAt.UTC(),
 		AgentType:   summary.AgentType,
@@ -157,7 +161,7 @@ func projectOperationSummary(summary harness.OperationSummary) protocol.Operatio
 		OperationId: summary.OperationID,
 		RequestKind: protocol.OperationRequestKind(summary.RequestKind),
 		Status:      protocol.OperationStatus(summary.Status),
-		Usage:       projectUsage(summary.Usage),
+		Usage:       usage,
 	}
 	if summary.SettledAt != nil {
 		settled := summary.SettledAt.UTC()
@@ -739,8 +743,10 @@ func resolveSessionSelection(agentType string, captured *configuration) sessionS
 // display estimate plus the context window of the shared selection
 // resolution.
 func projectSessionUsage(view harness.SessionReadView, measured *harness.UsageCount, selection sessionSelection) protocol.UsageProjection {
+	totals := projectUsage(view.TotalUsage)
+	totals.EstimatedCostUsd = view.EstimatedCostUSD
 	return protocol.UsageProjection{
-		Totals:  projectUsage(view.TotalUsage),
+		Totals:  totals,
 		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(measured), ContextWindow: sessionContextWindow(view, selection)},
 	}
 }

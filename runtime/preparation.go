@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -447,6 +448,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	// final effective model's.
 	compactRef := sel.agent.Model
 	compactTransport := transport
+	compactCost := entry.Cost
 	if !compactType.Model.IsZero() && compactType.Model != sel.agent.Model {
 		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compactType.Model.Provider, Model: compactType.Model.Model})
 		if lookupErr == nil {
@@ -461,6 +463,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 				if buildErr == nil {
 					compactRef = compactType.Model
 					compactTransport = built
+					compactCost = compactEntry.Cost
 				}
 			}
 		}
@@ -505,9 +508,11 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		Capabilities:          slices.Clone(sel.agent.Capabilities),
 		Readonly:              sel.agent.Readonly,
 		WriteDir:              sel.agent.WriteDir,
+		Pricing:               capturedPricing(entry.Cost),
 		Compact: harness.CompactCapture{
 			Model:        compactRef,
 			SystemPrompt: compactType.Prompt,
+			Pricing:      capturedPricing(compactCost),
 		},
 		Strategy: harness.StrategyCapture{
 			ID:                    productionStrategy.ID,
@@ -533,6 +538,30 @@ func outputReserve(maxOutputTokens int) int {
 		return maxOutputTokens
 	}
 	return 131072
+}
+
+// capturedPricing copies one catalog entry's per-million USD rates into
+// owned capture pricing: an absent cost means unknown pricing, and a
+// non-finite catalog rate becomes an absent rate, never a preparation
+// failure.
+func capturedPricing(cost *catalog.Cost) *harness.ModelPricing {
+	if cost == nil {
+		return nil
+	}
+	return &harness.ModelPricing{
+		Input:      finiteRate(cost.Input),
+		Output:     finiteRate(cost.Output),
+		CacheRead:  finiteRate(cost.CacheRead),
+		CacheWrite: finiteRate(cost.CacheWrite),
+	}
+}
+
+func finiteRate(v *float64) *float64 {
+	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
+		return nil
+	}
+	copied := *v
+	return &copied
 }
 
 // boundAdaptation binds the composition's single ModelAdaptation export from
@@ -795,6 +824,8 @@ func ownExecutionCapture(capture harness.ExecutionCapture) (harness.ExecutionCap
 		owned.Tools = req.Tools
 	}
 	owned.Capabilities = slices.Clone(capture.Capabilities)
+	owned.Pricing = capture.Pricing.Clone()
+	owned.Compact.Pricing = capture.Compact.Pricing.Clone()
 	return owned, nil
 }
 
@@ -812,7 +843,10 @@ func validateHookedCapture(base, next harness.ExecutionCapture) error {
 	if next.OutputReserve != base.OutputReserve {
 		return fmt.Errorf("preparation hook changed the captured output reserve: %w", harness.ErrInvalid)
 	}
-	if next.Compact != base.Compact {
+	if !next.Pricing.Equal(base.Pricing) {
+		return fmt.Errorf("preparation hook changed the captured model pricing: %w", harness.ErrInvalid)
+	}
+	if next.Compact.Model != base.Compact.Model || next.Compact.SystemPrompt != base.Compact.SystemPrompt || !next.Compact.Pricing.Equal(base.Compact.Pricing) {
 		return fmt.Errorf("preparation hook changed the captured compact configuration: %w", harness.ErrInvalid)
 	}
 	if next.ConfigurationRevision != base.ConfigurationRevision {

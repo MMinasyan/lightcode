@@ -61,19 +61,23 @@ type SessionHeader struct {
 // OperationSummary is one value-only Operation register summary: the
 // canonical admission identity, kind, Agent type, model capture, admission
 // time, the current status and settlement time, the terminal detail, and the
-// register usage totals. It copies no execution schema, capability list,
-// system prompt, or effect machinery — full execution captures stay live
-// execution state read through ReadOperation.
+// register usage totals. EstimatedCostUSD is the read-only approximate USD
+// estimate computed from this Operation's immutable captured pricing over
+// its original producers; nil means unknown, never zero. It copies no
+// execution schema, capability list, system prompt, or effect machinery —
+// full execution captures stay live execution state read through
+// ReadOperation.
 type OperationSummary struct {
-	OperationID string
-	RequestKind RequestKind
-	AgentType   string
-	Model       model.ModelRef
-	AdmittedAt  time.Time
-	Status      OperationState
-	SettledAt   *time.Time
-	Detail      string
-	Usage       UsageTotals
+	OperationID      string
+	RequestKind      RequestKind
+	AgentType        string
+	Model            model.ModelRef
+	AdmittedAt       time.Time
+	Status           OperationState
+	SettledAt        *time.Time
+	Detail           string
+	Usage            UsageTotals
+	EstimatedCostUSD *float64
 }
 
 // HistoryEntryHeader is one committed history entry's value metadata: the
@@ -107,11 +111,14 @@ type HistoryReadView struct {
 // SessionReadView is the hydration capture of one Session: the shared history
 // component plus the groups hydration consumes — the owned metadata header,
 // identity-sorted Operation summaries, both pending FIFO contents, background
-// membership rows, the register usage totals, and the durably current
-// Operation's captured context window — all from one coordinator-mutex hold.
-// Every exposed mutable slice and pointee is an owned copy; execution schemas,
-// capabilities, and pending/active-effect internals are omitted, and full
-// execution state stays behind ReadOperation.
+// membership rows, the register usage totals, the durably current
+// Operation's captured context window, and the coherent read-time approximate
+// USD cost estimates (the Session estimate over every original producer and
+// each Operation's own estimate) computed from the captured pricing in one
+// pass; a nil estimate means unknown, never zero. Every exposed mutable slice
+// and pointee is an owned copy; execution schemas, capabilities, and
+// pending/active-effect internals are omitted, and full execution state stays
+// behind ReadOperation.
 type SessionReadView struct {
 	Header              SessionHeader
 	History             HistoryReadView
@@ -120,6 +127,7 @@ type SessionReadView struct {
 	Queued              []PendingInput
 	Background          []BackgroundMemberView
 	TotalUsage          UsageTotals
+	EstimatedCostUSD    *float64
 	ActiveContextWindow int
 }
 
@@ -194,12 +202,21 @@ func captureSessionReadLocked(c *coordinator) SessionReadView {
 	}
 	view.Operations = make([]OperationSummary, 0, len(c.graph.Operations))
 	current := c.graph.Session.State.CurrentOperationID
+	estimates, sessionEstimate := estimateGraphCosts(c.graph)
 	for _, op := range c.graph.Operations {
 		if current != "" && op.Admission.OperationID == current {
 			view.ActiveContextWindow = op.Admission.Execution.ContextWindow
 		}
-		view.Operations = append(view.Operations, ownOperationSummary(op))
+		summary := ownOperationSummary(op)
+		if estimate, ok := estimates[op.Admission.OperationID]; ok {
+			summary.EstimatedCostUSD = estimate.value()
+		} else { // an Operation with no model producer is a known zero
+			zero := float64(0)
+			summary.EstimatedCostUSD = &zero
+		}
+		view.Operations = append(view.Operations, summary)
 	}
+	view.EstimatedCostUSD = sessionEstimate.value()
 	// Warm coordinators append admissions, so the returned copy is sorted
 	// here; the resident graph keeps its own read order.
 	sort.Slice(view.Operations, func(i, j int) bool {

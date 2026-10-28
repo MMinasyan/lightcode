@@ -67,6 +67,20 @@ func (f *maintenanceFacts) hasInput() bool { return f != nil && len(f.facts) > 0
 
 func (f *maintenanceFacts) hasConsumed() bool { return f != nil && f.consumed.BoundaryEntryID != "" }
 
+// witnessesRequest reports whether one retained fact already witnesses the
+// named producing request, so its live producer is never repeated elsewhere.
+func (f *maintenanceFacts) witnessesRequest(requestID string) bool {
+	if f == nil || requestID == "" {
+		return false
+	}
+	for _, fact := range f.facts {
+		if fact.RequestID == requestID {
+			return true
+		}
+	}
+	return false
+}
+
 // factsList returns the carrier's ordered facts; a nil carrier holds none.
 func factsList(f *maintenanceFacts) []maintenanceFact {
 	if f == nil {

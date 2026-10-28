@@ -41,7 +41,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"5","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"6","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -70,7 +70,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"5"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"6"}`, testInstance)
 	}
 }
 
@@ -1059,7 +1059,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
 	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
-	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N5, "health = %+v, want the connected owner", health)
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N6, "health = %+v, want the connected owner", health)
 
 	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_type":"integrated"}}`)
 	testassert.NoError(t, err)

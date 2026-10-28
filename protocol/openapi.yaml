@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "2" is the protocol identity, independent of the binary
+# Wire version "6" is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "2"
+  version: "6"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -888,7 +888,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "5"
+            - "6"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1145,6 +1145,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ModelUsage"
+        estimated_cost_usd:
+          type: number
+          format: double
+          description: Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
     UsageContext:
       type: object
       additionalProperties: false

@@ -3522,6 +3522,15 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 	}
 }
 
+// estimateText renders one read-time estimate for a failure message: absent
+// is unknown, a present value is its exact number.
+func estimateText(v *float64) string {
+	if v == nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%v", *v)
+}
+
 // assertRecoverIdempotent runs Recover once more and requires it to find no
 // running Operation and write nothing: both registers byte-identical at the
 // same revision and the entry list unchanged.
@@ -6664,6 +6673,22 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		script := newScriptModel(publicTurn())
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
+
+		// The recovered live maintenance producer lost its usage report with
+		// the process: its Operation estimate is unknown, not a zero that
+		// pretends no producer ran, and the Session total stays unknown.
+		{
+			view, err := f.h.ReadSessionView(ctx, sessionID)
+			testassert.NoError(t, err)
+			var compactEstimate *float64
+			for _, summary := range view.Operations {
+				if summary.OperationID == "compact-op" {
+					compactEstimate = summary.EstimatedCostUSD
+				}
+			}
+			testassert.Require(t, compactEstimate == nil, "recovered compact Operation estimate = %s, want absent: the lost live maintenance producer stays unknown", estimateText(compactEstimate))
+			testassert.Require(t, view.EstimatedCostUSD == nil, "recovered Session estimate = %s, want absent", estimateText(view.EstimatedCostUSD))
+		}
 		{
 			_, err := submit(t, f.h, sessionID, "op-next", harness.MessageModeRegular, "next question")
 			testassert.NoError(t, err)
@@ -6683,6 +6708,89 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		testassert.Require(t, len(got) == len(want), "next admission projection = %q, want %q", got, want)
 		for i := range want {
 			testassert.Require(t, got[i] == want[i], "next admission projection[%d] = %q, want %q", i, got[i], want[i])
+		}
+	})
+}
+
+// TestPublicRecoverRunningAutomaticMaintenanceWitnessesProducer proves the
+// automatic-maintenance recovery sibling: process loss retains no Facts, so
+// the settlement of a running Operation with a suspended conversation request
+// recovers the live model producer from the committed maintenance intent —
+// the request witness names the maintenance producer instead of the suspended
+// request, the Model names the effective compact model, the absent Usage
+// report stays absent with no fabricated Facts or evidence, the token totals
+// stay integer-empty, and the read-time estimate for the Operation and the
+// Session is unknown, neither zero nor a partial known sum. No effect
+// replays.
+func TestPublicRecoverRunningAutomaticMaintenanceWitnessesProducer(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		sessionID, entryID := newRawSessionID(t), newRawSessionID(t)
+		reserved := newRawSessionID(t)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, "maint-op"))
+		insertRawEntry(t, store, sessionID, entryID, "maint-op", harness.EntryInput, rawInputEntryPayload(sessionID, entryID, "maint-op"))
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "maint-op"},
+			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
+				`"running_request":{"request_id":"request-suspended","boundary_entry_id":%q,"hook_results":[]},`+
+				`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"maintainer-live","model":{"provider":"cprov","model":"compact-x"},"purpose":"maintenance"},`+
+				`"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				rawAdmission(sessionID, "maint-op", entryID), now, entryID, reserved))
+
+		pre := recoverEntries(t, store, sessionID)
+		{
+			err := harness.Recover(ctx, store)
+			testassert.NoError(t, err)
+		}
+		// Settled with no replay: the reserved identity is consumed, the
+		// committed tail is exactly the signal and the settlement, and a second
+		// run writes nothing.
+		assertRecoveredOperation(t, store, sessionID, "maint-op", pre, reserved, nil)
+		assertRecoverIdempotent(t, store, sessionID, "maint-op")
+
+		// The settlement recovers the producer from the maintenance intent:
+		// the witness is the maintenance producer, never the suspended
+		// conversation request, and the Model is the effective compact model.
+		// The missing report stays missing; the recovery fabricates no Facts,
+		// evidence, or maintenance-provenance marker.
+		entries := recoverEntries(t, store, sessionID)
+		settlement := entries[len(entries)-1]
+		testassert.Equal(t, settlement.Kind, harness.EntryOperationSettlement)
+		var wire struct {
+			RequestID       string          `json:"request_id"`
+			Model           json.RawMessage `json:"model"`
+			Usage           json.RawMessage `json:"usage"`
+			Facts           json.RawMessage `json:"facts"`
+			Evidence        json.RawMessage `json:"evidence"`
+			CompactionUsage bool            `json:"compaction_usage"`
+		}
+		testassert.NoError(t, json.Unmarshal(settlement.Payload, &wire))
+		testassert.Require(t, wire.RequestID == "maintainer-live", "recovered settlement witness = %q, want the maintenance producer identity, not the suspended conversation request", wire.RequestID)
+		testassert.Require(t, string(wire.Model) == `{"provider":"cprov","model":"compact-x"}`, "recovered settlement model = %s, want the effective compact model named from the maintenance intent", wire.Model)
+		testassert.Require(t, wire.Usage == nil && wire.Facts == nil && wire.Evidence == nil && !wire.CompactionUsage, "recovered settlement = %s, want no usage report, no Facts, no evidence, no maintenance provenance marker", settlement.Payload)
+
+		// The integer token totals are unchanged and no estimate is persisted
+		// anywhere in the durable state.
+		opReg := operationRegister(t, store, sessionID, "maint-op")
+		sessReg := sessionRegister(t, store, sessionID)
+		testassert.Require(t, bytes.Contains(opReg.Payload, []byte(`"usage":{"by_model":[]}`)) && !bytes.Contains(opReg.Payload, []byte("cost")), "terminal operation register = %s, want the empty integer totals with no persisted estimate", opReg.Payload)
+		testassert.Require(t, !bytes.Contains(sessReg.Payload, []byte("cost")), "session register = %s, want no persisted estimate", sessReg.Payload)
+
+		// The read-time estimate: the maintenance Operation is unknown, not
+		// zero, and the Session total stays unknown.
+		f := newPublicFixture(t, store, newScriptModel(publicTurn()), nil)
+		defer f.close()
+		{
+			view, err := f.h.ReadSessionView(ctx, sessionID)
+			testassert.NoError(t, err)
+			var maintainerEstimate *float64
+			for _, summary := range view.Operations {
+				if summary.OperationID == "maint-op" {
+					maintainerEstimate = summary.EstimatedCostUSD
+				}
+			}
+			testassert.Require(t, maintainerEstimate == nil, "recovered maintenance Operation estimate = %s, want absent: the unreported live producer stays unknown", estimateText(maintainerEstimate))
+			testassert.Require(t, view.EstimatedCostUSD == nil, "recovered Session estimate = %s, want absent", estimateText(view.EstimatedCostUSD))
 		}
 	})
 }

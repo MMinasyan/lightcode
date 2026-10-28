@@ -1333,6 +1333,10 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		f.prepareHook = func(call int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 			capture := publicCapture()
 			capture.Capabilities = []string{"cap.a", "cap.b"}
+			conversationInput, conversationOutput, conversationCacheWrite := 1.0, 2.0, 8.0
+			compactInput := 0.5
+			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput, CacheWrite: &conversationCacheWrite}
+			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
 			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
@@ -1575,6 +1579,9 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		mutatedRecord.Admission.Execution.Capabilities[0] = "mutated"
 		mutatedRecord.Admission.Execution.Capabilities = append(mutatedRecord.Admission.Execution.Capabilities, "forged")
 		mutatedRecord.Admission.Execution.Compact.SystemPrompt = "mutated"
+		*mutatedRecord.Admission.Execution.Pricing.Input = 999
+		*mutatedRecord.Admission.Execution.Pricing.CacheWrite = 999
+		*mutatedRecord.Admission.Execution.Compact.Pricing.Input = 999
 		*mutatedRecord.State.SettledAt = mutatedRecord.State.SettledAt.Add(2 * time.Hour)
 		mutatedRecord.State.Terminal.Detail = "mutated"
 		mutatedRecord.State.Terminal.SettlementEntry.EntryID = "mutated"

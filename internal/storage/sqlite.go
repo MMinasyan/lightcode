@@ -32,7 +32,7 @@ const (
 	// into PRAGMA user_version at initialization and checked at open. Version
 	// 10 is the tool-result original-content and shaping-failure payload
 	// members; the SQL tables are unchanged.
-	sqliteSchemaVersion = 11
+	sqliteSchemaVersion = 12
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate

@@ -1069,14 +1069,20 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 	// The settlement's request witness: a maintenance-family settlement
 	// names its own producer identity (never a replacement of the suspended
 	// conversation state, which lives on the register state until this
-	// terminal clears it); otherwise the published running request;
-	// otherwise a live model intent's identity. Ordinary accumulated
-	// maintenance facts can ride any terminal kind without owning the
-	// settlement's own witness.
+	// terminal clears it), recovery-included: an active maintenance intent no
+	// retained Fact witnesses still names that producer; otherwise the
+	// published running request; otherwise a live model intent's identity.
+	// Ordinary accumulated maintenance facts can ride any terminal kind
+	// without owning the settlement's own witness.
 	switch {
 	case compactionUsage && facts != nil && (facts.hasInput() || facts.hasConsumed()):
 		settlement.RequestID = maintenanceID
 		settlement.ConsumedRequestID = facts.sourceRequestID
+	case assistant == nil && activeEffect != nil && activeEffect.Kind == EffectModel &&
+		activeEffect.Purpose == InvocationPurposeMaintenance && activeEffect.RequestID != "":
+		// Recovery retains no process-local Facts: the live maintenance
+		// intent's own identity is the maintenance producer witness.
+		settlement.RequestID = activeEffect.RequestID
 	case currentOp.State.Request != nil:
 		settlement.RequestID = currentOp.State.Request.RequestID
 	case assistant == nil && activeEffect != nil && activeEffect.Kind == EffectModel && activeEffect.RequestID != "":
@@ -1097,10 +1103,23 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 		// never becomes the settlement's carried conversation usage.
 		settlement.Facts = cloneMaintenanceFacts(facts.facts)
 	}
-	if assistant == nil && usage != nil { // terminal no-output model usage rides the settlement entry
-		modelRef := usageModel
-		settlement.Model = &modelRef
-		settlement.Usage = usage
+	if assistant == nil {
+		if usage != nil { // terminal no-output model usage rides the settlement entry
+			modelRef := usageModel
+			settlement.Model = &modelRef
+			settlement.Usage = usage
+		} else if activeEffect != nil && activeEffect.Kind == EffectModel &&
+			activeEffect.Model != nil && !facts.witnessesRequest(activeEffect.RequestID) {
+			// A terminal model producer with no usage report still names its
+			// live model intent unless a retained maintenance fact already
+			// witnesses that request: a conversation intent directly, and a
+			// maintenance intent whose Facts process loss dropped — the
+			// absent report stays unknown instead of becoming a missing
+			// producer, and a fact-witnessed producer never repeats its
+			// model beside its Facts.
+			modelRef := *activeEffect.Model
+			settlement.Model = &modelRef
+		}
 	}
 	payload, err := encodeOperationSettlementEntry(settlement)
 	if err != nil {

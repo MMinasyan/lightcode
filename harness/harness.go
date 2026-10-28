@@ -2115,6 +2115,8 @@ func ownCapture(c ExecutionCapture) ExecutionCapture {
 	} else {
 		out.Capabilities = append([]string(nil), c.Capabilities...)
 	}
+	out.Pricing = c.Pricing.Clone()
+	out.Compact.Pricing = c.Compact.Pricing.Clone()
 	out.Strategy.Settings = model.CloneRaw(c.Strategy.Settings)
 	return out
 }

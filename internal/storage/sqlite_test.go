@@ -186,7 +186,7 @@ func sqliteFixtureDatabase(t *testing.T, path string, ddl []string, version int)
 }
 
 // TestSQLiteSchemaInitialization proves a missing path is initialized with the
-// complete canonical schema in one shot: version 11, exactly the two canonical
+// complete canonical schema in one shot: version 12, exactly the two canonical
 // tables and the one explicit index, only the autoindexes implied by those
 // tables, a well-formed image, no sidecars after close, and no partial file
 // when initialization fails.
@@ -202,7 +202,7 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	var version int
 	{
 		err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version)
-		testassert.Require(t, err == nil && version == 11, "PRAGMA user_version = %d (error %v), want 11", version, err)
+		testassert.Require(t, err == nil && version == 12, "PRAGMA user_version = %d (error %v), want 12", version, err)
 	}
 
 	objects := map[string]string{}
@@ -263,7 +263,7 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	var emptyVersion int
 	{
 		err := emptyStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&emptyVersion)
-		testassert.Check(t, err == nil && emptyVersion == 11, "zero-length file user_version = %d (error %v), want 11", emptyVersion, err)
+		testassert.Check(t, err == nil && emptyVersion == 12, "zero-length file user_version = %d (error %v), want 12", emptyVersion, err)
 	}
 	testassert.NoError(t, emptyStore.Close())
 	sqliteAssertNoSidecars(t, empty)
@@ -276,7 +276,7 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	var reservedVersion int
 	{
 		err := reservedStore.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&reservedVersion)
-		testassert.Check(t, err == nil && reservedVersion == 11, "reserved-path user_version = %d (error %v), want 11", reservedVersion, err)
+		testassert.Check(t, err == nil && reservedVersion == 12, "reserved-path user_version = %d (error %v), want 12", reservedVersion, err)
 	}
 	testassert.NoError(t, reservedStore.Close())
 	{
@@ -395,7 +395,7 @@ func TestSQLiteRejectsNonEmptyVersionZero(t *testing.T) {
 	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
 	testassert.Require(t, errors.As(err, &incompatible), "error = %T, want *harness.IncompatibleSchemaError", err)
-	testassert.Check(t, incompatible.Found == 0 && incompatible.Supported == 11, "recovered %+v, want found 0 supported 11", incompatible)
+	testassert.Check(t, incompatible.Found == 0 && incompatible.Supported == 12, "recovered %+v, want found 0 supported 12", incompatible)
 	testassert.Check(t, store == nil, "rejected database returned a store")
 	{
 		after := sqliteFileDigest(t, path)
@@ -417,7 +417,7 @@ func TestSQLiteRejectsPriorVersion(t *testing.T) {
 	store, err := OpenSQLite(path)
 	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
-	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 6 && incompatible.Supported == 11, "recovered %+v, want found 6 supported 11", incompatible)
+	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 6 && incompatible.Supported == 12, "recovered %+v, want found 6 supported 12", incompatible)
 	testassert.Check(t, store == nil, "rejected prior-version database returned a store")
 	{
 		after := sqliteFileDigest(t, path)
@@ -427,25 +427,25 @@ func TestSQLiteRejectsPriorVersion(t *testing.T) {
 }
 
 // TestSQLiteRejectsUnsupportedVersion proves a database with a future schema
-// version beyond the accepted 11 is rejected without any file or sidecar
+// version beyond the accepted 12 is rejected without any file or sidecar
 // change.
 func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "future.db")
-	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 12)
+	sqliteFixtureDatabase(t, path, []string{sqliteEntriesDDL, sqliteRegistersDDL, sqliteOperationIndexDDL}, 13)
 	before := sqliteFileDigest(t, path)
 
 	_, err := OpenSQLite(path)
 	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var incompatible *harness.IncompatibleSchemaError
-	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 12 && incompatible.Supported == 11, "recovered %+v, want found 12 supported 11", incompatible)
+	testassert.Check(t, errors.As(err, &incompatible) && incompatible.Found == 13 && incompatible.Supported == 12, "recovered %+v, want found 13 supported 12", incompatible)
 	{
 		after := sqliteFileDigest(t, path)
-		testassert.Check(t, after == before, "rejected version-12 database file changed")
+		testassert.Check(t, after == before, "rejected version-13 database file changed")
 	}
 	sqliteAssertNoSidecars(t, path)
 
-	// Unsupported hot-WAL sibling: version 12 lives only in an uncheckpointed
-	// WAL beside a checkpointed version 11 main file, with no SHM file — the
+	// Unsupported hot-WAL sibling: version 13 lives only in an uncheckpointed
+	// WAL beside a checkpointed version 12 main file, with no SHM file — the
 	// crashed-writer state. Read-only validation must see the WAL-carried
 	// version and reject the copy while leaving the database and WAL bytes
 	// unchanged; a SQLite-owned -shm WAL index may appear and remain.
@@ -453,7 +453,7 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	live, err := sql.Open(sqliteDriverName, sqliteDSN(source, "_journal_mode=WAL&_synchronous=FULL"))
 	testassert.NoError(t, err)
 	{
-		_, err := live.Exec(`PRAGMA user_version = 11`)
+		_, err := live.Exec(`PRAGMA user_version = 12`)
 		testassert.NoError(t, err)
 	}
 	{
@@ -461,7 +461,7 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := live.Exec(`PRAGMA user_version = 12`)
+		_, err := live.Exec(`PRAGMA user_version = 13`)
 		testassert.NoError(t, err)
 	}
 	mainBytes, err := os.ReadFile(source)
@@ -478,7 +478,7 @@ func TestSQLiteRejectsUnsupportedVersion(t *testing.T) {
 	crashedStore, err := OpenSQLite(target)
 	testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 	var walIncompatible *harness.IncompatibleSchemaError
-	testassert.Check(t, errors.As(err, &walIncompatible) && walIncompatible.Found == 12 && walIncompatible.Supported == 11, "recovered %+v, want the WAL-carried version found 12 supported 11", walIncompatible)
+	testassert.Check(t, errors.As(err, &walIncompatible) && walIncompatible.Found == 13 && walIncompatible.Supported == 12, "recovered %+v, want the WAL-carried version found 13 supported 12", walIncompatible)
 	testassert.Check(t, crashedStore == nil, "rejected WAL-mode database returned a store")
 	{
 		after := sqliteFileDigest(t, target)
@@ -520,12 +520,12 @@ ON registers(operation_id) WHERE kind = 'operation'`
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "schema.db")
-			sqliteFixtureDatabase(t, path, ddl, 11)
+			sqliteFixtureDatabase(t, path, ddl, 12)
 			store, err := OpenSQLite(path)
 			testassert.Require(t, errors.Is(err, harness.ErrIncompatible), "error = %v, want ErrIncompatible", err)
 			var incompatible *harness.IncompatibleSchemaError
 			testassert.Require(t, errors.As(err, &incompatible), "error = %T, want *harness.IncompatibleSchemaError", err)
-			testassert.Check(t, incompatible.Found == 11 && incompatible.Supported == 11, "recovered %+v, want found 11 supported 11", incompatible)
+			testassert.Check(t, incompatible.Found == 12 && incompatible.Supported == 12, "recovered %+v, want found 12 supported 12", incompatible)
 			testassert.Check(t, store == nil, "rejected database returned a store")
 		})
 	}
@@ -585,7 +585,7 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 		sqliteEntriesDDL,
 		sqliteRegistersDDL,
 		sqliteOperationIndexDDL,
-		`PRAGMA user_version = 11`,
+		`PRAGMA user_version = 12`,
 		`INSERT INTO registers (session_id, kind, operation_id, revision, payload) VALUES ('s1', 'session', '', 1, '{"session":"s1"}')`,
 		`INSERT INTO entries (session_id, sequence, entry_id, operation_id, kind, committed_at_ns, payload) VALUES ('s1', 1, 'e1', '', 'input', 1700000000000000000, '{"entry":"e1"}')`,
 	} {

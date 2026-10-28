@@ -181,13 +181,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N5 HealthProtocolVersion = "5"
+	N6 HealthProtocolVersion = "6"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N5:
+	case N6:
 		return true
 	default:
 		return false
@@ -1752,6 +1752,9 @@ type UsageProjection struct {
 // UsageTotals defines model for UsageTotals.
 type UsageTotals struct {
 	ByModel []ModelUsage `json:"by_model"`
+
+	// EstimatedCostUsd Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
+	EstimatedCostUsd *float64 `json:"estimated_cost_usd,omitempty"`
 }
 
 // Warning defines model for Warning.

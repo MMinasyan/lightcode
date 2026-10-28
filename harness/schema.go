@@ -163,13 +163,68 @@ type UsageTotals struct {
 	ByModel []ModelUsage `json:"by_model"`
 }
 
+// ModelPricing is one effective model's captured USD-per-million-token rates
+// taken from the catalog at admission: owned nullable rates, absent meaning
+// the rate was not priced. Each rate is finite; a non-finite rate never
+// reaches a durable capture.
+type ModelPricing struct {
+	Input      *float64 `json:"input,omitempty"`
+	Output     *float64 `json:"output,omitempty"`
+	CacheRead  *float64 `json:"cache_read,omitempty"`
+	CacheWrite *float64 `json:"cache_write,omitempty"`
+}
+
+// Equal reports value equality of two pricing values: nil equals only nil,
+// and each present rate is compared by value, never by pointer.
+func (p *ModelPricing) Equal(q *ModelPricing) bool {
+	if p == nil || q == nil {
+		return p == nil && q == nil
+	}
+	return rateEqual(p.Input, q.Input) && rateEqual(p.Output, q.Output) &&
+		rateEqual(p.CacheRead, q.CacheRead) && rateEqual(p.CacheWrite, q.CacheWrite)
+}
+
+func rateEqual(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// Clone returns an independent owned copy of one pricing value: every
+// present rate pointee is copied (a nil value clones to nil).
+func (p *ModelPricing) Clone() *ModelPricing {
+	if p == nil {
+		return nil
+	}
+	out := ModelPricing{}
+	if p.Input != nil {
+		v := *p.Input
+		out.Input = &v
+	}
+	if p.Output != nil {
+		v := *p.Output
+		out.Output = &v
+	}
+	if p.CacheRead != nil {
+		v := *p.CacheRead
+		out.CacheRead = &v
+	}
+	if p.CacheWrite != nil {
+		v := *p.CacheWrite
+		out.CacheWrite = &v
+	}
+	return &out
+}
+
 // ExecutionCapture is the complete non-secret configuration required to
 // interpret one Operation: the stable configuration revision, the complete
 // model identity, the system prompt, the advertised tool definitions in
 // preserved order, the selected capability names in preserved order, the
 // Agent definition's permission capability constraints, and the compaction
 // configuration — the effective compact model's selection and its prompt.
-// Readonly and WriteDir
+// Pricing is the captured conversation model's rates; absence means the
+// model's pricing was unknown. Readonly and WriteDir
 // are the configured lexical constraint copied from the one Harness-selected
 // definition; WriteDir is already trimmed at projection and stays unchanged in
 // the capture. The captured ConfigurationRevision also identifies the
@@ -187,6 +242,7 @@ type ExecutionCapture struct {
 	Capabilities          []string               `json:"capabilities,omitempty"`
 	Readonly              bool                   `json:"readonly"`
 	WriteDir              string                 `json:"write_dir"`
+	Pricing               *ModelPricing          `json:"pricing,omitempty"`
 	Compact               CompactCapture         `json:"compact"`
 	Strategy              StrategyCapture        `json:"strategy"`
 }
@@ -201,11 +257,16 @@ type StrategyCapture struct {
 }
 
 // CompactCapture is the effective compaction configuration of one capture:
-// the model the compaction summarizer runs on and the compact type's system
-// prompt. Fully comparable.
+// the model the compaction summarizer runs on, the compact type's system
+// prompt, and that final effective model's captured pricing — the
+// conversation model's pricing exactly when the fallback kept the
+// conversation model and its transport. Equality of two compact captures is
+// value equality through the pricing pointer and its rate pointees, never
+// pointer identity.
 type CompactCapture struct {
 	Model        model.ModelRef `json:"model"`
 	SystemPrompt string         `json:"system_prompt"`
+	Pricing      *ModelPricing  `json:"pricing,omitempty"`
 }
 
 // SessionIdentity is the immutable identity section of one Session register.
@@ -484,8 +545,10 @@ type maintenanceFact struct {
 }
 
 // operationSettlementEntry publishes one terminal Operation outcome. It is
-// never operationless; the model identity is present exactly when the
-// settlement carries usage. CompactionUsage marks one settlement as the
+// never operationless; the settlement's usage requires its model identity,
+// while the model identity alone additionally marks one no-output terminal
+// model producer whose usage report was absent. CompactionUsage marks one
+// settlement as the
 // maintenance procedure's own provenance: it identifies the maintenance
 // family directly and its ordered Facts carry the procedure's per-request
 // usage. RequestID is the

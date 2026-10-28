@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -47,14 +49,15 @@ Be specific — include file paths, function names, error messages, line numbers
 
 // compactPrepConfigDocument is the compaction-capture fixture document: the
 // referenced keyed provider beside one provider whose credential stays
-// absent, both pointed at the given endpoint.
+// absent, both pointed at the given endpoint. Every model carries its own
+// captured-price fixture rate.
 func compactPrepConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY",
-		`{"m":{"name":"M","context_window":4096},`+
-			`"m2":{"name":"M2","context_window":2048,"max_output_tokens":1000},`+
-			`"mzero":{"name":"MZ","context_window":0,"max_output_tokens":500}}`) +
+		`{"m":{"name":"M","context_window":4096,"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}},`+
+			`"m2":{"name":"M2","context_window":2048,"max_output_tokens":1000,"cost":{"input":0.5,"output":1,"cache_read":0.125,"cache_write":0.0625}},`+
+			`"mzero":{"name":"MZ","context_window":0,"max_output_tokens":500,"cost":{"input":0.25}}}`) +
 		`,"p2":` + nominalProvMember(endpoint, "PREP_COMPACT_ABSENT_KEY",
-		`{"m3":{"name":"M3","context_window":1024,"max_output_tokens":200}}`) + `},"sessions":{}}`
+		`{"m3":{"name":"M3","context_window":1024,"max_output_tokens":200,"cost":{"input":7}}}`) + `},"sessions":{}}`
 }
 
 // agentsWithCompact appends one compact builtin overlay to the retained
@@ -137,76 +140,96 @@ func testToolDefinitionRuntime() model.ToolDefinition {
 // TestConcretePrepareCompactCapture pins every capture field the compaction
 // configuration must carry from one revision: the conversation window, the
 // output reserve with the 131072 fallback, the compact selection with the
-// conversation-model default, and the compact prompt equal to the resolved
-// compact type's Prompt.
+// conversation-model default, the compact prompt equal to the resolved
+// compact type's Prompt, and the captured pricing of the final effective
+// conversation and compact models — the conversation model's own rates
+// exactly when the fallback kept that model and its transport, and the
+// fallback candidate's rates never reaching a capture it did not select.
 func TestConcretePrepareCompactCapture(t *testing.T) {
 	conversationRef := model.ModelRef{Provider: "prov", Model: "m"}
 	m2Ref := model.ModelRef{Provider: "prov", Model: "m2"}
+	fpr := func(v float64) *float64 { return &v }
+	mPricing := &harness.ModelPricing{Input: fpr(1.5), Output: fpr(3), CacheRead: fpr(0.5), CacheWrite: fpr(0.25)}
+	m2Pricing := &harness.ModelPricing{Input: fpr(0.5), Output: fpr(1), CacheRead: fpr(0.125), CacheWrite: fpr(0.0625)}
 
 	cases := []struct {
-		name           string
-		agentsDoc      string
-		agent          string
-		wantModel      model.ModelRef
-		wantWindow     int
-		wantReserve    int
-		wantCompactRef model.ModelRef
+		name              string
+		agentsDoc         string
+		agent             string
+		wantModel         model.ModelRef
+		wantWindow        int
+		wantReserve       int
+		wantCompactRef    model.ModelRef
+		wantPricing       *harness.ModelPricing
+		wantCompactPricing *harness.ModelPricing
 	}{
 		{
-			name:           "conversation model with the reserve fallback",
-			agentsDoc:      prepAgentsDocument,
-			agent:          "solo",
-			wantModel:      conversationRef,
-			wantWindow:     4096,
-			wantReserve:    131072,
-			wantCompactRef: conversationRef,
+			name:               "conversation model with the reserve fallback",
+			agentsDoc:          prepAgentsDocument,
+			agent:              "solo",
+			wantModel:          conversationRef,
+			wantWindow:         4096,
+			wantReserve:        131072,
+			wantCompactRef:     conversationRef,
+			wantPricing:        mPricing,
+			wantCompactPricing: mPricing,
 		},
 		{
-			name:           "compact model override via the roster",
-			agentsDoc:      agentsWithCompact(`{"model": "prov/m2"}`),
-			agent:          "solo",
-			wantModel:      conversationRef,
-			wantWindow:     4096,
-			wantReserve:    131072,
-			wantCompactRef: m2Ref,
+			name:               "compact model override via the roster",
+			agentsDoc:          agentsWithCompact(`{"model": "prov/m2"}`),
+			agent:              "solo",
+			wantModel:          conversationRef,
+			wantWindow:         4096,
+			wantReserve:        131072,
+			wantCompactRef:     m2Ref,
+			wantPricing:        mPricing,
+			wantCompactPricing: m2Pricing,
 		},
 		{
-			name:           "compact model that does not resolve falls back",
-			agentsDoc:      agentsWithCompact(`{"model": "prov/absent"}`),
-			agent:          "solo",
-			wantModel:      conversationRef,
-			wantWindow:     4096,
-			wantReserve:    131072,
-			wantCompactRef: conversationRef,
+			name:               "compact model that does not resolve falls back",
+			agentsDoc:          agentsWithCompact(`{"model": "prov/absent"}`),
+			agent:              "solo",
+			wantModel:          conversationRef,
+			wantWindow:         4096,
+			wantReserve:        131072,
+			wantCompactRef:     conversationRef,
+			wantPricing:        mPricing,
+			wantCompactPricing: mPricing,
 		},
 		{
-			name:           "compact key that does not resolve falls back",
-			agentsDoc:      agentsWithCompact(`{"model": "p2/m3"}`),
-			agent:          "solo",
-			wantModel:      conversationRef,
-			wantWindow:     4096,
-			wantReserve:    131072,
-			wantCompactRef: conversationRef,
+			name:               "compact key that does not resolve falls back",
+			agentsDoc:          agentsWithCompact(`{"model": "p2/m3"}`),
+			agent:              "solo",
+			wantModel:          conversationRef,
+			wantWindow:         4096,
+			wantReserve:        131072,
+			wantCompactRef:     conversationRef,
+			wantPricing:        mPricing,
+			wantCompactPricing: mPricing,
 		},
 		{
 			// catalog.Lookup rejects the zero-window model, so the
 			// conversation-model default applies.
-			name:           "compact entry with no positive window falls back",
-			agentsDoc:      agentsWithCompact(`{"model": "prov/mzero"}`),
-			agent:          "solo",
-			wantModel:      conversationRef,
-			wantWindow:     4096,
-			wantReserve:    131072,
-			wantCompactRef: conversationRef,
+			name:               "compact entry with no positive window falls back",
+			agentsDoc:          agentsWithCompact(`{"model": "prov/mzero"}`),
+			agent:              "solo",
+			wantModel:          conversationRef,
+			wantWindow:         4096,
+			wantReserve:        131072,
+			wantCompactRef:     conversationRef,
+			wantPricing:        mPricing,
+			wantCompactPricing: mPricing,
 		},
 		{
-			name:           "conversation reserve from the entry's max output tokens",
-			agentsDoc:      strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
-			agent:          "reservable",
-			wantModel:      m2Ref,
-			wantWindow:     2048,
-			wantReserve:    1000,
-			wantCompactRef: m2Ref,
+			name:               "conversation reserve from the entry's max output tokens",
+			agentsDoc:          strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
+			agent:              "reservable",
+			wantModel:          m2Ref,
+			wantWindow:         2048,
+			wantReserve:        1000,
+			wantCompactRef:     m2Ref,
+			wantPricing:        m2Pricing,
+			wantCompactPricing: m2Pricing,
 		},
 	}
 	for _, tc := range cases {
@@ -224,8 +247,32 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 				t.Fatalf("capture Compact.Model = %s, want %s", capture.Compact.Model.String(), tc.wantCompactRef.String())
 			}
 			testassert.Equal(t, capture.Compact.SystemPrompt, retainedSummarizerPrompt)
+			testassert.Require(t, capture.Pricing.Equal(tc.wantPricing), "capture pricing = %+v, want the conversation entry's catalog rates", capture.Pricing)
+			testassert.Require(t, capture.Compact.Pricing.Equal(tc.wantCompactPricing), "capture compact pricing = %+v, want the final effective compact model's catalog rates", capture.Compact.Pricing)
 		})
 	}
+}
+
+// TestCapturedPricingDropsNonFiniteCatalogRates pins the catalog-to-capture
+// rate copy: a nil cost means unknown pricing, present finite rates are
+// copied independently, and a non-finite catalog rate becomes an absent
+// rate rather than a preparation failure.
+func TestCapturedPricingDropsNonFiniteCatalogRates(t *testing.T) {
+	fpr := func(v float64) *float64 { return &v }
+	if capturedPricing(nil) != nil {
+		t.Fatal("capturedPricing(nil) is not unknown pricing")
+	}
+	cost := &catalog.Cost{
+		Input:      fpr(math.NaN()),
+		Output:     fpr(math.Inf(1)),
+		CacheRead:  fpr(math.Inf(-1)),
+		CacheWrite: fpr(0.25),
+	}
+	got := capturedPricing(cost)
+	testassert.Require(t, got != nil && got.Input == nil && got.Output == nil && got.CacheRead == nil && got.CacheWrite != nil && *got.CacheWrite == 0.25,
+		"capturedPricing(%+v) = %+v, want only the finite rate kept", cost, got)
+	*cost.CacheWrite = 99 // the capture owns its rate pointees
+	testassert.Require(t, *got.CacheWrite == 0.25, "mutating the catalog rate reached the captured pricing: %v", *got.CacheWrite)
 }
 
 // compactRecordingServer records every request's model and authorization and

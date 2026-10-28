@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -689,6 +690,68 @@ func assertExactJSONKeys(t *testing.T, v any, want []string) string {
 	sort.Strings(wantSorted)
 	testassert.Require(t, reflect.DeepEqual(got, wantSorted), "wire keys = %v, want exactly %v", got, wantSorted)
 	return string(data)
+}
+
+// TestProjectionCostEstimatesFromCapturedPricing pins the estimate's wire
+// shape end to end through the composed Runtime: a usage-reporting turn is
+// priced from its captured rates into the hydration totals and its Operation
+// summary, a turn with no usage report leaves both absent, one unknown
+// producer makes the whole Session estimate absent, and a Session with no
+// producer at all carries the present known zero.
+func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		e := newPrepEnv(t, store)
+		// The priced report: {prompt 10, cached 4, completion 2} over the
+		// fixture capture rates 1.5/0.5/3 is (6*1.5 + 4*0.5 + 2*3)/1e6.
+		const want = (6*1.5 + 4*0.5 + 2*3) / 1e6
+
+		empty := e.session("solo")
+		hydration, err := e.r.buildHydration(ctx, empty)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && *hydration.Usage.Totals.EstimatedCostUsd == 0, "no-producer hydration estimate = %+v, want the known zero", hydration.Usage.Totals.EstimatedCostUsd)
+
+		e.server.setScript(func(_ context.Context, body string) []string {
+			return append(textTurnEvents("priced answer"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":4}}}`)
+		})
+		priced := e.session("solo")
+		e.admit(priced, "op-1", "one")
+		e.awaitTerminal(priced, "op-1", harness.OperationSuccess)
+		hydration, err = e.r.buildHydration(ctx, priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && math.Abs(*hydration.Usage.Totals.EstimatedCostUsd-want) < 1e-12, "priced hydration estimate = %+v, want %v", hydration.Usage.Totals.EstimatedCostUsd, want)
+		view, err := e.sessionView(ctx, priced)
+		testassert.NoError(t, err)
+		pricedSummary := projectOperationSummary(view.Operations[0])
+		testassert.Require(t, pricedSummary.Usage.EstimatedCostUsd != nil && math.Abs(*pricedSummary.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate = %+v, want %v", pricedSummary.Usage, want)
+		assertExactJSONKeys(t, pricedSummary, []string{
+			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
+			"settled_at", "status", "usage", "usage.by_model", "usage.estimated_cost_usd",
+		})
+
+		// An unreported turn is an unknown producer: its own estimate and the
+		// Session total are absent, while the priced Operation keeps its value.
+		e.server.setScript(func(_ context.Context, body string) []string {
+			return nil // the default completed text turn reports no usage
+		})
+		e.admit(priced, "op-2", "two")
+		e.awaitTerminal(priced, "op-2", harness.OperationSuccess)
+		hydration, err = e.r.buildHydration(ctx, priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd == nil, "contaminated Session estimate = %+v, want absent", hydration.Usage.Totals.EstimatedCostUsd)
+		view, err = e.sessionView(ctx, priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Operations) == 2, "Operations = %d, want the settled pair", len(view.Operations))
+		repriced := projectOperationSummary(view.Operations[0])
+		unreported := projectOperationSummary(view.Operations[1])
+		testassert.Require(t, repriced.Usage.EstimatedCostUsd != nil && math.Abs(*repriced.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate after the sibling turn = %+v, want %v", repriced.Usage, want)
+		testassert.Require(t, unreported.Usage.EstimatedCostUsd == nil, "unreported Operation estimate = %+v, want absent", unreported.Usage)
+		assertExactJSONKeys(t, unreported, []string{
+			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
+			"settled_at", "status", "usage", "usage.by_model",
+		})
+	})
 }
 
 // oneShotEntriesStore wraps one store: the first ReadEntries after arming

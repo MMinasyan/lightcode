@@ -452,7 +452,7 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 	if err := decoder.Decode(&published); err != nil {
 		t.Fatalf("decode published record %s: %v", string(data), err)
 	}
-	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N5) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
+	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N6) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
 
 	// A second publication is refused — successful publication cannot repeat.
 	second := filepath.Join(dir, "second.json")

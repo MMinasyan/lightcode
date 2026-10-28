@@ -33,6 +33,8 @@ func factFixtureGraph() *testGraph {
 	}}}
 
 	op1 := validOperationRecord()
+	op1.Admission.Execution.Pricing = conversationPricing()
+	op1.Admission.Execution.Compact.Pricing = compactPricing()
 	op1.State.Status = OperationSuccess
 	op1.State.ActiveEffect = nil
 	op1.State.PendingToolCalls = []PendingToolCall{}
@@ -50,7 +52,12 @@ func factFixtureGraph() *testGraph {
 			OperationID: "op-compact",
 			RequestKind: RequestKindCompact,
 			AgentType:   "coder",
-			Execution:   testCapture(),
+			Execution: func() ExecutionCapture {
+				capture := testCapture()
+				capture.Pricing = conversationPricing()
+				capture.Compact.Pricing = compactPricing()
+				return capture
+			}(),
 			AdmittedAt:  testTime,
 		},
 		State: OperationCurrentState{
