@@ -413,22 +413,22 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 		}
 		checkpoint, facts, closeMaintenance, err := h.runContextMaintenance(ctx, c, operationID, exec, capture, planInput, &suspended)
 		if err != nil {
-			closeMaintenance()          // the failure terminal already settled inside the orchestration: dispose now
+			_ = closeMaintenance()      // the failure terminal already settled inside the orchestration: dispose now
 			return model.Request{}, err // the original cause stands; the outer settled guard preserves the existing terminal
 		}
 		if checkpoint != nil {
 			if err := h.commitMaintenance(ctx, c, operationID, capture, planInput, facts, checkpoint, false); err != nil {
-				closeMaintenance()
+				_ = closeMaintenance()
 				return model.Request{}, err // a failed or interrupted publication retains the actual state and error; the waiting conversation never dispatches
 			}
-			closeMaintenance() // the committed checkpoint precedes the maintenance stage's disposal
+			_ = closeMaintenance() // the committed checkpoint precedes the maintenance stage's disposal
 			canonical, checkpointID, boundaryID, err = h.projectCanonical(c, operationID)
 			if err != nil {
 				return model.Request{}, err
 			}
 			view.checkpoint, view.boundary = checkpointID, boundaryID
 		} else {
-			closeMaintenance() // no checkpoint to precede: dispose the unused maintenance stage
+			_ = closeMaintenance() // no checkpoint to precede: dispose the unused maintenance stage
 		}
 		// The frozen contribution view is applied exactly once to the rebuilt
 		// projection; its references now name the new checkpoint and tail.

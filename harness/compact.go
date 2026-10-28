@@ -631,8 +631,7 @@ func (h *Harness) runContextMaintenance(execCtx context.Context, c *coordinator,
 		// only the current owned closer. A plan that fails validation or
 		// ends at none/checkpoint retains the current closer through the
 		// settlement or consumption for the caller to dispose.
-		closeInvocation()
-		closeInvocation = func() error { return nil }
+		_ = closeInvocation()
 		output, closer, err := h.runMaintenanceModel(execCtx, c, operationID, exec, capture, plan.Model, suspended, facts)
 		if err != nil {
 			return nil, facts, closer, err
