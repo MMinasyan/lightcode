@@ -307,7 +307,7 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 		testassert.Equal(t, set.Disposition, agent.DispoReady)
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
-		var compaction *compactionEntry
+		var compaction *contextCheckpointEntry
 		settlements := 0
 		for _, entry := range graph.Entries {
 			if entry.Compaction != nil {
@@ -318,9 +318,9 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 			}
 		}
 		testassert.Require(t, compaction != nil, "no committed compaction entry")
-		testassert.Require(t, compaction.RequestID != "" && compaction.Input != nil && compaction.Evidence != nil && compaction.Evidence.BoundaryEntryID != "", "compaction entry provenance = %+v, want the maintenance identity, actual input, and consumed evidence", compaction)
-		testassert.Require(t, reflect.DeepEqual(compaction.Input, summaryRequest.Messages), "compaction input = %+v, want the exact tool-free summary request the effect consumed", compaction.Input)
-		for _, message := range compaction.Input {
+		testassert.Require(t, len(compaction.Facts) == 1 && compaction.Facts[0].RequestID != "" && compaction.Facts[0].Input != nil && compaction.Evidence != nil && compaction.Evidence.BoundaryEntryID != "", "compaction entry provenance = %+v, want the maintenance identity, actual input, and consumed evidence", compaction)
+		testassert.Require(t, reflect.DeepEqual(compaction.Facts[0].Input, summaryRequest.Messages), "compaction fact input = %+v, want the exact tool-free summary request the effect consumed", compaction.Facts[0].Input)
+		for _, message := range compaction.Facts[0].Input {
 			testassert.Require(t, len(message.ToolCalls) == 0, "compaction input carries tool members: %+v", message)
 		}
 		testassert.Equal(t, settlements, 0)
@@ -349,7 +349,7 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 				settlement = entry.Settlement
 			}
 		}
-		testassert.Require(t, settlement != nil && settlement.Input != nil && settlement.RequestID != "" && settlement.Evidence != nil, "settlement = %+v, want the maintenance facts settled on the terminal", settlement)
+		testassert.Require(t, settlement != nil && len(settlement.Facts) > 0 && settlement.RequestID != "" && settlement.Evidence != nil, "settlement = %+v, want the maintenance facts settled on the terminal", settlement)
 	})
 	t.Run("checkpointed maintenance then failed maintenance attributes each producer once", func(t *testing.T) {
 		// One Operation carries two maintenance producers: the first
@@ -387,7 +387,7 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 		testassert.Equal(t, dispatchCalls, 1) // the failed maintenance dispatched no conversation request
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
-		var compaction *compactionEntry
+		var compaction *contextCheckpointEntry
 		var settlement *operationSettlementEntry
 		compactions, settlements := 0, 0
 		for i := range graph.Entries {
@@ -401,12 +401,12 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 			}
 		}
 		testassert.Require(t, compactions == 1 && settlements == 1, "facts carriers = %d checkpoints, %d terminals, want each maintenance settled once", compactions, settlements)
-		testassert.Require(t, compaction.RequestID != "" && settlement.RequestID != "" && compaction.RequestID != settlement.RequestID,
-			"producers = checkpoint %q terminal %q, want two distinct maintenance identities", compaction.RequestID, settlement.RequestID)
-		testassert.Require(t, reflect.DeepEqual(compaction.Input, summaryInputs[0]) && reflect.DeepEqual(settlement.Input, summaryInputs[1]),
-			"facts carry summary inputs of the wrong producers: checkpoint %+v terminal %+v", compaction.Input, settlement.Input)
-		testassert.Require(t, compaction.Usage != nil && compaction.Usage.InputTokens == 1,
-			"checkpoint usage = %+v, want the producing summary's usage billed on its own entry", compaction.Usage)
+		testassert.Require(t, compaction.Facts[0].RequestID != "" && settlement.RequestID != "" && compaction.Facts[0].RequestID != settlement.RequestID,
+			"producers = checkpoint %q terminal %q, want two distinct maintenance identities", compaction.Facts[0].RequestID, settlement.RequestID)
+		testassert.Require(t, reflect.DeepEqual(compaction.Facts[0].Input, summaryInputs[0]) && reflect.DeepEqual(settlement.Facts[0].Input, summaryInputs[1]),
+			"facts carry summary inputs of the wrong producers: checkpoint %+v terminal %+v", compaction.Facts[0].Input, settlement.Facts[0].Input)
+		testassert.Require(t, compaction.Facts[0].Usage != nil && compaction.Facts[0].Usage.InputTokens == 1,
+			"checkpoint fact usage = %+v, want the producing summary's usage billed on its own entry", compaction.Facts[0].Usage)
 		testassert.Require(t, graph.Operations[0].State.Status == OperationFailure && graph.Operations[0].State.Terminal != nil,
 			"operation = %+v, want the cold graph terminal on the maintenance failure", graph.Operations[0].State)
 	})
@@ -725,7 +725,7 @@ func TestEvidenceBoundaryDoesNotPredateItsCheckpoint(t *testing.T) {
 	inputID, checkpointID, ownerID := hexID(1), hexID(2), hexID(3)
 	v := &graphValidation{sessionID: testSessionID, entryByID: map[string]graphEntry{
 		inputID:      {Envelope: Entry{ID: inputID, Sequence: 1}, Input: &inputEntry{}},
-		checkpointID: {Envelope: Entry{ID: checkpointID, Sequence: 2}, Compaction: &compactionEntry{}},
+		checkpointID: {Envelope: Entry{ID: checkpointID, Sequence: 2}, Compaction: &contextCheckpointEntry{}},
 	}}
 	owner := graphEntry{Envelope: Entry{ID: ownerID, Sequence: 3}}
 	evidence := &RequestEvidence{CheckpointEntryID: checkpointID, BoundaryEntryID: inputID}
@@ -1208,10 +1208,10 @@ func TestAutomaticMaintenanceEvidenceReconcilesEffectfulIdentities(t *testing.T)
 			if entry.Kind != EntryCompaction {
 				continue
 			}
-			comp, err := decodeCompactionEntry(entry)
+			comp, err := decodeContextCheckpointEntry(entry)
 			testassert.NoError(t, err)
-			testassert.Require(t, comp.ConsumedRequestID == sourceID && comp.RequestID != "" && comp.RequestID != sourceID,
-				"checkpoint identity = producer %q consumed %q, want the source %q kept distinct from the maintenance producer", comp.RequestID, comp.ConsumedRequestID, sourceID)
+			testassert.Require(t, comp.ConsumedRequestID == sourceID && comp.Facts[0].RequestID != "" && comp.Facts[0].RequestID != sourceID,
+				"checkpoint identity = producer %q consumed %q, want the source %q kept distinct from the maintenance producer", comp.Facts[0].RequestID, comp.ConsumedRequestID, sourceID)
 			records++
 		}
 		testassert.Equal(t, records, 1)
@@ -1224,7 +1224,7 @@ func TestAutomaticMaintenanceEvidenceReconcilesEffectfulIdentities(t *testing.T)
 			}
 			sett, err := decodeOperationSettlementEntry(entry)
 			testassert.NoError(t, err)
-			testassert.Require(t, sett.Input != nil && sett.Evidence != nil, "maintenance failure settlement = %+v, want the retained facts", sett)
+			testassert.Require(t, len(sett.Facts) > 0 && sett.Evidence != nil, "maintenance failure settlement = %+v, want the retained facts", sett)
 			testassert.Require(t, sett.ConsumedRequestID == failSource && sett.RequestID != "" && sett.RequestID != failSource,
 				"settlement identity = producer %q consumed %q, want the source %q kept distinct from the maintenance producer", sett.RequestID, sett.ConsumedRequestID, failSource)
 			settlements++
@@ -1262,7 +1262,7 @@ func TestAutomaticMaintenanceEvidenceReconcilesEffectfulIdentities(t *testing.T)
 			}
 			sett := entry.Settlement
 			settlements++
-			testassert.Require(t, sett.Input == nil, "opener-failed settlement invented actual input: %+v", sett.Input)
+			testassert.Require(t, len(sett.Facts) == 0, "opener-failed settlement invented actual input: %+v", sett.Facts)
 			testassert.Require(t, sett.CompactionUsage && sett.Evidence != nil && len(sett.Evidence.HookIDs) == 2 &&
 				sett.Evidence.HookIDs[0].HookID == "req.effectful.one" && sett.Evidence.HookIDs[1].HookID == "req.effectful.two",
 				"opener-failed settlement = %+v, want the retained maintenance evidence provenance with both effectful contributors", sett)

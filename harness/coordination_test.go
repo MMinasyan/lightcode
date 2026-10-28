@@ -938,7 +938,7 @@ func TestWaitConvergence(t *testing.T) {
 		h, cancel := newCancelableHarness(t, store, prepared, nil)
 		defer cancel()
 		replaces := 0
-		firstErr := fmt.Errorf("first storage failure: %w", ErrStorage)
+		firstErr := errors.New("first plain publication failure") // a marked publication failure with a plain cause: no storage sentinel
 		laterErr := fmt.Errorf("later storage failure: %w", ErrStorage)
 		failed := make(chan struct{}, 1)
 		store.txHook = func(step string) error {
@@ -972,7 +972,8 @@ func TestWaitConvergence(t *testing.T) {
 		cancel()
 		{
 			err := h.Wait(context.Background())
-			testassert.Require(t, errors.Is(err, firstErr), "Wait = %v, want the first retained storage error (later: %v)", err, laterErr)
+			testassert.Require(t, errors.Is(err, firstErr), "Wait = %v, want the first retained publication failure (later: %v)", err, laterErr)
+			testassert.Require(t, !errors.Is(err, laterErr), "Wait = %v, want the first retained failure not replaced by a later one", err)
 		}
 		{
 			rec := settledOperation(t, store, sessionA, "op-1")

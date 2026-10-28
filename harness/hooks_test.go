@@ -989,7 +989,7 @@ func TestRequestHookFailureSettlesTerminalOnce(t *testing.T) {
 	testassert.Equal(t, ran, 1)
 	settlement := graphSettlementOf(t, store, sessionID)
 	testassert.Require(t, settlement.Status == OperationFailure && settlement.Detail == "request binding broke" &&
-		settlement.RequestID != "" && settlement.Evidence == nil && settlement.Input == nil,
+		settlement.RequestID != "" && settlement.Evidence == nil && len(settlement.Facts) == 0,
 		"settlement = %+v, want exactly one failure terminal with the hook diagnostic and the request witness", settlement)
 	committed := hookGraphHookResults(t, store, sessionID)
 	testassert.Require(t, len(committed) == 1 && committed[0].Status == hookFailed && committed[0].Evidence == ExecutionObserved &&

@@ -373,6 +373,7 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 			Model:        model.ModelRef{Provider: "prov", Model: "m"},
 			SystemPrompt: "summarize",
 		},
+		Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 	}
 }
 

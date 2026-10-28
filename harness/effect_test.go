@@ -3443,41 +3443,91 @@ func TestAssistantEntryBoundedDiagnosticIsAlwaysValidUTF8(t *testing.T) {
 	t.Fatalf("no assistant entry with two calls committed")
 }
 
-// TestModelEffectIntentCancellationSettlesInterruption proves an intent
-// transaction aborted by cancellation settles the cancellation outcome: the
-// run ends in the fixed terminal interruption, never in a boundary violation.
-func TestModelEffectIntentCancellationSettlesInterruption(t *testing.T) {
+// TestModelEffectIntentPublicationUnderCancellationRetainsRunningState proves
+// the attempted intent publication's owner boundary: when the transaction
+// itself cancels the execution and returns context.Canceled or
+// DeadlineExceeded, the intent error stays marked publication-origin and
+// propagates with its original cause, the actual running state is retained
+// for recovery, and no compensating terminal, model, or waiting-request
+// dispatch follows.
+func TestModelEffectIntentPublicationUnderCancellationRetainsRunningState(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			calls := 0
+			modelFn := func(context.Context, model.Request) (model.Stream, error) {
+				calls++
+				return completedTurnStream(), nil
+			}
+			h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
+			{
+				_, err := submitText(t, h, sessionID, "op-2", MessageModeRegular, "queued")
+				testassert.NoError(t, err)
+			}
+			injected := fmt.Errorf("intent publication aborted: %w", cause)
+			replaced := 0
+			store.txHook = func(step string) error {
+				if step == "replace_register" {
+					replaced++
+					if replaced == 1 { // the intent transaction of the first model effect: it cancels the execution as it is invoked
+						harnessCancel()
+						return injected
+					}
+				}
+				return nil
+			}
+			{
+				err := executeDirect(h, c, h.ctx, testOpID, prepared)
+				testassert.Require(t, errors.Is(err, cause), "error = %v, want the original %v publication cause preserved", err, cause)
+				testassert.Require(t, isPublicationFailure(err), "error = %v, want the publication-origin classification", err)
+			}
+			store.txHook = nil
+			graph, err := validateFixture(t, store, sessionID)
+			testassert.NoError(t, err)
+			for _, entry := range graph.Entries {
+				testassert.Require(t, entry.Settlement == nil, "attempted intent publication fabricated a compensating terminal write")
+				testassert.Require(t, entry.Assistant == nil, "assistant entry %s published after an aborted intent", entry.Envelope.ID)
+			}
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil, "operation state = %+v, want the actual running state retained for recovery", rec.State)
+			testassert.Equal(t, calls, 0) // no compensating model dispatch
+			testassert.Require(t, !storedOperationExists(store, sessionID, "op-2"), "the waiting conversation request dispatched after the failed publication")
+		})
+	}
+}
+
+// TestModelEffectIntentCancellationBeforePublicationSettlesInterruption
+// retains the genuinely unattempted-cancellation sibling: the execution
+// context is already canceled when the effect begins, the observed cancellation
+// returns unwrapped before the intent transaction is ever invoked, and the
+// ordinary interruption settlement publishes — the effect's first recorded
+// mutation step is the settlement's own entry insert, never an intent replace.
+func TestModelEffectIntentCancellationBeforePublicationSettlesInterruption(t *testing.T) {
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		return completedTurnStream(), nil
 	}
-	spy := &toolSpy{}
-	var cancel context.CancelFunc
-	h, store, c, sessionID, prepared, harnessCancel := newExecutionHarness(t, modelFn, spy.tool)
-	cancel = harnessCancel
-	replaces := 0
+	h, store, c, sessionID := newEffectHarness(t, modelFn)
+	var steps []string
 	store.txHook = func(step string) error {
-		if step == "replace_register" {
-			replaces++
-			if replaces == 1 { // the intent transaction of the first model effect
-				cancel()
-				return context.Canceled
-			}
-		}
+		steps = append(steps, step)
 		return nil
 	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel() // the execution context is already canceled when the effect begins
 	{
-		err := executeDirect(h, c, h.ctx, testOpID, prepared)
+		set, err := invokeModelEffectCtx(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), canceled, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)
+		testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the ordinary interruption settlement", set)
 	}
+	testassert.Require(t, len(steps) > 0 && steps[0] == "insert_entry", "effect transactions = %v, want no intent transaction before the interruption settlement's inserts", steps)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
 	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
-	graph, err := validateFixture(t, store, sessionID)
-	testassert.NoError(t, err)
-	for _, entry := range graph.Entries {
-		testassert.Require(t, entry.Assistant == nil, "assistant entry %s published after an aborted intent", entry.Envelope.ID)
-	}
 	requireSessionCleared(t, h, sessionID)
+	{
+		_, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
+	}
 }
 
 // TestToolEffectIntentCancellationSettlesInterrupted proves a tool intent

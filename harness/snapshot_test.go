@@ -26,7 +26,7 @@ import (
 // the excluded evidence kind.
 func factFixtureGraph() *testGraph {
 	session := validSessionRecord()
-	session.State.CompactionEntryID = hexID(8)
+	session.State.CheckpointEntryID = hexID(8)
 	session.State.Usage = UsageTotals{ByModel: []ModelUsage{{
 		Model: testModelRef(),
 		Usage: UsageCount{InputTokens: 4, CachedInputTokens: 2, OutputTokens: 3},
@@ -100,8 +100,8 @@ func factFixtureGraph() *testGraph {
 
 	compaction := validCompactionEntry("op-compact")
 	compaction.EntryID = hexID(8)
-	compaction.BoundaryEntryID = hexID(2)
-	compaction.Usage = &UsageCount{InputTokens: 1, CachedInputTokens: 1, OutputTokens: 1}
+	compaction.BoundaryEntryID = testResultID
+	compaction.Facts[0].Usage = &UsageCount{InputTokens: 1, CachedInputTokens: 1, OutputTokens: 1}
 
 	settlement2 := validSettlementEntry()
 	settlement2.EntryID = hexID(9)
@@ -375,7 +375,7 @@ func TestHistoryViewFactUnionAndOwnership(t *testing.T) {
 					EntryAssistant:           fact.Assistant != nil,
 					EntryToolResult:          fact.ToolResult != nil,
 					EntrySignal:              fact.Signal != nil,
-					EntryCompaction:          fact.Compaction != nil,
+					EntryCompaction:          fact.Checkpoint != nil,
 					EntryOperationSettlement: fact.Settlement != nil,
 				} {
 					if isKind {
@@ -397,7 +397,7 @@ func TestHistoryViewFactUnionAndOwnership(t *testing.T) {
 		testassert.Require(t, facts[3].Assistant != nil && facts[3].Assistant.Usage != nil && *facts[3].Assistant.Usage == (UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}), "completing assistant fact = %+v", facts[3])
 		testassert.Require(t, facts[4].Signal != nil && facts[4].Signal.Signal == SignalInterruption && facts[4].Signal.RelatedOperation != nil && facts[4].Signal.RelatedOperation.OperationID == testOpID, "owned signal fact = %+v", facts[4])
 		testassert.Require(t, facts[5].Settlement != nil && facts[5].Settlement.Status == OperationSuccess, "settlement fact = %+v", facts[5])
-		testassert.Require(t, facts[6].Compaction != nil && facts[6].Compaction.BoundaryEntryID == hexID(2) && facts[6].Compaction.Usage != nil, "compaction fact = %+v", facts[6])
+		testassert.Require(t, facts[6].Checkpoint != nil && facts[6].Checkpoint.BoundaryEntryID == testResultID && facts[6].Checkpoint.Facts[0].Usage != nil, "compaction fact = %+v", facts[6])
 		testassert.Require(t, facts[8].Signal != nil && facts[8].Signal.RelatedMember != nil && facts[8].Signal.OperationID == "", "background completion fact = %+v", facts[8])
 
 		// The composed view is coherent: sorted Operation summaries, no busy
@@ -556,7 +556,12 @@ func TestHistoryViewAccessorsPure(t *testing.T) {
 	compactionAt := func(id string, seq int64) graphEntry {
 		return graphEntry{
 			Envelope:   Entry{ID: id, Sequence: seq, Kind: EntryCompaction, CommittedAt: testTime},
-			Compaction: &compactionEntry{EntryID: id, Summary: "summary", Usage: &UsageCount{InputTokens: 9, CachedInputTokens: 9, OutputTokens: 9}},
+			Compaction: &contextCheckpointEntry{EntryID: id, Messages: []model.Message{{Role: model.RoleAssistant, Content: []model.ContentPart{{Kind: model.PartText, Text: "summary"}}}}, Facts: []maintenanceFact{{
+				RequestID: "maintenance-" + id,
+				Model:     testModelRef(),
+				Input:     []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}}},
+				Usage:     &UsageCount{InputTokens: 9, CachedInputTokens: 9, OutputTokens: 9},
+			}}},
 		}
 	}
 	count := func(v int64) *UsageCount { return &UsageCount{InputTokens: v} }
@@ -684,7 +689,7 @@ func TestHistoryViewRetainedCaptureStable(t *testing.T) {
 	c.graph.Operations = append(c.graph.Operations, validOperationRecord())
 	c.graph.Session.Revision++
 	c.localRev++
-	c.graph.Session.State.CompactionEntryID = futureAssistantID
+	c.graph.Session.State.CheckpointEntryID = futureAssistantID
 	c.graph.Entries = append(c.graph.Entries,
 		graphEntry{
 			Envelope: Entry{ID: futureAssistantID, Sequence: 900, Kind: EntryAssistant, CommittedAt: testTime},

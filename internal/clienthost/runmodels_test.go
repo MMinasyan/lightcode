@@ -37,7 +37,7 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/health":
-			_ = json.NewEncoder(w).Encode(map[string]string{"instance_id": instance, "protocol_version": string(protocol.N4)})
+			_ = json.NewEncoder(w).Encode(map[string]string{"instance_id": instance, "protocol_version": string(protocol.N5)})
 		case "/v1/configuration":
 			w.WriteHeader(status)
 			_, _ = w.Write(body)
@@ -55,7 +55,7 @@ func modelsEndpoint(t *testing.T, status int, body []byte) clienthost.Options {
 		testassert.Check(t, reflect.DeepEqual(requests, want), "requests = %v, want exactly %v", requests, want)
 	})
 	dir := t.TempDir()
-	record, err := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N4), "credential": credential})
+	record, err := json.Marshal(map[string]string{"endpoint": server.URL, "instance_id": instance, "protocol_version": string(protocol.N5), "credential": credential})
 	testassert.NoError(t, err)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.json"), record, 0o600))
 	return clienthost.Options{DataDir: dir, Executable: filepath.Join(dir, "must-not-launch")}

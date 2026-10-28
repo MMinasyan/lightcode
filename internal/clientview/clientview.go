@@ -206,10 +206,10 @@ func ItemID(item protocol.ConversationItem) (string, error) {
 			return "", fmt.Errorf("signal conversation item: %w", err)
 		}
 		id = value.ItemId
-	case "compaction":
-		value, err := item.AsCompactionItem()
+	case "context_checkpoint":
+		value, err := item.AsCheckpointItem()
 		if err != nil {
-			return "", fmt.Errorf("compaction conversation item: %w", err)
+			return "", fmt.Errorf("checkpoint conversation item: %w", err)
 		}
 		id = value.ItemId
 	case "operation_end":

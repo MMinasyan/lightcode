@@ -339,7 +339,7 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		testassert.NoError(t, err)
 		var childSessionState struct {
 			State struct {
-				CompactionEntryID string `json:"compaction_entry_id"`
+				CheckpointEntryID string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
@@ -358,10 +358,10 @@ func TestPublicLaunchChildSessionAutomaticCompaction(t *testing.T) {
 		compactions := 0
 		for _, fact := range childFacts {
 			if fact.Kind == harness.EntryCompaction {
-				comp := fact.Compaction
+				comp := fact.Checkpoint
 				testassert.Require(t, comp != nil, "%v", "compaction fact has no payload")
 				compactions++
-				testassert.Require(t, comp.OperationID == "child-op-2" && comp.Summary == "child summary" && comp.Usage != nil && *comp.Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) && childSessionState.State.CompactionEntryID == comp.EntryID, "child compaction/projection = %+v", comp)
+				testassert.Require(t, comp.OperationID == "child-op-2" && len(comp.Messages) == 1 && comp.Messages[0].TextContent() == "[Previous conversation summary]\n\nchild summary\n\n[End of summary. Continue from here.]" && comp.Facts[0].Usage != nil && *comp.Facts[0].Usage == (harness.UsageCount{InputTokens: 1, OutputTokens: 1}) && childSessionState.State.CheckpointEntryID == comp.EntryID, "child compaction/projection = %+v", comp)
 			}
 		}
 		testassert.Equal(t, compactions, 1)

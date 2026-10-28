@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -342,6 +343,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	return harness.Execution{
 		OpenInvocation: openInvocation,
 		Permissions:    snapshot.permissionPolicy(workspace),
+		Strategy:       productionStrategy,
 		Close: func() error {
 			releaseOperation()
 			err := operation.close()
@@ -380,22 +382,27 @@ func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invo
 	return hooks, nil
 }
 
+// productionStrategy is the one context strategy binding this production
+// preparation supplies: the included summary policy. Its identity and
+// declared requirement are resolved capture inputs; the implementation is the
+// owned execution resource the opened Execution carries.
+var productionStrategy = harness.IncludedStrategyBinding()
+
 // requireCatalogModel admits only a selected model that resolves in the
-// captured catalog with a positive context window, and rejects a wholly
+// captured catalog, and rejects a wholly
 // empty selection with the retained "no model configured" diagnostic. A
 // partial identity keeps the catalog path: it is not resolvable there either.
+// The context-window requirement is the selected strategy's declared
+// metadata, enforced by the Harness admission gate over the capture.
 // Credentials and provider connection are resolved by the concrete
 // preparation that follows this availability check.
 func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 	if ref.IsZero() {
 		return fmt.Errorf("no model configured: %w", harness.ErrInvalid)
 	}
-	_, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
+	_, _, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	if err != nil {
 		return fmt.Errorf("agent model %s is not available in the catalog: %w: %w", ref.String(), err, harness.ErrInvalid)
-	}
-	if entry.ContextWindow <= 0 {
-		return fmt.Errorf("agent model %s has no positive context window: %w", ref.String(), harness.ErrInvalid)
 	}
 	return nil
 }
@@ -501,6 +508,10 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		Compact: harness.CompactCapture{
 			Model:        compactRef,
 			SystemPrompt: compactType.Prompt,
+		},
+		Strategy: harness.StrategyCapture{
+			ID:                    productionStrategy.ID,
+			RequiresContextWindow: productionStrategy.RequiresContextWindow,
 		},
 	}
 	workspace := req.Session.Identity.Workspace
@@ -806,6 +817,15 @@ func validateHookedCapture(base, next harness.ExecutionCapture) error {
 	}
 	if next.ConfigurationRevision != base.ConfigurationRevision {
 		return fmt.Errorf("preparation hook changed the captured revision: %w", harness.ErrInvalid)
+	}
+	if next.Strategy.ID != base.Strategy.ID {
+		return fmt.Errorf("preparation hook changed the captured strategy ID: %w", harness.ErrInvalid)
+	}
+	if next.Strategy.RequiresContextWindow != base.Strategy.RequiresContextWindow {
+		return fmt.Errorf("preparation hook changed the captured strategy requirement: %w", harness.ErrInvalid)
+	}
+	if !bytes.Equal(next.Strategy.Settings, base.Strategy.Settings) {
+		return fmt.Errorf("preparation hook changed the captured strategy settings: %w", harness.ErrInvalid)
 	}
 	if !slices.Equal(next.Capabilities, base.Capabilities) {
 		return fmt.Errorf("preparation hook changed the captured capability IDs: %w", harness.ErrInvalid)

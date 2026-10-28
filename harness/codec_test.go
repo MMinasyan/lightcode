@@ -52,6 +52,7 @@ func testCapture() ExecutionCapture {
 		SystemPrompt:          "system",
 		Tools:                 []model.ToolDefinition{testToolDefinition()},
 		Compact:               testCompactCapture(),
+		Strategy:              StrategyCapture{ID: IncludedStrategyID, RequiresContextWindow: true},
 	}
 }
 
@@ -175,22 +176,27 @@ func validSettlementEntry() operationSettlementEntry {
 	}
 }
 
-func validCompactionEntry(operationID string) compactionEntry {
-	return compactionEntry{
-		SessionID:             testSessionID,
-		EntryID:               testEntryID,
-		OperationID:           operationID,
-		Summary:               "Summary of the earlier conversation.",
-		BoundaryEntryID:       hexID(2),
-		Model:                 testModelRef(),
-		ConfigurationRevision: "rev-1",
-		RequestID:             "maintenance-one",
-		ConsumedRequestID:     "request-two",
-		Input: []model.Message{
-			{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "compact prompt"}}},
-			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
+func validCompactionEntry(operationID string) contextCheckpointEntry {
+	return contextCheckpointEntry{
+		SessionID:   testSessionID,
+		EntryID:     testEntryID,
+		OperationID: operationID,
+		StrategyID:  IncludedStrategyID,
+		Messages: []model.Message{
+			{Role: model.RoleAssistant, Source: testModelRef(), Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\nSummary of the earlier conversation.\n\n[End of summary. Continue from here.]"}}},
 		},
-		Evidence: &RequestEvidence{BoundaryEntryID: hexID(1)},
+		BoundaryEntryID:       hexID(2),
+		ConfigurationRevision: "rev-1",
+		Facts: []maintenanceFact{{
+			RequestID: "maintenance-one",
+			Model:     testModelRef(),
+			Input: []model.Message{
+				{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "compact prompt"}}},
+				{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
+			},
+		}},
+		ConsumedRequestID: "request-two",
+		Evidence:          &RequestEvidence{BoundaryEntryID: hexID(1)},
 	}
 }
 
@@ -376,18 +382,18 @@ func TestEntryPayloadRoundTrip(t *testing.T) {
 			env:  Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime},
 			encode: func() (json.RawMessage, error) {
 				v := validCompactionEntry(testOpID)
-				v.Usage = testUsage(3)
-				return encodeCompactionEntry(v)
+				v.Facts[0].Usage = testUsage(3)
+				return encodeContextCheckpointEntry(v)
 			},
-			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+			decode: func(env Entry) error { _, err := decodeContextCheckpointEntry(env); return err },
 		},
 		{
 			name: "compaction operationless fork copy",
 			env:  Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime},
 			encode: func() (json.RawMessage, error) {
-				return encodeCompactionEntry(validCompactionEntry(""))
+				return encodeContextCheckpointEntry(validCompactionEntry(""))
 			},
-			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+			decode: func(env Entry) error { _, err := decodeContextCheckpointEntry(env); return err },
 		},
 	}
 	for _, tc := range cases {
@@ -478,10 +484,10 @@ func TestEntryPayloadRejectsInvalidWire(t *testing.T) {
 			wrongValue: json.RawMessage(`"prov/gpt-x"`),
 			payload: func() (json.RawMessage, error) {
 				v := validCompactionEntry(testOpID)
-				v.Usage = testUsage(1)
-				return encodeCompactionEntry(v)
+				v.Facts[0].Usage = testUsage(1)
+				return encodeContextCheckpointEntry(v)
 			},
-			decode: func(env Entry) error { _, err := decodeCompactionEntry(env); return err },
+			decode: func(env Entry) error { _, err := decodeContextCheckpointEntry(env); return err },
 		},
 	}
 	for _, kind := range kinds {
@@ -2473,129 +2479,140 @@ func TestBackgroundCompletionSignalRules(t *testing.T) {
 // identity and usage members, the fork-prefix usage rule, and the value
 // rules enforced on both codec sides.
 func TestCompactionEntryPayloadRules(t *testing.T) {
-	t.Run("round trips owned with and without usage", func(t *testing.T) {
+	t.Run("round trips owned with and without fact usage", func(t *testing.T) {
 		for _, withUsage := range []bool{false, true} {
 			v := validCompactionEntry(testOpID)
 			if withUsage {
-				v.Usage = &UsageCount{InputTokens: 11, CachedInputTokens: 4, OutputTokens: 7}
+				v.Facts[0].Usage = &UsageCount{InputTokens: 11, CachedInputTokens: 4, OutputTokens: 7}
 			}
-			raw, err := encodeCompactionEntry(v)
+			raw, err := encodeContextCheckpointEntry(v)
 			testassert.Require(t, err == nil, "encode (usage %v): %v", withUsage, err)
 			env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime, Payload: raw}
-			got, err := decodeCompactionEntry(env)
+			got, err := decodeContextCheckpointEntry(env)
 			testassert.Require(t, err == nil, "decode (usage %v): %v", withUsage, err)
-			testassert.Require(t, (got.Usage == nil) == (v.Usage == nil), "decoded usage presence %+v, want %+v", got.Usage, v.Usage)
-			if withUsage && *got.Usage != *v.Usage {
-				t.Fatalf("decoded usage %+v, want %+v", *got.Usage, *v.Usage)
+			testassert.Require(t, (got.Facts[0].Usage == nil) == (v.Facts[0].Usage == nil), "decoded fact usage presence %+v, want %+v", got.Facts[0].Usage, v.Facts[0].Usage)
+			if withUsage && *got.Facts[0].Usage != *v.Facts[0].Usage {
+				t.Fatalf("decoded fact usage %+v, want %+v", *got.Facts[0].Usage, *v.Facts[0].Usage)
 			}
-			got.Usage = v.Usage // pointer identity is irrelevant; the counts compared above
 			if !reflect.DeepEqual(got, v) {
 				t.Fatalf("decoded compaction entry %+v, want %+v", got, v)
 			}
-			again, err := encodeCompactionEntry(got)
+			again, err := encodeContextCheckpointEntry(got)
 			testassert.Require(t, err == nil, "re-encode (usage %v): %v", withUsage, err)
 			testassert.Require(t, string(again) == string(raw), "re-encoded bytes %s, want %s", again, raw)
 		}
 	})
 
 	t.Run("round trips operationless fork copy", func(t *testing.T) {
-		raw, err := encodeCompactionEntry(validCompactionEntry(""))
+		raw, err := encodeContextCheckpointEntry(validCompactionEntry(""))
 		testassert.NoError(t, err)
 		env := Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime, Payload: raw}
-		got, err := decodeCompactionEntry(env)
+		got, err := decodeContextCheckpointEntry(env)
 		testassert.NoError(t, err)
-		testassert.Require(t, got.OperationID == "" && got.Usage == nil, "operationless decode = %+v", got)
+		testassert.Require(t, got.OperationID == "" && got.Facts[0].Usage == nil, "operationless decode = %+v", got)
 	})
 
 	t.Run("encode rejects invalid values", func(t *testing.T) {
 		cases := []struct {
 			name   string
-			mutate func(*compactionEntry)
+			mutate func(*contextCheckpointEntry)
 		}{
-			{"non-hex session id", func(v *compactionEntry) { v.SessionID = "ghost" }},
-			{"non-hex entry id", func(v *compactionEntry) { v.EntryID = "ghost" }},
-			{"non-hex boundary entry id", func(v *compactionEntry) { v.BoundaryEntryID = "ghost" }},
-			{"empty summary", func(v *compactionEntry) { v.Summary = "" }},
-			{"empty boundary entry id", func(v *compactionEntry) { v.BoundaryEntryID = "" }},
-			{"incomplete model", func(v *compactionEntry) { v.Model = model.ModelRef{Provider: "prov"} }},
-			{"empty configuration revision", func(v *compactionEntry) { v.ConfigurationRevision = "" }},
-			{"operationless with usage", func(v *compactionEntry) { v.OperationID = ""; v.Usage = testUsage(1) }},
+			{"non-hex session id", func(v *contextCheckpointEntry) { v.SessionID = "ghost" }},
+			{"non-hex entry id", func(v *contextCheckpointEntry) { v.EntryID = "ghost" }},
+			{"non-hex boundary entry id", func(v *contextCheckpointEntry) { v.BoundaryEntryID = "ghost" }},
+			{"empty strategy id", func(v *contextCheckpointEntry) { v.StrategyID = "" }},
+			{"empty messages", func(v *contextCheckpointEntry) { v.Messages = nil }},
+			{"unpaired tool call", func(v *contextCheckpointEntry) {
+				v.Messages = []model.Message{{Role: model.RoleAssistant, Source: testModelRef(), ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}}}
+			}},
+			{"unpaired tool result", func(v *contextCheckpointEntry) {
+				v.Messages = []model.Message{{Role: model.RoleTool, ToolCallID: "call-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "result"}}}}
+			}},
+			{"empty boundary entry id", func(v *contextCheckpointEntry) { v.BoundaryEntryID = "" }},
+			{"incomplete fact model", func(v *contextCheckpointEntry) { v.Facts[0].Model = model.ModelRef{Provider: "prov"} }},
+			{"empty configuration revision", func(v *contextCheckpointEntry) { v.ConfigurationRevision = "" }},
+			{"operationless with fact usage", func(v *contextCheckpointEntry) { v.OperationID = ""; v.Facts[0].Usage = testUsage(1) }},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				v := validCompactionEntry(testOpID)
 				tc.mutate(&v)
-				_, err := encodeCompactionEntry(v)
+				_, err := encodeContextCheckpointEntry(v)
 				testassert.Require(t, err != nil && errors.Is(err, ErrInvalid), "expected rejection; error %v is not ErrInvalid", err)
 			})
 		}
 	})
 
 	t.Run("decode rejects invalid wire", func(t *testing.T) {
-		raw, err := encodeCompactionEntry(validCompactionEntry(testOpID))
+		raw, err := encodeContextCheckpointEntry(validCompactionEntry(testOpID))
 		testassert.NoError(t, err)
 		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime}
 		rejections := []struct {
 			name    string
 			payload json.RawMessage
 		}{
-			{"missing summary", dropKey(raw, "summary")},
-			{"empty summary", setKey(raw, "summary", json.RawMessage(`""`))},
-			{"null summary", setKey(raw, "summary", json.RawMessage(`null`))},
+			{"missing strategy id", dropKey(raw, "strategy_id")},
+			{"empty strategy id", setKey(raw, "strategy_id", json.RawMessage(`""`))},
+			{"missing messages", dropKey(raw, "messages")},
+			{"empty messages", setKey(raw, "messages", json.RawMessage(`[]`))},
+			{"message with unpaired tool call", setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"hi"}],"tool_calls":[{"id":"call-1","name":"echo","arguments_base64":"e30="}]}]`))},
+			{"message tool call with empty id", setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"tool_calls":[{"id":"","name":"echo","arguments_base64":"e30="}]}]`))},
+			{"message tool call with non-base64 arguments", setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"tool_calls":[{"id":"call-1","name":"echo","arguments_base64":"!!!"}]}]`))},
 			{"missing boundary entry id", dropKey(raw, "boundary_entry_id")},
 			{"empty boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`""`))},
 			{"null boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`null`))},
 			{"non-hex boundary entry id", setKey(raw, "boundary_entry_id", json.RawMessage(`"zz"`))},
-			{"missing model", dropKey(raw, "model")},
-			{"null model", setKey(raw, "model", json.RawMessage(`null`))},
-			{"incomplete model", setKey(raw, "model", json.RawMessage(`{"provider":"prov"}`))},
+			{"missing facts", dropKey(raw, "facts")},
+			{"null facts", setKey(raw, "facts", json.RawMessage(`null`))},
+			{"wrong container facts", setKey(raw, "facts", json.RawMessage(`0`))},
+			{"fact missing request id", setKey(raw, "facts", json.RawMessage(`[{"model":{"provider":"prov","model":"gpt-x"},"input":[{"role":"user","content":[{"kind":"text","text":"x"}]}]}]`))},
+			{"fact incomplete model", setKey(raw, "facts", json.RawMessage(`[{"request_id":"maintenance-one","model":{"provider":"prov"},"input":[{"role":"user","content":[{"kind":"text","text":"x"}]}]}]`))},
+			{"fact missing input", setKey(raw, "facts", json.RawMessage(`[{"request_id":"maintenance-one","model":{"provider":"prov","model":"gpt-x"}}]`))},
+			{"fact input wrong shape", setKey(raw, "facts", json.RawMessage(`[{"request_id":"maintenance-one","model":{"provider":"prov","model":"gpt-x"},"input":0}]`))},
 			{"missing configuration revision", dropKey(raw, "configuration_revision")},
 			{"empty configuration revision", setKey(raw, "configuration_revision", json.RawMessage(`""`))},
 			{"null configuration revision", setKey(raw, "configuration_revision", json.RawMessage(`null`))},
 			{"null operation id", setKey(raw, "operation_id", json.RawMessage(`null`))},
 			{"empty operation id", setKey(raw, "operation_id", json.RawMessage(`""`))},
 			{"missing entry id", dropKey(raw, "entry_id")},
-			{"null usage", setKey(raw, "usage", json.RawMessage(`null`))},
-			{"wrong container usage", setKey(raw, "usage", json.RawMessage(`0`))},
-			{"incomplete usage", setKey(raw, "usage", json.RawMessage(`{"input_tokens":1}`))},
 		}
 		for _, tc := range rejections {
 			t.Run(tc.name, func(t *testing.T) {
 				env.Payload = tc.payload
 				{
-					_, err := decodeCompactionEntry(env)
+					_, err := decodeContextCheckpointEntry(env)
 					testassert.Require(t, err != nil, "expected rejection")
 				}
 			})
 		}
 	})
 
-	t.Run("operationless with stored usage is rejected", func(t *testing.T) {
+	t.Run("operationless with stored fact usage is rejected", func(t *testing.T) {
 		env := Entry{SessionID: testSessionID, ID: testEntryID, Kind: EntryCompaction, Sequence: 1, CommittedAt: testTime}
-		raw, err := encodeCompactionEntry(validCompactionEntry(""))
+		raw, err := encodeContextCheckpointEntry(validCompactionEntry(""))
 		testassert.NoError(t, err)
-		env.Payload = setKey(raw, "usage", json.RawMessage(`{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}`))
+		env.Payload = setKey(raw, "facts", json.RawMessage(`[{"request_id":"maintenance-one","model":{"provider":"prov","model":"gpt-x"},"input":[{"role":"user","content":[{"kind":"text","text":"x"}]}],"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}}]`))
 		{
-			_, err := decodeCompactionEntry(env)
-			testassert.Require(t, err != nil, "operationless compaction with stored usage must be rejected")
+			_, err := decodeContextCheckpointEntry(env)
+			testassert.Require(t, err != nil, "operationless compaction with stored fact usage must be rejected")
 		}
 	})
 }
 
-// TestSessionStateCompactionEntryIDRules proves the Session state's optional
+// TestSessionStateCheckpointEntryIDRules proves the Session state's optional
 // compaction_entry_id member: omission-encoded, hex-validated when present,
 // and rejected as null, empty, or a non-hex string on both codec sides.
-func TestSessionStateCompactionEntryIDRules(t *testing.T) {
+func TestSessionStateCheckpointEntryIDRules(t *testing.T) {
 	t.Run("round trips with the field set", func(t *testing.T) {
 		rec := validSessionRecord()
-		rec.State.CompactionEntryID = hexID(3)
+		rec.State.CheckpointEntryID = hexID(3)
 		raw, err := encodeSessionRegister(rec)
 		testassert.NoError(t, err)
 		reg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Revision: 1, Payload: raw}
 		got, err := decodeSessionRegister(reg)
 		testassert.NoError(t, err)
-		if got.State.CompactionEntryID != hexID(3) {
-			t.Fatalf("decoded CompactionEntryID %q, want %q", got.State.CompactionEntryID, hexID(3))
+		if got.State.CheckpointEntryID != hexID(3) {
+			t.Fatalf("decoded CheckpointEntryID %q, want %q", got.State.CheckpointEntryID, hexID(3))
 		}
 	})
 
@@ -2604,8 +2621,8 @@ func TestSessionStateCompactionEntryIDRules(t *testing.T) {
 		testassert.NoError(t, err)
 		state := wireObject(t, mustState(t, raw))
 		{
-			_, present := state["compaction_entry_id"]
-			testassert.Require(t, !present, "empty CompactionEntryID must encode by omission")
+			_, present := state["checkpoint_entry_id"]
+			testassert.Require(t, !present, "empty CheckpointEntryID must encode by omission")
 		}
 	})
 
@@ -2630,9 +2647,9 @@ func TestSessionStateCompactionEntryIDRules(t *testing.T) {
 			name   string
 			mutate func(obj map[string]json.RawMessage)
 		}{
-			{"non-hex id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`"ghost"`) }},
-			{"empty id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`""`) }},
-			{"null id", func(obj map[string]json.RawMessage) { obj["compaction_entry_id"] = json.RawMessage(`null`) }},
+			{"non-hex id", func(obj map[string]json.RawMessage) { obj["checkpoint_entry_id"] = json.RawMessage(`"ghost"`) }},
+			{"empty id", func(obj map[string]json.RawMessage) { obj["checkpoint_entry_id"] = json.RawMessage(`""`) }},
+			{"null id", func(obj map[string]json.RawMessage) { obj["checkpoint_entry_id"] = json.RawMessage(`null`) }},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -2647,7 +2664,7 @@ func TestSessionStateCompactionEntryIDRules(t *testing.T) {
 
 	t.Run("encode rejections", func(t *testing.T) {
 		rec := validSessionRecord()
-		rec.State.CompactionEntryID = "ghost"
+		rec.State.CheckpointEntryID = "ghost"
 		{
 			_, err := encodeSessionRegister(rec)
 			testassert.Require(t, errors.Is(err, ErrInvalid), "error %v, want ErrInvalid", err)
@@ -2952,25 +2969,25 @@ func TestMaintenanceConsumedRequestIdentityDomain(t *testing.T) {
 	t.Run("compaction", func(t *testing.T) {
 		absent := validCompactionEntry(testOpID)
 		absent.ConsumedRequestID = ""
-		raw, err := encodeCompactionEntry(absent)
+		raw, err := encodeContextCheckpointEntry(absent)
 		testassert.NoError(t, err)
 		testassert.Require(t, !strings.Contains(string(raw), "consumed_request_id"), "encode-side absence: %s", raw)
-		decoded, err := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: absent.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
+		decoded, err := decodeContextCheckpointEntry(Entry{SessionID: testSessionID, ID: absent.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
 		testassert.NoError(t, err)
 		testassert.Equal(t, decoded.ConsumedRequestID, "")
 		source := validCompactionEntry(testOpID)
 		source.ConsumedRequestID = "request-source"
-		raw, err = encodeCompactionEntry(source)
+		raw, err = encodeContextCheckpointEntry(source)
 		testassert.NoError(t, err)
-		decoded, err = decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
+		decoded, err = decodeContextCheckpointEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: raw})
 		testassert.NoError(t, err)
 		testassert.Equal(t, decoded.ConsumedRequestID, "request-source")
 		{
-			_, derr := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`""`))})
+			_, derr := decodeContextCheckpointEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`""`))})
 			testassert.Require(t, derr != nil, "a present-empty consumed source must reject")
 		}
 		{
-			_, derr := decodeCompactionEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`null`))})
+			_, derr := decodeContextCheckpointEntry(Entry{SessionID: testSessionID, ID: source.EntryID, OperationID: testOpID, Kind: EntryCompaction, Payload: setKey(raw, "consumed_request_id", json.RawMessage(`null`))})
 			testassert.Require(t, derr != nil, "a null consumed source must reject")
 		}
 	})
@@ -3062,4 +3079,87 @@ func TestForbiddenInputArgumentsMembershipReasonUniformity(t *testing.T) {
 				"%s %s member = %v, want the membership rule", b.name, c.name, derr)
 		}
 	}
+}
+
+// TestStrategyCaptureSettingsRawAcceptance pins the strategy settings as
+// arbitrary owned raw JSON under one accepted set across write and read: the
+// syntax-only acceptance admits null and large numbers, an accepted value
+// keeps its original bytes apart from the ordinary enclosing encoding, and
+// absence stays absent. A value accepted at admission survives the cold read
+// and recovery unchanged.
+func TestStrategyCaptureSettingsRawAcceptance(t *testing.T) {
+	encode := func(t *testing.T, settings json.RawMessage) json.RawMessage {
+		t.Helper()
+		v := testCapture()
+		v.Strategy = StrategyCapture{ID: "test.strategy/v1", Settings: settings}
+		raw, err := encodeExecutionCapture(v)
+		testassert.NoError(t, err)
+		return raw
+	}
+	with := func(settings string) map[string]json.RawMessage {
+		obj, err := decodePayloadObject(encode(t, nil))
+		testassert.NoError(t, err)
+		if settings != "" {
+			obj["strategy"] = json.RawMessage(`{"id":"test.strategy/v1","settings":` + settings + `,"requires_context_window":false}`)
+		}
+		return obj
+	}
+
+	for _, accepted := range []string{"null", "1e999", `{"nested":[1,{"a":"b"}]}`, "[]"} {
+		obj := with(accepted)
+		got, err := decodeExecutionCapture(obj)
+		testassert.Require(t, err == nil && string(got.Strategy.Settings) == accepted, "settings %s = %s err %v, want the original accepted bytes", accepted, got.Strategy.Settings, err)
+		// The accepted bytes re-encode and decode unchanged apart from the
+		// ordinary enclosing encoding, and never alias the payload.
+		again, err := decodeExecutionCapture(obj)
+		testassert.Require(t, err == nil && string(again.Strategy.Settings) == accepted, "second decode settings = %s err %v, want the same bytes", again.Strategy.Settings, err)
+		got.Strategy.Settings[0] = 'x'
+		third, err := decodeExecutionCapture(obj)
+		testassert.Require(t, err == nil && string(third.Strategy.Settings) == accepted, "decoded settings alias the payload bytes: %s", third.Strategy.Settings)
+	}
+
+	// Absent settings stays absent on both codec sides.
+	{
+		got, err := decodeExecutionCapture(with(""))
+		testassert.Require(t, err == nil && got.Strategy.Settings == nil, "omitted settings = %s err %v, want absent", got.Strategy.Settings, err)
+		v := testCapture()
+		v.Strategy = StrategyCapture{ID: "test.strategy/v1"}
+		raw, err := encodeExecutionCapture(v)
+		testassert.NoError(t, err)
+		obj, err := decodePayloadObject(raw)
+		testassert.NoError(t, err)
+		strategy, present := obj["strategy"]
+		testassert.Require(t, present, "the strategy member is required")
+		members, err := decodePayloadObject(strategy)
+		testassert.NoError(t, err)
+		_, has := members["settings"]
+		testassert.Require(t, !has, "absent settings leaked the settings member")
+	}
+
+	// Malformed inputs fail the same syntax-only acceptance on both sides.
+	for _, malformed := range []string{"{", `"unterminated`, "01", "NaN", "undefined"} {
+		_, err := decodeExecutionCapture(with(malformed))
+		testassert.Require(t, err != nil, "malformed settings %s was accepted", malformed)
+		v := testCapture()
+		v.Strategy = StrategyCapture{ID: "test.strategy/v1", Settings: json.RawMessage(malformed)}
+		_, err = encodeExecutionCapture(v)
+		testassert.Require(t, err != nil, "malformed settings %s was accepted on the validating side", malformed)
+	}
+}
+
+// TestStrategyCaptureSettingsSurviveColdReadAndRecovery proves a settings
+// value accepted at admission never corrupts through the durable cold read
+// and quiescent recovery.
+func TestStrategyCaptureSettingsSurviveColdReadAndRecovery(t *testing.T) {
+	prepared := modelPrepared(nil)
+	prepared.Capture.Strategy = StrategyCapture{ID: IncludedStrategyID, RequiresContextWindow: true, Settings: json.RawMessage(`1e999`)}
+	h, store, _, sessionID := newAdmittedHarness(t, context.Background(), prepared)
+	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(rec.Admission.Execution.Strategy.Settings) == "1e999", "warm read settings = %s, want the admitted bytes", rec.Admission.Execution.Strategy.Settings)
+
+	testassert.NoError(t, Recover(context.Background(), store))
+	rec, err = h.ReadOperation(context.Background(), sessionID, testOpID)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(rec.Admission.Execution.Strategy.Settings) == "1e999", "post-recovery settings = %s, want the admitted bytes", rec.Admission.Execution.Strategy.Settings)
 }

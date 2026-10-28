@@ -99,7 +99,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 
 		record := readDiscoveryRecord(t, recordPath)
 		health := healthSnapshot(t, record)
-		testassert.Require(t, health.InstanceId == record.InstanceId && health.ProtocolVersion == protocol.N4, "authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
+		testassert.Require(t, health.InstanceId == record.InstanceId && health.ProtocolVersion == protocol.N5, "authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
 
 		winner.shutdown()
 		{
@@ -166,7 +166,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		record := readDiscoveryRecord(t, recordPath)
 		before := readDiscoveryBytes(t, recordPath)
 		first := healthSnapshot(t, record)
-		testassert.Require(t, first.InstanceId == record.InstanceId && first.ProtocolVersion != "" && first.ProtocolVersion != protocol.N4, "incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
+		testassert.Require(t, first.InstanceId == record.InstanceId && first.ProtocolVersion != "" && first.ProtocolVersion != protocol.N5, "incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
 
 		contenderMarker := filepath.Join(t.TempDir(), "marker")
 		contender := startDiscoveryChild(t, e.home, dataDir, recordPath, contenderMarker, discoveryModeOwner)
@@ -401,7 +401,7 @@ func readDiscoveryRecord(t *testing.T, path string) discoveryRecord {
 		err := decodeOneDocument(data, &record)
 		testassert.Require(t, err == nil, "decode discovery record at %s: %v", path, err)
 	}
-	testassert.Require(t, record.ProtocolVersion == string(protocol.N4) && len(record.InstanceId) == 32 && strings.Trim(record.InstanceId, "0123456789abcdef") == "", "discovery record protocol version = %q, want %q; discovery instance %q is not 32 lowercase hex", record.ProtocolVersion, protocol.N4, record.InstanceId)
+	testassert.Require(t, record.ProtocolVersion == string(protocol.N5) && len(record.InstanceId) == 32 && strings.Trim(record.InstanceId, "0123456789abcdef") == "", "discovery record protocol version = %q, want %q; discovery instance %q is not 32 lowercase hex", record.ProtocolVersion, protocol.N5, record.InstanceId)
 	testassert.Require(t, len(record.Credential) == 64 && strings.Trim(record.Credential, "0123456789abcdef") == "", "discovery credential is not 64 lowercase hex")
 	endpoint, err := url.Parse(record.Endpoint)
 	testassert.Require(t, err == nil && endpoint.Scheme == "http" && endpoint.Hostname() == "127.0.0.1" && endpoint.Port() != "", "discovery endpoint %q is not an http loopback host:port", record.Endpoint)

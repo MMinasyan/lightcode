@@ -188,6 +188,16 @@ type ExecutionCapture struct {
 	Readonly              bool                   `json:"readonly"`
 	WriteDir              string                 `json:"write_dir"`
 	Compact               CompactCapture         `json:"compact"`
+	Strategy              StrategyCapture        `json:"strategy"`
+}
+
+// StrategyCapture is the resolved selected context-strategy input of one
+// capture: the binding's stable identity, its non-secret settings, and the
+// declared context-window requirement. It carries no strategy code.
+type StrategyCapture struct {
+	ID                    string          `json:"id"`
+	Settings              json.RawMessage `json:"settings,omitempty"`
+	RequiresContextWindow bool            `json:"requires_context_window"`
 }
 
 // CompactCapture is the effective compaction configuration of one capture:
@@ -212,15 +222,15 @@ type SessionIdentity struct {
 
 // SessionState is the mutable state section of one Session register.
 // CurrentOperationID, when present, names the Session's one running
-// Operation. CompactionEntryID, when present, names the in-session compaction
-// entry whose summary defines the model-visible context. ArchivedAt is
+// Operation. CheckpointEntryID, when present, names the in-session context
+// checkpoint entry whose messages define the model-visible context. ArchivedAt is
 // present exactly when the lifecycle is archived.
 type SessionState struct {
 	Lifecycle          SessionLifecycle `json:"lifecycle"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
 	CurrentAgentType   string           `json:"current_agent_type"`
 	CurrentOperationID string           `json:"current_operation_id,omitempty"`
-	CompactionEntryID  string           `json:"compaction_entry_id,omitempty"`
+	CheckpointEntryID  string           `json:"checkpoint_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
 	LastActivity       time.Time        `json:"last_activity"`
 }
@@ -460,20 +470,33 @@ type signalEntry struct {
 	Content          string         `json:"content"`
 }
 
+// maintenanceFact is one ordered maintenance procedure fact: the producer's
+// own request identity, the complete model identity that consumed it, the
+// actual tool-free logical Request messages the effect consumed, and the
+// optional reported usage — an absent usage differs from a known zero. Facts
+// settle once on the successful checkpoint or on the terminal settlement,
+// never both.
+type maintenanceFact struct {
+	RequestID string          `json:"request_id"`
+	Model     model.ModelRef  `json:"model"`
+	Input     []model.Message `json:"input"`
+	Usage     *UsageCount     `json:"usage,omitempty"`
+}
+
 // operationSettlementEntry publishes one terminal Operation outcome. It is
 // never operationless; the model identity is present exactly when the
 // settlement carries usage. CompactionUsage marks one settlement as the
-// maintenance procedure's own provenance: with summary usage carried it marks
-// that usage as the compaction summarizer's own, and with no usage carried the
-// marker identifies the maintenance family directly. RequestID is the
+// maintenance procedure's own provenance: it identifies the maintenance
+// family directly and its ordered Facts carry the procedure's per-request
+// usage. RequestID is the
 // settlement's own request witness — the answered conversation request, a live
 // model intent's identity, or a maintenance settlement's producer identity;
 // ConsumedRequestID names the conversation request whose frozen view an
 // automatic maintenance settlement consumed, present only beside maintenance
 // evidence and distinct from that producer. Evidence is the final effective
-// request evidence owned by a no-output settlement, and Input is the actual
-// tool-free logical maintenance request a maintenance settlement retains when
-// the procedure reached its request. Maintenance facts settle once on the
+// request evidence owned by a no-output settlement, and Facts are the actual
+// tool-free logical maintenance requests the procedure reached with their
+// producing models and reported usage. Maintenance facts settle once on the
 // successful checkpoint or on the terminal settlement, never both.
 type operationSettlementEntry struct {
 	SessionID         string           `json:"session_id"`
@@ -487,34 +510,32 @@ type operationSettlementEntry struct {
 	RequestID         string           `json:"request_id,omitempty"`
 	ConsumedRequestID string           `json:"consumed_request_id,omitempty"`
 	Evidence          *RequestEvidence `json:"evidence,omitempty"`
-	Input             []model.Message  `json:"input,omitempty"`
+	Facts             []maintenanceFact `json:"facts,omitempty"`
 }
 
-// compactionEntry is one immutable compaction commit: the single-request
-// summary of the frozen conversation up to its boundary entry, the compact
-// model identity that produced it, the governing configuration revision, and
-// the commit's
-// reported usage when present. RequestID is the maintenance producer's own
-// request identity, ConsumedRequestID the conversation request whose frozen
-// contribution view the automatic procedure consumed (manual compaction omits
-// it), Input the actual tool-free logical maintenance request the procedure
-// reached, and Evidence the effective contribution evidence consumed at that
-// frozen canonical boundary.
+// contextCheckpointEntry is one immutable context checkpoint commit: the
+// shared-schema messages defining the new model-visible context over the
+// frozen conversation up to its covered boundary entry, the selected strategy
+// identity that produced them, the governing configuration revision, and the
+// procedure's ordered maintenance facts — the producing request identities,
+// models, actual tool-free inputs and optional reported usage.
+// ConsumedRequestID names the conversation request whose frozen contribution
+// view the automatic procedure consumed (manual maintenance omits it), and
+// Evidence is the effective contribution evidence consumed at that frozen
+// canonical boundary.
 // Independently copied fork-prefix entries omit the owning Operation identity
 // and carry no source usage.
-type compactionEntry struct {
-	SessionID             string           `json:"session_id"`
-	EntryID               string           `json:"entry_id"`
-	OperationID           string           `json:"operation_id,omitempty"`
-	Summary               string           `json:"summary"`
-	BoundaryEntryID       string           `json:"boundary_entry_id"`
-	Model                 model.ModelRef   `json:"model"`
-	ConfigurationRevision string           `json:"configuration_revision"`
-	Usage                 *UsageCount      `json:"usage,omitempty"`
-	RequestID             string           `json:"request_id"`
-	ConsumedRequestID     string           `json:"consumed_request_id,omitempty"`
-	Input                 []model.Message  `json:"input"`
-	Evidence              *RequestEvidence `json:"evidence"`
+type contextCheckpointEntry struct {
+	SessionID             string            `json:"session_id"`
+	EntryID               string            `json:"entry_id"`
+	OperationID           string            `json:"operation_id,omitempty"`
+	StrategyID            string            `json:"strategy_id"`
+	Messages              []model.Message   `json:"messages"`
+	BoundaryEntryID       string            `json:"boundary_entry_id"`
+	ConfigurationRevision string            `json:"configuration_revision"`
+	Facts                 []maintenanceFact `json:"facts"`
+	ConsumedRequestID     string            `json:"consumed_request_id,omitempty"`
+	Evidence              *RequestEvidence  `json:"evidence"`
 }
 
 // Exported aliases of the validated entry payloads: the HistoryFact union
@@ -526,7 +547,8 @@ type (
 	ToolResultEntry          = toolResultEntry
 	SignalEntry              = signalEntry
 	OperationSettlementEntry = operationSettlementEntry
-	CompactionEntry          = compactionEntry
+	ContextCheckpointEntry   = contextCheckpointEntry
+	MaintenanceFact          = maintenanceFact
 	ToolCallRecord           = toolCallRecord
 	RelatedMember            = relatedMember
 	OperationRef             = operationRef

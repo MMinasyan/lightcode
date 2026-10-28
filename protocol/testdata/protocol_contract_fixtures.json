@@ -124,21 +124,87 @@
    ]
   },
   {
-   "schema": "CompactionItem",
+   "schema": "CheckpointItem",
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"item_id\":\"fixture\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"summary\":\"fixture\",\"model\":\"fixture\"}"
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"strategy\":\"fixture\",\"messages\":[]}"
     },
     {
      "name": "full",
-     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"}"
+     "json": "{\"item_id\":\"checkpoint-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"condensed\"}]}]}"
+    },
+    {
+     "name": "tool-exchange",
+     "json": "{\"item_id\":\"checkpoint-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"strategy\":\"melta.summary/v1\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"echo\",\"arguments_base64\":\"e30=\"}]},{\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":[{\"kind\":\"text\",\"text\":\"done\"}]}]}"
     }
    ],
    "reject": [
     {
-     "name": "missing-model",
-     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":null}"
+     "name": "null-model",
+     "json": "{\"item_id\":\"checkpoint-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"strategy\":\"melta.summary/v1\",\"model\":null,\"messages\":[]}"
+    },
+    {
+     "name": "missing-strategy",
+     "json": "{\"item_id\":\"checkpoint-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"model\":\"prov/m\",\"messages\":[]}"
+    }
+   ]
+  },
+  {
+   "schema": "Message",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"role\":\"user\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"condensed\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"name\":\"named\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"echo\",\"arguments_base64\":\"e30=\"}],\"extra\":{\"vendor\":1}}"
+    },
+    {
+     "name": "tool-result",
+     "json": "{\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":[{\"kind\":\"text\",\"text\":\"done\"}]}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "unknown-role",
+     "json": "{\"role\":\"note\"}"
+    },
+    {
+     "name": "tool-call-missing-id",
+     "json": "{\"role\":\"assistant\",\"tool_calls\":[{\"name\":\"echo\",\"arguments_base64\":\"e30=\"}]}"
+    }
+   ]
+  },
+  {
+   "schema": "MessageToolCall",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"id\":\"call-1\",\"name\":\"echo\",\"arguments_base64\":\"e30=\"}"
+    },
+    {
+     "name": "full",
+     "json": "{\"id\":\"call-1\",\"name\":\"echo\",\"arguments_base64\":\"e30=\",\"extra\":{\"vendor\":1}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-id",
+     "json": "{\"name\":\"echo\",\"arguments_base64\":\"e30=\"}"
+    },
+    {
+     "name": "missing-name",
+     "json": "{\"id\":\"call-1\",\"arguments_base64\":\"e30=\"}"
+    },
+    {
+     "name": "missing-arguments-base64",
+     "json": "{\"id\":\"call-1\",\"name\":\"echo\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"id\":\"call-1\",\"name\":\"echo\",\"arguments_base64\":\"e30=\",\"arguments\":\"{}\"}"
     }
    ]
   },
@@ -246,8 +312,8 @@
      "json": "{\"item_id\":\"fixture\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"subtype\":\"interruption\",\"content\":\"fixture\"}"
     },
     {
-     "name": "CompactionItem",
-     "json": "{\"item_id\":\"fixture\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"summary\":\"fixture\",\"model\":\"fixture\"}"
+     "name": "CheckpointItem",
+     "json": "{\"item_id\":\"fixture\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"strategy\":\"fixture\",\"model\":\"fixture\",\"messages\":[]}"
     },
     {
      "name": "OperationEndItem",
@@ -266,8 +332,8 @@
      "json": "{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}}"
     },
     {
-     "name": "compaction",
-     "json": "{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"}"
+     "name": "context_checkpoint",
+     "json": "{\"item_id\":\"checkpoint-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"condensed\"}]}]}"
     },
     {
      "name": "operation-end",
@@ -457,14 +523,14 @@
      "name": "WarningChangedEvent",
      "json": "{\"kind\":\"warning_changed\",\"scope\":{\"kind\":\"runtime\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"fixture\"}}"
     },
-     {
-      "name": "TextDeltaEvent",
-      "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
-     },
-     {
-      "name": "RefusalDeltaEvent",
-      "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"runtime\"},\"content\":\"fixture\"}"
-     },
+    {
+     "name": "TextDeltaEvent",
+     "json": "{\"kind\":\"text_delta\",\"scope\":{\"kind\":\"runtime\"},\"position\":0,\"content\":\"fixture\"}"
+    },
+    {
+     "name": "RefusalDeltaEvent",
+     "json": "{\"kind\":\"refusal_delta\",\"scope\":{\"kind\":\"runtime\"},\"content\":\"fixture\"}"
+    },
     {
      "name": "ToolStartedEvent",
      "json": "{\"kind\":\"tool_started\",\"scope\":{\"kind\":\"runtime\"},\"call_id\":\"fixture\",\"ordinal\":0,\"name\":\"fixture\"}"
@@ -529,7 +595,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"4\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"5\"}"
     }
    ],
    "reject": [
@@ -539,16 +605,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"4\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"5\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"4\"}"
+     "json": "{\"protocol_version\":\"5\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"4\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"5\",\"extra\":true}"
     }
    ]
   },
@@ -575,7 +641,7 @@
     },
     {
      "name": "with-active-operation",
-     "json": "{\"session\":{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"},\"operations\":[{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}],\"active_operation\":{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}},\"pending\":{\"steering\":[{\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}],\"queued\":[]},\"conversation\":{\"items\":[{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]},{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}},{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}},{\"item_id\":\"compaction-item\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"summary\":\"condensed\",\"model\":\"prov/m\"},{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"success\",\"detail\":\"done\"}],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"},\"usage\":{\"totals\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]},\"context\":{\"used_tokens\":\"154\",\"context_window\":8192}},\"warnings\":[{\"source\":\"runtime:catalog\",\"kind\":\"unusable_model\",\"message\":\"no key\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"background\":[{\"kind\":\"child\",\"id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"selected_model\":\"prov/m\"}"
+     "json": "{\"session\":{\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"workspace\":\"/workspace\",\"lifecycle\":\"open\",\"agent_type\":\"solo\",\"created_at\":\"2026-01-02T03:04:05.123456789Z\",\"last_activity\":\"2026-01-02T03:04:06Z\",\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"}},\"session_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"durable_revision\":\"12\",\"local_revision\":\"3\"},\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"7\"},\"warnings_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"revision\":\"4\"},\"operations\":[{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"success\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}}],\"active_operation\":{\"operation_id\":\"op-1\",\"request_kind\":\"message\",\"status\":\"running\",\"admitted_at\":\"2026-01-02T03:04:05Z\",\"settled_at\":\"2026-01-02T03:04:09Z\",\"agent_type\":\"solo\",\"model\":\"prov/m\",\"detail\":\"done\",\"usage\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]}},\"pending\":{\"steering\":[{\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]}],\"queued\":[]},\"conversation\":{\"items\":[{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]},{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}},{\"item_id\":\"signal-item\",\"kind\":\"signal\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-1\",\"subtype\":\"background_completion\",\"content\":\"child finished\",\"related_member\":{\"kind\":\"child\",\"id\":\"child-1\"}},{\"item_id\":\"compaction-item\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:08Z\",\"operation_id\":\"op-2\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"condensed\"}]}]},{\"item_id\":\"end-item\",\"kind\":\"operation_end\",\"committed_at\":\"2026-01-02T03:04:09Z\",\"operation_id\":\"op-1\",\"status\":\"success\",\"detail\":\"done\"}],\"older_cursor\":\"eyJ2ZXJzaW9uIjoxfQ\"},\"usage\":{\"totals\":{\"by_model\":[{\"model\":\"prov/m\",\"usage\":{\"input_tokens\":\"120\",\"cached_input_tokens\":\"12\",\"output_tokens\":\"34\"}}]},\"context\":{\"used_tokens\":\"154\",\"context_window\":8192}},\"warnings\":[{\"source\":\"runtime:catalog\",\"kind\":\"unusable_model\",\"message\":\"no key\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"background\":[{\"kind\":\"child\",\"id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}],\"selected_model\":\"prov/m\"}"
     }
    ],
    "reject": [

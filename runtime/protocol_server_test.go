@@ -281,7 +281,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N4, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N4)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N5, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N5)
 
 		workspace := filepath.Join(e.home, "mounted")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})

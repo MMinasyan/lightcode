@@ -126,6 +126,7 @@ func compactBaseCapture() harness.ExecutionCapture {
 			Model:        model.ModelRef{Provider: "prov", Model: "m2"},
 			SystemPrompt: "summarize",
 		},
+		Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 	}
 }
 

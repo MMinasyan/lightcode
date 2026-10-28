@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"path/filepath"
 	"strings"
@@ -114,6 +113,66 @@ func failureDetail(cause error) string {
 	return genericExecutionFailureDetail
 }
 
+// publicationFailure is the one private publication-origin wrapper: it marks an
+// error raised while publishing durable intent, result, checkpoint or
+// terminal state, preserving the original cause through errors.Is and
+// errors.As. A publication failure is distinguished by the boundary where it
+// occurred — never by its error identity — and retains the actual durable
+// running state for recovery, with no guessed follow-up terminal write.
+type publicationFailure struct{ cause error }
+
+func (e *publicationFailure) Error() string { return e.cause.Error() }
+func (e *publicationFailure) Unwrap() error { return e.cause }
+
+// wrapPublication wraps one publication-boundary cause.
+func wrapPublication(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &publicationFailure{cause: cause}
+}
+
+// isPublicationFailure reports whether one error originated at a durable
+// publication boundary.
+func isPublicationFailure(err error) bool {
+	var failure *publicationFailure
+	return errors.As(err, &failure)
+}
+
+// runEngineCall runs one Engine invocation at the one shared Harness
+// composition boundary: each supplied callback's publication-origin error is
+// retained before the Engine handles it, and after the run the retained
+// original propagates to the owning Harness orchestration or settler in place
+// of the Engine's substituted error or terminal. Every other outcome —
+// including a genuine pre-intent cancellation interruption and a
+// semantic or provider error of a similar sentinel shape — returns verbatim.
+// The Engine invokes the wrapped callbacks synchronously and sequentially, so
+// one captured variable holds the first retained error.
+func runEngineCall(execCtx context.Context, invocation agent.Invocation) (agent.TerminalResult, error) {
+	var retained error
+	keep := func(err error) error {
+		if err != nil && retained == nil && isPublicationFailure(err) {
+			retained = err
+		}
+		return err
+	}
+	request := invocation.Request
+	invocation.Request = func(ctx context.Context) (model.Request, error) {
+		req, err := request(ctx)
+		return req, keep(err)
+	}
+	modelEffect := invocation.ModelEffect
+	invocation.ModelEffect = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
+		settle, err := modelEffect(ctx, req, assemble)
+		return settle, keep(err)
+	}
+	res, err := agent.Run(execCtx, invocation)
+	if retained != nil {
+		return agent.TerminalResult{}, retained
+	}
+	return res, err
+}
+
 // modelEffectIntent is the committed intent of one logical model effect: the
 // facts the result transaction needs after the callback returns, including
 // the codec-adopted effective input evidence the intent published.
@@ -205,10 +264,12 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 		// per-call copy.
 		intent, err := h.beginModelEffect(ctx, c, operationID, round.requestID, InvocationPurposeConversation, capture.Model, &round.net, nil)
 		if err != nil {
-			// An intent transaction aborted by cancellation settles the
-			// cancellation outcome: the run never sees a cancellation-shaped
-			// error out of an active effect.
-			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
+			// A marked publication failure propagates before any cancellation
+			// rule, regardless of a concurrent cancellation. Only an unmarked
+			// cancellation observed before the intent transaction was ever
+			// attempted settles the cancellation outcome: the run never sees a
+			// cancellation-shaped error out of an active effect.
+			if !isPublicationFailure(err) && isExecutionCancellation(err) && ctx.Err() != nil {
 				if _, cerr := h.commitEffectResult(context.WithoutCancel(h.ctx), c, operationID, nil, modelResult{
 					terminal: OperationInterruption,
 					detail:   executionInterruptedDetail,
@@ -305,23 +366,15 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 	}
 }
 
-// conversationOverflows samples the newest reported conversation usage after
-// the current compaction boundary under a brief coordinator hold and reports
-// whether its exact signed total exceeds the captured window minus the output
-// reserve. Input is already uncached, so cached input is added once. A
-// missing report never overflows.
-func conversationOverflows(c *coordinator, capture ExecutionCapture) bool {
+// contextMeasurement samples the newest reported conversation usage after
+// the current checkpoint boundary under a brief coordinator hold — the
+// optional conversation measurement the selected strategy plans over. A
+// missing report stays missing.
+func contextMeasurement(c *coordinator) *UsageCount {
 	c.mu.Lock()
-	usage := latestContextUsage(c.graph.Entries, c.graph.Session.State.CompactionEntryID)
+	usage := latestContextUsage(c.graph.Entries, c.graph.Session.State.CheckpointEntryID)
 	c.mu.Unlock()
-	if usage == nil {
-		return false
-	}
-	total := new(big.Int).SetInt64(usage.InputTokens)
-	total.Add(total, big.NewInt(usage.CachedInputTokens))
-	total.Add(total, big.NewInt(usage.OutputTokens))
-	threshold := big.NewInt(int64(capture.ContextWindow) - int64(capture.OutputReserve))
-	return total.Cmp(threshold) > 0
+	return usage
 }
 
 // interruptModelEffect settles one committed model effect intent as the fixed
@@ -337,7 +390,7 @@ func (h *Harness) interruptModelEffect(c *coordinator, operationID string, inten
 		detail:        executionInterruptedDetail,
 		usage:         usage,
 		facts:         facts,
-		maintenanceID: intent.requestID,
+		maintenanceID: facts.producer(),
 	}); err != nil {
 		return agent.ModelSettlement{}, err
 	}
@@ -415,30 +468,51 @@ func publishedCallIDs(c *coordinator, operationID string) map[string]bool {
 // identity. The reserved identity stays free until the model result or the
 // consuming settlement commits under it. The caller continues on the
 // codec-adopted record the transaction wrote.
+// beginModelEffect commits the one active-effect intent of a model effect.
+// A cancellation observed before the intent transaction is invoked returns
+// unwrapped and may use the caller's ordinary interruption settlement. Once
+// the transaction is invoked it runs on a cancellation-free copy of the
+// execution context — values only, like the result and terminal publications
+// — so every error from it is a real store failure and a publication-origin
+// failure at the intent boundary: it propagates with the durable state
+// retained for recovery and is never followed by a guessed compensating
+// terminal write.
 func (h *Harness) beginModelEffect(ctx context.Context, c *coordinator, operationID string, requestID string, purpose InvocationPurpose, mdl model.ModelRef, evidence *RequestEvidence, suspended *RunningRequest) (modelEffectIntent, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return modelEffectIntent{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return modelEffectIntent{}, wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	if op.State.Status != OperationRunning {
 		c.mu.Unlock()
-		return modelEffectIntent{}, invalidInput("operation %q is %s; a model effect requires a running Operation", operationID, op.State.Status)
+		return modelEffectIntent{}, wrapPublication(invalidInput("operation %q is %s; a model effect requires a running Operation", operationID, op.State.Status))
 	}
 	if op.State.ActiveEffect != nil {
 		c.mu.Unlock()
-		return modelEffectIntent{}, invalidInput("operation %q already carries an active effect; effects never nest", operationID)
+		return modelEffectIntent{}, wrapPublication(invalidInput("operation %q already carries an active effect; effects never nest", operationID))
+	}
+	if ctx.Err() != nil { // cancellation observed before the Transact is ever invoked is not a
+		// publication failure: it returns unwrapped and the caller's ordinary
+		// interruption settlement applies. An invoked Transact can no longer observe this
+		// context, so every error from it is a real store failure marked publication-origin.
+		c.mu.Unlock()
+		return modelEffectIntent{}, ctx.Err()
 	}
 	resultID, err := newHexID()
 	if err != nil {
 		c.mu.Unlock()
-		return modelEffectIntent{}, fmt.Errorf("%w: %v", ErrStorage, err)
+		return modelEffectIntent{}, wrapPublication(fmt.Errorf("%w: %v", ErrStorage, err))
 	}
 	effectModel := mdl
 	var updated OperationRecord
-	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+	// Once the pre-Transact check admits the transition, the durable intent
+	// transaction runs without execution cancellation or deadline — values
+	// only, exactly like the result and terminal publications — so a shutdown
+	// that lands mid-transaction never aborts the admitted intent. The
+	// caller's execution-context gate settles the interruption afterwards.
+	err = h.deps.Storage.Transact(context.WithoutCancel(ctx), func(tx Transaction) error {
 		key := RegisterKey{SessionID: op.Admission.SessionID, Kind: RegisterOperation, OperationID: operationID}
 		reg, err := tx.ReadRegister(key)
 		if err != nil {
@@ -516,10 +590,10 @@ func (h *Harness) beginModelEffect(ctx context.Context, c *coordinator, operatio
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, op.Admission.SessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return modelEffectIntent{}, rerr
+				return modelEffectIntent{}, wrapPublication(rerr)
 			}
 		}
-		return modelEffectIntent{}, err
+		return modelEffectIntent{}, wrapPublication(err)
 	}
 	c.graph.replaceOperation(operationID, updated)
 	c.mu.Unlock()
@@ -562,15 +636,17 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 			// Interrupt winning this hold cannot be missed; a foreign
 			// marker or a root stop's stopping state never converts the
 			// success, and an Interrupt after the committed success cannot
-			// rewrite it.
-			res = modelResult{terminal: OperationInterruption, detail: executionInterruptedDetail}
+			// rewrite it. The conversion keeps the result's own facts,
+			// evidence and usage: only the prospective success becomes the
+			// ordinary interruption.
+			res.terminal, res.detail = OperationInterruption, executionInterruptedDetail
 		}
 	}
 	viewOp, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return OperationRecord{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return OperationRecord{}, wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	sessionID := viewOp.Admission.SessionID
 	viewSession := c.graph.Session
@@ -629,8 +705,12 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 				usageModel = intent.expected
 				compactionUsage = intent.compaction
 			}
+			// Every terminal kind accounts the active execution's
+			// accumulated uncommitted maintenance facts exactly once,
+			// together with the settled effect's own retained facts.
+			facts := consumePendingFacts(c, res.facts)
 			var err error
-			committedOp, committedSess, newEntries, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, res.terminal, res.detail, res.assistant, usageModel, res.usage, compactionUsage, res.facts, res.maintenanceID)
+			committedOp, committedSess, newEntries, err = commitTerminalSettlement(tx, sessionID, operationID, currentSession, currentOp, sreg.Revision, oreg.Revision, res.terminal, res.detail, res.assistant, usageModel, res.usage, compactionUsage, facts, res.maintenanceID)
 			if err != nil {
 				return err
 			}
@@ -731,10 +811,13 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return OperationRecord{}, rerr
+				return OperationRecord{}, wrapPublication(rerr)
 			}
 		}
-		return OperationRecord{}, err
+		return OperationRecord{}, wrapPublication(err)
+	}
+	if res.terminal != "" {
+		completePending(c) // the accumulated facts are consumed only after their successful publication
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
 	c.graph.replaceOperation(operationID, committedOp)
@@ -767,16 +850,26 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 func commitTerminalSettlement(tx Transaction, sessionID, operationID string, currentSession SessionRecord, currentOp OperationRecord, sregRevision, oregRevision int64, terminal OperationState, detail string, assistant *assistantEntry, usageModel model.ModelRef, usage *UsageCount, compactionUsage bool, facts *maintenanceFacts, maintenanceID string) (OperationRecord, SessionRecord, []graphEntry, error) {
 	var newEntries []graphEntry
 
-	// The transaction's usage contribution rides the produced assistant
-	// entry, or the settlement entry when the terminal output reported
-	// usage without an eligible payload; the same totals land on the
-	// producer entry, the Operation, and the Session.
+	// The transaction's usage contribution is additive: the ordinary
+	// assistant-carried or terminal no-output usage and the retained
+	// maintenance facts' own per-producer usage both land when both occur,
+	// and the same totals land on the producer entry, the Operation, and the
+	// Session. A reported zero stays known zero and an absent report
+	// contributes nothing.
 	var contribution UsageTotals
 	switch {
 	case assistant != nil && assistant.Usage != nil:
 		contribution = UsageTotals{ByModel: []ModelUsage{{Model: assistant.Source, Usage: *assistant.Usage}}}
 	case usage != nil:
 		contribution = UsageTotals{ByModel: []ModelUsage{{Model: usageModel, Usage: *usage}}}
+	}
+	factUsage, err := factsUsageContribution(factsList(facts))
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
+	}
+	contribution, err = addUsageTotals(contribution, factUsage)
+	if err != nil {
+		return OperationRecord{}, SessionRecord{}, nil, err
 	}
 	opUsage, err := addUsageTotals(currentOp.State.Usage, contribution)
 	if err != nil {
@@ -973,13 +1066,15 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 		Detail:          detail,
 		CompactionUsage: compactionUsage,
 	}
-	// The settlement's request witness: maintenance facts name their own
-	// producer identity (never a replacement of the suspended conversation
-	// state, which lives on the register state until this terminal clears
-	// it); otherwise the published running request; otherwise a live model
-	// intent's identity.
+	// The settlement's request witness: a maintenance-family settlement
+	// names its own producer identity (never a replacement of the suspended
+	// conversation state, which lives on the register state until this
+	// terminal clears it); otherwise the published running request;
+	// otherwise a live model intent's identity. Ordinary accumulated
+	// maintenance facts can ride any terminal kind without owning the
+	// settlement's own witness.
 	switch {
-	case facts != nil && (facts.hasInput() || facts.hasConsumed()):
+	case compactionUsage && facts != nil && (facts.hasInput() || facts.hasConsumed()):
 		settlement.RequestID = maintenanceID
 		settlement.ConsumedRequestID = facts.sourceRequestID
 	case currentOp.State.Request != nil:
@@ -991,22 +1086,16 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 		if activeEffect != nil && activeEffect.Kind == EffectModel && activeEffect.Evidence != nil {
 			evidence := *activeEffect.Evidence
 			settlement.Evidence = &evidence
-		} else if facts != nil && facts.hasConsumed() {
+		} else if compactionUsage && facts != nil && facts.hasConsumed() {
 			consumed := facts.consumed
 			settlement.Evidence = &consumed
 		}
-		if facts.hasInput() {
-			settlement.Input = cloneRequestMessages(facts.input)
-		}
 	}
-	if settlement.Input != nil {
-		modelRef := usageModel
-		if modelRef.Provider == "" {
-			return OperationRecord{}, SessionRecord{}, nil, invalidInput("maintenance settlement facts require their known producing model")
-		}
-		if settlement.Model == nil {
-			settlement.Model = &modelRef
-		}
+	if facts.hasInput() {
+		// The actual ordered maintenance facts settle on this terminal
+		// exactly once beside any ordinary usage; their own reported usage
+		// never becomes the settlement's carried conversation usage.
+		settlement.Facts = cloneMaintenanceFacts(facts.facts)
 	}
 	if assistant == nil && usage != nil { // terminal no-output model usage rides the settlement entry
 		modelRef := usageModel
@@ -2580,6 +2669,14 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		}
 		return &agent.TerminalResult{}, nil, nil, err
 	}
+	// The opened Execution owns its selected strategy from here: the resolved
+	// StrategyBinding value is copied once, before any invocation or strategy
+	// callback, so every maintenance procedure of this Execution selects the
+	// same accepted binding and a caller mutating its own supplied binding
+	// afterwards can never change the selection. A nil selection resolves to
+	// a copy of the included binding.
+	acceptedBinding := *resolveStrategyBinding(exec.Strategy)
+	exec.Strategy = &acceptedBinding
 	if exec.OpenInvocation == nil {
 		if exec.Close != nil {
 			h.recordCleanupFailure(exec.Close())
@@ -2590,30 +2687,43 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 	// A compact Operation wires no conversation Agent invocation: it projects
 	// the pure canonical conversation snapshot — the projected messages minus
 	// the leading system message, with no compact input to exclude — runs the
-	// orchestration over it, and commits the manual compaction whose one
-	// transaction also settles the Operation's success. The orchestration
+	// selected strategy's maintenance procedure over it, and commits the
+	// manual checkpoint whose one transaction also settles the Operation's
+	// success. The orchestration
 	// opens its own maintenance invocations; every orchestration failure or
-	// interruption has already settled the terminal durably with the reported
-	// usage (a summary failure inside its own effect, any other failure
-	// through the direct terminal settlement), and only an actually empty
-	// conversation fails with the retained detail.
+	// interruption has already settled the terminal durably with the retained
+	// facts (a model failure inside its own effect, any other failure
+	// through the direct terminal settlement), and only the checkpoint
+	// publication failure returns its error with the running state retained.
 	if admission.RequestKind == RequestKindCompact {
-		messages, _, _, err := h.projectContextRefs(c, operationID)
+		messages, checkpointID, boundaryID, injected, err := h.projectContextRefs(c, operationID)
 		if err != nil {
 			return nil, nil, exec.Close, err
 		}
 		snapshot := messages
-		if len(snapshot) > 0 && snapshot[0].Role == model.RoleSystem {
+		if injected {
 			snapshot = snapshot[1:]
 		}
-		summary, usage, maintenanceID, facts, closeMaintenance, err := h.runCompaction(execCtx, c, operationID, exec, agentCapture, snapshot, nil, nil)
+		planInput := PlanInput{
+			Trigger:           triggerManual,
+			Messages:          cloneRequestMessages(snapshot),
+			CheckpointEntryID: checkpointID,
+			BoundaryEntryID:   boundaryID,
+			Instructions:      agentCapture.Compact.SystemPrompt,
+			Tools:             cloneToolDefinitions(agentCapture.Tools),
+			Measurement:       contextMeasurement(c),
+			ContextWindow:     agentCapture.ContextWindow,
+			OutputReserve:     agentCapture.OutputReserve,
+			Settings:          model.CloneRaw(agentCapture.Strategy.Settings),
+		}
+		checkpoint, facts, closeMaintenance, err := h.runContextMaintenance(execCtx, c, operationID, exec, agentCapture, planInput, nil)
 		if err != nil {
 			return nil, closeMaintenance, exec.Close, err
 		}
 		// The completion owner closes the maintenance invocation only after
 		// this returned transaction — the manual compaction's commit is also
 		// its terminal settlement — so the checkpoint precedes the disposal.
-		return nil, closeMaintenance, exec.Close, h.commitCompaction(c, operationID, agentCapture, maintenanceID, facts, summary, len(snapshot), usage, true)
+		return nil, closeMaintenance, exec.Close, h.commitMaintenance(execCtx, c, operationID, agentCapture, planInput, facts, checkpoint, true)
 	}
 	invocationID, err := newHexID() // the Engine call's fresh per-invocation identity
 	if err != nil {
@@ -2637,7 +2747,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		return &agent.TerminalResult{}, nil, exec.Close, err
 	}
 	round := &conversationRound{}
-	res, runErr := agent.Run(execCtx, agent.Invocation{
+	res, runErr := runEngineCall(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Request:       h.requestSource(c, operationID, agentCapture, exec, inv, round),
 		ModelEffect:   h.modelEffect(c, operationID, exec, inv, agentCapture, round),
@@ -2663,12 +2773,13 @@ func executionCancellationResult(execCtx context.Context, err error) *agent.Term
 }
 
 // validateOpenedInvocation is the opened invocation's contract: a successful
-// Model, Tool and NormalizeTool must be non-nil, and every argument and
+// Model, Tool and NormalizeTool must be non-nil, every argument and
 // request hook requires a non-empty unique ID, a non-empty extension
 // identity, a valid mode, and a non-nil Run, while every output hook — pure
-// by contract — requires the same identities and Run without a mode. An
-// invalid invocation closes its own opened resources before the rejection
-// returns.
+// by contract — requires the same identities and Run without a mode. The
+// selected strategy binding is accepted once at the maintenance entry, never
+// re-gated per invocation. An invalid invocation closes its own opened
+// resources before the rejection returns.
 func validateOpenedInvocation(inv InvocationExecution) error {
 	if inv.Model == nil || inv.Tool == nil || inv.NormalizeTool == nil {
 		return invalidInput("opened invocation requires non-nil model, tool and normalization functions")
@@ -2763,7 +2874,10 @@ func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res ag
 	settled := op.State.Status != OperationRunning
 	quiet := op.State.ActiveEffect == nil
 	c.mu.Unlock()
-	if settled || !quiet { // already settled by a model effect, or a publication failure left the intent state for recovery
+	if settled || !quiet { // already settled by a model effect, or a committed intent state left for recovery
+		return runErr
+	}
+	if isPublicationFailure(runErr) { // classified by the publication boundary it occurred at: the durable running state stays for recovery
 		return runErr
 	}
 	if runErr != nil && errors.Is(runErr, ErrStorage) { // a storage-class error performs no compensating write: the committed running state stays for recovery

@@ -19,7 +19,7 @@ func TestClosedKinds(t *testing.T) {
 		harness.EntryToolResult:          "tool_result",
 		harness.EntrySignal:              "signal",
 		harness.EntryHookResult:          "hook_result",
-		harness.EntryCompaction:          "compaction",
+		harness.EntryCompaction:          "context_checkpoint",
 		harness.EntryOperationSettlement: "operation_settlement",
 	}
 	testassert.Equal(t, len(entryKinds), 7)

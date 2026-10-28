@@ -583,9 +583,12 @@ func TestObserveDurableAdvances(t *testing.T) {
 		{
 			canonical, _, _, cErr := h.projectCanonical(c, testOpID)
 			testassert.NoError(t, cErr)
-			err := h.commitCompaction(c, testOpID, testCapture(), hexID(8),
-				&maintenanceFacts{input: cloneRequestMessages(canonical), consumed: RequestEvidence{}},
-				"summary", 1, nil, false)
+			facts := &maintenanceFacts{consumed: RequestEvidence{}, maintenanceID: hexID(8), facts: []maintenanceFact{{
+				RequestID: hexID(8),
+				Model:     testCompactCapture().Model,
+				Input:     cloneRequestMessages(canonical),
+			}}}
+			err := h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: fixtureInputEntryID(c)}, facts, summaryCheckpoint(t, "summary", fixtureInputEntryID(c)), false)
 			testassert.NoError(t, err)
 		}
 		facts := col.invalidations()
@@ -1221,8 +1224,7 @@ func TestObserveCompactAttribution(t *testing.T) {
 	h, _, c, sessionID := newEffectHarness(t, nil)
 	col := observeHarness(h)
 	exec := effectExecution(compactFn, nil)
-	var reported *UsageCount
-	effect := h.compactModelEffect(c, testOpID, invocationExecution(compactFn, nil), exec.Retry, testCapture(), hexID(8), &maintenanceFacts{}, nil, &reported)
+	effect := h.compactModelEffect(c, testOpID, invocationExecution(compactFn, nil), exec.Retry, testCapture(), hexID(8), &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
 	{
 		_, err := invokeModelEffect(t, effect, defaultModelRequest(t), nil)
 		testassert.NoError(t, err)

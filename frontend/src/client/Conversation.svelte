@@ -138,10 +138,26 @@
         {#if relatedText(item)}<span class="signal-related"> ({relatedText(item)})</span>{/if}
         {#if item.content}<div class="signal-content">{item.content}</div>{/if}
       </div>
-    {:else if item.kind === 'compaction'}
-      <div class="system-msg compaction">
-        <span class="signal-label">Compaction summary</span><span class="signal-related"> ({item.model || 'model'})</span>
-        <div class="signal-content">{item.summary}</div>
+    {:else if item.kind === 'context_checkpoint'}
+      <div class="system-msg checkpoint">
+        <span class="signal-label">Context checkpoint</span>{#if item.model}<span class="signal-related"> ({item.model})</span>{/if}
+        {#each item.messages || [] as message}
+          <!-- Every admitted message field stays inspectable beside the
+               content and refusal rendering: the role and per-message source
+               as labeled values, the name and tool-result members as labeled
+               values, and the tool calls and message extras through the
+               raw-field/JSON pattern. -->
+          <div class="opaque-field"><span class="opaque-label">role</span> {message.role}</div>
+          {#if message.source}<div class="opaque-field"><span class="opaque-label">source</span> {message.source}</div>{/if}
+          {#if message.name}<div class="opaque-field"><span class="opaque-label">name</span> {message.name}</div>{/if}
+          {#if (message.content || []).map(contentText).join('\n')}<div class="signal-content">{(message.content || []).map(contentText).join('\n')}</div>{/if}
+          {#if message.refusal}<div class="refusal">Refused: {message.refusal}</div>{/if}
+          {#each message.tool_calls || [] as call}
+            <div class="opaque-field"><span class="opaque-label">tool call</span> {JSON.stringify(call)}</div>
+          {/each}
+          {#if message.tool_call_id}<div class="opaque-field"><span class="opaque-label">tool result</span> {message.tool_call_id}</div>{/if}
+          {#if message.extra}<div class="opaque-field"><span class="opaque-label">extra</span> {JSON.stringify(message.extra)}</div>{/if}
+        {/each}
       </div>
     {:else if item.kind === 'operation_end'}
       <div class="system-msg op-end">
@@ -207,7 +223,7 @@
   .signal-label { color:var(--text-dim); }
   .signal-related { color:var(--text-dim); font-style:normal; font-family:var(--font-mono); font-size:calc(11px * var(--scale, 1)); }
   .signal-content { font-style:normal; white-space:pre-wrap; word-break:break-word; }
-  .compaction, .op-end { border-left:3px solid var(--border-strong); }
+  .checkpoint, .op-end { border-left:3px solid var(--border-strong); }
   .error-msg { padding:8px 12px; margin:4px 12px; background:var(--error-soft); border-left:3px solid var(--error); border-radius:var(--radius); color:var(--error); font-size:calc(12px * var(--scale, 1)); white-space:pre-wrap; }
   .queued-msg { display:flex; align-items:flex-start; gap:8px; margin:10px 12px; padding:8px 12px; background:var(--bg-user-msg); border:1px solid var(--border); border-radius:var(--radius); font-family:var(--font-ui); font-size:calc(13px * var(--scale, 1)); line-height:1.6; opacity:0.6; }
   .queued-msg.steering { border-color:var(--border-strong); }

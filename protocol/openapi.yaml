@@ -888,7 +888,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "4"
+            - "5"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1458,31 +1458,82 @@ components:
           type: string
         related_member:
           $ref: "#/components/schemas/BackgroundMember"
-    CompactionItem:
+    CheckpointItem:
       type: object
       additionalProperties: false
       required:
         - item_id
         - kind
         - committed_at
-        - summary
-        - model
+        - strategy
+        - messages
       properties:
         item_id:
           type: string
         kind:
           type: string
           enum:
-            - compaction
+            - context_checkpoint
         committed_at:
           type: string
           format: date-time
         operation_id:
           type: string
-        summary:
+        strategy:
           type: string
         model:
           $ref: "#/components/schemas/ModelRef"
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+    Message:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum:
+            - system
+            - user
+            - assistant
+            - tool
+        source:
+          $ref: "#/components/schemas/ModelRef"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+        refusal:
+          type: string
+        name:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageToolCall"
+        tool_call_id:
+          type: string
+        extra:
+          $ref: "#/components/schemas/JSONObject"
+    MessageToolCall:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - arguments_base64
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments_base64:
+          type: string
+        extra:
+          $ref: "#/components/schemas/JSONObject"
     OperationEndItem:
       type: object
       additionalProperties: false
@@ -1517,7 +1568,7 @@ components:
         - $ref: "#/components/schemas/InputItem"
         - $ref: "#/components/schemas/AssistantItem"
         - $ref: "#/components/schemas/SignalItem"
-        - $ref: "#/components/schemas/CompactionItem"
+        - $ref: "#/components/schemas/CheckpointItem"
         - $ref: "#/components/schemas/OperationEndItem"
       discriminator:
         propertyName: kind
@@ -1525,7 +1576,7 @@ components:
           input: "#/components/schemas/InputItem"
           assistant: "#/components/schemas/AssistantItem"
           signal: "#/components/schemas/SignalItem"
-          compaction: "#/components/schemas/CompactionItem"
+          context_checkpoint: "#/components/schemas/CheckpointItem"
           operation_end: "#/components/schemas/OperationEndItem"
     ConversationPage:
       type: object

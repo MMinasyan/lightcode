@@ -149,10 +149,18 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			compactions++
 			var wire struct {
 				OperationID string `json:"operation_id"`
-				Summary     string `json:"summary"`
+				Messages    []struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"messages"`
 			}
 			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
-			testassert.Require(t, wire.OperationID == "op-2" && wire.Summary == "native summary one", "compaction entry = %+v, want op-2's committed summary", wire)
+			wireSummary := ""
+			if len(wire.Messages) > 0 && len(wire.Messages[0].Content) > 0 {
+				wireSummary = wire.Messages[0].Content[0].Text
+			}
+			testassert.Require(t, wire.OperationID == "op-2" && wireSummary == "[Previous conversation summary]\n\nnative summary one\n\n[End of summary. Continue from here.]", "compaction entry = %+v, want op-2's committed summary", wire)
 		}
 		testassert.Equal(t, compactions, 1)
 
@@ -282,7 +290,8 @@ func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionV
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
 			`"context_window":4096,"output_reserve":%d,`+
 			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, v.agentType,
 		v.model.Provider, v.model.Model, v.outputReserve,
 		v.systemPrompt, v.tools,
@@ -343,9 +352,12 @@ func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) st
 
 func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"m"},"configuration_revision":"rev-1","request_id":%q,"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}`,
-		sessionID, entryID, operationID, summary, boundaryID, "maintainer-"+entryID, "request-"+operationID, boundaryID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"strategy_id":"melta.summary/v1",`+
+			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}]}],`+
+			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
+			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"m"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
+			`"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, "request-"+operationID, boundaryID)
 }
 
 // compactRawSuccessOperation seeds one settled success message Operation:

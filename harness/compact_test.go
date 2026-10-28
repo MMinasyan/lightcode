@@ -56,18 +56,116 @@ func compactionExecution(t *testing.T, compact func(context.Context, model.Reque
 // maintenanceInvocationOf opens the given execution's maintenance invocation
 // for the captured compact model — the opened-invocation shape the direct
 // compact effect fixtures drive.
-// newMaintenanceFacts returns the fixtures' maintenance facts carrier with a
-// valid tool-free logical Request input; the consumed-evidence reference stays
-// zero so the commit derives it from the covered boundary.
+// newMaintenanceFacts returns the fixtures' maintenance facts carrier with
+// one valid tool-free logical Request fact; the consumed-evidence reference
+// stays zero so the commit derives it from the covered boundary.
 func newMaintenanceFacts(sourceRequestID, consumedBoundary string) *maintenanceFacts {
-	facts := &maintenanceFacts{sourceRequestID: sourceRequestID, input: []model.Message{
-		{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
-		{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
-	}}
+	facts := &maintenanceFacts{sourceRequestID: sourceRequestID, maintenanceID: "maintenance-one", facts: []maintenanceFact{{
+		RequestID: "maintenance-one",
+		Model:     testCompactCapture().Model,
+		Input: []model.Message{
+			{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
+			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}},
+		},
+	}}}
 	if consumedBoundary != "" { // automatic maintenance facts always carry the consumed contribution view alongside the source
 		facts.consumed = RequestEvidence{BoundaryEntryID: consumedBoundary}
 	}
 	return facts
+}
+
+// summaryText returns the summary inside the included policy's checkpoint
+// message wrapper, failing when the wrapper text is not the exact current one.
+func summaryText(t *testing.T, entry *contextCheckpointEntry) string {
+	t.Helper()
+	testassert.Require(t, len(entry.Messages) == 1, "checkpoint carries %d messages, want the one summary message", len(entry.Messages))
+	const prefix = "[Previous conversation summary]\n\n"
+	const suffix = "\n\n[End of summary. Continue from here.]"
+	text := entry.Messages[0].TextContent()
+	testassert.Require(t, strings.HasPrefix(text, prefix) && strings.HasSuffix(text, suffix), "checkpoint message %q is not the summary wrapper", text)
+	return strings.TrimSuffix(strings.TrimPrefix(text, prefix), suffix)
+}
+
+// summaryCheckpoint returns the included policy's checkpoint plan over the
+// given summary text at the given covered boundary.
+func summaryCheckpoint(t *testing.T, summary, boundary string) *CheckpointPlan {
+	t.Helper()
+	msg, err := model.NewMessage(model.Message{
+		Role:    model.RoleAssistant,
+		Source:  testCompactCapture().Model,
+		Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + summary + "\n\n[End of summary. Continue from here.]"}},
+	})
+	testassert.NoError(t, err)
+	return &CheckpointPlan{BoundaryEntryID: boundary, Items: authoredItems(msg)}
+}
+
+// authoredItems wraps explicitly strategy-authored context messages into
+// checkpoint proposal items.
+func authoredItems(messages ...model.Message) []CheckpointItem {
+	items := make([]CheckpointItem, 0, len(messages))
+	for i := range messages {
+		owned := messages[i]
+		items = append(items, CheckpointItem{Context: &owned})
+	}
+	return items
+}
+
+// retainItems wraps frozen-view source positions into checkpoint proposal
+// items.
+func retainItems(positions ...int) []CheckpointItem {
+	items := make([]CheckpointItem, 0, len(positions))
+	for _, position := range positions {
+		pos := position
+		items = append(items, CheckpointItem{Retain: &pos})
+	}
+	return items
+}
+
+// runCompaction drives the included maintenance procedure over the frozen
+// snapshot through the generic strategy loop and returns the produced
+// summary text, the one request's reported usage, the producer identity, the
+// accumulated facts, and the retained stage closer.
+func (h *Harness) runCompaction(execCtx context.Context, c *coordinator, operationID string, exec Execution, capture ExecutionCapture, snapshot []model.Message, suspended *RunningRequest, _ *maintenanceFacts) (string, *UsageCount, string, *maintenanceFacts, func() error, error) {
+	_, frozenCheckpoint, frozenBoundary, err := h.projectCanonical(c, operationID)
+	if err != nil {
+		return "", nil, "", &maintenanceFacts{}, func() error { return nil }, err
+	}
+	if suspended == nil {
+		// The procedure consumes one frozen conversation request view, as the
+		// request source always supplies in the automatic path.
+		suspended = &RunningRequest{RequestID: "request-conversation", CheckpointEntryID: frozenCheckpoint, BoundaryEntryID: frozenBoundary}
+	}
+	input := PlanInput{
+		Trigger:           triggerManual,
+		Messages:          cloneRequestMessages(snapshot),
+		CheckpointEntryID: frozenCheckpoint,
+		BoundaryEntryID:   frozenBoundary,
+		Instructions:      capture.Compact.SystemPrompt,
+		Tools:             cloneToolDefinitions(capture.Tools),
+		ContextWindow:     capture.ContextWindow,
+		OutputReserve:     capture.OutputReserve,
+	}
+	checkpoint, facts, closeInvocation, err := h.runContextMaintenance(execCtx, c, operationID, exec, capture, input, suspended)
+	var usage *UsageCount
+	if len(facts.facts) > 0 {
+		usage = facts.facts[len(facts.facts)-1].Usage
+	}
+	if err != nil || checkpoint == nil {
+		return "", usage, facts.maintenanceID, facts, closeInvocation, err
+	}
+	summary := summaryTextOf(checkpoint)
+	return summary, usage, facts.maintenanceID, facts, closeInvocation, nil
+}
+
+// summaryTextOf returns the summary inside the produced checkpoint wrapper.
+func summaryTextOf(checkpoint *CheckpointPlan) string {
+	const prefix = "[Previous conversation summary]\n\n"
+	const suffix = "\n\n[End of summary. Continue from here.]"
+	if checkpoint == nil || len(checkpoint.Items) == 0 || checkpoint.Items[0].Context == nil {
+		return ""
+	}
+	text := checkpoint.Items[0].Context.TextContent()
+	return strings.TrimSuffix(strings.TrimPrefix(text, prefix), suffix)
 }
 
 func maintenanceInvocationOf(t *testing.T, exec Execution) InvocationExecution {
@@ -260,8 +358,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return summaryStream("summary one", model.Usage{}), nil
 		}
 		exec := compactionExecution(t, compact, spy.retry)
-		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -284,8 +381,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 				turnDelta("", "partial"), usageDelta(model.Usage{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5})), nil
 		}
 		exec := compactionExecution(t, compact, (&retrySpy{limit: 0}).retry)
-		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -295,8 +391,8 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 		testassert.NoError(t, err)
 		settlement := settlementEntryOf(t, graph)
 		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "provider failure"), "settlement entry = %+v, want the failure terminal", settlement)
-		testassert.Require(t, settlement.Model != nil && *settlement.Model == compactRef, "settlement model = %+v, want the compact model identity", settlement.Model)
-		testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+		testassert.Require(t, settlement.Facts[0].Model == compactRef, "settlement fact model = %+v, want the compact model identity", settlement.Facts[0].Model)
+		testassert.Require(t, settlement.Facts[0].Usage != nil && *settlement.Facts[0].Usage == (UsageCount{InputTokens: 5, CachedInputTokens: 5, OutputTokens: 5}) && settlement.CompactionUsage, "settlement fact usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Facts[0].Usage)
 		testassert.Require(t, len(graph.Session.State.Usage.ByModel) == 1 && graph.Session.State.Usage.ByModel[0].Model == compactRef, "session usage = %+v, want the reported total keyed by the compact model", graph.Session.State.Usage)
 		view, err := h.ReadSessionView(context.Background(), sessionID)
 		testassert.NoError(t, err)
@@ -313,8 +409,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return nil, errors.New("unreachable")
 		}
 		exec := compactionExecution(t, compact, nil)
-		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -346,8 +441,7 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 			return streamOf(refusal, usageDelta(model.Usage{InputTokens: 2, OutputTokens: 1})), nil
 		}
 		exec := compactionExecution(t, compact, spy.retry)
-		var reported *UsageCount
-		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", newMaintenanceFacts("", ""), nil, &reported)
+		me := h.compactModelEffect(c, testOpID, maintenanceInvocationOf(t, exec), exec.Retry, testCapture(), "maintenance-test", &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
 		req, err := model.NewRequest(model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}})
 		testassert.NoError(t, err)
 		set, err := invokeModelEffect(t, me, req, nil)
@@ -417,8 +511,8 @@ func TestRunCompactionCanceledAfterSummarySettlesInterruption(t *testing.T) {
 	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
 	testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail, "settlement entry = %+v, want the run's interruption terminal", settlement)
-	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
-	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 4, OutputTokens: 2}) && settlement.CompactionUsage, "settlement usage = %+v, want the summary's reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+	testassert.Require(t, settlement.Facts[0].Model == testCompactCapture().Model, "settlement fact model = %+v, want the compact model identity", settlement.Facts[0].Model)
+	testassert.Require(t, settlement.Facts[0].Usage != nil && *settlement.Facts[0].Usage == (UsageCount{InputTokens: 4, OutputTokens: 2}) && settlement.CompactionUsage, "settlement fact usage = %+v, want the summary's reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Facts[0].Usage)
 	for i := range graph.Entries {
 		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
@@ -534,7 +628,7 @@ func compactedFixtureGraph(postBoundary ...testEntry) *testGraph {
 		compaction: &comp,
 	})
 	fixture.entries = append(fixture.entries, postBoundary...)
-	fixture.session.State.CompactionEntryID = hexID(3)
+	fixture.session.State.CheckpointEntryID = hexID(3)
 	return fixture
 }
 
@@ -645,8 +739,8 @@ func TestRunCompactionErroredSummaryCarriesOutputThroughTheRun(t *testing.T) {
 	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
 	testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "provider failure"), "settlement entry = %+v, want the failure terminal", settlement)
-	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
-	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 5, OutputTokens: 7}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+	testassert.Require(t, settlement.Facts[0].Model == testCompactCapture().Model, "settlement fact model = %+v, want the compact model identity", settlement.Facts[0].Model)
+	testassert.Require(t, settlement.Facts[0].Usage != nil && *settlement.Facts[0].Usage == (UsageCount{InputTokens: 5, OutputTokens: 7}) && settlement.CompactionUsage, "settlement fact usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Facts[0].Usage)
 	for i := range graph.Entries {
 		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
@@ -677,58 +771,13 @@ func TestRunCompactionEmptySummaryFailsWithTheRetainedDetail(t *testing.T) {
 	testassert.NoError(t, err)
 	settlement := settlementEntryOf(t, graph)
 	testassert.Require(t, settlement.Status == OperationFailure && settlement.Detail == "compaction summary is empty", "settlement entry = %+v, want the empty-summary failure terminal", settlement)
-	testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
-	testassert.Require(t, settlement.Usage != nil && *settlement.Usage == (UsageCount{InputTokens: 2, OutputTokens: 1}) && settlement.CompactionUsage, "settlement usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+	testassert.Require(t, settlement.Facts[0].Model == testCompactCapture().Model, "settlement fact model = %+v, want the compact model identity", settlement.Facts[0].Model)
+	testassert.Require(t, settlement.Facts[0].Usage != nil && *settlement.Facts[0].Usage == (UsageCount{InputTokens: 2, OutputTokens: 1}) && settlement.CompactionUsage, "settlement fact usage = %+v, want the reported counts; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Facts[0].Usage)
 	for i := range graph.Entries {
 		testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failure path")
 	}
 }
 
-// TestCompactionBoundaryRows pins the pure boundary helper: the covered
-// source is the frozen snapshot minus the prior summary message, counted
-// from the prior compaction's own boundary target — every projectable kind
-// derives the covered last message, an entry raced between the boundary
-// target and the named compaction counts against the target's sequence, and
-// the summary-only re-compaction names the prior compaction entry itself.
-// The rows build minimal typed graphEntry values: an envelope with the
-// sequence and the one non-nil payload pointer the kind needs.
-func TestCompactionBoundaryRows(t *testing.T) {
-	input := graphEntry{Envelope: Entry{ID: "in-1", Sequence: 1}, Input: &inputEntry{}}
-	assistant := graphEntry{Envelope: Entry{ID: "as-1", Sequence: 2}, Assistant: &assistantEntry{}}
-	toolResult := graphEntry{Envelope: Entry{ID: "tr-1", Sequence: 3}, ToolResult: &toolResultEntry{}}
-	signal := graphEntry{Envelope: Entry{ID: "sg-1", Sequence: 4}, Signal: &signalEntry{}}
-
-	t.Run("every projectable kind derives the covered last message", func(t *testing.T) {
-		for _, covered := range []graphEntry{input, assistant, toolResult, signal} {
-			{
-				got := compactionBoundary([]graphEntry{covered}, "", 1)
-				testassert.Require(t, got == covered.Envelope.ID, "boundary over the %s row = %q, want the covered entry %q", covered.Envelope.Kind, got, covered.Envelope.ID)
-			}
-		}
-	})
-
-	t.Run("an entry between the boundary target and the named compaction counts", func(t *testing.T) {
-		compaction := graphEntry{Envelope: Entry{ID: "co-1", Sequence: 5}, Compaction: &compactionEntry{BoundaryEntryID: assistant.Envelope.ID}}
-		// The frozen snapshot carried the prior summary and the raced
-		// signal: the boundary is the first entry after the target's
-		// sequence, not the first after the named entry's own.
-		{
-			got := compactionBoundary([]graphEntry{input, assistant, signal, compaction}, compaction.Envelope.ID, 2)
-			testassert.Equal(t, got, signal.Envelope.ID)
-		}
-	})
-
-	t.Run("the summary-only re-compaction names the prior compaction entry", func(t *testing.T) {
-		compaction := graphEntry{Envelope: Entry{ID: "co-1", Sequence: 3}, Compaction: &compactionEntry{BoundaryEntryID: assistant.Envelope.ID}}
-		{
-			got := compactionBoundary([]graphEntry{input, assistant, compaction}, compaction.Envelope.ID, 1)
-			testassert.Equal(t, got, compaction.Envelope.ID)
-		}
-	})
-}
-
-// UsageByModelForTest returns the totals' pieces keyed by ref: the shared
-// usage-by-model selection; each caller keeps its own expected counts.
 func UsageByModelForTest(totals UsageTotals, ref model.ModelRef) UsageTotals {
 	var out UsageTotals
 	for _, mu := range totals.ByModel {
@@ -740,9 +789,9 @@ func UsageByModelForTest(totals UsageTotals, ref model.ModelRef) UsageTotals {
 }
 
 // compactedEntryOf returns the one compaction entry of the validated graph.
-func compactedEntryOf(t *testing.T, graph *sessionGraph) *compactionEntry {
+func compactedEntryOf(t *testing.T, graph *sessionGraph) *contextCheckpointEntry {
 	t.Helper()
-	var found *compactionEntry
+	var found *contextCheckpointEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Compaction != nil {
 			testassert.Require(t, found == nil, "graph carries more than one compaction entry")
@@ -779,22 +828,24 @@ func TestCommitCompactionAutomaticCommitsAtomically(t *testing.T) {
 	beforeEntries, _ := storedSessionState(store, sessionID)
 
 	usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
-	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
-	// admitted input message.
+	// The fresh fixture's frozen snapshot carries the one admitted input
+	// message, which the checkpoint covers.
 	{
 		inputID := fixtureInputEntryID(c)
-		err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary one", 1, usage, false)
+		facts := newMaintenanceFacts("request-conversation", inputID)
+		facts.facts[0].Usage = usage
+		err := h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "summary one", inputID), false)
 		testassert.NoError(t, err)
 	}
 
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	testassert.Require(t, comp.OperationID == testOpID && comp.Summary == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
+	testassert.Require(t, comp.OperationID == testOpID && summaryText(t, comp) == "summary one", "compaction entry = %+v, want the Operation-owned committed summary", comp)
 	testassert.Equal(t, comp.BoundaryEntryID, graph.Entries[0].Envelope.ID)
-	testassert.Require(t, comp.Model == testCompactCapture().Model && comp.ConfigurationRevision == "rev-1", "compaction entry identity = %+v rev %q, want the compact model and the capture's revision", comp.Model, comp.ConfigurationRevision)
-	testassert.Require(t, comp.Usage != nil && *comp.Usage == *usage, "compaction entry usage = %+v, want the orchestration's reported total", comp.Usage)
-	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
+	testassert.Require(t, comp.Facts[0].Model == testCompactCapture().Model && comp.ConfigurationRevision == "rev-1", "compaction entry identity = %+v rev %q, want the compact model and the capture's revision", comp.Facts[0].Model, comp.ConfigurationRevision)
+	testassert.Require(t, comp.Facts[0].Usage != nil && *comp.Facts[0].Usage == *usage, "compaction entry fact usage = %+v, want the orchestration's reported total", comp.Facts[0].Usage)
+	testassert.Equal(t, graph.Session.State.CheckpointEntryID, comp.EntryID)
 
 	// The Operation continues: running, current, quiet, with no settlement.
 	testassert.Equal(t, graph.Session.State.CurrentOperationID, testOpID)
@@ -847,23 +898,26 @@ func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 	beforeEntries, _ := storedSessionState(store, sessionID)
 
 	usage := &UsageCount{InputTokens: 6, CachedInputTokens: 1, OutputTokens: 2}
-	// snapshotLen 1: the fresh fixture's frozen snapshot carries the one
-	// admitted input message.
+	// The fresh fixture's frozen snapshot carries the one admitted input
+	// message, which the checkpoint covers.
 	{
-		err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", ""), "manual summary", 1, usage, true)
+		inputID := fixtureInputEntryID(c)
+		facts := newMaintenanceFacts("request-conversation", "")
+		facts.facts[0].Usage = usage
+		err := h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "manual summary", inputID), true)
 		testassert.NoError(t, err)
 	}
 
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
 	comp := compactedEntryOf(t, graph)
-	testassert.Require(t, comp.Summary == "manual summary" && comp.BoundaryEntryID == graph.Entries[0].Envelope.ID, "compaction entry = %+v, want the committed summary at the projectable boundary", comp)
+	testassert.Require(t, summaryText(t, comp) == "manual summary" && comp.BoundaryEntryID == graph.Entries[0].Envelope.ID, "compaction entry = %+v, want the committed summary at the projectable boundary", comp)
 	settlement := settlementEntryOf(t, graph)
 	testassert.Require(t, settlement.Status == OperationSuccess && settlement.Detail == "" && (settlement.Model == nil && settlement.Usage == nil) && !settlement.CompactionUsage, "settlement entry = %+v, want the success terminal with no detail; settlement entry = %+v, want no usage on the settlement itself; settlement compaction_usage = true, want the manual settlement unmarked", settlement, settlement)
 	state := operationStateOf(t, graph, testOpID)
 	testassert.Require(t, state.Status == OperationSuccess && state.Terminal != nil && state.Terminal.SettlementEntry.EntryID == settlement.EntryID, "operation state = %+v, want the success terminal naming the settlement entry", state)
 	testassert.Equal(t, graph.Session.State.CurrentOperationID, "")
-	testassert.Equal(t, graph.Session.State.CompactionEntryID, comp.EntryID)
+	testassert.Equal(t, graph.Session.State.CheckpointEntryID, comp.EntryID)
 
 	// The usage landed through the compaction part: both totals carry it
 	// keyed by the compact model.
@@ -892,10 +946,10 @@ func TestCommitCompactionManualSettlesInTheSameTransaction(t *testing.T) {
 
 // TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent proves the
 // failure contract: an injected transaction failure commits nothing of the
-// compaction — the previous projection stays current — and the commit's own
-// failure settles the quiet running Operation through the direct terminal
-// settlement carrying the commit error and the reported usage keyed by the
-// compact model.
+// checkpoint — the previous projection and checkpoint stay current, the
+// waiting conversation request is never sent uncompacted — and the
+// publication failure fabricates no follow-up terminal write: the running
+// state stays for recovery and no settlement entry appears.
 func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T) {
 	t.Run("a persistently failing store leaves every durable value unchanged", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
@@ -910,8 +964,8 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 
 		{
 			inputID := fixtureInputEntryID(c)
-			err := h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, nil, false)
-			testassert.Require(t, err != nil, "commitCompaction succeeded past an injected failure")
+			err := h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: inputID}, newMaintenanceFacts("request-conversation", inputID), summaryCheckpoint(t, "summary", inputID), false)
+			testassert.Require(t, err != nil, "commitCheckpoint succeeded past an injected failure")
 		}
 
 		graph, err := validateFixture(t, store, sessionID)
@@ -926,7 +980,7 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 			got := registerRevision(t, store, sessionID, sessionKey)
 			testassert.Equal(t, got, sessionRevision)
 		}
-		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
+		testassert.Equal(t, graph.Session.State.CheckpointEntryID, "")
 		state := operationStateOf(t, graph, testOpID)
 		testassert.Require(t, state.Status == OperationRunning, "operation state = %+v, want still running", state)
 		after, err := h.projectContext(c, testOpID)
@@ -934,7 +988,7 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
 	})
 
-	t.Run("a one-shot commit failure settles the reported usage", func(t *testing.T) {
+	t.Run("a one-shot commit failure fabricates no follow-up terminal write", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		before, err := h.projectContext(c, testOpID)
 		testassert.NoError(t, err)
@@ -950,19 +1004,24 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		usage := &UsageCount{InputTokens: 7, CachedInputTokens: 3, OutputTokens: 4}
 
 		inputID := fixtureInputEntryID(c)
-		err = h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, usage, false)
+		facts := newMaintenanceFacts("request-conversation", inputID)
+		facts.facts[0].Usage = usage
+		err = h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "summary", inputID), false)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected commit failure"), "error %v, want the injected commit failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
 		for i := range graph.Entries {
 			testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry committed on a failed transaction")
+			testassert.Require(t, graph.Entries[i].Settlement == nil, "publication failure fabricated a follow-up terminal write")
 		}
-		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
-		settlement := settlementEntryOf(t, graph)
-		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "injected commit failure"), "settlement entry = %+v, want the commit failure terminal", settlement)
-		testassert.Require(t, settlement.Model != nil && *settlement.Model == testCompactCapture().Model, "settlement model = %+v, want the compact model identity", settlement.Model)
-		testassert.Require(t, settlement.Usage != nil && *settlement.Usage == *usage && settlement.CompactionUsage, "settlement usage = %+v, want the reported total; settlement compaction_usage = false, want the summary usage provenance marked", settlement.Usage)
+		// The previous checkpoint stays current and the running state is
+		// retained for recovery.
+		testassert.Equal(t, graph.Session.State.CheckpointEntryID, "")
+		state := operationStateOf(t, graph, testOpID)
+		testassert.Require(t, state.Status == OperationRunning, "operation state = %+v, want the running state retained for recovery", state)
+		// The waiting conversation request is never sent uncompacted: the
+		// projection the request source would rebuild stays unchanged.
 		after, err := h.projectContext(c, testOpID)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)
@@ -985,18 +1044,18 @@ func TestCommitCompactionInjectedFailureLeavesPreviousStateCurrent(t *testing.T)
 		}
 
 		inputID := fixtureInputEntryID(c)
-		err = h.commitCompaction(c, testOpID, testCapture(), "maintenance-one", newMaintenanceFacts("request-conversation", inputID), "summary", 1, nil, true)
+		err = h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: inputID}, newMaintenanceFacts("request-conversation", inputID), summaryCheckpoint(t, "summary", inputID), true)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "injected settlement failure"), "error %v, want the injected settlement failure", err)
 
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
 		for i := range graph.Entries {
 			testassert.Require(t, graph.Entries[i].Compaction == nil, "compaction entry survived the failed shared transaction")
+			testassert.Require(t, graph.Entries[i].Settlement == nil, "publication failure fabricated a follow-up terminal write")
 		}
-		testassert.Equal(t, graph.Session.State.CompactionEntryID, "")
-		// The commit's own failure settlement stands alone.
-		settlement := settlementEntryOf(t, graph)
-		testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "injected settlement failure"), "settlement entry = %+v, want the commit failure terminal", settlement)
+		testassert.Equal(t, graph.Session.State.CheckpointEntryID, "")
+		state := operationStateOf(t, graph, testOpID)
+		testassert.Require(t, state.Status == OperationRunning, "operation state = %+v, want the running state retained for recovery", state)
 		after, err := h.projectContext(c, testOpID)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(before, after), "projection changed through a failed commit:\nbefore %+v\nafter  %+v", before, after)

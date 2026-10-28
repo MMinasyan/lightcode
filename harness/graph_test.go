@@ -1,12 +1,14 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -290,7 +292,7 @@ type testEntry struct {
 	signal      *signalEntry
 	hookResult  *hookResultEntry
 	settlement  *operationSettlementEntry
-	compaction  *compactionEntry
+	compaction  *contextCheckpointEntry
 	rawOverride json.RawMessage
 }
 
@@ -351,7 +353,7 @@ func (g *testGraph) storage(t testing.TB) *graphStorage {
 			testassert.NoError(t, err)
 			env.Payload = raw
 		case entry.compaction != nil:
-			raw, err := encodeCompactionEntry(*entry.compaction)
+			raw, err := encodeContextCheckpointEntry(*entry.compaction)
 			testassert.NoError(t, err)
 			env.Payload = raw
 		default:
@@ -584,7 +586,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 		fixture.entries = append(fixture.entries, testEntry{
 			env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
 		})
-		fixture.session.State.CompactionEntryID = hexID(5)
+		fixture.session.State.CheckpointEntryID = hexID(5)
 		fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(5)}
 		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
 			t.Fatalf("summary-only running request boundary: %v", err)
@@ -601,7 +603,7 @@ func TestGraphValidatorAcceptsCoherentSessions(t *testing.T) {
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp},
 			testEntry{env: Entry{SessionID: testSessionID, ID: hexID(6), OperationID: testOpID, Kind: EntrySignal, Sequence: 4, CommittedAt: testTime}, signal: &signal},
 		)
-		fixture.session.State.CompactionEntryID = hexID(5)
+		fixture.session.State.CheckpointEntryID = hexID(5)
 		fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(6)}
 		if _, err := validateFixture(t, fixture.storage(t), testSessionID); err != nil {
 			t.Fatalf("later canonical tail boundary: %v", err)
@@ -1707,7 +1709,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryCompaction, Sequence: 4, CommittedAt: testTime}, compaction: &two,
 			})
-			fixture.session.State.CompactionEntryID = hexID(4)
+			fixture.session.State.CheckpointEntryID = hexID(4)
 		}},
 		{"assistant provenance omits a committed request hook", func(t *testing.T, fixture *testGraph) {
 			hook := validRequestBoundHookResult(hookSucceeded)
@@ -1927,7 +1929,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
 			})
-			fixture.session.State.CompactionEntryID = hexID(5)
+			fixture.session.State.CheckpointEntryID = hexID(5)
 			fixture.ops[0].State.Request = &RunningRequest{RequestID: "request-active", CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(1)}
 		}},
 		{"active request hook effect references a boundary its checkpoint covered", func(t *testing.T, fixture *testGraph) {
@@ -1936,7 +1938,7 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 			fixture.entries = append(fixture.entries, testEntry{
 				env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp,
 			})
-			fixture.session.State.CompactionEntryID = hexID(5)
+			fixture.session.State.CheckpointEntryID = hexID(5)
 			fixture.ops[0].State.ActiveEffect = &ActiveEffect{
 				Kind: EffectHook, ResultEntryID: hexID(9), HookID: "cap.hook.one", ExtensionID: "ext.one", RequestID: "request-active",
 				Evidence: &RequestEvidence{CheckpointEntryID: hexID(5), BoundaryEntryID: hexID(1)},
@@ -1988,8 +1990,8 @@ func TestGraphValidatorSurfacesCorruption(t *testing.T) {
 		"active tool effect provenance omits committed hook effects":              "omits committed hook result",
 		"tool result provenance names a hook effect committed after the result":   "follows that call's terminal tool result",
 		"active tool effect provenance names its hook effects out of order":       "out of order",
-		"running request state names a boundary its checkpoint covered":           "before its checkpoint entry",
-		"active request hook effect references a boundary its checkpoint covered": "before its checkpoint entry",
+		"running request state names a boundary its checkpoint covered":           "already covered by checkpoint entry",
+		"active request hook effect references a boundary its checkpoint covered": "already covered by checkpoint entry",
 		"automatic maintenance record names no consumed conversation request":     "names no consumed conversation request",
 	}
 	for _, tc := range corruptions {
@@ -2282,7 +2284,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	compactionAt := func(entryID, boundaryID, operationID string, sequence int64) testEntry {
 		v := validCompactionEntry(operationID)
 		v.EntryID = entryID
-		v.RequestID = "maintenance-" + entryID
+		v.Facts[0].RequestID = "maintenance-" + entryID
 		v.BoundaryEntryID = boundaryID
 		return testEntry{
 			env:        Entry{SessionID: testSessionID, ID: entryID, OperationID: operationID, Kind: EntryCompaction, Sequence: sequence, CommittedAt: testTime},
@@ -2293,7 +2295,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 	t.Run("committed compaction entry with projection state validates", func(t *testing.T) {
 		fixture := validTestGraph()
 		fixture.entries = append(fixture.entries, compactionAt(hexID(3), hexID(2), testOpID, 3))
-		fixture.session.State.CompactionEntryID = hexID(3)
+		fixture.session.State.CheckpointEntryID = hexID(3)
 		view, err := validateFixture(t, fixture.storage(t), testSessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(view.Entries) == 3 && view.Entries[2].Compaction != nil, "decoded view does not carry the compaction payload")
@@ -2304,15 +2306,15 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 
 	t.Run("dangling projection reference corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.session.State.CompactionEntryID = otherEntry()
+		fixture.session.State.CheckpointEntryID = otherEntry()
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		corrupt := wantCorruption(t, err)
-		testassert.Require(t, strings.Contains(corrupt.Detail, "compaction"), "corruption detail = %q, want the compaction rule", corrupt.Detail)
+		testassert.Require(t, strings.Contains(corrupt.Detail, "checkpoint"), "corruption detail = %q, want the checkpoint reference rule", corrupt.Detail)
 	})
 
 	t.Run("projection naming a non-compaction entry corrupts", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.session.State.CompactionEntryID = hexID(2)
+		fixture.session.State.CheckpointEntryID = hexID(2)
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		wantCorruption(t, err)
 	})
@@ -2349,7 +2351,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			compactionAt(hexID(3), hexID(2), testOpID, 3),
 			compactionAt(hexID(4), hexID(3), testOpID, 4),
 		)
-		fixture.session.State.CompactionEntryID = hexID(4)
+		fixture.session.State.CheckpointEntryID = hexID(4)
 		{
 			_, err := validateFixture(t, fixture.storage(t), testSessionID)
 			testassert.NoError(t, err)
@@ -2372,7 +2374,7 @@ func TestGraphValidatorCompactionRules(t *testing.T) {
 			}(),
 		}
 		fixture.session.State.CurrentOperationID = "op-2"
-		fixture.session.State.CompactionEntryID = hexID(6)
+		fixture.session.State.CheckpointEntryID = hexID(6)
 		input := validInputEntry(testOpID)
 		input.EntryID = hexID(1)
 		assistant := validAssistantEntry(testOpID)
@@ -2431,12 +2433,12 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		mutate  func(t *testing.T, fixture *testGraph, compaction *compactionEntry)
+		mutate  func(t *testing.T, fixture *testGraph, compaction *contextCheckpointEntry)
 		corrupt bool
 	}{
 		{
 			name: "compaction usage joins the totals",
-			mutate: func(t *testing.T, fixture *testGraph, compaction *compactionEntry) {
+			mutate: func(t *testing.T, fixture *testGraph, compaction *contextCheckpointEntry) {
 				assistantUsage := UsageCount{InputTokens: 1, CachedInputTokens: 2, OutputTokens: 3}
 				compactionUsage := UsageCount{InputTokens: 4, CachedInputTokens: 5, OutputTokens: 6}
 				assistant := validAssistantEntry(testOpID)
@@ -2444,7 +2446,7 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 				assistant.RequestID = hexID(2)
 				assistant.Usage = &assistantUsage
 				fixture.entries[1].assistant = &assistant
-				compaction.Usage = &compactionUsage
+				compaction.Facts[0].Usage = &compactionUsage
 				merged, err := addUsageTotals(
 					UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: assistantUsage}}},
 					UsageTotals{ByModel: []ModelUsage{{Model: otherRef, Usage: compactionUsage}}},
@@ -2456,8 +2458,8 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 		},
 		{
 			name: "compaction usage missing from the totals corrupts",
-			mutate: func(t *testing.T, fixture *testGraph, compaction *compactionEntry) {
-				compaction.Usage = testUsage(5)
+			mutate: func(t *testing.T, fixture *testGraph, compaction *contextCheckpointEntry) {
+				compaction.Facts[0].Usage = testUsage(5)
 			},
 			corrupt: true,
 		},
@@ -2468,7 +2470,7 @@ func TestGraphValidatorCompactionUsage(t *testing.T) {
 			compaction := validCompactionEntry(testOpID)
 			compaction.EntryID = hexID(3)
 			compaction.BoundaryEntryID = hexID(2)
-			compaction.Model = otherRef
+			compaction.Facts[0].Model = otherRef
 			tc.mutate(t, fixture, &compaction)
 			fixture.entries = append(fixture.entries, testEntry{
 				env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
@@ -2501,7 +2503,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 			first := validCompactionEntry(testOpID)
 			first.EntryID = hexID(3)
 			first.BoundaryEntryID = hexID(2)
-			first.Usage = testUsage(5)
+			first.Facts[0].Usage = testUsage(5)
 			fixture.entries = append(fixture.entries, testEntry{
 				env:        Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime},
 				compaction: &first,
@@ -2509,7 +2511,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 			second := validCompactionEntry(testOpID)
 			second.EntryID = hexID(4)
 			second.BoundaryEntryID = hexID(3)
-			second.Summary = "Second summary."
+			setSummaryMessage(&second, "Second summary.", testModelRef())
 			fixture.entries = append(fixture.entries, testEntry{
 				env:        Entry{SessionID: testSessionID, ID: hexID(4), OperationID: testOpID, Kind: EntryCompaction, Sequence: 4, CommittedAt: testTime},
 				compaction: &second,
@@ -2545,7 +2547,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 		commit := runFork(t, buildSource(t, true))
 
 		var copiedAssistantID string
-		var copiedCompactions []*compactionEntry
+		var copiedCompactions []*contextCheckpointEntry
 		var copiedCompactionIDs []string
 		for i := range commit.entries {
 			entry := commit.entries[i]
@@ -2563,16 +2565,78 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 			testassert.Require(t, v.SessionID == destID && v.EntryID == copiedCompactionIDs[i], "copied compaction identity %s/%s, want destination identities", v.SessionID, v.EntryID)
 			testassert.Require(t, v.ConsumedRequestID == "request-two", "copied compaction %s consumed source = %q, want the source identity carried unchanged and informational", v.EntryID, v.ConsumedRequestID)
 			testassert.Equal(t, v.OperationID, "")
-			if v.Usage != nil {
-				t.Fatalf("copied compaction carries source usage %+v", *v.Usage)
+			for _, fact := range v.Facts {
+				if fact.Usage != nil {
+					t.Fatalf("copied compaction carries source usage %+v", *fact.Usage)
+				}
 			}
-			testassert.Equal(t, v.Model, testModelRef())
+			testassert.Equal(t, v.Facts[0].Model, testModelRef())
 			testassert.Equal(t, v.ConfigurationRevision, "rev-1")
 		}
-		testassert.Require(t, copiedCompactions[0].Summary == "Summary of the earlier conversation." && copiedCompactions[1].Summary == "Second summary.", "copied summaries %q and %q did not survive", copiedCompactions[0].Summary, copiedCompactions[1].Summary)
+		testassert.Require(t, summaryText(t, copiedCompactions[0]) == "Summary of the earlier conversation." && summaryText(t, copiedCompactions[1]) == "Second summary.", "copied summaries %q and %q did not survive", summaryText(t, copiedCompactions[0]), summaryText(t, copiedCompactions[1]))
 		testassert.Equal(t, copiedCompactions[0].BoundaryEntryID, copiedAssistantID)
 		testassert.Equal(t, copiedCompactions[1].BoundaryEntryID, copiedCompactionIDs[0])
-		testassert.Equal(t, commit.session.State.CompactionEntryID, copiedCompactionIDs[1])
+		testassert.Equal(t, commit.session.State.CheckpointEntryID, copiedCompactionIDs[1])
+	})
+
+	t.Run("copied messages preserve the complete shared domain through cold reads", func(t *testing.T) {
+		arguments := []byte{0x7b, 0xff, 0x00, 0x7d} // not valid JSON
+		fixture := buildSource(t, true)
+		for i := range fixture.entries {
+			if fixture.entries[i].compaction == nil || fixture.entries[i].env.ID != hexID(3) {
+				continue
+			}
+			fixture.entries[i].compaction.Messages = []model.Message{
+				{
+					Role:      model.RoleAssistant,
+					Source:    testModelRef(),
+					Content:   []model.ContentPart{{Kind: model.PartText, Text: "calling"}},
+					Refusal:   "declined",
+					Name:      "named",
+					Extra:     model.Extra{"vendor": json.RawMessage(`1`)},
+					ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: arguments, Extra: model.Extra{"call": json.RawMessage(`"x"`)}}},
+				},
+				{Role: model.RoleTool, ToolCallID: "call-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "done"}}},
+			}
+		}
+		const destID = "ffffffffffffffffffffffffffffffff"
+		store := fixture.storage(t)
+		h := newTestHarness(t, store, nil)
+		var commit forkCommit
+		err := store.Transact(context.Background(), func(tx Transaction) error {
+			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{
+				SourceSessionID: testSessionID,
+				BoundaryEntryID: boundaryID,
+				OperationID:     forkOpID,
+				Content:         []model.ContentPart{{Kind: model.PartText, Text: "continue"}},
+			}, nil, testCapture(), &commit)
+		})
+		testassert.NoError(t, err)
+
+		var copied *contextCheckpointEntry
+		for i := range commit.entries {
+			if e := commit.entries[i].Compaction; e != nil && copied == nil {
+				copied = e
+			}
+		}
+		testassert.Require(t, copied != nil && len(copied.Messages) == 2, "copied messages = %+v, want the retained tool exchange", copied)
+		testassert.Require(t, len(copied.Messages[0].ToolCalls) == 1 && bytes.Equal(copied.Messages[0].ToolCalls[0].Arguments, arguments) && copied.Messages[1].ToolCallID == "call-1",
+			"copied tool exchange = %+v, want the exact raw argument bytes and pairing", copied.Messages)
+		testassert.Require(t, copied.Messages[0].Refusal == "declined" && copied.Messages[0].Name == "named" && copied.Messages[0].Extra["vendor"] != nil,
+			"copied message fields = %+v, want refusal, name and extras preserved", copied.Messages[0])
+
+		// The cold read of the fork's stored payload preserves the same
+		// admitted fields byte-for-byte.
+		stored, err := store.ReadEntries(context.Background(), destID, 0)
+		testassert.NoError(t, err)
+		for _, entry := range stored {
+			if entry.Kind != EntryCompaction || entry.ID != copied.EntryID {
+				continue
+			}
+			decoded, derr := decodeContextCheckpointEntry(entry)
+			testassert.NoError(t, derr)
+			testassert.Require(t, reflect.DeepEqual(decoded.Messages, copied.Messages), "cold-read messages = %+v, want the copied values byte-for-byte", decoded.Messages)
+		}
 	})
 
 	t.Run("prefix without compaction entries yields an empty field", func(t *testing.T) {
@@ -2580,7 +2644,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 		for _, entry := range commit.entries {
 			testassert.Require(t, entry.Compaction == nil, "prefix without compaction entries copied one")
 		}
-		testassert.Equal(t, commit.session.State.CompactionEntryID, "")
+		testassert.Equal(t, commit.session.State.CheckpointEntryID, "")
 	})
 
 	t.Run("source session is unchanged", func(t *testing.T) {
@@ -2671,5 +2735,76 @@ func TestGraphValidatorGroupsEntriesByOperation(t *testing.T) {
 	{
 		_, err := validateFixture(t, fixture.storage(t), testSessionID)
 		testassert.NoError(t, err)
+	}
+}
+
+// TestBuildCutSafetyVerdicts pins the precomputed cut-safety table over one
+// indexed immutable entry sequence with multiple calls and cuts: a call
+// published before a cut with its reserved result beyond it makes that cut
+// and every later one unsafe, a missing result keeps all subsequent cuts
+// unsafe, and cuts at or after every resolved pair are safe again — verdicts
+// over the carried calls, with no timing.
+func TestBuildCutSafetyVerdicts(t *testing.T) {
+	callA := validAssistantEntry(testOpID)
+	callA.EntryID = hexID(2)
+	callA.RequestID = hexID(2)
+	callA.ToolCalls = []toolCallRecord{validToolCallRecord()}
+	callA.ToolCalls[0].ID = "call-a"
+	callA.ToolCalls[0].ResultEntryID = hexID(5)
+	callB := validAssistantEntry(testOpID)
+	callB.EntryID = hexID(3)
+	callB.RequestID = hexID(3)
+	callB.ToolCalls = []toolCallRecord{validToolCallRecord()}
+	callB.ToolCalls[0].ID = "call-b"
+	callB.ToolCalls[0].ResultEntryID = hexID(4)
+	resultB := validToolResultEntry(testOpID)
+	resultB.EntryID = hexID(4)
+	resultB.ToolCallID = "call-b"
+	resultA := validToolResultEntry(testOpID)
+	resultA.EntryID = hexID(5)
+	resultA.ToolCallID = "call-a"
+	callC := validAssistantEntry(testOpID)
+	callC.EntryID = hexID(6)
+	callC.RequestID = hexID(6)
+	callC.ToolCalls = []toolCallRecord{validToolCallRecord()}
+	callC.ToolCalls[0].ID = "call-c"
+	callC.ToolCalls[0].ResultEntryID = hexID(9) // never committed
+
+	input := validInputEntry(testOpID)
+	input.EntryID = hexID(1)
+	cutOne := validCompactionEntry(testOpID)
+	cutOne.EntryID = hexID(7)
+	cutTwo := validCompactionEntry(testOpID)
+	cutTwo.EntryID = hexID(8)
+	entries := []graphEntry{
+		{Envelope: Entry{ID: hexID(1), Kind: EntryInput, Sequence: 1}, Input: &input},
+		{Envelope: Entry{ID: hexID(2), Kind: EntryAssistant, Sequence: 2}, Assistant: &callA},
+		{Envelope: Entry{ID: hexID(3), Kind: EntryAssistant, Sequence: 3}, Assistant: &callB},
+		{Envelope: Entry{ID: hexID(4), Kind: EntryToolResult, Sequence: 4}, ToolResult: &resultB},
+		{Envelope: Entry{ID: hexID(5), Kind: EntryToolResult, Sequence: 5}, ToolResult: &resultA},
+		{Envelope: Entry{ID: hexID(6), Kind: EntryAssistant, Sequence: 6}, Assistant: &callC},
+		{Envelope: Entry{ID: hexID(7), Kind: EntryCompaction, Sequence: 7}, Compaction: &cutOne},
+		{Envelope: Entry{ID: hexID(8), Kind: EntryCompaction, Sequence: 8}, Compaction: &cutTwo},
+	}
+	unsafe := buildCutSafety(entries)
+
+	// Cuts and their verdicts: (boundary entry, offender; empty = safe).
+	rows := []struct{ boundary, offender string }{
+		{hexID(1), ""},        // before any call is published
+		{hexID(2), "call-a"},  // call-a's result sits beyond the cut
+		{hexID(3), "call-a"},  // both published calls resolve beyond the cut
+		{hexID(4), "call-a"},  // call-b resolved, call-a still beyond
+		{hexID(5), ""},        // every published call resolved at or before
+		{hexID(6), "call-c"},  // call-c's result is missing
+		{hexID(7), "call-c"},  // the first checkpoint cut stays unsafe
+		{hexID(8), "call-c"},  // a missing result keeps subsequent cuts unsafe
+	}
+	for _, row := range rows {
+		offender, present := unsafe[row.boundary]
+		if row.offender == "" {
+			testassert.Require(t, !present, "cut %s = %q, want a safe cut", row.boundary, offender)
+			continue
+		}
+		testassert.Require(t, present && offender == row.offender, "cut %s = %q, want the offending call %q", row.boundary, offender, row.offender)
 	}
 }

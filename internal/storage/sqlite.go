@@ -32,7 +32,7 @@ const (
 	// into PRAGMA user_version at initialization and checked at open. Version
 	// 10 is the tool-result original-content and shaping-failure payload
 	// members; the SQL tables are unchanged.
-	sqliteSchemaVersion = 10
+	sqliteSchemaVersion = 11
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate
@@ -55,7 +55,7 @@ const sqliteEntriesDDL = `CREATE TABLE entries (
     operation_id    TEXT    NOT NULL,
     kind            TEXT    NOT NULL CHECK (kind IN (
         'input', 'assistant', 'tool_result', 'signal',
-        'hook_result', 'compaction', 'operation_settlement'
+        'hook_result', 'context_checkpoint', 'operation_settlement'
     )),
     committed_at_ns INTEGER NOT NULL CHECK (committed_at_ns > 0),
     payload         TEXT    NOT NULL CHECK (json_valid(payload)),

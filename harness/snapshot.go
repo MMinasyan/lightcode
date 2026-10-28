@@ -39,7 +39,7 @@ type HistoryFact struct {
 	Assistant   *AssistantEntry
 	ToolResult  *ToolResultEntry
 	Signal      *SignalEntry
-	Compaction  *CompactionEntry
+	Checkpoint  *ContextCheckpointEntry
 	Settlement  *OperationSettlementEntry
 }
 
@@ -175,7 +175,7 @@ func captureHistoryLocked(c *coordinator) HistoryReadView {
 		HasPending:        len(c.steering) > 0 || len(c.queued) > 0,
 		HasBackground:     c.group != nil && len(c.group.members) > 0,
 		prefix:            c.graph.Entries[:len(c.graph.Entries):len(c.graph.Entries)],
-		compactionEntryID: c.graph.Session.State.CompactionEntryID,
+		compactionEntryID: c.graph.Session.State.CheckpointEntryID,
 	}
 }
 
@@ -514,7 +514,7 @@ func ownHistoryFact(entry graphEntry) (HistoryFact, bool) {
 	case EntrySignal:
 		fact.Signal = ownSignalPayload(*entry.Signal)
 	case EntryCompaction:
-		fact.Compaction = ownCompactionPayload(*entry.Compaction)
+		fact.Checkpoint = ownCheckpointPayload(*entry.Compaction)
 	case EntryOperationSettlement:
 		fact.Settlement = ownSettlementPayload(*entry.Settlement)
 	}
@@ -600,17 +600,14 @@ func ownSettlementPayload(v operationSettlementEntry) *operationSettlementEntry 
 		out.Usage = &usage
 	}
 	out.Evidence = copyRequestEvidencePointer(v.Evidence)
-	out.Input = cloneRequestMessages(v.Input)
+	out.Facts = cloneMaintenanceFacts(v.Facts)
 	return &out
 }
 
-func ownCompactionPayload(v compactionEntry) *compactionEntry {
+func ownCheckpointPayload(v contextCheckpointEntry) *contextCheckpointEntry {
 	out := v
-	if v.Usage != nil {
-		usage := *v.Usage
-		out.Usage = &usage
-	}
-	out.Input = cloneRequestMessages(v.Input)
+	out.Messages = cloneRequestMessages(v.Messages)
+	out.Facts = cloneMaintenanceFacts(v.Facts)
 	out.Evidence = copyRequestEvidencePointer(v.Evidence)
 	return &out
 }

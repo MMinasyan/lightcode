@@ -205,11 +205,46 @@ func renderItems(items []protocol.ConversationItem, width int) string {
 			if err == nil {
 				b.WriteString(terminal.RenderSystemMsg(s.Content))
 			}
-		case "compaction":
-			compact, err := item.AsCompactionItem()
+		case "context_checkpoint":
+			checkpoint, err := item.AsCheckpointItem()
 			if err == nil {
-				raw, _ := json.Marshal(compact)
-				b.WriteString(terminal.RenderSystemMsg("Committed compaction: " + string(raw)))
+				b.WriteString(terminal.RenderSystemMsg("Context checkpoint"))
+				for _, m := range checkpoint.Messages {
+					// Every admitted message field stays inspectable beside
+					// the content and refusal rendering: the role and
+					// per-message source as labeled values, the name and
+					// tool-result members as labeled values, and the tool
+					// calls and message extras through the raw-field/JSON
+					// pattern.
+					b.WriteString(terminal.RenderSystemMsg("role: " + string(m.Role)))
+					if m.Source != nil {
+						b.WriteString(terminal.RenderSystemMsg("source: " + string(*m.Source)))
+					}
+					if m.Name != nil {
+						b.WriteString(terminal.RenderSystemMsg("name: " + *m.Name))
+					}
+					if m.Content != nil {
+						if text := contentText(*m.Content); text != "" {
+							b.WriteString(terminal.RenderSystemMsg(text))
+						}
+					}
+					if m.Refusal != nil {
+						b.WriteString(terminal.RenderWarningMsg("Refusal: " + *m.Refusal))
+					}
+					if m.ToolCalls != nil {
+						for _, call := range *m.ToolCalls {
+							raw, _ := json.Marshal(call)
+							b.WriteString(terminal.RenderSystemMsg("tool call: " + string(raw)))
+						}
+					}
+					if m.ToolCallId != nil {
+						b.WriteString(terminal.RenderSystemMsg("tool result: " + *m.ToolCallId))
+					}
+					if m.Extra != nil {
+						raw, _ := json.Marshal(m.Extra)
+						b.WriteString(terminal.RenderSystemMsg("extra: " + string(raw)))
+					}
+				}
 			}
 		case "operation_end":
 			end, err := item.AsOperationEndItem()

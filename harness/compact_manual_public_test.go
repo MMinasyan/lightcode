@@ -240,19 +240,33 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 		}
 		testassert.Require(t, parkedCompaction != nil && parkedCompaction.OperationID == "c-1", "parked compaction entry = %+v, want the c-1-owned commit", parkedCompaction)
 		var parkedWire struct {
-			Summary string              `json:"summary"`
-			Usage   *harness.UsageCount `json:"usage"`
+			Messages []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+			Facts []struct {
+				Usage *harness.UsageCount `json:"usage"`
+			} `json:"facts"`
 		}
 		{
 			err := json.Unmarshal(parkedCompaction.Payload, &parkedWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, parkedWire.Summary == "S1" && parkedWire.Usage != nil && *parkedWire.Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "parked compaction entry = %+v, want the committed summary and summary usage", parkedWire)
+		parkedSummary := ""
+		if len(parkedWire.Messages) > 0 && len(parkedWire.Messages[0].Content) > 0 {
+			parkedSummary = parkedWire.Messages[0].Content[0].Text
+		}
+		var parkedFactUsage *harness.UsageCount
+		if len(parkedWire.Facts) > 0 {
+			parkedFactUsage = parkedWire.Facts[0].Usage
+		}
+		testassert.Require(t, parkedSummary == "[Previous conversation summary]\n\nS1\n\n[End of summary. Continue from here.]" && parkedFactUsage != nil && *parkedFactUsage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "parked compaction entry = %+v, want the committed summary and summary usage", parkedWire)
 		parkedSessionReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession})
 		testassert.NoError(t, err)
 		var parkedSession struct {
 			State struct {
-				CompactionEntryID string          `json:"compaction_entry_id"`
+				CheckpointEntryID string          `json:"checkpoint_entry_id"`
 				Usage             json.RawMessage `json:"usage"`
 			} `json:"state"`
 		}
@@ -260,7 +274,7 @@ func TestPublicManualCompactIdleCommitsAndSettles(t *testing.T) {
 			err := json.Unmarshal(parkedSessionReg.Payload, &parkedSession)
 			testassert.NoError(t, err)
 		}
-		testassert.Equal(t, parkedSession.State.CompactionEntryID, parkedCompaction.ID)
+		testassert.Equal(t, parkedSession.State.CheckpointEntryID, parkedCompaction.ID)
 		testassert.Require(t, parkedUsageCount(t, parkedSession.State.Usage, compactModelRef), "parked session usage = %s, want the summary counts keyed by the compact model", parkedSessionReg.Payload)
 		parkedOpReg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "c-1"})
 		testassert.NoError(t, err)
@@ -515,14 +529,14 @@ func TestPublicManualCompactEmptyConversationFails(t *testing.T) {
 		testassert.NoError(t, err)
 		var sessionState struct {
 			State struct {
-				CompactionEntryID string `json:"compaction_entry_id"`
+				CheckpointEntryID string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(sessionReg.Payload, &sessionState)
 			testassert.NoError(t, err)
 		}
-		testassert.Equal(t, sessionState.State.CompactionEntryID, "")
+		testassert.Equal(t, sessionState.State.CheckpointEntryID, "")
 		// Subsequent messages never see a synthetic compact request.
 		{
 			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
@@ -728,14 +742,14 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 		var wire struct {
 			State struct {
 				CurrentOperationID string `json:"current_operation_id"`
-				CompactionEntryID  string `json:"compaction_entry_id"`
+				CheckpointEntryID  string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(reg.Payload, &wire)
 			testassert.NoError(t, err)
 		}
-		testassert.Equal(t, wire.State.CompactionEntryID, priorID)
+		testassert.Equal(t, wire.State.CheckpointEntryID, priorID)
 		deadline := time.Now().Add(10 * time.Second)
 		for wire.State.CurrentOperationID != "" {
 			testassert.Require(t, !time.Now().After(deadline), "current Operation %q never cleared after the interruption", wire.State.CurrentOperationID)
@@ -747,5 +761,200 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 		}
+	})
+}
+
+// publicReplacementStrategy is the replacement policy over the public
+// contract: one tool-free model pass folds into a checkpoint that retains the
+// frozen view's first message beside one authored context message — the valid
+// non-summary checkpoint a replacement strategy commits without a custom
+// canonical decoder. The model->none variant folds the same pass into none.
+type publicReplacementStrategy struct {
+	none bool
+	seen *[]*harness.UsageCount
+}
+
+func (s publicReplacementStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	if s.seen != nil {
+		*s.seen = append(*s.seen, in.Measurement)
+	}
+	return harness.PlanOutput{Kind: harness.PlanModel, Model: &harness.ModelPlan{
+		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "maintenance pass"}}}}},
+	}}, nil
+}
+
+func (s publicReplacementStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	if s.none {
+		return harness.PlanOutput{Kind: harness.PlanNone}, nil
+	}
+	zero := 0
+	authored, err := model.NewMessage(model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "authored context"}}})
+	if err != nil {
+		return harness.PlanOutput{}, err
+	}
+	return harness.PlanOutput{Kind: harness.PlanCheckpoint, Checkpoint: &harness.CheckpointPlan{
+		BoundaryEntryID: in.Input.BoundaryEntryID,
+		Items:           []harness.CheckpointItem{{Retain: &zero}, {Context: &authored}},
+	}}, nil
+}
+
+// replacementStrategyPrep arms the fixture's preparation with the replacement
+// binding's captured strategy inputs and the binding on the opened execution.
+func replacementStrategyPrep(f *publicFixture, none bool) {
+	replacementStrategyPrepRecording(f, none, nil)
+}
+
+// replacementStrategyPrepRecording additionally records every plan
+// measurement the strategy observes.
+func replacementStrategyPrepRecording(f *publicFixture, none bool, seen *[]*harness.UsageCount) {
+	f.defaultPrep.Capture = compactManualCapture()
+	f.defaultPrep.Capture.Strategy = harness.StrategyCapture{ID: "test.strategy/v1"}
+	open := f.defaultPrep.Open
+	f.defaultPrep.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+		exec, err := open(ctx, admission)
+		if err != nil {
+			return exec, err
+		}
+		exec.Strategy = &harness.StrategyBinding{ID: "test.strategy/v1", Strategy: publicReplacementStrategy{none: none, seen: seen}}
+		return exec, nil
+	}
+}
+
+// TestPublicManualCompactReplacementStrategyCommitsNonSummaryMessages proves
+// the public Prepare/Open/Compact path with one replacement strategy: the
+// retained and authored non-summary messages commit under the selected
+// strategy identity and project as ordinary messages.
+func TestPublicManualCompactReplacementStrategyCommitsNonSummaryMessages(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("unused"))
+		var measurements []*harness.UsageCount
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		replacementStrategyPrepRecording(f, false, &measurements)
+		defer f.close()
+		session := createSession(t, f.h)
+		idleHistory(t, f, session)
+
+		compactWhenIdle(t, f.h, session, "c-1")
+		rec := awaitTerminal(t, f.h, session, "c-1")
+		testassert.Require(t, rec.State.Status == harness.OperationSuccess, "compact operation = %+v, want the success terminal", rec.State)
+		// The manual plan received the conversation measurement exactly like
+		// automatic planning: the assistant turn's reported usage. The first
+		// recorded plan is the submit's own automatic planning over the
+		// then-empty measurement.
+		testassert.Require(t, len(measurements) == 2 && measurements[0] == nil && measurements[1] != nil && *measurements[1] == (harness.UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}),
+			"manual measurements = %+v, want the available conversation measurement", measurements)
+
+		// After the committed checkpoint the conversation measurement is
+		// absent and stays nil in the manual plan.
+		compactWhenIdle(t, f.h, session, "c-2")
+		rec2 := awaitTerminal(t, f.h, session, "c-2")
+		testassert.Require(t, rec2.State.Status == harness.OperationSuccess, "second compact operation = %+v, want the success terminal", rec2.State)
+		testassert.Require(t, len(measurements) == 3 && measurements[2] == nil,
+			"manual measurements = %+v, want the absent measurement kept nil", measurements)
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		testassert.NoError(t, err)
+		owned := 0
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryCompaction || entry.OperationID != "c-1" {
+				continue
+			}
+			owned++
+			payload := string(entry.Payload)
+			testassert.Require(t, strings.Contains(payload, `"strategy_id":"test.strategy/v1"`), "checkpoint payload %s, want the selected strategy identity", payload)
+			testassert.Require(t, strings.Contains(payload, "authored context"), "checkpoint payload %s, want the authored context message", payload)
+		}
+		testassert.Equal(t, owned, 1)
+	})
+}
+
+// TestPublicSubmitAutomaticNoneContinuesAndSettlesFacts proves the public
+// Prepare/Open/Submit path with one replacement strategy that incurs model
+// work and settles at none: the waiting conversation request is sent
+// uncompacted and the accumulated maintenance facts settle exactly once on
+// the ordinary terminal beside the conversation's own usage.
+func TestPublicSubmitAutomaticNoneContinuesAndSettlesFacts(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("unused"))
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		replacementStrategyPrep(f, true)
+		defer f.close()
+		session := createSession(t, f.h)
+
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
+		}
+		rec := awaitSettled(t, f.h, session, "op-1")
+		testassert.Require(t, rec.State.Status == harness.OperationSuccess, "operation = %+v, want the ordinary success terminal", rec.State)
+		// The waiting conversation continued: the dispatched request carries
+		// the user message.
+		reqs := conversation.seen()
+		testassert.Require(t, len(reqs) == 1 && texts(reqs[0])[len(texts(reqs[0]))-1] == "hello", "conversation requests = %v, want the uncompacted dispatch", texts(reqs[0]))
+		// The accumulated maintenance fact settled on the ordinary terminal.
+		payload := settlementPayloadOf(t, store, session, "op-1")
+		testassert.Require(t, strings.Contains(payload, `"facts"`) && strings.Contains(payload, "maintenance pass"), "settlement payload %s, want the accumulated maintenance facts", payload)
+	})
+}
+
+// TestPublicManualCompactReplacementStrategyZeroWindowCommits exercises the
+// unknown-window split through public admission: a replacement strategy that
+// does not require a known context window accepts a capture whose
+// ContextWindow is zero and executes the real Prepare/Open/Compact path to a
+// committed checkpoint.
+func TestPublicManualCompactReplacementStrategyZeroWindowCommits(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("unused"))
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		replacementStrategyPrep(f, false) // the captured strategy requires no window
+		f.defaultPrep.Capture.ContextWindow = 0
+		defer f.close()
+		session := createSession(t, f.h)
+		idleHistory(t, f, session)
+
+		compactWhenIdle(t, f.h, session, "c-1")
+		rec := awaitTerminal(t, f.h, session, "c-1")
+		testassert.Require(t, rec.State.Status == harness.OperationSuccess, "compact operation = %+v, want the success terminal", rec.State)
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		testassert.NoError(t, err)
+		owned := 0
+		for _, entry := range entries {
+			if entry.Kind == harness.EntryCompaction && entry.OperationID == "c-1" {
+				owned++
+				testassert.Require(t, strings.Contains(string(entry.Payload), "authored context"), "checkpoint payload %s, want the committed checkpoint", entry.Payload)
+			}
+		}
+		testassert.Equal(t, owned, 1)
+	})
+}
+
+// TestPublicManualCompactIncludedPolicyZeroWindowRefusedBeforeAdmission is the
+// forbidden sibling: the included policy's captured requirement refuses the
+// zero-window capture while the Harness validates the prepared execution
+// before admission — no Operation is admitted and the opened Execution is
+// never invoked.
+func TestPublicManualCompactIncludedPolicyZeroWindowRefusedBeforeAdmission(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("unused"))
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		replacementStrategyPrep(f, false)
+		f.defaultPrep.Capture.ContextWindow = 0
+		f.defaultPrep.Capture.Strategy = harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true}
+		defer f.close()
+		session := createSession(t, f.h)
+		opens := 0
+		open := f.defaultPrep.Open
+		f.defaultPrep.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+			opens++
+			return open(ctx, admission)
+		}
+		_, err := f.h.Compact(context.Background(), harness.CompactRequest{SessionID: session, OperationID: "c-1"})
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "context_window"), "Compact = %v, want the pre-admission refusal of the unknown window", err)
+		testassert.Equal(t, opens, 0) // the refusal lands before any opened Execution
+		_, rerr := f.h.ReadOperation(context.Background(), session, "c-1")
+		testassert.Require(t, errors.Is(rerr, harness.ErrNotFound), "operation c-1 = %+v err %v, want no admitted Operation", rerr, rerr)
 	})
 }

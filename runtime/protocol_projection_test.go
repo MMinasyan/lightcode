@@ -318,7 +318,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		awaitModelArrival(t, e)
 
 		active := projectOperation(readOperation(t, r, session, "op-1"))
-		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.Message && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentType == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
+		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.OperationRequestKindMessage && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentType == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
 
 		close(gate)
 		record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)

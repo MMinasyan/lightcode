@@ -281,7 +281,11 @@ type Execution struct {
 	// revision its capture records. Nil selects the included built-in
 	// policy (the zero PermissionPolicy).
 	Permissions PermissionEvaluator
-	Close       func() error
+	// Strategy is the selected context strategy binding of this Operation,
+	// resolved from the same immutable configuration revision its capture
+	// records. Nil selects the included summary policy binding.
+	Strategy  *StrategyBinding
+	Close     func() error
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible
@@ -419,6 +423,13 @@ type coordinator struct {
 	steering []*pendingMessage // regular input waiting for the next model boundary
 	queued   []*pendingMessage // queued input waiting for the next Agent turn end
 	run      *activeExecution  // non-nil while one execution is in flight
+
+	// pendingFacts holds the active execution's accumulated uncommitted
+	// maintenance facts — incurred by procedures that settled at none —
+	// until the next successful checkpoint or terminal publication accounts
+	// them exactly once. Process-local only: never durable, never a
+	// crash-survival guarantee.
+	pendingFacts []maintenanceFact
 
 	group             *backgroundGroup // nil until the first member
 	bgState           bgState          // starts as bgOpen at every construction site; the zero value is never observed
@@ -1937,10 +1948,12 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	}
 }
 
-// recordStorageFailure retains the first storage-class failure that stopped
-// admitted work; later failures never replace it.
+// recordStorageFailure retains the first storage-class failure or marked
+// publication failure that stopped admitted work — whatever the cause's own
+// identity, Is/As preserved through the wrapper; later failures never replace
+// it.
 func (h *Harness) recordStorageFailure(err error) {
-	if err == nil || !errors.Is(err, ErrStorage) {
+	if err == nil || (!errors.Is(err, ErrStorage) && !isPublicationFailure(err)) {
 		return
 	}
 	h.mu.Lock()
@@ -2102,6 +2115,7 @@ func ownCapture(c ExecutionCapture) ExecutionCapture {
 	} else {
 		out.Capabilities = append([]string(nil), c.Capabilities...)
 	}
+	out.Strategy.Settings = model.CloneRaw(c.Strategy.Settings)
 	return out
 }
 

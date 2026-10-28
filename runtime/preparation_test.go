@@ -1021,6 +1021,18 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 				c.WriteDir = "/tmp/hook-elsewhere"
 				return c
 			}},
+			{"strategy id", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.ID = "other.strategy/v1"
+				return c
+			}},
+			{"strategy requirement", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.RequiresContextWindow = !c.Strategy.RequiresContextWindow
+				return c
+			}},
+			{"strategy settings", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.Settings = json.RawMessage(`{"hook":1}`)
+				return c
+			}},
 		}
 		for _, v := range violations {
 			t.Run(v.name, func(t *testing.T) {

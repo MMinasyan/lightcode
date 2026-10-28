@@ -297,7 +297,7 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 			}
 		}
 	}
-	dest.State.CompactionEntryID = lastCompactionEntryID
+	dest.State.CheckpointEntryID = lastCompactionEntryID
 
 	record, committed, entry, perr := produceAdmission(tx, dest, capture, admissionRequest{
 		SessionID:   destID,
@@ -396,14 +396,17 @@ func copyForkEntry(tx Transaction, destID, sourceID string, decoded graphEntry, 
 		}
 		copied := *decoded.Compaction
 		copied.SessionID, copied.EntryID, copied.OperationID = destID, newID, ""
-		copied.Usage = nil // copied prefix entries carry no source usage
+		copied.Facts = cloneMaintenanceFacts(decoded.Compaction.Facts)
+		for i := range copied.Facts {
+			copied.Facts[i].Usage = nil // copied prefix entries carry no source usage
+		}
 		// the boundary reference is rewritten when its target is in the copied prefix
 		if published, ok := entryIDs[copied.BoundaryEntryID]; ok {
 			copied.BoundaryEntryID = published
 		}
 		copied.Evidence = copyRequestEvidencePointer(decoded.Compaction.Evidence)
 		remapEvidenceRefs(copied.Evidence, entryIDs)
-		payload, err := encodeCompactionEntry(copied)
+		payload, err := encodeContextCheckpointEntry(copied)
 		if err != nil {
 			return nil, err
 		}

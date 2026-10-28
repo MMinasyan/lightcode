@@ -392,24 +392,34 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 		if err := h.runRequestHooks(ctx, c, operationID, inv, requestID, view); err != nil {
 			return model.Request{}, err
 		}
-		if conversationOverflows(c, capture) {
-			snapshot := cloneRequestMessages(canonical)
-			facts := &maintenanceFacts{
-				consumed: view.evidenceFor(), // the maintenance procedure consumes the frozen contribution evidence
-			}
-			suspended := RunningRequest{
-				RequestID:         requestID,
-				CheckpointEntryID: checkpointID,
-				BoundaryEntryID:   boundaryID,
-			}
-			summary, usage, maintenanceID, _, closeMaintenance, err := h.runCompaction(ctx, c, operationID, exec, capture, snapshot, &suspended, facts)
-			if err != nil {
-				closeMaintenance()          // the failure terminal already settled inside the orchestration: dispose now
-				return model.Request{}, err // the original cause stands; the outer settled guard preserves the existing terminal
-			}
-			if err := h.commitCompaction(c, operationID, capture, maintenanceID, facts, summary, len(snapshot), usage, false); err != nil {
+		contributions := view.evidenceFor() // the maintenance procedure consumes the frozen contribution evidence
+		planInput := PlanInput{
+			Trigger:           triggerAutomatic,
+			Messages:          cloneRequestMessages(canonical),
+			CheckpointEntryID: checkpointID,
+			BoundaryEntryID:   boundaryID,
+			Instructions:      capture.Compact.SystemPrompt,
+			Tools:             cloneToolDefinitions(capture.Tools),
+			Contributions:     &contributions,
+			Measurement:       contextMeasurement(c),
+			ContextWindow:     capture.ContextWindow,
+			OutputReserve:     capture.OutputReserve,
+			Settings:          model.CloneRaw(capture.Strategy.Settings),
+		}
+		suspended := RunningRequest{
+			RequestID:         requestID,
+			CheckpointEntryID: checkpointID,
+			BoundaryEntryID:   boundaryID,
+		}
+		checkpoint, facts, closeMaintenance, err := h.runContextMaintenance(ctx, c, operationID, exec, capture, planInput, &suspended)
+		if err != nil {
+			closeMaintenance()          // the failure terminal already settled inside the orchestration: dispose now
+			return model.Request{}, err // the original cause stands; the outer settled guard preserves the existing terminal
+		}
+		if checkpoint != nil {
+			if err := h.commitMaintenance(ctx, c, operationID, capture, planInput, facts, checkpoint, false); err != nil {
 				closeMaintenance()
-				return model.Request{}, err // a failed checkpoint commit retains the actual state and error for recovery
+				return model.Request{}, err // a failed or interrupted publication retains the actual state and error; the waiting conversation never dispatches
 			}
 			closeMaintenance() // the committed checkpoint precedes the maintenance stage's disposal
 			canonical, checkpointID, boundaryID, err = h.projectCanonical(c, operationID)
@@ -417,6 +427,8 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 				return model.Request{}, err
 			}
 			view.checkpoint, view.boundary = checkpointID, boundaryID
+		} else {
+			closeMaintenance() // no checkpoint to precede: dispose the unused maintenance stage
 		}
 		// The frozen contribution view is applied exactly once to the rebuilt
 		// projection; its references now name the new checkpoint and tail.
@@ -442,90 +454,89 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 // before that boundary never project as messages. With the field empty the
 // full history projects.
 func (h *Harness) projectContext(c *coordinator, operationID string) ([]model.Message, error) {
-	messages, _, _, err := h.projectContextRefs(c, operationID)
+	messages, _, _, _, err := h.projectContextRefs(c, operationID)
 	return messages, err
 }
 
 // projectContextRefs projects the conversation and reports the named
 // checkpoint and the canonical boundary entry of the same projection
-// snapshot. The boundary is the newest conversation-bearing entry the
-// projection carried — including the named checkpoint entry itself, whose
-// summary rides the projection as its message — so a rebuilt projection
-// always names a complete checkpoint-and-tail pair; an uncompacted
-// projection with no projectable entry names none.
-func (h *Harness) projectContextRefs(c *coordinator, operationID string) ([]model.Message, string, string, error) {
+// snapshot, plus whether the leading system prompt was injected at the top of
+// the projection. The boundary is the newest conversation-bearing entry of
+// the projection's kept tail; a rebuilt projection whose entry tail is the
+// checkpoint alone names the checkpoint entry itself as its canonical
+// boundary, so a rebuilt projection always names a complete
+// checkpoint-and-tail pair — and an uncompacted projection with no
+// projectable entry names none.
+func (h *Harness) projectContextRefs(c *coordinator, operationID string) ([]model.Message, string, string, bool, error) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		c.mu.Unlock()
-		return nil, "", "", fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return nil, "", "", false, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
 	}
 	entries := c.graph.Entries
 	systemPrompt := op.Admission.Execution.SystemPrompt
-	compactionID := c.graph.Session.State.CompactionEntryID
+	compactionID := c.graph.Session.State.CheckpointEntryID
 	c.mu.Unlock()
 
 	messages := make([]model.Message, 0, len(entries)+1)
-	if systemPrompt != "" {
+	injected := systemPrompt != ""
+	if injected {
 		msg, err := model.NewMessage(model.Message{
 			Role:    model.RoleSystem,
 			Content: []model.ContentPart{{Kind: model.PartText, Text: systemPrompt}},
 		})
 		if err != nil {
-			return nil, "", "", err
+			return nil, "", "", false, err
 		}
 		messages = append(messages, msg)
 	}
-	// The named compaction's payload supplies the one summary message and
+	// The named checkpoint's payload supplies its owned messages and
 	// its boundary target's sequence is boundarySequence, at or before which
-	// no entry projects; -1 means no compaction boundary and the full
+	// no entry projects; -1 means no checkpoint boundary and the full
 	// history projects.
 	compaction, boundarySequence := findCompactionCutoff(entries, compactionID)
 	if compaction != nil {
-		msg, err := model.NewMessage(model.Message{
-			Role:    model.RoleAssistant,
-			Source:  compaction.Model,
-			Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
-		})
-		if err != nil {
-			return nil, "", "", err
-		}
-		messages = append(messages, msg)
+		messages = append(messages, cloneRequestMessages(compaction.Messages)...)
 	}
 	boundary := ""
 	for _, entry := range entries {
 		if entry.Envelope.Sequence <= boundarySequence {
 			continue
 		}
-		// The named checkpoint entry itself is conversation-bearing: a
-		// rebuilt projection whose tail is the checkpoint names the
-		// checkpoint entry as its canonical boundary, exactly as the
+		// The named checkpoint entry itself never displaces the kept tail's
+		// canonical boundary: it names that boundary only when the entry
+		// tail carries no message-bearing entry of its own, exactly as the
 		// committed advance publishes it.
-		if conversationBearingEntryKind(entry) {
+		if entry.Envelope.ID != compactionID && messageBearingEntryKind(entry) {
 			boundary = entry.Envelope.ID
 		}
 		msg, ok, err := projectEntry(entry)
 		if err != nil {
-			return nil, "", "", err
+			return nil, "", "", false, err
 		}
 		if ok {
 			messages = append(messages, msg)
 		}
 	}
-	return messages, compactionID, boundary, nil
+	if boundary == "" && compactionID != "" {
+		boundary = compactionID
+	}
+	return messages, compactionID, boundary, injected, nil
 }
 
 // projectCanonical is the frozen canonical conversation view one request
-// round consumes: the projected messages with the leading captured system
-// prompt stripped (the prompt is the request's rendered text, carried
-// separately), together with the same-snapshot canonical references.
+// round consumes: the projected messages with exactly the injected captured
+// system prompt stripped (the prompt is the request's rendered text, carried
+// separately) — a checkpoint's own leading system message is never stripped —
+// together with the same-snapshot canonical references.
 func (h *Harness) projectCanonical(c *coordinator, operationID string) ([]model.Message, string, string, error) {
-	messages, checkpointID, boundaryID, err := h.projectContextRefs(c, operationID)
+	messages, checkpointID, boundaryID, injected, err := h.projectContextRefs(c, operationID)
 	if err != nil {
 		return nil, "", "", err
 	}
-	if len(messages) > 0 && messages[0].Role == model.RoleSystem {
+	if injected && len(messages) > 0 {
 		messages = messages[1:]
 	}
 	return messages, checkpointID, boundaryID, nil

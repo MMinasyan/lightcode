@@ -329,6 +329,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 						Model:        model.ModelRef{Provider: "prov", Model: "m"},
 						SystemPrompt: "summarize",
 					},
+					Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					modelFn := func(context.Context, model.Request) (model.Stream, error) {

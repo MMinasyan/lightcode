@@ -51,6 +51,7 @@ func publicCapture() harness.ExecutionCapture {
 			Model:        publicModelRef,
 			SystemPrompt: "summarize",
 		},
+		Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 	}
 }
 
@@ -1282,6 +1283,50 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 				testassert.Require(t, len(entries) != 0, "committed destination %q has no entries", dest)
 			}
 		})
+	})
+}
+
+// TestPublicExecutionCancellationAtModelIntentHandoff proves the managed
+// shutdown row at the model effect intent handoff on both real stores: a
+// Harness lifetime cancellation injected exactly when the intent transaction
+// is handed to the store — after beginModelEffect's pre-Transact check has
+// already admitted the transition — never aborts the admitted intent's
+// durable write, the execution gate then settles the ordinary terminal
+// interruption without ever dispatching the external model callback, and
+// Wait retains no publication failure, so Close leaves no running Operation
+// behind.
+func TestPublicExecutionCancellationAtModelIntentHandoff(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel(publicTurn())
+		probe := &publicationCancelStore{Storage: store}
+		f := newPublicFixture(t, probe, script, nil)
+		defer f.close()
+		session := createSession(t, f.h)
+		intentHandoff := make(chan struct{})
+		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+			// Armed before the admission commits: the Harness lifetime dies
+			// at the entry of the transaction that follows it — the model
+			// effect's intent transaction handed to the actual store.
+			probe.afterCommit = func() {
+				probe.atEntry = func() {
+					close(intentHandoff)
+					f.cancel()
+				}
+			}
+			return f.defaultPrep, nil
+		}
+		res, err := submit(t, f.h, session, "op-intent", harness.MessageModeRegular, "hello")
+		testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted && res.Operation != nil, "submit = %+v err %v, want the admitted operation", res, err)
+		<-intentHandoff // the intent transaction is at the store handoff: the pre-Transact cancellation check has already passed
+		{
+			err := converge(t, f)
+			testassert.Require(t, err == nil, "Wait after the intent-handoff shutdown = %v, want no retained publication or storage failure", err)
+		}
+		testassert.Require(t, len(script.seen()) == 0, "the canceled execution dispatched %d model requests, want none after the committed intent", len(script.seen()))
+		rec, err := f.h.ReadOperation(context.Background(), session, "op-intent")
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent interrupted",
+			"operation after the intent-handoff shutdown = %+v, want the committed ordinary interruption and no running state", rec.State)
 	})
 }
 
@@ -3248,7 +3293,8 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
 }
 
@@ -4507,7 +4553,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		},
 		{
 			name:   "validator: running request state names a boundary its checkpoint covered",
-			detail: "before its checkpoint entry",
+			detail: "already covered by checkpoint entry",
 			seed:   seedCorruptSiblingRunning,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				sessionID := snapSessionID(snap)
@@ -4516,7 +4562,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
 				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
 				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
-					state["compaction_entry_id"] = json.RawMessage(`"` + comp + `"`)
+					state["checkpoint_entry_id"] = json.RawMessage(`"` + comp + `"`)
 				})
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
@@ -4526,7 +4572,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		},
 		{
 			name:   "validator: active request hook effect references a boundary its checkpoint covered",
-			detail: "before its checkpoint entry",
+			detail: "already covered by checkpoint entry",
 			seed:   seedCorruptSiblingRunning,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				sessionID := snapSessionID(snap)
@@ -4535,7 +4581,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
 				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
 				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
-					state["compaction_entry_id"] = json.RawMessage(`"` + comp + `"`)
+					state["checkpoint_entry_id"] = json.RawMessage(`"` + comp + `"`)
 				})
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
@@ -5436,6 +5482,13 @@ func TestPublicForkArchivedSource(t *testing.T) {
 		testassert.Equal(t, res.Session.State.Lifecycle, harness.LifecycleOpen)
 		src, err := f2.h.ReadSessionHeader(ctx, source)
 		testassert.Require(t, err == nil && src.Lifecycle == harness.LifecycleArchived, "source after fork = %+v err %v, want it archived without reopening", src, err)
+		// The destination's turn settles before the convergence barrier: a model
+		// intent must not race the convergence cancellation, which stays a
+		// publication failure rather than a relabeled interruption.
+		{
+			rec := awaitTerminal(t, f2.h, res.Session.Identity.SessionID, "fork-1")
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "fork operation = %+v, want the settled destination turn", rec.State)
+		}
 		{
 			err := converge(t, f2)
 			testassert.NoError(t, err)
@@ -6348,18 +6401,32 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		// The wire compaction entry carries its model as the string
 		// "provider/model" form; the copy observes the identity members only.
 		type compactionWire struct {
-			OperationID           string              `json:"operation_id"`
-			Summary               string              `json:"summary"`
-			BoundaryEntryID       string              `json:"boundary_entry_id"`
-			ConfigurationRevision string              `json:"configuration_revision"`
-			Usage                 *harness.UsageCount `json:"usage"`
+			OperationID           string `json:"operation_id"`
+			BoundaryEntryID       string `json:"boundary_entry_id"`
+			ConfigurationRevision string `json:"configuration_revision"`
+			Messages              []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+			Facts []struct {
+				Usage *harness.UsageCount `json:"usage"`
+			} `json:"facts"`
 		}
 		var sourceWire compactionWire
 		{
 			err := json.Unmarshal(sourceComp.Payload, &sourceWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceWire.Summary == "summary one" && sourceWire.Usage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
+		sourceSummary := ""
+		if len(sourceWire.Messages) > 0 && len(sourceWire.Messages[0].Content) > 0 {
+			sourceSummary = sourceWire.Messages[0].Content[0].Text
+		}
+		sourceUsage := (*harness.UsageCount)(nil)
+		if len(sourceWire.Facts) > 0 {
+			sourceUsage = sourceWire.Facts[0].Usage
+		}
+		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceSummary == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" && sourceUsage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
 
 		res, err := f.h.Fork(ctx, harness.ForkRequest{
 			SourceSessionID: source,
@@ -6412,7 +6479,15 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 			err := json.Unmarshal(copied.Payload, &copiedWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, copiedWire.OperationID == "" && copiedWire.Usage == nil && copiedWire.Summary == "summary one", "got %v, want %v; copied compaction entry usage = %+v, want none; got %v, want %v", copiedWire.OperationID, "", copiedWire.Usage, copiedWire.Summary, "summary one")
+		copiedSummary := ""
+		if len(copiedWire.Messages) > 0 && len(copiedWire.Messages[0].Content) > 0 {
+			copiedSummary = copiedWire.Messages[0].Content[0].Text
+		}
+		copiedUsage := (*harness.UsageCount)(nil)
+		if len(copiedWire.Facts) > 0 {
+			copiedUsage = copiedWire.Facts[0].Usage
+		}
+		testassert.Require(t, copiedWire.OperationID == "" && copiedUsage == nil && copiedSummary == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]", "got %v, want %v; copied compaction entry usage = %+v, want none; got %v, want %v", copiedWire.OperationID, "", copiedUsage, copiedSummary, "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]")
 		expectedBoundary, ok := idMap[sourceWire.BoundaryEntryID]
 		testassert.Require(t, ok, "the source boundary %q is not inside the copied prefix", sourceWire.BoundaryEntryID)
 		testassert.Require(t, copiedWire.BoundaryEntryID == expectedBoundary && copiedWire.ConfigurationRevision == sourceWire.ConfigurationRevision, "got %v, want %v; got %v, want %v", copiedWire.BoundaryEntryID, expectedBoundary, copiedWire.ConfigurationRevision, sourceWire.ConfigurationRevision)
@@ -6424,14 +6499,14 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		testassert.NoError(t, err)
 		var destState struct {
 			State struct {
-				CompactionEntryID string `json:"compaction_entry_id"`
+				CheckpointEntryID string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(destReg.Payload, &destState)
 			testassert.NoError(t, err)
 		}
-		testassert.Equal(t, destState.State.CompactionEntryID, copied.ID)
+		testassert.Equal(t, destState.State.CheckpointEntryID, copied.ID)
 		destView, err := f.h.ReadSessionView(ctx, dest)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(harness.UsageByModelForTest(destView.TotalUsage, compactModelRef).ByModel) == 0, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
@@ -6461,7 +6536,7 @@ func rawSessionRegisterWithCompaction(sessionID, currentOp, compactionEntryID st
 	return fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
 			`"state":{"lifecycle":"open","current_agent_type":"coder","current_operation_id":%q,`+
-			`"compaction_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"checkpoint_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
 		sessionID, now, currentOp, compactionEntryID, now)
 }
 
@@ -6475,16 +6550,20 @@ func rawCompactAdmission(sessionID, operationID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, rawToolDefinition, now)
 }
 
 // rawCompactionEntryPayload builds one committed compaction entry payload.
 func rawCompactionEntryPayload(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1","request_id":%q,"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}`,
-		sessionID, entryID, operationID, summary, boundaryID, "maintainer-"+entryID, boundaryID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"strategy_id":"melta.summary/v1",`+
+			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}]}],`+
+			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
+			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"gpt-x"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
+			`"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, boundaryID)
 }
 
 // rawSettledSuccessOperation seeds one settled success message Operation —
@@ -6570,14 +6649,14 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		var sessWire struct {
 			State struct {
 				CurrentOperationID string `json:"current_operation_id"`
-				CompactionEntryID  string `json:"compaction_entry_id"`
+				CheckpointEntryID  string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(sessReg.Payload, &sessWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, sessWire.State.CurrentOperationID == "" && sessWire.State.CompactionEntryID == compactionID, "recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
+		testassert.Require(t, sessWire.State.CurrentOperationID == "" && sessWire.State.CheckpointEntryID == compactionID, "recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
 
 		// The next admission over the repaired state projects the prior
 		// summary, the post-boundary entries, and the interruption signal —
@@ -6605,5 +6684,116 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		for i := range want {
 			testassert.Require(t, got[i] == want[i], "next admission projection[%d] = %q, want %q", i, got[i], want[i])
 		}
+	})
+}
+
+// publicBindingMutator is the accepted conversation-execution policy: its
+// first Plan incurs one model pass, rewrites the Strategy field of the
+// caller's own supplied binding to the touched marker, and folds the output
+// into one checkpoint; every later Plan returns none. publicTouchedStrategy
+// records any dispatch through the rewritten field.
+type publicBindingMutator struct {
+	binding     *harness.StrategyBinding
+	touched     *publicTouchedStrategy
+	plans       atomic.Int64
+	consumes    atomic.Int64
+}
+
+func (s *publicBindingMutator) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	if s.plans.Add(1) == 1 {
+		s.binding.Strategy = s.touched // the caller rewrites its own supplied binding mid-Execution
+		return harness.PlanOutput{Kind: harness.PlanModel, Model: &harness.ModelPlan{
+			Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "binding snapshot pass"}}}}},
+		}}, nil
+	}
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+func (s *publicBindingMutator) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	s.consumes.Add(1)
+	zero := 0
+	authored, err := model.NewMessage(model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "snapshot checkpoint"}}})
+	if err != nil {
+		return harness.PlanOutput{}, err
+	}
+	return harness.PlanOutput{Kind: harness.PlanCheckpoint, Checkpoint: &harness.CheckpointPlan{
+		BoundaryEntryID: in.Input.BoundaryEntryID,
+		Items:           []harness.CheckpointItem{{Retain: &zero}, {Context: &authored}},
+	}}, nil
+}
+
+type publicTouchedStrategy struct{ calls atomic.Int64 }
+
+func (s *publicTouchedStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	s.calls.Add(1)
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+func (s *publicTouchedStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	s.calls.Add(1)
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+// TestPublicExecutionOwnsTheAcceptedBindingValue proves the opened Execution's
+// binding snapshot through the public submit flow: the admitted Execution
+// copies the resolved StrategyBinding value before any callback, so a policy
+// that rewrites the caller's own supplied binding during the first automatic
+// procedure still faces its accepted implementation at Consume and at the
+// same Execution's later procedure — never the replacement and never a panic
+// — and the checkpoint keeps the original captured provenance.
+func TestPublicExecutionOwnsTheAcceptedBindingValue(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		// attempt 1: the first procedure's maintenance model pass;
+		// attempt 2: the conversation turn with one tool call (the
+		// continuation round); attempt 3: the continuation turn's answer.
+		script := newScriptModel(
+			publicAttempt{stream: publicUsageTurnStream(model.Usage{InputTokens: 1, OutputTokens: 1})},
+			publicTurn("call-1"),
+			publicTurn(),
+		)
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		mutator := &publicBindingMutator{}
+		touched := &publicTouchedStrategy{}
+		mutator.touched = touched
+		binding := &harness.StrategyBinding{ID: "test.strategy/v1", Strategy: mutator}
+		mutator.binding = binding
+		f.defaultPrep.Capture = publicCapture()
+		f.defaultPrep.Capture.Strategy = harness.StrategyCapture{ID: "test.strategy/v1"}
+		open := f.defaultPrep.Open
+		f.defaultPrep.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+			exec, err := open(ctx, admission)
+			if err != nil {
+				return exec, err
+			}
+			exec.Strategy = binding
+			return exec, nil
+		}
+		session := createSession(t, f.h)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
+		}
+		awaitTerminal(t, f.h, session, "op-1")
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
+		}
+		testassert.Equal(t, mutator.plans.Load(), int64(2)) // the accepted implementation runs every procedure of this Execution
+		testassert.Equal(t, mutator.consumes.Load(), int64(1))
+		testassert.Equal(t, touched.calls.Load(), int64(0)) // the rewritten field is never dispatched
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		testassert.NoError(t, err)
+		owned := 0
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryCompaction || entry.OperationID != "op-1" {
+				continue
+			}
+			owned++
+			payload := string(entry.Payload)
+			testassert.Require(t, strings.Contains(payload, `"strategy_id":"test.strategy/v1"`), "checkpoint payload %s, want the accepted binding provenance", payload)
+			testassert.Require(t, strings.Contains(payload, "snapshot checkpoint"), "checkpoint payload %s, want the accepted implementation's authored message", payload)
+		}
+		testassert.Equal(t, owned, 1)
 	})
 }

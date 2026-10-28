@@ -131,8 +131,8 @@ func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 			if fact.Signal != nil && fact.Signal.RelatedMember != nil {
 				fact.Signal.RelatedMember.ID = "mutated"
 			}
-			if fact.Compaction != nil && fact.Compaction.Usage != nil {
-				fact.Compaction.Usage.InputTokens = 999
+			if fact.Checkpoint != nil && len(fact.Checkpoint.Facts) > 0 && fact.Checkpoint.Facts[0].Usage != nil {
+				fact.Checkpoint.Facts[0].Usage.InputTokens = 999
 			}
 			if fact.Settlement != nil {
 				if fact.Settlement.Model != nil {
@@ -550,13 +550,13 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		awaitTerminal(t, f.h, session, "comp-1")
 		after, err := f.h.ReadSessionView(ctx, session)
 		testassert.NoError(t, err)
-		var compaction *harness.CompactionEntry
+		var compaction *harness.ContextCheckpointEntry
 		for _, fact := range after.History.HistoryFacts(historyIDsOf(after.History.HistoryHeaders())) {
-			if fact.Compaction != nil {
-				compaction = fact.Compaction
+			if fact.Checkpoint != nil {
+				compaction = fact.Checkpoint
 			}
 		}
-		testassert.Require(t, compaction != nil && compaction.Summary == "Summary." && compaction.Model == compactModelRef, "compaction fact = %+v", compaction)
+		testassert.Require(t, compaction != nil && len(compaction.Messages) == 1 && compaction.Messages[0].TextContent() == "[Previous conversation summary]\n\nSummary.\n\n[End of summary. Continue from here.]" && compaction.Facts[0].Model == compactModelRef, "compaction fact = %+v", compaction)
 		found := false
 		for _, op := range after.Operations {
 			if op.OperationID == "comp-1" {
@@ -1518,7 +1518,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 				relatedOperation = relatedOperation || fact.Signal.RelatedOperation != nil
 				relatedMember = relatedMember || fact.Signal.RelatedMember != nil
 			case harness.EntryCompaction:
-				testassert.Require(t, fact.Compaction != nil && fact.Compaction.Usage != nil, "compaction fact fixture lost its usage: %+v", fact.Compaction)
+				testassert.Require(t, fact.Checkpoint != nil && len(fact.Checkpoint.Facts) > 0 && fact.Checkpoint.Facts[0].Usage != nil, "compaction fact fixture lost its usage: %+v", fact.Checkpoint)
 			case harness.EntryOperationSettlement:
 				testassert.Require(t, fact.Settlement != nil, "settlement fact fixture lost its payload: %+v", fact)
 				settlementWithUsage = settlementWithUsage || (fact.Settlement.Model != nil && fact.Settlement.Usage != nil)
@@ -1636,12 +1636,12 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 					fact.Signal.RelatedMember.ID = "mutated"
 				}
 				fact.Signal.Content = "mutated"
-			case fact.Compaction != nil:
-				fact.Compaction.Summary = "mutated"
-				fact.Compaction.BoundaryEntryID = "mutated"
-				fact.Compaction.Model.Provider = "mutated"
-				fact.Compaction.ConfigurationRevision = "mutated"
-				*fact.Compaction.Usage = harness.UsageCount{InputTokens: 999}
+			case fact.Checkpoint != nil:
+				fact.Checkpoint.Messages = nil
+				fact.Checkpoint.BoundaryEntryID = "mutated"
+				fact.Checkpoint.Facts[0].Model.Provider = "mutated"
+				fact.Checkpoint.ConfigurationRevision = "mutated"
+				*fact.Checkpoint.Facts[0].Usage = harness.UsageCount{InputTokens: 999}
 			case fact.Settlement != nil:
 				if fact.Settlement.Model != nil {
 					fact.Settlement.Model.Provider = "mutated"

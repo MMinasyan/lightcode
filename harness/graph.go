@@ -18,7 +18,7 @@ type graphEntry struct {
 	Signal     *signalEntry
 	HookResult *hookResultEntry
 	Settlement *operationSettlementEntry
-	Compaction *compactionEntry
+	Compaction *contextCheckpointEntry
 }
 
 // sessionGraph is the owned decoded view of one Session: the Session record,
@@ -158,8 +158,8 @@ func decodeGraphEntry(sessionID string, env Entry) (graphEntry, error) {
 			entry.Settlement = &v
 		}
 	case EntryCompaction:
-		var v compactionEntry
-		if v, err = decodeCompactionEntry(env); err == nil {
+		var v contextCheckpointEntry
+		if v, err = decodeContextCheckpointEntry(env); err == nil {
 			entry.Compaction = &v
 		}
 	default:
@@ -193,6 +193,51 @@ type graphValidation struct {
 	entryByID    map[string]graphEntry
 	entriesByOp  map[string][]int
 	reservations map[string]publishedReservation
+	cutSafety    map[string]string
+}
+
+// buildCutSafety computes one cut-safety verdict per canonical boundary of
+// the indexed immutable entry sequence in a single cumulative
+// maximum-result-sequence pass over the carried calls: a boundary is unsafe
+// exactly when a tool call published at or before it has a missing result or
+// a reserved-result sequence beyond it, and the table retains one offending
+// call ID for the existing diagnostics. A missing result keeps every later
+// cut unsafe. The table is a per-pass computation over the graph's entries:
+// no persistent index and no storage surface.
+func buildCutSafety(entries []graphEntry) map[string]string {
+	byID := make(map[string]graphEntry, len(entries))
+	for i := range entries {
+		byID[entries[i].Envelope.ID] = entries[i]
+	}
+	unsafe := make(map[string]string)
+	maxResult := int64(-1)
+	maxCall := ""
+	missingCall := ""
+	for i := range entries {
+		entry := entries[i]
+		if entry.Assistant != nil {
+			for _, call := range entry.Assistant.ToolCalls {
+				result, ok := byID[call.ResultEntryID]
+				if !ok {
+					if missingCall == "" {
+						missingCall = call.ID
+					}
+					continue
+				}
+				if result.Envelope.Sequence > maxResult {
+					maxResult = result.Envelope.Sequence
+					maxCall = call.ID
+				}
+			}
+		}
+		switch {
+		case missingCall != "":
+			unsafe[entry.Envelope.ID] = missingCall
+		case maxResult > entry.Envelope.Sequence:
+			unsafe[entry.Envelope.ID] = maxCall
+		}
+	}
+	return unsafe
 }
 
 func (g *sessionGraph) operationIndex() map[string]*OperationRecord {
@@ -243,6 +288,10 @@ func (v *graphValidation) run() error {
 			v.entriesByOp[opID] = append(v.entriesByOp[opID], i)
 		}
 	}
+	// One cut-safety table for every checkpoint cut this validation checks:
+	// built once over the indexed immutable entry sequence, never once per
+	// checkpoint, and discarded with the validation pass that built it.
+	v.cutSafety = buildCutSafety(v.graph.Entries)
 	if err := v.validateSessionState(); err != nil {
 		return err
 	}
@@ -298,10 +347,10 @@ func (v *graphValidation) validateSessionState() error {
 	if session.State.Lifecycle == LifecycleArchived && len(running) > 0 {
 		return v.corrupt("running Operation %q in an archived Session", running[0])
 	}
-	if session.State.CompactionEntryID != "" {
-		compaction, ok := v.entryByID[session.State.CompactionEntryID]
+	if session.State.CheckpointEntryID != "" {
+		compaction, ok := v.entryByID[session.State.CheckpointEntryID]
 		if !ok || compaction.Compaction == nil {
-			return v.corrupt("compaction_entry_id %q names no in-session compaction entry", session.State.CompactionEntryID)
+			return v.corrupt("checkpoint_entry_id %q names no in-session context checkpoint entry", session.State.CheckpointEntryID)
 		}
 	}
 	return nil
@@ -483,6 +532,13 @@ func (v *graphValidation) validateEntryReferences() error {
 			}
 			if boundary.Envelope.Sequence >= entry.Envelope.Sequence {
 				return v.corrupt("compaction entry %s names boundary entry %s at or after its own sequence", entry.Envelope.ID, boundary.Envelope.ID)
+			}
+			// No tool-call/result pair straddles the covered cut and no
+			// unfinished call is hidden at it: the shared cut-safety rule
+			// rejects any boundary whose published calls leave a missing
+			// result or a reserved-result sequence beyond it.
+			if offender, unsafe := v.cutSafety[entry.Compaction.BoundaryEntryID]; unsafe {
+				return v.corrupt("compaction entry %s covers a cut between tool call %q and its result", entry.Envelope.ID, offender)
 			}
 			if entry.Envelope.OperationID == "" {
 				// A copied prefix entry's evidence references stay local: the
@@ -840,7 +896,8 @@ func (v *graphValidation) validatePendingCalls(opID string, published []publishe
 
 // validateUsage recomputes Operation and Session totals from the
 // usage-bearing producer entries — assistant usages, terminal
-// no-output-settlement usage pairs, and committed compaction usage — and
+// no-output-settlement usage pairs, and committed maintenance fact usages —
+// and
 // requires exact agreement. Counts accumulate per model identity into maps
 // and each total materializes exactly once: accumulation is linear in entries,
 // followed by sorting each total's distinct model identities.
@@ -848,37 +905,35 @@ func (v *graphValidation) validateUsage() error {
 	sessionCounts := make(map[model.ModelRef]UsageCount)
 	perOperation := make(map[string]map[model.ModelRef]UsageCount, len(v.graph.Operations))
 	for _, entry := range v.graph.Entries {
-		var ref model.ModelRef
-		var counts UsageCount
-		bears := false
+		if entry.Assistant != nil && entry.Assistant.Usage != nil {
+			if err := v.recordUsage(sessionCounts, perOperation, entry.Envelope.OperationID, entry.Assistant.Source, *entry.Assistant.Usage); err != nil {
+				return err
+			}
+		}
+		// The ordinary no-output settlement usage and the committed
+		// maintenance fact usages are additive when both occur on one
+		// settlement.
+		if entry.Settlement != nil && entry.Settlement.Usage != nil {
+			if err := v.recordUsage(sessionCounts, perOperation, entry.Envelope.OperationID, *entry.Settlement.Model, *entry.Settlement.Usage); err != nil {
+				return err
+			}
+		}
+		// Committed maintenance facts carry their optional per-producer usage.
+		var facts []maintenanceFact
 		switch {
-		case entry.Assistant != nil && entry.Assistant.Usage != nil:
-			ref, counts, bears = entry.Assistant.Source, *entry.Assistant.Usage, true
-		case entry.Settlement != nil && entry.Settlement.Usage != nil:
-			ref, counts, bears = *entry.Settlement.Model, *entry.Settlement.Usage, true
-		case entry.Compaction != nil && entry.Compaction.Usage != nil:
-			ref, counts, bears = entry.Compaction.Model, *entry.Compaction.Usage, true
+		case entry.Compaction != nil:
+			facts = entry.Compaction.Facts
+		case entry.Settlement != nil:
+			facts = entry.Settlement.Facts
 		}
-		if !bears {
-			continue
-		}
-		if entry.Envelope.OperationID != "" {
-			opCounts := perOperation[entry.Envelope.OperationID]
-			if opCounts == nil {
-				opCounts = make(map[model.ModelRef]UsageCount)
-				perOperation[entry.Envelope.OperationID] = opCounts
+		for _, fact := range facts {
+			if fact.Usage == nil {
+				continue
 			}
-			sum, err := addUsageCount(opCounts[ref], counts)
-			if err != nil {
-				return v.corrupt("usage of operation %q overflows: %v", entry.Envelope.OperationID, err)
+			if err := v.recordUsage(sessionCounts, perOperation, entry.Envelope.OperationID, fact.Model, *fact.Usage); err != nil {
+				return err
 			}
-			opCounts[ref] = sum
 		}
-		sum, err := addUsageCount(sessionCounts[ref], counts)
-		if err != nil {
-			return v.corrupt("session usage overflows: %v", err)
-		}
-		sessionCounts[ref] = sum
 	}
 	for i := range v.graph.Operations {
 		op := &v.graph.Operations[i]
@@ -900,6 +955,29 @@ func (v *graphValidation) validateUsage() error {
 	if !usageTotalsEqual(sessionUsage, v.graph.Session.State.Usage) {
 		return v.corrupt("usage totals of the Session disagree with its usage-bearing entries")
 	}
+	return nil
+}
+
+// recordUsage accumulates one usage-bearing producer's counts into the
+// session and owning-operation totals.
+func (v *graphValidation) recordUsage(sessionCounts map[model.ModelRef]UsageCount, perOperation map[string]map[model.ModelRef]UsageCount, operationID string, ref model.ModelRef, counts UsageCount) error {
+	if operationID != "" {
+		opCounts := perOperation[operationID]
+		if opCounts == nil {
+			opCounts = make(map[model.ModelRef]UsageCount)
+			perOperation[operationID] = opCounts
+		}
+		sum, err := addUsageCount(opCounts[ref], counts)
+		if err != nil {
+			return v.corrupt("usage of operation %q overflows: %v", operationID, err)
+		}
+		opCounts[ref] = sum
+	}
+	sum, err := addUsageCount(sessionCounts[ref], counts)
+	if err != nil {
+		return v.corrupt("session usage overflows: %v", err)
+	}
+	sessionCounts[ref] = sum
 	return nil
 }
 
@@ -1033,7 +1111,10 @@ func (v *graphValidation) collectRequestDomain(opID string) error {
 			if err := v.validateEvidenceRefs("compaction entry "+entry.Envelope.ID+" evidence", entry.Compaction.Evidence, entry); err != nil {
 				return err
 			}
-			orderKey := entry.Compaction.RequestID
+			orderKey := ""
+			if len(entry.Compaction.Facts) > 0 {
+				orderKey = entry.Compaction.Facts[0].RequestID
+			}
 			if entry.Compaction.ConsumedRequestID != "" {
 				orderKey = entry.Compaction.ConsumedRequestID
 			} else if automatic {
@@ -1047,13 +1128,18 @@ func (v *graphValidation) collectRequestDomain(opID string) error {
 	maintenanceProducers := make(map[string]string)
 	for _, i := range v.entriesByOp[opID] {
 		entry := v.graph.Entries[i]
-		producerID := ""
-		if entry.Compaction != nil && entry.Compaction.Input != nil {
-			producerID = entry.Compaction.RequestID
-		} else if entry.Settlement != nil && entry.Settlement.Input != nil {
-			producerID = entry.Settlement.RequestID
+		var facts []maintenanceFact
+		switch {
+		case entry.Compaction != nil:
+			facts = entry.Compaction.Facts
+		case entry.Settlement != nil:
+			facts = entry.Settlement.Facts
 		}
-		if producerID != "" {
+		for _, fact := range facts {
+			producerID := fact.RequestID
+			if producerID == "" {
+				continue
+			}
 			if previous, exists := maintenanceProducers[producerID]; exists {
 				return v.corrupt("operation %q settles maintenance producer %q on both entries %s and %s", opID, producerID, previous, entry.Envelope.ID)
 			}
@@ -1135,11 +1221,21 @@ func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvi
 			return v.corrupt("%s checkpoint reference %q names no in-session compaction entry", what, evidence.CheckpointEntryID)
 		}
 		// A consumed pair names the projection actually frozen for it: the
-		// boundary is the checkpoint itself (a summary-only projection) or a
-		// canonical tail at or after it, never an entry the checkpoint already
-		// covered.
-		if boundary.Envelope.Sequence < checkpoint.Envelope.Sequence {
-			return v.corrupt("%s references boundary entry %s before its checkpoint entry %s", what, boundary.Envelope.ID, checkpoint.Envelope.ID)
+		// boundary is the checkpoint itself (an empty kept tail) or a
+		// canonical tail entry it did not cover, never an entry the
+		// checkpoint already covered.
+		if boundary.Envelope.ID == checkpoint.Envelope.ID {
+			if owner.Envelope.Sequence != 0 && checkpoint.Envelope.Sequence >= owner.Envelope.Sequence {
+				return v.corrupt("%s references checkpoint entry %s at or after its own sequence", what, checkpoint.Envelope.ID)
+			}
+			return nil
+		}
+		target, ok := v.entryByID[checkpoint.Compaction.BoundaryEntryID]
+		if !ok {
+			return v.corrupt("%s names checkpoint entry %s with boundary entry %q outside the Session", what, checkpoint.Envelope.ID, checkpoint.Compaction.BoundaryEntryID)
+		}
+		if boundary.Envelope.Sequence <= target.Envelope.Sequence {
+			return v.corrupt("%s references boundary entry %s already covered by checkpoint entry %s", what, boundary.Envelope.ID, checkpoint.Envelope.ID)
 		}
 		if owner.Envelope.Sequence != 0 && checkpoint.Envelope.Sequence >= owner.Envelope.Sequence {
 			return v.corrupt("%s references checkpoint entry %s at or after its own sequence", what, checkpoint.Envelope.ID)
@@ -1152,6 +1248,13 @@ func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvi
 // into the canonical conversation view a request consumes.
 func conversationBearingEntryKind(entry graphEntry) bool {
 	return entry.Input != nil || entry.Assistant != nil || entry.ToolResult != nil || entry.Signal != nil || entry.Compaction != nil
+}
+
+// messageBearingEntryKind reports whether one committed entry contributes an
+// ordinary message to the projection; a checkpoint contributes its owned
+// messages through the named register entry instead.
+func messageBearingEntryKind(entry graphEntry) bool {
+	return entry.Input != nil || entry.Assistant != nil || entry.ToolResult != nil || entry.Signal != nil
 }
 
 // validateEvidenceHookOrder reconciles one evidence value's recorded hook
@@ -1202,7 +1305,7 @@ func (v *graphValidation) validateRunningRequestState(op *OperationRecord, reque
 		return nil
 	}
 	opID := op.Admission.OperationID
-	if v.graph.Session.State.CompactionEntryID != state.CheckpointEntryID {
+	if v.graph.Session.State.CheckpointEntryID != state.CheckpointEntryID {
 		return v.corrupt("running request state of operation %q carries a checkpoint reference foreign to the Session's current compaction entry", opID)
 	}
 	if err := v.validateEvidenceRefs(fmt.Sprintf("running request state of operation %q", opID), &RequestEvidence{

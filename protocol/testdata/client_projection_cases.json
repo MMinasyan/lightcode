@@ -510,7 +510,7 @@
   },
   {
    "name": "compaction_variant_id",
-   "item": "{\"item_id\":\"item-compaction\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"sum\",\"model\":\"prov/m\"}",
+   "item": "{\"item_id\":\"item-compaction\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"sum\"}]}]}",
    "id": "item-compaction"
   },
   {
@@ -572,8 +572,8 @@
   {
    "name": "overlap_mixed_variants",
    "older": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"old-2\"}],\"tool_calls\":[]}]",
-   "newer": "[{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"new-3\",\"model\":\"prov/m\"}]",
-   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"compaction\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"summary\":\"new-3\",\"model\":\"prov/m\"}]"
+   "newer": "[{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]}]}]",
+   "result": "[{\"item_id\":\"m1\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"origin\":\"user\",\"content\":[{\"kind\":\"text\",\"text\":\"old-1\"}]},{\"item_id\":\"m2\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:06Z\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-2\"}],\"tool_calls\":[]},{\"item_id\":\"m3\",\"kind\":\"context_checkpoint\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"strategy\":\"melta.summary/v1\",\"model\":\"prov/m\",\"messages\":[{\"role\":\"assistant\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"new-3\"}]}]}]"
   },
   {
    "name": "disjoint_concatenates",

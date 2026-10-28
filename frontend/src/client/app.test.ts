@@ -389,7 +389,7 @@ describe('conversation rendering', () => {
       { item_id: 'u1', kind: 'input', committed_at: '0', origin: 'user', content: [{ kind: 'text', text: 'hello user' }] },
       { item_id: 'a1', kind: 'assistant', committed_at: '0', operation_id: 'op-a1', status: 'completed', source: 'prov/model', content: [{ kind: 'text', text: '**bold** reply' }], refusal: 'refused here', tool_calls: [{ id: 'c1', name: 'read_file', arguments: '{"path":"a.go"}', status: 'success', content: 'ok', normalized_arguments: { raw: JSON.rawJSON('9007199254740993'), huge: JSON.rawJSON('1e400') }, metadata: { note: { n: JSON.rawJSON('9007199254740993') } } }] },
       { item_id: 's1', kind: 'signal', committed_at: '0', subtype: 'interruption', content: 'stopped' },
-      { item_id: 'c1', kind: 'compaction', committed_at: '0', summary: 'summary here', model: 'prov/compact' },
+      { item_id: 'c1', kind: 'context_checkpoint', committed_at: '0', strategy: 'summarize', model: 'prov/compact', messages: [{ role: 'assistant', source: 'prov/compact', content: [{ kind: 'text', text: 'summary here' }] }] },
       { item_id: 'o1', kind: 'operation_end', committed_at: '0', operation_id: 'op-o1', status: 'failure', detail: 'failed detail' },
     ];
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
