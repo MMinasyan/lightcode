@@ -77,27 +77,24 @@ func TestMatchInIsAnchoredNotSubstring(t *testing.T) {
 func TestMatchInReturnsCopyNotAlias(t *testing.T) {
 	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{
 		ExcludeTools:                []string{"edit_file"},
-		IncludeTools:                []string{"apply_patch"},
 		Blocks:                      []string{"coach"},
 		Additions:                   map[string]string{"tone": "tone-add"},
-		ToolDescriptionReplacements: map[string]string{"<EDIT FILE OR WRITE FILE>": "apply_patch"},
+		ToolDescriptionReplacements: map[string]string{"edit_file or write_file": "apply_patch"},
 	}}}
 	got := matchIn(tbl, "gpt-5.4")
 	testassert.Require(t, got != nil, "matchIn returned nil")
 	testassert.Require(t, got != &tbl[0].adapt, "matchIn returned a pointer aliasing the table entry")
 	// Mutating every field of the result must not touch the table entry.
 	got.ExcludeTools[0] = "mutated"
-	got.IncludeTools[0] = "mutated"
 	got.Blocks[0] = "mutated"
 	got.Blocks = append(got.Blocks, "extra")
 	got.Additions["tone"] = "mutated"
 	got.Additions["safety"] = "mutated"
-	got.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] = "mutated"
+	got.ToolDescriptionReplacements["edit_file or write_file"] = "mutated"
 	testassert.Equal(t, tbl[0].adapt.ExcludeTools[0], "edit_file")
-	testassert.Equal(t, tbl[0].adapt.IncludeTools[0], "apply_patch")
 	testassert.Require(t, len(tbl[0].adapt.Blocks) == 1 && tbl[0].adapt.Blocks[0] == "coach", "Blocks leaked into the table: %v", tbl[0].adapt.Blocks)
 	testassert.Require(t, len(tbl[0].adapt.Additions) == 1 && tbl[0].adapt.Additions["tone"] == "tone-add", "Additions leaked into the table: %v", tbl[0].adapt.Additions)
-	testassert.Require(t, len(tbl[0].adapt.ToolDescriptionReplacements) == 1 && tbl[0].adapt.ToolDescriptionReplacements["<EDIT FILE OR WRITE FILE>"] == "apply_patch", "ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
+	testassert.Require(t, len(tbl[0].adapt.ToolDescriptionReplacements) == 1 && tbl[0].adapt.ToolDescriptionReplacements["edit_file or write_file"] == "apply_patch", "ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
 }
 
 func TestSectionAdditionResolution(t *testing.T) {
@@ -120,42 +117,27 @@ func TestSectionAdditionResolution(t *testing.T) {
 	}
 }
 
-func TestShippedToolDescriptionDefaults(t *testing.T) {
-	want := map[string]string{
-		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
-	}
-	for key, value := range want {
-		{
-			got := defaultToolDescriptionReplacements[key]
-			testassert.Require(t, got == value, "defaultToolDescriptionReplacements[%q] = %q, want %q", key, got, value)
-		}
-	}
-}
-
 func TestRenderToolDescriptionReplacements(t *testing.T) {
-	orig := defaultToolDescriptionReplacements
-	defer func() { defaultToolDescriptionReplacements = orig }()
-	defaultToolDescriptionReplacements = map[string]string{
-		"<EDIT FILE OR WRITE FILE>": "edit_file or write_file",
-		"<REMOVE LINE>":             "- removed by adaptation",
-	}
-
 	description := strings.Join([]string{
-		"use <EDIT FILE OR WRITE FILE>",
-		"<REMOVE LINE>",
+		"use edit_file or write_file",
+		"- removed by adaptation",
 		"done",
 	}, "\n")
 
+	// With no active adaptation the description is the tool's own text.
 	baseline := RenderToolDescription(description, nil)
-	testassert.Require(t, !strings.Contains(baseline, "<") && strings.Contains(baseline, "use edit_file or write_file") && strings.Contains(baseline, "- removed by adaptation"), "baseline RenderToolDescription = %q", baseline)
+	testassert.Equal(t, baseline, description)
 
+	// The active adaptation's literal overrides apply: one rewrites the
+	// naming phrase inside its line, the other resolves to empty and removes
+	// the line that is only that value.
 	adapted := RenderToolDescription(description, &Adaptation{
 		ToolDescriptionReplacements: map[string]string{
-			"<EDIT FILE OR WRITE FILE>": "apply_patch",
-			"<REMOVE LINE>":             "",
+			"edit_file or write_file": "apply_patch",
+			"- removed by adaptation": "",
 		},
 	})
-	testassert.Require(t, !strings.Contains(adapted, "<") && !strings.Contains(adapted, "removed by adaptation"), "adapted RenderToolDescription = %q", adapted)
+	testassert.Require(t, !strings.Contains(adapted, "removed by adaptation"), "adapted RenderToolDescription = %q", adapted)
 	{
 		want := "use apply_patch\ndone"
 		testassert.Equal(t, adapted, want)
@@ -166,6 +148,13 @@ func TestRenderToolDescriptionReplacements(t *testing.T) {
 // GPT-Codex row (5.4 / 5.5) gets the combined adaptation: prompt addition
 // plus the apply_patch tool swap. The expected text is sourced from the
 // fixture JSON — no Go constant for the addition text.
+// gptGuidanceLine and gptGuidanceReplacement are the complete literal standard
+// run_command guidance line the bundled GPT rows replace and its GPT form: the
+// data names the whole line, so unrelated prose carrying the same phrase is
+// never rewritten.
+const gptGuidanceLine = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file."
+const gptGuidanceReplacement = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use apply_patch."
+
 func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
 	fx := loadFixture(t)
 	codex := fixtureRow(fx, "gpt-codex")
@@ -182,7 +171,7 @@ func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
 				add := SectionAddition(got, "task_execution")
 				testassert.Require(t, add == want, "SectionAddition(Match(%q), task_execution) differs from canonical text", id)
 			}
-			testassert.Check(t, slices.Contains(got.IncludeTools, "apply_patch"), "Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
+			testassert.Require(t, reflect.DeepEqual(got.ToolDescriptionReplacements, map[string]string{gptGuidanceLine: gptGuidanceReplacement}), "Match(%q).ToolDescriptionReplacements = %q, want the one literal guidance-line rule", id, got.ToolDescriptionReplacements)
 		})
 	}
 }
@@ -196,8 +185,8 @@ func TestShippedTableMatchesBundledGPTApplyPatchBroad(t *testing.T) {
 		t.Run(id, func(t *testing.T) {
 			got := Match(id)
 			testassert.Require(t, got != nil, "Match(%q) = nil, want gpt-apply-patch", id)
-			testassert.Require(t, reflect.DeepEqual(got.IncludeTools, ap.IncludeTools), "Match(%q).IncludeTools = %v, want the %s row include_tools", id, got.IncludeTools, ap.Name)
-			testassert.Check(t, slices.Contains(got.IncludeTools, "apply_patch"), "Match(%q).IncludeTools = %v, want apply_patch", id, got.IncludeTools)
+			testassert.Require(t, reflect.DeepEqual(got.ExcludeTools, ap.ExcludeTools), "Match(%q).ExcludeTools = %v, want the %s row exclude_tools", id, got.ExcludeTools, ap.Name)
+			testassert.Check(t, slices.Contains(got.ExcludeTools, "write_file"), "Match(%q).ExcludeTools = %v, want the file tools the V4A row replaces", id, got.ExcludeTools)
 			{
 				v, ok := got.Additions["task_execution"]
 				testassert.Check(t, !ok || v == "", "Match(%q).Additions[task_execution] = %q, want absent (broader gpt-5 has no prompt addition)", id, v)
@@ -217,7 +206,7 @@ func TestShippedTableMatchesBundledGrok(t *testing.T) {
 				add := SectionAddition(got, "task_execution")
 				testassert.Require(t, add != "" && add == ge.Additions["task_execution"], "Match(%q).Additions[task_execution] = %q, want the nonempty %s row addition", id, add, ge.Name)
 			}
-			testassert.Check(t, !slices.Contains(got.IncludeTools, "apply_patch"), "grok should not include apply_patch (not V4A): %v", got.IncludeTools)
+			testassert.Require(t, len(got.ExcludeTools) == 0 && len(got.ToolDescriptionReplacements) == 0, "grok adaptation carries tool levers %+v, want the addition-only row", got)
 		})
 	}
 }

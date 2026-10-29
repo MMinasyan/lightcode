@@ -1,10 +1,12 @@
-// Package tools declares Lightcode's native file-tools plugin: read_file,
-// write_file, edit_file and apply_patch as ordinary Runtime-scoped Tool
-// exports. It is an ordinary composition unit selected through static
-// registration — the same Plugin/Instance contract an externally supplied
-// capability implements, with no additional Runtime authority and no legacy
-// authorization wrapper.
-package tools
+package runtime
+
+// The baseline standard tools: the seven owner-constructed Tool
+// implementations — read_file, write_file, edit_file, and apply_patch over the
+// shared file preparation, snapshot bookkeeping, and artifact-derived code
+// groups, plus the foreground/background command, process, and sleep tools.
+// They are ordinary composition members compiled directly into every
+// Runtime: they are never optional plugin exports, and file tools carry no
+// process dependency.
 
 import (
 	"bytes"
@@ -20,69 +22,81 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/shellparse"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/plugins/jobs"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 const (
-	pluginID = "tools"
+	// toolsSettingsID is the configuration section the standard tools read
+	// their per-call settings from.
+	toolsSettingsID = "tools"
+
+	// jobsSettingsID is the configuration section forwarded verbatim to one
+	// background job start.
+	jobsSettingsID = "jobs"
 
 	// maxDiagnosticBytes is the durable diagnostic bound for the
-	// validation-class diagnostics this plugin produces, matching the
+	// validation-class diagnostics these tools produce, matching the
 	// Harness's own tool-boundary bound.
 	maxDiagnosticBytes = 512
 )
 
-// settings is the plugin's private configuration, decoded with json.Unmarshal
+// toolSettings is the tools' private configuration, decoded with json.Unmarshal
 // from the plugins.tools section. Nil input and missing or null-valued
 // members keep the defaults; every consumed limit must be positive, and
 // command_timeout must fit its seconds-to-time.Duration conversion. Every
 // other member is ignored, including max_background_processes regardless of
 // its JSON value.
-type settings struct {
+type toolSettings struct {
 	MaxOutputBytes   int `json:"max_output_bytes"`
 	ReadMaxLines     int `json:"read_max_lines"`
 	ReadLineMaxChars int `json:"read_line_max_chars"`
 	CommandTimeout   int `json:"command_timeout"`
 }
 
-func defaultSettings() settings {
-	return settings{MaxOutputBytes: 15360, ReadMaxLines: 500, ReadLineMaxChars: 5000, CommandTimeout: 120}
+func defaultToolSettings() toolSettings {
+	return toolSettings{MaxOutputBytes: 15360, ReadMaxLines: 500, ReadLineMaxChars: 5000, CommandTimeout: 120}
 }
 
-// decodeSettings decodes one supplied plugins.tools section on top of the
+// decodeToolSettings decodes one supplied plugins.tools section on top of the
 // defaults and validates every consumed limit.
-func decodeSettings(raw json.RawMessage) (settings, error) {
-	s := defaultSettings()
+func decodeToolSettings(raw json.RawMessage) (toolSettings, error) {
+	s := defaultToolSettings()
 	if len(bytes.TrimSpace(raw)) != 0 {
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return settings{}, fmt.Errorf("tools: invalid settings: %w", err)
+			return toolSettings{}, fmt.Errorf("tools: invalid settings: %w", err)
 		}
 	}
 	switch {
 	case s.MaxOutputBytes <= 0:
-		return settings{}, errors.New("tools: max_output_bytes must be positive")
+		return toolSettings{}, errors.New("tools: max_output_bytes must be positive")
 	case s.ReadMaxLines <= 0:
-		return settings{}, errors.New("tools: read_max_lines must be positive")
+		return toolSettings{}, errors.New("tools: read_max_lines must be positive")
 	case s.ReadLineMaxChars <= 0:
-		return settings{}, errors.New("tools: read_line_max_chars must be positive")
+		return toolSettings{}, errors.New("tools: read_line_max_chars must be positive")
 	case s.CommandTimeout <= 0:
-		return settings{}, errors.New("tools: command_timeout must be positive")
+		return toolSettings{}, errors.New("tools: command_timeout must be positive")
 	case int64(s.CommandTimeout) > math.MaxInt64/int64(time.Second):
-		return settings{}, errors.New("tools: command_timeout overflows the seconds-to-duration conversion")
+		return toolSettings{}, errors.New("tools: command_timeout overflows the seconds-to-duration conversion")
 	}
 	return s, nil
 }
 
+// validateToolsSettings validates one captured plugins.tools section; the
+// configuration publisher calls it directly for every publication.
+func validateToolsSettings(raw json.RawMessage) error {
+	_, err := decodeToolSettings(raw)
+	return err
+}
+
 // toolsConfig projects the decoded settings onto the shared file-tool
 // configuration.
-func (s settings) toolsConfig() config.ToolsConfig {
+func (s toolSettings) toolsConfig() config.ToolsConfig {
 	return config.ToolsConfig{
 		MaxOutputBytes:   s.MaxOutputBytes,
 		ReadMaxLines:     s.ReadMaxLines,
@@ -90,21 +104,19 @@ func (s settings) toolsConfig() config.ToolsConfig {
 	}
 }
 
-// instance is one Open's constructed state: the owner data root and the jobs
-// capability the background command and process paths call. It keeps no
-// Session-indexed state, no handle tags, no cached read records and no
-// reset or eviction hooks: every mutating call opens its code group fresh
-// from the calling Operation's admitted-input identity and drops it
-// afterward. No environment key set is captured at Open — the command paths
-// resolve the live subprocess environment through the ToolContext's
-// call-time producer, so keys connected after this Open are still scrubbed.
-type instance struct {
-	dataDir string
-	jobs    jobs.Jobs
-}
+// standardTools is the constructed file-tool state: the owner data root the
+// mutating calls derive their code groups from and the command spills derive
+// their output directory from. It keeps no Session-indexed state, no handle
+// tags, no cached read records and no reset or eviction hooks, and no process
+// dependency: every mutating call opens its code group fresh from the calling
+// Operation's admitted-input identity and drops it afterward. No environment
+// key set is captured here — the command paths resolve the live subprocess
+// environment through the ToolContext's call-time producer, and the jobs
+// service is a field of the two tools that call it.
+type standardTools struct{ dataDir string }
 
-func (in *instance) settings(inv runtime.Invocation) (settings, error) {
-	return decodeSettings(inv.Config(pluginID))
+func (in *standardTools) settings(inv Invocation) (toolSettings, error) {
+	return decodeToolSettings(inv.Config(toolsSettingsID))
 }
 
 // openCodeGroup opens the calling Operation's one disk code group, keyed by
@@ -114,7 +126,7 @@ func (in *instance) settings(inv runtime.Invocation) (settings, error) {
 // so every normally delivered head — steering included — opens its own group.
 // The handle is opened per call, shared by that call's sub-operations, and
 // not retained.
-func (in *instance) openCodeGroup(tc runtime.ToolContext) (*snapshot.CodeStore, error) {
+func (in *standardTools) openCodeGroup(tc ToolContext) (*snapshot.CodeStore, error) {
 	directory := filepath.Join(in.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID)
 	return snapshot.OpenCodeStore(directory)
 }
@@ -136,7 +148,7 @@ func immediateDenied(callID string) harness.PreparedTool {
 	}}
 }
 
-// boundedDiagnostic renders one plugin-produced validation diagnostic within
+// boundedDiagnostic renders one tool-produced validation diagnostic within
 // the durable diagnostic bound.
 func boundedDiagnostic(cause error) string {
 	msg := cause.Error()
@@ -168,7 +180,7 @@ func canonicalPaths(root, writeDir string) (workspace, boundary string, err erro
 
 // canonicalPathsFn is the one seam over preparation canonicalization: both
 // containment inputs route through it, so tests flip a symlink between the
-// plugin's resolutions and the shared preparation's binding. Nil-free in
+// tool's resolutions and the shared preparation's binding. Nil-free in
 // production; it simply delegates to canonicalPaths.
 var canonicalPathsFn = canonicalPaths
 
@@ -189,9 +201,9 @@ func permissionPairs(permission string, targets []tool.PreparedTarget) []harness
 // stringOutcome runs one prepared string-result call and wraps the outcome:
 // the model-visible content is the shared body's own bounded output, and an
 // optional metadata converter turns the committed normalized arguments plus
-// the result into the plugin-owned metadata shape. A nil metadata map or a
-// failed well-formedness marshal drops the optional metadata; the result
-// itself always commits.
+// the result into the owned metadata shape. A nil metadata map or a failed
+// well-formedness marshal drops the optional metadata; the result itself
+// always commits.
 func stringOutcome(ctx context.Context, callID string, call *tool.PreparedCall, args string, metadata func(args, result string) map[string]any) harness.ToolOutcome {
 	result, err := call.Execute(ctx)
 	if err != nil {
@@ -241,12 +253,12 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 	return json.Marshal(normalized)
 }
 
-// readTool is the read_file export: always available, no metadata, the
+// readTool is the read_file tool: always available, no metadata, the
 // nil-tracker read path that always returns the bounded requested content.
-type readTool struct{ inst *instance }
+type readTool struct{ inst *standardTools }
 
-func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return runtime.ToolDescription{
+func (readTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
 			Description: readFileDescription,
@@ -256,7 +268,7 @@ func (readTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harn
 	}, nil
 }
 
-func (t readTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t readTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -266,7 +278,7 @@ func (t readTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.R
 	})
 }
 
-func (t readTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t readTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -304,11 +316,11 @@ type mutationPrepared struct {
 
 // prepareMutation is the one shared mutation-Prepare body: the strict
 // decode-and-pass of the committed normalized arguments, the canonical
-// root/write-dir binding, the per-call
-// code group, and the assembled executor plan with its file.write pairs.
-// The per-tool callback runs the shared preparation and wraps the outcome;
-// its error is a failed canonical preparation.
-func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
+// root/write-dir binding, the per-call code group, and the assembled executor
+// plan with its file.write pairs. The per-tool callback runs the shared
+// preparation and wraps the outcome; its error is a failed canonical
+// preparation.
+func (in *standardTools) prepareMutation(tc ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
 	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -333,18 +345,18 @@ func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall,
 	}
 }
 
-// writeTool is the write_file export.
-type writeTool struct{ inst *instance }
+// writeTool is the write_file tool.
+type writeTool struct{ inst *standardTools }
 
-func (t writeTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return mutationDescription("write_file", writeFileDescription, writeFileParameters, false, constraints)
+func (t writeTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return mutationDescription("write_file", writeFileDescription, writeFileParameters, constraints)
 }
 
-func (writeTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (writeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeWriteArgs)
 }
 
-func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t writeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PrepareWriteCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
@@ -359,19 +371,19 @@ func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 	})
 }
 
-// editTool is the edit_file export; its metadata carries the edit_preview
-// diff built from the committed normalized arguments and the result.
-type editTool struct{ inst *instance }
+// editTool is the edit_file tool; its metadata carries the edit_preview diff
+// built from the committed normalized arguments and the result.
+type editTool struct{ inst *standardTools }
 
-func (t editTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return mutationDescription("edit_file", editFileDescription, editFileParameters, false, constraints)
+func (t editTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return mutationDescription("edit_file", editFileDescription, editFileParameters, constraints)
 }
 
-func (editTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (editTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeEditArgs)
 }
 
-func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t editTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PrepareEditCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
@@ -386,19 +398,19 @@ func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.
 	})
 }
 
-// patchTool is the apply_patch export; it is DefaultHidden like its legacy
-// counterpart, so only model adaptations that include it can see it.
-type patchTool struct{ inst *instance }
+// patchTool is the apply_patch tool; it is advertised exactly like every
+// other selected eligible tool.
+type patchTool struct{ inst *standardTools }
 
-func (t patchTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, true, constraints)
+func (t patchTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, constraints)
 }
 
-func (patchTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (patchTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizePatchArgs)
 }
 
-func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t patchTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PreparePatchCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
@@ -413,7 +425,7 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 	})
 }
 
-// runCommandTool is the run_command export: always available; the calling
+// runCommandTool is the run_command tool: always available; the calling
 // Agent's readonly constraint selects the implementation. The readonly
 // variant authorizes and executes the read-only allowlist's rewritten
 // command; its foreground path keeps the captured default timeout — a model
@@ -424,15 +436,20 @@ func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model
 // segment, falls back to one complete target for everything else, and always
 // executes through the shell. background=true starts a job through the
 // background bridge and returns the retained immediate text; every start
-// failure renders through the one wrapper.
-type runCommandTool struct{ inst *instance }
+// failure renders through the one wrapper. Its own fields are the file-tool
+// state (for the spill directory and settings) and the jobs service the
+// background start calls.
+type runCommandTool struct {
+	inst *standardTools
+	jobs jobs.Jobs
+}
 
-func (runCommandTool) describe(_ runtime.Invocation, constraints runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
+func (runCommandTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	description := runCommandDescription
 	if constraints.Readonly {
 		description = tool.ReadOnlyRunCommandDescription
 	}
-	return runtime.ToolDescription{
+	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "run_command",
 			Description: description,
@@ -442,7 +459,7 @@ func (runCommandTool) describe(_ runtime.Invocation, constraints runtime.ToolCon
 	}, nil
 }
 
-func (t runCommandTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t runCommandTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -452,7 +469,7 @@ func (t runCommandTool) Normalize(tc runtime.ToolContext, call model.ToolCall) (
 	})
 }
 
-func (t runCommandTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t runCommandTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -545,7 +562,7 @@ var errNoSubprocessEnv = errors.New("run_command: no subprocess environment prod
 // the ToolContext's call-time producer. A missing callback — or a producer
 // reporting no environment — is an ordinary error the caller renders with no
 // process start; there is no ambient-environment fallback.
-func commandEnvironment(tc runtime.ToolContext) ([]string, error) {
+func commandEnvironment(tc ToolContext) ([]string, error) {
 	if tc.SubprocessEnv == nil {
 		return nil, errNoSubprocessEnv
 	}
@@ -569,11 +586,11 @@ func commandEnvironmentFailure(callID string, cause error) harness.ToolOutcome {
 // reservation when the bridge or the start rejects, and returns the retained
 // immediate template on success. Every start failure — reserve, handoff, or
 // spawn — renders through the one legacy wrapper.
-func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command string, timeoutSec int, tc runtime.ToolContext) harness.ToolOutcome {
+func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command string, timeoutSec int, tc ToolContext) harness.ToolOutcome {
 	if tc.SubprocessEnv == nil {
 		return commandEnvironmentFailure(callID, errNoSubprocessEnv)
 	}
-	jobsInst := t.inst.jobs
+	jobsInst := t.jobs
 	sessionID := tc.AdmittedEntry.SessionID
 	jobID, err := jobsInst.Reserve()
 	if err != nil {
@@ -594,7 +611,7 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 			Command:    command,
 			TimeoutSec: timeoutSec,
 			Env:        env,
-			Config:     tc.Invocation.Config("jobs"),
+			Config:     tc.Invocation.Config(jobsSettingsID),
 			OnExit: func(er jobs.ExitResult) {
 				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
 			},
@@ -665,11 +682,11 @@ func truncateCompletionText(text string, limit int) string {
 // completed run settles as success or — for a nonzero exit — the same
 // ExitError output the legacy engine reports as an error; a configured
 // timeout settles as an error result with the retained timeout text; the
-// runner's delivered-cause cancellation settles as an interrupted result
-// with the retained cancellation text. The classification reads the cause
-// the runner flagged on the error, never the context after the runner has
-// settled the real result.
-func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s settings, spillDir string, env []string) harness.ToolOutcome {
+// runner's delivered-cause cancellation settles as an interrupted result with
+// the retained cancellation text. The classification reads the cause the
+// runner flagged on the error, never the context after the runner has settled
+// the real result.
+func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec int, s toolSettings, spillDir string, env []string) harness.ToolOutcome {
 	result, err := runForegroundCommandFn(ctx, command, dir, timeoutSec, s.MaxOutputBytes, s.ReadLineMaxChars, spillDir, env)
 	var exitErr *tool.ExitError
 	if errors.As(err, &exitErr) {
@@ -685,13 +702,13 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
 }
 
-// sleepTool is the sleep export: normalization clamps to integer seconds
+// sleepTool is the sleep tool: normalization clamps to integer seconds
 // 1..300, the fixed target * is the one the built-in policy allows, and
 // execution observes cancellation as an interrupted result.
 type sleepTool struct{}
 
-func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return runtime.ToolDescription{
+func (sleepTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",
 			Description: sleepDescription,
@@ -701,11 +718,11 @@ func (sleepTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ har
 	}, nil
 }
 
-func (sleepTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (sleepTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeSleepArgs)
 }
 
-func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (sleepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
 	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -732,14 +749,14 @@ func (sleepTool) Prepare(_ context.Context, _ runtime.ToolContext, call model.To
 	}
 }
 
-// processTool is the process export: always available; it maps the retained
-// read/kill/list actions onto the jobs capability under the owner-scoped
+// processTool is the process tool: always available; it maps the retained
+// read/kill/list actions onto the jobs service under the owner-scoped
 // canonical target <session-id>/<job-id> (read/kill) or the fixed target *
-// (list).
-type processTool struct{ inst *instance }
+// (list). The jobs service is its own field.
+type processTool struct{ jobs jobs.Jobs }
 
-func (processTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ harness.SessionIdentity) (runtime.ToolDescription, error) {
-	return runtime.ToolDescription{
+func (processTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "process",
 			Description: processDescription,
@@ -749,11 +766,11 @@ func (processTool) describe(_ runtime.Invocation, _ runtime.ToolConstraints, _ h
 	}, nil
 }
 
-func (processTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (processTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, normalizeProcessArgs)
 }
 
-func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t processTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -774,13 +791,13 @@ func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call mod
 			Permissions: []harness.PermissionRequest{{Permission: harness.PermissionProcessOwn, Target: target}},
 			Execute: func(_ context.Context) harness.ToolOutcome {
 				if action == "read" {
-					output, err := t.inst.jobs.Read(sessionID, id)
+					output, err := t.jobs.Read(sessionID, id)
 					if err != nil {
 						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 					}
 					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: output}}
 				}
-				if err := t.inst.jobs.Kill(sessionID, id); err != nil {
+				if err := t.jobs.Kill(sessionID, id); err != nil {
 					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 				}
 				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: fmt.Sprintf("Process %s terminated.", id)}}
@@ -790,7 +807,7 @@ func (t processTool) Prepare(_ context.Context, tc runtime.ToolContext, call mod
 		return harness.PreparedTool{
 			Permissions: []harness.PermissionRequest{{Permission: harness.PermissionProcessOwn, Target: "*"}},
 			Execute: func(_ context.Context) harness.ToolOutcome {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.inst.jobs.List(sessionID)}}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.jobs.List(sessionID)}}
 			},
 		}
 	default:
@@ -817,7 +834,7 @@ func normalizeProcessArgs(args map[string]any) (map[string]any, error) {
 	return clean, nil
 }
 
-// isJobID reports whether id is inside the jobs capability's
+// isJobID reports whether id is inside the jobs service's
 // 8-lowercase-hex identity namespace.
 func isJobID(id string) bool {
 	if len(id) != 8 {
@@ -837,72 +854,49 @@ func isJobID(id string) bool {
 // dir — with a nonempty write dir the Harness confines every write to it, so
 // the tool stays available. The description consumes the hard constraints
 // only; no execution instance is constructed.
-func mutationDescription(name, description, parameters string, defaultHidden bool, constraints runtime.ToolConstraints) (runtime.ToolDescription, error) {
-	return runtime.ToolDescription{
+func mutationDescription(name, description, parameters string, constraints ToolConstraints) (ToolDescription, error) {
+	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        name,
 			Description: description,
 			Parameters:  json.RawMessage(parameters),
 		},
-		Available:     !constraints.Readonly || constraints.WriteDir != "",
-		DefaultHidden: defaultHidden,
+		Available: !constraints.Readonly || constraints.WriteDir != "",
 	}, nil
 }
 
-// Plugin returns the Runtime-scoped plugin whose seven exports are the native
-// file tools plus the foreground/background command, process, and sleep
-// tools. It requires the jobs capability and binds it strictly — there is no
-// degraded mode without it. ValidateConfig validates the owned
-// plugins.tools section; Open captures the owner data root the mutating
-// calls derive their code groups from and the command spills their output
-// directory from, and the bound jobs capability the background and process
-// paths call.
-func Plugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:    pluginID,
-		Scope: runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{
-			runtime.ToolSpec("read_file", readTool{}.describe),
-			runtime.ToolSpec("write_file", writeTool{}.describe),
-			runtime.ToolSpec("edit_file", editTool{}.describe),
-			runtime.ToolSpec("apply_patch", patchTool{}.describe),
-			runtime.ToolSpec("run_command", runCommandTool{}.describe),
-			runtime.ToolSpec("process", processTool{}.describe),
-			runtime.ToolSpec("sleep", sleepTool{}.describe),
-		},
-		Requires: []runtime.CapabilitySpec{
-			runtime.Spec[jobs.Jobs]("jobs"),
-		},
-		ValidateConfig: func(raw json.RawMessage) error {
-			_, err := decodeSettings(raw)
-			return err
-		},
-		Open: open,
+// standardToolSpecs returns the seven standard tool declarations in
+// declaration order. Every description is pure over the captured Invocation,
+// the hard constraints, and the literal description constants, so the
+// declarations compile once for every composition with no constructed state.
+func standardToolSpecs() []CapabilitySpec {
+	return []CapabilitySpec{
+		ToolSpec("read_file", readTool{}.describe),
+		ToolSpec("write_file", writeTool{}.describe),
+		ToolSpec("edit_file", editTool{}.describe),
+		ToolSpec("apply_patch", patchTool{}.describe),
+		ToolSpec("run_command", runCommandTool{}.describe),
+		ToolSpec("process", processTool{}.describe),
+		ToolSpec("sleep", sleepTool{}.describe),
 	}
 }
 
-// open checks the scope context, binds the declared jobs capability
-// strictly, and captures the scope identity's owner data root. Six of the
-// seven tool values share that one instance (sleep needs no instance state);
-// no per-Session state is created here and no environment key set is
-// captured — the command paths resolve the live subprocess environment
-// through the ToolContext's call-time producer.
-func open(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings) (runtime.Instance, error) {
-	if err := ctx.Err(); err != nil {
-		return runtime.Instance{}, err
-	}
-	jobsInst, err := runtime.Bind[jobs.Jobs](bindings, "jobs")
-	if err != nil {
-		return runtime.Instance{}, err
-	}
-	inst := &instance{dataDir: info.DataDir, jobs: jobsInst}
-	return runtime.Instance{Values: map[string]any{
+// newStandardTools constructs the seven standard tool values over the owner
+// data root and the jobs service: the file tools share one state that carries
+// no process dependency, run_command carries the jobs service beside that
+// state, process carries only the jobs service, and sleep needs neither; no
+// per-Session state is created here and no environment key set is captured —
+// the command paths resolve the live subprocess environment through the
+// ToolContext's call-time producer.
+func newStandardTools(dataDir string, jobsService jobs.Jobs) map[string]Tool {
+	inst := &standardTools{dataDir: dataDir}
+	return map[string]Tool{
 		"read_file":   readTool{inst},
 		"write_file":  writeTool{inst},
 		"edit_file":   editTool{inst},
 		"apply_patch": patchTool{inst},
-		"run_command": runCommandTool{inst},
-		"process":     processTool{inst},
+		"run_command": runCommandTool{inst, jobsService},
+		"process":     processTool{jobsService},
 		"sleep":       sleepTool{},
-	}}, nil
+	}
 }

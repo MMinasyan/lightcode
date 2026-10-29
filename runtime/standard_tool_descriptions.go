@@ -1,4 +1,4 @@
-package tools
+package runtime
 
 // Model-facing tool descriptions and JSON parameter schemas. The texts mirror
 // the retained concrete-tool surface; the target read_file description drops
@@ -99,7 +99,7 @@ const runCommandDescription = `Executes a shell command and returns combined std
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
-- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
+- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file.`
 
 const runCommandParameters = `{
   "type": "object",

@@ -1,8 +1,8 @@
 package runtime_test
 
 // The phase-composed mounted flow: one real production composition (the
-// shipped tools, jobs, tasks, and adaptation plugins over memory or the
-// shipped SQLite set), one mounted authenticated protocol server, one real
+// shipped adaptation and tasks plugins over the directly constructed SQLite
+// baseline), one mounted authenticated protocol server, one real
 // discovery record, the generated Go client, and one authenticated SSE
 // stream. The scenario drives the complete create → model/tool/child/Job →
 // hydration/events → older pages → archive/reopen/delete path, provider
@@ -30,12 +30,9 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
-	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
-	"github.com/MMinasyan/lightcode/internal/plugins/tools"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/plugins/jobs"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -66,20 +63,6 @@ const composedFlowAgentsDocument = `{
   "main": {"model": "prov/m", "system_prompt": "simple", "tools": ["write_file", "read_file", "run_command", "process", "task"]},
   "childtype": {"model": "prov/m", "system_prompt": "simple"}
 }`
-
-// composedMemoryStorage is the memory-store composition unit of the flow:
-// the same declared export the shipped SQLite plugin provides, over the
-// in-memory store the test retains.
-func composedMemoryStorage(store harness.Storage) runtime.Plugin {
-	return runtime.Plugin{
-		ID:       "memstore",
-		Scope:    runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{runtime.Spec[harness.Storage]("session_store")},
-		Open: func(context.Context, runtime.ScopeInfo, runtime.Bindings) (runtime.Instance, error) {
-			return runtime.Instance{Values: map[string]any{"session_store": store}}, nil
-		},
-	}
-}
 
 // composedCustomPluginID is the flow's selected custom plugin: an arbitrary
 // registered ID whose own settings document and Runtime-scoped warning the
@@ -981,16 +964,9 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 	}
 
-	t.Run("memory", func(t *testing.T) {
-		run(t, []runtime.Plugin{
-			composedMemoryStorage(storage.NewMemory()),
-			tools.Plugin(), adaptation.Plugin(), jobs.Plugin(), tasks.Plugin(),
-			composedCustomPlugin(),
-		})
-	})
-	t.Run("sqlite", func(t *testing.T) {
-		run(t, []runtime.Plugin{sqlite.Plugin(), tools.Plugin(), adaptation.Plugin(), jobs.Plugin(), tasks.Plugin(), composedCustomPlugin()})
-	})
+	// The shipped composition over the included store: the composition's
+	// optional plugins ride the directly constructed baseline services.
+	run(t, []runtime.Plugin{adaptation.Plugin(), tasks.Plugin(), composedCustomPlugin()})
 }
 
 func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *string) *protocol.HistoryPage {
@@ -1260,11 +1236,11 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		agentsPath := agents.PathForConfig(configPath)
 		composedWriteFile(t, agentsPath, heldAgentsMain)
 
-		store := storage.NewMemory()
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []runtime.Plugin{
-			composedMemoryStorage(store), tools.Plugin(), jobs.Plugin(),
-		}})
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath})
 		testassert.NoError(t, err)
+		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+		testassert.NoError(t, err)
+		defer store.Close()
 		defer func() { _ = r.Close(ctx) }()
 		ps, err := r.OpenProtocol(ctx)
 		testassert.NoError(t, err)

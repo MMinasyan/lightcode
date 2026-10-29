@@ -59,7 +59,8 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		ctx := context.Background()
 
@@ -200,7 +201,8 @@ func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
 		var agOpens atomic.Int64
-		r, err := e.open(context.Background(), e.storagePlugin(store),
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
 		ctx := context.Background()

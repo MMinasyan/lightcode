@@ -270,14 +270,7 @@ func TestComposedTaskPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 			return stopStream("done"), nil
 		}
 	}
-	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		advertise:   []string{"task"},
-		permissions: policy,
-		invocation:  invocation,
-		background:  background,
-		extraPlugin: tasks.Plugin(),
-		extraToolID: "task",
-	})
+	th := newTaskHarness(t, modelFn, policy, invocation, background)
 	session := th.createSession()
 	th.submit(session, "op-1", "exercise the denied and allowed launches")
 	rec := th.awaitSettled(session, "op-1")

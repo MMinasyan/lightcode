@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -15,6 +14,8 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/jobs"
+	"github.com/MMinasyan/lightcode/internal/storage"
 )
 
 // ErrOwned reports advisory-lock contention: another Runtime process owns the
@@ -78,6 +79,13 @@ type Runtime struct {
 	harness      *harness.Harness
 	artifacts    *artifactIntervals
 	dataDir      string
+
+	// jobs and closeStore are the directly constructed baseline services:
+	// the jobs service (also the Harness job-stop seam) and the included
+	// store's closer. Both close after Harness settlement, the jobs work
+	// group joining before the store closes and the lock releases.
+	jobs       jobsService
+	closeStore func() error
 	// protocol is the one attached isolated protocol server, set under mu by
 	// OpenProtocol and frozen once closure begins; nil when none is attached.
 	protocol *ProtocolServer
@@ -97,22 +105,23 @@ type Runtime struct {
 // finished. It requires nonempty paths, normalizes both
 // paths once with filepath.Abs, and validates the context before any
 // initialization. Startup order is fixed: validate declarations (definitions
-// and capability declarations, including exactly one Runtime-scoped export
-// declared as harness.Storage, all before any factory), acquire the
+// and plugin capability declarations, all before any factory), acquire the
 // process-lifetime lock at <DataDir>/runtime.lock, load the managed dotenv and
-// publish the initial configuration snapshot, construct the complete Runtime
-// scope in the composition's stable topological order, obtain the private Core
-// storage export and the optional job-stop seam, run restart recovery against
-// the storage, and construct the Harness with the bound preparation and seam.
-// The storage factory initializes its backend
-// under the held ownership; other factories receive no canonical Storage.
+// publish the initial configuration snapshot, directly construct the included
+// SQLite store and the jobs service under the held ownership and the standard
+// tool values over them, construct the complete Runtime scope in the
+// composition's stable topological order with those values bound as its own
+// provided capabilities, run restart recovery against the storage, and
+// construct the Harness with the bound preparation and the jobs stop seam.
+// Other factories receive no canonical Storage.
 // The automatic sweep's owned ticker loop is then registered as Runtime work
 // and one initial pass runs, both before the completed-owner publication.
-// Failure or cancellation before completed construction unwinds every
-// acquired resource, closes state access before releasing the lock, and
-// preserves committed repair. Construction never returns a non-nil Runtime
-// together with an error; the Harness and every scope stay private until this
-// call returns.
+// Failure or cancellation before completed construction unwinds every acquired
+// resource in reverse acquisition order — the constructed Runtime scope's
+// instances, then the jobs work group joining, then the store — closing state
+// access before releasing the lock, and preserves committed repair.
+// Construction never returns a non-nil Runtime together with an error; the
+// Harness and every scope stay private until this call returns.
 func open(ctx context.Context, options options) (*Runtime, error) {
 	if ctx == nil {
 		return nil, errors.New("runtime: construction requires a non-nil context")
@@ -140,9 +149,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 	c, err := newComposition(options.Plugins)
 	if err != nil {
-		return nil, err
-	}
-	if err := requireCoreStorage(c); err != nil {
 		return nil, err
 	}
 
@@ -187,28 +193,43 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unlock(err)
 	}
 
+	// unwind releases the acquired prefix in reverse acquisition order: each
+	// closer joins its own work — the jobs work group covers every monitor and
+	// completion callback — and the ownership lock releases last. A failed
+	// construction never appends its own resource: openScope already cleaned
+	// the partial scope it built.
+	var acquired []func() error
+	unwind := func(cause error) (*Runtime, error) {
+		cancelWork()
+		errs := []error{cause}
+		for i := len(acquired) - 1; i >= 0; i-- {
+			errs = append(errs, acquired[i]())
+		}
+		errs = append(errs, lock.Release())
+		return nil, errors.Join(errs...)
+	}
+
+	// The baseline services are acquired before the optional Runtime scope
+	// opens, so a Runtime-scoped factory's declared dependency on a standard
+	// tool resolves from the scope's own bindings when its factory runs.
+	store, closeStorage, err := openStore(work, dataDir)
+	if err != nil {
+		return unwind(err)
+	}
+	acquired = append(acquired, closeStorage)
+	jobsService := newJobs(dataDir)
+	acquired = append(acquired, jobsService.Close)
+	c.standardValues = newStandardTools(dataDir, jobsService)
 	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
 	if err != nil {
-		return unlock(err)
+		return unwind(err)
 	}
+	acquired = append(acquired, runtimeScope.cleanup)
 	// The observation is attached after construction: no subscriber can
 	// exist before the owner is published, so the Runtime scope announces
 	// only its closure, and descendant scopes inherit the publisher from it.
 	runtimeScope.obs = obs
-	unwind := func(cause error) (*Runtime, error) {
-		cancelWork()
-		return nil, errors.Join(cause, runtimeScope.cleanup(), lock.Release())
-	}
-
-	storage, err := coreStorage(runtimeScope)
-	if err != nil {
-		return unwind(err)
-	}
-	jobs, err := jobStopper(c, runtimeScope)
-	if err != nil {
-		return unwind(err)
-	}
-	if err := harness.Recover(work, storage); err != nil {
+	if err := harness.Recover(work, store); err != nil {
 		return unwind(err)
 	}
 
@@ -240,8 +261,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		}
 	}
 	h, err := harness.New(work, harness.Dependencies{
-		Storage: storage,
-		Jobs:    jobs,
+		Storage: store,
+		Jobs:    jobsService,
 		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv).bind(),
 		Observe: adapter.observe,
 	})
@@ -268,6 +289,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		harness:      h,
 		artifacts:    artifacts,
 		dataDir:      dataDir,
+		jobs:         jobsService,
+		closeStore:   closeStorage,
 		shutdownDone: make(chan struct{}),
 	}
 	sweepTicks, stopSweepTicker := options.sweepTicks, func() {}
@@ -279,75 +302,32 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	return r.publishOwner(work)
 }
 
-// requireCoreStorage enforces the canonical-state contract on the compiled
-// declarations before any factory: exactly one export is declared as
-// harness.Storage, and its plugin is Runtime-scoped. Names grant nothing; an
-// unrelated ordinary capability may be named storage.
-func requireCoreStorage(c *composition) error {
-	switch {
-	case len(c.coreExports) == 0:
-		return fmt.Errorf("no export is declared as harness.Storage: %w", ErrComposition)
-	case len(c.coreExports) > 1:
-		return fmt.Errorf("%d exports are declared as harness.Storage: %w", len(c.coreExports), ErrComposition)
-	case c.coreExports[0].scope != ScopeRuntime:
-		return fmt.Errorf("Core storage export %q is %s-scoped: %w", c.coreExports[0].id, c.coreExports[0].scope, ErrComposition)
-	}
-	return nil
+// openStore is the owner's included storage construction: the SQLite database
+// derived from the owned data directory, returned together with its closer.
+// It checks the construction context before touching the filesystem and runs
+// under the held ownership lock; in-package construction and unwind fixtures
+// replace it, and no other entry supplies the Harness storage.
+// jobsService is the directly constructed background process service: the
+// standard tools' jobs contract, the Harness job-stop seam, and the shutdown
+// closer. newJobs is its construction seam, which the in-package fixtures
+// point at a scripted service; no composition declaration supplies it.
+type jobsService interface {
+	jobs.Jobs
+	harness.JobStopper
+	Close() error
 }
 
-// coreStorage obtains the constructed Runtime scope's private Core export for
-// the owner. All capabilities of the storage plugin already share its ordinary
-// scope lifecycle; only the Runtime passes this value to the Harness and
-// recovery. An invalid success unwinds through the same scope rollback and
-// Instance.Close as other invalid exports.
-func coreStorage(runtimeScope *scope) (harness.Storage, error) {
-	var value any
-	for _, stored := range runtimeScope.storages {
-		value = stored
-	}
-	storage, ok := value.(harness.Storage)
-	if !ok {
-		return nil, fmt.Errorf("Core storage export supplies %T, not harness.Storage: %w", value, ErrComposition)
-	}
-	if isTypedNil(storage) {
-		return nil, fmt.Errorf("Core storage export supplies a typed-nil harness.Storage: %w", ErrComposition)
-	}
-	return storage, nil
-}
+var newJobs = func(dataDir string) jobsService { return jobs.New(dataDir) }
 
-// isTypedNil reports whether v's dynamic value is a nil of a nil-able kind:
-// the one typed-nil shape shared by the private Harness seam bindings.
-func isTypedNil(v any) bool {
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return rv.IsNil()
-	default:
-		return false
+var openStore = func(ctx context.Context, dataDir string) (harness.Storage, func() error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
-}
-
-// jobStopper resolves the optional Harness job-stop seam over the Runtime
-// scope: composition recorded every export declared exactly as
-// harness.JobStopper, zero leaves the seam nil, and the single
-// Runtime-scoped export resolves from the scope's private Core seam values
-// after the coreStorage-shape typed-nil check — multiple or narrower-scoped
-// exports fail composition. It runs after the Runtime scope's bindings commit
-// and before Harness construction, so a failure never publishes a Harness.
-func jobStopper(c *composition, runtimeScope *scope) (harness.JobStopper, error) {
-	switch {
-	case len(c.jobStoppers) == 0:
-		return nil, nil
-	case len(c.jobStoppers) > 1:
-		return nil, fmt.Errorf("%d exports are declared as harness.JobStopper: %w", len(c.jobStoppers), ErrComposition)
-	case c.jobStoppers[0].scope != ScopeRuntime:
-		return nil, fmt.Errorf("job stopper export %q is %s-scoped: %w", c.jobStoppers[0].id, c.jobStoppers[0].scope, ErrComposition)
+	store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+	if err != nil {
+		return nil, nil, err
 	}
-	stopper := runtimeScope.jobStoppers[c.jobStoppers[0].id].(harness.JobStopper)
-	if isTypedNil(stopper) {
-		return nil, fmt.Errorf("job stopper export %q supplies a typed-nil harness.JobStopper: %w", c.jobStoppers[0].id, ErrComposition)
-	}
-	return stopper, nil
+	return store, store.Close, nil
 }
 
 // publishOwner registers the constructor context's cancellation watcher and
@@ -519,8 +499,10 @@ func (r *Runtime) beginShutdown() {
 // its context cancellation has settled every in-flight preparation,
 // execution, and required terminal commit, then closes every
 // live Workspace scope in sorted path order and the Runtime scope in reverse
-// dependency order, closes every passive subscription once those cleanup
-// events have been published, withdraws the attached protocol server's
+// dependency order, closes the jobs service — joining every monitor and
+// completion callback — before closing the included store, which closes last
+// among the owned resources, closes every passive subscription once those
+// cleanup events have been published, withdraws the attached protocol server's
 // remembered discovery record, and releases the lock as the final ownership
 // action. Every required close is attempted and all errors are joined; no
 // state-owning mutex is held across any of it.
@@ -537,6 +519,12 @@ func (r *Runtime) joinShutdown() error {
 		errs = append(errs, err)
 	}
 	if err := r.runtimeScope.close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.jobs.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.closeStore(); err != nil {
 		errs = append(errs, err)
 	}
 	r.obs.closeAll()

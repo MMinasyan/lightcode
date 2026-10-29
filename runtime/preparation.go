@@ -320,10 +320,13 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		if err != nil {
 			return unwind(err, nil)
 		}
-		// The invocation view binds the Agent's declared tool exports —
-		// separately from the explicitly selected non-tool capability IDs —
-		// over the freshly opened Agent tier.
-		bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, slices.Concat(agent.Capabilities, agent.Tools))
+		// The invocation view selects every capability the Agent declared —
+		// its non-tool capability IDs and each declared tool name, the
+		// standard tools included — over the freshly opened Agent tier.
+		selected := make([]string, 0, len(agent.Capabilities)+len(agent.Tools))
+		selected = append(selected, agent.Capabilities...)
+		selected = append(selected, agent.Tools...)
+		bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, selected)
 		if err != nil {
 			return unwind(err, releaseAgent)
 		}

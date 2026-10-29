@@ -14,10 +14,9 @@ import (
 // surfaceRequest is the captured pure input of one composed prompt and tool
 // surface: the Runtime's once-resolved home, the preparation's Workspace and
 // session-start environment, the selected definition's prompt fields, the
-// captured Invocation, hard constraints, and session identity, the
-// composition's tool specs in the agent's selection order after
-// first-occurrence dedupe, the bound ModelAdaptation (nil when unselected),
-// and the active model ref.
+// captured Invocation, hard constraints, and session identity, the compiled
+// tool specs in the agent's selection order after first-occurrence dedupe,
+// the bound ModelAdaptation (nil when unselected), and the active model ref.
 type surfaceRequest struct {
 	home         string
 	workspace    string
@@ -40,9 +39,8 @@ type surfaceRequest struct {
 // through the shared Service with every retained invariant (none skips rules
 // and adaptation; simple and full share the one assembly), and the advertised
 // surface walks the tool specs in the agent's selection order after
-// first-occurrence dedupe: eligible tools minus the
-// excluded names (exclusion always wins over inclusion), minus default-hidden
-// tools unless included — an include can never revive a tool the hard
+// first-occurrence dedupe: every selected eligible tool is advertised minus
+// the excluded names — an exclusion can never revive a tool the hard
 // constraints made ineligible. Every advertised description renders through
 // the existing adaptation rendering helper. A zero session start samples the
 // compose time once, so the resulting prompt is captured once.
@@ -57,7 +55,6 @@ func composeSurface(req surfaceRequest) (prompt.Result, []model.ToolDefinition, 
 		resolved = value
 		conv = &adaptation.Adaptation{
 			ExcludeTools:                slices.Clone(resolved.ExcludeTools),
-			IncludeTools:                slices.Clone(resolved.IncludeTools),
 			Blocks:                      slices.Clone(resolved.Blocks),
 			Additions:                   maps.Clone(resolved.Additions),
 			ToolDescriptionReplacements: maps.Clone(resolved.ToolDescriptionReplacements),
@@ -80,7 +77,7 @@ func composeSurface(req surfaceRequest) (prompt.Result, []model.ToolDefinition, 
 			continue
 		}
 		name := description.Definition.Name
-		if slices.Contains(resolved.ExcludeTools, name) || (description.DefaultHidden && !slices.Contains(resolved.IncludeTools, name)) {
+		if slices.Contains(resolved.ExcludeTools, name) {
 			continue
 		}
 		definition := description.Definition

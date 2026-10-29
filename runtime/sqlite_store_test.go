@@ -1,4 +1,4 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
@@ -14,20 +14,17 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
-// External composition integration: the actual sqlite.Plugin is assembled
-// through the test-build OpenForTest bridge, without a runtime-to-plugin
-// import cycle. Every test isolates HOME and every bundled provider
-// credential, so construction reaches no network, starts no user's Runtime,
-// and touches no real .env or discovery cache.
+// Composition integration for the included store: the Runtime owner
+// constructs the real SQLite store directly under its ownership lock through
+// the owner-private store opener. Every test isolates HOME and every bundled
+// provider credential, so construction reaches no network, starts no user's
+// Runtime, and touches no real .env or discovery cache.
 
 const composedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`
 
@@ -50,38 +47,10 @@ func newComposeEnv(t *testing.T) *composeEnv {
 	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath}
 }
 
-// isolateBundledCredentials empties every api_key_env declared by the bundled
-// catalog so a captured build never starts a network attempt.
-func isolateBundledCredentials(t *testing.T) {
-	t.Helper()
-	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
-	testassert.NoError(t, err)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join("..", "internal", "catalog", "builtin", entry.Name()))
-		if err != nil {
-			t.Fatalf("read bundled provider %s: %v", entry.Name(), err)
-		}
-		var provider struct {
-			Transport struct {
-				APIKeyEnv string `json:"api_key_env"`
-			} `json:"transport"`
-		}
-		if err := json.Unmarshal(data, &provider); err != nil {
-			t.Fatalf("decode bundled provider %s: %v", entry.Name(), err)
-		}
-		if provider.Transport.APIKeyEnv != "" {
-			t.Setenv(provider.Transport.APIKeyEnv, "")
-		}
-	}
-}
-
-// openComposed assembles the real sqlite plugin through the test bridge.
-func (e *composeEnv) openComposed(ctx context.Context) (*runtime.Runtime, error) {
+// openComposed constructs the Runtime over the included store.
+func (e *composeEnv) openComposed(ctx context.Context) (*Runtime, error) {
 	e.t.Helper()
-	return runtime.OpenForTest(ctx, e.dataDir, e.configPath, []runtime.Plugin{sqlite.Plugin()})
+	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
 }
 
 // treeFiles maps every file under root, relative slash path to bytes.
@@ -143,33 +112,20 @@ func keys(m map[string]string) []string {
 	return out
 }
 
-// TestSQLitePluginDeclaration exercises the plugin's ordinary Plugin/Instance
-// contract directly, the same surface an externally supplied capability
-// implements.
-func TestSQLitePluginDeclaration(t *testing.T) {
-	p := sqlite.Plugin()
-	testassert.Require(t, p.ID == "sqlite" && p.Scope == runtime.ScopeRuntime && len(p.Provides) == 1 && len(p.Requires) == 0, "got %v, want %v; got %v, want %v; got %v, want %v; got %v, want %v", p.ID, "sqlite", p.Scope, runtime.ScopeRuntime, len(p.Provides), 1, len(p.Requires), 0)
-	testassert.Require(t, p.ValidateConfig == nil, "plugin declares a settings validator, want none")
-	testassert.Require(t, p.Open != nil, "plugin declares no Open")
-
-	t.Run("open derives the exact database path and returns the declared store with its Close", func(t *testing.T) {
+// TestIncludedStoreConstruction exercises the owner's direct store opener:
+// the exact database path under the data root, the returned store and its
+// closer, and the context check before any filesystem touch.
+func TestIncludedStoreConstruction(t *testing.T) {
+	t.Run("open derives the exact database path and returns the store with its closer", func(t *testing.T) {
 		dir := t.TempDir()
-		inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dir}, runtime.Bindings{})
+		store, closeStore, err := openStore(context.Background(), dir)
 		testassert.NoError(t, err)
-		testassert.Equal(t, len(inst.Values), 1)
-		var store harness.Storage
-		for _, value := range inst.Values {
-			storageValue, ok := value.(harness.Storage)
-			testassert.Require(t, ok, "instance export supplies %T, not harness.Storage", value)
-			store = storageValue
-		}
-		testassert.Require(t, store != nil, "instance export supplies a nil harness.Storage")
-		testassert.Require(t, inst.Close != nil, "instance declares no Close for the opened store")
+		testassert.Require(t, store != nil && closeStore != nil, "openStore returned (%v, closer supplied %v), want the store and its closer", store, closeStore != nil)
 		{
 			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
 			testassert.NoError(t, err)
 		}
-		testassert.NoError(t, inst.Close())
+		testassert.NoError(t, closeStore())
 		reopened, err := storage.OpenSQLite(filepath.Join(dir, "lightcode.db"))
 		testassert.NoError(t, err)
 		testassert.NoError(t, reopened.Close())
@@ -179,18 +135,18 @@ func TestSQLitePluginDeclaration(t *testing.T) {
 		dir := t.TempDir()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		inst, err := p.Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dir}, runtime.Bindings{})
-		testassert.Require(t, inst.Values == nil && inst.Close == nil, "canceled Open returned the instance %+v", inst)
-		testassert.Require(t, errors.Is(err, context.Canceled), "canceled Open error = %v, want the context error", err)
+		store, closeStore, err := openStore(ctx, dir)
+		testassert.Require(t, store == nil && closeStore == nil, "canceled openStore returned (%v, closer supplied %v)", store, closeStore != nil)
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled openStore error = %v, want the context error", err)
 		{
 			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
-			testassert.Require(t, os.IsNotExist(err), "a canceled Open touched the filesystem: stat err = %v", err)
+			testassert.Require(t, os.IsNotExist(err), "a canceled openStore touched the filesystem: stat err = %v", err)
 		}
 	})
 }
 
-// TestComposedSQLiteRuntime assembles the real plugin through the test-build
-// bridge over real temporary SQLite: R1-R3 and R13 composition behavior.
+// TestComposedSQLiteRuntime constructs the Runtime over the included
+// store: R1-R3 and R13 composition behavior.
 func TestComposedSQLiteRuntime(t *testing.T) {
 	ctx := context.Background()
 
@@ -231,7 +187,7 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 		contender := newComposeEnv(t)
 		rivalData := e.dataDir
 		contender.dataDir = rivalData
-		if got, err := contender.openComposed(ctx); err == nil || !errors.Is(err, runtime.ErrOwned) {
+		if got, err := contender.openComposed(ctx); err == nil || !errors.Is(err, ErrOwned) {
 			_ = r.Close(ctx)
 			t.Fatalf("contender open = (%v, %v), want (nil, ErrOwned)", got, err)
 		}
@@ -260,11 +216,11 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(filepath.Join(e.dataDir, "lightcode.db"), []byte("not a database at all"), 0o600))
 		r, err := e.openComposed(ctx)
 		testassert.Require(t, r == nil, "failed assembly returned a Runtime (%v)", err)
-		testassert.Require(t, err != nil && !errors.Is(err, runtime.ErrOwned), "failed assembly error = %v, want the storage failure, not the ownership identity", err)
+		testassert.Require(t, err != nil && !errors.Is(err, ErrOwned), "failed assembly error = %v, want the storage failure, not the ownership identity", err)
 		// The lock was released: the next attempt fails at storage again rather
 		// than reporting ownership contention, and no partial owner remains.
 		again, err := e.openComposed(ctx)
-		testassert.Require(t, again == nil && err != nil && !errors.Is(err, runtime.ErrOwned), "open over the failed assembly = (%v, %v), want (nil, the same storage failure)", again, err)
+		testassert.Require(t, again == nil && err != nil && !errors.Is(err, ErrOwned), "open over the failed assembly = (%v, %v), want (nil, the same storage failure)", again, err)
 	})
 
 	t.Run("startup recovery repairs the seeded running state before execution", func(t *testing.T) {
@@ -274,7 +230,7 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 		// Registered before the seed's own cleanup, so the parked execution is
 		// released before the store closes.
 		t.Cleanup(func() { _ = store.Close() })
-		sessionID, executions := seedRunningOperation(t, store, filepath.Join(e.home, "workspace"))
+		sessionID, executions := seedRunningOperationCounted(t, store, filepath.Join(e.home, "workspace"))
 
 		key := harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "seed-op"}
 		reg, err := store.ReadRegister(ctx, key)
@@ -305,11 +261,11 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 	})
 }
 
-// seedRunningOperation commits one running Operation through a standalone
+// seedRunningOperationCounted commits one running Operation through a standalone
 // Harness whose model effect never completes: abandoning that owner is the
 // durable state restart recovery consumes. The returned counter observes the
 // model effect, and the parked execution is released during cleanup.
-func seedRunningOperation(t *testing.T, store harness.Storage, workspace string) (string, *atomic.Int32) {
+func seedRunningOperationCounted(t *testing.T, store harness.Storage, workspace string) (string, *atomic.Int32) {
 	t.Helper()
 	arrived := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -406,19 +362,19 @@ func readSessionRegister(t *testing.T, store harness.Storage, sessionID string) 
 }
 
 // nextComposedEvent reads one event with the test budget applied.
-func nextComposedEvent(t *testing.T, sub *runtime.Subscription) (runtime.Event, bool) {
+func nextComposedEvent(t *testing.T, sub *Subscription) (Event, bool) {
 	t.Helper()
 	select {
 	case event, ok := <-sub.Events():
 		return event, ok
 	case <-time.After(10 * time.Second):
 		t.Fatal("no event arrived within the test budget")
-		return runtime.Event{}, false
+		return Event{}, false
 	}
 }
 
 // composedEventKind reads one composed event's discriminator.
-func composedEventKind(t *testing.T, event runtime.Event) string {
+func composedEventKind(t *testing.T, event Event) string {
 	t.Helper()
 	kind, err := event.Discriminator()
 	testassert.NoError(t, err)
@@ -427,7 +383,7 @@ func composedEventKind(t *testing.T, event runtime.Event) string {
 
 // composedEventGeneration reads one composed configuration event's
 // generation.
-func composedEventGeneration(t *testing.T, event runtime.Event) string {
+func composedEventGeneration(t *testing.T, event Event) string {
 	t.Helper()
 	body, err := event.AsConfigurationChangedEvent()
 	testassert.NoError(t, err)
@@ -435,7 +391,7 @@ func composedEventGeneration(t *testing.T, event runtime.Event) string {
 }
 
 // composedEventJSON renders one composed event for failure diagnostics.
-func composedEventJSON(event runtime.Event) string {
+func composedEventJSON(event Event) string {
 	data, err := event.MarshalJSON()
 	if err != nil {
 		return "<unset>"
@@ -445,7 +401,7 @@ func composedEventJSON(event runtime.Event) string {
 
 // composedConfigurationEvent builds one configuration event through the
 // generated constructor for the composed order oracles.
-func composedConfigurationEvent(generation uint64) runtime.Event {
+func composedConfigurationEvent(generation uint64) Event {
 	var scope protocol.Scope
 	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
 	var event protocol.Event
@@ -486,7 +442,7 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		testassert.Require(t, !ok, "saturated subscriber still open at the second publication, want it removed and closed")
 	}
 	sat.Close()
-	var observed []runtime.Event
+	var observed []Event
 	for _, want := range []string{"2", "3"} {
 		event, ok := nextComposedEvent(t, healthy)
 		if !ok || composedEventKind(t, event) != "configuration_changed" || composedEventGeneration(t, event) != want {
@@ -506,42 +462,20 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 		}
 		observed = append(observed, event)
 	}
-	want := []runtime.Event{
+	want := []Event{
 		composedConfigurationEvent(2),
 		composedConfigurationEvent(3),
 		composedRuntimeScopeClosed(),
 	}
-	testassert.Require(t, slices.EqualFunc(observed, want, runtime.EqualEventForTest), "healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
+	testassert.Require(t, slices.EqualFunc(observed, want, EqualEventForTest), "healthy subscriber events = %+v, want the observed revisions plus the Runtime closure in publication order %+v", observed, want)
 	again, err := e.openComposed(ctx)
 	testassert.NoError(t, err)
 	testassert.NoError(t, again.Close(ctx))
 }
 
-// TestBuiltinRegistrationComposes proves the shipped registration set — the
-// SQLite storage plugin, the native tools, the bundled adaptation, and the
-// background jobs plugin — composes through the real
-// construction path: the complete declared set opens over the real plugin's
-// database, reload publishes, and shutdown converges leaving exactly the
-// plugin-owned files.
-func TestBuiltinRegistrationComposes(t *testing.T) {
-	ctx := context.Background()
-	e := newComposeEnv(t)
-	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
-	testassert.NoError(t, err)
-	{
-		revision, err := r.Reload(ctx)
-		testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
-	}
-	testassert.NoError(t, r.Close(ctx))
-	{
-		got := sortedNames(t, e.dataDir)
-		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the real SQLite plugin's files", got)
-	}
-}
-
 // composedRuntimeScopeClosed builds the Runtime closure scope event for the
 // composed order oracles.
-func composedRuntimeScopeClosed() runtime.Event {
+func composedRuntimeScopeClosed() Event {
 	var scope protocol.Scope
 	_ = scope.FromRuntimeScope(protocol.RuntimeScope{Kind: protocol.RuntimeScopeKindRuntime}) // plain members; the marshal cannot fail
 	var event protocol.Event

@@ -112,11 +112,7 @@ type Instance struct {
 // of its owned input: no I/O, background work, waits, or retained input. A
 // nil ValidateConfig means the plugin has no settings, so only absent
 // configuration or the empty object is accepted, never arbitrary ignored
-// JSON. An export declared with exactly the harness.Storage or
-// harness.JobStopper type is a private Core seam binding, identified by type
-// rather than a reserved ID; it stays in the same declaration, instance, and
-// disposal machinery but is omitted from ordinary Bindings and the capability
-// universe.
+// JSON.
 type Plugin struct {
 	ID             string
 	Scope          ScopeKind
@@ -226,28 +222,61 @@ func acceptSettings(plugin Plugin, raw json.RawMessage) error {
 	return fmt.Errorf("plugin %q declares no settings validator but received configuration: %w", plugin.ID, ErrComposition)
 }
 
-// typedExportDecl records one export declared as exactly a
-// Harness-recognized interface type — harness.Storage's private Core binding
-// or the harness.JobStopper job-stop seam — so the Runtime can identify it by
-// declared type rather than by ID or value assertion.
-type typedExportDecl struct {
-	plugin string
-	scope  ScopeKind
-	id     string
+// provider is one capability ID's supplier in the composition's single export
+// table: a plugin's export, or the fixed ownerProvider identity for the
+// baseline standard tools the Runtime owner supplies directly.
+type provider struct {
+	plugin int
+	spec   CapabilitySpec
+}
+
+// ownerProvider is the export table's supplier index for the baseline
+// standard tools: they have no Plugin declaration and no factory.
+const ownerProvider = -1
+
+func (p provider) owner() bool { return p.plugin == ownerProvider }
+
+// providerLabel names one supplier in a rejection: the plugin's registered ID,
+// or the owner's directly constructed standard tools.
+func providerLabel(owned []Plugin, p provider) string {
+	if p.owner() {
+		return "the owner's standard tools"
+	}
+	return owned[p.plugin].ID
+}
+
+// providerScope is the lifetime a supplier provides: the owner-provided
+// standard tools are Runtime-lifetime capabilities.
+func providerScope(owned []Plugin, p provider) ScopeKind {
+	if p.owner() {
+		return ScopeRuntime
+	}
+	return owned[p.plugin].Scope
 }
 
 // composition is the validated static plugin set: an owned declaration copy,
 // per-scope construction plans in stable topological order (registration
-// order breaks ties), the ordinary capability universe excluding Core
-// storage exports, the tool-declaration universe feeding the agent parser,
-// the storage export declarations, and the job-stop seam declarations.
+// order breaks ties), and the one export table every capability ID resolves
+// through — the seven standard tool declarations seeded as owner-provided
+// Runtime-lifetime providers first, then the optional plugins' exports. The
+// owner installs the directly constructed standard tool values into the
+// Runtime scope's bindings, so every capability — a standard tool or a plugin
+// export — travels the same selectCapabilities and Bind path.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
 	capabilityIDs []string
 	toolIDs       []string
-	coreExports   []typedExportDecl
-	jobStoppers   []typedExportDecl
+
+	// exports is the one provider table: every selectable capability ID with
+	// its declaring type, description function, and supplier.
+	exports map[string]provider
+
+	// standardValues holds the owner-constructed standard tool values the
+	// Runtime scope binds as its own provided capabilities. It is set by the
+	// Runtime owner before the Runtime scope opens; an isolated composition
+	// leaves it nil and its Runtime scope binds no tool values.
+	standardValues map[string]Tool
 
 	// reportWarning is the owner's neutral plugin-warning sink: it receives
 	// one registered plugin's ID with the reported (kind,message) and performs
@@ -263,15 +292,18 @@ type composition struct {
 }
 
 // newComposition validates the complete selected plugin set before any
-// factory can run: unique nonempty plugin IDs, valid scopes, non-nil Open,
-// at least one provider, unique nonempty export IDs globally and unique
-// nonempty dependency IDs per plugin, assignable provider types,
-// lifetime-compatible PreparationHook declarations (Runtime or Workspace
-// scope only), Tool declarations carrying their description functions, at
-// most one ModelAdaptation export and it Runtime scoped, and
-// same-or-longer-lived dependency scopes and an acyclic dependency graph. An
-// ordinary dependency on an ID reserved by a Core
-// storage export is a plain missing binding and is rejected.
+// factory can run: unique nonempty plugin IDs that are not one of the baseline
+// services' own configuration section IDs, valid scopes, non-nil Open, at
+// least one provider, unique nonempty export IDs globally and unique nonempty
+// dependency IDs per plugin, assignable provider types, lifetime-compatible
+// PreparationHook declarations (Runtime or Workspace scope only), Tool
+// declarations carrying their description functions, at most one
+// ModelAdaptation export and it Runtime scoped, and same-or-longer-lived
+// dependency scopes and an acyclic dependency graph. The seven standard tool
+// declarations are seeded into the same export table as owner-provided
+// Runtime-lifetime capabilities, so an optional export naming one collides as
+// a duplicate provider and an ordinary dependency on one resolves through the
+// same type and lifetime rules as any other capability.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
 	for i, p := range plugins {
@@ -280,19 +312,15 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		owned[i] = p
 	}
 
-	type exportSource struct {
-		plugin int
-		spec   CapabilitySpec
+	exports := make(map[string]provider, len(standardToolSpecs()))
+	var capabilityIDs, toolIDs []string
+	for _, spec := range standardToolSpecs() {
+		exports[spec.id] = provider{plugin: ownerProvider, spec: spec}
+		capabilityIDs = append(capabilityIDs, spec.id)
+		toolIDs = append(toolIDs, spec.id)
 	}
-	storageType := reflect.TypeFor[harness.Storage]()
-	jobStopperType := reflect.TypeFor[harness.JobStopper]()
-	all := make(map[string]exportSource)
-	ordinary := make(map[string]exportSource)
+
 	seenPluginIDs := make(map[string]bool)
-	var capabilityIDs []string
-	var toolIDs []string
-	var coreExports []typedExportDecl
-	var jobStoppers []typedExportDecl
 	var adaptationExports []string
 	for i, p := range owned {
 		if p.ID == "" {
@@ -302,6 +330,11 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			return nil, fmt.Errorf("plugin %q: duplicate plugin ID: %w", p.ID, ErrComposition)
 		}
 		seenPluginIDs[p.ID] = true
+		for _, section := range baselineSections() {
+			if p.ID == section.id {
+				return nil, fmt.Errorf("plugin %q: the %q settings section belongs to the directly constructed baseline service: %w", p.ID, section.id, ErrComposition)
+			}
+		}
 		if p.Scope.rank() == 0 {
 			return nil, fmt.Errorf("plugin %q: invalid scope %q: %w", p.ID, p.Scope, ErrComposition)
 		}
@@ -328,29 +361,22 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			if prov.typ == toolType && prov.describe == nil {
 				return nil, fmt.Errorf("plugin %q: capability %q declared as Tool lacks its description function: %w", p.ID, prov.id, ErrComposition)
 			}
-			if src, dup := all[prov.id]; dup {
-				return nil, fmt.Errorf("plugin %q: capability %q already exported by %q: %w", p.ID, prov.id, owned[src.plugin].ID, ErrComposition)
+			if src, dup := exports[prov.id]; dup {
+				return nil, fmt.Errorf("plugin %q: capability %q already exported by %s: %w", p.ID, prov.id, providerLabel(owned, src), ErrComposition)
 			}
-			all[prov.id] = exportSource{plugin: i, spec: prov}
+			exports[prov.id] = provider{plugin: i, spec: prov}
+			capabilityIDs = append(capabilityIDs, prov.id)
 			if prov.typ.Implements(preparationHookType) && p.Scope != ScopeRuntime && p.Scope != ScopeWorkspace {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s implements PreparationHook and requires Runtime or Workspace scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
 			if prov.typ == modelAdaptationType && p.Scope != ScopeRuntime {
 				return nil, fmt.Errorf("plugin %q (%s): capability %q declared as %s requires Runtime scope: %w", p.ID, p.Scope, prov.id, prov.typ, ErrComposition)
 			}
-			if prov.typ == storageType {
-				coreExports = append(coreExports, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
-			} else if prov.typ == jobStopperType {
-				jobStoppers = append(jobStoppers, typedExportDecl{plugin: p.ID, scope: p.Scope, id: prov.id})
-			} else {
-				ordinary[prov.id] = exportSource{plugin: i, spec: prov}
-				capabilityIDs = append(capabilityIDs, prov.id)
-				if prov.typ == toolType {
-					toolIDs = append(toolIDs, prov.id)
-				}
-				if prov.typ == modelAdaptationType {
-					adaptationExports = append(adaptationExports, prov.id)
-				}
+			if prov.typ == toolType {
+				toolIDs = append(toolIDs, prov.id)
+			}
+			if prov.typ == modelAdaptationType {
+				adaptationExports = append(adaptationExports, prov.id)
 			}
 		}
 	}
@@ -359,16 +385,15 @@ func newComposition(plugins []Plugin) (*composition, error) {
 	}
 	for _, p := range owned {
 		for _, req := range p.Requires {
-			src, ok := ordinary[req.id]
+			src, ok := exports[req.id]
 			if !ok {
-				return nil, fmt.Errorf("plugin %q: required capability %q has no ordinary binding: %w", p.ID, req.id, ErrComposition)
+				return nil, fmt.Errorf("plugin %q: required capability %q has no provider: %w", p.ID, req.id, ErrComposition)
 			}
 			if !src.spec.typ.AssignableTo(req.typ) {
 				return nil, fmt.Errorf("plugin %q: capability %q declared as %s is not assignable to required %s: %w", p.ID, req.id, src.spec.typ, req.typ, ErrComposition)
 			}
-			provider := owned[src.plugin]
-			if provider.Scope.rank() > p.Scope.rank() {
-				return nil, fmt.Errorf("plugin %q (%s) requires %q from shorter-lived %s plugin %q: %w", p.ID, p.Scope, req.id, provider.Scope, provider.ID, ErrComposition)
+			if providerScope(owned, src).rank() > p.Scope.rank() {
+				return nil, fmt.Errorf("plugin %q (%s) requires %q from shorter-lived %s provider %s: %w", p.ID, p.Scope, req.id, providerScope(owned, src), providerLabel(owned, src), ErrComposition)
 			}
 		}
 	}
@@ -385,7 +410,10 @@ func newComposition(plugins []Plugin) (*composition, error) {
 	}
 	for i, p := range owned {
 		for _, req := range p.Requires {
-			src := ordinary[req.id]
+			src := exports[req.id]
+			if src.owner() { // the owner supplies it; no plugin edge exists
+				continue
+			}
 			if edges[i][src.plugin] {
 				continue
 			}
@@ -428,8 +456,7 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		plan:            plan,
 		capabilityIDs:   capabilityIDs,
 		toolIDs:         toolIDs,
-		coreExports:     coreExports,
-		jobStoppers:     jobStoppers,
+		exports:         exports,
 		modelAdaptation: modelAdaptation,
 	}, nil
 }
@@ -480,21 +507,23 @@ func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo
 
 // openScope constructs the plugins planned for info.Kind in topological
 // order, seeding ordinary dependencies from the supplied ancestor scopes in
-// longer-to-shorter order. The failing factory owns its provisional
-// resources; every other failure runs the common scope cleanup — cancel, join
-// admitted work, dispose constructed instances in reverse construction order
-// attempting all and joining errors — and publishes nothing.
+// longer-to-shorter order. The Runtime scope binds the owner's directly
+// constructed standard tool values as its own provided capabilities before any
+// planned factory runs, so a factory's declared dependency on a standard tool
+// resolves through the same Bind path as any other capability. The failing
+// factory owns its provisional resources; every other failure runs the common
+// scope cleanup — cancel, join admitted work, dispose constructed instances in
+// reverse construction order attempting all and joining errors — and publishes
+// nothing.
 func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors []*scope) (*scope, error) {
 	if err := validateScopeInfo(info); err != nil {
 		return nil, err
 	}
 	scopeCtx, cancel := context.WithCancel(ctx)
 	sc := &scope{
-		info:        info,
-		ctx:         scopeCtx,
-		cancel:      cancel,
-		storages:    make(map[string]any),
-		jobStoppers: make(map[string]any),
+		info:   info,
+		ctx:    scopeCtx,
+		cancel: cancel,
 	}
 	if len(ancestors) > 0 {
 		sc.obs = ancestors[0].obs
@@ -506,6 +535,17 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		}
 	}
 	own := make(map[string]bindingEntry)
+	if info.Kind == ScopeRuntime {
+		for id, src := range c.exports {
+			value, supplied := c.standardValues[id]
+			if !src.owner() || !supplied {
+				continue
+			}
+			entry := bindingEntry{declared: src.spec.typ, value: value, from: sc}
+			resolved[id] = entry
+			own[id] = entry
+		}
+	}
 	fail := func(err error) (*scope, error) {
 		return nil, errors.Join(err, sc.cleanup())
 	}
@@ -555,8 +595,8 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 // registerInstance validates one factory output — exactly the declared IDs,
 // each with a dynamic Go type assignable to its declaration, untyped nil
 // supplying no verifiable type — and copies the returned map into the scope's
-// resolved ordinary bindings and Core storage values. Typed nils and zero
-// concrete values follow the ordinary assignability rule.
+// resolved ordinary bindings. Typed nils and zero concrete values follow the
+// ordinary assignability rule.
 func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own map[string]bindingEntry) error {
 	declared := make(map[string]CapabilitySpec, len(p.Provides))
 	for _, spec := range p.Provides {
@@ -567,8 +607,6 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 			return fmt.Errorf("instance exports undeclared capability %q: %w", id, ErrComposition)
 		}
 	}
-	storageType := reflect.TypeFor[harness.Storage]()
-	jobStopperType := reflect.TypeFor[harness.JobStopper]()
 	for id, spec := range declared {
 		value, ok := values[id]
 		if !ok {
@@ -580,38 +618,29 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		if !reflect.TypeOf(value).AssignableTo(spec.typ) {
 			return fmt.Errorf("capability %q supplied as %T is not assignable to declared %s: %w", id, value, spec.typ, ErrComposition)
 		}
-		if spec.typ == storageType {
-			sc.storages[id] = value
-		} else if spec.typ == jobStopperType {
-			sc.jobStoppers[id] = value
-		} else {
-			entry := bindingEntry{declared: spec.typ, value: value, from: sc, plugin: p.ID}
-			own[id] = entry
-			resolved[id] = entry
-		}
+		entry := bindingEntry{declared: spec.typ, value: value, from: sc, plugin: p.ID}
+		own[id] = entry
+		resolved[id] = entry
 	}
 	return nil
 }
 
-// toolSpec resolves one tool ID to its composed declaration. Agent tool
-// lists are validated against the composed tool universe, so a miss cannot
-// occur in a published selection; the returned spec is the one declaration
-// the ID globally names.
+// toolSpec resolves one tool ID to its composed declaration through the
+// single export table: the owner-provided standard tools and the plugin
+// declarations are the same lookup. Agent tool lists are validated against the
+// composed tool universe, so a miss cannot occur in a published selection; the
+// returned spec is the one declaration the ID globally names.
 func (c *composition) toolSpec(id string) (CapabilitySpec, bool) {
-	for _, p := range c.plugins {
-		for _, spec := range p.Provides {
-			if spec.id == id && spec.typ == toolType {
-				return spec, true
-			}
-		}
+	if src, ok := c.exports[id]; ok && src.spec.typ == toolType {
+		return src.spec, true
 	}
 	return CapabilitySpec{}, false
 }
 
 // selectCapabilities builds an Agent's selected view from the same resolved
-// scope instances, containing only the selected ordinary exports. Unknown or
-// Core-storage IDs are not in the capability universe and are rejected; the
-// selected view never rebinds.
+// scope instances, containing only the selected capability IDs. Unknown IDs are
+// not in the capability universe and are rejected; the selected view never
+// rebinds.
 func selectCapabilities(scopes []*scope, selected []string) (Bindings, error) {
 	entries := make(map[string]bindingEntry, len(selected))
 	for _, id := range selected {
@@ -624,7 +653,7 @@ func selectCapabilities(scopes []*scope, selected []string) (Bindings, error) {
 			}
 		}
 		if !found {
-			return Bindings{}, fmt.Errorf("capability %q is not an ordinary export of the supplied scopes: %w", id, ErrComposition)
+			return Bindings{}, fmt.Errorf("capability %q is not a bound capability of the supplied scopes: %w", id, ErrComposition)
 		}
 	}
 	return Bindings{entries: entries}, nil
@@ -647,10 +676,8 @@ type scope struct {
 	// ancestor; scopes constructed before the owner exists keep it nil.
 	obs *observation
 
-	bindings    Bindings
-	storages    map[string]any
-	jobStoppers map[string]any
-	closers     []func() error
+	bindings Bindings
+	closers  []func() error
 
 	mu     sync.Mutex
 	closed bool

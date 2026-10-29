@@ -54,7 +54,8 @@ func openProtocolServer(t *testing.T, r *Runtime) *ProtocolServer {
 func openProtocolOwner(t *testing.T, store harness.Storage) (*Runtime, *ownerEnv) {
 	t.Helper()
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(store))
+	e.fixtureStore(store)
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	return r, e
 }
@@ -686,7 +687,8 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		// One malformed line makes the startup LoadDotEnv diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
@@ -1306,7 +1308,8 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 func TestProtocolServerAgentModelEdit(t *testing.T) {
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo": {"model": "prov/m", "system_prompt": "simple"}, "..": {"model": "prov/m", "system_prompt": "simple"}}`)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)

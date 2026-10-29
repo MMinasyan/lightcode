@@ -106,6 +106,48 @@ func isolateBundledCredentials(t *testing.T) {
 	}
 }
 
+// fixtureStore points the owner's store construction seam at the supplied
+// store: every later open in the row treats it as the owner's own constructed
+// store, disposed at the owner's storage-close point, and the seam returns to
+// the production one when the row's test ends.
+func (e *ownerEnv) fixtureStore(store harness.Storage) {
+	e.fixtureStoreClose(store, func() error { e.events.add("close:core"); return nil })
+}
+
+// fixtureStoreClose is the sibling over a scripted store closer: the row
+// controls when the storage close returns and with what error.
+func (e *ownerEnv) fixtureStoreClose(store harness.Storage, closeFn func() error) {
+	previous := openStore
+	openStore = func(ctx context.Context, dataDir string) (harness.Storage, func() error, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		return store, closeFn, nil
+	}
+	e.t.Cleanup(func() { openStore = previous })
+}
+
+// fixtureStoreFailure is the sibling: the owner's store construction fails
+// with the supplied error before any closer exists.
+func (e *ownerEnv) fixtureStoreFailure(err error) {
+	previous := openStore
+	openStore = func(ctx context.Context, dataDir string) (harness.Storage, func() error, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, err
+	}
+	e.t.Cleanup(func() { openStore = previous })
+}
+
+// fixtureJobs points the owner's jobs construction seam at the supplied
+// scripted service for every later open in the row.
+func (e *ownerEnv) fixtureJobs(service jobsService) {
+	previous := newJobs
+	newJobs = func(string) jobsService { return service }
+	e.t.Cleanup(func() { newJobs = previous })
+}
+
 func (e *ownerEnv) options(plugins ...Plugin) options {
 	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins}
 }
@@ -128,8 +170,9 @@ func (e *ownerEnv) openSwept(ctx context.Context, plugins ...Plugin) (*Runtime, 
 }
 
 // corePlugin is one Runtime-scoped plugin whose single export is declared
-// exactly as harness.Storage: the private Core binding. Its Close records the
-// disposal event only; the test retains the store itself.
+// exactly as harness.Storage: an ordinary capability export the owner never
+// consumes. Its Close records the disposal event only; the test retains the
+// store itself.
 func (e *ownerEnv) corePlugin(id, exportID string, value any, closeFn func() error) Plugin {
 	return Plugin{
 		ID:       id,
@@ -141,13 +184,6 @@ func (e *ownerEnv) corePlugin(id, exportID string, value any, closeFn func() err
 			return Instance{Values: map[string]any{exportID: value}, Close: closeFn}, nil
 		},
 	}
-}
-
-func (e *ownerEnv) storagePlugin(value any) Plugin {
-	return e.corePlugin("core", "session_store", value, func() error {
-		e.events.add("close:core")
-		return nil
-	})
 }
 
 // ordinaryPlugin provides one value capability and records its construction
@@ -294,7 +330,8 @@ func wantFailedOpen(t *testing.T, e *ownerEnv, plugins []Plugin, wantIs error) {
 // assertLockReleased proves the failed attempt released the ownership lock.
 func (e *ownerEnv) assertLockReleased(t *testing.T) {
 	t.Helper()
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	testassert.NoError(t, r.Close(context.Background()))
 }
@@ -467,8 +504,8 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 			name string
 			opts options
 		}{
-			{"empty data directory", options{ConfigPath: e.configPath, Plugins: []Plugin{e.storagePlugin(nil)}}},
-			{"empty config path", options{DataDir: e.dataDir, Plugins: []Plugin{e.storagePlugin(nil)}}},
+			{"empty data directory", options{ConfigPath: e.configPath}},
+			{"empty config path", options{DataDir: e.dataDir}},
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)
@@ -481,7 +518,8 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		e := newOwnerEnv(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()))
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(ctx)
 		testassert.Require(t, r == nil && errors.Is(err, context.Canceled), "open = (%v, %v), want (nil, context.Canceled)", r, err)
 		e.assertNoOwnershipSideEffects(t)
 	})
@@ -521,7 +559,8 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		writeServiceFile(t, configPath, ownerConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(configPath), ownerAgentsDocument)
 		e.configPath = configPath
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		{
 			_, err := os.Stat(filepath.Join(configDir, "agents.json"))
@@ -539,7 +578,8 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 
 func TestRuntimeOwnershipLockIsExclusive(t *testing.T) {
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	// A contender with its own configuration override still targets the same
 	// owner root: identity is the normalized data directory.
@@ -553,7 +593,8 @@ func TestRuntimeOwnershipLockIsExclusive(t *testing.T) {
 		t.Fatalf("contender factory events = %v, want no factory invoked while losing ownership", rival.events.all())
 	}
 	testassert.NoError(t, r.Close(context.Background()))
-	again, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	again, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	testassert.NoError(t, again.Close(context.Background()))
 }
@@ -656,14 +697,16 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		e := newOwnerEnv(t)
 		duplicateA := e.ordinaryPlugin("same", ScopeRuntime, "a.cap")
 		duplicateB := e.ordinaryPlugin("same", ScopeRuntime, "b.cap")
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), duplicateA, duplicateB}, ErrComposition)
+		e.fixtureStore(storage.NewMemory())
+		wantFailedOpen(t, e, []Plugin{duplicateA, duplicateB}, ErrComposition)
 		e.assertNoOwnershipSideEffects(t)
 	})
 
 	t.Run("configuration failure releases the lock with no factory", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, `{not json`)
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory())}, ErrConfiguration)
+		e.fixtureStore(storage.NewMemory())
+		wantFailedOpen(t, e, nil, ErrConfiguration)
 		{
 			events := e.events.all()
 			testassert.Require(t, len(events) == 0, "factory events = %v, want the configuration rejection to precede any factory", events)
@@ -679,28 +722,26 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 			e.events.add("open:failing")
 			return Instance{}, errFactory
 		}
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), e.ordinaryPlugin("first", ScopeRuntime, "first.cap"), failing}, errFactory)
+		e.fixtureStore(storage.NewMemory())
+		e.fixtureJobs(&stubStopper{events: e.events})
+		wantFailedOpen(t, e, []Plugin{e.ordinaryPlugin("first", ScopeRuntime, "first.cap"), failing}, errFactory)
+		// Reverse acquisition order: the constructed scope's instances, then the
+		// jobs work group joining, then the store closing; the failing factory
+		// disposed nothing, and the ownership lock — which carries no event —
+		// releases last, proven by the re-acquisition below.
 		events := eventNames(e.events.all())
-		testassert.Require(t, orderedSubset(events, "close:first") && !slices.Contains(events, "close:failing"), "factory events = %v, want only the constructed prefix disposed", events)
+		testassert.Require(t, orderedSubset(events, "close:first", "close:jobs", "close:core") && !slices.Contains(events, "close:failing"), "factory events = %v, want the scope disposed, then the jobs group joined, then the store closed, and never the failing factory", events)
 		e.assertLockReleased(t)
 	})
 
-	t.Run("untyped-nil Core storage rolls back through its closer", func(t *testing.T) {
+	t.Run("store construction failure unwinds the acquired resources", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(nil)}, ErrComposition)
+		errStore := errors.New("fixture store construction failure")
+		e.fixtureStoreFailure(errStore)
+		wantFailedOpen(t, e, nil, errStore)
 		{
 			events := eventNames(e.events.all())
-			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the invalid instance disposed", events)
-		}
-		e.assertLockReleased(t)
-	})
-
-	t.Run("typed-nil Core storage rolls back through its closer", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin((*nilStorage)(nil))}, ErrComposition)
-		{
-			events := eventNames(e.events.all())
-			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the invalid instance disposed", events)
+			testassert.Require(t, !slices.Contains(events, "close:core"), "factory events = %v, want no storage disposal for a store that never constructed", events)
 		}
 		e.assertLockReleased(t)
 	})
@@ -709,7 +750,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		e := newOwnerEnv(t)
 		errRecover := errors.New("test recovery failure")
 		store := &failingListStore{Storage: storage.NewMemory(), err: errRecover}
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(store)}, errRecover)
+		e.fixtureStore(store)
+		wantFailedOpen(t, e, nil, errRecover)
 		{
 			events := eventNames(e.events.all())
 			testassert.Require(t, slices.Contains(events, "close:core"), "factory events = %v, want the constructed Runtime scope disposed", events)
@@ -741,7 +783,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 			<-arrive
 			cancel()
 		}()
-		r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()), first, second)
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(ctx, first, second)
 		if r != nil {
 			cancel()
 			t.Fatalf("canceled construction returned a non-nil Runtime (%v)", err)
@@ -772,7 +815,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()), gate)
+			e.fixtureStore(storage.NewMemory())
+			r, err := e.open(ctx, gate)
 			done <- outcome{r, err}
 		}()
 		<-arrive
@@ -798,7 +842,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 		gate.ValidateConfig = func(json.RawMessage) error { return ErrClosed }
-		wantFailedOpen(t, e, []Plugin{e.storagePlugin(storage.NewMemory()), gate}, ErrClosed)
+		e.fixtureStore(storage.NewMemory())
+		wantFailedOpen(t, e, []Plugin{gate}, ErrClosed)
 		{
 			events := e.events.all()
 			testassert.Require(t, len(events) == 0, "factory events = %v, want the validator rejection preserved before any factory", events)
@@ -823,7 +868,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			r, err := e.open(ctx, e.storagePlugin(storage.NewMemory()), gate)
+			e.fixtureStore(storage.NewMemory())
+			r, err := e.open(ctx, gate)
 			done <- outcome{r, err}
 		}()
 		<-arrive
@@ -850,7 +896,7 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		errXClose := errors.New("test scope close failure")
 		blockClose := make(chan struct{})
 		entered := make(chan struct{}, 1)
-		storagePlugin := e.corePlugin("core", "session_store", store, func() error {
+		e.fixtureStoreClose(store, func() error {
 			select {
 			case entered <- struct{}{}:
 			default:
@@ -873,11 +919,11 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		}
 		w := e.ordinaryPlugin("w", ScopeWorkspace, "w.cap")
 
-		r, err := e.open(context.Background(), storagePlugin, y, x, w)
+		r, err := e.open(context.Background(), y, x, w)
 		testassert.NoError(t, err)
 		{
 			events := eventNames(e.events.all())
-			testassert.Require(t, orderedSubset(events, "open:core", "open:x", "open:y"), "factory events = %v, want dependencies constructed before consumers in stable topological order", events)
+			testassert.Require(t, orderedSubset(events, "open:x", "open:y"), "factory events = %v, want dependencies constructed before consumers in stable topological order", events)
 		}
 		{
 			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"})
@@ -900,7 +946,7 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 			err := r.Close(canceledCtx)
 			testassert.Require(t, errors.Is(err, context.Canceled), "canceled Close waiter = %v, want its own context error while the shared cleanup continues", err)
 		}
-		if got, err := e.open(context.Background(), e.corePlugin("contender", "session_store", storage.NewMemory(), nil)); err == nil || !errors.Is(err, ErrOwned) {
+		if got, err := e.open(context.Background()); err == nil || !errors.Is(err, ErrOwned) {
 			close(blockClose)
 			t.Fatalf("contender open during blocked disposal = (%v, %v), want the lock held until every required close has run", got, err)
 		}
@@ -945,7 +991,8 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		t.Run("two reloads publish successive revisions", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			r, err := e.open(context.Background(), e.storagePlugin(store))
+			e.fixtureStore(store)
+			r, err := e.open(context.Background())
 			testassert.NoError(t, err)
 			defer func() {
 				{
@@ -977,7 +1024,8 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
-			r, err := e.open(context.Background(), e.storagePlugin(store), gate)
+			e.fixtureStore(store)
+			r, err := e.open(context.Background(), gate)
 			testassert.NoError(t, err)
 			defer func() {
 				{
@@ -1012,7 +1060,8 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
 			gate.ValidateConfig = validator.ValidateConfig
-			r, err := e.open(context.Background(), e.storagePlugin(store), gate)
+			e.fixtureStore(store)
+			r, err := e.open(context.Background(), gate)
 			testassert.NoError(t, err)
 			arrive := validator.arm()
 			reloadDone := make(chan error, 1)
@@ -1051,7 +1100,8 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		t.Run("a canceled request leaves the owner and other work intact", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			r, err := e.open(context.Background(), e.storagePlugin(store))
+			e.fixtureStore(store)
+			r, err := e.open(context.Background())
 			testassert.NoError(t, err)
 			{
 				_, err := r.createSession(context.Background(), e.dataDir, "solo")
@@ -1086,7 +1136,8 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 
 		t.Run("a canceled Runtime context rejects entry before the cancellation watcher runs", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			r, err := e.open(context.Background(), e.storagePlugin(store))
+			e.fixtureStore(store)
+			r, err := e.open(context.Background())
 			testassert.NoError(t, err)
 			// The exact post-cancellation pre-watcher state: the owned work
 			// context is done while no closure has begun.
@@ -1137,14 +1188,16 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			default:
 				t.Fatal("the watcher-started shutdown disposed no plugin")
 			}
-			again, err := e.open(context.Background(), e.storagePlugin(store))
+			e.fixtureStore(store)
+			again, err := e.open(context.Background())
 			testassert.NoError(t, err)
 			testassert.NoError(t, again.Close(context.Background()))
 		})
 
 		t.Run("closed access rejects and repeated Close joins the same result", func(t *testing.T) {
 			e := newOwnerEnv(t)
-			r, err := e.open(context.Background(), e.storagePlugin(store))
+			e.fixtureStore(store)
+			r, err := e.open(context.Background())
 			testassert.NoError(t, err)
 			testassert.NoError(t, r.Close(context.Background()))
 			{
@@ -1176,7 +1229,8 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 func TestRuntimePublishOwnerBarrier(t *testing.T) {
 	t.Run("observed cancellation unwinds and reports the context error", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -1191,7 +1245,8 @@ func TestRuntimePublishOwnerBarrier(t *testing.T) {
 
 	t.Run("publication wins while cancellation starts shutdown behind it", func(t *testing.T) {
 		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		got, err := r.publishOwner(context.Background())
 		testassert.Require(t, got == r && err == nil, "publishOwner = (%v, %v), want the same completed owner", got, err)
@@ -1206,7 +1261,8 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 		e := newOwnerEnv(t)
 		opens := make(chan int64, 16)
 		ws := e.countedPlugin("ws", ScopeWorkspace, "ws.cap", opens)
-		r, err := e.open(context.Background(), e.storagePlugin(store), ws)
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(), ws)
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -1295,55 +1351,226 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 	})
 }
 
-// --- Core storage binding contract ---
+// --- the directly constructed baseline services ---
 
-func TestRuntimeCoreStorageBindingContract(t *testing.T) {
-	t.Run("invalid canonical storage declarations reject before any factory", func(t *testing.T) {
-		cases := []struct {
-			name    string
-			plugins func(e *ownerEnv) []Plugin
-		}{
-			{"missing", func(e *ownerEnv) []Plugin { return []Plugin{e.ordinaryPlugin("plain", ScopeRuntime, "plain.cap")} }},
-			{"duplicate plugins", func(e *ownerEnv) []Plugin {
-				return []Plugin{e.storagePlugin(storage.NewMemory()), e.storagePlugin(storage.NewMemory())}
-			}},
-			{"duplicate exports", func(e *ownerEnv) []Plugin {
-				plugin := e.storagePlugin(storage.NewMemory())
-				plugin.Provides = append(plugin.Provides, Spec[harness.Storage]("second_store"))
-				return []Plugin{plugin}
-			}},
-			{"wrong scope", func(e *ownerEnv) []Plugin {
-				plugin := e.storagePlugin(storage.NewMemory())
-				plugin.Scope = ScopeWorkspace
-				return []Plugin{plugin}
-			}},
-			{"required as an ordinary dependency", func(e *ownerEnv) []Plugin {
-				return []Plugin{
-					e.storagePlugin(storage.NewMemory()),
-					e.ordinaryPlugin("needs", ScopeRuntime, "needs.cap", Spec[harness.Storage]("session_store")),
-				}
-			}},
+// TestRuntimeBaselineServicesAreDirectlyConstructed proves the store and jobs
+// services have no declaration side: the owner composes its own store over the
+// data root and binds its own jobs service even when a plugin exports the
+// same shapes, and the one export identity the composition rejects is a
+// standard tool name.
+func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
+	t.Run("storage and job-stop exports are ordinary capabilities", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		exported := &countingStore{Storage: storage.NewMemory()}
+		shadow := &stubStopper{}
+		r, err := e.open(context.Background(),
+			e.corePlugin("core", "session_store", exported, nil),
+			e.corePlugin("core.second", "second_store", exported, nil),
+			jobStopperExportPlugin("shadow", shadow),
+		)
+		testassert.NoError(t, err)
+		spawned := false
+		session, err := r.createSession(context.Background(), filepath.Join(e.home, "baseline-ws"), "solo")
+		testassert.NoError(t, err)
+		var completionID string
+		err = startJobThrough(r, session.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
+			spawned = true
+			completionID = id
+			return nil
+		})
+		testassert.NoError(t, err)
+		testassert.Require(t, spawned, "the job never started through the constructed service")
+		// The exports are ordinary capabilities: the job-stop export never
+		// becomes the owner's constructed stopper, so the constructed service
+		// knows nothing of this raw member and its terminal report is owed
+		// directly before shutdown converges.
+		testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			return h.DeliverBackgroundCompletion(ctx, session.Identity.SessionID, completionID, "job finished")
+		}))
+		testassert.NoError(t, r.Close(context.Background()))
+		{
+			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			testassert.Require(t, err == nil, "the owner never composed its own store at the data root: %v", err)
 		}
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				e := newOwnerEnv(t)
-				wantFailedOpen(t, e, tc.plugins(e), ErrComposition)
-				e.assertNoOwnershipSideEffects(t)
-			})
-		}
+		testassert.Equal(t, exported.listCount(), 0)
 	})
 
-	t.Run("names neither grant nor hide canonical authority", func(t *testing.T) {
+	t.Run("recovery runs on the constructed store", func(t *testing.T) {
 		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 			e := newOwnerEnv(t)
 			canonical := &countingStore{Storage: store}
 			named := e.ordinaryPlugin("storage", ScopeRuntime, "storage")
-			plugin := e.corePlugin("state", "whatever", canonical, func() error { e.events.add("close:state"); return nil })
-			r, err := e.open(context.Background(), plugin, named)
+			e.fixtureStore(canonical)
+			r, err := e.open(context.Background(), named)
 			testassert.NoError(t, err)
 			testassert.NoError(t, r.Close(context.Background()))
-			testassert.Require(t, canonical.listCount() != 0, "recovery never used the type-identified Core binding")
+			testassert.Require(t, canonical.listCount() != 0, "recovery never used the constructed store")
 		})
+	})
+
+	t.Run("a standard tool name is the rejected export identity", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		shadow := Plugin{
+			ID:    "shadow",
+			Scope: ScopeRuntime,
+			Provides: []CapabilitySpec{ToolSpec("write_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+				return ToolDescription{}, nil
+			})},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"write_file": nil}}, nil
+			},
+		}
+		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+}
+
+// TestRuntimeStandardToolsAreOwnerProvidedCapabilities proves the one
+// capability and binding path for the directly constructed baseline tools: the
+// owner installs them in the Runtime scope's bindings before any optional
+// factory runs, a plugin at every shorter lifetime binds the actual value
+// through Bind and can run it, and the nearest forbidden siblings — a duplicate
+// export, a wrongly typed dependency — reject before any factory dispatches.
+func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
+	t.Run("the owner's Runtime factory binds the actual read_file value", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		workspace := filepath.Join(e.home, "owner-tool-ws")
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "held.txt"), []byte("owner provided\n"), 0o600))
+		var bound Tool
+		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[Tool]("read_file"))
+		consumer.Open = func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+			tool, err := Bind[Tool](deps, "read_file")
+			if err != nil {
+				return Instance{}, err
+			}
+			bound = tool
+			e.events.add("open:consumer")
+			return Instance{Values: map[string]any{"consumer.cap": "consumer"}}, nil
+		}
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background(), consumer)
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(context.Background()))
+		testassert.Require(t, bound != nil, "the Runtime factory never bound the owner-provided read_file value")
+		// The bound value is the owner's real tool: it reads one Workspace
+		// file through its own preparation and execution.
+		tc := ToolContext{
+			Workspace:     workspace,
+			AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
+		}
+		arguments, err := bound.Normalize(tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"held.txt"}`)})
+		testassert.NoError(t, err)
+		prepared := bound.Prepare(context.Background(), tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: arguments})
+		testassert.Require(t, prepared.Execute != nil, "prepared tool = %+v, want an executable plan", prepared)
+		outcome := prepared.Execute(context.Background())
+		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "owner provided"), "bound tool read = %+v, want the file content", outcome.Result)
+	})
+
+	t.Run("Workspace, Operation and Agent consumers bind the owner-provided value", func(t *testing.T) {
+		var bound []string
+		consumer := func(id string, kind ScopeKind) Plugin {
+			return Plugin{
+				ID:       id,
+				Scope:    kind,
+				Provides: []CapabilitySpec{Spec[any](id + ".cap")},
+				Requires: []CapabilitySpec{Spec[Tool]("read_file")},
+				Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+					tool, err := Bind[Tool](deps, "read_file")
+					if err != nil {
+						return Instance{}, err
+					}
+					if tool == nil {
+						return Instance{}, errors.New("the standard tool binding supplied no value")
+					}
+					bound = append(bound, string(kind))
+					return Instance{Values: map[string]any{id + ".cap": id}}, nil
+				},
+			}
+		}
+		c := mustComposition(t,
+			consumer("rt", ScopeRuntime),
+			consumer("ws", ScopeWorkspace),
+			consumer("op", ScopeOperation),
+			consumer("ag", ScopeAgent))
+		c.standardValues = newStandardTools(t.TempDir(), &fakeJobs{})
+		rt := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
+		ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/one"), []*scope{rt})
+		op := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws})
+		ag := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeAgent, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws, op})
+		for _, sc := range []*scope{rt, ws, op, ag} {
+			defer func() { _ = sc.close() }()
+		}
+		testassert.Require(t, slices.Equal(bound, []string{"runtime", "workspace", "operation", "agent"}), "standard tool bindings = %q, want every lifetime's factory to receive the owner-provided value", bound)
+	})
+
+	t.Run("a wrongly typed dependency on a standard tool rejects before any factory", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[greeter]("read_file"))
+		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+
+	t.Run("a duplicate export of a standard tool rejects before any factory", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		shadow := Plugin{
+			ID:    "shadow",
+			Scope: ScopeRuntime,
+			Provides: []CapabilitySpec{ToolSpec("read_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+				return ToolDescription{Definition: model.ToolDefinition{Name: "read_file", Parameters: json.RawMessage(`{}`)}}, nil
+			})},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"read_file": readTool{}}}, nil
+			},
+		}
+		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+}
+
+// TestRuntimeSettingsSectionsHaveOneOwner proves the settings-owner collision:
+// an optional Plugin claiming one of the baseline services' own section IDs
+// rejects during composition before its validator or factory runs, while an
+// unrelated plugin keeps its own settings owner beside the usable baseline
+// sections.
+func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
+	t.Run("a plugin claiming the tools section collides", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		claimed := e.ordinaryPlugin("tools", ScopeRuntime, "tools.cap") // the nil validator is the permissive case
+		wantFailedOpen(t, e, []Plugin{claimed}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+
+	t.Run("a plugin claiming the jobs section collides", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		validated := 0
+		claimed := e.ordinaryPlugin("jobs", ScopeRuntime, "jobs.cap")
+		claimed.ValidateConfig = func(json.RawMessage) error {
+			validated++
+			return nil
+		}
+		_, err := e.open(context.Background(), claimed)
+		testassert.Require(t, errors.Is(err, ErrComposition), "open with a plugin owning the jobs section = %v, want the composition collision", err)
+		testassert.Require(t, validated == 0 && len(e.events.all()) == 0, "validator ran %d times with events %v, want the collision to precede validation and construction", validated, e.events.all())
+		e.assertNoOwnershipSideEffects(t)
+	})
+
+	t.Run("an unrelated plugin keeps its own settings owner", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+
+			`,"plugins":{"capowner":{"kept":1},"tools":{"read_max_lines":7},"jobs":{"max_background_processes":3}}}`)
+		var received json.RawMessage
+		own := e.ordinaryPlugin("capowner", ScopeRuntime, "capowner.cap")
+		own.ValidateConfig = func(raw json.RawMessage) error {
+			received = raw
+			return nil
+		}
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background(), own)
+		testassert.NoError(t, err)
+		defer func() { testassert.NoError(t, r.Close(context.Background())) }()
+		testassert.Equal(t, string(received), `{"kept":1}`)
+		testassert.Require(t, slices.Contains(e.events.all(), "open:capowner"), "events = %v, want the unrelated plugin's factory to open", e.events.all())
 	})
 }
 
@@ -1393,8 +1620,8 @@ func TestRuntimeRecoveryRepairsBeforeExecution(t *testing.T) {
 		e := newOwnerEnv(t)
 		sessionID, operationID := seedRunningOperation(t, store, filepath.Join(e.home, "seeded"))
 		var opOpens, agOpens atomic.Int64
+		e.fixtureStore(&countingStore{Storage: store})
 		r, err := e.open(context.Background(),
-			e.storagePlugin(&countingStore{Storage: store}),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
@@ -1447,9 +1674,9 @@ func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *test
 
 		var opOpens, agOpens atomic.Int64
 		stopper := &stubStopper{events: e.events}
+		e.fixtureStore(store)
+		e.fixtureJobs(stopper)
 		r, err := e.open(ctx,
-			e.storagePlugin(store),
-			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
@@ -1499,9 +1726,9 @@ func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *test
 
 		// A repeated recovery over the same durable state changes nothing.
 		requestsBefore := e.server.requests()
-		again, err := e.open(ctx,
-			e.storagePlugin(store),
-			jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
+		e.fixtureStore(store)
+		e.fixtureJobs(stopper)
+		again, err := e.open(ctx)
 		testassert.NoError(t, err)
 		testassert.Equal(t, e.server.requests(), requestsBefore)
 		testassert.Equal(t, eventsNamed(e.events.all(), "stopjob"), 0)

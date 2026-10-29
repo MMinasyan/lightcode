@@ -1,16 +1,14 @@
-// Package jobs declares the background jobs capability: reservation-native
-// job identities, per-Session attribution over real background processes,
-// bounded output capture under the session artifact tree, per-Session limits,
-// and kill escalation with a total StopJob over every state. It is an
-// ordinary Runtime-scoped composition unit providing two declared views of
-// one instance — the Jobs contract for tool-facing calls and the Harness
-// job-stop seam at its lowest consumer — with no additional Runtime
-// authority and no legacy process-manager wrapper.
+// Package jobs is the background-jobs service the Runtime owner constructs
+// directly: reservation-native job identities, per-Session attribution over
+// real background processes, bounded output capture under the session artifact
+// tree, per-Session limits, and kill escalation with a total StopJob over
+// every state. It carries no composition-plugin authority: the owner supplies
+// the data root, consumes the Jobs contract for tool-facing calls, and hands
+// the same instance to the Harness as the job-stop seam.
 package jobs
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -26,10 +24,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/cmdoutput"
-	"github.com/MMinasyan/lightcode/runtime"
 )
-
-const pluginID = "jobs"
 
 // Exit reasons: first reason wins, recorded by whichever of the timeout or
 // kill paths gets there before the exit goroutine settles the real result.
@@ -74,8 +69,9 @@ type StartRequest struct {
 }
 
 // Jobs is the capability contract: a reservation-native identity mint,
-// per-Session start/read/kill/list/live over background processes, and the
-// total StopJob (also exported separately as the Harness job-stop seam).
+// per-Session start/read/kill/list/live over background processes, and
+// Abort's reservation release. The concrete Manager's StopJob is the Harness
+// job-stop seam.
 type Jobs interface {
 	Reserve() (string, error)     // mint an 8-hex job ID (crypto/rand, the newProcessID shape) and register it reserved
 	Abort(jobID string)           // resolve a reservation that will not start; idempotent
@@ -86,7 +82,7 @@ type Jobs interface {
 	Live(sessionID string) []string // the session's running job IDs, sorted
 }
 
-// settings is the plugin's private configuration, decoded with json.Unmarshal
+// settings is the service's private configuration, decoded with json.Unmarshal
 // from the plugins.jobs section. Nil input and missing or null-valued members
 // keep the defaults; unknown members are ignored; every consumed field is
 // range-checked against the retained bounds.
@@ -118,6 +114,33 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 		return settings{}, errors.New("jobs: read_line_max_chars must be between 100 and 100000")
 	}
 	return s, nil
+}
+
+// ValidateSettings validates one captured plugins.jobs section on top of the
+// defaults; the Runtime publisher calls it directly for every publication.
+func ValidateSettings(raw json.RawMessage) error {
+	_, err := decodeSettings(raw)
+	return err
+}
+
+// Manager is one constructed jobs service: the owner data root, the job map,
+// the closed flag, and the work group covering every exit/timeout goroutine
+// (and therefore every admitted callback and all capture/record cleanup).
+type Manager struct {
+	mu      sync.Mutex
+	jobs    map[string]*jobRecord
+	closed  bool
+	wg      sync.WaitGroup
+	dataDir string
+}
+
+var _ Jobs = (*Manager)(nil)
+var _ harness.JobStopper = (*Manager)(nil)
+
+// New constructs one Manager rooted at the owner data directory the session
+// output directories derive from. Close is the service disposal.
+func New(dataDir string) *Manager {
+	return &Manager{jobs: make(map[string]*jobRecord), dataDir: dataDir}
 }
 
 // jobRecord is one job's state. Immutable fields (id, command, capture,
@@ -167,20 +190,6 @@ func (r *jobRecord) claimKilledLocked() {
 	}
 }
 
-// instance is one Open's constructed state: the owner data root, the job map,
-// the closed flag, and the work group covering every exit/timeout goroutine
-// (and therefore every admitted callback and all capture/record cleanup).
-type instance struct {
-	mu      sync.Mutex
-	jobs    map[string]*jobRecord
-	closed  bool
-	wg      sync.WaitGroup
-	dataDir string
-}
-
-var _ Jobs = (*instance)(nil)
-var _ harness.JobStopper = (*instance)(nil)
-
 // waitCommand is the one cmd.Wait seam for background jobs: the Wait-returned
 // point of every job's exit goroutine routes through it, so tests drive the
 // reaping boundary deterministically. It is nil-free in production and simply
@@ -188,7 +197,7 @@ var _ harness.JobStopper = (*instance)(nil)
 var waitCommand = func(cmd *exec.Cmd) error { return cmd.Wait() }
 
 // Reserve mints an 8-hex job identity and registers it reserved.
-func (j *instance) Reserve() (string, error) {
+func (j *Manager) Reserve() (string, error) {
 	id, err := newJobID()
 	if err != nil {
 		return "", err
@@ -204,7 +213,7 @@ func (j *instance) Reserve() (string, error) {
 
 // Abort removes a reservation that will not start; it is idempotent and a
 // no-op over running, exited, or absent records.
-func (j *instance) Abort(jobID string) {
+func (j *Manager) Abort(jobID string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	rec, ok := j.jobs[jobID]
@@ -227,7 +236,7 @@ func (j *instance) Abort(jobID string) {
 // the running registration, so a child is either registered before a close or
 // never starts after it. The process is not cancellable through its start: only
 // its timeout or an explicit stop ends it.
-func (j *instance) Start(req StartRequest) error {
+func (j *Manager) Start(req StartRequest) error {
 	j.mu.Lock()
 	if j.closed {
 		j.mu.Unlock()
@@ -315,7 +324,7 @@ func (j *instance) Start(req StartRequest) error {
 // invokes it outside the capability mutex with the formatted output, then
 // removes the record and closes the capture before the work-group Done. Nil
 // callbacks skip invocation but not cleanup.
-func (j *instance) exitLoop(rec *jobRecord, cmd *exec.Cmd, capture *cmdoutput.Capture) {
+func (j *Manager) exitLoop(rec *jobRecord, cmd *exec.Cmd, capture *cmdoutput.Capture) {
 	defer j.wg.Done()
 	waitErr := waitCommand(cmd)
 
@@ -369,7 +378,7 @@ func (j *instance) exitLoop(rec *jobRecord, cmd *exec.Cmd, capture *cmdoutput.Ca
 // timeoutLoop retains the timer/SIGTERM/500ms/SIGKILL escalation: once the
 // timer fires and the first-reason claim succeeds, the process group is
 // converged; the exit goroutine's reaped notification ends the wait.
-func (j *instance) timeoutLoop(rec *jobRecord, cmd *exec.Cmd, timeoutSec int) {
+func (j *Manager) timeoutLoop(rec *jobRecord, cmd *exec.Cmd, timeoutSec int) {
 	defer j.wg.Done()
 	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 	defer timer.Stop()
@@ -390,7 +399,7 @@ func (j *instance) timeoutLoop(rec *jobRecord, cmd *exec.Cmd, timeoutSec int) {
 // Read returns the retained output text for one owned record: unknown-ID for
 // absent or foreign identities (reservations are invisible), the retained
 // empty placeholder for a silent capture, and the bounded format otherwise.
-func (j *instance) Read(sessionID, jobID string) (string, error) {
+func (j *Manager) Read(sessionID, jobID string) (string, error) {
 	j.mu.Lock()
 	rec, ok := j.jobs[jobID]
 	j.mu.Unlock()
@@ -415,7 +424,7 @@ func (j *instance) Read(sessionID, jobID string) (string, error) {
 // nil (termination, not reaping, is Kill's contract), and a running job gets
 // the group SIGTERM/500ms/SIGKILL escalation with the legacy 5-second
 // diagnose-and-abandon outcome returning nil.
-func (j *instance) Kill(sessionID, jobID string) error {
+func (j *Manager) Kill(sessionID, jobID string) error {
 	j.mu.Lock()
 	rec, ok := j.jobs[jobID]
 	j.mu.Unlock()
@@ -459,7 +468,7 @@ func (j *instance) Kill(sessionID, jobID string) error {
 // (Start and StopJob stay serialized), returning once the child is reaped;
 // the ordinary exit callback then delivers the stopped result. Exited,
 // absent, or foreign identities return.
-func (j *instance) StopJob(sessionID, jobID string) {
+func (j *Manager) StopJob(sessionID, jobID string) {
 	j.mu.Lock()
 	rec, ok := j.jobs[jobID]
 	if !ok {
@@ -505,7 +514,7 @@ func reapGroup(pid int, done <-chan struct{}) {
 // List returns one line per started record of the session (reservations are
 // invisible; unspecified order), with the retained running and exited suffix
 // formats, the trailing newline stripped, and the retained empty text.
-func (j *instance) List(sessionID string) string {
+func (j *Manager) List(sessionID string) string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	var result string
@@ -535,7 +544,7 @@ func (j *instance) List(sessionID string) string {
 
 // Live returns the session's running job IDs, sorted; reservations and exited
 // records are excluded.
-func (j *instance) Live(sessionID string) []string {
+func (j *Manager) Live(sessionID string) []string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	ids := make([]string, 0, len(j.jobs))
@@ -559,7 +568,7 @@ func (j *instance) Live(sessionID string) []string {
 // callbacks, timeout goroutines, and all capture/record cleanup included),
 // and finally removing the leftover reservations. Callbacks execute outside
 // the mutex.
-func (j *instance) Close() error {
+func (j *Manager) Close() error {
 	type runningJob struct {
 		pid  int
 		done <-chan struct{}
@@ -593,47 +602,6 @@ func (j *instance) Close() error {
 	}
 	j.mu.Unlock()
 	return nil
-}
-
-// Plugin returns the Runtime-scoped plugin providing the two declared views
-// of one jobs instance: Spec[Jobs]("jobs") for tool-facing calls and
-// Spec[harness.JobStopper]("job-stopper") for the Harness consumer. It has
-// no dependencies. ValidateConfig validates the owned plugins.jobs section;
-// Open captures the owner data root the session output directories derive
-// from, and the instance's Close is the scope disposal.
-func Plugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:    pluginID,
-		Scope: runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{
-			runtime.Spec[Jobs]("jobs"),
-			runtime.Spec[harness.JobStopper]("job-stopper"),
-		},
-		ValidateConfig: func(raw json.RawMessage) error {
-			_, err := decodeSettings(raw)
-			return err
-		},
-		Open: open,
-	}
-}
-
-// open checks the scope context and captures the scope identity's owner data
-// root; one instance backs both declared views.
-func open(ctx context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
-	if err := ctx.Err(); err != nil {
-		return runtime.Instance{}, err
-	}
-	inst := &instance{
-		jobs:    make(map[string]*jobRecord),
-		dataDir: info.DataDir,
-	}
-	return runtime.Instance{
-		Values: map[string]any{
-			"jobs":        Jobs(inst),
-			"job-stopper": harness.JobStopper(inst),
-		},
-		Close: inst.Close,
-	}, nil
 }
 
 func newJobID() (string, error) {

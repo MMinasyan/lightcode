@@ -28,7 +28,8 @@ func TestObservationPausedFactEmitsCurrentRevision(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		e := newOwnerEnv(t)
-		r, err := e.open(ctx, e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(ctx)
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -430,7 +431,8 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 				},
 			}
 		}
-		r, err := e.open(ctx, e.storagePlugin(store), reporterPlugin("alpha"), reporterPlugin("beta"))
+		e.fixtureStore(store)
+		r, err := e.open(ctx, reporterPlugin("alpha"), reporterPlugin("beta"))
 		testassert.NoError(t, err)
 		defer func() {
 			{

@@ -15,11 +15,6 @@ type Adaptation struct {
 	// ExcludeTools lists registered tool names hidden from this model.
 	ExcludeTools []string
 
-	// IncludeTools lists registered tool names surfaced to this model,
-	// including tools hidden from the baseline advertisement. An include of a
-	// name that is not registered is a silent no-op.
-	IncludeTools []string
-
 	// Blocks are coaching paragraphs appended to the system prompt after the
 	// built-in sections and before user rules.
 	Blocks []string
@@ -31,7 +26,10 @@ type Adaptation struct {
 	// entries mean no addition for that section.
 	Additions map[string]string
 
-	// ToolDescriptionReplacements overrides default placeholder replacements
-	// applied to model-facing tool descriptions.
+	// ToolDescriptionReplacements rewrites the model-facing tool description
+	// text: inside each line, every occurrence of each key is replaced by its
+	// value, and a key naming a whole line with an empty value removes that
+	// line. The rules are text-only — the same input line gets the same
+	// transformation whichever tool carries it.
 	ToolDescriptionReplacements map[string]string
 }

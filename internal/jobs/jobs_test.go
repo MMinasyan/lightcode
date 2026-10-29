@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 // unknownIDText is the retained unknown-ID error for one job identity.
@@ -25,29 +23,28 @@ func unknownIDText(id string) string {
 
 var jobIDShape = regexp.MustCompile(`^[0-9a-f]{8}$`)
 
-// openJobs opens the real plugin over a fresh data root, asserts the two-view
-// declaration, and registers the instance's Close with the test.
-func openJobs(t *testing.T, dataDir string) *instance {
+// openJobs opens one real jobs service over a fresh data root and registers
+// its Close — which joins the monitor and callback work — with the test.
+func openJobs(t *testing.T, dataDir string) *Manager {
 	t.Helper()
-	p := Plugin()
-	testassert.Require(t, p.ID == "jobs" && p.Scope == runtime.ScopeRuntime && p.ValidateConfig != nil && p.Open != nil && len(p.Requires) == 0 && len(p.Provides) == 2, "plugin declaration = %+v, want the Runtime-scoped jobs plugin with a validator and no dependencies; got %v, want %v", p, len(p.Provides), 2)
-	inst, err := p.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: dataDir}, runtime.Bindings{})
-	testassert.NoError(t, err)
-	testassert.Require(t, inst.Close != nil && len(inst.Values) == 2, "instance = %d exports with a nil Close %v, want exactly the two views and a closer", len(inst.Values), inst.Close == nil)
-	jobsView, ok := inst.Values["jobs"].(Jobs)
-	testassert.Require(t, ok, "jobs export supplies %T, not a Jobs", inst.Values["jobs"])
-	stopper, ok := inst.Values["job-stopper"].(interface{ StopJob(string, string) })
-	testassert.Require(t, ok, "job-stopper export supplies %T, not a job stopper", inst.Values["job-stopper"])
-	core := jobsView.(*instance)
-	testassert.Require(t, stopper.(*instance) == core, "the two declared views do not share one instance")
-	t.Cleanup(func() { _ = inst.Close() })
-	return core
+	manager := New(dataDir)
+	t.Cleanup(func() { _ = manager.Close() })
+	return manager
+}
+
+// TestManagerSatisfiesTheOwnerSeams proves the one construction supplies both
+// consumers: the tools' jobs contract and the Harness job-stop seam.
+func TestManagerSatisfiesTheOwnerSeams(t *testing.T) {
+	var jobsValue any = New(t.TempDir())
+	_, isJobs := jobsValue.(Jobs)
+	_, isStopper := jobsValue.(interface{ StopJob(string, string) })
+	testassert.Require(t, isJobs && isStopper, "Manager implements Jobs=%v job stopper=%v, want both", isJobs, isStopper)
 }
 
 // armTestReaper replaces the wait seam with one parked until the returned
-// release function runs. Cleanup releases the barrier, closes the instance so
+// release function runs. Cleanup releases the barrier, closes the service so
 // every reaper goroutine leaves the seam, and only then restores the seam.
-func armTestReaper(t *testing.T, inst *instance) (release func()) {
+func armTestReaper(t *testing.T, inst *Manager) (release func()) {
 	t.Helper()
 	orig := waitCommand
 	gate := make(chan struct{})
@@ -66,7 +63,7 @@ func armTestReaper(t *testing.T, inst *instance) (release func()) {
 }
 
 // start runs one reserved start, failing the test on error.
-func start(t *testing.T, j *instance, req StartRequest) string {
+func start(t *testing.T, j *Manager, req StartRequest) string {
 	t.Helper()
 	{
 		err := j.Start(req)
@@ -76,7 +73,7 @@ func start(t *testing.T, j *instance, req StartRequest) string {
 }
 
 // reserveStart reserves one identity and starts it.
-func reserveStart(t *testing.T, j *instance, req StartRequest) string {
+func reserveStart(t *testing.T, j *Manager, req StartRequest) string {
 	t.Helper()
 	id, err := j.Reserve()
 	testassert.NoError(t, err)
@@ -98,7 +95,7 @@ func waitExit(t *testing.T, ch <-chan ExitResult) ExitResult {
 
 // waitRemoved polls until the identified record leaves the map, which the exit
 // goroutine does after the callback and before its work-group Done.
-func waitRemoved(t *testing.T, j *instance, id string) {
+func waitRemoved(t *testing.T, j *Manager, id string) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -114,7 +111,7 @@ func waitRemoved(t *testing.T, j *instance, id string) {
 }
 
 // stateOf reads one record's lifecycle state.
-func stateOf(j *instance, id string) (jobState, bool) {
+func stateOf(j *Manager, id string) (jobState, bool) {
 	j.mu.Lock()
 	rec, ok := j.jobs[id]
 	j.mu.Unlock()
@@ -416,9 +413,9 @@ func TestStartRejectedAtSessionLimit(t *testing.T) {
 // failures name the jobs field and range, and malformed JSON, non-object
 // input, and wrong consumed-field types wrap the retained invalid-settings
 // text.
-func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
+func TestValidateSettingsRangesAndShapes(t *testing.T) {
 	validate := func(raw string) error {
-		return Plugin().ValidateConfig([]byte(raw))
+		return ValidateSettings([]byte(raw))
 	}
 	for _, raw := range []string{
 		"", " ", "{}", "null",
@@ -434,7 +431,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	} {
 		{
 			err := validate(raw)
-			testassert.Check(t, err == nil, "ValidateConfig(%s) = %v, want accepted", raw, err)
+			testassert.Check(t, err == nil, "ValidateSettings(%s) = %v, want accepted", raw, err)
 		}
 	}
 	for _, row := range []struct{ raw, want string }{
@@ -447,7 +444,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	} {
 		{
 			err := validate(row.raw)
-			testassert.Check(t, err != nil && err.Error() == row.want, "ValidateConfig(%s) = %v, want %q", row.raw, err, row.want)
+			testassert.Check(t, err != nil && err.Error() == row.want, "ValidateSettings(%s) = %v, want %q", row.raw, err, row.want)
 		}
 	}
 	for _, raw := range []string{
@@ -458,7 +455,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		`[]`, `"jobs"`, `5`,
 	} {
 		err := validate(raw)
-		testassert.Check(t, err != nil && strings.HasPrefix(err.Error(), "jobs: invalid settings: "), "ValidateConfig(%s) = %v, want the jobs: invalid settings wrap", raw, err)
+		testassert.Check(t, err != nil && strings.HasPrefix(err.Error(), "jobs: invalid settings: "), "ValidateSettings(%s) = %v, want the jobs: invalid settings wrap", raw, err)
 	}
 }
 

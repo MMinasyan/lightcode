@@ -1,4 +1,4 @@
-package tools
+package runtime
 
 import (
 	"context"
@@ -8,12 +8,11 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 func TestRunCommandNormalization(t *testing.T) {
 	byID := directTools(t.TempDir())
-	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
+	tc := callToolContext(t.TempDir(), ToolConstraints{})
 	runCommand := byID["run_command"]
 
 	t.Run("applies the default timeout and strips private fields", func(t *testing.T) {
@@ -104,7 +103,7 @@ func TestCommandOutcomeClassifiesByDeliveredCause(t *testing.T) {
 			cancel()
 			return result, err
 		}
-		outcome := commandOutcome(ctx, "call-1", "kill -TERM $$", "", 0, defaultSettings(), t.TempDir(), nil)
+		outcome := commandOutcome(ctx, "call-1", "kill -TERM $$", "", 0, defaultToolSettings(), t.TempDir(), nil)
 		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content == "Error: Exit code -1\n", "result = (%v, %q), want the real signal-death result as an error", outcome.Result.Status, outcome.Result.Content)
 	})
 
@@ -116,7 +115,7 @@ func TestCommandOutcomeClassifiesByDeliveredCause(t *testing.T) {
 			cancel()
 			return result, err
 		}
-		outcome := commandOutcome(ctx, "call-2", "sleep 5", "", 1, defaultSettings(), t.TempDir(), nil)
+		outcome := commandOutcome(ctx, "call-2", "sleep 5", "", 1, defaultToolSettings(), t.TempDir(), nil)
 		testassert.Require(t, outcome.Result.Status == model.ResultError && strings.HasPrefix(outcome.Result.Content, "Error: Exit code -1 (timeout)\n"), "result = (%v, %q), want the retained timeout text as an error", outcome.Result.Status, outcome.Result.Content)
 	})
 }

@@ -1,4 +1,4 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,25 +19,19 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
-	"github.com/MMinasyan/lightcode/internal/plugins/tools"
+	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/plugins/jobs"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
-// The tools-plugin composition tests: the real native tools plugin is
-// assembled through the test-build OpenForTest bridge like the SQLite
-// plugin, and its prepared tools run through a real Harness over real
-// temporary SQLite — allow/deny at the automatic policy boundary, file
-// effects and code-group creation on disk, and interruption recovery. The
-// direct open of the plugin happens through the composed scope helper, where
-// a test jobs plugin is registered and the runtime constructs the binding
-// in-package; the plugin requires the jobs capability, so no test opens it
-// with empty bindings.
+// The composed standard-tools tests: the directly constructed baseline tools
+// run through a real Harness over real temporary SQLite — allow/deny at the
+// automatic policy boundary, file effects and code-group creation on disk,
+// and interruption recovery. The tools are built from owner state over one
+// data root with a scripted or real jobs service; no optional registration is
+// involved in opening them.
 
 const toolsComposedDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"tools":{"read_max_lines":77}}}`
 
@@ -49,28 +44,28 @@ func writeToolsConfig(t *testing.T, path, doc string) {
 	testassert.NoError(t, os.WriteFile(path, []byte(doc), 0o600))
 }
 
-// TestComposedToolsPluginPublication composes the real tools plugin through
-// the OpenForTest bridge and proves the plugins.tools section publication
-// matrix: a valid section publishes, a consumed-limit violation and a null
-// section fail publication without replacing the live revision, and the next
-// success continues the generation sequence.
-func TestComposedToolsPluginPublication(t *testing.T) {
+// TestComposedToolsSettingsPublication proves the plugins.tools section
+// publication matrix over the directly composed baseline: a valid section
+// publishes, a consumed-limit violation and a null section fail publication
+// without replacing the live revision, and the next success continues the
+// generation sequence. No optional registration is involved.
+func TestComposedToolsSettingsPublication(t *testing.T) {
 	ctx := context.Background()
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, toolsComposedDocument)
-	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, []runtime.Plugin{sqlite.Plugin(), fakeJobsPlugin(&fakeJobs{}), tools.Plugin()})
+	r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
 	testassert.NoError(t, err)
 	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
 		_ = r.Close(ctx)
 		t.Fatalf("first Reload = (%q, %v), want revision 2", rev, err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedInvalidDocument)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, runtime.ErrConfiguration) {
+	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a nonpositive consumed limit = %v, want a complete publication failure", err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedNullDocument)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, runtime.ErrConfiguration) {
+	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a null tools section = %v, want the publisher's non-object rejection", err)
 	}
@@ -83,13 +78,7 @@ func TestComposedToolsPluginPublication(t *testing.T) {
 	testassert.NoError(t, r.Close(ctx))
 }
 
-// The admitted-input identity the direct preparation tests prepare with.
-const (
-	testSessionID = "0123456789abcdef0123456789abcdef"
-	testEntryID   = "fedcba9876543210fedcba9876543210"
-)
-
-// toolExportIDs are the tools plugin's tool exports in declaration order.
+// toolExportIDs are the baseline standard tools in declaration order.
 var toolExportIDs = []string{"read_file", "write_file", "edit_file", "apply_patch", "run_command", "process", "sleep"}
 
 // fakeJobs is the scriptable jobs.Jobs test double: it records every call
@@ -139,78 +128,99 @@ func (f *fakeJobs) List(string) string {
 
 func (f *fakeJobs) Live(string) []string { return f.live }
 
-// fakeJobsPlugin registers one test jobs capability under the id the tools
-// plugin requires.
-func fakeJobsPlugin(j *fakeJobs) runtime.Plugin {
-	return runtime.Plugin{
-		ID:       "jobs",
-		Scope:    runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{runtime.Spec[jobs.Jobs]("jobs")},
-		Open: func(context.Context, runtime.ScopeInfo, runtime.Bindings) (runtime.Instance, error) {
-			return runtime.Instance{Values: map[string]any{"jobs": jobs.Jobs(j)}}, nil
-		},
-	}
+// realJobs constructs the real jobs service over one data root and registers
+// its Close with the test.
+func realJobs(t *testing.T, dataDir string) *jobs.Manager {
+	t.Helper()
+	manager := jobs.New(dataDir)
+	t.Cleanup(func() { _ = manager.Close() })
+	return manager
 }
 
-// openToolsComposed opens the real tools plugin through the composed scope —
-// the runtime constructs the jobs binding in-package — with one optional
-// extra plugin composed in the same scope (the zero Plugin composes none),
-// and returns its tool exports plus every bound capability value.
-func openToolsComposed(t *testing.T, dataDir string, jobsPlugin, extra runtime.Plugin) (map[string]runtime.Tool, map[string]any) {
+// openToolsComposed constructs the baseline standard tool values directly over
+// the given data root and jobs service, optionally composing one extra plugin
+// as an isolated Runtime scope (the zero Plugin composes none) and returning
+// its bound capability values.
+func openToolsComposed(t *testing.T, dataDir string, jobsValue jobs.Jobs, extra Plugin) (map[string]Tool, map[string]any) {
 	t.Helper()
-	plugins := []runtime.Plugin{jobsPlugin, tools.Plugin()}
+	byID := newStandardTools(dataDir, jobsValue)
+	var values map[string]any
 	if extra.ID != "" {
-		plugins = append(plugins, extra)
-	}
-	values, closeScope, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{
-		Kind:    runtime.ScopeRuntime,
-		DataDir: dataDir,
-	}, plugins)
-	testassert.NoError(t, err)
-	t.Cleanup(func() { _ = closeScope() })
-	byID := make(map[string]runtime.Tool, len(toolExportIDs))
-	for _, id := range toolExportIDs {
-		value, ok := values[id]
-		testassert.Require(t, ok, "composition is missing the tool export %q", id)
-		toolValue, ok := value.(runtime.Tool)
-		testassert.Require(t, ok, "export %q supplies %T, not a runtime.Tool", id, value)
-		byID[id] = toolValue
+		composed, closeScope, err := ComposeScopeForTest(context.Background(), ScopeInfo{
+			Kind:    ScopeRuntime,
+			DataDir: dataDir,
+		}, []Plugin{extra})
+		testassert.NoError(t, err)
+		t.Cleanup(func() { _ = closeScope() })
+		values = composed
 	}
 	return byID, values
 }
 
-func openTools(t *testing.T, dataDir string) map[string]runtime.Tool {
+func openTools(t *testing.T, dataDir string) map[string]Tool {
 	t.Helper()
-	byID, _ := openToolsComposed(t, dataDir, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
-	return byID
+	return newStandardTools(dataDir, &fakeJobs{})
 }
 
-// TestComposedToolsPluginContract proves the plugin declaration and the
-// composed open: seven tool exports, the strict jobs dependency, and every
-// export usable as a runtime.Tool once a jobs provider is registered.
-func TestComposedToolsPluginContract(t *testing.T) {
-	p := tools.Plugin()
-	testassert.Require(t, p.ID == "tools" && p.Scope == runtime.ScopeRuntime && p.ValidateConfig != nil && p.Open != nil && len(p.Provides) == 7, "plugin declaration = %+v, want the Runtime-scoped tools plugin with a validator and an opener; got %v, want %v", p, len(p.Provides), 7)
-	// Without a jobs provider the composed open fails, naming the required
-	// capability: there is no degraded mode.
+// TestStandardToolsCompiledIntoComposition proves the baseline tool universe:
+// the seven standard tool declarations compile into every composition without
+// any registration, they are the capability universe's fixed prefix beside the
+// tool universe, an optional export naming one collides as a duplicate
+// provider, and an ordinary dependency on one resolves through the same
+// provider rules as any other capability.
+func TestStandardToolsCompiledIntoComposition(t *testing.T) {
+	c, err := newComposition(nil)
+	testassert.Require(t, err == nil, "newComposition(nil): %v", err)
+	baseline := make([]string, 0, len(standardToolSpecs()))
+	for _, spec := range standardToolSpecs() {
+		baseline = append(baseline, spec.id)
+	}
+	testassert.Require(t, slices.Equal(c.capabilityIDs[:len(baseline)], baseline), "capability universe prefix = %v, want the seven standard tools first", c.capabilityIDs)
+	testassert.Require(t, slices.Equal(c.toolIDs[:len(baseline)], baseline), "tool universe prefix = %v, want the seven standard tools first", c.toolIDs)
+	for _, id := range toolExportIDs {
+		spec, ok := c.toolSpec(id)
+		testassert.Require(t, ok && spec.id == id && spec.describe != nil, "tool %q has no compiled baseline declaration", id)
+		testassert.Require(t, slices.Contains(c.capabilityIDs, id), "capability universe = %q, want %q selectable", c.capabilityIDs, id)
+	}
 	{
-		_, _, err := runtime.ComposeScopeForTest(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, []runtime.Plugin{tools.Plugin()})
-		testassert.Require(t, err != nil && strings.Contains(err.Error(), `"jobs"`), "open without a jobs provider = %v, want the unresolved jobs dependency error", err)
+		_, err := newComposition([]Plugin{{
+			ID:    "shadow",
+			Scope: ScopeRuntime,
+			Provides: []CapabilitySpec{ToolSpec("run_command", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+				return ToolDescription{}, nil
+			})},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"run_command": nil}}, nil
+			},
+		}})
+		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), `capability "run_command" already exported by the owner's standard tools`), "plugin exporting a standard tool name = %v, want the duplicate-provider collision", err)
 	}
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+	{
+		_, err := newComposition([]Plugin{{
+			ID:       "dependent",
+			Scope:    ScopeWorkspace,
+			Provides: []CapabilitySpec{Spec[any]("marker")},
+			Requires: []CapabilitySpec{Spec[Tool]("write_file")},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"marker": ""}}, nil
+			},
+		}})
+		testassert.Require(t, err == nil, "plugin depending on a standard tool name = %v, want the ordinary provider resolution", err)
+	}
+	{
+		_, err := newComposition([]Plugin{{
+			ID:       "dependent",
+			Scope:    ScopeRuntime,
+			Provides: []CapabilitySpec{Spec[any]("marker")},
+			Requires: []CapabilitySpec{Spec[greeter]("write_file")},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"marker": ""}}, nil
+			},
+		}})
+		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), "is not assignable to required"), "plugin depending on a standard tool name with the wrong type = %v, want the ordinary type rule", err)
+	}
+	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
 	testassert.Equal(t, len(byID), 7)
-}
-
-// callToolContext is the ToolContext the direct tests prepare with: a real
-// temporary Workspace, a valid-looking admitted-input identity, the zero
-// Invocation (defaults), and the given constraints.
-func callToolContext(workspace string, constraints runtime.ToolConstraints) runtime.ToolContext {
-	return runtime.ToolContext{
-		Workspace:     workspace,
-		AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
-		Invocation:    runtime.Invocation{},
-		Constraints:   constraints,
-	}
 }
 
 // stubManagedEnv returns one real manager bound to a throwaway .env whose
@@ -224,36 +234,11 @@ func stubManagedEnv(t *testing.T) *config.ManagedEnv {
 // envCallContext is a callToolContext whose call-time environment producer
 // is one empty real manager: the ambient environment passes through
 // unfiltered.
-func envCallContext(t *testing.T, workspace string, constraints runtime.ToolConstraints) runtime.ToolContext {
+func envCallContext(t *testing.T, workspace string, constraints ToolConstraints) ToolContext {
 	t.Helper()
 	tc := callToolContext(workspace, constraints)
 	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 	return tc
-}
-
-func makeCall(t *testing.T, name, args string) model.ToolCall {
-	t.Helper()
-	call, err := model.NewToolCall(model.ToolCall{ID: "call-1", Name: name, Arguments: json.RawMessage(args)})
-	testassert.NoError(t, err)
-	return call
-}
-
-// prepare prepares one call, returning the plan.
-func prepare(t *testing.T, tool runtime.Tool, tc runtime.ToolContext, name, args string) harness.PreparedTool {
-	t.Helper()
-	return tool.Prepare(context.Background(), tc, makeCall(t, name, args))
-}
-
-// normalize runs one tool's normalization over raw argument bytes.
-func normalize(t *testing.T, tool runtime.Tool, tc runtime.ToolContext, name, args string) (json.RawMessage, error) {
-	t.Helper()
-	return tool.Normalize(tc, makeCall(t, name, args))
-}
-
-// groupDir is the exact per-Operation code-group directory the mutating
-// calls derive from the ToolContext's admitted-input identity.
-func groupDir(dataDir, sessionID, entryID string) string {
-	return filepath.Join(dataDir, "code", sessionID, entryID)
 }
 
 // scriptBackground is the test BackgroundServices over no Harness: StartJob
@@ -377,16 +362,17 @@ func toolsCapture(names []string) harness.ExecutionCapture {
 	}
 }
 
-// toolsHarnessOpts varies one composed tools Harness: the jobs provider, the
-// advertised tool set, the resolved permission policy, the background bridge,
-// the captured invocation, and the call-time subprocess environment
-// producer.
+// toolsHarnessOpts varies one composed tools Harness: the jobs provider (a
+// fake or the real service), the advertised tool set, the resolved permission
+// policy, the background bridge, the captured invocation, and the call-time
+// subprocess environment producer.
 type toolsHarnessOpts struct {
-	jobsPlugin    runtime.Plugin
+	jobsValue     jobs.Jobs // the tool-facing jobs provider; realJobs wins when set
+	realJobs      bool      // construct the real jobs service over the fixture data root
 	advertise     []string
 	permissions   harness.PermissionPolicy
-	background    runtime.BackgroundServices
-	invocation    runtime.Invocation
+	background    BackgroundServices
+	invocation    Invocation
 	subprocessEnv func() []string
 	// store, when non-nil, is the durable store behind the fixture's
 	// Harness; the zero value opens a temporary SQLite store.
@@ -394,7 +380,7 @@ type toolsHarnessOpts struct {
 	// extraPlugin, when non-empty, composes beside the tools plugin in the
 	// same scope, and extraToolID is additionally bound as a tool export —
 	// the fixture's seam for a caller-owned plugin's tool.
-	extraPlugin runtime.Plugin
+	extraPlugin Plugin
 	extraToolID string
 }
 
@@ -432,16 +418,21 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 		store = opened
 	}
 
-	jobsPlugin := opts.jobsPlugin
-	if jobsPlugin.ID == "" {
-		jobsPlugin = fakeJobsPlugin(&fakeJobs{})
+	var jobsValue jobs.Jobs
+	switch {
+	case opts.realJobs:
+		jobsValue = realJobs(t, dataDir)
+	case opts.jobsValue != nil:
+		jobsValue = opts.jobsValue
+	default:
+		jobsValue = &fakeJobs{}
 	}
-	byID, values := openToolsComposed(t, dataDir, jobsPlugin, opts.extraPlugin)
+	byID, values := openToolsComposed(t, dataDir, jobsValue, opts.extraPlugin)
 	if opts.extraToolID != "" {
 		value, ok := values[opts.extraToolID]
 		testassert.Require(t, ok, "composition is missing the extra tool export %q", opts.extraToolID)
-		toolValue, ok := value.(runtime.Tool)
-		testassert.Require(t, ok, "export %q supplies %T, not a runtime.Tool", opts.extraToolID, value)
+		toolValue, ok := value.(Tool)
+		testassert.Require(t, ok, "export %q supplies %T, not a Tool", opts.extraToolID, value)
 		byID[opts.extraToolID] = toolValue
 	}
 	advertise := opts.advertise
@@ -460,11 +451,11 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 					th.mu.Lock()
 					th.admission = admission.AdmittedEntry
 					th.mu.Unlock()
-					tc := runtime.ToolContext{
+					tc := ToolContext{
 						Workspace:     workspace,
 						AdmittedEntry: admission.AdmittedEntry,
 						Invocation:    opts.invocation,
-						Constraints:   runtime.ToolConstraints{Readonly: admission.Execution.Readonly, WriteDir: admission.Execution.WriteDir},
+						Constraints:   ToolConstraints{Readonly: admission.Execution.Readonly, WriteDir: admission.Execution.WriteDir},
 						Background:    opts.background,
 						SubprocessEnv: opts.subprocessEnv,
 					}
@@ -490,9 +481,10 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 			}, nil
 		},
 	}
-	// The composed jobs capability also declares the Harness job-stop seam;
-	// wire it exactly as production wires it so background starts admit.
-	if stopper, ok := values["job-stopper"].(harness.JobStopper); ok {
+	// The directly constructed jobs service is also the Harness job-stop
+	// seam; wire it exactly as production wires it so background starts
+	// admit.
+	if stopper, ok := jobsValue.(harness.JobStopper); ok {
 		deps.Jobs = stopper
 	}
 	h, err := harness.New(owner, deps)
@@ -721,7 +713,7 @@ func TestComposedToolsHarnessRecovery(t *testing.T) {
 	// A fresh Runtime composition over the same data root repairs the
 	// abandoned running state before any execution can start.
 	e := newComposeEnv(t)
-	r, err := runtime.OpenForTest(ctx, th.dataDir, e.configPath, []runtime.Plugin{sqlite.Plugin(), fakeJobsPlugin(&fakeJobs{}), tools.Plugin()})
+	r, err := Open(ctx, Options{DataDir: th.dataDir, ConfigPath: e.configPath})
 	testassert.NoError(t, err)
 	testassert.NoError(t, r.Close(ctx))
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"}
@@ -743,7 +735,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	ws := t.TempDir()
 
 	t.Run("conclusive simple commands declare one target per segment", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":"echo one; echo two && echo three"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{}), "run_command", `{"command":"echo one; echo two && echo three"}`)
 		testassert.Require(t, plan.Immediate == nil && plan.Execute != nil && len(plan.Permissions) == 3, "plan = %+v, want an executor plan; pairs = %+v, want one command.run pair per segment", plan, plan.Permissions)
 		want := []string{"echo one", "echo two", "echo three"}
 		for i, pair := range plan.Permissions {
@@ -764,27 +756,27 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 			// byte — the heredoc body and the trailing newline — preserved.
 			{"{\"command\":\"  \\ncat <<EOF\\nbody\\nEOF\\n\"}", "cat <<EOF\nbody\nEOF\n"},
 		} {
-			plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", tc.args)
+			plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{}), "run_command", tc.args)
 			testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Permission == "command.run", "%s: pairs = %+v, want the single complete-command target", tc.args, plan.Permissions)
 			testassert.Require(t, plan.Permissions[0].Target == tc.want, "%s: target = %q, want %q", tc.args, plan.Permissions[0].Target, tc.want)
 		}
 	})
 
 	t.Run("all-blank text takes the whole-command fallback with the original input", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":"   "}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{}), "run_command", `{"command":"   "}`)
 		testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Target == "   ", "pairs = %+v, want the unchanged original blank input as the one target", plan.Permissions)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == "(No output)", "result = %+v, want the retained no-op run", outcome.Result)
 	})
 
 	t.Run("empty command text is an immediate argument error", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{}), "run_command", `{"command":""}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{}), "run_command", `{"command":""}`)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "plan = %+v, want one immediate outcome", plan)
 		testassert.Require(t, plan.Immediate.Result.Status == model.ResultError && plan.Immediate.Result.Content == "run_command: command is required", "immediate = %+v, want the retained required error", plan.Immediate)
 	})
 
 	t.Run("readonly declares the rewritten command and executes it", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"git status --short"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{Readonly: true}), "run_command", `{"command":"git status --short"}`)
 		testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Permission == "command.run", "pairs = %+v, want one command.run pair", plan.Permissions)
 		target := plan.Permissions[0].Target
 		testassert.Require(t, strings.HasPrefix(target, "git --no-pager --no-optional-locks") && strings.Contains(target, "status --short") != false, "target = %q, want the rewritten read-only git command", target)
@@ -793,21 +785,21 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 	})
 
 	t.Run("readonly plain command runs in the workspace", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"pwd"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{Readonly: true}), "run_command", `{"command":"pwd"}`)
 		testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Target == "pwd", "pairs = %+v, want the unchanged pwd target", plan.Permissions)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.TrimSpace(outcome.Result.Content) == ws, "result = %+v, want pwd in the workspace", outcome.Result)
 	})
 
 	t.Run("readonly rejection is an immediate error with the fixed text", func(t *testing.T) {
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"curl example.com"}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{Readonly: true}), "run_command", `{"command":"curl example.com"}`)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "plan = %+v, want one immediate outcome", plan)
 		testassert.Require(t, plan.Immediate.Result.Status == model.ResultError && strings.Contains(plan.Immediate.Result.Content, "read-only agent") && !strings.Contains(plan.Immediate.Result.Content, "curl"), "immediate = %+v, want the fixed rejection that never echoes the command", plan.Immediate)
 	})
 
 	t.Run("readonly blank and empty commands settle the fixed rejection", func(t *testing.T) {
 		for _, args := range []string{`{"command":""}`, `{"command":"   "}`, "{\"command\":\" \\n\\t \"}"} {
-			plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", args)
+			plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{Readonly: true}), "run_command", args)
 			testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "%s: plan = %+v, want one immediate outcome", args, plan)
 			testassert.Require(t, plan.Immediate.Result.Status == model.ResultError && plan.Immediate.Result.Content == tool.ReadOnlyRunCommandRejected, "%s: immediate = %+v, want the fixed rejection that never echoes the command", args, plan.Immediate)
 		}
@@ -828,7 +820,7 @@ func TestRunCommandPrepareTargets(t *testing.T) {
 			}
 		}()
 		start := time.Now()
-		plan := prepare(t, byID["run_command"], envCallContext(t, ws, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"cat pipe","timeout":1}`)
+		plan := prepare(t, byID["run_command"], envCallContext(t, ws, ToolConstraints{Readonly: true}), "run_command", `{"command":"cat pipe","timeout":1}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == "done", "result = %+v, want the default timeout to let the command finish", outcome.Result)
 		{
@@ -842,7 +834,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 	dataDir := t.TempDir()
 	byID := openTools(t, dataDir)
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 
 	t.Run("success carries the captured output", func(t *testing.T) {
@@ -908,7 +900,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_TEST", "env-value")
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret") // cleanup reservation only
 		testassert.NoError(t, os.Unsetenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED"))
-		byID, _ := openToolsComposed(t, dataDir, fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+		byID, _ := openToolsComposed(t, dataDir, &fakeJobs{}, Plugin{})
 		runCommand := byID["run_command"]
 		// The key connects AFTER the tools plugin opened: the call-time
 		// subprocess-environment producer, not any Open-captured copy, must
@@ -927,7 +919,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 
 func TestSleepTool(t *testing.T) {
 	byID := openTools(t, t.TempDir())
-	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
+	tc := callToolContext(t.TempDir(), ToolConstraints{})
 	sleepTool := byID["sleep"]
 
 	t.Run("normalization strips private fields, requires strict integers and clamps to 1..300", func(t *testing.T) {
@@ -1040,7 +1032,7 @@ func TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers(t *testin
 	} {
 		t.Run(command, func(t *testing.T) {
 			_ = os.Remove(marker)
-			plan := prepare(t, byID["run_command"], envCallContext(t, repo, runtime.ToolConstraints{Readonly: true}), "run_command", `{"command":"`+command+`"}`)
+			plan := prepare(t, byID["run_command"], envCallContext(t, repo, ToolConstraints{Readonly: true}), "run_command", `{"command":"`+command+`"}`)
 			testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Permission == "command.run", "pairs = %+v, want one command.run pair", plan.Permissions)
 			{
 				target := plan.Permissions[0].Target
@@ -1064,13 +1056,13 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 	t.Run("read_file binds canonical targets with file.read pairs", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("hello\n"), 0o644))
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
+		plan := prepare(t, byID["read_file"], callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
 		testassert.Require(t, plan.Immediate == nil && plan.Execute != nil && len(plan.Permissions) == 1 && plan.Permissions[0].Permission == "file.read", "plan = %+v, want one executor; permissions = %+v, want one file.read pair", plan, plan.Permissions)
 		testassert.Require(t, plan.Permissions[0].Target == filepath.Join(ws, "notes.txt") && plan.CanonicalWorkspace == ws && plan.CanonicalWriteDir == "", "target = %q, want the canonical file path; canonicals = %q/%q, want the workspace and an empty write dir", plan.Permissions[0].Target, plan.CanonicalWorkspace, plan.CanonicalWriteDir)
 	})
 	t.Run("read_file of a missing leaf declares the parent directory too", func(t *testing.T) {
 		ws := t.TempDir()
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"ghost.txt"}`)
+		plan := prepare(t, byID["read_file"], callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"ghost.txt"}`)
 		testassert.Require(t, len(plan.Permissions) == 2, "permissions = %+v, want the file and parent-directory file.read pairs", plan.Permissions)
 		for _, pair := range plan.Permissions {
 			testassert.Require(t, pair.Permission == "file.read" && pair.Target != "", "pair = %+v, want a nonempty canonical file.read pair", pair)
@@ -1080,13 +1072,13 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 		real := t.TempDir()
 		link := filepath.Join(t.TempDir(), "link")
 		testassert.NoError(t, os.Symlink(real, link))
-		plan := prepare(t, byID["read_file"], callToolContext(link, runtime.ToolConstraints{}), "read_file", `{"path":"a.txt"}`)
+		plan := prepare(t, byID["read_file"], callToolContext(link, ToolConstraints{}), "read_file", `{"path":"a.txt"}`)
 		testassert.Equal(t, plan.CanonicalWorkspace, real)
 	})
 	t.Run("write_file declares file.write and the canonical write-dir boundary", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.MkdirAll(filepath.Join(ws, "wd"), 0o755))
-		constraints := runtime.ToolConstraints{WriteDir: "wd"}
+		constraints := ToolConstraints{WriteDir: "wd"}
 		plan := prepare(t, byID["write_file"], callToolContext(ws, constraints), "write_file", `{"path":"wd/out.txt","content":"x"}`)
 		testassert.Require(t, plan.Immediate == nil && plan.Execute != nil && len(plan.Permissions) == 1 && plan.Permissions[0].Permission == "file.write", "plan = %+v, want one executor; permissions = %+v, want one file.write pair", plan, plan.Permissions)
 		wantBoundary := filepath.Join(ws, "wd")
@@ -1100,7 +1092,7 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 		patch := "*** Begin Patch\n*** Add File: a.txt\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n*** End Patch"
 		input, err := json.Marshal(map[string]string{"input": patch})
 		testassert.NoError(t, err)
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
+		plan := prepare(t, byID["apply_patch"], callToolContext(ws, ToolConstraints{}), "apply_patch", string(input))
 		want := []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"}
 		if len(plan.Permissions) != len(want) {
 			t.Fatalf("permissions = %+v, want %d file.write pairs in declaration order", plan.Permissions, len(want))
@@ -1112,7 +1104,7 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 	})
 	t.Run("undecodable arguments in Prepare map to the immediate validation error", func(t *testing.T) {
 		ws := t.TempDir()
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":`)
+		plan := prepare(t, byID["read_file"], callToolContext(ws, ToolConstraints{}), "read_file", `{"path":`)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "plan = %+v, want one immediate outcome", plan)
 		outcome := *plan.Immediate
 		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.CallID == "call-1" && outcome.Result.Content != "", "immediate = %+v, want the bounded validation error for the original call", outcome)
@@ -1125,24 +1117,24 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 		// "1e0" spelling canonicalizes once at normalization, and
 		// preparation consumes the byte-identical committed value and reads
 		// exactly line 1 with the canonical integer window.
-		committed, err := normalize(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"f.txt","offset":1e0,"limit":1.0}`)
+		committed, err := normalize(t, tool, callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"f.txt","offset":1e0,"limit":1.0}`)
 		testassert.NoError(t, err)
 		testassert.Require(t, string(committed) == `{"limit":1,"offset":1,"path":"f.txt"}`, "committed normalized arguments = %s, want the canonical integers once", committed)
-		plan := prepare(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", string(committed))
+		plan := prepare(t, tool, callToolContext(ws, ToolConstraints{}), "read_file", string(committed))
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.HasPrefix(outcome.Result.Content, "1\tone\n") && strings.Contains(outcome.Result.Content, "(Showing lines 1-1 of 3. Use offset=2 to continue.)"), "result = %+v, want the canonical 1/1 window through preparation", outcome.Result)
 		// Preparation performs no validation or defaulting of its own: an
 		// un-normalized fraction handed directly to Prepare is not a second
 		// normalization error — preparation binds targets and parses the
 		// canonical lexeme only at its point of use.
-		plan = prepare(t, tool, callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"f.txt","offset":2.5}`)
+		plan = prepare(t, tool, callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"f.txt","offset":2.5}`)
 		testassert.Require(t, plan.Immediate == nil && plan.Execute != nil, "plan = %+v, want one executor: Prepare runs no second normalization", plan)
 	})
 	t.Run("failed canonical preparation maps to the immediate denial", func(t *testing.T) {
 		ws := t.TempDir()
 		loop := filepath.Join(ws, "loop")
 		testassert.NoError(t, os.Symlink("loop", loop))
-		plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{WriteDir: "loop"}), "write_file", `{"path":"out.txt","content":"x"}`)
+		plan := prepare(t, byID["write_file"], callToolContext(ws, ToolConstraints{WriteDir: "loop"}), "write_file", `{"path":"out.txt","content":"x"}`)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "plan = %+v, want one immediate outcome", plan)
 		outcome := *plan.Immediate
 		testassert.Require(t, outcome.Result.Status == model.ResultDenied && outcome.Result.Content == "Permission denied.", "immediate = %+v, want the fixed denial", outcome)
@@ -1150,7 +1142,7 @@ func TestPrepareShapesAndCanonicals(t *testing.T) {
 	t.Run("a write target outside the write dir is denied at preparation", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.MkdirAll(filepath.Join(ws, "wd"), 0o755))
-		plan := prepare(t, byID["edit_file"], callToolContext(ws, runtime.ToolConstraints{WriteDir: "wd"}), "edit_file", `{"path":"outside.txt","old_string":"a","new_string":"b"}`)
+		plan := prepare(t, byID["edit_file"], callToolContext(ws, ToolConstraints{WriteDir: "wd"}), "edit_file", `{"path":"outside.txt","old_string":"a","new_string":"b"}`)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil && plan.Immediate.Result.Status == model.ResultDenied, "plan = %+v, want the preparation denial", plan)
 	})
 }
@@ -1162,14 +1154,14 @@ func TestExecuteFileEffects(t *testing.T) {
 	t.Run("read_file returns bounded numbered content and no metadata", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("one\ntwo\nthree\n"), 0o644))
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt","offset":2,"limit":2}`)
+		plan := prepare(t, byID["read_file"], callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"notes.txt","offset":2,"limit":2}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.CallID == "call-1" && strings.Contains(outcome.Result.Content, "2\ttwo") && strings.Contains(outcome.Result.Content, "3\tthree") && outcome.Metadata == nil, "result = %+v, want success for call-1; content = %q, want the numbered requested window; metadata = %s, want none for read_file", outcome.Result, outcome.Result.Content, outcome.Metadata)
 	})
 	t.Run("read_file of a missing file returns the suggestion outcome", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("x\n"), 0o644))
-		plan := prepare(t, byID["read_file"], callToolContext(ws, runtime.ToolConstraints{}), "read_file", `{"path":"notes.tx"}`)
+		plan := prepare(t, byID["read_file"], callToolContext(ws, ToolConstraints{}), "read_file", `{"path":"notes.tx"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "not found"), "result = %+v, want the bounded not-found suggestions outcome", outcome)
 	})
@@ -1177,7 +1169,7 @@ func TestExecuteFileEffects(t *testing.T) {
 		dataDir := t.TempDir()
 		byID := openTools(t, dataDir)
 		ws := t.TempDir()
-		plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"sub/dir/new.txt","content":"body"}`)
+		plan := prepare(t, byID["write_file"], callToolContext(ws, ToolConstraints{}), "write_file", `{"path":"sub/dir/new.txt","content":"body"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "Wrote"), "result = %+v, want the write success", outcome.Result)
 		data, err := os.ReadFile(filepath.Join(ws, "sub", "dir", "new.txt"))
@@ -1201,7 +1193,7 @@ func TestExecuteFileEffects(t *testing.T) {
 	t.Run("edit_file mutates the file and emits the edit_preview metadata shape", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("alpha\nbeta\ngamma\n"), 0o644))
-		plan := prepare(t, byID["edit_file"], callToolContext(ws, runtime.ToolConstraints{}), "edit_file", `{"path":"notes.txt","old_string":"beta","new_string":"BETA"}`)
+		plan := prepare(t, byID["edit_file"], callToolContext(ws, ToolConstraints{}), "edit_file", `{"path":"notes.txt","old_string":"beta","new_string":"BETA"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "lines 2"), "result = %+v, want the edit summary", outcome.Result)
 		data, err := os.ReadFile(filepath.Join(ws, "notes.txt"))
@@ -1231,7 +1223,7 @@ func TestExecuteFileEffects(t *testing.T) {
 		patch := "*** Begin Patch\n*** Add File: a.txt\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** Delete File: c.txt\n*** Update File: d.txt\n*** Move to: e.txt\n*** End Patch"
 		input, err := json.Marshal(map[string]string{"input": patch})
 		testassert.NoError(t, err)
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
+		plan := prepare(t, byID["apply_patch"], callToolContext(ws, ToolConstraints{}), "apply_patch", string(input))
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "Success. Updated the following files:"), "result = %+v, want the patch success summary", outcome.Result)
 		{
@@ -1274,12 +1266,12 @@ func TestExecuteFileEffects(t *testing.T) {
 		dataDir := t.TempDir()
 		byID := openTools(t, dataDir)
 		ws := t.TempDir()
-		first := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"one.txt","content":"1"}`)
+		first := prepare(t, byID["write_file"], callToolContext(ws, ToolConstraints{}), "write_file", `{"path":"one.txt","content":"1"}`)
 		{
 			outcome := first.Execute(context.Background())
 			testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "first write = %+v", outcome.Result)
 		}
-		second := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"two.txt","content":"2"}`)
+		second := prepare(t, byID["write_file"], callToolContext(ws, ToolConstraints{}), "write_file", `{"path":"two.txt","content":"2"}`)
 		{
 			outcome := second.Execute(context.Background())
 			testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "second write = %+v", outcome.Result)
@@ -1294,7 +1286,7 @@ func TestExecuteFileEffects(t *testing.T) {
 		dataDir := t.TempDir()
 		byID := openTools(t, dataDir)
 		ws := t.TempDir()
-		tc := callToolContext(ws, runtime.ToolConstraints{})
+		tc := callToolContext(ws, ToolConstraints{})
 		tc.AdmittedEntry = harness.EntryRef{SessionID: testSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 		plan := prepare(t, byID["write_file"], tc, "write_file", `{"path":"other.txt","content":"x"}`)
 		{
@@ -1309,7 +1301,7 @@ func TestExecuteFileEffects(t *testing.T) {
 	t.Run("a readonly agent with a write dir writes inside the boundary", func(t *testing.T) {
 		ws := t.TempDir()
 		testassert.NoError(t, os.MkdirAll(filepath.Join(ws, "wd"), 0o755))
-		tc := callToolContext(ws, runtime.ToolConstraints{Readonly: true, WriteDir: "wd"})
+		tc := callToolContext(ws, ToolConstraints{Readonly: true, WriteDir: "wd"})
 		plan := prepare(t, byID["write_file"], tc, "write_file", `{"path":"wd/allowed.txt","content":"x"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "write = %+v, want success inside the write dir", outcome.Result)
@@ -1320,7 +1312,7 @@ func TestExecuteFileEffects(t *testing.T) {
 		patch := "*** Begin Patch\n*** Update File: b.txt\n@@\n-old\n+new\n*** End Patch"
 		input, err := json.Marshal(map[string]string{"input": patch})
 		testassert.NoError(t, err)
-		plan := prepare(t, byID["apply_patch"], callToolContext(ws, runtime.ToolConstraints{}), "apply_patch", string(input))
+		plan := prepare(t, byID["apply_patch"], callToolContext(ws, ToolConstraints{}), "apply_patch", string(input))
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultError && outcome.Result.Content != "", "result = %+v, want the failed-hunk error outcome", outcome.Result)
 	})
@@ -1335,7 +1327,7 @@ func TestFailedCallRetainsEarlierSnapshot(t *testing.T) {
 	dataDir := t.TempDir()
 	byID := openTools(t, dataDir)
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 	testassert.NoError(t, os.WriteFile(filepath.Join(ws, "a.txt"), []byte("alpha\n"), 0o644))
 	testassert.NoError(t, os.WriteFile(filepath.Join(ws, "b.txt"), []byte("beta\n"), 0o644))
 
@@ -1391,7 +1383,7 @@ func TestExecutedPlanRejectsPostAuthorizationBindingChange(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(real, []byte("before\n"), 0o644))
 	link := filepath.Join(ws, "alias.txt")
 	testassert.NoError(t, os.Symlink(real, link))
-	plan := prepare(t, byID["write_file"], callToolContext(ws, runtime.ToolConstraints{}), "write_file", `{"path":"alias.txt","content":"after"}`)
+	plan := prepare(t, byID["write_file"], callToolContext(ws, ToolConstraints{}), "write_file", `{"path":"alias.txt","content":"after"}`)
 	// Repoint the alias at a different leaf after authorization.
 	other := filepath.Join(ws, "other.txt")
 	testassert.NoError(t, os.WriteFile(other, []byte("do not touch\n"), 0o644))
@@ -1416,7 +1408,7 @@ func TestExecutedReadFailsUnderWorkspaceRootChange(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(filepath.Join(real, "notes.txt"), []byte("real\n"), 0o644))
 	link := filepath.Join(t.TempDir(), "ws-link")
 	testassert.NoError(t, os.Symlink(real, link))
-	plan := prepare(t, byID["read_file"], callToolContext(link, runtime.ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
+	plan := prepare(t, byID["read_file"], callToolContext(link, ToolConstraints{}), "read_file", `{"path":"notes.txt"}`)
 	testassert.NoError(t, os.Remove(link))
 	other := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(other, "notes.txt"), []byte("substituted\n"), 0o644))
@@ -1433,8 +1425,8 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("handoff rejection renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{}
-		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
-		tc := callToolContext(ws, runtime.ToolConstraints{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{startErr: errors.New("background group is closed or stopping")}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1446,8 +1438,8 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("spawn failure renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{startErr: errors.New("spawn boom")}
-		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
-		tc := callToolContext(ws, runtime.ToolConstraints{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1458,8 +1450,8 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("reserve failure renders through the wrapper without an abort", func(t *testing.T) {
 		fake := &fakeJobs{reserveErr: errors.New("process: manager is closed")}
-		byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
-		tc := callToolContext(ws, runtime.ToolConstraints{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -1475,9 +1467,9 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 // sub-one becomes 0, and the immediate result is the retained template.
 func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	fake := &fakeJobs{live: []string{"b0b0b0b0", "11111111"}}
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{Readonly: true})
+	tc := callToolContext(ws, ToolConstraints{Readonly: true})
 	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 	tc.Background = &scriptBackground{}
 
@@ -1514,11 +1506,11 @@ func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
 	t.Setenv(managedKey, "") // cleanup reservation only
 	testassert.NoError(t, os.Unsetenv(managedKey))
 	managed := stubManagedEnv(t)
-	byID, values := openToolsComposed(t, t.TempDir(), jobs.Plugin(), runtime.Plugin{})
-	jobsInst, ok := values["jobs"].(jobs.Jobs)
-	testassert.Require(t, ok, "values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
+	jobsDir := t.TempDir()
+	jobsInst := realJobs(t, jobsDir)
+	byID := newStandardTools(jobsDir, jobsInst)
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = managed.SubprocessEnv
 	tc.Background = &scriptBackground{}
 
@@ -1618,12 +1610,11 @@ func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
 	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret") // cleanup reservation only
 	testassert.NoError(t, os.Unsetenv("LIGHTCODE_BG_MANAGED"))
 	dataDir := t.TempDir()
-	byID, values := openToolsComposed(t, dataDir, jobs.Plugin(), runtime.Plugin{})
-	jobsInst, ok := values["jobs"].(jobs.Jobs)
-	testassert.Require(t, ok, "values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
+	jobsInst := realJobs(t, dataDir)
+	byID := newStandardTools(dataDir, jobsInst)
 	managed := stubManagedEnv(t)
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = managed.SubprocessEnv
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_BG_UNLISTED\" \"$LIGHTCODE_BG_MANAGED\"; sleep 30","background":true}`)
@@ -1670,7 +1661,7 @@ func completionTextIn(req model.Request) string {
 func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testing.T) {
 	delivered := make(chan struct{}, 1)
 	bg := &harnessBackground{delivered: delivered}
-	invocation, err := runtime.ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_output_bytes":1024}`})
+	invocation, err := ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_output_bytes":1024}`})
 	testassert.NoError(t, err)
 	var mu sync.Mutex
 	attempt := 0
@@ -1703,7 +1694,7 @@ func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testin
 		}
 	}
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		jobsPlugin:    jobs.Plugin(),
+		realJobs:      true,
 		advertise:     []string{"run_command"},
 		background:    bg,
 		invocation:    invocation,
@@ -1772,12 +1763,12 @@ func reserveAndStart(t *testing.T, jobsInst jobs.Jobs, workspace, command string
 // owner-scoped canonical targets and the capability's unknown-ID text for
 // well-shaped unknown and foreign identities.
 func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
-	byID, values := openToolsComposed(t, t.TempDir(), jobs.Plugin(), runtime.Plugin{})
-	jobsInst, ok := values["jobs"].(jobs.Jobs)
-	testassert.Require(t, ok, "values[\"jobs\"] supplies %T, not jobs.Jobs", values["jobs"])
+	jobsDir := t.TempDir()
+	jobsInst := realJobs(t, jobsDir)
+	byID := newStandardTools(jobsDir, jobsInst)
 	process := byID["process"]
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 
 	t.Run("empty list retains the empty text on the fixed target", func(t *testing.T) {
 		plan := prepare(t, process, tc, "process", `{"action":"list"}`)
@@ -1817,7 +1808,7 @@ func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
 	})
 
 	t.Run("a foreign session id reaches the capability and returns the same text", func(t *testing.T) {
-		tcForeign := callToolContext(ws, runtime.ToolConstraints{})
+		tcForeign := callToolContext(ws, ToolConstraints{})
 		tcForeign.AdmittedEntry.SessionID = "ffffffffffffffffffffffffffffffff"
 		plan := prepare(t, process, tcForeign, "process", fmt.Sprintf(`{"action":"kill","id":"%s"}`, runningID))
 		testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0].Target == "ffffffffffffffffffffffffffffffff/"+runningID, "pairs = %+v, want the foreign owner-scoped target", plan.Permissions)
@@ -1852,7 +1843,7 @@ func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
 // no capability call — never permission-denied status.
 func TestProcessToolValidationIsImmediateError(t *testing.T) {
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
 	process := byID["process"]
 	ws := t.TempDir()
 	cases := []struct {
@@ -1870,7 +1861,7 @@ func TestProcessToolValidationIsImmediateError(t *testing.T) {
 		{`{"action":"kill","id":"deadbeeg"}`, `process: no process with ID "deadbeeg"`},
 	}
 	for _, tc := range cases {
-		plan := prepare(t, process, callToolContext(ws, runtime.ToolConstraints{}), "process", tc.args)
+		plan := prepare(t, process, callToolContext(ws, ToolConstraints{}), "process", tc.args)
 		testassert.Require(t, plan.Execute == nil && plan.Immediate != nil, "%s: plan = %+v, want one immediate outcome", tc.args, plan)
 		testassert.Require(t, plan.Immediate.Result.Status == model.ResultError && plan.Immediate.Result.Content == tc.want && len(plan.Permissions) == 0, "%s: immediate = %+v, want error %q; %s: pairs = %+v, want no permission target", tc.args, plan.Immediate.Result, tc.want, tc.args, plan.Permissions)
 	}
@@ -1906,7 +1897,7 @@ func TestComposedPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 		}
 	}
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		jobsPlugin:  fakeJobsPlugin(fake),
+		jobsValue:   fake,
 		advertise:   []string{"run_command", "process", "write_file"},
 		permissions: policy,
 	})
@@ -1947,7 +1938,7 @@ func TestRunCommandNilSubprocessEnvNoStart(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			marker := filepath.Join(ws, strings.ReplaceAll(testCase.name, " ", "-")+"-marker")
-			tc := callToolContext(ws, runtime.ToolConstraints{})
+			tc := callToolContext(ws, ToolConstraints{})
 			tc.SubprocessEnv = testCase.producer
 			plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"touch `+marker+`"}`)
 			outcome := plan.Execute(context.Background())
@@ -1966,8 +1957,8 @@ func TestRunCommandNilSubprocessEnvNoStart(t *testing.T) {
 func TestBackgroundNilSubprocessEnvNoReservation(t *testing.T) {
 	ws := t.TempDir()
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 	outcome := plan.Execute(context.Background())
@@ -1989,7 +1980,7 @@ func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 	t.Setenv(external, "early-value")
 	runCommand := openTools(t, t.TempDir())["run_command"]
 	ws := t.TempDir()
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = managed.SubprocessEnv
 	plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TIMING_EXTERNAL\" \"$LIGHTCODE_SCRUB_LATE\""}`)
 	// Both clocks move after Prepare: the external sibling changes and the
@@ -2008,8 +1999,8 @@ func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 func TestBackgroundNilEnvSnapshotAbortsBeforeStart(t *testing.T) {
 	ws := t.TempDir()
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(fake), runtime.Plugin{})
-	tc := callToolContext(ws, runtime.ToolConstraints{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = func() []string { return nil } // a nil snapshot is never an ambient fallback
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)

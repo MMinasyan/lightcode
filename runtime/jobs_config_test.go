@@ -1,4 +1,4 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
@@ -6,41 +6,37 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 // jobsComposedDoc wraps one plugins section in the shared composed provider
 // document, the same split the tools publication matrix uses: direct decoder
-// tests live in the plugin package, and the composed half drives the real
+// tests live in the jobs package, and the composed half drives the real
 // configuration service here. Config writes go through the package's existing
-// writeToolsConfig helper (identical to the internal-package writeServiceFile,
-// which a runtime_test file importing the plugins cannot reference without an
-// import cycle).
+// writeToolsConfig helper.
 func jobsComposedDoc(plugins string) string {
 	return strings.TrimSuffix(composedConfigDocument, "}") + `,"plugins":` + plugins + `}`
 }
 
-// TestComposedJobsPluginPublication composes the shipped five-plugin
-// registration through the OpenForTest bridge and proves the plugins.jobs
-// publication matrix: the four compiled sections publish together with a
-// well-formed jobs object (unknown keys ignored, a null member retaining its
-// default), a consumed-range violation, a wrong consumed-field type, and a
-// null section each fail publication with the jobs decoder's text through the
-// object-only boundary, and a failed publication leaves the live revision
-// untouched so the next success continues the generation sequence.
-func TestComposedJobsPluginPublication(t *testing.T) {
+// TestComposedJobsSettingsPublication proves the plugins.jobs publication
+// matrix over the directly constructed baseline: the baseline sections publish
+// together with a well-formed jobs object (unknown keys ignored, a null
+// member retaining its default), a consumed-range violation, a wrong
+// consumed-field type, and a null section each fail publication with the jobs
+// decoder's text through the object-only boundary, and a failed publication
+// leaves the live revision untouched so the next success continues the
+// generation sequence.
+func TestComposedJobsSettingsPublication(t *testing.T) {
 	ctx := context.Background()
-	const fourSections = `"sqlite":{},"tools":{},"adaptation":{}`
-	accept := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}}`)
-	violation := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_output_bytes":1023}}`)
-	badType := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_output_bytes":"many"}}`)
-	nullSection := jobsComposedDoc(`{` + fourSections + `,"jobs":null}`)
+	const baselineSections = `"tools":{}`
+	accept := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}}`)
+	violation := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_output_bytes":1023}}`)
+	badType := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_output_bytes":"many"}}`)
+	nullSection := jobsComposedDoc(`{` + baselineSections + `,"jobs":null}`)
 
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, accept)
-	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
+	r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
 	testassert.NoError(t, err)
 	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
 		_ = r.Close(ctx)
@@ -48,7 +44,7 @@ func TestComposedJobsPluginPublication(t *testing.T) {
 	}
 
 	writeToolsConfig(t, e.configPath, violation)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, runtime.ErrConfiguration) {
+	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with an out-of-range jobs limit = %v, want a complete publication failure", err)
 	} else if !strings.Contains(err.Error(), "jobs: max_output_bytes must be between 1024 and 1048576") {
@@ -57,7 +53,7 @@ func TestComposedJobsPluginPublication(t *testing.T) {
 	}
 
 	writeToolsConfig(t, e.configPath, badType)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, runtime.ErrConfiguration) {
+	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a wrong-typed jobs field = %v, want a complete publication failure", err)
 	} else if !strings.Contains(err.Error(), "jobs: invalid settings:") {
@@ -66,7 +62,7 @@ func TestComposedJobsPluginPublication(t *testing.T) {
 	}
 
 	writeToolsConfig(t, e.configPath, nullSection)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, runtime.ErrConfiguration) {
+	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a null jobs section = %v, want the publisher's non-object rejection", err)
 	}

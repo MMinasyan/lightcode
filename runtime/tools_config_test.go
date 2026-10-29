@@ -1,4 +1,4 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
@@ -11,19 +11,18 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
-// TestToolsPluginConsumesConfiguredValues proves the published
+// TestConfiguredToolsSettingsTakeEffect proves the published
 // plugins.tools values change tool behavior through the real
 // Invocation.Config channel: the configured read_max_lines is the
 // normalization default limit and bounds the executed read window
 // end-to-end, while the zero Invocation keeps the shipped defaults. The
 // configured Invocation comes from the test-only runtime bridge, because
 // outside the runtime package only the zero Invocation is constructible.
-func TestToolsPluginConsumesConfiguredValues(t *testing.T) {
+func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 	ctx := context.Background()
-	byID, _ := openToolsComposed(t, t.TempDir(), fakeJobsPlugin(&fakeJobs{}), runtime.Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
 	value, ok := byID["read_file"]
 	testassert.Require(t, ok, "plugin instance exports no read_file")
 	readTool := value
@@ -34,15 +33,15 @@ func TestToolsPluginConsumesConfiguredValues(t *testing.T) {
 		return completed
 	}
 
-	configured, err := runtime.ConfiguredInvocationForTest(map[string]string{"tools": `{"read_max_lines":77}`})
+	configured, err := ConfiguredInvocationForTest(map[string]string{"tools": `{"read_max_lines":77}`})
 	testassert.NoError(t, err)
-	raw, err := readTool.Normalize(runtime.ToolContext{Invocation: configured}, call(t, `{"path":"a.txt"}`))
+	raw, err := readTool.Normalize(ToolContext{Invocation: configured}, call(t, `{"path":"a.txt"}`))
 	testassert.NoError(t, err)
 	testassert.Require(t, string(raw) == `{"limit":77,"offset":1,"path":"a.txt"}`, "configured normalization = %s, want the configured default limit 77", raw)
 
 	// The zero Invocation keeps the shipped default: the channel, not the
 	// decoder, carries the configured value.
-	raw, err = readTool.Normalize(runtime.ToolContext{}, call(t, `{"path":"a.txt"}`))
+	raw, err = readTool.Normalize(ToolContext{}, call(t, `{"path":"a.txt"}`))
 	testassert.NoError(t, err)
 	testassert.Require(t, string(raw) == `{"limit":500,"offset":1,"path":"a.txt"}`, "zero-Invocation normalization = %s, want the shipped default limit 500", raw)
 
@@ -55,7 +54,7 @@ func TestToolsPluginConsumesConfiguredValues(t *testing.T) {
 		lines[i] = strings.Repeat("x", 10)
 	}
 	testassert.NoError(t, os.WriteFile(filepath.Join(ws, "big.txt"), []byte(strings.Join(lines, "\n")), 0o644))
-	tc := runtime.ToolContext{
+	tc := ToolContext{
 		Workspace:     ws,
 		AdmittedEntry: harness.EntryRef{SessionID: "0123456789abcdef0123456789abcdef", EntryID: "fedcba9876543210fedcba9876543210"},
 		Invocation:    configured,

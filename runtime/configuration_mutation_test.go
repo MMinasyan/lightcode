@@ -256,7 +256,7 @@ func (p *writeSyncProbe) awaitWriteStarted(t *testing.T) {
 func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -326,7 +326,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 func TestConfigurationMutateIdenticalBytesStillWriteAndPublish(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -402,7 +402,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 			mu.Unlock()
 			return nil
 		}),
-		servicePlugin("tools", &h.opens, acceptValidator),
+		servicePlugin("capowner", &h.opens, acceptValidator),
 	)
 	svc.attachWarnings(newWarningStore())
 	{
@@ -510,7 +510,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 func TestConfigurationMutateEverySuccessfulEditWritesAndPublishes(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -541,7 +541,7 @@ func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 	h := newServiceHarness(t)
 	// No input files exist yet: the mutation must not create the non-owning
 	// file, and the owning file is born at mode 0600.
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	agentsPath := filepath.Join(h.dataDir, "agents.json")
 
 	candidate, err := svc.mutate(context.Background(), svc.editAgentModel("primary", "prov/m"))
@@ -757,37 +757,55 @@ func TestConfigurationMutateMalformedModelRefFailsWithoutWrite(t *testing.T) {
 // plugins member are removed by the whole-shape write instead — the
 // whole-plugins regression owns that axis.)
 func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing.T) {
-	sentinel := errors.New("tools settings invalid")
+	sentinel := errors.New("written settings invalid")
 	// rejectWritten accepts the absent section but rejects the mutation's
-	// written tools section (MaxOutputBytes 2048).
+	// written section (2048) for the fixture's own unrelated plugin id.
 	rejectWritten := func(raw json.RawMessage) error {
 		if strings.Contains(string(raw), "2048") {
 			return sentinel
 		}
 		return nil
 	}
+	// withSection returns the shared written settings plus one extra owned
+	// section, so a row can target one specific settings owner.
+	withSection := func(id, document string) protocol.Settings {
+		settings := mutationSettings()
+		settings.Plugins[id] = document
+		return settings
+	}
 	rows := []struct {
 		name       string
 		validate   func(json.RawMessage) error
 		external   string // the document an external editor writes before the edit
+		settings   protocol.Settings
 		wantSource string
 	}{
 		{
-			name:       "validator rejects the written section",
+			name:       "the baseline settings owner rejects the written section",
+			validate:   acceptValidator,
+			external:   mutationConfigDocument(),
+			settings:   withSection("tools", `{"max_output_bytes":0}`),
+			wantSource: "tools: max_output_bytes must be positive",
+		},
+		{
+			name:       "an unrelated plugin validator rejects its own written section",
 			validate:   rejectWritten,
 			external:   mutationConfigDocument(),
-			wantSource: "tools settings invalid",
+			settings:   withSection("capowner", `{"kept":2048}`),
+			wantSource: "written settings invalid",
 		},
 		{
 			name:       "externally malformed document",
 			validate:   acceptValidator,
 			external:   `{not json`,
+			settings:   mutationSettings(),
 			wantSource: "decode",
 		},
 		{
 			name:       "externally trailing document",
 			validate:   acceptValidator,
 			external:   mutationConfigDocument() + `{}`,
+			settings:   mutationSettings(),
 			wantSource: "after top-level value",
 		},
 	}
@@ -796,7 +814,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
 			svc := h.service(context.Background(),
-				servicePlugin("tools", &h.opens, row.validate),
+				servicePlugin("capowner", &h.opens, row.validate),
 				servicePlugin("alpha", &h.opens, acceptValidator))
 			{
 				_, err := svc.publish(context.Background())
@@ -812,7 +830,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 			// is the state that write left.
 			writeServiceFile(t, h.configPath, row.external)
 			before, published, warnRev := metadataBaseline(t, svc, h.configPath)
-			candidate, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
+			candidate, err := svc.mutate(context.Background(), editSettings(row.settings))
 			testassert.Require(t, candidate.snapshot == nil, "mutate = %+v, want a rejected candidate", candidate)
 			testassert.Require(t, row.wantSource == "" || strings.Contains(err.Error(), row.wantSource), "error %v does not preserve %q", err, row.wantSource)
 			assertMetadataRefused(t, svc, sub, h.configPath, before, published, warnRev, err, ErrConfiguration)
@@ -858,7 +876,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
 			writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), workerAgentsDocument)
 			svc := h.service(context.Background(),
-				servicePlugin("tools", &h.opens, acceptValidator),
+				servicePlugin("capowner", &h.opens, acceptValidator),
 				servicePlugin("alpha", &h.opens, acceptValidator))
 			{
 				_, err := svc.publish(context.Background())
@@ -897,7 +915,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 func TestConfigurationMutateMalformedPermissionsFallbackPublishes(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -926,7 +944,7 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, mutationConfigDocument())
 		ctx, cancel := context.WithCancel(context.Background())
-		svc := h.service(context.Background(), servicePlugin("tools", &h.opens, func(json.RawMessage) error {
+		svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
 			cancel()
 			return nil
 		}))
@@ -949,7 +967,7 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 		owner, cancelOwner := context.WithCancel(context.Background())
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, mutationConfigDocument())
-		svc := h.service(owner, servicePlugin("tools", &h.opens, acceptValidator))
+		svc := h.service(owner, servicePlugin("capowner", &h.opens, acceptValidator))
 		{
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
@@ -974,7 +992,7 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 func TestConfigurationMutateCompletesPublicationAfterWriteStarts(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -1021,7 +1039,7 @@ func TestConfigurationMutateCompletesPublicationAfterWriteStarts(t *testing.T) {
 func TestConfigurationMutateWriteFailureLeavesEverythingUnchanged(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -1056,7 +1074,7 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 	var builds atomic.Int64
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, func(json.RawMessage) error {
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
 		if builds.Add(1) == 2 { // the second build — the mutation — parks
 			entered <- struct{}{}
 			<-gate
@@ -1185,7 +1203,8 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "",
 			`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},"wide":{"name":"W","context_window":262144,"max_output_tokens":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
@@ -1308,7 +1327,7 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	var parked int32 // the validator parks only the edit build
 	arrive := make(chan struct{}, 1)
 	gate := make(chan struct{})
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, func(json.RawMessage) error {
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
 		if atomic.LoadInt32(&parked) == 1 {
 			arrive <- struct{}{} // signal from the validation stage; no I/O here
 			<-gate

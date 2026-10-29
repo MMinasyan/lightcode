@@ -203,8 +203,8 @@ func writeToolCallTurn(w http.ResponseWriter, id, name, args string) {
 }
 
 func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *workspaceOpens) []Plugin {
+	e.fixtureStore(store)
 	return []Plugin{
-		e.storagePlugin(store),
 		hookPlugin(hook),
 		{
 			ID:       "base",

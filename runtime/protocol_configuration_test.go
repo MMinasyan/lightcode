@@ -66,8 +66,8 @@ const configurationAgentsDocument = `{
 func settingsPlugins() []Plugin {
 	var opens atomic.Int64 // the fixture counters are unread here
 	return []Plugin{
-		servicePlugin("tools", &opens, func(json.RawMessage) error { return nil }),
-		servicePlugin("jobs", &opens, func(json.RawMessage) error { return nil }),
+		servicePlugin("capowner", &opens, func(json.RawMessage) error { return nil }),
+		servicePlugin("jobcap", &opens, func(json.RawMessage) error { return nil }),
 		servicePlugin("tasks", &opens, func(json.RawMessage) error { return nil }),
 		rosterToolPlugin(),
 	}
@@ -292,7 +292,8 @@ func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *own
 	t.Helper()
 	writeServiceFile(t, e.configPath, configDoc)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), agentsDoc)
-	r, err := e.open(context.Background(), append([]Plugin{e.storagePlugin(store)}, extra...)...)
+	e.fixtureStore(store)
+	r, err := e.open(context.Background(), extra...)
 	testassert.NoError(t, err)
 	return r, e
 }

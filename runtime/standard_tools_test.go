@@ -1,4 +1,4 @@
-package tools
+package runtime
 
 import (
 	"context"
@@ -13,16 +13,12 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
-// Direct plugin contract tests. Outside the runtime package only the zero
-// Invocation is constructible, so Normalize/Prepare here exercise the
-// defaults path; configuration-bearing behavior is covered by
-// ValidateConfig directly and by the runtime-composed tests in the runtime
-// package. These tests never open the plugin — the tools plugin requires the
-// jobs capability, whose binding only the composed Runtime scope constructs —
-// so the concrete tool values are built from one instance directly.
+// Direct standard-tool contract tests: the baseline tool values are built
+// from one constructed state the way the owner composes them; the zero
+// Invocation exercises the defaults path, and configuration-bearing behavior
+// is covered by the publication tests in the runtime package.
 
 // testEntry is a valid-looking Harness admitted-input identity.
 const (
@@ -30,29 +26,20 @@ const (
 	testEntryID   = "fedcba9876543210fedcba9876543210"
 )
 
-// directTools constructs the plugin's tool exports from one instance the
-// way open publishes them, without opening the plugin.
-func directTools(dataDir string) map[string]runtime.Tool {
-	inst := &instance{dataDir: dataDir}
-	return map[string]runtime.Tool{
-		"read_file":   readTool{inst},
-		"write_file":  writeTool{inst},
-		"edit_file":   editTool{inst},
-		"apply_patch": patchTool{inst},
-		"run_command": runCommandTool{inst},
-		"process":     processTool{inst},
-		"sleep":       sleepTool{},
-	}
+// directTools constructs the baseline tool values over one data root with no
+// jobs service, the way newStandardTools composes them.
+func directTools(dataDir string) map[string]Tool {
+	return newStandardTools(dataDir, nil)
 }
 
 // callToolContext is the ToolContext the direct tests prepare with: a real
 // temporary Workspace, a valid-looking admitted-input identity, the zero
 // Invocation (defaults), and the given constraints.
-func callToolContext(workspace string, constraints runtime.ToolConstraints) runtime.ToolContext {
-	return runtime.ToolContext{
+func callToolContext(workspace string, constraints ToolConstraints) ToolContext {
+	return ToolContext{
 		Workspace:     workspace,
 		AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
-		Invocation:    runtime.Invocation{},
+		Invocation:    Invocation{},
 		Constraints:   constraints,
 	}
 }
@@ -65,13 +52,13 @@ func makeCall(t *testing.T, name, args string) model.ToolCall {
 }
 
 // prepare normalizes and prepares one call, returning the plan.
-func prepare(t *testing.T, tool runtime.Tool, tc runtime.ToolContext, name, args string) harness.PreparedTool {
+func prepare(t *testing.T, tool Tool, tc ToolContext, name, args string) harness.PreparedTool {
 	t.Helper()
 	return tool.Prepare(context.Background(), tc, makeCall(t, name, args))
 }
 
 // normalize runs one tool's normalization over raw argument bytes.
-func normalize(t *testing.T, tool runtime.Tool, tc runtime.ToolContext, name, args string) (json.RawMessage, error) {
+func normalize(t *testing.T, tool Tool, tc ToolContext, name, args string) (json.RawMessage, error) {
 	t.Helper()
 	return tool.Normalize(tc, makeCall(t, name, args))
 }
@@ -84,7 +71,7 @@ func groupDir(dataDir, sessionID, entryID string) string {
 
 func TestValidateConfigSettings(t *testing.T) {
 	validate := func(raw string) error {
-		return Plugin().ValidateConfig(json.RawMessage(raw))
+		return validateToolsSettings(json.RawMessage(raw))
 	}
 	for _, raw := range []string{
 		"", " ", "{}", "null",
@@ -125,7 +112,7 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 	// The describe functions are static method values needing no instance;
 	// the composed open contract is asserted in the runtime package's
 	// composed tools suite.
-	describe := map[string]func(runtime.Invocation, runtime.ToolConstraints, harness.SessionIdentity) (runtime.ToolDescription, error){
+	describe := map[string]func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error){
 		"read_file":   readTool{}.describe,
 		"write_file":  writeTool{}.describe,
 		"edit_file":   editTool{}.describe,
@@ -137,20 +124,18 @@ func TestDescribeAvailabilityAndDefinitions(t *testing.T) {
 
 	cases := []struct {
 		name        string
-		constraints runtime.ToolConstraints
+		constraints ToolConstraints
 		available   map[string]bool
 	}{
-		{"unconstrained agent", runtime.ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
-		{"readonly without write dir", runtime.ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false, "run_command": true, "process": true, "sleep": true}},
-		{"readonly with write dir", runtime.ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
+		{"unconstrained agent", ToolConstraints{}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
+		{"readonly without write dir", ToolConstraints{Readonly: true}, map[string]bool{"read_file": true, "write_file": false, "edit_file": false, "apply_patch": false, "run_command": true, "process": true, "sleep": true}},
+		{"readonly with write dir", ToolConstraints{Readonly: true, WriteDir: "/w"}, map[string]bool{"read_file": true, "write_file": true, "edit_file": true, "apply_patch": true, "run_command": true, "process": true, "sleep": true}},
 	}
 	for _, tc := range cases {
 		for name, want := range tc.available {
-			got, err := describe[name](runtime.Invocation{}, tc.constraints, harness.SessionIdentity{})
+			got, err := describe[name](Invocation{}, tc.constraints, harness.SessionIdentity{})
 			testassert.Require(t, err == nil, "%s: describe %s: %v", tc.name, name, err)
 			testassert.Check(t, got.Available == want, "%s: describe %s Available = %v, want %v", tc.name, name, got.Available, want)
-			wantHidden := name == "apply_patch"
-			testassert.Check(t, got.DefaultHidden == wantHidden, "%s: describe %s DefaultHidden = %v, want %v", tc.name, name, got.DefaultHidden, wantHidden)
 			testassert.Check(t, got.Definition.Name == name, "%s: describe %s declares name %q", tc.name, name, got.Definition.Name)
 			testassert.Check(t, got.Definition.Description != "" && json.Valid(got.Definition.Parameters), "%s: describe %s produced an unusable definition", tc.name, name)
 		}
@@ -182,7 +167,7 @@ const wantRunCommandDescription = `Executes a shell command and returns combined
 - Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
-- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use <EDIT FILE OR WRITE FILE>.`
+- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file.`
 
 // wantRunCommandParameters is the independent golden fixture for the one
 // run_command schema the ordinary and readonly surfaces share.
@@ -236,12 +221,12 @@ const wantProcessParameters = `{
 // expectations are independent test-local fixtures, not the production
 // constants.
 func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
-	ordinary, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
+	ordinary, err := runCommandTool{}.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{})
 	testassert.NoError(t, err)
 	testassert.Check(t, ordinary.Definition.Description == wantRunCommandDescription, "ordinary description = %q, want the retained description %q", ordinary.Definition.Description, wantRunCommandDescription)
 	assertJSONEqual(t, ordinary.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
 
-	readonly, err := runCommandTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{Readonly: true}, harness.SessionIdentity{})
+	readonly, err := runCommandTool{}.describe(Invocation{}, ToolConstraints{Readonly: true}, harness.SessionIdentity{})
 	testassert.NoError(t, err)
 	testassert.Check(t, readonly.Definition.Description == tool.ReadOnlyRunCommandDescription, "readonly description = %q, want the retained readonly description", readonly.Definition.Description)
 	assertJSONEqual(t, readonly.Definition.Parameters, json.RawMessage(wantRunCommandParameters))
@@ -251,16 +236,16 @@ func TestRunCommandDescriptionsAndSchemasMatchRetained(t *testing.T) {
 // TestProcessDescriptionAndSchemaMatchRetained pins the process tool's
 // model-visible surface to the independent test-local fixtures.
 func TestProcessDescriptionAndSchemaMatchRetained(t *testing.T) {
-	got, err := processTool{}.describe(runtime.Invocation{}, runtime.ToolConstraints{}, harness.SessionIdentity{})
+	got, err := processTool{}.describe(Invocation{}, ToolConstraints{}, harness.SessionIdentity{})
 	testassert.NoError(t, err)
 	testassert.Check(t, got.Definition.Description == wantProcessDescription, "process description = %q, want the retained description %q", got.Definition.Description, wantProcessDescription)
 	assertJSONEqual(t, got.Definition.Parameters, json.RawMessage(wantProcessParameters))
-	testassert.Check(t, got.Definition.Name == "process" && got.Available && !got.DefaultHidden, "process definition = %+v, want name process, available, not hidden", got)
+	testassert.Check(t, got.Definition.Name == "process" && got.Available, "process definition = %+v, want name process and available", got)
 }
 
 func TestNormalizeArguments(t *testing.T) {
 	byID := directTools(t.TempDir())
-	tc := callToolContext(t.TempDir(), runtime.ToolConstraints{})
+	tc := callToolContext(t.TempDir(), ToolConstraints{})
 
 	t.Run("read_file applies defaults and strips private fields", func(t *testing.T) {
 		raw, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a.txt","_lightcode_receipt":"x"}`)
@@ -379,7 +364,7 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 		t.Run(cell.name, func(t *testing.T) {
 			byID := directTools(t.TempDir())
 			var workspace, link, flipTo, preFlipWriteDir string
-			var constraints runtime.ToolConstraints
+			var constraints ToolConstraints
 			if cell.slot == "root" {
 				realA, realB := t.TempDir(), t.TempDir()
 				flipTo = realB
@@ -393,7 +378,7 @@ func TestPrepareBindingSurvivesCanonicalPathsRepoint(t *testing.T) {
 				preFlipWriteDir = wdA
 				link = filepath.Join(workspace, "wd")
 				testassert.NoError(t, os.Symlink(wdA, link))
-				constraints = runtime.ToolConstraints{WriteDir: "wd"}
+				constraints = ToolConstraints{WriteDir: "wd"}
 			}
 			if cell.content != "" {
 				testassert.NoError(t, os.WriteFile(filepath.Join(flipTo, "target.txt"), []byte(cell.content), 0o644))

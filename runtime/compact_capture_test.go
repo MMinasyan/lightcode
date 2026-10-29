@@ -89,7 +89,7 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture
 
 func compactToolsPlugin() Plugin {
 	return Plugin{
-		ID:       "tools",
+		ID:       "compacttools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {

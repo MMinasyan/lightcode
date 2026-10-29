@@ -42,7 +42,6 @@ func (resolver) Resolve(ref model.ModelRef) (runtime.Adaptation, error) {
 	}
 	return runtime.Adaptation{
 		ExcludeTools:                match.ExcludeTools,
-		IncludeTools:                match.IncludeTools,
 		Blocks:                      match.Blocks,
 		Additions:                   match.Additions,
 		ToolDescriptionReplacements: match.ToolDescriptionReplacements,

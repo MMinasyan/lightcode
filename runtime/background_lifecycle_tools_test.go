@@ -1,4 +1,4 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
@@ -15,18 +15,14 @@ import (
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/plugins/jobs"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
-// The real-plugin background-lifecycle rows: the jobs capability, the
-// run_command background start, and the process tool run against real
-// background processes through the composed tools fixture — the real jobs
-// and tools plugins composed in one scope over a real Harness — with the
-// per-Session job limit, the retained immediate and limit texts, and the
-// per-Session stop scope proving no process-global stop. The in-package
-// suite composes the same rows through the Runtime's own surfaces where the
-// plugin import cycle allows it.
+// The real-jobs background-lifecycle rows: the jobs service, the run_command
+// background start, and the process tool run against real background
+// processes through the composed tools fixture — the directly constructed
+// baseline tools over the real jobs service on one data root and a real
+// Harness — with the per-Session job limit, the retained immediate and limit
+// texts, and the per-Session stop scope proving no process-global stop.
 
 // backgroundIDPattern extracts one started background job identity from a
 // retained immediate result.
@@ -56,8 +52,8 @@ func lifecycleRequestText(req model.Request) string {
 	return b.String()
 }
 
-// lastUserText returns the last user message's text of one model request.
-func lastUserText(req model.Request) string {
+// requestUserText returns the last user message's text of one model request.
+func requestUserText(req model.Request) string {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role != "user" {
 			continue
@@ -92,10 +88,10 @@ func lastToolText(req model.Request) string {
 	return text.String()
 }
 
-// lastMessageRole returns the wire role of one model request's final
+// requestMessageRole returns the wire role of one model request's final
 // message: a tool result ends the current operation's follow-up turn, while
 // an earlier operation's tool results must not short-circuit a new one.
-func lastMessageRole(req model.Request) model.Role {
+func requestMessageRole(req model.Request) model.Role {
 	if len(req.Messages) == 0 {
 		return ""
 	}
@@ -170,8 +166,8 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	reads := 0
 	readCallID := "call-b-read"
 	modelFn := func(_ context.Context, req model.Request) (model.Stream, error) {
-		prompt := lastUserText(req)
-		if lastMessageRole(req) == "tool" {
+		prompt := requestUserText(req)
+		if requestMessageRole(req) == "tool" {
 			// Readiness rendezvous through the model loop: while the turn
 			// following the read call still lacks the process output (the
 			// capture returned its placeholder), emit another read instead
@@ -213,10 +209,10 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 			return stopStream("done"), nil
 		}
 	}
-	invocation, err := runtime.ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_background_processes":1}`})
+	invocation, err := ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_background_processes":1}`})
 	testassert.NoError(t, err)
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		jobsPlugin:    jobs.Plugin(),
+		realJobs:      true,
 		advertise:     []string{"run_command", "process"},
 		background:    background,
 		invocation:    invocation,

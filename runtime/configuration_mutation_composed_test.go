@@ -35,6 +35,24 @@ func composedMutationSettings() protocol.Settings {
 	}
 }
 
+// mutationEnv is this suite's own isolated composition environment: a
+// throwaway home and one config file over a dedicated data root. The
+// in-package suite keeps its copy because internal/plugins/* cannot be
+// imported from package runtime's own tests.
+type mutationEnv struct {
+	dataDir    string
+	configPath string
+}
+
+func newMutationEnv(t *testing.T) mutationEnv {
+	t.Helper()
+	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(configDir, "config.json")
+	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`), 0o600))
+	return mutationEnv{dataDir: dataDir, configPath: configPath}
+}
+
 // TestComposedSettingsMutationThroughRealValidators proves the settings PUT
 // end to end over the shipped plugin set: a valid whole-shape write is
 // validated by the real plugins' validators, rewritten to the owning file,
@@ -42,7 +60,7 @@ func composedMutationSettings() protocol.Settings {
 // tools validator rejects changes no file, generation, warning, or event.
 func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	ctx := context.Background()
-	e := newComposeEnv(t)
+	e := newMutationEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
 	testassert.NoError(t, err)
 	sub, err := r.Subscribe(8)
@@ -108,7 +126,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 // while an unknown type fails invalid without creating a bare entry.
 func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	ctx := context.Background()
-	e := newComposeEnv(t)
+	e := newMutationEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
 	testassert.NoError(t, err)
 	agentsPath := filepath.Join(filepath.Dir(e.configPath), "agents.json")

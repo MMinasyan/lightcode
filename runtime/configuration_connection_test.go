@@ -1406,7 +1406,7 @@ func TestMutationResultStaysFrozenAfterNextPublication(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	env := config.NewManagedEnvForTest(filepath.Join(h.dataDir, ".env"))
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	svc.attachWarnings(newWarningStore())
 	svc.attachEnv(env)
 	{
@@ -2382,7 +2382,7 @@ func TestCreateProviderNilManagedEnvTypedFailure(t *testing.T) {
 	// no second manager is constructed on demand.
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, providerConfigFile("One"))
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	svc.attachWarnings(newWarningStore())
 	{
 		_, err := svc.publish(context.Background())
@@ -2497,7 +2497,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
 
-		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), connectEnvEchoPlugin())
+		r, err := e.openPlugins(ctx, connectEnvEchoPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 

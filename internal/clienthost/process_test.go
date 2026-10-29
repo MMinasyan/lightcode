@@ -33,7 +33,6 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -167,22 +166,35 @@ func runShapedChild(dataDir, configPath, version string, park bool) {
 	awaitStopAndClose(r)
 }
 
-// openRuntime opens the production sqlite plugin declaration through the
-// public Runtime constructor, wrapping its test-only factory callback with the
-// per-attempt marker. No controlled preparation or private constructor is
-// used.
-func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
-	plugins := []runtime.Plugin{sqlite.Plugin()}
-	for index := range plugins {
-		plugin := plugins[index]
-		open := plugin.Open
-		plugin.Open = func(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings) (runtime.Instance, error) {
-			markFactory(plugin.ID)
-			return open(ctx, info, bindings)
-		}
-		plugins[index] = plugin
+// attemptMarkerPlugin is one inert Runtime-scoped plugin: its factory runs
+// only after the ownership lock and the initial publication are acquired, so a
+// losing attempt's zero factories stay provable per attempt. The store and the
+// standard tools are directly constructed by the owner and declare no factory.
+func attemptMarkerPlugin() runtime.Plugin {
+	return runtime.Plugin{
+		ID:       "attempt",
+		Scope:    runtime.ScopeRuntime,
+		Provides: []runtime.CapabilitySpec{runtime.Spec[attemptCloser]("attempt.closer")},
+		Open: func(context.Context, runtime.ScopeInfo, runtime.Bindings) (runtime.Instance, error) {
+			markFactory("attempt")
+			return runtime.Instance{Values: map[string]any{"attempt.closer": attemptCloser{}}}, nil
+		},
 	}
-	return runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
+}
+
+// attemptCloser is the marker plugin's exported value type: a closer that
+// does nothing but keeps the declaration a real capability.
+type attemptCloser struct{}
+
+// openRuntime opens one real Runtime through the public constructor with the
+// per-attempt factory marker. No controlled preparation or private constructor
+// is used.
+func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
+	return runtime.Open(context.Background(), runtime.Options{
+		DataDir:    dataDir,
+		ConfigPath: configPath,
+		Plugins:    []runtime.Plugin{attemptMarkerPlugin()},
+	})
 }
 
 // shapeHealth starts one test-only health server over the record's published

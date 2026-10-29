@@ -35,7 +35,8 @@ func openProjectionRuntime(t *testing.T, store harness.Storage) (*Runtime, *owne
 	t.Helper()
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
-	r, err := e.open(context.Background(), e.storagePlugin(store))
+	e.fixtureStore(store)
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	return r, e
 }

@@ -365,7 +365,8 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	for i, name := range []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"} {
 		e.argHooks[i] = &recordArgumentHook{replace: json.RawMessage(`{"repaired":"` + name + `"}`)}
 	}
-	r, err := e.open(context.Background(), append(e.plugins(), e.storagePlugin(store))...)
+	e.fixtureStore(store)
+	r, err := e.open(context.Background(), e.plugins()...)
 	testassert.NoError(t, err)
 	e.r = r
 	t.Cleanup(func() { _ = e.converge() })
@@ -662,10 +663,9 @@ func TestPreparationHappyPathThroughHarness(t *testing.T) {
 		}
 
 		// Hooks ran in selected order inside the preparation guard; the owner's
-		// storage plugin opened first at public Open; reverse disposal closed
-		// the Agent scope before the Operation scope.
+		// store is directly constructed, so no factory precedes them; reverse
+		// disposal closed the Agent scope before the Operation scope.
 		wantEvents := []string{
-			"open:core",
 			"hook:hook.first", "hook:hook.second",
 			"op-open:op-1", "ag-open",
 			"ag-close", "op-close",

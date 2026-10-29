@@ -53,7 +53,6 @@ func TestProductionBundledDataIsValid(t *testing.T) {
 		testassert.Check(t, tbl[i].pattern == e.Pattern, "row %d: loader pattern %q != fixture %q", i, tbl[i].pattern, e.Pattern)
 		testassert.Check(t, maps.Equal(tbl[i].adapt.Additions, e.Additions) &&
 			slices.Equal(tbl[i].adapt.ExcludeTools, e.ExcludeTools) &&
-			slices.Equal(tbl[i].adapt.IncludeTools, e.IncludeTools) &&
 			maps.Equal(tbl[i].adapt.ToolDescriptionReplacements, e.ToolDescriptionReplacements), "row %d (%q): loaded adaptation outputs %+v != fixture row %+v", i, e.Pattern, tbl[i].adapt, e)
 	}
 }
@@ -98,28 +97,26 @@ func TestProductionBundledDataAdditionsUseValidSectionIDs(t *testing.T) {
 	}
 }
 
-func TestProductionBundledDataHasToolDescriptionDefaults(t *testing.T) {
+func TestProductionBundledDataReplacementKeysAreLiteralNonEmpty(t *testing.T) {
 	doc := loadFixture(t)
-	testassert.Require(t, len(doc.Defaults.ToolDescriptionReplacements) != 0, "fixture defaults.tool_description_replacements is empty")
-	for _, key := range []string{"<EDIT FILE OR WRITE FILE>"} {
-		{
-			_, ok := doc.Defaults.ToolDescriptionReplacements[key]
-			testassert.Require(t, ok, "fixture missing default tool description replacement %q", key)
+	matched := false
+	for _, e := range doc.Entries {
+		for key, value := range e.ToolDescriptionReplacements {
+			matched = true
+			testassert.Check(t, key != "", "entry %q has an empty tool_description_replacements key", e.Pattern)
+			testassert.Check(t, value != "", "entry %q tool_description_replacements[%q] is empty", e.Pattern, key)
 		}
 	}
+	testassert.Require(t, matched, "no fixture row carries a tool_description_replacements override")
 }
 
-func TestBundledEntryRejectsUnknownToolDescriptionReplacement(t *testing.T) {
+func TestBundledEntryRejectsEmptyToolDescriptionReplacementKey(t *testing.T) {
 	err := validateBundledEntry(0, bundledEntry{
-		Pattern: "model-*",
-		Name:    "model",
-		ToolDescriptionReplacements: map[string]string{
-			"<UNKNOWN>": "value",
-		},
-	}, bundledDefaults{ToolDescriptionReplacements: map[string]string{
-		"<KNOWN>": "value",
-	}})
-	testassert.Require(t, err != nil && strings.Contains(err.Error(), "has no default replacement"), "validateBundledEntry err = %v, want unknown replacement key error", err)
+		Pattern:                     "model-*",
+		Name:                        "model",
+		ToolDescriptionReplacements: map[string]string{"": "value"},
+	})
+	testassert.Require(t, err != nil && strings.Contains(err.Error(), "key is empty"), "validateBundledEntry err = %v, want the empty replacement key rejection", err)
 }
 
 func indexOf(doc bundledDoc, want bundledEntry) int {

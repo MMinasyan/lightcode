@@ -153,7 +153,8 @@ func drainClosed(t *testing.T, sub *Subscription) []Event {
 
 func TestRuntimeSubscribeValidatesCapacityAndUsesTheClosedGate(t *testing.T) {
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	{
 		_, err := r.Subscribe(0)
@@ -182,8 +183,8 @@ func TestRuntimeSubscribeValidatesCapacityAndUsesTheClosedGate(t *testing.T) {
 
 func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
 	r, err := e.open(context.Background(),
-		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
 	testassert.NoError(t, err)
 	sub, err := r.Subscribe(16)
@@ -216,8 +217,8 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 
 func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
 	r, err := e.open(context.Background(),
-		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
 	testassert.NoError(t, err)
 	defer func() {
@@ -344,7 +345,8 @@ func pauseObservation(t *testing.T, o *observation, event Event) (<-chan struct{
 
 func TestObservationSaturatedSubscriberIsRemovedAndHealthyOnesContinue(t *testing.T) {
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	full, err := r.Subscribe(1)
 	testassert.NoError(t, err)
@@ -387,7 +389,8 @@ func TestObservationSaturatedSubscriberIsRemovedAndHealthyOnesContinue(t *testin
 
 func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	healthy, err := r.Subscribe(64)
 	testassert.NoError(t, err)
@@ -456,8 +459,8 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 
 func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
 	r, err := e.open(context.Background(),
-		e.storagePlugin(storage.NewMemory()),
 		e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
 	testassert.NoError(t, err)
 	stalled, err := r.Subscribe(1)
@@ -494,7 +497,8 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		r, err := e.open(context.Background(), e.storagePlugin(store),
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(),
 			e.ordinaryPlugin("w", ScopeWorkspace, "w.cap"))
 		testassert.NoError(t, err)
 		session, err := r.createSession(context.Background(), e.dataDir, "solo")

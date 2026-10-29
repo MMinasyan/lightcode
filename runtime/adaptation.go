@@ -7,11 +7,12 @@ import (
 )
 
 // Adaptation is the public per-model treatment value a ModelAdaptation
-// resolves: which registered tools the model is shown, which coaching blocks
-// join its system prompt, and which per-section additions and tool-description
-// replacements apply. The zero value is a valid no-op baseline.
+// resolves: which registered tools the model is hidden from, which coaching
+// blocks join its system prompt, and which per-section additions and
+// tool-description replacements apply. The zero value is a valid no-op
+// baseline.
 type Adaptation struct {
-	ExcludeTools, IncludeTools, Blocks     []string
+	ExcludeTools, Blocks                   []string
 	Additions, ToolDescriptionReplacements map[string]string
 }
 

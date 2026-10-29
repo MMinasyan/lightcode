@@ -150,7 +150,9 @@ func openCodeRuntime(t *testing.T, store harness.Storage) *codeRuntime {
 	// text turns and manual compaction.
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
-	r, _, err := e.openSwept(context.Background(), e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, newLifecycleStopper()))
+	e.fixtureStore(store)
+	e.fixtureJobs(newLifecycleStopper())
+	r, _, err := e.openSwept(context.Background())
 	testassert.NoError(t, err)
 	return &codeRuntime{t: t, store: store, r: r, e: e}
 }
@@ -1379,7 +1381,9 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
 		stopper := &stubStopper{events: e.events}
-		r, err := e.open(context.Background(), e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
+		e.fixtureStore(store)
+		e.fixtureJobs(stopper)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		workspace := filepath.Join(e.home, "wake-ws")
@@ -1459,7 +1463,8 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 		e := newOwnerEnv(t)
 		var fail atomic.Bool
 		fail.Store(true)
-		r, err := e.open(context.Background(), e.storagePlugin(store), failingAgentFactoryPlugin(&fail))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(), failingAgentFactoryPlugin(&fail))
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		workspace := filepath.Join(e.home, "openerr-ws")
@@ -1512,7 +1517,8 @@ func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 		e := newOwnerEnv(t)
 		closeGate := make(chan struct{})
 		closeStarted := make(chan struct{}, 1)
-		r, err := e.open(context.Background(), e.storagePlugin(store), parkingAgentClosePlugin(closeStarted, closeGate))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(), parkingAgentClosePlugin(closeStarted, closeGate))
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		workspace := filepath.Join(e.home, "cleanup-ws")

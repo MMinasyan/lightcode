@@ -854,7 +854,7 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"tools":["tool.x"]}}`)
 	describeCalled := false
 	toolPlugin := Plugin{
-		ID:    "tools",
+		ID:    "tooldecl",
 		Scope: ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("tool.x", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 			describeCalled = true
