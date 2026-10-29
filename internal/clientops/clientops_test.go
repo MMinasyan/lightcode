@@ -102,7 +102,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"6"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"7"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -230,20 +230,6 @@ var dispatchCases = []dispatchCase{
 		status: 200, response: `{"path":"/ws/a.go","content":"package a"}`,
 		method: "POST", path: "/v1/workspaces/files/read",
 		body: `{"workspace":"/ws","path":"a.go"}`,
-	},
-	{
-		name: "GetRetainedCodeSnapshots", operation: "GetRetainedCodeSnapshots",
-		params: `{"query":{"workspace":"/ws","session_id":"0123456789abcdef0123456789abcdef"}}`,
-		status: 200, response: `{"turns":[]}`,
-		method: "GET", path: "/v1/retained-code-snapshots",
-		rawQuery: "workspace=%2Fws&session_id=0123456789abcdef0123456789abcdef",
-	},
-	{
-		name: "RevertRetainedCode", operation: "RevertRetainedCode",
-		params: `{"body":{"session_id":"0123456789abcdef0123456789abcdef","turn":1}}`,
-		status: 200, response: `{"restored":["a.go"],"skipped":[]}`,
-		method: "POST", path: "/v1/retained-code-snapshots/revert",
-		body: `{"session_id":"0123456789abcdef0123456789abcdef","turn":1}`,
 	},
 	{
 		name: "GetConfiguration with opaque overflow extra_body numbers", operation: "GetConfiguration",
@@ -430,7 +416,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"6"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"7"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		testassert.Require(t, err == nil, "Call(GetHealth, %q) = %v", params, err)
@@ -478,7 +464,6 @@ func TestCallRejectsForbiddenEnvelope(t *testing.T) {
 		{"optional query has an unknown member", "GetSessionHistory", `{"session_id":"s1","query":{"bogus":1}}`},
 		{"query has an unknown member", "ListSessions", `{"query":{"workspace":"/ws","lifecycle":"open","x":1}}`},
 		{"query member has the wrong type", "ListModels", `{"query":{"all":"yes"}}`},
-		{"retained session_id is not the outer envelope member", "GetRetainedCodeSnapshots", `{"session_id":"s1","query":{"workspace":"/ws","session_id":"s1"}}`},
 		{"undeclared body", "GetHealth", `{"body":{}}`},
 		{"missing body", "CreateSession", `{}`},
 		{"null body", "CreateSession", `{"body":null}`},

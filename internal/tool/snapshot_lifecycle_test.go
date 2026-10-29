@@ -13,7 +13,7 @@ import (
 // the fixture's known group directory, as production does.
 func revertLifecycleGroup(t *testing.T, store testCodeGroupStore) (snapshot.RevertResult, error) {
 	t.Helper()
-	return snapshot.RevertCodeGroups([]string{store.groupDir}, 0)
+	return snapshot.RevertCodeGroups([]string{store.groupDir})
 }
 
 func TestWriteFileRetainsSnapshotWhenTargetChangesBeforeMutation(t *testing.T) {
@@ -135,7 +135,7 @@ func TestFailedValidationDoesNotDiscardPreviouslyRetainedSnapshot(t *testing.T) 
 	assertFileContent(t, path, "before")
 }
 
-func TestWriteFileSameTurnSecondWriteControlsSnapshotIdentity(t *testing.T) {
+func TestWriteFileSameGroupSecondWriteControlsSnapshotIdentity(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	store := newSnapshotLifecycleStore(t)
@@ -293,11 +293,11 @@ func withMutationFailure(t *testing.T, target string, step mutationFailureStep) 
 	})
 }
 
-// newSnapshotLifecycleStore opens one real artifact code group with explicit
-// group and turn identity for the snapshot-lifecycle rows.
+// newSnapshotLifecycleStore opens one real artifact code group
+// group for the snapshot-lifecycle rows.
 func newSnapshotLifecycleStore(t *testing.T) testCodeGroupStore {
 	t.Helper()
-	return newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 1)
+	return newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))
 }
 
 func snapshotLifecycleFile(t *testing.T, root, name, content string) string {

@@ -133,7 +133,7 @@ func TestApplyPatchRecordsSnapshotIdentityForAddUpdateAndDelete(t *testing.T) {
 	addPath := filepath.Join(dir, "new.txt")
 	testassert.NoError(t, os.WriteFile(updatePath, []byte("a\nB\nc"), 0o644))
 	testassert.NoError(t, os.WriteFile(deletePath, []byte("remove me"), 0o644))
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 4)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+created\n*** Update File: update.txt\n@@\n a\n-B\n+B2\n c\n*** Delete File: delete.txt")
 	{
@@ -141,9 +141,9 @@ func TestApplyPatchRecordsSnapshotIdentityForAddUpdateAndDelete(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 
-	assertSnapshotIdentityContent(t, store.identityRecords, 4, store.entryIDFor(addPath), "created")
-	assertSnapshotIdentityContent(t, store.identityRecords, 4, store.entryIDFor(updatePath), "a\nB2\nc")
-	assertSnapshotIdentityAbsent(t, store.identityRecords, 4, store.entryIDFor(deletePath))
+	assertSnapshotIdentityContent(t, store.identityRecords, store.entryIDFor(addPath), "created")
+	assertSnapshotIdentityContent(t, store.identityRecords, store.entryIDFor(updatePath), "a\nB2\nc")
+	assertSnapshotIdentityAbsent(t, store.identityRecords, store.entryIDFor(deletePath))
 }
 
 func TestApplyPatchSnapshotsEveryTouchedFile(t *testing.T) {
@@ -152,7 +152,7 @@ func TestApplyPatchSnapshotsEveryTouchedFile(t *testing.T) {
 	updated := filepath.Join(dir, "x.txt")
 	testassert.NoError(t, os.WriteFile(src, []byte("a\nB\nc"), 0o644))
 	testassert.NoError(t, os.WriteFile(updated, []byte("a\nB\nc"), 0o644))
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 7)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	input := applyPatchInput(t, "*** Update File: x.txt\n@@\n a\n-B\n+B2\n c\n*** Update File: old.go\n*** Move to: new.go\n@@\n a\n-B\n+B2\n c")
 	{
@@ -160,11 +160,8 @@ func TestApplyPatchSnapshotsEveryTouchedFile(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	// Expected snapshots: updated (Update), new.go (Move dest, Existed:false),
-	// old.go (Move source, Existed:true). That's 3 snapshot calls under turn=7.
+	// old.go (Move source, Existed:true). That's 3 snapshot calls.
 	testassert.Equal(t, len(store.calls), 3)
-	for _, c := range store.calls {
-		testassert.Equal(t, c.turn, 7)
-	}
 }
 
 func TestApplyPatchAddFailsIfFileExists(t *testing.T) {

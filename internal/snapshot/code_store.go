@@ -8,8 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"syscall"
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
@@ -19,18 +17,19 @@ import (
 
 // CodeStore owns the code-only snapshot implementation: the snapshot-root
 // state, capture, last-write identity replacement and recording, listing and
-// restore. It knows nothing about conversation, claims, session metadata,
-// transcript, tokens or compaction files — an isolated target code group is
-// addressed through OpenCodeStore with no conversation state at all. One
-// production call owns one handle; its sub-operations run sequentially, so
-// the store keeps no cross-call claim state.
+// restore. One group holds one fixed entry directory, snapshots/1. It knows
+// nothing about conversation, claims, session metadata, transcript, tokens or
+// compaction files — an isolated target code group is addressed through
+// OpenCodeStore with no conversation state at all. One production call owns
+// one handle; its sub-operations run sequentially, so the store keeps no
+// cross-call claim state.
 type CodeStore struct {
 	snapshotsDir string
 }
 
 // OpenCodeStore returns a code store rooted at directory/snapshots. It
-// creates no directories, conversation, turn or claim; snapshot writes begin
-// only in the allowed effect.
+// creates no directories or conversation state; snapshot writes begin only
+// in the allowed effect.
 func OpenCodeStore(directory string) (*CodeStore, error) {
 	if directory == "" {
 		return nil, errors.New("snapshot: code store directory is empty")
@@ -39,14 +38,11 @@ func OpenCodeStore(directory string) (*CodeStore, error) {
 }
 
 // SnapshotResolvedEntry captures the first preimage of one canonical target
-// under the turn and reports the concrete entry id plus whether this call
-// created the entry. A caller discards only an entry its own created flag
-// says it created, and only when no mutation started; an existing first
-// preimage survives later failures.
-func (c *CodeStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
-	if err := validateSnapshotTurn(turn); err != nil {
-		return "", false, err
-	}
+// and reports the concrete entry id plus whether this call created the entry.
+// A caller discards only an entry its own created flag says it created, and
+// only when no mutation started; an existing first preimage survives later
+// failures.
+func (c *CodeStore) SnapshotResolvedEntry(originalPath, canonicalPath string) (string, bool, error) {
 	snapshotsDir := c.snapshotsDir
 	realPath, err := filepath.EvalSymlinks(canonicalPath)
 	if err != nil {
@@ -60,7 +56,7 @@ func (c *CodeStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath 
 		return "", false, fmt.Errorf("snapshot: stat %s: %w", canonicalPath, err)
 	}
 	pathHash := hashString(realPath)
-	entryDir := filepath.Join(snapshotsDir, strconv.Itoa(turn), pathHash)
+	entryDir := filepath.Join(snapshotsDir, groupEntriesDir, pathHash)
 	metaPath := filepath.Join(entryDir, "meta.json")
 	if _, err := os.Stat(metaPath); err == nil {
 		return pathHash, false, nil
@@ -108,14 +104,11 @@ func (c *CodeStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath 
 // DiscardSnapshotEntry removes a snapshot entry. Callers only discard entries
 // their own SnapshotResolvedEntry created, and only while no mutation has
 // started; a created flag that is false leaves the entry untouched.
-func (c *CodeStore) DiscardSnapshotEntry(turn int, entryID string) error {
-	if err := validateSnapshotTurn(turn); err != nil {
-		return err
-	}
+func (c *CodeStore) DiscardSnapshotEntry(entryID string) error {
 	if err := validateSnapshotEntryID(entryID); err != nil {
 		return err
 	}
-	entryDir := filepath.Join(c.snapshotsDir, strconv.Itoa(turn), entryID)
+	entryDir := filepath.Join(c.snapshotsDir, groupEntriesDir, entryID)
 	if err := os.RemoveAll(entryDir); err != nil {
 		return fmt.Errorf("snapshot: discard %s: %w", entryDir, err)
 	}
@@ -126,14 +119,11 @@ func (c *CodeStore) DiscardSnapshotEntry(turn int, entryID string) error {
 // returns the identity the entry owned before the replacement. ReplaceSnapshotIdentity
 // with a nil identity clears the proof before a mutation starts; the returned
 // prior proof is only ever written back for a proven non-mutating failure.
-func (c *CodeStore) ReplaceSnapshotIdentity(turn int, entryID string, identity *SnapshotContentIdentity) (*SnapshotContentIdentity, error) {
-	if err := validateSnapshotTurn(turn); err != nil {
-		return nil, err
-	}
+func (c *CodeStore) ReplaceSnapshotIdentity(entryID string, identity *SnapshotContentIdentity) (*SnapshotContentIdentity, error) {
 	if err := validateSnapshotEntryID(entryID); err != nil {
 		return nil, err
 	}
-	metaPath := filepath.Join(c.snapshotsDir, strconv.Itoa(turn), entryID, "meta.json")
+	metaPath := filepath.Join(c.snapshotsDir, groupEntriesDir, entryID, "meta.json")
 	var meta SnapshotMeta
 	if err := readJSON(metaPath, &meta); err != nil {
 		return nil, err
@@ -147,98 +137,76 @@ func (c *CodeStore) ReplaceSnapshotIdentity(turn int, entryID string, identity *
 }
 
 // RecordSnapshotContent records the content produced by a completed mutation.
-func (c *CodeStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
-	_, err := c.ReplaceSnapshotIdentity(turn, entryID, &SnapshotContentIdentity{Hash: hashBytes(content)})
+func (c *CodeStore) RecordSnapshotContent(entryID string, content []byte) error {
+	_, err := c.ReplaceSnapshotIdentity(entryID, &SnapshotContentIdentity{Hash: hashBytes(content)})
 	return err
 }
 
 // RecordSnapshotAbsence records that a completed mutation removed the file.
-func (c *CodeStore) RecordSnapshotAbsence(turn int, entryID string) error {
-	_, err := c.ReplaceSnapshotIdentity(turn, entryID, &SnapshotContentIdentity{Absent: true})
+func (c *CodeStore) RecordSnapshotAbsence(entryID string) error {
+	_, err := c.ReplaceSnapshotIdentity(entryID, &SnapshotContentIdentity{Absent: true})
 	return err
 }
 
-// validateSnapshotTurn and validateSnapshotEntryID are the shared argument
-// checks for the entry and identity methods.
-func validateSnapshotTurn(turn int) error {
-	if turn < 1 {
-		return fmt.Errorf("snapshot: turn must be >= 1, got %d", turn)
-	}
-	return nil
-}
-
+// validateSnapshotEntryID is the shared argument check for the entry and
+// identity methods.
 func validateSnapshotEntryID(entryID string) error {
-	if !isLegacyEntryID(entryID) {
+	if !isEntryID(entryID) {
 		return fmt.Errorf("snapshot: invalid entry id %q", entryID)
 	}
 	return nil
 }
 
-// TurnEntry describes one snapshot turn for UI display.
-type TurnEntry struct {
-	Turn  int            `json:"turn"`
-	Files []SnapshotMeta `json:"files"`
+// groupEntriesDir is the one fixed entry directory of a group's snapshots
+// root: every capture of one code group lives under snapshots/1.
+const groupEntriesDir = "1"
+
+// ListEntries returns every recorded snapshot entry of one group in the
+// fixed entry directory, in the directory's own lexical entry order.
+func (c *CodeStore) ListEntries() ([]SnapshotMeta, error) {
+	entriesDir := filepath.Join(c.snapshotsDir, groupEntriesDir)
+	dirEntries, err := os.ReadDir(entriesDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("snapshot: read entries dir %s: %w", entriesDir, err)
+	}
+	var metas []SnapshotMeta
+	for _, de := range dirEntries {
+		if !de.IsDir() {
+			continue
+		}
+		var meta SnapshotMeta
+		if err := readJSON(filepath.Join(entriesDir, de.Name(), "meta.json"), &meta); err != nil {
+			continue
+		}
+		metas = append(metas, meta)
+	}
+	return metas, nil
 }
 
-// ListTurns returns all recorded snapshot turns with their file meta.
-func (c *CodeStore) ListTurns() ([]TurnEntry, error) {
-	snapshotsDir := c.snapshotsDir
-	turns := readIntDirs(snapshotsDir)
-	var entries []TurnEntry
-	for _, turn := range turns {
-		turnDir := filepath.Join(snapshotsDir, strconv.Itoa(turn))
-		dirEntries, err := os.ReadDir(turnDir)
-		if err != nil {
-			return entries, fmt.Errorf("snapshot: read turn %d: %w", turn, err)
-		}
-		var files []SnapshotMeta
-		for _, de := range dirEntries {
-			if !de.IsDir() {
-				continue
-			}
-			var meta SnapshotMeta
-			if err := readJSON(filepath.Join(turnDir, de.Name(), "meta.json"), &meta); err != nil {
-				continue
-			}
-			files = append(files, meta)
-		}
-		entries = append(entries, TurnEntry{Turn: turn, Files: files})
-	}
-	return entries, nil
-}
-
-// RevertCodeGroups restores every file snapshotted in turns > afterTurn
-// across the supplied directories, latest-first, under ONE traversal
-// ownership: the skip and reported-skip ledgers span every group and every
-// descending turn, so an identity skipped in a newer directory is never
-// restored by an older one. Turn numbering, the after-turn floor and turn-dir
-// removal stay per directory. A failure returns the result accumulated so far
-// with the error; the restore work that already succeeded stays honest.
-func RevertCodeGroups(directories []string, afterTurn int) (RevertResult, error) {
-	if afterTurn < 0 {
-		afterTurn = 0
-	}
+// RevertCodeGroups restores every snapshotted file across the supplied
+// directories under ONE traversal ownership: the skip and reported-skip
+// ledgers span every group, so an identity skipped in a newer group is never
+// restored by an older one. Each group's fixed entries directory is visited
+// exactly once in the caller's order. A failure returns the result
+// accumulated so far with the error; the restore work that already succeeded
+// stays honest.
+func RevertCodeGroups(directories []string) (RevertResult, error) {
 	var result RevertResult
 	skippedEntries := make(map[string]struct{})
 	reportedSkippedEntries := make(map[string]struct{})
 	for _, directory := range directories {
-		snapshotsDir := filepath.Join(directory, "snapshots")
-		turns := readIntDirs(snapshotsDir)
-		for i := len(turns) - 1; i >= 0; i-- {
-			turn := turns[i]
-			if turn <= afterTurn {
-				break
-			}
-			turnDir := filepath.Join(snapshotsDir, strconv.Itoa(turn))
-			turnResult, err := revertOneTurn(turnDir, skippedEntries, reportedSkippedEntries)
-			result.Restored = append(result.Restored, turnResult.Restored...)
-			result.Skipped = append(result.Skipped, turnResult.Skipped...)
-			if err != nil {
-				return result, fmt.Errorf("snapshot: revert %s turn %d: %w", directory, turn, err)
-			}
-			if err := os.Remove(turnDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
-				return result, fmt.Errorf("snapshot: remove %s: %w", turnDir, err)
-			}
+		entriesDir := filepath.Join(directory, "snapshots", groupEntriesDir)
+		groupResult, err := revertEntriesDir(entriesDir, skippedEntries, reportedSkippedEntries)
+		result.Restored = append(result.Restored, groupResult.Restored...)
+		result.Skipped = append(result.Skipped, groupResult.Skipped...)
+		if err != nil {
+			return result, fmt.Errorf("snapshot: revert %s: %w", directory, err)
+		}
+		if err := os.Remove(entriesDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isDirNotEmpty(err) {
+			return result, fmt.Errorf("snapshot: remove %s: %w", entriesDir, err)
 		}
 	}
 	return result, nil
@@ -246,9 +214,12 @@ func RevertCodeGroups(directories []string, afterTurn int) (RevertResult, error)
 
 // --- shared restore/identity/path/file-copy helpers ---
 
-func revertOneTurn(turnDir string, skippedEntries, reportedSkippedEntries map[string]struct{}) (RevertResult, error) {
-	entries, err := os.ReadDir(turnDir)
+func revertEntriesDir(entriesDir string, skippedEntries, reportedSkippedEntries map[string]struct{}) (RevertResult, error) {
+	entries, err := os.ReadDir(entriesDir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return RevertResult{}, nil
+		}
 		return RevertResult{}, err
 	}
 	var result RevertResult
@@ -256,7 +227,7 @@ func revertOneTurn(turnDir string, skippedEntries, reportedSkippedEntries map[st
 		if !e.IsDir() {
 			continue
 		}
-		entryDir := filepath.Join(turnDir, e.Name())
+		entryDir := filepath.Join(entriesDir, e.Name())
 		var meta SnapshotMeta
 		if err := readJSON(filepath.Join(entryDir, "meta.json"), &meta); err != nil {
 			return result, fmt.Errorf("read snapshot meta in %s: %w", entryDir, err)
@@ -386,22 +357,24 @@ func isDirNotEmpty(err error) bool {
 	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, unix.ENOTEMPTY)
 }
 
+// validateRestorePath proves one restore target through the entry's
+// capture-time canonical witness. An entry without that witness is refused:
+// the restore never reconstructs a target from a path guess.
 func validateRestorePath(entryID string, meta SnapshotMeta) (string, *SkippedRevert, error) {
-	if !meta.Existed {
-		restorePath, err := validateDeletePath(entryID, meta)
-		return restorePath, nil, err
-	}
 	if meta.CanonicalPath == "" {
-		restorePath, err := validateLegacyRestorePath(entryID, meta.OriginalPath)
+		return "", nil, fmt.Errorf("canonical proof refused: snapshot entry for %s carries no capture-time canonical path", meta.OriginalPath)
+	}
+	if hashString(meta.CanonicalPath) != entryID {
+		return "", nil, fmt.Errorf("canonical proof refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
+	}
+	if !meta.Existed {
+		restorePath, err := validateCanonicalDeletePath(meta)
 		return restorePath, nil, err
 	}
-	return validateModernRestorePath(entryID, meta)
+	return validateCanonicalRestorePath(meta)
 }
 
-func validateModernRestorePath(entryID string, meta SnapshotMeta) (string, *SkippedRevert, error) {
-	if hashString(meta.CanonicalPath) != entryID {
-		return "", nil, fmt.Errorf("modern restore refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
-	}
+func validateCanonicalRestorePath(meta SnapshotMeta) (string, *SkippedRevert, error) {
 	resolved, err := pathutil.ResolveFilePath(meta.OriginalPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve restore path %s: %w", meta.OriginalPath, err)
@@ -415,17 +388,7 @@ func validateModernRestorePath(entryID string, meta SnapshotMeta) (string, *Skip
 	return meta.CanonicalPath, nil, nil
 }
 
-func validateDeletePath(entryID string, meta SnapshotMeta) (string, error) {
-	if meta.CanonicalPath != "" {
-		return validateModernDeletePath(entryID, meta)
-	}
-	return "", fmt.Errorf("legacy delete refused: %s has no canonical proof", meta.OriginalPath)
-}
-
-func validateModernDeletePath(entryID string, meta SnapshotMeta) (string, error) {
-	if hashString(meta.CanonicalPath) != entryID {
-		return "", fmt.Errorf("modern delete refused: meta canonical path %q does not match entry id %s", meta.CanonicalPath, entryID)
-	}
+func validateCanonicalDeletePath(meta SnapshotMeta) (string, error) {
 	absOriginal, err := filepath.Abs(meta.OriginalPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve delete path %s: %w", meta.OriginalPath, err)
@@ -441,38 +404,7 @@ func validateModernDeletePath(entryID string, meta SnapshotMeta) (string, error)
 	return meta.CanonicalPath, nil
 }
 
-func validateLegacyRestorePath(entryID, path string) (string, error) {
-	if path == "" {
-		return "", fmt.Errorf("legacy restore path is empty")
-	}
-	if !isLegacyEntryID(entryID) {
-		return "", fmt.Errorf("legacy snapshot entry id %q is invalid", entryID)
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
-	}
-
-	resolved, err := pathutil.ResolveFilePath(absPath)
-	if err == nil {
-		if got := hashString(resolved.CanonicalPath); got == entryID {
-			return resolved.CanonicalPath, nil
-		} else if resolved.LeafExists {
-			return "", fmt.Errorf("legacy snapshot target hash changed from %s to %s", entryID, got)
-		}
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("resolve legacy restore path %s: %w", path, err)
-	}
-
-	cleanAbs := filepath.Clean(absPath)
-	if got := hashString(cleanAbs); got == entryID {
-		return cleanAbs, nil
-	}
-	return "", fmt.Errorf("legacy snapshot target missing and cannot be proven for %s", path)
-}
-
-func isLegacyEntryID(id string) bool {
+func isEntryID(id string) bool {
 	if len(id) != 16 {
 		return false
 	}
@@ -482,26 +414,6 @@ func isLegacyEntryID(id string) bool {
 		}
 	}
 	return true
-}
-
-func readIntDirs(dir string) []int {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var out []int
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		n, err := strconv.Atoi(e.Name())
-		if err != nil || n < 1 {
-			continue
-		}
-		out = append(out, n)
-	}
-	sort.Ints(out)
-	return out
 }
 
 func hashString(s string) string {

@@ -55,10 +55,9 @@ func TestSnapshotResolvedEntryRejectsNonRegularExistingTargets(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newTestCodeGroup(t)
 			target := tc.target(t)
-			const turn = 1
 
 			err := runSnapshotShapeWithTimeout(func() error {
-				_, _, err := store.SnapshotResolvedEntry(turn, target, target)
+				_, _, err := store.SnapshotResolvedEntry(target, target)
 				return err
 			})
 			testassert.Require(t, err != nil, "SnapshotResolvedEntry(%s) succeeded, want non-regular target refusal", tc.name)
@@ -80,18 +79,17 @@ func TestSnapshotResolvedEntryRejectsNonRegularExistingTargets(t *testing.T) {
 
 func TestSnapshotResolvedEntryStillAllowsMissingAndRegularTargets(t *testing.T) {
 	store := newTestCodeGroup(t)
-	const turn = 1
 
 	missing := filepath.Join(t.TempDir(), "new-file.txt")
 	{
-		_, _, err := store.SnapshotResolvedEntry(turn, missing, missing)
+		_, _, err := store.SnapshotResolvedEntry(missing, missing)
 		testassert.NoError(t, err)
 	}
 
 	regular := filepath.Join(t.TempDir(), "regular.txt")
 	testassert.NoError(t, os.WriteFile(regular, []byte("before"), 0o644))
 	{
-		_, _, err := store.SnapshotResolvedEntry(turn, regular, regular)
+		_, _, err := store.SnapshotResolvedEntry(regular, regular)
 		testassert.NoError(t, err)
 	}
 }

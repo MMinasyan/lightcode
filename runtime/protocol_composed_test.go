@@ -544,7 +544,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N6, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N7, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)

@@ -114,25 +114,10 @@ func (in *instance) settings(inv runtime.Invocation) (settings, error) {
 // so every normally delivered head — steering included — opens its own group.
 // The handle is opened per call, shared by that call's sub-operations, and
 // not retained.
-func (in *instance) openCodeGroup(tc runtime.ToolContext) (codeGroupStore, error) {
+func (in *instance) openCodeGroup(tc runtime.ToolContext) (*snapshot.CodeStore, error) {
 	directory := filepath.Join(in.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID)
-	store, err := snapshot.OpenCodeStore(directory)
-	if err != nil {
-		return codeGroupStore{}, err
-	}
-	return codeGroupStore{CodeStore: store}, nil
+	return snapshot.OpenCodeStore(directory)
 }
-
-// codeGroupStore adapts one per-call snapshot.CodeStore to the complete
-// internal/tool SnapshotStore interface. The embedded CodeStore provides the
-// entry capture, discard, and identity methods directly.
-type codeGroupStore struct {
-	*snapshot.CodeStore
-}
-
-// CurrentTurn pins the group's single turn: an Operation-backed code group
-// holds one preimage set, not a session turn history.
-func (codeGroupStore) CurrentTurn() int { return 1 }
 
 // immediateError is the normalization-class immediate outcome: status error
 // carrying the bounded validation diagnostic, per the tool-boundary
@@ -323,7 +308,7 @@ type mutationPrepared struct {
 // code group, and the assembled executor plan with its file.write pairs.
 // The per-tool callback runs the shared preparation and wraps the outcome;
 // its error is a failed canonical preparation.
-func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
+func (in *instance) prepareMutation(tc runtime.ToolContext, call model.ToolCall, run func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error)) harness.PreparedTool {
 	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
 		return immediateError(call.ID, err)
@@ -360,7 +345,7 @@ func (writeTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.Raw
 }
 
 func (t writeTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PrepareWriteCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err
@@ -387,7 +372,7 @@ func (editTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawM
 }
 
 func (t editTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PrepareEditCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err
@@ -414,7 +399,7 @@ func (patchTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.Raw
 }
 
 func (t patchTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group codeGroupStore, args map[string]any) (mutationPrepared, error) {
+	return t.inst.prepareMutation(tc, call, func(root, rootCanonical, writeDirCanonical string, opts tool.CapabilityOptions, group *snapshot.CodeStore, args map[string]any) (mutationPrepared, error) {
 		prepared, err := tool.PreparePatchCall(root, rootCanonical, writeDirCanonical, opts, group, args)
 		if err != nil {
 			return mutationPrepared{}, err

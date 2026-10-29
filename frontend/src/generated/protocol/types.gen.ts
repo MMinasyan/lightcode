@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '6';
+    protocol_version: '7';
 };
 
 /**
@@ -446,21 +446,6 @@ export type CodeRevertResult = {
 };
 
 export type CodeRevertError = CodeRevertResult | Error;
-
-export type RetainedTurn = {
-    turn: number;
-    files: Array<SnapshotFile>;
-};
-
-export type RetainedTurns = {
-    turns: Array<RetainedTurn>;
-};
-
-export type RetainedRevertRequest = {
-    workspace: string;
-    session_id: string;
-    after_turn: number;
-};
 
 export type SessionsSettings = {
     auto_archive: boolean;
@@ -1306,60 +1291,6 @@ export type ReadWorkspaceFileResponses = {
 };
 
 export type ReadWorkspaceFileResponse = ReadWorkspaceFileResponses[keyof ReadWorkspaceFileResponses];
-
-export type GetRetainedCodeSnapshotsData = {
-    body?: never;
-    path?: never;
-    query: {
-        workspace: string;
-        session_id: string;
-    };
-    url: '/v1/retained-code-snapshots';
-};
-
-export type GetRetainedCodeSnapshotsErrors = {
-    /**
-     * One schema-defined typed error.
-     */
-    default: Error;
-};
-
-export type GetRetainedCodeSnapshotsError = GetRetainedCodeSnapshotsErrors[keyof GetRetainedCodeSnapshotsErrors];
-
-export type GetRetainedCodeSnapshotsResponses = {
-    /**
-     * The legacy per-turn snapshot groups of one pre-cutover Session.
-     */
-    200: RetainedTurns;
-};
-
-export type GetRetainedCodeSnapshotsResponse = GetRetainedCodeSnapshotsResponses[keyof GetRetainedCodeSnapshotsResponses];
-
-export type RevertRetainedCodeData = {
-    body: RetainedRevertRequest;
-    path?: never;
-    query?: never;
-    url: '/v1/retained-code-snapshots/revert';
-};
-
-export type RevertRetainedCodeErrors = {
-    /**
-     * A traversal I/O failure after earlier turns changed returns the same result DTO with accumulated restored/skipped members and the error member; every other failure, including a pre-traversal storage failure, returns the schema error.
-     *
-     */
-    default: CodeRevertError;
-};
-
-export type RevertRetainedCodeError = RevertRetainedCodeErrors[keyof RevertRetainedCodeErrors];
-
-export type RevertRetainedCodeResponses = {
-    /**
-     * The completed legacy restore result.
-     */
-    200: CodeRevertResult;
-};
-
-export type RevertRetainedCodeResponse = RevertRetainedCodeResponses[keyof RevertRetainedCodeResponses];
 
 export type GetConfigurationData = {
     body?: never;

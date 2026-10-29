@@ -137,15 +137,14 @@ func TestGeneratedScopeEventRoundTripsBothKinds(t *testing.T) {
 	}
 }
 
-// TestRevertDefaultsShareTheCodeRevertErrorContract keeps the two revert
-// default responses on one shared union contract: both wire cases (a plain
-// schema error and the partial result carrying its error) stay accepted,
-// and a body matching neither branch stays rejected.
+// TestRevertDefaultsShareTheCodeRevertErrorContract keeps the revert default
+// response on its shared union contract: both wire cases (a plain schema
+// error and the partial result carrying its error) stay accepted, and a body
+// matching neither branch stays rejected.
 func TestRevertDefaultsShareTheCodeRevertErrorContract(t *testing.T) {
 	doc := schema(t)
 	for _, row := range []struct{ path string }{
 		{"/v1/sessions/{id}/revert-code"},
-		{"/v1/retained-code-snapshots/revert"},
 	} {
 		item := doc.Paths.Find(row.path)
 		testassert.Require(t, item != nil && item.Post != nil, "%s has no POST operation", row.path)

@@ -595,7 +595,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"7\"}"
     }
    ],
    "reject": [
@@ -605,16 +605,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"6\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"7\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"6\"}"
+     "json": "{\"protocol_version\":\"7\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"7\",\"extra\":true}"
     }
    ]
   },
@@ -1245,55 +1245,6 @@
      "typescript": false
     }
    ]
-  },
-  {
-   "schema": "RetainedRevertRequest",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"workspace\":\"fixture\",\"session_id\":\"01234567\",\"after_turn\":0}"
-    },
-    {
-     "name": "after-zero",
-     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":0}"
-    },
-    {
-     "name": "after-negative",
-     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":-1}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "missing-workspace",
-     "json": "{\"session_id\":\"01234567\",\"after_turn\":0}"
-    }
-   ]
-  },
-  {
-   "schema": "RetainedTurn",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"turn\":1,\"files\":[]}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "zero-turn",
-     "json": "{\"turn\":0,\"files\":[]}",
-     "typescript": false
-    }
-   ]
-  },
-  {
-   "schema": "RetainedTurns",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"turns\":[]}"
-    }
-   ],
-   "reject": []
   },
   {
    "schema": "RevertCodeRequest",
@@ -2271,16 +2222,6 @@
    }
   },
   {
-   "operation_id": "GetRetainedCodeSnapshots",
-   "method": "get",
-   "path": "/v1/retained-code-snapshots",
-   "request": null,
-   "responses": {
-    "200": "RetainedTurns",
-    "default": "Error"
-   }
-  },
-  {
    "operation_id": "GetSessionCodeSnapshots",
    "method": "get",
    "path": "/v1/sessions/{id}/code-snapshots",
@@ -2427,16 +2368,6 @@
    "responses": {
     "200": "ModelMutation",
     "default": "Error"
-   }
-  },
-  {
-   "operation_id": "RevertRetainedCode",
-   "method": "post",
-   "path": "/v1/retained-code-snapshots/revert",
-   "request": "RetainedRevertRequest",
-   "responses": {
-    "200": "CodeRevertResult",
-    "default": "CodeRevertError"
    }
   },
   {

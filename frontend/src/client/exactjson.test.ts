@@ -14,9 +14,7 @@ import {
   parseExactJSON,
   parseSettingsObject,
   presentNumber,
-  rawJSONText,
   replaceObjectMembers,
-  readRetainedTurnsText,
 } from './exactjson';
 
 const CONFIGURATION = '{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},'
@@ -32,8 +30,6 @@ describe('parseExactJSON', () => {
 
   it('exposes the raw token and renders booleans and strings ordinarily', () => {
     const parsed = parseExactJSON('{"n":-9223372036854775808,"flag":true,"s":"x"}') as Record<string, unknown>;
-    expect(rawJSONText(parsed.n)).toBe('-9223372036854775808');
-    expect(rawJSONText(parsed.flag)).toBeNull();
     expect(JSON.stringify(parsed.n)).toBe('-9223372036854775808');
     expect(JSON.stringify(parsed.flag)).toBe('true');
     expect(JSON.stringify(parsed.s)).toBe('"x"');
@@ -158,7 +154,7 @@ describe('patch composition', () => {
   });
 });
 
-describe('fork body and retained turns', () => {
+describe('fork body', () => {
   it('composes the Fork body from the immutable IDs and the exact replacement text', () => {
     const body = composeForkBody('item-1', 'abcdef', '[{"kind":"text","text":"x"}]');
     expect(JSON.parse(body)).toEqual({
@@ -170,32 +166,4 @@ describe('fork body and retained turns', () => {
     expect(composeForkBody('i', 'o', '[not json')).toBe('{"boundary_item_id":"i","operation_id":"o","content":[not json}');
   });
 
-  it('reads retained turns with their exact boundary tokens', () => {
-    const document = parseExactJSON('{"turns":[{"turn":9007199254740993,"files":[{"path":"a","existed":true}]}]}');
-    const turns = readRetainedTurnsText(document);
-    expect(turns).toEqual([{ turnText: '9007199254740993', files: [{ path: 'a', existed: true }] }]);
-  });
-
-  it('rejects a retained turn without a numeric boundary or files', () => {
-    expect(() => readRetainedTurnsText({ turns: [{ files: [] }] })).toThrow();
-    expect(() => readRetainedTurnsText({ turns: [{ turn: 1 }] })).toThrow();
-    expect(() => readRetainedTurnsText({})).toThrow();
-  });
-
-  it('returns the retained files array and its file objects by reference', () => {
-    const document = parseExactJSON('{"turns":[{"turn":9007199254740993,"files":[{"path":"a","existed":true,"extra":1}]}]}') as {
-      turns: Array<{ files: unknown[] }>;
-    };
-    const turns = readRetainedTurnsText(document);
-    expect(turns[0].turnText).toBe('9007199254740993');
-    // The consumed shape is validated in place; the original array and objects
-    // are returned, never rebuilt (the uninterpreted extra member survives).
-    expect(turns[0].files).toBe(document.turns[0].files);
-    expect(turns[0].files[0]).toBe(document.turns[0].files[0]);
-    // Malformed consumed shapes still throw.
-    expect(() => readRetainedTurnsText({ turns: [{ turn: 1, files: [null] }] })).toThrow();
-    expect(() => readRetainedTurnsText({ turns: [{ turn: 1, files: [{}] }] })).toThrow();
-    expect(() => readRetainedTurnsText({ turns: [{ turn: {}, files: [] }] })).toThrow();
-    expect(() => readRetainedTurnsText({ turns: [{ turn: '5', files: [] }] })).toThrow();
-  });
 });

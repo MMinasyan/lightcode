@@ -70,7 +70,7 @@ func TestPreparedWriteWritesContentExactlyIncludingTrailingNewline(t *testing.T)
 func TestPreparedWriteWithSnapshotSnapshotsBeforeWrite(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	root := filepath.Dir(path)
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 9)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
@@ -79,7 +79,7 @@ func TestPreparedWriteWithSnapshotSnapshotsBeforeWrite(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Equal(t, result, "Wrote "+path+".")
 	testassert.Equal(t, len(store.calls), 1)
-	testassert.Require(t, store.calls[0].turn == 9 && store.calls[0].path == path, "snapshot call = %+v, want turn=9 path=%q", store.calls[0], path)
+	testassert.Require(t, store.calls[0].path == path, "snapshot call = %+v, want path=%q", store.calls[0], path)
 	assertEntryPreimage(t, store, path, "before")
 	assertFileContent(t, path, "after")
 }
@@ -92,7 +92,7 @@ func TestPreparedWriteWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testi
 	linkDir := filepath.Join(root, "linked")
 	testassert.NoError(t, os.Symlink(realDir, linkDir))
 	requested := filepath.Join(linkDir, "file.txt")
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 10)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    requested,

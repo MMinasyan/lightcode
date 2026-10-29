@@ -102,10 +102,10 @@ func Connect(ctx context.Context, discoveryPath string) (*Client, error) {
 	if health.JSON200.ProtocolVersion == "" {
 		return nil, fmt.Errorf("authenticated health carries no protocol version: %w", ErrNoRuntime)
 	}
-	if live := health.JSON200; live.ProtocolVersion != protocol.N6 {
+	if live := health.JSON200; live.ProtocolVersion != protocol.N7 {
 		return nil, fmt.Errorf("live protocol version %q: %w", live.ProtocolVersion, ErrIncompatibleProtocol)
 	}
-	if record.ProtocolVersion != string(protocol.N6) {
+	if record.ProtocolVersion != string(protocol.N7) {
 		return nil, fmt.Errorf("discovery protocol version %q disagrees with the authenticated live owner: %w", record.ProtocolVersion, ErrNoRuntime)
 	}
 	return &Client{ClientWithResponses: transport, instance: record.InstanceId}, nil

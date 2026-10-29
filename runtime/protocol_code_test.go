@@ -7,9 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -39,14 +39,14 @@ func captureCodeMutation(t *testing.T, groupRoot, displayPath, target string, co
 	t.Helper()
 	group, err := snapshot.OpenCodeStore(groupRoot)
 	testassert.Require(t, err == nil, "OpenCodeStore(%s): %v", groupRoot, err)
-	entryID, _, err := group.SnapshotResolvedEntry(1, displayPath, target)
+	entryID, _, err := group.SnapshotResolvedEntry(displayPath, target)
 	testassert.Require(t, err == nil, "SnapshotResolvedEntry(%s): %v", target, err)
 	{
 		err := os.WriteFile(target, content, 0o600)
 		testassert.Require(t, err == nil, "WriteFile(%s): %v", target, err)
 	}
 	{
-		err := group.RecordSnapshotContent(1, entryID, content)
+		err := group.RecordSnapshotContent(entryID, content)
 		testassert.Require(t, err == nil, "RecordSnapshotContent(%s): %v", target, err)
 	}
 }
@@ -647,7 +647,7 @@ func seedFIFOCodeEntry(t *testing.T, groupRoot, target, content string) string {
 		"existed":        true,
 		"last_write":     map[string]any{"hash": sha256Hex([]byte(content))},
 	}
-	writeRetainedJSON(t, filepath.Join(entryDir, "meta.json"), meta)
+	writeTestJSON(t, filepath.Join(entryDir, "meta.json"), meta)
 	return fifo
 }
 
@@ -924,394 +924,150 @@ func TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable(t *testing.T) {
 // --- retained pre-cutover rows ---
 
 const (
-	retainedConversationCanary = "conversation-must-stay-untouched"
-	retainedClaimCanary        = "claim-must-stay-untouched"
+	legacyConversationCanary = "conversation-must-stay-untouched"
+	legacyClaimCanary        = "claim-must-stay-untouched"
 )
 
-// seedRetainedSession writes one valid legacy session meta plus conversation
-// and claim canaries, returning the session directory.
-func seedRetainedSession(t *testing.T, home, workspace, legacyID string) string {
+// seedLegacySessionFixture writes one pre-cutover home-layout Session
+// directory: the old meta.json proof members, the old conversation and claim
+// canaries, and old turn-shaped snapshot entry dirs at snapshots/1 and
+// snapshots/2 holding a real preimage meta. Nothing canonical reads this
+// layout; the fixture only ever serves as inert sentinel data.
+func seedLegacySessionFixture(t *testing.T, home, workspace, legacyID string) string {
 	t.Helper()
 	normalized := filepath.Clean(workspace)
 	sum := sha256.Sum256([]byte(normalized))
 	hash := hex.EncodeToString(sum[:])
 	dir := filepath.Join(home, ".lightcode", "projects", "p-"+hash, "sessions", legacyID)
-	// The fixture seeds the three proof fields and ordinary extra metadata;
-	// the reader interprets only the proof fields.
-	writeRetainedJSON(t, filepath.Join(dir, "meta.json"), map[string]any{
+	writeTestJSON(t, filepath.Join(dir, "meta.json"), map[string]any{
 		"id":           legacyID,
 		"created_at":   "2026-01-01T00:00:00Z",
 		"project_path": normalized,
 		"project_hash": hash[:16],
 		"state":        "active",
 	})
-	writeServiceFile(t, filepath.Join(dir, "turns", "1", "messages.jsonl"), retainedConversationCanary)
-	writeServiceFile(t, filepath.Join(dir, "claims", "claim.json"), retainedClaimCanary)
+	writeServiceFile(t, filepath.Join(dir, "turns", "1", "messages.jsonl"), legacyConversationCanary)
+	writeServiceFile(t, filepath.Join(dir, "claims", "claim.json"), legacyClaimCanary)
+	for _, turn := range []string{"1", "2"} {
+		file := filepath.Join(workspace, "legacy.txt")
+		entryID := sha256Hex16(file)
+		entryDir := filepath.Join(dir, "snapshots", turn, entryID)
+		testassert.NoError(t, os.MkdirAll(entryDir, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(entryDir, "original"), []byte("legacy-preimage-"+turn), 0o600))
+		writeTestJSON(t, filepath.Join(entryDir, "meta.json"), map[string]any{
+			"original_path":  file,
+			"canonical_path": file,
+			"existed":        true,
+			"last_write":     map[string]any{"hash": sha256Hex([]byte("legacy-" + turn))},
+		})
+	}
 	return dir
 }
 
-func writeRetainedJSON(t *testing.T, path string, value any) {
+func writeTestJSON(t *testing.T, path string, value any) {
 	t.Helper()
 	data, err := json.Marshal(value)
 	testassert.Require(t, err == nil, "marshal %s: %v", path, err)
 	writeServiceFile(t, path, string(data))
 }
 
-func rewriteRetainedMeta(t *testing.T, sessionDir string, edit func(map[string]any)) {
+// snapshotTree walks one directory tree into a sorted path->content map, so a
+// sentinel comparison can prove nothing was read into a change or written.
+func snapshotTree(t *testing.T, root string) map[string]string {
 	t.Helper()
-	path := filepath.Join(sessionDir, "meta.json")
-	data, err := os.ReadFile(path)
-	testassert.NoError(t, err)
-	var meta map[string]any
-	testassert.NoError(t, json.Unmarshal(data, &meta))
-	edit(meta)
-	writeRetainedJSON(t, path, meta)
-}
-
-// recordRetainedMutation drives one real CodeStore capture at the given turn
-// of a pruned legacy session directory.
-func recordRetainedMutation(t *testing.T, sessionDir string, turn int, display, target string, content []byte) {
-	t.Helper()
-	store, err := snapshot.OpenCodeStore(sessionDir)
-	testassert.Require(t, err == nil, "OpenCodeStore(%s): %v", sessionDir, err)
-	entryID, _, err := store.SnapshotResolvedEntry(turn, display, target)
-	testassert.Require(t, err == nil, "SnapshotResolvedEntry turn %d: %v", turn, err)
-	{
-		err := os.WriteFile(target, content, 0o600)
-		testassert.Require(t, err == nil, "WriteFile(%s): %v", target, err)
-	}
-	{
-		err := store.RecordSnapshotContent(turn, entryID, content)
-		testassert.Require(t, err == nil, "RecordSnapshotContent turn %d: %v", turn, err)
-	}
-}
-
-// assertCanariesUntouched verifies the hazardous conversation and claim files
-// stayed byte-identical.
-func assertCanariesUntouched(t *testing.T, sessionDir string) {
-	t.Helper()
-	for path, want := range map[string]string{
-		filepath.Join(sessionDir, "turns", "1", "messages.jsonl"): retainedConversationCanary,
-		filepath.Join(sessionDir, "claims", "claim.json"):         retainedClaimCanary,
-	} {
+	tree := map[string]string{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			tree[path] = "<dir>"
+			return nil
+		}
 		data, err := os.ReadFile(path)
-		testassert.Require(t, err == nil && string(data) == want, "canary %s = (%q, %v), want untouched %q", path, data, err, want)
-	}
+		if err != nil {
+			return err
+		}
+		tree[path] = string(data)
+		return nil
+	})
+	testassert.Require(t, err == nil, "walk %s: %v", root, err)
+	return tree
 }
 
-// TestRetainedCodeSnapshotsProof proves the retained path proof and its
-// refusals: exact 8-hex IDs, normalized workspace, full-hash project
-// directory, and the meta ID/ProjectPath/hash-prefix triple; every mismatch
-// fails before any snapshot read, while a valid proof with absent snapshots is
-// empty success.
-func TestRetainedCodeSnapshotsProof(t *testing.T) {
+// TestCodeSnapshotsLegacySessionDataStaysInert proves the old home layout is
+// inert sentinel data for canonical operations: a canonical Session's list
+// and restore over its own groups never read or change the pre-cutover
+// Session directory, its snapshot entries, or its conversation and claim
+// canaries — and the 8-hex legacy ID is refused on the canonical route, so a
+// canonical operation can never address the legacy target.
+func TestCodeSnapshotsLegacySessionDataStaysInert(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
-		workspace := filepath.Join(e.home, "legacy-ws")
+		workspace := filepath.Join(e.home, "legacy-inert-ws")
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		legacyID := "deadbeef"
-		home := r.config.loader.Home()
-		sessionDir := seedRetainedSession(t, home, workspace, legacyID)
+		legacyDir := seedLegacySessionFixture(t, r.config.loader.Home(), workspace, legacyID)
+		before := snapshotTree(t, legacyDir)
+		testassert.Require(t, len(before) > 4, "legacy sentinel tree = %v, want meta, canaries, and snapshot entries", before)
 
-		turns, err := r.listRetainedCodeSnapshots(context.Background(), workspace, legacyID)
-		testassert.Require(t, err == nil && turns.Turns != nil && len(turns.Turns) == 0, "empty retained list = (%+v, %v), want a non-nil empty list", turns, err)
-		result, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID, AfterTurn: 3})
-		testassert.Require(t, err == nil && result.Restored != nil && result.Skipped != nil && len(result.Restored) == 0 && len(result.Skipped) == 0, "empty retained revert = (%+v, %v), want non-nil empty success", result, err)
-
-		// The workspace proof is lexical: a non-normalized spelling of the
-		// same root normalizes to the same storage key and meta proof, while
-		// a symlinked spelling is a different key and is never resolved.
+		// Canonical operations over the same workspace.
+		session := projectionSession(t, r, workspace, "solo").Identity.SessionID
+		op := submitCodeOperation(t, r, session, "op-1", "one")
+		file := filepath.Join(workspace, "legacy.txt")
+		testassert.NoError(t, os.WriteFile(file, []byte("canonical-v1"), 0o600))
+		captureCodeMutation(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, file, []byte("canonical-v2"))
+		awaitRestorableSession(t, r, session)
+		groups, err := r.listSessionCodeSnapshots(context.Background(), session)
+		testassert.Require(t, err == nil && len(groups) == 1 && groups[0].OperationId == "op-1", "canonical groups = (%+v, %v), want only the canonical group", groups, err)
+		result, err := r.revertSessionCode(context.Background(), session, "op-1")
+		testassert.Require(t, err == nil && len(result.Restored) == 1 && result.Restored[0] == file, "canonical restore = (%+v, %v), want the canonical file", result, err)
 		{
-			turns, err := r.listRetainedCodeSnapshots(context.Background(), workspace+string(filepath.Separator)+".", legacyID)
-			testassert.Require(t, err == nil && len(turns.Turns) == 0, "non-normalized workspace spelling = (%+v, %v), want the proven empty success", turns, err)
-		}
-		symlink := filepath.Join(e.home, "legacy-ws-link")
-		testassert.NoError(t, os.Symlink(workspace, symlink))
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), symlink, legacyID)
-			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "symlinked workspace spelling = %v, want harness.ErrNotFound (lexical proof only)", err)
+			data, err := os.ReadFile(file)
+			testassert.Require(t, err == nil && string(data) == "canonical-v1", "canonical file = (%q, %v), want the canonical preimage", data, err)
 		}
 
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), "", legacyID)
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty workspace = %v, want harness.ErrInvalid", err)
-		}
-		for _, id := range []string{"deadbee", "deadbeef0", "DEADBEEF", "deadbeez"} {
-			{
-				_, err := r.listRetainedCodeSnapshots(context.Background(), workspace, id)
-				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "legacy id %q = %v, want harness.ErrInvalid", id, err)
-			}
-		}
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), workspace, "0123456789abcdef0123456789abcdef")
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "32-hex target id into retained route = %v, want harness.ErrInvalid", err)
-		}
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), workspace, "abcdef01")
-			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "missing legacy session = %v, want harness.ErrNotFound", err)
-		}
+		// The whole legacy tree — meta.json, conversation and claim canaries,
+		// and every snapshot entry — is byte-identical to the seeded tree.
+		after := snapshotTree(t, legacyDir)
+		testassert.Require(t, reflect.DeepEqual(before, after), "the canonical operations changed the legacy tree")
+
+		// Identity boundary: the 8-hex legacy ID never addresses a canonical
+		// target route.
 		{
 			_, err := r.listSessionCodeSnapshots(context.Background(), legacyID)
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "8-hex id into target route = %v, want harness.ErrInvalid", err)
-		}
-
-		for _, tc := range []struct {
-			name string
-			edit func(map[string]any)
-		}{
-			{"wrong id", func(m map[string]any) { m["id"] = "deadbeee" }},
-			{"wrong project path", func(m map[string]any) { m["project_path"] = filepath.Join(workspace, "other") }},
-			{"wrong hash prefix", func(m map[string]any) { m["project_hash"] = "0000000000000000" }},
-		} {
-			metaPath := filepath.Join(sessionDir, "meta.json")
-			original, err := os.ReadFile(metaPath)
-			testassert.NoError(t, err)
-			rewriteRetainedMeta(t, sessionDir, tc.edit)
-			{
-				_, err := r.listRetainedCodeSnapshots(context.Background(), workspace, legacyID)
-				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s = %v, want harness.ErrInvalid", tc.name, err)
-			}
-			{
-				_, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s revert = %v, want harness.ErrInvalid", tc.name, err)
-			}
-			writeServiceFile(t, metaPath, string(original))
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "8-hex legacy id into the canonical list route = %v, want harness.ErrInvalid", err)
 		}
 		{
-			_, err := os.Stat(sessionDir)
-			testassert.NoError(t, err)
-		}
-		assertCanariesUntouched(t, sessionDir)
-
-		// A large ignored legacy field is still one valid JSON meta document:
-		// the proof reads the complete regular file and ignores unknown
-		// members, so list and revert succeed with empty snapshots. The
-		// malformed sibling stays refused.
-		metaPath := filepath.Join(sessionDir, "meta.json")
-		original, err := os.ReadFile(metaPath)
-		testassert.NoError(t, err)
-		normalized := filepath.Clean(workspace)
-		sum := sha256.Sum256([]byte(normalized))
-		hash := hex.EncodeToString(sum[:])
-		large, err := json.Marshal(map[string]any{
-			"id":                   legacyID,
-			"created_at":           "2026-01-01T00:00:00Z",
-			"project_path":         normalized,
-			"project_hash":         hash[:16],
-			"state":                "active",
-			"legacy_ignored_field": strings.Repeat("x", (1<<20)+1),
-		})
-		testassert.NoError(t, err)
-		writeServiceFile(t, metaPath, string(large))
-		{
-			turns, err := r.listRetainedCodeSnapshots(context.Background(), workspace, legacyID)
-			testassert.Require(t, err == nil && len(turns.Turns) == 0, "large ignored meta field list = (%+v, %v), want the proven empty success", turns, err)
-		}
-		{
-			result, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-			testassert.Require(t, err == nil && len(result.Restored) == 0, "large ignored meta field revert = (%+v, %v), want the proven empty success", result, err)
-		}
-		writeServiceFile(t, metaPath, "{ not a json document")
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), workspace, legacyID)
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "malformed meta list = %v, want harness.ErrInvalid", err)
-		}
-		{
-			_, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "malformed meta revert = %v, want harness.ErrInvalid", err)
-		}
-		writeServiceFile(t, metaPath, string(original))
-
-		// The full-hash directory is exact: a same-ID session under a wrong
-		// project directory is not found.
-		wrongRoot := filepath.Join(e.home, "other-ws")
-		{
-			_, err := r.listRetainedCodeSnapshots(context.Background(), wrongRoot, legacyID)
-			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "wrong workspace root = %v, want harness.ErrNotFound", err)
+			_, err := r.revertSessionCode(context.Background(), legacyID, "op-1")
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "8-hex legacy id into the canonical restore route = %v, want harness.ErrInvalid", err)
 		}
 	})
 }
 
-// TestRetainedCodeSnapshotsListAndRevert proves the retained list and restore
-// over real CodeStore captures: turn order and display paths, after_turn used
-// directly, created-file absence, skip-on-identity, and the untouched
-// conversation/claim canaries.
-func TestRetainedCodeSnapshotsListAndRevert(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
-		defer closeProjectionRuntime(r)
-		workspace := filepath.Join(e.home, "legacy-list-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		legacyID := "cafebabe"
-		home := r.config.loader.Home()
-		sessionDir := seedRetainedSession(t, home, workspace, legacyID)
-
-		file := filepath.Join(workspace, "legacy.txt")
-		testassert.NoError(t, os.WriteFile(file, []byte("a0"), 0o600))
-		recordRetainedMutation(t, sessionDir, 1, file, file, []byte("a1"))
-		created := filepath.Join(workspace, "legacy-created.txt")
-		recordRetainedMutation(t, sessionDir, 2, file, file, []byte("a2"))
-		recordRetainedMutation(t, sessionDir, 2, created, created, []byte("c"))
-
-		turns, err := r.listRetainedCodeSnapshots(context.Background(), workspace, legacyID)
-		testassert.NoError(t, err)
-		testassert.Require(t, len(turns.Turns) == 2 && turns.Turns[0].Turn == 1 && turns.Turns[1].Turn == 2, "turns = %+v, want the retained order 1, 2", turns.Turns)
-		testassert.Require(t, len(turns.Turns[0].Files) == 1 && turns.Turns[0].Files[0] == (protocol.SnapshotFile{Path: file, Existed: true}), "turn 1 files = %+v, want the edited display path", turns.Turns[0].Files)
-		testassert.Require(t, len(turns.Turns[1].Files) == 2, "turn 2 files = %+v, want the edited and created entries", turns.Turns[1].Files)
-		assertCanariesUntouched(t, sessionDir)
-
-		result, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID, AfterTurn: 1})
-		testassert.NoError(t, err)
-		testassert.Require(t, len(result.Restored) == 2 && result.Skipped != nil && len(result.Skipped) == 0, "turn 2 result = %+v, want both files restored without skips", result)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "a1", "legacy file after turn 2 revert = (%q, %v), want the turn 1 post-write", data, err)
-		}
-		{
-			_, err := os.Stat(created)
-			testassert.Require(t, errors.Is(err, os.ErrNotExist), "created file stat = %v, want restored absence", err)
-		}
-
-		result, err = r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-		testassert.NoError(t, err)
-		testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == file, "turn 1 result = %+v, want the edited file restored", result)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "a0", "legacy file after turn 1 revert = (%q, %v), want the turn 1 preimage", data, err)
-		}
-		assertCanariesUntouched(t, sessionDir)
-
-		// A re-recorded turn 1 with an external edit skips instead of
-		// overwriting, still reporting the retained display path.
-		recordRetainedMutation(t, sessionDir, 1, file, file, []byte("a1"))
-		testassert.NoError(t, os.WriteFile(file, []byte("external"), 0o600))
-		result, err = r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-		testassert.NoError(t, err)
-		testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 1 && result.Skipped[0].Path == file && strings.Contains(result.Skipped[0].Reason, "content changed"), "skip result = %+v, want the changed display path skipped", result)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "external", "legacy file after skip = (%q, %v), want the external content", data, err)
-		}
-	})
-}
-
-// TestRetainedCodeSnapshotsPartialTraversal proves a later-visited corrupt
-// turn returns the accumulated earlier turn result with the internal error
-// class and no legacy 8-hex ID in the generated target Session field.
-func TestRetainedCodeSnapshotsPartialTraversal(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
-		defer closeProjectionRuntime(r)
-		workspace := filepath.Join(e.home, "legacy-partial-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		legacyID := "feedface"
-		home := r.config.loader.Home()
-		sessionDir := seedRetainedSession(t, home, workspace, legacyID)
-
-		file := filepath.Join(workspace, "partial.txt")
-		testassert.NoError(t, os.WriteFile(file, []byte("p0"), 0o600))
-		recordRetainedMutation(t, sessionDir, 1, file, file, []byte("p1"))
-		recordRetainedMutation(t, sessionDir, 2, file, file, []byte("p2"))
-
-		// Corrupt turn 1's meta after recording: turn 2 restores first, then
-		// turn 1 errors.
-		turnDir := filepath.Join(sessionDir, "snapshots", "1")
-		entries, err := os.ReadDir(turnDir)
-		testassert.Require(t, err == nil && len(entries) == 1, "turn 1 dirs = (%d, %v), want one entry", len(entries), err)
-		testassert.NoError(t, os.WriteFile(filepath.Join(turnDir, entries[0].Name(), "meta.json"), []byte("{"), 0o600))
-
-		result, err := r.revertRetainedCode(context.Background(), protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-		testassert.Require(t, err != nil, "partial revert = %+v, want the traversal error", result)
-		testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == file && result.Skipped != nil && result.Error != nil && result.Error.Code == protocol.Internal && result.Error.Message != "" && result.Error.SessionId == nil, "partial result = %+v, want the later turn's accumulated restore; partial error = %+v, want the internal class with no target Session id", result, result.Error)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "p1", "partial file = (%q, %v), want the completed later-turn restore", data, err)
-		}
-		assertCanariesUntouched(t, sessionDir)
-	})
-}
-
-// TestRetainedMountedRestoreConflict proves the retained restore interval
-// over the mounted generated client: one parked retained restore holds its
-// directory, a concurrent mounted retained restore answers the typed
-// conflict, and the parked restore completes with its FIFO preimage while
-// the legacy canaries stay untouched.
-func TestRetainedMountedRestoreConflict(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
-		defer closeProjectionRuntime(r)
-		ps := openProtocolServer(t, r)
-		client := protocolClient(t, ps)
-		ctx := context.Background()
-
-		workspace := filepath.Join(e.home, "retained-mounted-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		legacyID := "c0ffee12"
-		sessionDir := seedRetainedSession(t, r.config.loader.Home(), workspace, legacyID)
-		file := filepath.Join(workspace, "retained-mounted.txt")
-		testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
-		// The turn-1 entry's saved original is a FIFO whose last-write hash
-		// matches the file's current content, so the retained restore
-		// reaches restoreFile's plain os.Open and parks on the FIFO.
-		fifo := seedFIFOCodeEntry(t, sessionDir, file, "v1")
-
-		// One result shape carries both mounted restore attempts — the
-		// parked first restore and the concurrent second restore.
-		type mountedRetainedResult struct {
-			response *protocol.RevertRetainedCodeResponse
-			err      error
-		}
-		request := func() mountedRetainedResult {
-			response, err := client.RevertRetainedCodeWithResponse(ctx, protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID})
-			return mountedRetainedResult{response: response, err: err}
-		}
-
-		// The mounted retained restore parks inside its traversal: its HTTP
-		// handler is mid-restore while the client waits.
-		parked := make(chan mountedRetainedResult, 1)
-		go func() { parked <- request() }()
-		// The shared FIFO park returns only once the mounted restore's
-		// reader is parked in restoreFile's os.Open.
-		park := parkFIFO(t, fifo)
-		defer park.flush()
-
-		// A concurrent mounted retained restore answers the typed conflict:
-		// the refusal happens before any traversal, so the bounded wait
-		// never competes with the parked FIFO.
-		secondCh := make(chan mountedRetainedResult, 1)
-		go func() { secondCh <- request() }()
-		var second mountedRetainedResult
-		select {
-		case second = <-secondCh:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the second mounted retained restore never answered, want the typed conflict")
-		}
-		testassert.Require(t, second.err == nil, "second mounted retained restore: %v, want the typed conflict 409", second.err)
-		testassert.Require(t, second.response != nil, "second mounted retained restore = <nil response>, want the typed conflict 409")
-		if second.response.JSONDefault == nil || second.response.HTTPResponse.StatusCode != http.StatusConflict {
-			body, _ := json.Marshal(second.response)
-			t.Fatalf("second mounted retained restore = (%d, %s), want the typed conflict 409", second.response.HTTPResponse.StatusCode, body)
-		}
-		conflictError, err := second.response.JSONDefault.AsError()
-		testassert.Require(t, err == nil && conflictError.Code == protocol.Conflict, "second retained restore error = %+v (%v), want the typed conflict", second.response.JSONDefault, err)
-
-		// The parked mounted retained restore completes with its own result.
-		park.release("mounted-restored")
-		var out mountedRetainedResult
-		select {
-		case out = <-parked:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the parked mounted retained restore never returned after its FIFO completed")
-		}
-		testassert.Require(t, out.err == nil && out.response != nil && out.response.JSON200 != nil, "mounted retained restore: %v, want the restored result; mounted retained restore = %+v, want the restored result", out.err, out.response)
-		testassert.Require(t, len(out.response.JSON200.Restored) == 1 && out.response.JSON200.Restored[0] == file && len(out.response.JSON200.Skipped) == 0, "restored = %+v, want exactly the retained display path", out.response.JSON200)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "mounted-restored", "file = (%q, %v), want the FIFO content", data, err)
-		}
-		assertCanariesUntouched(t, sessionDir)
-	})
+// TestCodeGroupsOwnershipTable proves the group derivation is exactly one
+// rule over the captured headers — an admitted input owned by an Operation
+// derives a group regardless of its origin, and everything else does not:
+// an operationless copied input and every non-input kind are excluded, and
+// the headers' own sequence order is preserved.
+func TestCodeGroupsOwnershipTable(t *testing.T) {
+	headers := []harness.HistoryEntryHeader{
+		{EntryID: "entry-user", OperationID: "op-user", Kind: harness.EntryInput, InputOrigin: harness.InputOriginUser},
+		{EntryID: "entry-assistant", OperationID: "op-user", Kind: harness.EntryAssistant},
+		{EntryID: "entry-tool", OperationID: "op-user", Kind: harness.EntryToolResult},
+		{EntryID: "entry-copied", OperationID: "", Kind: harness.EntryInput, InputOrigin: harness.InputOriginUser},
+		{EntryID: "entry-runtime", OperationID: "op-runtime", Kind: harness.EntryInput, InputOrigin: harness.InputOriginRuntime},
+		{EntryID: "entry-settlement", OperationID: "op-runtime", Kind: harness.EntryOperationSettlement},
+		{EntryID: "entry-plugin", OperationID: "op-plugin", Kind: harness.EntryInput, InputOrigin: harness.InputOriginPlugin},
+	}
+	groups := codeGroups(headers)
+	want := []codeGroup{
+		{operationID: "op-user", entryID: "entry-user"},
+		{operationID: "op-runtime", entryID: "entry-runtime"},
+		{operationID: "op-plugin", entryID: "entry-plugin"},
+	}
+	testassert.Require(t, reflect.DeepEqual(groups, want), "codeGroups = %+v, want the three owned inputs in header order (copied and non-input kinds excluded)", groups)
 }
 
 // --- bounded viewer rows ---
@@ -1510,22 +1266,14 @@ func TestCodeProducersClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed revert = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.listRetainedCodeSnapshots(ctx, workspace, "deadbeef")
-			testassert.Require(t, errors.Is(err, ErrClosed), "closed retained list = %v, want ErrClosed", err)
-		}
-		{
-			_, err := r.revertRetainedCode(ctx, protocol.RetainedRevertRequest{Workspace: workspace, SessionId: "deadbeef"})
-			testassert.Require(t, errors.Is(err, ErrClosed), "closed retained revert = %v, want ErrClosed", err)
-		}
-		{
 			_, err := r.readWorkspaceFile(ctx, protocol.ReadFileRequest{Workspace: workspace, Path: "x"})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed viewer = %v, want ErrClosed", err)
 		}
 	})
 }
 
-// sha256Hex and sha256Hex16 mirror the retained snapshot identity encodings
-// for hand-built fixtures only.
+// sha256Hex and sha256Hex16 mirror the snapshot identity encodings for
+// hand-built fixtures only.
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])

@@ -13,12 +13,11 @@ import (
 // edit and patch mutations require. It is mandatory: mutation never runs
 // against a missing or partial store.
 type SnapshotStore interface {
-	CurrentTurn() int
-	SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (entryID string, created bool, err error)
-	DiscardSnapshotEntry(turn int, entryID string) error
-	RecordSnapshotContent(turn int, entryID string, content []byte) error
-	RecordSnapshotAbsence(turn int, entryID string) error
-	ReplaceSnapshotIdentity(turn int, entryID string, identity *snapshot.SnapshotContentIdentity) (*snapshot.SnapshotContentIdentity, error)
+	SnapshotResolvedEntry(originalPath, canonicalPath string) (entryID string, created bool, err error)
+	DiscardSnapshotEntry(entryID string) error
+	RecordSnapshotContent(entryID string, content []byte) error
+	RecordSnapshotAbsence(entryID string) error
+	ReplaceSnapshotIdentity(entryID string, identity *snapshot.SnapshotContentIdentity) (*snapshot.SnapshotContentIdentity, error)
 }
 
 type mutationFile interface {
@@ -43,7 +42,6 @@ var (
 // the pre-mutation clear.
 type snapshotEntry struct {
 	store   SnapshotStore
-	turn    int
 	entryID string
 	created bool
 	prior   *snapshot.SnapshotContentIdentity
@@ -54,21 +52,20 @@ type snapshotEntry struct {
 // clear abandons the capture (a newly created preimage is discarded) and the
 // caller must not mutate.
 func captureSnapshotEntry(store SnapshotStore, originalPath, canonicalPath string) (snapshotEntry, error) {
-	turn := store.CurrentTurn()
-	entryID, created, err := store.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	entryID, created, err := store.SnapshotResolvedEntry(originalPath, canonicalPath)
 	if err != nil {
 		return snapshotEntry{}, err
 	}
-	prior, err := store.ReplaceSnapshotIdentity(turn, entryID, nil)
+	prior, err := store.ReplaceSnapshotIdentity(entryID, nil)
 	if err != nil {
 		if created {
-			if discardErr := store.DiscardSnapshotEntry(turn, entryID); discardErr != nil {
+			if discardErr := store.DiscardSnapshotEntry(entryID); discardErr != nil {
 				return snapshotEntry{}, fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
 			}
 		}
 		return snapshotEntry{}, err
 	}
-	return snapshotEntry{store: store, turn: turn, entryID: entryID, created: created, prior: prior}, nil
+	return snapshotEntry{store: store, entryID: entryID, created: created, prior: prior}, nil
 }
 
 // abandonUnmutatedSnapshot resolves a proven non-mutation failure: this call's
@@ -77,12 +74,12 @@ func captureSnapshotEntry(store SnapshotStore, originalPath, canonicalPath strin
 // reports its error, and preserves the preimage for a later restore skip.
 func abandonUnmutatedSnapshot(entry snapshotEntry) error {
 	if entry.created {
-		return entry.store.DiscardSnapshotEntry(entry.turn, entry.entryID)
+		return entry.store.DiscardSnapshotEntry(entry.entryID)
 	}
 	if entry.prior == nil {
 		return nil
 	}
-	if _, err := entry.store.ReplaceSnapshotIdentity(entry.turn, entry.entryID, entry.prior); err != nil {
+	if _, err := entry.store.ReplaceSnapshotIdentity(entry.entryID, entry.prior); err != nil {
 		return fmt.Errorf("restore snapshot proof: %w", err)
 	}
 	return nil
@@ -129,7 +126,7 @@ func finishMutationFailure(entry snapshotEntry, started, complete bool, produced
 		return err
 	}
 	if complete {
-		if recordErr := entry.store.RecordSnapshotContent(entry.turn, entry.entryID, produced); recordErr != nil {
+		if recordErr := entry.store.RecordSnapshotContent(entry.entryID, produced); recordErr != nil {
 			return fmt.Errorf("%w; additionally failed to record snapshot identity: %v", err, recordErr)
 		}
 	}
@@ -140,11 +137,11 @@ func finishMutationFailure(entry snapshotEntry, started, complete bool, produced
 // completed. A failure leaves the cleared nil proof and reports its error;
 // the retained preimage serves a later restore skip.
 func recordProducedSnapshotContent(entry snapshotEntry, content []byte) error {
-	return entry.store.RecordSnapshotContent(entry.turn, entry.entryID, content)
+	return entry.store.RecordSnapshotContent(entry.entryID, content)
 }
 
 func recordProducedSnapshotAbsence(entry snapshotEntry) error {
-	return entry.store.RecordSnapshotAbsence(entry.turn, entry.entryID)
+	return entry.store.RecordSnapshotAbsence(entry.entryID)
 }
 
 // openWriteTargetForMutation opens the canonical write target through the

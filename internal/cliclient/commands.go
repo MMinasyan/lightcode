@@ -690,11 +690,7 @@ func (c *CLI) command(text string) {
 			if read && err != nil {
 				text = terminal.RenderErrorMsg(err.Error())
 			}
-			label := invocation[0]
-			if strings.Contains(label, "Retained") {
-				label += " — retained snapshot boundaries, not conversation turns"
-			}
-			text = terminal.RenderSystemMsg(label) + text
+			text = terminal.RenderSystemMsg(invocation[0]) + text
 			c.report(s, text, !read)
 			if errors.Is(err, clientops.ErrInvalidParams) {
 				return

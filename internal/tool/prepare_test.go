@@ -606,7 +606,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 	}
 	testassert.Require(t, len(store.discards) == 1 && store.discards[0] == store.entryIDFor(real1), "write discards = %v, want the unmutated snapshot claim for %s discarded once", store.discards, real1)
 	assertEntryDiscarded(t, store, real1)
-	assertSnapshotEntryCount(t, store.groupDir, "1", 0)
+	assertSnapshotEntryCount(t, store.groupDir, 0)
 	assertFileContent(t, real1, "before")
 	assertFileContent(t, real2, "before")
 
@@ -627,7 +627,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 	}
 	testassert.Require(t, len(store2.discards) == 1 && store2.discards[0] == store2.entryIDFor(real1), "edit discards = %v, want the unmutated snapshot claim for %s discarded once", store2.discards, real1)
 	assertEntryDiscarded(t, store2, real1)
-	assertSnapshotEntryCount(t, store2.groupDir, "1", 0)
+	assertSnapshotEntryCount(t, store2.groupDir, 0)
 	assertFileContent(t, real1, "before")
 	assertFileContent(t, real2, "before")
 }

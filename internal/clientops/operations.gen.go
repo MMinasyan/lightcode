@@ -165,17 +165,6 @@ var operationDescriptors = map[string]descriptor{
 			return c.GetProviderDetail(ctx, &query)
 		},
 	},
-	"GetRetainedCodeSnapshots": {
-		query:  memberRequired,
-		status: 200,
-		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var query protocol.GetRetainedCodeSnapshotsParams
-			if err := bindQuery(env.query, []string{"workspace", "session_id"}, &query); err != nil {
-				return nil, err
-			}
-			return c.GetRetainedCodeSnapshots(ctx, &query)
-		},
-	},
 	"GetSessionCodeSnapshots": {
 		session: memberRequired,
 		status:  200,
@@ -332,13 +321,6 @@ var operationDescriptors = map[string]descriptor{
 				return nil, err
 			}
 			return c.ResetProviderModelField(ctx, pathValue, &query)
-		},
-	},
-	"RevertRetainedCode": {
-		body:   memberRequired,
-		status: 200,
-		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			return c.RevertRetainedCodeWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
 	"RevertSessionCode": {

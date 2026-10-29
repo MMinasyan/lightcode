@@ -119,7 +119,7 @@ func TestPreparedEditMultilineReplacementLineRange(t *testing.T) {
 func TestPreparedEditWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	root := filepath.Dir(path)
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 11)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
@@ -129,7 +129,7 @@ func TestPreparedEditWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Equal(t, result, "Edited "+path+" (1 replacement, lines 1-1).")
 	testassert.Equal(t, len(store.calls), 1)
-	testassert.Require(t, store.calls[0].turn == 11 && store.calls[0].path == path, "snapshot call = %+v, want turn=11 path=%q", store.calls[0], path)
+	testassert.Require(t, store.calls[0].path == path, "snapshot call = %+v, want path=%q", store.calls[0], path)
 	assertEntryPreimage(t, store, path, "before")
 	assertFileContent(t, path, "after")
 }
@@ -142,7 +142,7 @@ func TestPreparedEditWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testin
 	linkDir := filepath.Join(root, "linked")
 	testassert.NoError(t, os.Symlink(realDir, linkDir))
 	requested := filepath.Join(linkDir, "file.txt")
-	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 12)}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       requested,

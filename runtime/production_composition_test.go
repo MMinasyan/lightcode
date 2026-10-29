@@ -207,8 +207,6 @@ func chainImmediateDenied(callID string) harness.PreparedTool {
 // wrapper: the embedded CodeStore provides the entry and identity methods.
 type chainCodeGroup struct{ *snapshot.CodeStore }
 
-func (chainCodeGroup) CurrentTurn() int { return 1 }
-
 // chainWriteTool is the combined scenario's prod_write capability: the
 // shared write preparation (the per-call code group opened fresh from the
 // admitted-input identity, the pre-write preimage capture, one file.write

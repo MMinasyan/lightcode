@@ -111,7 +111,7 @@ func TestProofClearFailureBeforeMutationLeavesFileAndPreimageUntouched(t *testin
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	{
 		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "first"})
 		testassert.NoError(t, err)
@@ -128,7 +128,7 @@ func TestProofClearFailureBeforeMutationLeavesFileAndPreimageUntouched(t *testin
 	assertFileContent(t, path, "first")
 	last := soleSnapshotMeta(t, store).LastWrite
 	testassert.Require(t, last != nil && last.Hash == snapshotIdentityHash("first"), "LastWrite after proof-clear failure = %+v, want the prior proof unchanged", last)
-	assertEntryOriginal(t, groupDir, "1", "before")
+	assertEntryOriginal(t, groupDir, "before")
 	testassert.Require(t, counts.writes == 0 && counts.truncates == 0, "mutation file I/O = %+v, want no Write/Truncate after a failed proof clear", counts)
 }
 
@@ -136,7 +136,7 @@ func TestProvenPreMutationFailureRestoresPriorProof(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	{
 		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "first"})
 		testassert.NoError(t, err)
@@ -157,7 +157,7 @@ func TestFailedPriorProofRestoreKeepsNilProofAndSkipsLaterRevert(t *testing.T) {
 	root := t.TempDir()
 	path := snapshotLifecycleFile(t, root, "file.txt", "before")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	{
 		_, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "first"})
 		testassert.NoError(t, err)
@@ -172,10 +172,10 @@ func TestFailedPriorProofRestoreKeepsNilProofAndSkipsLaterRevert(t *testing.T) {
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "restore snapshot proof"), "edit error = %v, want the failed proof restoration reported", err)
 	assertFileContent(t, path, "first")
 	testassert.Require(t, soleSnapshotMeta(t, store).LastWrite == nil, "LastWrite after failed proof restoration = %+v, want nil proof", soleSnapshotMeta(t, store).LastWrite)
-	assertEntryOriginal(t, groupDir, "1", "before")
+	assertEntryOriginal(t, groupDir, "before")
 	result := revertTestGroup(t, groupDir)
 	testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 1 && result.Skipped[0].Path == path, "restored = %v skipped = %+v, want the nil proof to skip %s", result.Restored, result.Skipped, path)
-	assertSnapshotEntryCount(t, groupDir, "1", 1)
+	assertSnapshotEntryCount(t, groupDir, 1)
 	assertFileContent(t, path, "first")
 }
 
@@ -183,7 +183,7 @@ func TestFailedFinalIdentityRecordKeepsNilProofAndSkipsRevert(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "created.txt")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 
 	// Publications under the seam: capture meta, pre-mutation proof clear,
 	// and the final identity record — only the final record fails.
@@ -193,7 +193,7 @@ func TestFailedFinalIdentityRecordKeepsNilProofAndSkipsRevert(t *testing.T) {
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "record snapshot identity"), "write error = %v, want the failed final identity record", err)
 	assertFileContent(t, path, "created")
 	testassert.Require(t, soleSnapshotMeta(t, store).LastWrite == nil, "LastWrite after failed final record = %+v, want nil proof", soleSnapshotMeta(t, store).LastWrite)
-	assertSnapshotEntryCount(t, groupDir, "1", 1)
+	assertSnapshotEntryCount(t, groupDir, 1)
 	result := revertTestGroup(t, groupDir)
 	testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 1 && result.Skipped[0].Path == path, "restored = %v skipped = %+v, want the nil proof to skip %s", result.Restored, result.Skipped, path)
 	assertFileContent(t, path, "created")
@@ -215,7 +215,7 @@ func TestAppearedDestinationWithFailedAbandonReportsRefusalAndCleanupFailure(t *
 	root := t.TempDir()
 	path := filepath.Join(root, "created.txt")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	{
 		_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": applyPatchInput(t, "*** Add File: created.txt\n+one")})
 		testassert.NoError(t, err)
@@ -234,14 +234,14 @@ func TestAppearedDestinationWithFailedAbandonReportsRefusalAndCleanupFailure(t *
 	testassert.Require(t, len(wrapped.discards) == 0, "discards = %v, want none: the reused entry is not discardable", wrapped.discards)
 	assertFileContent(t, path, string(appearedDestinationBytes))
 	testassert.Require(t, soleSnapshotMeta(t, store).LastWrite == nil, "LastWrite after failed restoration = %+v, want the cleared nil proof preserved", soleSnapshotMeta(t, store).LastWrite)
-	assertSnapshotEntryCount(t, groupDir, "1", 1)
+	assertSnapshotEntryCount(t, groupDir, 1)
 }
 
 func TestAppearedDestinationWithCompletedAbandonKeepsEntryAndPriorProof(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "created.txt")
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	{
 		_, err := execPatch(t, root, "", "", CapabilityOptions{}, store, map[string]any{"input": applyPatchInput(t, "*** Add File: created.txt\n+one")})
 		testassert.NoError(t, err)
@@ -258,7 +258,7 @@ func TestAppearedDestinationWithCompletedAbandonKeepsEntryAndPriorProof(t *testi
 	assertFileContent(t, path, string(appearedDestinationBytes))
 	last := soleSnapshotMeta(t, store).LastWrite
 	testassert.Require(t, last != nil && last.Hash == snapshotIdentityHash("one"), "LastWrite after refusal = %+v, want the existing entry's prior proof restored", last)
-	assertSnapshotEntryCount(t, groupDir, "1", 1)
+	assertSnapshotEntryCount(t, groupDir, 1)
 }
 
 // --- post-capture rebinding refusals for every mutation producer ---
@@ -318,7 +318,7 @@ func TestMutationToolsRefuseRebindingDuringSnapshotCapture(t *testing.T) {
 		assertEntryDiscarded(t, store, canonical)
 		testassert.Require(t, len(store.identityRecords) == 0, "identity records = %+v, want none for the refused operation", store.identityRecords)
 	}
-	// A refused capture that reused this turn's existing entry must leave the
+	// A refused capture that reused this group's existing entry must leave the
 	// entry and its preimage on disk with the prior proof restored, and
 	// discard nothing.
 	assertReusedCapturePreserved := func(t *testing.T, store *recordingCodeGroupStore, canonical, priorProof string) {
@@ -353,7 +353,7 @@ func TestMutationToolsRefuseRebindingDuringSnapshotCapture(t *testing.T) {
 		},
 		{
 			// Reused-entry sibling of write_target: the seed write already
-			// created the turn's entry for real1, so the refused capture
+			// created the group's entry for real1, so the refused capture
 			// reuses it — the entry must survive with the prior proof
 			// restored instead of being discarded.
 			name: "write_reused_target",
@@ -370,7 +370,7 @@ func TestMutationToolsRefuseRebindingDuringSnapshotCapture(t *testing.T) {
 					assertFileContent(t, real1, "first")
 					assertFileContent(t, real2, "before")
 					assertReusedCapturePreserved(t, store, real1, "first")
-					assertSnapshotIdentityContent(t, store.identityRecords, 1, store.entryIDFor(real1), "first")
+					assertSnapshotIdentityContent(t, store.identityRecords, store.entryIDFor(real1), "first")
 				}
 				return run, "approved canonical path changed", assert
 			},
@@ -488,14 +488,14 @@ func TestMutationToolsRefuseRebindingDuringSnapshotCapture(t *testing.T) {
 					assertEntryPresent(t, store, dst)
 					assertEntryDiscarded(t, store, real1)
 					testassert.Require(t, len(store.identityRecords) == 1, "identity records = %+v, want only the completed destination record", store.identityRecords)
-					assertSnapshotIdentityContent(t, store.identityRecords, 1, store.entryIDFor(dst), "after")
+					assertSnapshotIdentityContent(t, store.identityRecords, store.entryIDFor(dst), "after")
 				}
 				return run, "approved canonical path changed", assert
 			},
 		},
 		{
 			// Reused-entry sibling of patch_move_src_target: the seed write
-			// created the turn's entry for real1, so the refused source
+			// created the group's entry for real1, so the refused source
 			// capture reuses it — the entry must survive with the prior
 			// proof restored while the completed destination stays recorded.
 			name: "patch_move_src_reused_target",
@@ -517,7 +517,7 @@ func TestMutationToolsRefuseRebindingDuringSnapshotCapture(t *testing.T) {
 					assertReusedCapturePreserved(t, store, real1, "first")
 					assertEntryPresent(t, store, dst)
 					testassert.Require(t, len(store.identityRecords) == 2, "identity records = %+v, want the seed write plus the completed destination", store.identityRecords)
-					assertSnapshotIdentityContent(t, store.identityRecords, 1, store.entryIDFor(dst), "after")
+					assertSnapshotIdentityContent(t, store.identityRecords, store.entryIDFor(dst), "after")
 				}
 				return run, "approved canonical path changed", assert
 			},

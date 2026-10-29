@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/snapshot"
@@ -16,31 +15,26 @@ import (
 
 // testCodeGroupStore adapts one real snapshot.CodeStore to the complete
 // SnapshotStore interface in the same private group-adapter shape the
-// production tools plugin uses around a per-call code group: the group's
-// single turn is explicit test identity.
+// production tools plugin uses around a per-call code group.
 type testCodeGroupStore struct {
 	*snapshot.CodeStore
 	groupDir string
-	turn     int
 }
 
-// CurrentTurn pins the group's single explicit test turn.
-func (s testCodeGroupStore) CurrentTurn() int { return s.turn }
-
 // newCodeGroupStore opens one real artifact code group at the test's explicit
-// directory and turn identity.
-func newCodeGroupStore(t *testing.T, groupDir string, turn int) testCodeGroupStore {
+// directory.
+func newCodeGroupStore(t *testing.T, groupDir string) testCodeGroupStore {
 	t.Helper()
 	store, err := snapshot.OpenCodeStore(groupDir)
 	testassert.NoError(t, err)
-	return testCodeGroupStore{CodeStore: store, groupDir: groupDir, turn: turn}
+	return testCodeGroupStore{CodeStore: store, groupDir: groupDir}
 }
 
 // newTempCodeGroupStore opens one real artifact code group in a fresh
-// temporary directory at the default turn.
+// temporary directory.
 func newTempCodeGroupStore(t *testing.T) testCodeGroupStore {
 	t.Helper()
-	return newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 1)
+	return newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))
 }
 
 // execPatch runs one apply_patch through the exported Normalize* + Prepare*
@@ -66,7 +60,6 @@ func execPatch(t *testing.T, root, rootCanonical, writeDirCanonical string, opts
 }
 
 type snapshotCall struct {
-	turn      int
 	path      string
 	canonical string
 	entryID   string
@@ -74,7 +67,6 @@ type snapshotCall struct {
 }
 
 type snapshotIdentityRecord struct {
-	turn    int
 	entryID string
 	content string
 	absent  bool
@@ -107,7 +99,7 @@ func newRecordingCodeGroupStore(t *testing.T) *recordingCodeGroupStore {
 	return &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t)}
 }
 
-func (s *recordingCodeGroupStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
+func (s *recordingCodeGroupStore) SnapshotResolvedEntry(originalPath, canonicalPath string) (string, bool, error) {
 	if s.plantBefore != "" {
 		path := s.plantBefore
 		s.plantBefore = ""
@@ -120,37 +112,37 @@ func (s *recordingCodeGroupStore) SnapshotResolvedEntry(turn int, originalPath, 
 	if s.failOnCall > 0 && len(s.calls)+1 == s.failOnCall {
 		return "", false, s.errFail
 	}
-	entryID, created, err := s.testCodeGroupStore.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
+	entryID, created, err := s.testCodeGroupStore.SnapshotResolvedEntry(originalPath, canonicalPath)
 	if err != nil {
 		return "", false, err
 	}
-	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath, entryID: entryID, created: created})
+	s.calls = append(s.calls, snapshotCall{path: originalPath, canonical: canonicalPath, entryID: entryID, created: created})
 	if s.onSnapshot != nil {
 		s.onSnapshot(len(s.calls))
 	}
 	return entryID, created, nil
 }
 
-func (s *recordingCodeGroupStore) DiscardSnapshotEntry(turn int, entryID string) error {
+func (s *recordingCodeGroupStore) DiscardSnapshotEntry(entryID string) error {
 	s.discards = append(s.discards, entryID)
-	return s.testCodeGroupStore.DiscardSnapshotEntry(turn, entryID)
+	return s.testCodeGroupStore.DiscardSnapshotEntry(entryID)
 }
 
-func (s *recordingCodeGroupStore) ReplaceSnapshotIdentity(turn int, entryID string, identity *snapshot.SnapshotContentIdentity) (*snapshot.SnapshotContentIdentity, error) {
+func (s *recordingCodeGroupStore) ReplaceSnapshotIdentity(entryID string, identity *snapshot.SnapshotContentIdentity) (*snapshot.SnapshotContentIdentity, error) {
 	if s.failAbandon && identity != nil {
 		return nil, errInjectedAbandon
 	}
-	return s.testCodeGroupStore.ReplaceSnapshotIdentity(turn, entryID, identity)
+	return s.testCodeGroupStore.ReplaceSnapshotIdentity(entryID, identity)
 }
 
-func (s *recordingCodeGroupStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
-	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{turn: turn, entryID: entryID, content: string(content)})
-	return s.testCodeGroupStore.RecordSnapshotContent(turn, entryID, content)
+func (s *recordingCodeGroupStore) RecordSnapshotContent(entryID string, content []byte) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{entryID: entryID, content: string(content)})
+	return s.testCodeGroupStore.RecordSnapshotContent(entryID, content)
 }
 
-func (s *recordingCodeGroupStore) RecordSnapshotAbsence(turn int, entryID string) error {
-	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{turn: turn, entryID: entryID, absent: true})
-	return s.testCodeGroupStore.RecordSnapshotAbsence(turn, entryID)
+func (s *recordingCodeGroupStore) RecordSnapshotAbsence(entryID string) error {
+	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{entryID: entryID, absent: true})
+	return s.testCodeGroupStore.RecordSnapshotAbsence(entryID)
 }
 
 // entryIDFor returns the real entry id the recorded capture reported for one
@@ -172,39 +164,37 @@ func snapshotIdentityHash(content string) string {
 }
 
 func snapshotEntryDir(store testCodeGroupStore, entryID string) string {
-	return filepath.Join(store.groupDir, "snapshots", strconv.Itoa(store.turn), entryID)
+	return filepath.Join(store.groupDir, "snapshots", "1", entryID)
 }
 
 func soleSnapshotMeta(t *testing.T, store testCodeGroupStore) snapshot.SnapshotMeta {
 	t.Helper()
-	turns, err := store.ListTurns()
+	metas, err := store.ListEntries()
 	testassert.NoError(t, err)
-	testassert.Require(t, len(turns) == 1 && len(turns[0].Files) == 1, "ListTurns = %+v, want one turn with one entry", turns)
-	return turns[0].Files[0]
+	testassert.Require(t, len(metas) == 1, "ListEntries = %+v, want one entry", metas)
+	return metas[0]
 }
 
 func metaForCanonical(t *testing.T, store testCodeGroupStore, canonical string) snapshot.SnapshotMeta {
 	t.Helper()
-	turns, err := store.ListTurns()
+	metas, err := store.ListEntries()
 	testassert.NoError(t, err)
-	for _, entry := range turns {
-		for _, file := range entry.Files {
-			if file.CanonicalPath == canonical {
-				return file
-			}
+	for _, meta := range metas {
+		if meta.CanonicalPath == canonical {
+			return meta
 		}
 	}
-	t.Fatalf("ListTurns = %+v, want an entry recorded for %s", turns, canonical)
+	t.Fatalf("ListEntries = %+v, want an entry recorded for %s", metas, canonical)
 	return snapshot.SnapshotMeta{}
 }
 
-func assertSnapshotEntryCount(t *testing.T, groupDir, turn string, want int) {
+func assertSnapshotEntryCount(t *testing.T, groupDir string, want int) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(groupDir, "snapshots", turn))
+	entries, err := os.ReadDir(filepath.Join(groupDir, "snapshots", "1"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
-	testassert.Require(t, len(entries) == want, "snapshot entries in %s = %v, want %d", turn, entries, want)
+	testassert.Require(t, len(entries) == want, "snapshot entries = %v, want %d", entries, want)
 }
 
 func assertEntryPresent(t *testing.T, store *recordingCodeGroupStore, canonical string) {
@@ -223,12 +213,12 @@ func assertEntryDiscarded(t *testing.T, store *recordingCodeGroupStore, canonica
 	testassert.Require(t, os.IsNotExist(err), "entry %s for %s = %v, want the refused new capture discarded from disk", entryID, canonical, err)
 }
 
-func assertEntryOriginal(t *testing.T, groupDir, turn, want string) {
+func assertEntryOriginal(t *testing.T, groupDir, want string) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(groupDir, "snapshots", turn))
+	entries, err := os.ReadDir(filepath.Join(groupDir, "snapshots", "1"))
 	testassert.NoError(t, err)
 	testassert.Require(t, len(entries) == 1 && entries[0].IsDir(), "snapshot entries = %v, want one entry directory", entries)
-	data, err := os.ReadFile(filepath.Join(groupDir, "snapshots", turn, entries[0].Name(), "original"))
+	data, err := os.ReadFile(filepath.Join(groupDir, "snapshots", "1", entries[0].Name(), "original"))
 	testassert.NoError(t, err)
 	testassert.Require(t, string(data) == want, "preimage = %q, want %q", data, want)
 }
@@ -244,7 +234,7 @@ func assertEntryPreimage(t *testing.T, store *recordingCodeGroupStore, canonical
 
 func revertTestGroup(t *testing.T, groupDir string) snapshot.RevertResult {
 	t.Helper()
-	result, err := snapshot.RevertCodeGroups([]string{groupDir}, 0)
+	result, err := snapshot.RevertCodeGroups([]string{groupDir})
 	testassert.NoError(t, err)
 	return result
 }
@@ -265,24 +255,24 @@ func assertFileContent(t *testing.T, path, want string) {
 	}
 }
 
-func assertSnapshotIdentityContent(t *testing.T, records []snapshotIdentityRecord, turn int, entryID, content string) {
+func assertSnapshotIdentityContent(t *testing.T, records []snapshotIdentityRecord, entryID, content string) {
 	t.Helper()
 	for _, record := range records {
-		if record.turn == turn && record.entryID == entryID && !record.absent && record.content == content {
+		if record.entryID == entryID && !record.absent && record.content == content {
 			return
 		}
 	}
-	t.Fatalf("snapshot identity records = %+v, want turn=%d entry=%q content=%q", records, turn, entryID, content)
+	t.Fatalf("snapshot identity records = %+v, want entry=%q content=%q", records, entryID, content)
 }
 
-func assertSnapshotIdentityAbsent(t *testing.T, records []snapshotIdentityRecord, turn int, entryID string) {
+func assertSnapshotIdentityAbsent(t *testing.T, records []snapshotIdentityRecord, entryID string) {
 	t.Helper()
 	for _, record := range records {
-		if record.turn == turn && record.entryID == entryID && record.absent {
+		if record.entryID == entryID && record.absent {
 			return
 		}
 	}
-	t.Fatalf("snapshot identity records = %+v, want turn=%d entry=%q absent", records, turn, entryID)
+	t.Fatalf("snapshot identity records = %+v, want entry=%q absent", records, entryID)
 }
 
 // --- shared producer inventory ---
@@ -355,16 +345,16 @@ func runProducerMutationCase(t *testing.T, tc producerMutationCase, step mutatio
 		testassert.NoError(t, os.WriteFile(path, []byte(tc.seed), 0o644))
 	}
 	groupDir := filepath.Join(t.TempDir(), "group")
-	store := newCodeGroupStore(t, groupDir, 1)
+	store := newCodeGroupStore(t, groupDir)
 	withMutationFailure(t, path, step)
 
 	err := tc.run(t, root, path, store)
 
 	testassert.Require(t, err != nil, "%s with %s succeeded, want injected mutation failure", tc.name, step)
 	meta := soleSnapshotMeta(t, store)
-	assertSnapshotEntryCount(t, groupDir, "1", 1)
+	assertSnapshotEntryCount(t, groupDir, 1)
 	if tc.existing {
-		assertEntryOriginal(t, groupDir, "1", tc.seed)
+		assertEntryOriginal(t, groupDir, tc.seed)
 	}
 	prefix := tc.intended[:len(tc.intended)/2]
 	switch step {

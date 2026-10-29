@@ -593,7 +593,7 @@ func TestFailedResumeLeavesTheSourceLiveUnderAHeldHydration(t *testing.T) {
 	testassert.Require(t, c.rootID == rootA && c.root != nil && c.root.hydration != nil && c.root.hydration.SessionRevision.DurableRevision == "3", "the retained source was left stale after a failed resume")
 }
 
-func TestRuntimeCurrentRetainedSnapshotsAndPartialRestoreRemainReachable(t *testing.T) {
+func TestRuntimeCurrentSnapshotsAndPartialRestoreRemainReachable(t *testing.T) {
 	c, transport := fixture(t)
 	settledReader(t, c, transport)
 	c.command(`/runtime GetSessionCodeSnapshots {"session_id":"` + rootA + `"}`)
@@ -602,15 +602,9 @@ func TestRuntimeCurrentRetainedSnapshotsAndPartialRestoreRemainReachable(t *test
 	current.respond([]protocol.CodeSnapshotGroup{{OperationId: "owned-operation", GroupItemId: "group", Files: []protocol.SnapshotFile{}}})
 	settleTasks(t, c)
 	testassert.Require(t, strings.Contains(outputs(c), "owned-operation"), "Operation snapshot boundary dropped")
-	c.command(`/runtime GetRetainedCodeSnapshots {"query":{"workspace":"/workspace","session_id":"1234abcd"}}`)
-	retained := receive(t, transport.requests)
-	testassert.Require(t, retained.req.URL.Query().Get("workspace") == "/workspace" && retained.req.URL.Query().Get("session_id") == "1234abcd", "retained snapshot address changed")
-	retained.respond(protocol.RetainedTurns{Turns: []protocol.RetainedTurn{{Turn: 7, Files: []protocol.SnapshotFile{}}}})
-	settleTasks(t, c)
-	testassert.Require(t, strings.Contains(outputs(c), "retained snapshot boundaries"), "retained boundary labelled as conversation turn")
-	c.command(`/runtime RevertRetainedCode {"body":{"workspace":"/workspace","session_id":"1234abcd","after_turn":7}}`)
+	c.command(`/runtime RevertSessionCode {"session_id":"` + rootA + `","body":{"boundary_operation_id":"owned-operation"}}`)
 	restore := receive(t, transport.requests)
-	testassert.Require(t, strings.Contains(string(restore.body), `"after_turn":7`), "retained restore boundary rewritten")
+	testassert.Require(t, strings.Contains(string(restore.body), `"boundary_operation_id":"owned-operation"`), "canonical restore boundary rewritten")
 	restore.reject(409, protocol.CodeRevertResult{Restored: []string{"one.go"}, Skipped: []protocol.SkippedFile{{Path: "two.go", Reason: "changed"}}, Error: &protocol.Error{Code: "conflict", Message: "partial restore"}})
 	receive(t, transport.requests).respond(hydration(rootA, "2", inputs(1, 1), nil))
 	settleTasks(t, c)

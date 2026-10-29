@@ -371,7 +371,7 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 
 	t.Run("snapshot_capture", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		store := newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 1)
+		store := newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))
 		_, err := execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, store,
 			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)

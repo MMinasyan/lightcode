@@ -1,16 +1,13 @@
 <script>
   import { openDialog } from './dialogs';
-  // Both snapshot layouts as actual generated tasks: current groups use the
-  // generated Operation identities; retained snapshots use the selected
-  // Workspace, an 8-hex retained ID and each turn's exact after_turn token.
+  // Snapshot layout as an actual generated task: current groups use the
+  // generated Operation identities.
   import { createEventDispatcher, onMount } from 'svelte';
   import { invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
   import { sameStamp } from './reader';
-  import { composeObjectPatch, parseExactJSON, readRetainedTurnsText } from './exactjson';
   export let getClient;
   export let stamp; // () => ReaderStamp
-  export let workspace = '';
   export let sessionID = '';
   const dispatch = createEventDispatcher();
 
@@ -25,11 +22,6 @@
   let currentPending = null; // sessionID
   let groupsError = '';
   let groupsToken = 0;
-  let retainedID = '';
-  let loadedRetained = null; // { workspace, sessionID, turns }
-  let retainedPending = null; // { workspace, sessionID }
-  let retainedError = '';
-  let retainedToken = 0;
   let restoreText = [];
   let busy = false;
 
@@ -37,11 +29,6 @@
     groupsToken += 1;
     currentPending = null;
   }
-  $: if (retainedPending !== null && (retainedPending.workspace !== workspace || retainedPending.sessionID !== retainedID)) {
-    retainedToken += 1;
-    retainedPending = null;
-  }
-
 
   const invoke = (label, operation, params, decode) => invokeNative(getClient, label, operation, params, decode);
 
@@ -63,28 +50,6 @@
     }
   }
 
-  async function loadRetained() {
-    const token = ++retainedToken;
-    const cap = stamp();
-    const targetWorkspace = workspace;
-    const target = retainedID;
-    retainedError = '';
-    if (!target) { loadedRetained = null; retainedPending = null; return; }
-    retainedPending = { workspace: targetWorkspace, sessionID: target };
-    // The exact-text retained decoder consumes the accepted body at the boundary.
-    const classified = await invoke('retained snapshots', 'GetRetainedCodeSnapshots', JSON.stringify({
-      query: { workspace: targetWorkspace, session_id: target },
-    }), (body) => readRetainedTurnsText(parseExactJSON(body)));
-    if (token !== retainedToken || !sameStamp(cap, stamp())) return;
-    retainedPending = null;
-    if (classified.kind !== 'ok') {
-      loadedRetained = null;
-      retainedError = classified.message;
-      return;
-    }
-    loadedRetained = { workspace: targetWorkspace, sessionID: target, turns: classified.data };
-  }
-
   // A restore reports its addressed outcome through the App note and inline; the
   // stamped refresh stays gated, so unmounting loses no actual response.
   async function revertCurrent(group) {
@@ -101,25 +66,6 @@
     restoreText = restoreLines(outcome);
     dispatch('note', `Code rewind for session ${target}: ${restoreLines(outcome).join('; ')}`);
     if (sameStamp(cap, stamp()) && loadedCurrent !== null && loadedCurrent.sessionID === target) void loadGroups();
-  }
-
-  async function revertRetained(turnText) {
-    if (busy || !loadedRetained) return;
-    busy = true;
-    const targetWorkspace = loadedRetained.workspace;
-    const target = loadedRetained.sessionID;
-    const bodyText = composeObjectPatch([
-      ['workspace', JSON.stringify(targetWorkspace)],
-      ['session_id', JSON.stringify(target)],
-      ['after_turn', turnText],
-    ]);
-    const classified = await invoke('retained rewind', 'RevertRetainedCode', composeObjectPatch([
-      ['body', bodyText],
-    ]), JSON.parse);
-    busy = false;
-    const outcome = classifyRestore(classified, 'retained rewind');
-    restoreText = restoreLines(outcome);
-    dispatch('note', `Retained code rewind for ${targetWorkspace} · ${target}: ${restoreLines(outcome).join('; ')}`);
   }
 </script>
 
@@ -151,38 +97,6 @@
         {/each}
       {/if}
 
-      <div class="sec">Retained pre-cutover snapshots</div>
-      <div class="retained-row">
-        <span class="ws" title={workspace}>{workspace || '(no workspace)'}</span>
-        <input class="id" type="text" bind:value={retainedID} placeholder="8-hex retained session id"
-          aria-label="Retained session id" on:keydown={(e) => { if (e.key === 'Enter') void loadRetained(); }} />
-        <button class="ghost" disabled={!workspace || !retainedID || busy} on:click={() => void loadRetained()} aria-label="Read retained snapshots">Read</button>
-      </div>
-      {#if retainedError}
-        <div class="error">{retainedError}</div>
-      {:else if loadedRetained && loadedRetained.turns.length > 0}
-        <div class="sec">Loaded retained target: {loadedRetained.workspace} · {loadedRetained.sessionID}</div>
-        <div class="group">
-          <div class="group-hdr">
-            <span class="ids">Retained snapshot boundary after turn 0 (initial)</span>
-            <button class="ghost" disabled={busy} on:click={() => void revertRetained('0')}
-              aria-label="Revert to initial retained boundary">Revert after</button>
-          </div>
-        </div>
-        {#each loadedRetained.turns as turn (turn.turnText)}
-          <div class="group">
-            <div class="group-hdr">
-              <span class="ids">Retained snapshot boundary after turn {turn.turnText}</span>
-              <button class="ghost" disabled={busy} on:click={() => void revertRetained(turn.turnText)}
-                aria-label={`Revert after retained turn ${turn.turnText}`}>Revert after</button>
-            </div>
-            {#each turn.files as file (file.path)}
-              <div class="file"><span class="path">{file.path}</span><span class="flag">{file.existed ? 'existed' : 'created'}</span></div>
-            {/each}
-          </div>
-        {/each}
-      {/if}
-
       {#if restoreText.length > 0}
         <div class="sec">Restore outcome</div>
         <div class="restore">
@@ -206,10 +120,6 @@
   .file { display:flex; justify-content:space-between; gap:8px; padding:2px 0; font-family:var(--font-mono); font-size:11px; }
   .path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); }
   .flag { color:var(--text-dim); flex-shrink:0; }
-  .retained-row { display:flex; align-items:center; gap:6px; }
-  .ws { flex:0 1 auto; max-width:38%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-dim); font-family:var(--font-mono); font-size:11px; }
-  .id { flex:1; min-width:0; padding:5px 8px; border:1px solid var(--border-button); border-radius:var(--radius); background:var(--bg-input); color:var(--text); font-family:var(--font-mono); font-size:12px; outline:none; }
-  .id:focus { border-color:var(--accent); }
   .ghost { padding:4px 10px; border:1px solid var(--border-button); border-radius:var(--radius); background:none; color:var(--text-dim); font-family:var(--font-ui); font-size:11px; cursor:pointer; flex-shrink:0; }
   .ghost:hover:not(:disabled) { color:var(--accent); border-color:var(--accent); }
   .ghost:disabled { opacity:.45; cursor:default; }

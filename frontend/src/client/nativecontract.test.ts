@@ -96,10 +96,7 @@ describe('native invocation contract', () => {
     rejects('GetSessionHistory', '{"session_id":"root1","query":{"cursor":5}}');
     rejects('GetSessionHistory', '{"session_id":"root1","query":{"bogus":1}}');
     // The envelope's session_id belongs only to the operations that declare a
-    // session path; the retained query's own session_id is a query member.
-    rejects('GetRetainedCodeSnapshots', '{"session_id":"root1","query":{"workspace":"/ws"}}');
-    rejects('GetRetainedCodeSnapshots', '{"query":{"workspace":"/ws"}}');
-    allows('GetRetainedCodeSnapshots', '{"query":{"workspace":"/ws","session_id":"0123456789abcdef0123456789abcdef"}}');
+    // session path.
   });
 
   it('checks every recorded call, so one violating envelope fails the whole history', () => {

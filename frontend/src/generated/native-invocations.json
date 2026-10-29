@@ -138,22 +138,6 @@
       }
     }
   },
-  "GetRetainedCodeSnapshots": {
-    "session_id": "forbidden",
-    "field": "forbidden",
-    "query": "required",
-    "body": "forbidden",
-    "query_members": {
-      "session_id": {
-        "required": true,
-        "type": "string"
-      },
-      "workspace": {
-        "required": true,
-        "type": "string"
-      }
-    }
-  },
   "GetSessionCodeSnapshots": {
     "session_id": "required",
     "field": "forbidden",
@@ -296,13 +280,6 @@
         "type": "string"
       }
     }
-  },
-  "RevertRetainedCode": {
-    "session_id": "forbidden",
-    "field": "forbidden",
-    "query": "forbidden",
-    "body": "required",
-    "query_members": {}
   },
   "RevertSessionCode": {
     "session_id": "required",

@@ -181,13 +181,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N6 HealthProtocolVersion = "6"
+	N7 HealthProtocolVersion = "7"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N6:
+	case N7:
 		return true
 	default:
 		return false
@@ -1441,24 +1441,6 @@ type RefusalDeltaEvent struct {
 // RefusalDeltaEventKind defines model for RefusalDeltaEvent.Kind.
 type RefusalDeltaEventKind string
 
-// RetainedRevertRequest defines model for RetainedRevertRequest.
-type RetainedRevertRequest struct {
-	AfterTurn int    `json:"after_turn"`
-	SessionId string `json:"session_id"`
-	Workspace string `json:"workspace"`
-}
-
-// RetainedTurn defines model for RetainedTurn.
-type RetainedTurn struct {
-	Files []SnapshotFile `json:"files"`
-	Turn  int            `json:"turn"`
-}
-
-// RetainedTurns defines model for RetainedTurns.
-type RetainedTurns struct {
-	Turns []RetainedTurn `json:"turns"`
-}
-
 // RevertCodeRequest defines model for RevertCodeRequest.
 type RevertCodeRequest struct {
 	BoundaryOperationId string `json:"boundary_operation_id"`
@@ -1890,12 +1872,6 @@ type ResetProviderModelFieldParams struct {
 	ModelId    ModelIDQuery    `form:"model_id" json:"model_id"`
 }
 
-// GetRetainedCodeSnapshotsParams defines parameters for GetRetainedCodeSnapshots.
-type GetRetainedCodeSnapshotsParams struct {
-	Workspace string `form:"workspace" json:"workspace"`
-	SessionId string `form:"session_id" json:"session_id"`
-}
-
 // ListSessionsParams defines parameters for ListSessions.
 type ListSessionsParams struct {
 	Workspace WorkspaceQuery `form:"workspace" json:"workspace"`
@@ -1927,9 +1903,6 @@ type DiscoverProviderCandidatesJSONRequestBody = DiscoveryRequest
 
 // UpdateProviderModelJSONRequestBody defines body for UpdateProviderModel for application/json ContentType.
 type UpdateProviderModelJSONRequestBody = UpdateProviderModelRequest
-
-// RevertRetainedCodeJSONRequestBody defines body for RevertRetainedCode for application/json ContentType.
-type RevertRetainedCodeJSONRequestBody = RetainedRevertRequest
 
 // CreateSessionJSONRequestBody defines body for CreateSession for application/json ContentType.
 type CreateSessionJSONRequestBody = CreateSessionRequest
@@ -3032,17 +3005,6 @@ type ClientInterface interface {
 	// ResetProviderModelField performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
 	ResetProviderModelField(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// GetRetainedCodeSnapshots performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
-	GetRetainedCodeSnapshots(ctx context.Context, params *GetRetainedCodeSnapshotsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// RevertRetainedCodeWithBody performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request,
-	// with any type of body and a specified content type.
-	RevertRetainedCodeWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// RevertRetainedCode performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request.
-	// Takes a body of the `application/json` content type.
-	RevertRetainedCode(ctx context.Context, body RevertRetainedCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// ListSessions performs a GET /v1/sessions (the `ListSessions` operationId) request.
 	ListSessions(ctx context.Context, params *ListSessionsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3501,47 +3463,6 @@ func (c *Client) DiscoverProviderModelCandidates(ctx context.Context, params *Di
 // ResetProviderModelField performs a DELETE /v1/providers/models/fields/{field} (the `ResetProviderModelField` operationId) request.
 func (c *Client) ResetProviderModelField(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewResetProviderModelFieldRequest(c.Server, field, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// GetRetainedCodeSnapshots performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
-func (c *Client) GetRetainedCodeSnapshots(ctx context.Context, params *GetRetainedCodeSnapshotsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetRetainedCodeSnapshotsRequest(c.Server, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// RevertRetainedCodeWithBody performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request,
-// with any type of body and a specified content type.
-func (c *Client) RevertRetainedCodeWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRevertRetainedCodeRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// RevertRetainedCode performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request.
-// Takes a body of the `application/json` content type.
-func (c *Client) RevertRetainedCode(ctx context.Context, body RevertRetainedCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRevertRetainedCodeRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4886,104 +4807,6 @@ func NewResetProviderModelFieldRequest(server string, field ModelField, params *
 	return req, nil
 }
 
-// NewGetRetainedCodeSnapshotsRequest constructs an http.Request for the GetRetainedCodeSnapshots method
-func NewGetRetainedCodeSnapshotsRequest(server string, params *GetRetainedCodeSnapshotsParams) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/retained-code-snapshots")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "workspace", params.Workspace, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "session_id", params.SessionId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
-
-// NewRevertRetainedCodeRequest calls the generic RevertRetainedCode builder with application/json body
-func NewRevertRetainedCodeRequest(server string, body RevertRetainedCodeJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewRevertRetainedCodeRequestWithBody(server, "application/json", bodyReader)
-}
-
-// NewRevertRetainedCodeRequestWithBody constructs an http.Request for the RevertRetainedCode method, with any body, and a specified content type
-func NewRevertRetainedCodeRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/retained-code-snapshots/revert")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
 // NewListSessionsRequest constructs an http.Request for the ListSessions method
 func NewListSessionsRequest(server string, params *ListSessionsParams) (*http.Request, error) {
 	var err error
@@ -5893,21 +5716,6 @@ type ClientWithResponsesInterface interface {
 	//
 	// Returns a wrapper object for the known response body format(s).
 	ResetProviderModelFieldWithResponse(ctx context.Context, field ModelField, params *ResetProviderModelFieldParams, reqEditors ...RequestEditorFn) (*ResetProviderModelFieldResponse, error)
-
-	// GetRetainedCodeSnapshotsWithResponse performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	GetRetainedCodeSnapshotsWithResponse(ctx context.Context, params *GetRetainedCodeSnapshotsParams, reqEditors ...RequestEditorFn) (*GetRetainedCodeSnapshotsResponse, error)
-
-	// RevertRetainedCodeWithBodyWithResponse performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request,
-	// with any type of body and a specified content type.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	RevertRetainedCodeWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RevertRetainedCodeResponse, error)
-
-	// RevertRetainedCodeWithResponse performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request.
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	RevertRetainedCodeWithResponse(ctx context.Context, body RevertRetainedCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*RevertRetainedCodeResponse, error)
 
 	// ListSessionsWithResponse performs a GET /v1/sessions (the `ListSessions` operationId) request.
 	//
@@ -7030,102 +6838,6 @@ func (r ResetProviderModelFieldResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ResetProviderModelFieldResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type GetRetainedCodeSnapshotsResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *RetainedTurns
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r GetRetainedCodeSnapshotsResponse) GetJSON200() *RetainedTurns {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r GetRetainedCodeSnapshotsResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r GetRetainedCodeSnapshotsResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r GetRetainedCodeSnapshotsResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetRetainedCodeSnapshotsResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r GetRetainedCodeSnapshotsResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type RevertRetainedCodeResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *CodeRevertResult
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *CodeRevertError
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r RevertRetainedCodeResponse) GetJSON200() *CodeRevertResult {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r RevertRetainedCodeResponse) GetJSONDefault() *CodeRevertError {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r RevertRetainedCodeResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r RevertRetainedCodeResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r RevertRetainedCodeResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r RevertRetainedCodeResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -8283,39 +7995,6 @@ func (c *ClientWithResponses) ResetProviderModelFieldWithResponse(ctx context.Co
 	return ParseResetProviderModelFieldResponse(rsp)
 }
 
-// GetRetainedCodeSnapshotsWithResponse performs a GET /v1/retained-code-snapshots (the `GetRetainedCodeSnapshots` operationId) request.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) GetRetainedCodeSnapshotsWithResponse(ctx context.Context, params *GetRetainedCodeSnapshotsParams, reqEditors ...RequestEditorFn) (*GetRetainedCodeSnapshotsResponse, error) {
-	rsp, err := c.GetRetainedCodeSnapshots(ctx, params, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseGetRetainedCodeSnapshotsResponse(rsp)
-}
-
-// RevertRetainedCodeWithBodyWithResponse performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request,
-// with any type of body and a specified content type.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) RevertRetainedCodeWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RevertRetainedCodeResponse, error) {
-	rsp, err := c.RevertRetainedCodeWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseRevertRetainedCodeResponse(rsp)
-}
-
-// RevertRetainedCodeWithResponse performs a POST /v1/retained-code-snapshots/revert (the `RevertRetainedCode` operationId) request.
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) RevertRetainedCodeWithResponse(ctx context.Context, body RevertRetainedCodeJSONRequestBody, reqEditors ...RequestEditorFn) (*RevertRetainedCodeResponse, error) {
-	rsp, err := c.RevertRetainedCode(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseRevertRetainedCodeResponse(rsp)
-}
-
 // ListSessionsWithResponse performs a GET /v1/sessions (the `ListSessions` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
@@ -9277,72 +8956,6 @@ func ParseResetProviderModelFieldResponse(rsp *http.Response) (*ResetProviderMod
 	return response, nil
 }
 
-// ParseGetRetainedCodeSnapshotsResponse parses an HTTP response from a GetRetainedCodeSnapshotsWithResponse call
-func ParseGetRetainedCodeSnapshotsResponse(rsp *http.Response) (*GetRetainedCodeSnapshotsResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &GetRetainedCodeSnapshotsResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest RetainedTurns
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
-}
-
-// ParseRevertRetainedCodeResponse parses an HTTP response from a RevertRetainedCodeWithResponse call
-func ParseRevertRetainedCodeResponse(rsp *http.Response) (*RevertRetainedCodeResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &RevertRetainedCodeResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest CodeRevertResult
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest CodeRevertError
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
-}
-
 // ParseListSessionsResponse parses an HTTP response from a ListSessionsWithResponse call
 func ParseListSessionsResponse(rsp *http.Response) (*ListSessionsResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -9990,12 +9603,6 @@ type ServerInterface interface {
 
 	// (DELETE /v1/providers/models/fields/{field})
 	ResetProviderModelField(w http.ResponseWriter, r *http.Request, field ModelField, params ResetProviderModelFieldParams)
-
-	// (GET /v1/retained-code-snapshots)
-	GetRetainedCodeSnapshots(w http.ResponseWriter, r *http.Request, params GetRetainedCodeSnapshotsParams)
-
-	// (POST /v1/retained-code-snapshots/revert)
-	RevertRetainedCode(w http.ResponseWriter, r *http.Request)
 
 	// (GET /v1/sessions)
 	ListSessions(w http.ResponseWriter, r *http.Request, params ListSessionsParams)
@@ -10659,66 +10266,6 @@ func (siw *ServerInterfaceWrapper) ResetProviderModelField(w http.ResponseWriter
 	handler.ServeHTTP(w, r)
 }
 
-// GetRetainedCodeSnapshots operation middleware
-func (siw *ServerInterfaceWrapper) GetRetainedCodeSnapshots(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// Parameter object where we will unmarshal all parameters from the context
-	var params GetRetainedCodeSnapshotsParams
-
-	// ------------- Required query parameter "workspace" -------------
-
-	err = runtime.BindQueryParameterWithOptions("form", true, true, "workspace", r.URL.Query(), &params.Workspace, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
-	if err != nil {
-		var requiredError *runtime.RequiredParameterError
-		if errors.As(err, &requiredError) {
-			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "workspace"})
-		} else {
-			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "workspace", Err: err})
-		}
-		return
-	}
-
-	// ------------- Required query parameter "session_id" -------------
-
-	err = runtime.BindQueryParameterWithOptions("form", true, true, "session_id", r.URL.Query(), &params.SessionId, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
-	if err != nil {
-		var requiredError *runtime.RequiredParameterError
-		if errors.As(err, &requiredError) {
-			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "session_id"})
-		} else {
-			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "session_id", Err: err})
-		}
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetRetainedCodeSnapshots(w, r, params)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
-// RevertRetainedCode operation middleware
-func (siw *ServerInterfaceWrapper) RevertRetainedCode(w http.ResponseWriter, r *http.Request) {
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.RevertRetainedCode(w, r)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
 // ListSessions operation middleware
 func (siw *ServerInterfaceWrapper) ListSessions(w http.ResponseWriter, r *http.Request) {
 
@@ -11314,8 +10861,6 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/revert-code", wrapper.RevertSessionCode)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/workspaces", wrapper.ListWorkspaces)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/workspaces/files/read", wrapper.ReadWorkspaceFile)
-	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/retained-code-snapshots", wrapper.GetRetainedCodeSnapshots)
-	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/retained-code-snapshots/revert", wrapper.RevertRetainedCode)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/configuration", wrapper.GetConfiguration)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/configuration/reload", wrapper.ReloadConfiguration)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/configuration/settings", wrapper.UpdateConfigurationSettings)

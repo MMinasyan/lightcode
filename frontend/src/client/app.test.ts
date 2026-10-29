@@ -59,7 +59,6 @@ const sdk: Record<string, ReturnType<typeof vi.fn>> = {
   ForkSession: vi.fn(),
   GetConfiguration: vi.fn(),
   GetProviderDetail: vi.fn(),
-  GetRetainedCodeSnapshots: vi.fn(),
   GetSessionCodeSnapshots: vi.fn(),
   GetSessionHistory: vi.fn(),
   GetSessionHydration: vi.fn(),
@@ -74,7 +73,6 @@ const sdk: Record<string, ReturnType<typeof vi.fn>> = {
   ReopenSession: vi.fn(),
   ResetProviderField: vi.fn(),
   ResetProviderModelField: vi.fn(),
-  RevertRetainedCode: vi.fn(),
   RevertSessionCode: vi.fn(),
   SetAgentTypeModel: vi.fn(),
   SetSessionAgentType: vi.fn(),
@@ -1641,14 +1639,6 @@ async function openNewProvider(target: HTMLElement) {
 async function openSnapshots(target: HTMLElement) {
   await openSettings(target);
   (target.querySelector('[aria-label="Snapshots"]') as HTMLElement).click();
-}
-
-// readRetainedSnapshots targets one retained session through the loaded
-// Workspace; the caller's settles, held replies and draft retargets stay in
-// the case.
-async function readRetainedSnapshots(target: HTMLElement, id: string) {
-  await changeInput(target, 'Retained session id', id);
-  (target.querySelector('[aria-label="Read retained snapshots"]') as HTMLElement).click();
 }
 
 // The richer Fork fixture: four inputs and three owned operations, plus the
@@ -3510,55 +3500,7 @@ describe('code snapshots', () => {
     expect(target.textContent).toContain('Restore failed: partial failure');
   });
 
-  it('reads retained turns as exact text and sends after_turn as an exact token', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    vi.mocked(sdk.GetRetainedCodeSnapshots).mockResolvedValue(native(200,
-      '{"turns":[{"turn":9007199254740993,"files":[{"path":"legacy.ts","existed":true}]}]}',
-    false));
-    vi.mocked(sdk.RevertRetainedCode).mockRejectedValue(new Error('retained rewind lost'));
-    const { target } = await mountApp(connection);
-    await openSnapshots(target);
-    await settle();
-    await readRetainedSnapshots(target, 'abcd1234');
-    await settle();
-    await settle();
-    expect(target.textContent).toContain('after turn 9007199254740993');
-    (target.querySelector('[aria-label="Revert after retained turn 9007199254740993"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const call = vi.mocked(sdk.RevertRetainedCode).mock.calls[0][0] as string;
-    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":9007199254740993}');
-    expect(target.textContent).toContain('Rewind outcome unknown');
-  });
 
-  it('offers the initial retained boundary 0 for a loaded target with only later turns', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    vi.mocked(sdk.GetRetainedCodeSnapshots).mockResolvedValue(native(200,
-      '{"turns":[{"turn":1,"files":[{"path":"legacy.ts","existed":true}]}]}',
-    false));
-    vi.mocked(sdk.RevertRetainedCode).mockRejectedValue(new Error('retained rewind lost'));
-    const { target } = await mountApp(connection);
-    await openSnapshots(target);
-    await settle();
-    await readRetainedSnapshots(target, 'abcd1234');
-    await settle();
-    await settle();
-    // The existing per-turn boundary row keeps its exact lexeme.
-    expect(target.querySelector('[aria-label="Revert after retained turn 1"]')).not.toBeNull();
-    // The draft retarget must not retarget the initial boundary either.
-    await changeInput(target, 'Retained session id', 'ffffffff');
-    const initial = target.querySelector('[aria-label="Revert to initial retained boundary"]');
-    expect(initial).not.toBeNull();
-    (initial as HTMLElement).click();
-    await settle();
-    await settle();
-    const call = vi.mocked(sdk.RevertRetainedCode).mock.calls[0][0] as string;
-    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":0}');
-    expect(target.textContent).toContain('Retained snapshot boundary after turn 0');
-    expect(target.textContent).toContain('Rewind outcome unknown');
-  });
 
   it('reports a current rewind outcome addressed to its loaded Session', async () => {
     const connection = fakeConnection();
@@ -3584,27 +3526,6 @@ describe('code snapshots', () => {
     expect(note).toContain('Restore failed: partial failure');
   });
 
-  it('reports a retained rewind outcome addressed to its loaded Workspace and ID', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    vi.mocked(sdk.GetRetainedCodeSnapshots).mockResolvedValue(native(200,
-      '{"turns":[{"turn":1,"files":[{"path":"legacy.ts","existed":true}]}]}',
-    false));
-    vi.mocked(sdk.RevertRetainedCode).mockResolvedValue(json(200, { restored: ['legacy.ts'], skipped: [] }));
-    const { target } = await mountApp(connection);
-    await openSnapshots(target);
-    await settle();
-    await readRetainedSnapshots(target, 'abcd1234');
-    await settle();
-    await settle();
-    (target.querySelector('[aria-label="Revert to initial retained boundary"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const note = target.querySelector('.note.outcome')?.textContent ?? '';
-    expect(note).toContain('/ws');
-    expect(note).toContain('abcd1234');
-    expect(note).toContain('Restored: legacy.ts');
-  });
 
   it('reports a pending rewind after a repair unmounts the dialog, without retransmitting', async () => {
     const connection = fakeConnection();
@@ -4431,48 +4352,7 @@ describe('loaded snapshot identity', () => {
     expect(vi.mocked(sdk.GetSessionCodeSnapshots).mock.calls.at(-1)?.[0]).toEqual('{"session_id":"root2"}');
   });
 
-  it('retained revert uses the loaded Workspace/ID and boundary after the draft ID changes', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    vi.mocked(sdk.GetRetainedCodeSnapshots).mockResolvedValue(native(200,
-      '{"turns":[{"turn":9007199254740993,"files":[{"path":"legacy.ts","existed":true}]}]}',
-    false));
-    vi.mocked(sdk.RevertRetainedCode).mockResolvedValue(json(200, { restored: ['legacy.ts'], skipped: [] }));
-    const { target } = await mountApp(connection);
-    await openSnapshots(target);
-    await settle();
-    await readRetainedSnapshots(target, 'abcd1234');
-    await settle();
-    await settle();
-    expect(target.textContent).toContain('Loaded retained target: /ws · abcd1234');
-    // A draft retarget must not silently retarget the displayed rows/actions.
-    await changeInput(target, 'Retained session id', 'ffffffff');
-    (target.querySelector('[aria-label="Revert after retained turn 9007199254740993"]') as HTMLElement).click();
-    await settle();
-    await settle();
-    const call = vi.mocked(sdk.RevertRetainedCode).mock.calls[0][0] as string;
-    expect(bodyOf(call)).toBe('{"workspace":"/ws","session_id":"abcd1234","after_turn":9007199254740993}');
-  });
 
-  it('invalidates a pending retained read when its draft target changes', async () => {
-    const connection = fakeConnection();
-    basicMocks(connection);
-    const { promise: pending, resolve: releaseRead } = Promise.withResolvers();
-    vi.mocked(sdk.GetRetainedCodeSnapshots).mockImplementationOnce(() => pending as never);
-    const { target } = await mountApp(connection);
-    await openSnapshots(target);
-    await settle();
-    await readRetainedSnapshots(target, 'abcd1234');
-    await settle();
-    // The draft target changes while the read is parked.
-    await changeInput(target, 'Retained session id', 'ffffffff');
-    releaseRead(native(200, '{"turns":[{"turn":1,"files":[]}]}', false));
-    await settle();
-    await settle();
-    // The stale completion publishes nothing.
-    expect(target.textContent).not.toContain('after turn 1');
-    expect(target.textContent).not.toContain('Loaded retained target');
-  });
 });
 
 describe('workspace and empty-selection repair', () => {
